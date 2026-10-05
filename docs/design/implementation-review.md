@@ -99,3 +99,9 @@
 - **Decision:** When a decoded U+FFFD replacement comes from malformed UTF-8 inside a quote-delimited literal, keep the enclosing `STRING`, `BYTE_STRING`, `CHAR`, or `BYTE` token and set `HAS_ERROR`. Outside literals, emit an `ERROR` token. Report `INVALID_UTF8` once from decoding and do not add a second literal diagnostic for the same bytes.
 - **Reason:** Splitting a quote-delimited literal around a replacement character would destroy the token boundary the parser uses to recover it as one expression. The literal token's existing `HAS_ERROR` contract lets later phases suppress value-dependent diagnostics while preserving the source structure.
 - **Review:** Confirm the parser, AST literal accessors, and HIR lowering all honor `HAS_ERROR` and never interpret a replacement-containing literal as valid. Revisit if conformance requires a distinct `ERROR` token inside literals.
+
+### IR-017: Check indentation on whitespace-only multiline-string lines
+
+- **Decision:** Treat every non-empty multiline-string content line, including a line containing only spaces or tabs, as subject to the base-indentation prefix check. Use the exact bytes before the closing delimiter as the required prefix; additional indentation after that prefix is allowed.
+- **Reason:** The lexical specification exempts empty lines and requires every non-empty line to start with the base indentation. Applying that wording literally avoids silently exempting lines that contain source bytes and keeps indentation removal deterministic.
+- **Review:** Confirm whitespace-only lines should follow the same prefix rule as lines with content, and confirm that base indentation is a required prefix rather than an exact count of leading whitespace.

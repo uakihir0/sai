@@ -238,6 +238,51 @@ impl LexOutput {
         &source[token.range.start().to_usize()..token.range.end().to_usize()]
     }
 
+    fn sort_diagnostics(&mut self) -> Result<(), LexError> {
+        let mut indexed = std::mem::take(&mut self.errors)
+            .into_iter()
+            .enumerate()
+            .collect::<Vec<_>>();
+        indexed.sort_by(|(left_index, left), (right_index, right)| {
+            let left_primary = left.primary();
+            let right_primary = right.primary();
+            left_primary
+                .is_some()
+                .cmp(&right_primary.is_some())
+                .then_with(|| {
+                    left_primary
+                        .map(|location| location.span.range.start())
+                        .cmp(&right_primary.map(|location| location.span.range.start()))
+                })
+                .then_with(|| {
+                    left_primary
+                        .map(|location| location.span.range.end())
+                        .cmp(&right_primary.map(|location| location.span.range.end()))
+                })
+                .then_with(|| left.severity.cmp(&right.severity))
+                .then_with(|| left.code.as_str().cmp(right.code.as_str()))
+                .then_with(|| left.message.cmp(&right.message))
+                .then_with(|| left_index.cmp(right_index))
+        });
+
+        let mut remapping = vec![0; indexed.len()];
+        for (sorted, (original, _)) in indexed.iter().enumerate() {
+            *remapping
+                .get_mut(*original)
+                .ok_or(LexError::InvalidSourceSpan)? = sorted;
+        }
+        self.errors = indexed
+            .into_iter()
+            .map(|(_, diagnostic)| diagnostic)
+            .collect();
+        for pending in &mut self.pending_fixes {
+            pending.diagnostic = *remapping
+                .get(pending.diagnostic)
+                .ok_or(LexError::InvalidSourceSpan)?;
+        }
+        Ok(())
+    }
+
     /// Binds diagnostics to a snapshot and constructs the lexical fixes that
     /// can be planned directly from their token ranges.
     pub fn attach_lexical_fixes(&mut self, snapshot: &WorkspaceSnapshot) -> Result<(), LexError> {
@@ -453,6 +498,7 @@ pub fn lex(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<LexOutput, L
             lexer.lex_trivia()?;
             if lexer.at_eof() {
                 lexer.finish_eof()?;
+                lexer.output.sort_diagnostics()?;
                 return Ok(lexer.output);
             }
             lexer.lex_token()?
@@ -496,6 +542,7 @@ enum ForbiddenClass {
 enum EscapeMode {
     SimpleString,
     ByteString,
+    MultilineString,
     Char,
     Byte,
 }
@@ -831,6 +878,22 @@ impl<'a> Lexer<'a> {
         Ok(self.source.invalid_utf8_sequence_at(offset).is_some())
     }
 
+    fn range_contains_invalid_utf8(&self, start: usize, end: usize) -> Result<bool, LexError> {
+        let mut cursor = start;
+        while cursor < end {
+            if self.invalid_utf8_at_offset(cursor)? {
+                return Ok(true);
+            }
+            let ch = self
+                .text
+                .get(cursor..end)
+                .and_then(|remaining| remaining.chars().next())
+                .ok_or(LexError::InvalidSourceSpan)?;
+            cursor += ch.len_utf8();
+        }
+        Ok(false)
+    }
+
     fn emit_invalid_utf8_error(&mut self) -> Result<(), LexError> {
         let start = self.pos;
         self.bump_char().ok_or(LexError::InvalidSourceSpan)?;
@@ -909,6 +972,12 @@ impl<'a> Lexer<'a> {
         if let Some(path) = self.try_pkg_path()? {
             return Ok(path);
         }
+        if ch == 'b'
+            && self.text[self.pos..].starts_with("br")
+            && self.raw_string_opener(2).is_some()
+        {
+            return self.lex_raw_string(true, 2);
+        }
         if self.text[self.pos..].starts_with("b'") {
             return self.lex_character(true, 1);
         }
@@ -919,7 +988,13 @@ impl<'a> Lexer<'a> {
             return self.lex_character(false, 0);
         }
         if ch == '"' {
+            if self.text[self.pos..].starts_with("\"\"\"") {
+                return self.lex_multiline_string();
+            }
             return self.lex_simple_string(false, 0);
+        }
+        if ch == 'r' && self.raw_string_opener(1).is_some() {
+            return self.lex_raw_string(false, 1);
         }
         if ch == 'r'
             && self.text[self.pos..].starts_with("r#")
@@ -957,6 +1032,358 @@ impl<'a> Lexer<'a> {
             return self.lex_number();
         }
         self.lex_punctuator_or_unexpected()
+    }
+
+    fn raw_string_opener(&self, prefix_len: usize) -> Option<(usize, usize)> {
+        let mut quote_start = self.pos.checked_add(prefix_len)?;
+        let bytes = self.text.as_bytes();
+        let mut hashes = 0;
+        while bytes.get(quote_start) == Some(&b'#') {
+            quote_start += 1;
+            hashes += 1;
+        }
+        (bytes.get(quote_start) == Some(&b'"')).then_some((quote_start, hashes))
+    }
+
+    fn raw_string_closing_end(&self, quote_start: usize, hashes: usize) -> Option<usize> {
+        if self.text.as_bytes().get(quote_start) != Some(&b'"') {
+            return None;
+        }
+        let mut end = quote_start + 1;
+        for _ in 0..hashes {
+            if self.text.as_bytes().get(end) != Some(&b'#') {
+                return None;
+            }
+            end += 1;
+        }
+        Some(end)
+    }
+
+    fn multiline_closing_line(&self, mut line_start: usize) -> Option<(usize, usize, usize)> {
+        let bytes = self.text.as_bytes();
+        loop {
+            let mut line_end = line_start;
+            while line_end < bytes.len() && !matches!(bytes[line_end], b'\r' | b'\n') {
+                line_end += 1;
+            }
+
+            let mut quote_start = line_start;
+            while matches!(bytes.get(quote_start), Some(b' ' | b'\t')) {
+                quote_start += 1;
+            }
+            if bytes.get(quote_start..quote_start.checked_add(3)?) == Some(b"\"\"\"")
+                && quote_start + 3 == line_end
+            {
+                return Some((line_start, quote_start, quote_start + 3));
+            }
+
+            if line_end == bytes.len() {
+                return None;
+            }
+            line_start = if bytes[line_end] == b'\r' && bytes.get(line_end + 1) == Some(&b'\n') {
+                line_end + 2
+            } else {
+                line_end + 1
+            };
+        }
+    }
+
+    fn lex_raw_string(
+        &mut self,
+        byte_string: bool,
+        prefix_len: usize,
+    ) -> Result<LexedToken, LexError> {
+        let start = self.pos;
+        let (quote_start, hashes) = self
+            .raw_string_opener(prefix_len)
+            .ok_or(LexError::InvalidSourceSpan)?;
+        self.pos = quote_start + 1;
+        let mut has_error = false;
+        let mut terminated = false;
+
+        if hashes > 255 {
+            self.report_at(
+                Code::MalformedRawString,
+                Severity::Error,
+                "raw string delimiters may contain at most 255 hashes",
+                start,
+                quote_start,
+            )?;
+            has_error = true;
+        }
+
+        while let Some(ch) = self.peek() {
+            if ch == '"'
+                && let Some(end) = self.raw_string_closing_end(self.pos, hashes)
+            {
+                self.pos = end;
+                terminated = true;
+                break;
+            }
+            let char_start = self.pos;
+            let invalid_utf8 = self.invalid_utf8_at_pos()?;
+            self.bump_char();
+            if ch == '\r' {
+                if self.peek() == Some('\n') {
+                    self.bump_char();
+                } else {
+                    self.report_at(
+                        Code::InvalidLineEnding,
+                        Severity::Error,
+                        "lone CR is an invalid line ending",
+                        char_start,
+                        self.pos,
+                    )?;
+                    has_error = true;
+                }
+            }
+            if invalid_utf8 {
+                has_error = true;
+            } else if byte_string && !ch.is_ascii() {
+                self.report_at(
+                    Code::InvalidEscape,
+                    Severity::Error,
+                    "byte strings may contain only ASCII characters",
+                    char_start,
+                    self.pos,
+                )?;
+                has_error = true;
+            }
+        }
+
+        if !terminated {
+            self.report_at(
+                Code::UnterminatedString,
+                Severity::Error,
+                "unterminated raw string literal",
+                quote_start,
+                quote_start + 1,
+            )?;
+            has_error = true;
+        }
+
+        let range = self.text_range(start, self.pos)?;
+        if self.text.get(start..self.pos).is_some_and(|text| {
+            text.chars()
+                .any(|ch| forbidden_class(ch) == Some(ForbiddenClass::Bidi))
+        }) {
+            self.check_bidi(range)?;
+            has_error = true;
+        }
+
+        let mut flags = TokenFlags::empty();
+        if has_error {
+            flags.insert(TokenFlags::HAS_ERROR);
+        }
+        Ok(LexedToken {
+            kind: if byte_string {
+                SyntaxKind::BYTE_STRING
+            } else {
+                SyntaxKind::STRING
+            },
+            start,
+            end: self.pos,
+            flags,
+        })
+    }
+
+    fn lex_multiline_string(&mut self) -> Result<LexedToken, LexError> {
+        let start = self.pos;
+        let opener_end = start + 3;
+        self.pos = opener_end;
+        let mut errors = Vec::new();
+        let mut has_error = false;
+
+        match self.peek() {
+            Some('\n') => self.pos += 1,
+            Some('\r') => {
+                let line_end = if self.text.as_bytes().get(self.pos + 1) == Some(&b'\n') {
+                    self.pos + 2
+                } else {
+                    errors.push((
+                        self.pos,
+                        self.pos + 1,
+                        Code::InvalidLineEnding,
+                        "lone CR is an invalid line ending",
+                        false,
+                    ));
+                    has_error = true;
+                    self.pos + 1
+                };
+                self.pos = line_end;
+            }
+            _ => {
+                errors.push((
+                    start,
+                    opener_end,
+                    Code::MalformedMultilineString,
+                    "multiline string opener must be followed by a line break",
+                    false,
+                ));
+                has_error = true;
+            }
+        }
+
+        let content_start = self.pos;
+        let closing_line = self.multiline_closing_line(content_start);
+        let (body_end, token_end, base_indent) =
+            if let Some((line_start, quote_start, end)) = closing_line {
+                (
+                    line_start,
+                    end,
+                    self.text[line_start..quote_start].to_owned(),
+                )
+            } else {
+                errors.push((
+                    start,
+                    opener_end,
+                    Code::UnterminatedString,
+                    "unterminated multiline string literal",
+                    false,
+                ));
+                has_error = true;
+                (self.text.len(), self.text.len(), String::new())
+            };
+
+        if closing_line.is_some() {
+            let base_indent_bytes = base_indent.as_bytes();
+            let bytes = self.text.as_bytes();
+            let mut line_start = content_start;
+            while line_start < body_end {
+                let mut line_end = line_start;
+                while line_end < body_end && !matches!(bytes[line_end], b'\r' | b'\n') {
+                    line_end += 1;
+                }
+
+                let line = &bytes[line_start..line_end];
+                if !line.is_empty() && !line.starts_with(base_indent_bytes) {
+                    errors.push((
+                        line_start,
+                        line_end,
+                        Code::InconsistentIndent,
+                        "multiline string line does not start with the base indentation",
+                        false,
+                    ));
+                    has_error = true;
+                }
+
+                if line_end == body_end {
+                    break;
+                }
+                if bytes[line_end] == b'\r' && bytes.get(line_end + 1) == Some(&b'\n') {
+                    line_start = line_end + 2;
+                } else {
+                    line_start = line_end + 1;
+                }
+            }
+        }
+
+        self.pos = content_start;
+        while self.pos < body_end {
+            let ch = self.peek().ok_or(LexError::InvalidSourceSpan)?;
+            if ch == '\\' {
+                if self.pos + 1 < body_end && self.invalid_utf8_at_offset(self.pos + 1)? {
+                    self.pos += 1;
+                    self.bump_char().ok_or(LexError::InvalidSourceSpan)?;
+                    has_error = true;
+                    continue;
+                }
+                let escape = scan_escape(
+                    &self.text[..body_end],
+                    self.pos,
+                    EscapeMode::MultilineString,
+                );
+                if !escape.valid {
+                    has_error = true;
+                    if !self.range_contains_invalid_utf8(self.pos, escape.end)? {
+                        errors.push((
+                            self.pos,
+                            escape.end,
+                            Code::InvalidEscape,
+                            "invalid escape sequence",
+                            false,
+                        ));
+                    }
+                }
+                self.pos = escape.end;
+                continue;
+            }
+
+            let char_start = self.pos;
+            let invalid_utf8 = self.invalid_utf8_at_pos()?;
+            self.bump_char();
+            if invalid_utf8 {
+                has_error = true;
+            }
+            if ch == '\r' {
+                if self.pos < body_end && self.peek() == Some('\n') {
+                    self.bump_char();
+                } else {
+                    errors.push((
+                        char_start,
+                        self.pos,
+                        Code::InvalidLineEnding,
+                        "lone CR is an invalid line ending",
+                        false,
+                    ));
+                    has_error = true;
+                }
+            }
+        }
+
+        let token_text = &self.text[start..token_end];
+        let mut cursor = 0;
+        while cursor < token_text.len() {
+            let ch = token_text[cursor..]
+                .chars()
+                .next()
+                .ok_or(LexError::InvalidSourceSpan)?;
+            if forbidden_class(ch) != Some(ForbiddenClass::Bidi) {
+                cursor += ch.len_utf8();
+                continue;
+            }
+            let run_start = cursor;
+            cursor += ch.len_utf8();
+            while cursor < token_text.len() {
+                let next = token_text[cursor..]
+                    .chars()
+                    .next()
+                    .ok_or(LexError::InvalidSourceSpan)?;
+                if forbidden_class(next) != Some(ForbiddenClass::Bidi) {
+                    break;
+                }
+                cursor += next.len_utf8();
+            }
+            errors.push((
+                start + run_start,
+                start + cursor,
+                Code::ForbiddenCharacter,
+                "bidirectional control characters are forbidden in source text",
+                true,
+            ));
+            has_error = true;
+        }
+
+        errors.sort_by_key(|error| error.0);
+        for (error_start, error_end, code, message, forbidden) in errors {
+            if forbidden {
+                self.report_forbidden_at(message, error_start, error_end)?;
+            } else {
+                self.report_at(code, Severity::Error, message, error_start, error_end)?;
+            }
+        }
+
+        self.pos = token_end;
+        let mut flags = TokenFlags::empty();
+        if has_error {
+            flags.insert(TokenFlags::HAS_ERROR);
+        }
+        Ok(LexedToken {
+            kind: SyntaxKind::STRING,
+            start,
+            end: token_end,
+            flags,
+        })
     }
 
     fn lex_simple_string(
@@ -1007,7 +1434,9 @@ impl<'a> Lexer<'a> {
                 let escape = scan_escape(self.text, self.pos, mode);
                 if !escape.valid {
                     has_error = true;
-                    if !escape.line_break_follows {
+                    if !escape.line_break_follows
+                        && !self.range_contains_invalid_utf8(self.pos, escape.end)?
+                    {
                         self.report_at(
                             Code::InvalidEscape,
                             Severity::Error,
@@ -1181,7 +1610,9 @@ impl<'a> Lexer<'a> {
                 let escape = scan_escape(self.text, self.pos, mode);
                 if !escape.valid {
                     has_error = true;
-                    if !escape.line_break_follows {
+                    if !escape.line_break_follows
+                        && !self.range_contains_invalid_utf8(self.pos, escape.end)?
+                    {
                         self.report_at(
                             Code::InvalidEscape,
                             Severity::Error,
@@ -2349,7 +2780,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
 
     if escaped == 'u' {
         let quote = match mode {
-            EscapeMode::SimpleString | EscapeMode::ByteString => '"',
+            EscapeMode::SimpleString | EscapeMode::ByteString | EscapeMode::MultilineString => '"',
             EscapeMode::Char | EscapeMode::Byte => '\'',
         };
         if matches!(mode, EscapeMode::ByteString | EscapeMode::Byte) {
@@ -2985,6 +3416,237 @@ mod tests {
     }
 
     #[test]
+    fn lexes_raw_strings_without_interpreting_their_contents() {
+        let text = "r#\"raw \"quote\" and \\n\"#\nnext";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [
+                SyntaxKind::STRING,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::LIDENT,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert_eq!(
+            output.token_text(&output.tokens[0], text),
+            "r#\"raw \"quote\" and \\n\"#"
+        );
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn raw_string_delimiters_match_their_hash_count_and_report_oversized_openers() {
+        let text = "r##\"body \"# still inside\"##";
+        let output = lex_text(text);
+
+        assert_eq!(output.tokens[0].kind, SyntaxKind::STRING);
+        assert_eq!(output.token_text(&output.tokens[0], text), text);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+
+        let hashes = "#".repeat(256);
+        let malformed = format!("r{hashes}\"body\"{hashes}");
+        let output = lex_text(&malformed);
+
+        assert_eq!(output.tokens[0].kind, SyntaxKind::STRING);
+        assert_eq!(output.token_text(&output.tokens[0], &malformed), malformed);
+        assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::MalformedRawString);
+    }
+
+    #[test]
+    fn lexes_raw_byte_strings_and_rejects_non_ascii_contents() {
+        for (text, has_error) in [("br#\"ASCII \\x41\"#", false), ("br#\"é\"#", true)] {
+            let output = lex_text(text);
+
+            assert_eq!(output.tokens[0].kind, SyntaxKind::BYTE_STRING);
+            assert_eq!(
+                output.tokens[0].flags.contains(TokenFlags::HAS_ERROR),
+                has_error
+            );
+            assert_eq!(output.errors.len(), usize::from(has_error));
+            if has_error {
+                assert_eq!(output.errors[0].code, Code::InvalidEscape);
+            }
+        }
+    }
+
+    #[test]
+    fn unterminated_raw_strings_extend_to_eof() {
+        let text = "r##\"unfinished";
+        let output = lex_text(text);
+
+        assert_eq!(output.tokens[0].kind, SyntaxKind::STRING);
+        assert_eq!(output.token_text(&output.tokens[0], text), text);
+        assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::UnterminatedString);
+    }
+
+    #[test]
+    fn lexes_multiline_strings_and_keeps_internal_line_breaks_in_one_token() {
+        let text = "\"\"\"\r\n  first\n  second\n  \"\"\"\nnext";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [
+                SyntaxKind::STRING,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::LIDENT,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert_eq!(
+            output.token_text(&output.tokens[0], text),
+            "\"\"\"\r\n  first\n  second\n  \"\"\""
+        );
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn multiline_indentation_uses_the_closing_line_prefix() {
+        let text = "\"\"\"\n  good\n bad\n \n\tbad\n  \"\"\"";
+        let output = lex_text(text);
+
+        assert_eq!(output.tokens[0].kind, SyntaxKind::STRING);
+        assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>(),
+            [
+                Code::InconsistentIndent,
+                Code::InconsistentIndent,
+                Code::InconsistentIndent,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_multiline_openers_recover_at_the_next_closing_line() {
+        let text = "\"\"\"oops\n\"\"\"\n+ value";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [
+                SyntaxKind::STRING,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::PLUS,
+                SyntaxKind::LIDENT,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert_eq!(
+            output.token_text(&output.tokens[0], text),
+            "\"\"\"oops\n\"\"\""
+        );
+        assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::MalformedMultilineString);
+    }
+
+    #[test]
+    fn multiline_strings_validate_escapes_and_extend_to_eof_when_unterminated() {
+        let escaped = "\"\"\"\n  bad\\q\n  \"\"\"";
+        let output = lex_text(escaped);
+
+        assert_eq!(output.tokens[0].kind, SyntaxKind::STRING);
+        assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::InvalidEscape);
+
+        let unterminated = "\"\"\"\n  body";
+        let output = lex_text(unterminated);
+        assert_eq!(
+            output.token_text(&output.tokens[0], unterminated),
+            unterminated
+        );
+        assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::UnterminatedString);
+    }
+
+    #[test]
+    fn malformed_multiline_unicode_escapes_stop_before_the_closing_delimiter() {
+        let text = "\"\"\"\n  \\u{GG\n  \"\"\"\nnext";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [
+                SyntaxKind::STRING,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::LIDENT,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert_eq!(
+            output.token_text(&output.tokens[0], text),
+            "\"\"\"\n  \\u{GG\n  \"\"\""
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::InvalidEscape);
+    }
+
+    #[test]
+    fn multiline_string_diagnostics_follow_source_order_and_report_lone_cr() {
+        let text = "\"\"\"\n  \\q\n bad\n  \"\"\"";
+        let output = lex_text(text);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidEscape, Code::InconsistentIndent]
+        );
+
+        let lone_cr = lex_text("\"\"\"\rbody\r\"\"\"");
+        assert_eq!(
+            lone_cr
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidLineEnding, Code::InvalidLineEnding]
+        );
+        assert!(lone_cr.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+    }
+
+    #[test]
+    fn same_span_diagnostics_use_the_canonical_code_order() {
+        let output = lex_text("\"\"\"\n\u{202E}\n \"\"\"");
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>(),
+            [Code::ForbiddenCharacter, Code::InconsistentIndent]
+        );
+        assert_eq!(
+            output.errors[0]
+                .primary()
+                .map(|location| location.span.range),
+            output.errors[1]
+                .primary()
+                .map(|location| location.span.range)
+        );
+    }
+
+    #[test]
     fn string_line_continuations_consume_indentation() {
         let text = "\"first\\\r\n \tsecond\"";
         let output = lex_text(text);
@@ -3057,8 +3719,16 @@ mod tests {
         for (bytes, kind) in [
             (b"\"\xFF\"".as_slice(), SyntaxKind::STRING),
             (b"\"\\\xFF\"".as_slice(), SyntaxKind::STRING),
+            (b"r#\"\xFF\"#".as_slice(), SyntaxKind::STRING),
+            (b"\"\"\"\n\xFF\n\"\"\"".as_slice(), SyntaxKind::STRING),
+            (b"\"\\u{\xFF}\"".as_slice(), SyntaxKind::STRING),
+            (
+                b"\"\"\"\n  \\u{\xFF}\n  \"\"\"".as_slice(),
+                SyntaxKind::STRING,
+            ),
             (b"'\xFF'".as_slice(), SyntaxKind::CHAR),
             (b"'\\\xFF'".as_slice(), SyntaxKind::CHAR),
+            (b"'\\u{\xFF}'".as_slice(), SyntaxKind::CHAR),
             (b"b\"\xFF\"".as_slice(), SyntaxKind::BYTE_STRING),
         ] {
             let output = lex_bytes(bytes);
@@ -3512,6 +4182,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Code::InvalidUtf8]
         );
+    }
+
+    #[test]
+    fn diagnostics_are_sorted_by_source_position_after_utf8_decoding() {
+        let output = lex_bytes(b"\"\\q\" \xFF");
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidEscape, Code::InvalidUtf8]
+        );
+    }
+
+    #[test]
+    fn diagnostic_sorting_keeps_lexical_fixes_attached_to_their_diagnostics() {
+        let source = Arc::new(SourceFile::decode(FileId::new(1), b"r#name \xFF").expect("source"));
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            source,
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("snapshot");
+        let output = lex_with_fixes(&snapshot, FileId::new(1)).expect("lex with fixes");
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>(),
+            [Code::UnnecessaryRawIdent, Code::InvalidUtf8]
+        );
+        assert!(!output.errors[0].fixes().is_empty());
+        assert!(output.errors[1].fixes().is_empty());
     }
 
     #[test]
