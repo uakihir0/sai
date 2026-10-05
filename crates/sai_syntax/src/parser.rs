@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef};
@@ -28,6 +29,7 @@ pub struct Parser<'src, 'tokens> {
     allow_assoc_type_bindings: bool,
     nesting_depth: usize,
     reported_nesting_limit: bool,
+    spec_failures: HashSet<usize>,
 }
 
 struct DiagnosticSource<'src> {
@@ -35,7 +37,7 @@ struct DiagnosticSource<'src> {
     source_ref: SourceRef,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ExpectedSet {
     position: Option<usize>,
     kinds: Vec<SyntaxKind>,
@@ -151,6 +153,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             allow_assoc_type_bindings: false,
             nesting_depth: 0,
             reported_nesting_limit: false,
+            spec_failures: HashSet::new(),
         })
     }
 
@@ -1477,10 +1480,9 @@ mod tests {
             ("fn f() { g[0] }\n", SyntaxKind::L_BRACKET),
             ("fn f() { g? }\n", SyntaxKind::QUESTION),
             ("fn f() { .Some }\n", SyntaxKind::DOT),
-            ("fn f() { g<I32> }\n", SyntaxKind::LT),
-            ("fn f() { g<foo.Bar> }\n", SyntaxKind::LT),
-            ("fn f() { g<I32,>() }\n", SyntaxKind::LT),
-            ("fn f() { g<I32\n>() }\n", SyntaxKind::LT),
+            ("fn f() { g<I32>() }\n", SyntaxKind::L_PAREN),
+            ("fn f() { g<I32,>() }\n", SyntaxKind::L_PAREN),
+            ("fn f() { g<I32\n>() }\n", SyntaxKind::L_PAREN),
         ] {
             let (snapshot_file, lexed) = lex_file(source);
             let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
@@ -1494,6 +1496,25 @@ mod tests {
                 parser.into_events(),
                 Err(ParserError::UnconsumedTokens { .. })
             ));
+        }
+
+        for source in [
+            "fn f() { g<I32> }\n",
+            "fn f() { g<foo.Bar> }\n",
+            "fn f() { g<-3> }\n",
+            "fn f() { g<(I32, U32)> }\n",
+        ] {
+            let output = parse_file(source);
+            assert!(
+                output.errors.is_empty(),
+                "valid generic expression arguments should parse: {source}"
+            );
+            assert!(
+                crate::SyntaxNode::new_root(output.root)
+                    .descendants()
+                    .any(|node| node.kind() == SyntaxKind::GENERIC_ARG_LIST),
+                "generic arguments should be represented in the CST: {source}"
+            );
         }
 
         assert!(parse_file("fn f() { a < b }\n").errors.is_empty());
@@ -1518,13 +1539,10 @@ mod tests {
             .expect("fallback consumes the malformed comparison expression");
 
         let malformed = parse_file("fn f() { g<B + C>(d) }\n");
+        assert_eq!(malformed.errors.len(), 1);
         assert_eq!(
-            malformed
-                .errors
-                .iter()
-                .filter(|diagnostic| diagnostic.code == Code::ChainedComparison)
-                .count(),
-            1,
+            malformed.errors[0].code,
+            Code::ChainedComparison,
             "an invalid type argument must fall back to comparison parsing"
         );
 

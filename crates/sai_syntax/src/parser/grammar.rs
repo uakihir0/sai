@@ -1250,12 +1250,6 @@ impl Parser<'_, '_> {
                 previous_non_associative = None;
                 continue;
             }
-            if lhs.kind() == SyntaxKind::PATH_EXPR && self.generic_expr_args_follow() {
-                return Err(ParserError::UnsupportedSyntax {
-                    position: self.position,
-                    kind: SyntaxKind::LT,
-                });
-            }
             if self.at_any(&[
                 SyntaxKind::DOT,
                 SyntaxKind::L_PAREN,
@@ -1339,183 +1333,80 @@ impl Parser<'_, '_> {
         Ok(lhs)
     }
 
-    fn generic_expr_args_follow(&self) -> bool {
-        if !self.at(SyntaxKind::LT) {
-            return false;
+    fn maybe_generic_args_expr(&mut self) -> Result<bool, ParserError> {
+        let start_position = self.position;
+        if !self.at(SyntaxKind::LT) || self.spec_failures.contains(&start_position) {
+            return Ok(false);
         }
-        let Some(previous) = self
-            .position
+        let Some(previous) = start_position
             .checked_sub(1)
             .and_then(|position| self.tokens.get(position))
         else {
-            return false;
+            return Ok(false);
         };
         if !matches!(previous.kind, SyntaxKind::LIDENT | SyntaxKind::UIDENT)
             || !previous.flags.contains(crate::TokenFlags::JOINT)
         {
-            return false;
+            return Ok(false);
         }
 
-        let mut angle_depth = 0usize;
-        let mut delimiters = Vec::<(SyntaxKind, usize, bool)>::new();
-        let mut at_item_start = false;
-        let mut saw_item = false;
-        let mut previous_top_level_kind = None;
+        let event_count = self.events.len();
+        let expected = self.expected.clone();
+        let reported_expected_at = self.reported_expected_at;
+        let reported_expected_event = self.reported_expected_event;
+        let active_markers = self.active_markers.borrow().clone();
+        let marker_failure_count = self.marker_failures.borrow().len();
+        let nesting_depth = self.nesting_depth;
+        let reported_nesting_limit = self.reported_nesting_limit;
+        let allow_assoc_type_bindings = self.allow_assoc_type_bindings;
 
-        for position in self.position..self.tokens.len() {
-            let Some(token) = self.tokens.get(position) else {
-                return false;
-            };
-            let kind = token.kind;
-            let offset = position - self.position;
-            let at_top_level = angle_depth == 1 && delimiters.is_empty();
-            let starts_effect_set = kind == SyntaxKind::LIDENT
-                && self.nth(offset + 1) == SyntaxKind::L_BRACE
-                && token_is_contextual(self.source, self.tokens, position, "effects");
+        self.allow_assoc_type_bindings = false;
+        let parsed = self.generic_arg_list();
+        self.allow_assoc_type_bindings = allow_assoc_type_bindings;
 
-            if kind == SyntaxKind::LIDENT
-                && !delimiters.iter().any(|(_, _, effect_set)| *effect_set)
-                && self.nth(offset + 1) != SyntaxKind::DOT
-                && !starts_effect_set
-            {
-                return false;
-            }
-
-            if at_top_level
-                && !at_item_start
-                && matches!(
-                    kind,
-                    SyntaxKind::PLUS
-                        | SyntaxKind::MINUS
-                        | SyntaxKind::PLUS_PERCENT
-                        | SyntaxKind::MINUS_PERCENT
-                        | SyntaxKind::STAR
-                        | SyntaxKind::STAR_PERCENT
-                        | SyntaxKind::SLASH
-                        | SyntaxKind::PERCENT
-                        | SyntaxKind::EQ2
-                        | SyntaxKind::NEQ
-                        | SyntaxKind::LE
-                        | SyntaxKind::AMP
-                        | SyntaxKind::AMP2
-                        | SyntaxKind::PIPE
-                        | SyntaxKind::PIPE2
-                        | SyntaxKind::CARET
-                        | SyntaxKind::SHL
-                        | SyntaxKind::AND_KW
-                        | SyntaxKind::OR_KW
-                        | SyntaxKind::AS_KW
-                        | SyntaxKind::FAT_ARROW
-                )
-            {
-                return false;
-            }
-
-            if at_top_level
-                && !at_item_start
-                && GENERIC_ARG_START_KINDS.contains(&kind)
-                && !starts_effect_set
-                && previous_top_level_kind.is_some_and(|previous| {
-                    matches!(
-                        previous,
-                        SyntaxKind::LIDENT
-                            | SyntaxKind::UIDENT
-                            | SyntaxKind::UNDERSCORE
-                            | SyntaxKind::SELF_TYPE_KW
-                            | SyntaxKind::INT
-                            | SyntaxKind::CHAR
-                            | SyntaxKind::TRUE_KW
-                            | SyntaxKind::FALSE_KW
-                            | SyntaxKind::R_PAREN
-                            | SyntaxKind::R_BRACKET
-                            | SyntaxKind::R_BRACE
-                            | SyntaxKind::GT
-                    )
-                })
-            {
-                return false;
-            }
-
-            if at_top_level && kind == SyntaxKind::NEWLINE {
-                if saw_item && self.nth(offset + 1) == SyntaxKind::GT {
-                    return GENERIC_EXPR_FOLLOW_KINDS.contains(&self.nth(offset + 2));
-                }
-                return false;
-            }
-
-            if at_item_start && at_top_level {
-                if kind == SyntaxKind::GT {
-                    return saw_item && GENERIC_EXPR_FOLLOW_KINDS.contains(&self.nth(offset + 1));
-                }
-                if !GENERIC_ARG_START_KINDS.contains(&kind) {
-                    return false;
-                }
-                if kind == SyntaxKind::MINUS && self.nth(offset + 1) != SyntaxKind::INT {
-                    return false;
-                }
-                at_item_start = false;
-                saw_item = true;
-            }
-
-            match kind {
-                SyntaxKind::LT => {
-                    angle_depth += 1;
-                    if angle_depth == 1 {
-                        at_item_start = true;
-                    }
-                }
-                SyntaxKind::GT if angle_depth > 0 => {
-                    if delimiters
-                        .last()
-                        .is_some_and(|(_, opening_angle_depth, _)| {
-                            angle_depth <= *opening_angle_depth
-                        })
-                    {
-                        return false;
-                    }
-                    angle_depth -= 1;
-                    if angle_depth == 0 {
-                        return delimiters.is_empty()
-                            && saw_item
-                            && GENERIC_EXPR_FOLLOW_KINDS.contains(&self.nth(offset + 1));
-                    }
-                }
-                SyntaxKind::GT => return false,
-                SyntaxKind::L_PAREN => delimiters.push((SyntaxKind::R_PAREN, angle_depth, false)),
-                SyntaxKind::L_BRACKET => {
-                    delimiters.push((SyntaxKind::R_BRACKET, angle_depth, false));
-                }
-                SyntaxKind::L_BRACE => delimiters.push((
-                    SyntaxKind::R_BRACE,
-                    angle_depth,
-                    position.checked_sub(1).is_some_and(|previous| {
-                        token_is_contextual(self.source, self.tokens, previous, "effects")
-                    }),
-                )),
-                SyntaxKind::R_PAREN | SyntaxKind::R_BRACKET | SyntaxKind::R_BRACE => {
-                    if delimiters
-                        .last()
-                        .is_some_and(|(close, _, _)| *close == kind)
-                    {
-                        delimiters.pop();
-                    } else {
-                        return false;
-                    }
-                }
-                SyntaxKind::COMMA if at_top_level => at_item_start = true,
-                SyntaxKind::NEWLINE if at_top_level => return false,
-                SyntaxKind::EOF => return false,
-                _ => {}
-            }
-            if angle_depth == 1 && delimiters.is_empty() {
-                if kind == SyntaxKind::COMMA {
-                    previous_top_level_kind = None;
-                } else {
-                    previous_top_level_kind = Some(kind);
-                }
-            }
+        let marker_failure = self
+            .marker_failures
+            .borrow()
+            .get(marker_failure_count)
+            .cloned();
+        let active_markers_changed = *self.active_markers.borrow() != active_markers;
+        let parser_error = marker_failure.or_else(|| {
+            active_markers_changed.then(|| ParserError::InvalidMarkerNesting {
+                position: active_markers
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| u32::try_from(event_count).unwrap_or(u32::MAX)),
+            })
+        });
+        let has_diagnostic = self.events[event_count..]
+            .iter()
+            .any(|event| matches!(event, crate::Event::Error { .. }));
+        let succeeded = parsed.is_ok()
+            && parser_error.is_none()
+            && !has_diagnostic
+            && GENERIC_EXPR_FOLLOW_KINDS.contains(&self.current());
+        if succeeded {
+            return Ok(true);
         }
-        false
+
+        self.position = start_position;
+        self.events.truncate(event_count);
+        self.expected = expected;
+        self.reported_expected_at = reported_expected_at;
+        self.reported_expected_event = reported_expected_event;
+        *self.active_markers.borrow_mut() = active_markers;
+        self.marker_failures
+            .borrow_mut()
+            .truncate(marker_failure_count);
+        self.nesting_depth = nesting_depth;
+        self.reported_nesting_limit = reported_nesting_limit;
+        self.spec_failures.insert(start_position);
+
+        if let Some(error) = parser_error {
+            return Err(error);
+        }
+        parsed?;
+        Ok(false)
     }
 
     fn infix_operator(&self) -> Option<InfixOperator> {
@@ -1684,6 +1575,15 @@ impl Parser<'_, '_> {
             SyntaxKind::LIDENT | SyntaxKind::UIDENT => {
                 let path = self.start();
                 self.name_node(IDENT_KINDS, SyntaxKind::NAME_REF)?;
+                if self.at(SyntaxKind::LT) {
+                    match self.maybe_generic_args_expr() {
+                        Ok(_) => {}
+                        Err(error) => {
+                            path.abandon(self)?;
+                            return Err(error);
+                        }
+                    }
+                }
                 path.complete(self, SyntaxKind::PATH_EXPR)
             }
             SyntaxKind::SELF_KW => {
