@@ -542,7 +542,7 @@ fn append_element(
     Ok(())
 }
 
-fn validate_token_mapping(
+pub(crate) fn validate_token_mapping(
     tokens: &[Token],
     start: usize,
     end: usize,
@@ -582,7 +582,11 @@ fn validate_token_mapping(
     }
 }
 
-fn validate_joint_tokens(tokens: &[Token], start: usize, end: usize) -> Result<(), TreeBuildError> {
+pub(crate) fn validate_joint_tokens(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+) -> Result<(), TreeBuildError> {
     for index in start..end.saturating_sub(1) {
         let left = tokens
             .get(index)

@@ -11,8 +11,10 @@ use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
+mod parser;
 mod red;
 mod tree;
+pub use parser::{CompletedMarker, Marker, Parser, ParserError};
 pub use red::{Descendants, SyntaxElement, SyntaxNode, SyntaxToken, TokenAtOffset};
 pub use tree::{
     Event, GreenElement, GreenNode, GreenToken, GreenTrivia, NodeCache, TreeBuildError,
