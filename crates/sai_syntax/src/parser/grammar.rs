@@ -2174,6 +2174,13 @@ impl Parser<'_, '_> {
                 self.bump();
                 literal.complete(self, SyntaxKind::LITERAL)
             }
+            SyntaxKind::LIDENT
+                if self.at_contextual("region")
+                    && self.nth(1) == SyntaxKind::LIDENT
+                    && self.nth(2) == SyntaxKind::L_BRACE =>
+            {
+                self.region_expr()
+            }
             SyntaxKind::LIDENT | SyntaxKind::UIDENT => {
                 let path = self.start();
                 self.name_node(IDENT_KINDS, SyntaxKind::NAME_REF)?;
@@ -2382,6 +2389,23 @@ impl Parser<'_, '_> {
         while self.eat_nl() {}
         label.complete(self, SyntaxKind::LOOP_LABEL)?;
         Ok(true)
+    }
+
+    fn region_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        let result = (|| {
+            self.bump();
+            self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+            self.with_no_block_operand(false, |parser| parser.block())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => expression.complete(self, SyntaxKind::REGION_EXPR),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
     }
 
     fn closure_expr(&mut self) -> Result<CompletedMarker, ParserError> {

@@ -1535,6 +1535,61 @@ mod tests {
     }
 
     #[test]
+    fn region_expressions_use_contextual_lookahead_and_keep_their_scope_shape() {
+        let output = parse_file(concat!(
+            "fn f(value: Bool) {\n",
+            "let region = value\n",
+            "let allocated = region arena { value }\n",
+            "let condition = if region arena { value } {}\n",
+            "let name = region\n",
+            "let raw_name = r#region\n",
+            "}\n",
+        ));
+        assert!(
+            output.errors.is_empty(),
+            "region expressions and the ordinary identifier should parse cleanly: {:?}",
+            output.errors
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let region_expressions = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::REGION_EXPR)
+            .collect::<Vec<_>>();
+
+        assert_eq!(region_expressions.len(), 2);
+        assert!(
+            region_expressions.iter().all(|region| {
+                let children = region.children().collect::<Vec<_>>();
+                children.len() == 2
+                    && children[0].kind() == SyntaxKind::NAME
+                    && children[0]
+                        .first_token()
+                        .is_some_and(|token| token.text() == "arena")
+                    && children[1].kind() == SyntaxKind::BLOCK
+            }),
+            "each region expression must retain its binder before its body block"
+        );
+        assert!(
+            root.descendants().any(|node| {
+                node.kind() == SyntaxKind::PATH_EXPR
+                    && node
+                        .first_token()
+                        .is_some_and(|token| token.text() == "region")
+            }),
+            "a bare region identifier remains a path expression"
+        );
+        assert!(
+            root.descendants().any(|node| {
+                node.kind() == SyntaxKind::PATH_EXPR
+                    && node
+                        .first_token()
+                        .is_some_and(|token| token.text() == "r#region")
+            }),
+            "a raw `region` identifier remains a path expression"
+        );
+    }
+
+    #[test]
     fn function_parser_builds_closures_and_async_blocks() {
         let source = concat!(
             "fn f(value: I32) {\n",
