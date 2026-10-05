@@ -105,3 +105,33 @@
 - **Decision:** Treat every non-empty multiline-string content line, including a line containing only spaces or tabs, as subject to the base-indentation prefix check. Use the exact bytes before the closing delimiter as the required prefix; additional indentation after that prefix is allowed.
 - **Reason:** The lexical specification exempts empty lines and requires every non-empty line to start with the base indentation. Applying that wording literally avoids silently exempting lines that contain source bytes and keeps indentation removal deterministic.
 - **Review:** Confirm whitespace-only lines should follow the same prefix rule as lines with content, and confirm that base indentation is a required prefix rather than an exact count of leading whitespace.
+
+### IR-018: Keep green-tree operations safe for deep syntax
+
+- **Decision:** Compute each green node's structural hash from its children, compare nodes and find their last token iteratively, and empty uniquely owned child lists iteratively during destruction. Intern nodes with at most three children by structural child values; leave larger nodes uncached.
+- **Reason:** Left-associative expressions can produce trees whose depth grows with token count even when parser nesting is bounded. Recursive hashing or destruction can overflow the native stack. Address-only cache keys avoid recursive work but fail to intern equal parents around structurally equal, uncached larger children; cached child hashes keep ordinary construction linear while structural equality resolves collisions exactly.
+- **Review:** Retain the 10,000-level equality, hashing, token lookup, and drop regression test. Profile the cached-hash and small-node-key costs on representative source files before expanding interning to larger nodes.
+
+### IR-019: Preserve lexer token discriminants when adding syntax nodes
+
+- **Decision:** Append CST node kinds after `EOF` in the `#[repr(u16)]` `SyntaxKind` enum, and treat `ERROR` as both a raw token kind and a recovery node kind.
+- **Reason:** Existing lexer token discriminants remain unchanged for consumers that store or compare their numeric representation. `ERROR` is emitted for malformed source and is also the documented wrapper for parser recovery.
+- **Review:** Keep `is_token()` tied to the token range ending at `EOF` and keep `is_node()` explicitly admitting `ERROR`; update the boundary and error-tree tests when adding token kinds or recovery nodes.
+
+### IR-020: Permit zero-child nodes only for recovery errors
+
+- **Decision:** Reject every zero-source-width green node except `ERROR` and the root `SOURCE_FILE` of an empty file. Delimited list and block nodes must contain at least one real opening or closing delimiter token.
+- **Reason:** An empty file necessarily has a zero-width root and EOF, while a semantically empty delimited list still has source delimiters. Synthetic NEWLINE or EOF tokens cannot stand in for the list's source text.
+- **Review:** Keep coverage for the empty-file root, a zero-width `ERROR`, an empty `ARG_LIST` with and without unrelated text, and a correctly delimited empty list. When parser recovery is added, ensure missing delimiters are represented without manufacturing source text.
+
+### IR-021: Index red tokens by source text range
+
+- **Decision:** Build a root-wide green-node/token interval index lazily on the first `token_at_offset` call, then use binary search within the queried node's token interval. Create red node handles only for the returned token's parent path. Ignore zero-width synthetic `NEWLINE` tokens but keep zero-width `EOF` addressable.
+- **Reason:** Several synthetic tokens can share one source offset. Returning the first two inclusive matches can hide EOF, while scanning descendants from the start makes repeated editor lookups quadratic. NEWLINE has no source text to point into; EOF is useful at the end-of-file position.
+- **Review:** Keep tests for adjacent token boundaries, trivia gaps, an EOF sharing an offset with NEWLINE, lookup scoped to a descendant, and sorted index construction. Measure the one-time memory cost on large files.
+
+### IR-022: Make red-tree diagnostics and teardown shallow
+
+- **Decision:** Format red nodes as a shallow summary and iteratively release parent chains. The offset index stores only green metadata until lookup; it then caches strong red handles by weak-free node IDs, with no cache back-reference in `NodeData`.
+- **Reason:** Derived debug output recursively follows green children or red parents, and a strong red-parent chain can recurse during destruction. Caching lazily materialized red paths avoids repeated deep reconstruction without making the entire red tree eager; keeping `NodeData` independent of its cache prevents a reference cycle.
+- **Review:** Retain deep debug/drop regression tests and verify that token-indexed red nodes release cleanly both when handles outlive the root wrapper and when the cache is dropped.
