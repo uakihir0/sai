@@ -143,6 +143,7 @@ pub struct LineIndex {
     line_starts: Vec<TextSize>,
     bom_shift: u32,
     invalid_utf8: Arc<[InvalidUtf8Sequence]>,
+    invalid_utf8_prefix_delta: Vec<i64>,
 }
 
 impl LineIndex {
@@ -160,6 +161,18 @@ impl LineIndex {
         had_bom: bool,
         invalid_utf8: Arc<[InvalidUtf8Sequence]>,
     ) -> Self {
+        let mut invalid_utf8_prefix_delta = Vec::with_capacity(invalid_utf8.len());
+        let mut prefix_delta = 0_i64;
+        for sequence in invalid_utf8.iter().copied() {
+            let decoded_width = sequence
+                .decoded_range
+                .end()
+                .to_usize()
+                .saturating_sub(sequence.decoded_range.start().to_usize());
+            prefix_delta += i64::from(sequence.raw_len) - decoded_width as i64;
+            invalid_utf8_prefix_delta.push(prefix_delta);
+        }
+
         let mut line_starts = vec![TextSize::new(0)];
         let bytes = text.as_bytes();
         let mut i = 0;
@@ -193,6 +206,7 @@ impl LineIndex {
             line_starts,
             bom_shift: if had_bom { 3 } else { 0 },
             invalid_utf8,
+            invalid_utf8_prefix_delta,
         }
     }
 
@@ -441,25 +455,19 @@ impl LineIndex {
     }
 
     fn original_byte_offset(&self, offset: usize) -> u32 {
-        let mut original = self.bom_shift as u64;
-        let mut decoded_cursor = 0usize;
-
-        for sequence in self.invalid_utf8.iter().copied() {
-            let range = sequence.decoded_range;
-            let start = range.start().to_usize();
-            let end = range.end().to_usize();
-            if start >= offset {
-                break;
-            }
-            original = original.saturating_add(start.saturating_sub(decoded_cursor) as u64);
-            if end > offset {
-                return u32::try_from(original).unwrap_or(u32::MAX);
-            }
-            original = original.saturating_add(sequence.raw_len as u64);
-            decoded_cursor = end;
-        }
-        original = original.saturating_add(offset.saturating_sub(decoded_cursor) as u64);
-        u32::try_from(original).unwrap_or(u32::MAX)
+        let sequence_count = self
+            .invalid_utf8
+            .partition_point(|sequence| sequence.decoded_range.end().to_usize() <= offset);
+        let delta = sequence_count
+            .checked_sub(1)
+            .and_then(|index| self.invalid_utf8_prefix_delta.get(index))
+            .copied()
+            .unwrap_or(0);
+        let original = (self.bom_shift as i64)
+            .saturating_add(offset as i64)
+            .saturating_add(delta)
+            .clamp(0, u32::MAX as i64);
+        original as u32
     }
 }
 
@@ -765,6 +773,16 @@ impl SourceFile {
         &self.invalid_utf8
     }
 
+    pub fn invalid_utf8_sequence_at(&self, decoded_start: TextSize) -> Option<InvalidUtf8Sequence> {
+        let index = self
+            .invalid_utf8
+            .partition_point(|sequence| sequence.decoded_range().start() < decoded_start);
+        self.invalid_utf8
+            .get(index)
+            .copied()
+            .filter(|sequence| sequence.decoded_range().start() == decoded_start)
+    }
+
     pub const fn id(&self) -> FileId {
         self.id
     }
@@ -784,6 +802,11 @@ impl SourceFile {
     /// The exact bytes read for this source file, including a leading BOM.
     pub fn raw_bytes(&self) -> &[u8] {
         &self.raw_bytes
+    }
+
+    /// Shares the immutable original source bytes without copying them.
+    pub fn raw_bytes_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.raw_bytes)
     }
 
     /// Maps a decoded-text offset to its byte offset in the original source.
@@ -1135,6 +1158,11 @@ mod tests {
         assert_eq!(file.text(), "\u{FFFD}a");
         assert_eq!(file.invalid_utf8_sequences().len(), 1);
         assert_eq!(
+            file.invalid_utf8_sequence_at(size(0)),
+            Some(file.invalid_utf8_sequences()[0])
+        );
+        assert_eq!(file.invalid_utf8_sequence_at(size(3)), None);
+        assert_eq!(
             file.invalid_utf8_sequences()[0].decoded_range(),
             TextRange::new(size(0), size(3)).expect("ordered range")
         );
@@ -1169,6 +1197,24 @@ mod tests {
         );
         assert_eq!(file.line_index().from_utf16(1, 2), size(0));
         assert_eq!(file.line_index().from_utf16(1, 4), size(3));
+    }
+
+    #[test]
+    fn maps_offsets_after_many_invalid_utf8_sequences() {
+        let count = 4096;
+        let bytes = vec![0xFF; count];
+        let file =
+            SourceFile::decode(FileId::new(1), &bytes).expect("invalid UTF-8 is recoverable");
+
+        assert_eq!(file.invalid_utf8_sequences().len(), count);
+        for index in [0, 1, count / 2, count - 1, count] {
+            let decoded_offset = size(index * 3);
+            assert_eq!(file.to_original_offset(decoded_offset), Some(size(index)));
+            assert_eq!(
+                file.line_index().position(decoded_offset).byte,
+                index as u32
+            );
+        }
     }
 
     #[test]
