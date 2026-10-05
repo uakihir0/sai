@@ -47,6 +47,34 @@ const PARAM_START_KINDS: &[SyntaxKind] = &[
     SyntaxKind::VAR_KW,
     SyntaxKind::AT,
 ];
+const PATTERN_START_KINDS: &[SyntaxKind] = &[
+    SyntaxKind::UNDERSCORE,
+    SyntaxKind::BORROW_KW,
+    SyntaxKind::VAR_KW,
+    SyntaxKind::LIDENT,
+    SyntaxKind::UIDENT,
+    SyntaxKind::MINUS,
+    SyntaxKind::INT,
+    SyntaxKind::FLOAT,
+    SyntaxKind::STRING,
+    SyntaxKind::BYTE_STRING,
+    SyntaxKind::CHAR,
+    SyntaxKind::BYTE,
+    SyntaxKind::TRUE_KW,
+    SyntaxKind::FALSE_KW,
+    SyntaxKind::DOT2EQ,
+    SyntaxKind::DOT,
+    SyntaxKind::L_PAREN,
+    SyntaxKind::L_BRACKET,
+];
+const RANGE_END_START_KINDS: &[SyntaxKind] = &[
+    SyntaxKind::MINUS,
+    SyntaxKind::INT,
+    SyntaxKind::CHAR,
+    SyntaxKind::BYTE,
+    SyntaxKind::LIDENT,
+    SyntaxKind::UIDENT,
+];
 const GENERIC_PARAM_START_KINDS: &[SyntaxKind] =
     &[SyntaxKind::UIDENT, SyntaxKind::CONST_KW, SyntaxKind::AT];
 const EXPRESSION_START_KINDS: &[SyntaxKind] = &[
@@ -1027,7 +1055,7 @@ impl Parser<'_, '_> {
         let statement = self.start();
         let result = (|| {
             self.bump();
-            self.binding_pattern()?;
+            self.pattern()?;
             if self.eat(SyntaxKind::COLON) {
                 self.type_(true)?;
             }
@@ -1068,21 +1096,537 @@ impl Parser<'_, '_> {
         }
     }
 
-    fn binding_pattern(&mut self) -> Result<(), ParserError> {
-        if self.at(SyntaxKind::UNDERSCORE) {
-            let wildcard = self.start();
+    fn pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return self.recover_overdeep_pattern();
+        }
+        self.nesting_depth += 1;
+        let result = self.pattern_inner();
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn pattern_inner(&mut self) -> Result<CompletedMarker, ParserError> {
+        if self.at(SyntaxKind::PIPE) {
+            let alternatives = self.start();
             self.bump();
-            wildcard.complete(self, SyntaxKind::WILDCARD_PAT)?;
-            return Ok(());
+            self.alt_pattern()?;
+            while self.eat(SyntaxKind::PIPE) {
+                self.alt_pattern()?;
+            }
+            return alternatives.complete(self, SyntaxKind::OR_PAT);
         }
-        if !self.at(SyntaxKind::LIDENT) {
-            self.expect(SyntaxKind::LIDENT)?;
-            return Ok(());
+
+        let first = self.alt_pattern()?;
+        if !self.at(SyntaxKind::PIPE) {
+            return Ok(first);
         }
+        let alternatives = first.precede(self);
+        while self.eat(SyntaxKind::PIPE) {
+            self.alt_pattern()?;
+        }
+        alternatives.complete(self, SyntaxKind::OR_PAT)
+    }
+
+    fn alt_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        if !self.binding_pattern_is_at_pattern() {
+            return self.primary_pattern();
+        }
+        let at_pattern = self.start();
+        self.binding_pattern()?;
+        self.expect(SyntaxKind::AT)?;
+        self.primary_pattern()?;
+        at_pattern.complete(self, SyntaxKind::AT_PAT)
+    }
+
+    fn binding_pattern_is_at_pattern(&self) -> bool {
+        match self.current() {
+            SyntaxKind::LIDENT => self.nth(1) == SyntaxKind::AT,
+            SyntaxKind::VAR_KW => {
+                self.nth(1) == SyntaxKind::LIDENT && self.nth(2) == SyntaxKind::AT
+            }
+            SyntaxKind::BORROW_KW if self.nth(1) == SyntaxKind::MUT_KW => {
+                self.nth(2) == SyntaxKind::LIDENT && self.nth(3) == SyntaxKind::AT
+            }
+            SyntaxKind::BORROW_KW => {
+                self.nth(1) == SyntaxKind::LIDENT && self.nth(2) == SyntaxKind::AT
+            }
+            _ => false,
+        }
+    }
+
+    fn binding_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
         let pattern = self.start();
+        if self.at_any(&[SyntaxKind::BORROW_KW, SyntaxKind::VAR_KW]) {
+            let mode = self.start();
+            if self.eat(SyntaxKind::BORROW_KW) {
+                self.eat(SyntaxKind::MUT_KW);
+            } else {
+                self.bump();
+            }
+            mode.complete(self, SyntaxKind::BINDING_MODE)?;
+        }
         self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
-        pattern.complete(self, SyntaxKind::BINDING_PAT)?;
-        Ok(())
+        pattern.complete(self, SyntaxKind::BINDING_PAT)
+    }
+
+    fn primary_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        match self.current() {
+            SyntaxKind::UNDERSCORE => {
+                let wildcard = self.start();
+                self.bump();
+                wildcard.complete(self, SyntaxKind::WILDCARD_PAT)
+            }
+            SyntaxKind::BORROW_KW | SyntaxKind::VAR_KW => self.binding_pattern(),
+            SyntaxKind::LIDENT if self.nth(1) != SyntaxKind::DOT => self.binding_pattern(),
+            SyntaxKind::LIDENT | SyntaxKind::UIDENT => self.const_or_ctor_pattern(),
+            SyntaxKind::MINUS | SyntaxKind::INT | SyntaxKind::CHAR | SyntaxKind::BYTE => {
+                let literal = self.literal_pattern(false)?;
+                self.range_pattern_suffix(literal)
+            }
+            SyntaxKind::FLOAT => {
+                let literal = self.literal_pattern(false)?;
+                self.range_pattern_suffix(literal)
+            }
+            SyntaxKind::STRING
+            | SyntaxKind::BYTE_STRING
+            | SyntaxKind::TRUE_KW
+            | SyntaxKind::FALSE_KW => self.literal_pattern(false),
+            SyntaxKind::DOT2EQ => self.prefix_range_pattern(),
+            SyntaxKind::DOT if self.nth(1) == SyntaxKind::UIDENT => self.implicit_member_pattern(),
+            SyntaxKind::L_PAREN => self.paren_pattern(),
+            SyntaxKind::L_BRACKET => self.slice_pattern(),
+            _ => self.missing_pattern(),
+        }
+    }
+
+    fn missing_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        self.expected_error_node(PATTERN_START_KINDS)
+    }
+
+    fn expected_error_node(
+        &mut self,
+        expected_kinds: &[SyntaxKind],
+    ) -> Result<CompletedMarker, ParserError> {
+        for kind in expected_kinds {
+            self.expected.record(self.position, *kind);
+        }
+        self.emit_expected_token()?;
+        self.start().complete(self, SyntaxKind::ERROR)
+    }
+
+    fn const_or_ctor_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        let path = self.const_path()?;
+        if self.at_any(&[SyntaxKind::DOT2, SyntaxKind::DOT2EQ]) {
+            return self.range_pattern_suffix(path);
+        }
+        let constructor = path.precede(self);
+        if self.at(SyntaxKind::L_PAREN) {
+            self.ctor_pat_args()?;
+        }
+        constructor.complete(self, SyntaxKind::CTOR_PAT)
+    }
+
+    fn const_path(&mut self) -> Result<CompletedMarker, ParserError> {
+        let path = self.start();
+        while self.at(SyntaxKind::LIDENT) {
+            self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME_REF)?;
+            self.expect(SyntaxKind::DOT)?;
+        }
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME_REF)?;
+        while self.eat(SyntaxKind::DOT) {
+            self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME_REF)?;
+        }
+        path.complete(self, SyntaxKind::CONST_PATH)
+    }
+
+    fn implicit_member_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        let pattern = self.start();
+        self.bump();
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME_REF)?;
+        if self.at(SyntaxKind::L_PAREN) {
+            self.ctor_pat_args()?;
+        }
+        pattern.complete(self, SyntaxKind::IMPLICIT_MEMBER_PAT)
+    }
+
+    fn literal_pattern(&mut self, range_end: bool) -> Result<CompletedMarker, ParserError> {
+        let literal = self.start();
+        let negative = self.eat(SyntaxKind::MINUS);
+        match self.current() {
+            SyntaxKind::INT => {
+                self.bump();
+            }
+            SyntaxKind::CHAR | SyntaxKind::BYTE if !negative => {
+                self.bump();
+            }
+            SyntaxKind::FLOAT => {
+                let range = self
+                    .current_token()
+                    .map(|token| token.range)
+                    .ok_or(ParserError::InvalidDiagnosticSpan)?;
+                self.bump();
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::FloatPattern,
+                    range,
+                    "floating-point literals cannot be used in patterns",
+                )?;
+                return literal.complete(
+                    self,
+                    if range_end {
+                        SyntaxKind::ERROR
+                    } else {
+                        SyntaxKind::LITERAL_PAT
+                    },
+                );
+            }
+            SyntaxKind::STRING
+            | SyntaxKind::BYTE_STRING
+            | SyntaxKind::TRUE_KW
+            | SyntaxKind::FALSE_KW
+                if !range_end && !negative =>
+            {
+                self.bump();
+            }
+            _ => {
+                self.expect_any(if negative {
+                    &[SyntaxKind::INT]
+                } else if range_end {
+                    RANGE_END_START_KINDS
+                } else {
+                    &[
+                        SyntaxKind::INT,
+                        SyntaxKind::FLOAT,
+                        SyntaxKind::STRING,
+                        SyntaxKind::BYTE_STRING,
+                        SyntaxKind::CHAR,
+                        SyntaxKind::BYTE,
+                        SyntaxKind::TRUE_KW,
+                        SyntaxKind::FALSE_KW,
+                    ]
+                })?;
+            }
+        }
+        literal.complete(self, SyntaxKind::LITERAL_PAT)
+    }
+
+    fn range_end(&mut self) -> Result<CompletedMarker, ParserError> {
+        match self.current() {
+            SyntaxKind::MINUS
+            | SyntaxKind::INT
+            | SyntaxKind::FLOAT
+            | SyntaxKind::CHAR
+            | SyntaxKind::BYTE => self.literal_pattern(true),
+            SyntaxKind::UIDENT => self.const_path(),
+            SyntaxKind::LIDENT if self.nth(1) == SyntaxKind::DOT => self.const_path(),
+            _ => self.expected_error_node(RANGE_END_START_KINDS),
+        }
+    }
+
+    fn at_range_end_start(&self) -> bool {
+        if self.at(SyntaxKind::LIDENT) {
+            return self.nth(1) == SyntaxKind::DOT;
+        }
+        RANGE_END_START_KINDS.contains(&self.current())
+    }
+
+    fn range_pattern_suffix(
+        &mut self,
+        start: CompletedMarker,
+    ) -> Result<CompletedMarker, ParserError> {
+        if !self.at_any(&[SyntaxKind::DOT2, SyntaxKind::DOT2EQ]) {
+            return Ok(start);
+        }
+        let range = start.precede(self);
+        let inclusive = self.eat(SyntaxKind::DOT2EQ);
+        if !inclusive {
+            self.expect(SyntaxKind::DOT2)?;
+        }
+        if self.at_range_end_start() {
+            self.range_end()?;
+        } else if self.at(SyntaxKind::FLOAT) {
+            self.invalid_float_range_end()?;
+        } else if inclusive {
+            self.expected_error_node(RANGE_END_START_KINDS)?;
+        }
+        range.complete(self, SyntaxKind::RANGE_PAT)
+    }
+
+    fn prefix_range_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        let range = self.start();
+        self.bump();
+        if self.at_range_end_start() {
+            self.range_end()?;
+        } else if self.at(SyntaxKind::FLOAT) {
+            self.invalid_float_range_end()?;
+        } else {
+            self.expected_error_node(RANGE_END_START_KINDS)?;
+        }
+        range.complete(self, SyntaxKind::RANGE_PAT)
+    }
+
+    fn invalid_float_range_end(&mut self) -> Result<CompletedMarker, ParserError> {
+        let invalid_end = self.start();
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.bump();
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::FloatPattern,
+            range,
+            "floating-point literals cannot be used in patterns",
+        )?;
+        invalid_end.complete(self, SyntaxKind::ERROR)
+    }
+
+    fn paren_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        let pattern = self.start();
+        self.bump();
+        if self.eat(SyntaxKind::R_PAREN) {
+            return pattern.complete(self, SyntaxKind::TUPLE_PAT);
+        }
+        self.pattern()?;
+        if !self.eat(SyntaxKind::COMMA) {
+            self.expect(SyntaxKind::R_PAREN)?;
+            return pattern.complete(self, SyntaxKind::PAREN_PAT);
+        }
+        while !self.at_any(&[
+            SyntaxKind::R_PAREN,
+            SyntaxKind::R_BRACKET,
+            SyntaxKind::R_BRACE,
+            SyntaxKind::NEWLINE,
+            SyntaxKind::EOF,
+        ]) {
+            let item_position = self.position;
+            self.pattern()?;
+            if self.eat(SyntaxKind::COMMA) {
+                continue;
+            }
+            if self.at_any(&[
+                SyntaxKind::R_PAREN,
+                SyntaxKind::R_BRACKET,
+                SyntaxKind::R_BRACE,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]) {
+                break;
+            }
+            self.expect(SyntaxKind::COMMA)?;
+            if self.position == item_position {
+                let recovery_start = self.position;
+                self.recover_to_list_separator()?;
+                if self.position == recovery_start {
+                    break;
+                }
+                self.eat(SyntaxKind::COMMA);
+            }
+        }
+        self.expect(SyntaxKind::R_PAREN)?;
+        pattern.complete(self, SyntaxKind::TUPLE_PAT)
+    }
+
+    fn slice_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        let pattern = self.start();
+        self.bump();
+        let result = (|| {
+            let mut rest_count = 0usize;
+            while !self.at_any(&[
+                SyntaxKind::R_BRACKET,
+                SyntaxKind::R_PAREN,
+                SyntaxKind::R_BRACE,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]) {
+                let position = self.position;
+                if self.at(SyntaxKind::DOT2) {
+                    let range = self
+                        .current_token()
+                        .map(|token| token.range)
+                        .ok_or(ParserError::InvalidDiagnosticSpan)?;
+                    self.rest_pattern(true)?;
+                    rest_count += 1;
+                    if rest_count > 1 {
+                        self.emit_parser_diagnostic(
+                            sai_diagnostics::Code::MultipleRestPatterns,
+                            range,
+                            "a slice pattern may contain at most one rest pattern",
+                        )?;
+                    }
+                } else {
+                    self.pattern()?;
+                }
+                if self.eat(SyntaxKind::COMMA) {
+                    continue;
+                }
+                if self.at_any(&[
+                    SyntaxKind::R_BRACKET,
+                    SyntaxKind::R_PAREN,
+                    SyntaxKind::R_BRACE,
+                    SyntaxKind::NEWLINE,
+                    SyntaxKind::EOF,
+                ]) {
+                    break;
+                }
+                self.expect(SyntaxKind::COMMA)?;
+                if self.position == position && self.recover_to_list_separator()? {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::R_BRACKET)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => pattern.complete(self, SyntaxKind::SLICE_PAT),
+            Err(error) => {
+                pattern.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn rest_pattern(&mut self, allow_binding: bool) -> Result<CompletedMarker, ParserError> {
+        let rest = self.start();
+        self.expect(SyntaxKind::DOT2)?;
+        if allow_binding
+            && self.at_any(&[
+                SyntaxKind::BORROW_KW,
+                SyntaxKind::VAR_KW,
+                SyntaxKind::LIDENT,
+            ])
+        {
+            self.binding_pattern()?;
+        }
+        rest.complete(self, SyntaxKind::REST_PAT)
+    }
+
+    fn ctor_pat_args(&mut self) -> Result<(), ParserError> {
+        let args = self.start();
+        self.expect(SyntaxKind::L_PAREN)?;
+        let result = (|| {
+            let mut saw_rest = false;
+            let mut reported_nonfinal_rest = false;
+            while !self.at_any(&[
+                SyntaxKind::R_PAREN,
+                SyntaxKind::R_BRACE,
+                SyntaxKind::R_BRACKET,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]) {
+                let position = self.position;
+                let is_rest_arg = self.at(SyntaxKind::DOT2);
+                if self.at(SyntaxKind::DOT2) {
+                    self.rest_pattern(false)?;
+                    saw_rest = true;
+                } else if self.at(SyntaxKind::LIDENT) && self.nth(1) == SyntaxKind::COLON {
+                    let named = self.start();
+                    self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME_REF)?;
+                    self.expect(SyntaxKind::COLON)?;
+                    self.pattern()?;
+                    named.complete(self, SyntaxKind::NAMED_PAT_ARG)?;
+                } else {
+                    self.pattern()?;
+                }
+                if is_rest_arg && self.at(SyntaxKind::COMMA) && self.nth(1) == SyntaxKind::R_PAREN {
+                    self.expect(SyntaxKind::R_PAREN)?;
+                    self.bump();
+                    continue;
+                }
+                if self.eat(SyntaxKind::COMMA) {
+                    if saw_rest && !self.at(SyntaxKind::R_PAREN) && !reported_nonfinal_rest {
+                        self.expect(SyntaxKind::R_PAREN)?;
+                        reported_nonfinal_rest = true;
+                    }
+                    continue;
+                }
+                if self.at_any(&[
+                    SyntaxKind::R_PAREN,
+                    SyntaxKind::R_BRACE,
+                    SyntaxKind::R_BRACKET,
+                    SyntaxKind::NEWLINE,
+                    SyntaxKind::EOF,
+                ]) {
+                    break;
+                }
+                if saw_rest && !reported_nonfinal_rest {
+                    self.expect(SyntaxKind::R_PAREN)?;
+                    reported_nonfinal_rest = true;
+                } else {
+                    self.expect(SyntaxKind::COMMA)?;
+                }
+                if self.position == position && self.recover_to_list_separator()? {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::R_PAREN)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                args.complete(self, SyntaxKind::CTOR_PAT_ARGS)?;
+                Ok(())
+            }
+            Err(error) => {
+                args.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn recover_overdeep_pattern(&mut self) -> Result<CompletedMarker, ParserError> {
+        let error = self.start();
+        let range = self.current_token().map(|token| token.range);
+        let mut delimiters = Vec::new();
+        let mut consumed = false;
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if delimiters.is_empty()
+                && matches!(
+                    kind,
+                    SyntaxKind::COMMA
+                        | SyntaxKind::PIPE
+                        | SyntaxKind::R_PAREN
+                        | SyntaxKind::R_BRACKET
+                        | SyntaxKind::R_BRACE
+                        | SyntaxKind::NEWLINE
+                )
+            {
+                break;
+            }
+            if self.at_confirmed_block_boundary() {
+                break;
+            }
+            match kind {
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACKET | SyntaxKind::L_BRACE => {
+                    delimiters.push(kind);
+                }
+                SyntaxKind::R_PAREN | SyntaxKind::R_BRACKET | SyntaxKind::R_BRACE => {
+                    let expected_open = match kind {
+                        SyntaxKind::R_PAREN => SyntaxKind::L_PAREN,
+                        SyntaxKind::R_BRACKET => SyntaxKind::L_BRACKET,
+                        SyntaxKind::R_BRACE => SyntaxKind::L_BRACE,
+                        _ => unreachable!("matched a closing delimiter"),
+                    };
+                    if delimiters.last() != Some(&expected_open) {
+                        break;
+                    }
+                    delimiters.pop();
+                }
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+        }
+        let completed = if consumed {
+            error.complete(self, SyntaxKind::ERROR)?
+        } else {
+            error.abandon(self)?;
+            self.start().complete(self, SyntaxKind::ERROR)?
+        };
+        if let Some(range) = range {
+            self.report_nesting_limit(range)?;
+        }
+        Ok(completed)
     }
 
     fn var_stmt(&mut self) -> Result<bool, ParserError> {

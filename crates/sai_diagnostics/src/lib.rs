@@ -71,6 +71,8 @@ define_codes! {
     ChainedRange => "CHAINED_RANGE",
     BaseArgNotLast => "BASE_ARG_NOT_LAST",
     InvalidTupleIndex => "INVALID_TUPLE_INDEX",
+    FloatPattern => "FLOAT_PATTERN",
+    MultipleRestPatterns => "MULTIPLE_REST_PATTERNS",
     MissingFnBody => "MISSING_FN_BODY",
     ImplementationLimitExceeded => "IMPLEMENTATION_LIMIT_EXCEEDED",
     ClauseOrder => "CLAUSE_ORDER",

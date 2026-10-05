@@ -2086,6 +2086,235 @@ mod tests {
     }
 
     #[test]
+    fn pattern_parser_builds_binding_tuple_constructor_and_alternation_nodes() {
+        let output = parse_file(
+            "fn f() {\n\
+             let (a, borrow mut b, var c,) = tuple\n\
+             let named @ User(id: var value, ..) = user\n\
+             let | .Some(x) | pkg.http.Status.Ok = result\n\
+             let (grouped) = value\n\
+             let () = unit\n\
+             }\n",
+        );
+        assert!(
+            output.errors.is_empty(),
+            "valid binding and constructor patterns should parse cleanly: {:?}",
+            output.errors
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let count = |kind| {
+            root.descendants()
+                .filter(|node| node.kind() == kind)
+                .count()
+        };
+        assert_eq!(count(SyntaxKind::BINDING_PAT), 7);
+        assert_eq!(count(SyntaxKind::BINDING_MODE), 3);
+        assert_eq!(count(SyntaxKind::TUPLE_PAT), 2);
+        assert_eq!(count(SyntaxKind::PAREN_PAT), 1);
+        assert_eq!(count(SyntaxKind::AT_PAT), 1);
+        assert_eq!(count(SyntaxKind::OR_PAT), 1);
+        assert_eq!(count(SyntaxKind::CTOR_PAT), 2);
+        assert_eq!(count(SyntaxKind::CTOR_PAT_ARGS), 2);
+        assert_eq!(count(SyntaxKind::NAMED_PAT_ARG), 1);
+        assert_eq!(count(SyntaxKind::REST_PAT), 1);
+        assert_eq!(count(SyntaxKind::IMPLICIT_MEMBER_PAT), 1);
+        assert_eq!(count(SyntaxKind::CONST_PATH), 2);
+    }
+
+    #[test]
+    fn pattern_parser_builds_range_and_slice_patterns() {
+        let output = parse_file(
+            "fn f() {\n\
+             let 1..=4 = value\n\
+             let ..=8 = value\n\
+             let [first, ..borrow rest, last] = values\n\
+             }\n",
+        );
+        assert!(
+            output.errors.is_empty(),
+            "valid ranges and slice rest patterns should parse cleanly: {:?}",
+            output.errors
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let count = |kind| {
+            root.descendants()
+                .filter(|node| node.kind() == kind)
+                .count()
+        };
+        assert_eq!(count(SyntaxKind::RANGE_PAT), 2);
+        assert_eq!(count(SyntaxKind::SLICE_PAT), 1);
+        assert_eq!(count(SyntaxKind::REST_PAT), 1);
+        assert_eq!(count(SyntaxKind::BINDING_MODE), 1);
+    }
+
+    #[test]
+    fn pattern_parser_reports_float_and_multiple_slice_rest_patterns() {
+        let output =
+            parse_file("fn f() { let 1.25 = value\nlet -2.5 = value\nlet [.., ..] = values\n}\n");
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                Code::FloatPattern,
+                Code::FloatPattern,
+                Code::MultipleRestPatterns
+            ]
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LITERAL_PAT)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::SLICE_PAT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_range_and_constructor_patterns_report_expected_tokens() {
+        let missing_inclusive_end = parse_file("fn f() { let 1..= = value }\n");
+        assert_eq!(
+            missing_inclusive_end.errors[0].code,
+            Code::ExpectedToken,
+            "an inclusive range requires an endpoint"
+        );
+
+        let nonfinal_ctor_rest = parse_file("fn f() { let Some(.., value) = result }\n");
+        assert!(
+            nonfinal_ctor_rest
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "constructor rest patterns must be final"
+        );
+
+        let invalid_lowercase_range_end = parse_file("fn f() { let 1..value = result }\n");
+        assert!(
+            invalid_lowercase_range_end
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "a bare lowercase binding is not a constant range endpoint"
+        );
+
+        let trailing_ctor_rest =
+            parse_file("fn f() { let Some(..,) = value\nlet Other(a, ..,) = value }\n");
+        assert_eq!(
+            trailing_ctor_rest
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ExpectedToken)
+                .count(),
+            2,
+            "constructor rest arguments cannot be followed by a comma"
+        );
+
+        for invalid in ["-'a'", "-b'x'", "-name", "-Upper"] {
+            let invalid_signed_literal =
+                parse_file(&format!("fn f() {{ let {invalid} = value }}\n"));
+            assert!(
+                invalid_signed_literal
+                    .errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+                "a minus sign in a pattern must be followed by an integer literal: {invalid}"
+            );
+        }
+
+        let float_range_ends = parse_file(
+            "fn f() { let 1..=2.5 = value\nlet ..=3.5 = value\nlet 1..=-4.5 = value }\n",
+        );
+        assert_eq!(
+            float_range_ends
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::FloatPattern)
+                .count(),
+            3,
+            "floats are diagnosed and retained as invalid range endpoints"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_patterns_report_the_shared_nesting_limit() {
+        let depth = 520;
+        let source = format!(
+            "fn f() {{ let {}value{} = value\nlet later = 1\n}}\nfn next() {{}}\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded),
+            "pattern nesting must use the shared parser depth limit"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2,
+            "balanced over-depth recovery must preserve the later statement"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn overdeep_unclosed_pattern_recovery_preserves_later_statements() {
+        let depth = 520;
+        let source = format!(
+            "fn f() {{ let {}value = 0\nlet later = 1\n}}\n",
+            "(".repeat(depth)
+        );
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded),
+            "over-deep recovery must report the shared parser nesting limit"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2,
+            "an unclosed pattern must stop recovery before the later line-start let"
+        );
+    }
+
+    #[test]
+    fn malformed_tuple_pattern_recovery_preserves_later_items() {
+        let output = parse_file("fn f() { let (a, b, ]\n}\nfn next() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "a mismatched tuple-pattern closer must not stall or consume the next item"
+        );
+    }
+
+    #[test]
     fn block_separator_recovery_preserves_a_same_line_closing_brace() {
         let output = parse_file("fn f() { a b }\n");
         let root = crate::SyntaxNode::new_root(output.root);

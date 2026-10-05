@@ -525,13 +525,15 @@ fn node_delimiters(kind: SyntaxKind) -> Option<(SyntaxKind, SyntaxKind)> {
         SyntaxKind::ARG_LIST | SyntaxKind::PARAM_LIST | SyntaxKind::CTOR_PAT_ARGS => {
             Some((SyntaxKind::L_PAREN, SyntaxKind::R_PAREN))
         }
-        SyntaxKind::ARRAY_EXPR | SyntaxKind::INDEX_EXPR => {
+        SyntaxKind::ARRAY_EXPR | SyntaxKind::INDEX_EXPR | SyntaxKind::SLICE_PAT => {
             Some((SyntaxKind::L_BRACKET, SyntaxKind::R_BRACKET))
         }
         SyntaxKind::PAREN_TYPE
         | SyntaxKind::TUPLE_TYPE
         | SyntaxKind::PAREN_EXPR
         | SyntaxKind::TUPLE_EXPR
+        | SyntaxKind::PAREN_PAT
+        | SyntaxKind::TUPLE_PAT
         | SyntaxKind::FN_PTR_TYPE
         | SyntaxKind::FN_SUGAR_BOUND => Some((SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)),
         SyntaxKind::GENERIC_ARG_LIST | SyntaxKind::GENERIC_PARAM_LIST => {
