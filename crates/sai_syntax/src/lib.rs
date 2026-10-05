@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use sai_diagnostics::{
     Applicability, Child, ChildKind, Code, Diagnostic, Fix, FixOperation, FixOperationName,
@@ -447,13 +447,16 @@ pub fn lex(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<LexOutput, L
 
     lexer.lex_shebang()?;
     loop {
-        lexer.lex_trivia()?;
-        if lexer.at_eof() {
-            lexer.finish_eof()?;
-            return Ok(lexer.output);
-        }
-
-        let token = lexer.lex_token()?;
+        let token = if let Some(token) = lexer.pending_tokens.pop_front() {
+            token
+        } else {
+            lexer.lex_trivia()?;
+            if lexer.at_eof() {
+                lexer.finish_eof()?;
+                return Ok(lexer.output);
+            }
+            lexer.lex_token()?
+        };
         lexer.maybe_emit_newline_before(token)?;
         let is_semicolon =
             token.kind == SyntaxKind::ERROR && lexer.text.get(token.start..token.end) == Some(";");
@@ -490,6 +493,21 @@ enum ForbiddenClass {
 }
 
 #[derive(Clone, Copy)]
+enum EscapeMode {
+    SimpleString,
+    ByteString,
+    Char,
+    Byte,
+}
+
+#[derive(Clone, Copy)]
+struct EscapeScan {
+    end: usize,
+    valid: bool,
+    line_break_follows: bool,
+}
+
+#[derive(Clone, Copy)]
 struct PreviousToken {
     index: usize,
     in_e: bool,
@@ -503,6 +521,7 @@ struct Lexer<'a> {
     pos: usize,
     output: LexOutput,
     brackets: Vec<Bracket>,
+    pending_tokens: VecDeque<LexedToken>,
     previous: Option<PreviousToken>,
     trivia_start: usize,
     after_line_break: bool,
@@ -524,6 +543,7 @@ impl<'a> Lexer<'a> {
                 ..LexOutput::default()
             },
             brackets: Vec::new(),
+            pending_tokens: VecDeque::new(),
             previous: None,
             trivia_start: 0,
             after_line_break: false,
@@ -642,16 +662,20 @@ impl<'a> Lexer<'a> {
         if self.pos != 0 || !self.text.starts_with("#!") {
             return Ok(());
         }
-        let start = self.pos;
+        let mut trivia_start = self.pos;
         while let Some(ch) = self.peek() {
             if matches!(ch, '\n' | '\r') {
                 break;
             }
+            if self.invalid_utf8_at_pos()? {
+                self.push_comment_trivia(TriviaKind::Shebang, trivia_start, self.pos)?;
+                self.emit_invalid_utf8_error()?;
+                trivia_start = self.pos;
+                continue;
+            }
             self.bump_char();
         }
-        let index = self.push_trivia(TriviaKind::Shebang, start, self.pos)?;
-        let range = self.output.trivia[index].range;
-        self.check_bidi(range)?;
+        self.push_comment_trivia(TriviaKind::Shebang, trivia_start, self.pos)?;
         Ok(())
     }
 
@@ -707,16 +731,20 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_line_comment(&mut self) -> Result<(), LexError> {
-        let start = self.pos;
+        let mut trivia_start = self.pos;
         while let Some(ch) = self.peek() {
             if matches!(ch, '\n' | '\r') {
                 break;
             }
+            if self.invalid_utf8_at_pos()? {
+                self.push_comment_trivia(TriviaKind::LineComment, trivia_start, self.pos)?;
+                self.emit_invalid_utf8_error()?;
+                trivia_start = self.pos;
+                continue;
+            }
             self.bump_char();
         }
-        let index = self.push_trivia(TriviaKind::LineComment, start, self.pos)?;
-        let range = self.output.trivia[index].range;
-        self.check_bidi(range)?;
+        self.push_comment_trivia(TriviaKind::LineComment, trivia_start, self.pos)?;
         Ok(())
     }
 
@@ -724,8 +752,22 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         self.pos += 2;
         let mut depth = 1_u32;
-        let mut contains_line_break = false;
+        let mut trivia_start = start;
+        let mut segment_has_line_break = false;
         while !self.at_eof() {
+            if self.invalid_utf8_at_pos()? {
+                if let Some(trivia_index) =
+                    self.push_comment_trivia(TriviaKind::BlockComment, trivia_start, self.pos)?
+                {
+                    if segment_has_line_break {
+                        self.arm_newline(NewlineTrigger::Trivia(trivia_index));
+                    }
+                }
+                self.emit_invalid_utf8_error()?;
+                trivia_start = self.pos;
+                segment_has_line_break = false;
+                continue;
+            }
             if self.starts_with("/*") {
                 self.pos += 2;
                 depth = depth.saturating_add(1);
@@ -736,11 +778,13 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             } else if self.starts_with("\r\n") {
-                contains_line_break = true;
+                segment_has_line_break = true;
+                self.after_line_break = true;
                 self.pos += 2;
             } else if self.peek() == Some('\r') {
                 let line_break = self.pos;
-                contains_line_break = true;
+                segment_has_line_break = true;
+                self.after_line_break = true;
                 self.pos += 1;
                 self.report_at(
                     Code::InvalidLineEnding,
@@ -750,15 +794,22 @@ impl<'a> Lexer<'a> {
                     self.pos,
                 )?;
             } else if self.peek() == Some('\n') {
-                contains_line_break = true;
+                segment_has_line_break = true;
+                self.after_line_break = true;
                 self.pos += 1;
             } else {
                 self.bump_char();
             }
         }
-        let index = self.push_trivia(TriviaKind::BlockComment, start, self.pos)?;
-        let range = self.output.trivia[index].range;
-        self.check_bidi(range)?;
+        if trivia_start < self.pos {
+            if let Some(trivia_index) =
+                self.push_comment_trivia(TriviaKind::BlockComment, trivia_start, self.pos)?
+            {
+                if segment_has_line_break {
+                    self.arm_newline(NewlineTrigger::Trivia(trivia_index));
+                }
+            }
+        }
         if depth != 0 {
             self.report_at(
                 Code::UnterminatedComment,
@@ -768,11 +819,40 @@ impl<'a> Lexer<'a> {
                 self.pos,
             )?;
         }
-        if contains_line_break {
-            self.after_line_break = true;
-            self.arm_newline(NewlineTrigger::Trivia(index));
-        }
         Ok(())
+    }
+
+    fn invalid_utf8_at_pos(&self) -> Result<bool, LexError> {
+        self.invalid_utf8_at_offset(self.pos)
+    }
+
+    fn invalid_utf8_at_offset(&self, offset: usize) -> Result<bool, LexError> {
+        let offset = TextSize::from_usize(offset).ok_or(LexError::InvalidSourceSpan)?;
+        Ok(self.source.invalid_utf8_sequence_at(offset).is_some())
+    }
+
+    fn emit_invalid_utf8_error(&mut self) -> Result<(), LexError> {
+        let start = self.pos;
+        self.bump_char().ok_or(LexError::InvalidSourceSpan)?;
+        let token = self.token(SyntaxKind::ERROR, start, self.pos);
+        self.maybe_emit_newline_before(token)?;
+        self.push_token(token)?;
+        Ok(())
+    }
+
+    fn push_comment_trivia(
+        &mut self,
+        kind: TriviaKind,
+        start: usize,
+        end: usize,
+    ) -> Result<Option<usize>, LexError> {
+        if start >= end {
+            return Ok(None);
+        }
+        let index = self.push_trivia(kind, start, end)?;
+        let range = self.output.trivia[index].range;
+        self.check_bidi(range)?;
+        Ok(Some(index))
     }
 
     fn check_bidi(&mut self, range: TextRange) -> Result<(), LexError> {
@@ -801,7 +881,7 @@ impl<'a> Lexer<'a> {
                 cursor += next.len_utf8();
             }
             self.report_forbidden_at(
-                "bidirectional control characters are forbidden in comments and shebangs",
+                "bidirectional control characters are forbidden in source text",
                 run_start,
                 cursor,
             )?;
@@ -828,6 +908,18 @@ impl<'a> Lexer<'a> {
         let ch = self.peek().ok_or(LexError::InvalidSourceSpan)?;
         if let Some(path) = self.try_pkg_path()? {
             return Ok(path);
+        }
+        if self.text[self.pos..].starts_with("b'") {
+            return self.lex_character(true, 1);
+        }
+        if self.text[self.pos..].starts_with("b\"") {
+            return self.lex_simple_string(true, 1);
+        }
+        if ch == '\'' {
+            return self.lex_character(false, 0);
+        }
+        if ch == '"' {
+            return self.lex_simple_string(false, 0);
         }
         if ch == 'r'
             && self.text[self.pos..].starts_with("r#")
@@ -865,6 +957,332 @@ impl<'a> Lexer<'a> {
             return self.lex_number();
         }
         self.lex_punctuator_or_unexpected()
+    }
+
+    fn lex_simple_string(
+        &mut self,
+        byte_string: bool,
+        prefix_len: usize,
+    ) -> Result<LexedToken, LexError> {
+        let start = self.pos;
+        let quote_start = start + prefix_len;
+        self.pos = quote_start + 1;
+        let mode = if byte_string {
+            EscapeMode::ByteString
+        } else {
+            EscapeMode::SimpleString
+        };
+        let mut has_error = false;
+        let mut terminated = false;
+
+        while let Some(ch) = self.peek() {
+            if ch == '"' {
+                self.bump_char();
+                terminated = true;
+                break;
+            }
+            if matches!(ch, '\n' | '\r') {
+                let end = self.pos;
+                let break_end = if ch == '\r' && self.text.as_bytes().get(end + 1) == Some(&b'\n') {
+                    end + 2
+                } else {
+                    end + ch.len_utf8()
+                };
+                self.report_unterminated_literal(
+                    Code::UnterminatedString,
+                    "unterminated string literal",
+                    quote_start,
+                    Some((end, break_end)),
+                )?;
+                has_error = true;
+                break;
+            }
+            if ch == '\\' {
+                if self.invalid_utf8_at_offset(self.pos + 1)? {
+                    self.pos += 1;
+                    self.bump_char().ok_or(LexError::InvalidSourceSpan)?;
+                    has_error = true;
+                    continue;
+                }
+                let escape = scan_escape(self.text, self.pos, mode);
+                if !escape.valid {
+                    has_error = true;
+                    if !escape.line_break_follows {
+                        self.report_at(
+                            Code::InvalidEscape,
+                            Severity::Error,
+                            "invalid escape sequence",
+                            self.pos,
+                            escape.end,
+                        )?;
+                    }
+                }
+                self.pos = escape.end;
+                continue;
+            }
+
+            let char_start = self.pos;
+            let invalid_utf8 = self.invalid_utf8_at_pos()?;
+            self.bump_char();
+            if invalid_utf8 {
+                has_error = true;
+            } else if byte_string && !ch.is_ascii() {
+                self.report_at(
+                    Code::InvalidEscape,
+                    Severity::Error,
+                    "byte strings may contain only ASCII characters",
+                    char_start,
+                    self.pos,
+                )?;
+                has_error = true;
+            }
+        }
+
+        if !terminated && self.at_eof() {
+            self.report_unterminated_literal(
+                Code::UnterminatedString,
+                "unterminated string literal",
+                quote_start,
+                None,
+            )?;
+            has_error = true;
+        }
+
+        let range = self.text_range(start, self.pos)?;
+        if self.text.get(start..self.pos).is_some_and(|text| {
+            text.chars()
+                .any(|ch| forbidden_class(ch) == Some(ForbiddenClass::Bidi))
+        }) {
+            self.check_bidi(range)?;
+            has_error = true;
+        }
+
+        let mut flags = TokenFlags::empty();
+        if has_error {
+            flags.insert(TokenFlags::HAS_ERROR);
+        }
+        Ok(LexedToken {
+            kind: if byte_string {
+                SyntaxKind::BYTE_STRING
+            } else {
+                SyntaxKind::STRING
+            },
+            start,
+            end: self.pos,
+            flags,
+        })
+    }
+
+    fn lex_character(
+        &mut self,
+        byte_character: bool,
+        prefix_len: usize,
+    ) -> Result<LexedToken, LexError> {
+        let start = self.pos;
+        let quote_start = start + prefix_len;
+        self.pos = quote_start + 1;
+
+        if !byte_character && self.peek().is_some_and(is_ident_start) {
+            let name_start = self.pos;
+            self.bump_char();
+            self.bump_while(unicode_ident::is_xid_continue);
+            let name_end = self.pos;
+            if self.peek() != Some('\'') {
+                let range = self.text_range(start, self.pos)?;
+                let has_bidi = self.text[name_start..name_end]
+                    .chars()
+                    .any(|ch| forbidden_class(ch) == Some(ForbiddenClass::Bidi));
+                if has_bidi {
+                    self.check_bidi(range)?;
+                }
+                return Ok(LexedToken {
+                    kind: SyntaxKind::LABEL,
+                    start,
+                    end: self.pos,
+                    flags: if has_bidi {
+                        TokenFlags::HAS_ERROR
+                    } else {
+                        TokenFlags::empty()
+                    },
+                });
+            }
+            self.bump_char();
+            let mut has_error = name_end - name_start == 0;
+            if self.text[name_start..name_end].chars().count() != 1 {
+                self.report_at(
+                    Code::InvalidCharLiteral,
+                    Severity::Error,
+                    "character literal must contain exactly one scalar value",
+                    start,
+                    self.pos,
+                )?;
+                has_error = true;
+            }
+            let range = self.text_range(start, self.pos)?;
+            if self.text[name_start..name_end]
+                .chars()
+                .any(|ch| forbidden_class(ch) == Some(ForbiddenClass::Bidi))
+            {
+                self.check_bidi(range)?;
+                has_error = true;
+            }
+            let mut flags = TokenFlags::empty();
+            if has_error {
+                flags.insert(TokenFlags::HAS_ERROR);
+            }
+            return Ok(LexedToken {
+                kind: SyntaxKind::CHAR,
+                start,
+                end: self.pos,
+                flags,
+            });
+        }
+
+        let mode = if byte_character {
+            EscapeMode::Byte
+        } else {
+            EscapeMode::Char
+        };
+        let mut scalar_count = 0_u32;
+        let mut has_error = false;
+        let mut terminated = false;
+        let mut invalid_body = false;
+
+        while let Some(ch) = self.peek() {
+            if ch == '\'' {
+                self.bump_char();
+                terminated = true;
+                break;
+            }
+            if matches!(ch, '\n' | '\r') {
+                let end = self.pos;
+                let break_end = if ch == '\r' && self.text.as_bytes().get(end + 1) == Some(&b'\n') {
+                    end + 2
+                } else {
+                    end + ch.len_utf8()
+                };
+                self.report_unterminated_literal(
+                    Code::UnterminatedChar,
+                    "unterminated character literal",
+                    quote_start,
+                    Some((end, break_end)),
+                )?;
+                has_error = true;
+                break;
+            }
+            if ch == '\\' {
+                if self.invalid_utf8_at_offset(self.pos + 1)? {
+                    self.pos += 1;
+                    self.bump_char().ok_or(LexError::InvalidSourceSpan)?;
+                    scalar_count += 1;
+                    has_error = true;
+                    continue;
+                }
+                let escape = scan_escape(self.text, self.pos, mode);
+                if !escape.valid {
+                    has_error = true;
+                    if !escape.line_break_follows {
+                        self.report_at(
+                            Code::InvalidEscape,
+                            Severity::Error,
+                            "invalid escape sequence",
+                            self.pos,
+                            escape.end,
+                        )?;
+                    }
+                }
+                self.pos = escape.end;
+                scalar_count += 1;
+                continue;
+            }
+
+            let invalid_utf8 = self.invalid_utf8_at_pos()?;
+            self.bump_char();
+            scalar_count += 1;
+            if invalid_utf8 {
+                has_error = true;
+            } else {
+                invalid_body |= if byte_character {
+                    !ch.is_ascii_graphic() && ch != ' '
+                } else {
+                    ch == '\t'
+                };
+            }
+        }
+
+        if !terminated && self.at_eof() {
+            self.report_unterminated_literal(
+                Code::UnterminatedChar,
+                "unterminated character literal",
+                quote_start,
+                None,
+            )?;
+            has_error = true;
+        } else if terminated && (scalar_count != 1 || invalid_body) {
+            self.report_at(
+                Code::InvalidCharLiteral,
+                Severity::Error,
+                "character literal must contain exactly one valid scalar value",
+                start,
+                self.pos,
+            )?;
+            has_error = true;
+        }
+
+        let range = self.text_range(start, self.pos)?;
+        if self.text.get(start..self.pos).is_some_and(|text| {
+            text.chars()
+                .any(|ch| forbidden_class(ch) == Some(ForbiddenClass::Bidi))
+        }) {
+            self.check_bidi(range)?;
+            has_error = true;
+        }
+
+        let mut flags = TokenFlags::empty();
+        if has_error {
+            flags.insert(TokenFlags::HAS_ERROR);
+        }
+        Ok(LexedToken {
+            kind: if byte_character {
+                SyntaxKind::BYTE
+            } else {
+                SyntaxKind::CHAR
+            },
+            start,
+            end: self.pos,
+            flags,
+        })
+    }
+
+    fn report_unterminated_literal(
+        &mut self,
+        code: Code,
+        message: &str,
+        quote_start: usize,
+        secondary: Option<(usize, usize)>,
+    ) -> Result<(), LexError> {
+        self.report_at(code, Severity::Error, message, quote_start, quote_start + 1)?;
+        let Some((secondary_start, secondary_end)) = secondary else {
+            return Ok(());
+        };
+        let range = self.text_range(secondary_start, secondary_end)?;
+        let location = Location::from_decoded_source(
+            self.source_ref.clone(),
+            Span::new(self.file_id, range),
+            self.source,
+        )
+        .ok_or(LexError::InvalidSourceSpan)?;
+        self.output
+            .errors
+            .last_mut()
+            .ok_or(LexError::InvalidSourceSpan)?
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: "line break occurs here".to_owned(),
+                location: Some(location),
+            })
+            .map_err(|_| LexError::FixPlanningFailed)?;
+        Ok(())
     }
 
     fn try_pkg_path(&mut self) -> Result<Option<LexedToken>, LexError> {
@@ -968,20 +1386,29 @@ impl<'a> Lexer<'a> {
         } else {
             SyntaxKind::DOC_OUTER
         };
+        let mut invalid_start = None;
         while let Some(ch) = self.peek() {
             if matches!(ch, '\n' | '\r') {
                 break;
             }
+            if self.invalid_utf8_at_pos()? {
+                invalid_start = Some(self.pos);
+                while self.peek().is_some_and(|ch| !matches!(ch, '\n' | '\r')) {
+                    self.bump_char();
+                }
+                break;
+            }
             self.bump_char();
         }
-        let range = self.text_range(start, self.pos)?;
-        self.check_bidi(range)?;
-        Ok(LexedToken {
-            kind,
-            start,
-            end: self.pos,
-            flags: TokenFlags::empty(),
-        })
+        let end = self.pos;
+        self.check_bidi(self.text_range(start, end)?)?;
+        if let Some(error_start) = invalid_start {
+            self.pending_tokens
+                .push_back(self.token(SyntaxKind::ERROR, error_start, end));
+            Ok(self.token(kind, start, error_start))
+        } else {
+            Ok(self.token(kind, start, end))
+        }
     }
 
     fn lex_identifier(&mut self, raw: bool) -> Result<LexedToken, LexError> {
@@ -1853,6 +2280,157 @@ fn scan_malformed_pkg_path_tail(text: &str, mut cursor: usize) -> usize {
     cursor
 }
 
+fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
+    let invalid = |end| EscapeScan {
+        end,
+        valid: false,
+        line_break_follows: false,
+    };
+    let valid = |end| EscapeScan {
+        end,
+        valid: true,
+        line_break_follows: false,
+    };
+    let Some(escaped) = text
+        .get(start + 1..)
+        .and_then(|remaining| remaining.chars().next())
+    else {
+        return invalid(start + 1);
+    };
+    let mut end = start + 1 + escaped.len_utf8();
+    if matches!(escaped, '\n' | '\r') {
+        let can_continue = matches!(mode, EscapeMode::SimpleString | EscapeMode::ByteString);
+        if !can_continue {
+            return EscapeScan {
+                end: start + 1,
+                valid: false,
+                line_break_follows: true,
+            };
+        }
+        if escaped == '\n' {
+            while text
+                .get(end..)
+                .and_then(|remaining| remaining.chars().next())
+                .is_some_and(|ch| matches!(ch, ' ' | '\t'))
+            {
+                end += 1;
+            }
+            return EscapeScan {
+                end,
+                valid: true,
+                line_break_follows: true,
+            };
+        }
+        if text.as_bytes().get(end) != Some(&b'\n') {
+            return EscapeScan {
+                end: start + 1,
+                valid: false,
+                line_break_follows: true,
+            };
+        }
+        end += 1;
+        while text
+            .get(end..)
+            .and_then(|remaining| remaining.chars().next())
+            .is_some_and(|ch| matches!(ch, ' ' | '\t'))
+        {
+            end += 1;
+        }
+        return EscapeScan {
+            end,
+            valid: true,
+            line_break_follows: true,
+        };
+    }
+
+    if matches!(escaped, 'n' | 'r' | 't' | '\\' | '\'' | '"' | '0') {
+        return valid(end);
+    }
+
+    if escaped == 'u' {
+        let quote = match mode {
+            EscapeMode::SimpleString | EscapeMode::ByteString => '"',
+            EscapeMode::Char | EscapeMode::Byte => '\'',
+        };
+        if matches!(mode, EscapeMode::ByteString | EscapeMode::Byte) {
+            if text.as_bytes().get(end) == Some(&b'{') {
+                end += 1;
+                while let Some(ch) = text
+                    .get(end..)
+                    .and_then(|remaining| remaining.chars().next())
+                {
+                    if matches!(ch, '\n' | '\r' | '}') || ch == quote {
+                        break;
+                    }
+                    end += ch.len_utf8();
+                }
+                if text.as_bytes().get(end) == Some(&b'}') {
+                    end += 1;
+                }
+            }
+            return invalid(end);
+        }
+        if text.as_bytes().get(end) != Some(&b'{') {
+            return invalid(end);
+        }
+        end += 1;
+        let mut digits = 0_u32;
+        let mut scalar = 0_u32;
+        let mut malformed_digit = false;
+        while let Some(ch) = text
+            .get(end..)
+            .and_then(|remaining| remaining.chars().next())
+        {
+            if matches!(ch, '\n' | '\r' | '}') || ch == quote {
+                break;
+            }
+            if ch.is_ascii() {
+                if let Some(value) = digit_value(ch as u8) {
+                    digits += 1;
+                    scalar = scalar.saturating_mul(16).saturating_add(value);
+                } else {
+                    malformed_digit = true;
+                }
+            } else {
+                malformed_digit = true;
+            }
+            end += ch.len_utf8();
+        }
+        let closed = text.as_bytes().get(end) == Some(&b'}');
+        if closed {
+            end += 1;
+        }
+        let valid_scalar = (1..=6).contains(&digits)
+            && !malformed_digit
+            && closed
+            && char::from_u32(scalar).is_some();
+        return if valid_scalar {
+            valid(end)
+        } else {
+            invalid(end)
+        };
+    }
+
+    if escaped == 'x' {
+        let byte_mode = matches!(mode, EscapeMode::ByteString | EscapeMode::Byte);
+        let digits_start = end;
+        let mut digits = 0;
+        while digits < 2 && text.as_bytes().get(end).is_some_and(u8::is_ascii_hexdigit) {
+            end += 1;
+            digits += 1;
+        }
+        return if byte_mode && digits == 2 {
+            valid(end)
+        } else if byte_mode {
+            invalid(end)
+        } else {
+            invalid(end.max(digits_start))
+        };
+    }
+
+    invalid(end)
+}
+
 fn is_in_e(kind: SyntaxKind) -> bool {
     matches!(
         kind,
@@ -1960,7 +2538,11 @@ mod tests {
     use std::sync::Arc;
 
     fn lex_text(text: &str) -> LexOutput {
-        let source = Arc::new(SourceFile::new(FileId::new(1), text, false).expect("source"));
+        lex_bytes(text.as_bytes())
+    }
+
+    fn lex_bytes(bytes: &[u8]) -> LexOutput {
+        let source = Arc::new(SourceFile::decode(FileId::new(1), bytes).expect("source"));
         let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
             source,
             "src/main.sai",
@@ -2378,6 +2960,164 @@ mod tests {
     }
 
     #[test]
+    fn lexes_simple_strings_characters_bytes_and_labels() {
+        let text = "\"line\\ntext\" b\"\\x41\" '\\u{1F642}' b'\\x41' 'outer";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [
+                SyntaxKind::STRING,
+                SyntaxKind::BYTE_STRING,
+                SyntaxKind::CHAR,
+                SyntaxKind::BYTE,
+                SyntaxKind::LABEL,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            output.token_text(&output.tokens[0], text),
+            "\"line\\ntext\""
+        );
+        assert_eq!(output.token_text(&output.tokens[1], text), "b\"\\x41\"");
+    }
+
+    #[test]
+    fn string_line_continuations_consume_indentation() {
+        let text = "\"first\\\r\n \tsecond\"";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [SyntaxKind::STRING, SyntaxKind::NEWLINE, SyntaxKind::EOF]
+        );
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(output.token_text(&output.tokens[0], text), text);
+    }
+
+    #[test]
+    fn malformed_literal_escapes_mark_the_literal_and_report_the_escape() {
+        for (text, kind) in [
+            ("\"bad\\q\"", SyntaxKind::STRING),
+            ("'\\u{}'", SyntaxKind::CHAR),
+            ("b\"\\u{41}\"", SyntaxKind::BYTE_STRING),
+            ("b'\\u{41}'", SyntaxKind::BYTE),
+        ] {
+            let output = lex_text(text);
+
+            assert_eq!(output.tokens[0].kind, kind, "{text:?}");
+            assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+            assert_eq!(output.errors.len(), 1, "{text:?}: {:?}", output.errors);
+            assert_eq!(output.errors[0].code, Code::InvalidEscape);
+        }
+    }
+
+    #[test]
+    fn simple_string_ends_before_a_line_break_and_points_to_it() {
+        let text = "\"unfinished\r\nnext";
+        let output = lex_text(text);
+        let string = &output.tokens[0];
+
+        assert_eq!(string.kind, SyntaxKind::STRING);
+        assert_eq!(output.token_text(string, text), "\"unfinished");
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::UnterminatedString);
+        assert_eq!(output.errors[0].children().len(), 1);
+        assert_eq!(
+            output.errors[0].children()[0]
+                .location
+                .as_ref()
+                .expect("secondary line-break location")
+                .span
+                .range,
+            TextRange::new(TextSize::new(11), TextSize::new(13)).expect("CRLF span")
+        );
+    }
+
+    #[test]
+    fn invalid_char_contents_and_non_ascii_byte_contents_are_reported() {
+        for (text, kind, code) in [
+            ("''", SyntaxKind::CHAR, Code::InvalidCharLiteral),
+            ("'ab'", SyntaxKind::CHAR, Code::InvalidCharLiteral),
+            ("b'€'", SyntaxKind::BYTE, Code::InvalidCharLiteral),
+            ("b\"€\"", SyntaxKind::BYTE_STRING, Code::InvalidEscape),
+        ] {
+            let output = lex_text(text);
+
+            assert_eq!(output.tokens[0].kind, kind, "{text:?}");
+            assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+            assert_eq!(output.errors[0].code, code, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_inside_literals_marks_the_literal_without_duplicate_errors() {
+        for (bytes, kind) in [
+            (b"\"\xFF\"".as_slice(), SyntaxKind::STRING),
+            (b"\"\\\xFF\"".as_slice(), SyntaxKind::STRING),
+            (b"'\xFF'".as_slice(), SyntaxKind::CHAR),
+            (b"'\\\xFF'".as_slice(), SyntaxKind::CHAR),
+            (b"b\"\xFF\"".as_slice(), SyntaxKind::BYTE_STRING),
+        ] {
+            let output = lex_bytes(bytes);
+
+            assert_eq!(output.tokens[0].kind, kind);
+            assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+            assert_eq!(output.errors.len(), 1);
+            assert_eq!(output.errors[0].code, Code::InvalidUtf8);
+        }
+    }
+
+    #[test]
+    fn malformed_unicode_escape_covers_the_whole_escape_once() {
+        let text = "'\\u{1g}'";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [SyntaxKind::CHAR, SyntaxKind::NEWLINE, SyntaxKind::EOF]
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::InvalidEscape);
+        assert_eq!(
+            output.errors[0]
+                .primary()
+                .expect("escape location")
+                .span
+                .range,
+            TextRange::new(TextSize::new(1), TextSize::new(7)).expect("escape span")
+        );
+    }
+
+    #[test]
+    fn malformed_unicode_escape_stops_before_the_literal_quote() {
+        for (text, literal_kind) in [
+            ("\"x\\u{GG\" + y", SyntaxKind::STRING),
+            ("'\\u{GG' + y", SyntaxKind::CHAR),
+        ] {
+            let output = lex_text(text);
+
+            assert_eq!(output.tokens[0].kind, literal_kind, "{text:?}");
+            assert_eq!(output.tokens[1].kind, SyntaxKind::PLUS, "{text:?}");
+            assert_eq!(output.tokens[2].kind, SyntaxKind::LIDENT, "{text:?}");
+            assert_eq!(output.errors.len(), 1, "{text:?}: {:?}", output.errors);
+            assert_eq!(output.errors[0].code, Code::InvalidEscape);
+        }
+    }
+
+    #[test]
+    fn bidi_literal_diagnostic_describes_the_applicable_source_rule() {
+        let output = lex_text("\"a\u{202E}b\"");
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ForbiddenCharacter);
+        assert!(output.errors[0].message.contains("source text"));
+        assert!(output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+    }
+
+    #[test]
     fn numbers_after_dots_follow_tuple_index_lexing_rules() {
         let text = "t.0.1 t.0e1 t.0_1 t.007";
         let output = lex_text(text);
@@ -2772,5 +3512,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Code::InvalidUtf8]
         );
+    }
+
+    #[test]
+    fn malformed_utf8_inside_comments_and_shebangs_still_becomes_error_tokens() {
+        for bytes in [
+            b"// \xFF note\nx".as_slice(),
+            b"/* \xFF note */x".as_slice(),
+            b"#! /usr/bin/sai \xFF\nx".as_slice(),
+            b"/// \xFF note\nx".as_slice(),
+            b"//! \xFF note\nx".as_slice(),
+        ] {
+            let output = lex_bytes(bytes);
+
+            assert_eq!(
+                output
+                    .tokens
+                    .iter()
+                    .filter(|token| token.kind == SyntaxKind::ERROR)
+                    .count(),
+                1
+            );
+            assert_eq!(output.errors.len(), 1);
+            assert_eq!(output.errors[0].code, Code::InvalidUtf8);
+            assert_every_trivia_is_attached_once(&output);
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_doc_comment_suffix_is_not_a_second_doc_token() {
+        let output = lex_bytes(b"///a\xFFb\nx");
+
+        assert_eq!(output.tokens[0].kind, SyntaxKind::DOC_OUTER);
+        assert_eq!(output.tokens[1].kind, SyntaxKind::ERROR);
+        assert_eq!(
+            output
+                .tokens
+                .iter()
+                .filter(|token| token.kind == SyntaxKind::DOC_OUTER)
+                .count(),
+            1
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::InvalidUtf8);
+        assert_every_trivia_is_attached_once(&output);
     }
 }

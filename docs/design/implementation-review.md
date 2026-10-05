@@ -93,3 +93,9 @@
 - **Decision:** Map every code point admitted by the three forbidden-character classes to its Unicode name in `sai_syntax`; include both `U+XXXX` and the name in a diagnostic note.
 - **Reason:** The language defines a finite forbidden set, and a closed table avoids a runtime Unicode-name dependency while keeping diagnostic spelling stable across Rust toolchains.
 - **Review:** Check the table against the Unicode 16.0.0 source data and retain coverage for every code point admitted by `forbidden_class`.
+
+### IR-016: Preserve literal boundaries for malformed UTF-8
+
+- **Decision:** When a decoded U+FFFD replacement comes from malformed UTF-8 inside a quote-delimited literal, keep the enclosing `STRING`, `BYTE_STRING`, `CHAR`, or `BYTE` token and set `HAS_ERROR`. Outside literals, emit an `ERROR` token. Report `INVALID_UTF8` once from decoding and do not add a second literal diagnostic for the same bytes.
+- **Reason:** Splitting a quote-delimited literal around a replacement character would destroy the token boundary the parser uses to recover it as one expression. The literal token's existing `HAS_ERROR` contract lets later phases suppress value-dependent diagnostics while preserving the source structure.
+- **Review:** Confirm the parser, AST literal accessors, and HIR lowering all honor `HAS_ERROR` and never interpret a replacement-containing literal as valid. Revisit if conformance requires a distinct `ERROR` token inside literals.

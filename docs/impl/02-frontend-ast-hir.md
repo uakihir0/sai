@@ -64,7 +64,7 @@ pub struct SourceFile {
 Decoding is done once, before lexing, by `source_text`:
 
 1. A leading UTF-8 BOM (`EF BB BF`) is removed from the text and recorded in `had_bom`. All offsets are relative to the text without the BOM; the line index records a 3-byte shift so that byte offsets in the original file can be recovered for tools that need them.
-2. Ill-formed UTF-8 is reported as `INVALID_UTF8` once per maximal ill-formed subsequence (as defined by the Unicode "maximal subpart" practice). Each such subsequence is replaced by U+FFFD in the decoded text. The decoded text is what the lexer sees; the replaced region lexes as an `ERROR` token (U+FFFD is not an identifier character), so no further diagnostic is produced for it (§2.4.12).
+2. Ill-formed UTF-8 is reported as `INVALID_UTF8` once per maximal ill-formed subsequence (as defined by the Unicode "maximal subpart" practice). Each such subsequence is replaced by U+FFFD in the decoded text. The decoded text is what the lexer sees. Outside quote-delimited literals, the replaced region lexes as an `ERROR` token, so no further diagnostic is produced for it (§2.4.12). Inside a quote-delimited literal, the literal keeps its token kind and receives `HAS_ERROR`; this preserves the literal boundary for parser recovery (IR-016).
 3. Line endings are not rewritten. CRLF is kept in the text and treated as one line break by the lexer; a lone CR is reported by the lexer (`INVALID_LINE_ENDING`, §2.4.2) and then treated as a line break.
 
 ### 2.2.2 Spans and the line index
@@ -558,8 +558,9 @@ Each emitted NEWLINE records, in a side table `LexOutput::newline_causes: Vec<Ne
 1. The lexer never stops early. Every character belongs to exactly one token or trivia piece.
 2. An `ERROR` token is produced for: a run of forbidden characters outside comments and literals; a lone `!`; `;`; `#` that does not start a raw string; and any other character that cannot start a token (`UNEXPECTED_CHARACTER`). Consecutive offending characters of the same cause form one token and one diagnostic.
 3. Literal errors (malformed numbers, invalid escapes, unterminated strings and characters, inconsistent indentation) do **not** produce `ERROR` tokens. They produce a token of the literal's own kind with `HAS_ERROR`, so the parser sees a well-formed expression and no cascade arises.
-4. The unterminated-literal end positions are fixed (N-E-5): a simple string, character, byte, or format string ends before the offending line break; a multiline string, raw string, or block comment extends to EOF.
-5. Each lexical diagnostic carries a primary span covering exactly the offending characters. Forbidden-character diagnostics include a note with the first character's code point and Unicode name. The pure `lex()` query keeps fix intents independent of the opaque workspace snapshot; `lex_with_fixes()` binds them and plans token-level fixes for NFC normalization, unnecessary `r#`, lone `!`, and `;`. The parser adds `.` for `::`, `and` / `or`, and raw-prefix fixes when it owns the relevant syntax operation.
+4. Ill-formed UTF-8 inside a quote-delimited literal is covered by the literal token's `HAS_ERROR` flag and the decoder's `INVALID_UTF8` diagnostic. Elsewhere, the replacement character is emitted as an `ERROR` token. Neither path reports a second diagnostic for the same malformed byte sequence (IR-016).
+5. The unterminated-literal end positions are fixed (N-E-5): a simple string, character, byte, or format string ends before the offending line break; a multiline string, raw string, or block comment extends to EOF.
+6. Each lexical diagnostic carries a primary span covering exactly the offending characters. Forbidden-character diagnostics include a note with the first character's code point and Unicode name. The pure `lex()` query keeps fix intents independent of the opaque workspace snapshot; `lex_with_fixes()` binds them and plans token-level fixes for NFC normalization, unnecessary `r#`, lone `!`, and `;`. The parser adds `.` for `::`, `and` / `or`, and raw-prefix fixes when it owns the relevant syntax operation.
 
 ---
 
