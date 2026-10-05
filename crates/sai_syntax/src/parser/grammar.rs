@@ -1852,7 +1852,10 @@ impl Parser<'_, '_> {
                     self.emit_parser_diagnostic(code, operator_range, message)?;
                 }
                 if operator.node_kind == SyntaxKind::RANGE_EXPR {
-                    if self.at_expression_start() {
+                    let optional_block_endpoint = self.no_block_operand
+                        && self.at(SyntaxKind::L_BRACE)
+                        && operator.kind == SyntaxKind::DOT2;
+                    if self.at_expression_start() && !optional_block_endpoint {
                         self.expr_bp(operator.right_bp)?;
                     } else if operator.kind == SyntaxKind::DOT2EQ
                         || self
@@ -1908,6 +1911,7 @@ impl Parser<'_, '_> {
         let nesting_depth = self.nesting_depth;
         let reported_nesting_limit = self.reported_nesting_limit;
         let allow_assoc_type_bindings = self.allow_assoc_type_bindings;
+        let no_block_operand = self.no_block_operand;
 
         self.allow_assoc_type_bindings = false;
         let parsed = self.generic_arg_list();
@@ -1949,6 +1953,7 @@ impl Parser<'_, '_> {
             .truncate(marker_failure_count);
         self.nesting_depth = nesting_depth;
         self.reported_nesting_limit = reported_nesting_limit;
+        self.no_block_operand = no_block_operand;
         self.spec_failures.insert(start_position);
 
         if let Some(error) = parser_error {
@@ -2145,10 +2150,15 @@ impl Parser<'_, '_> {
                 self.bump();
                 expression.complete(self, SyntaxKind::SELF_TYPE_EXPR)
             }
-            SyntaxKind::L_PAREN => self.paren_or_tuple_expr(),
+            SyntaxKind::L_PAREN => {
+                self.with_no_block_operand(false, |parser| parser.paren_or_tuple_expr())
+            }
             SyntaxKind::L_BRACE => {
+                if self.no_block_operand {
+                    self.emit_block_in_condition()?;
+                }
                 let expression = self.start();
-                if let Err(error) = self.block() {
+                if let Err(error) = self.with_no_block_operand(false, |parser| parser.block()) {
                     expression.abandon(self)?;
                     return Err(error);
                 }
@@ -2163,7 +2173,7 @@ impl Parser<'_, '_> {
                     expression.abandon(self)?;
                     return Err(ParserError::UnsupportedSyntax { position, kind });
                 }
-                if let Err(error) = self.block() {
+                if let Err(error) = self.with_no_block_operand(false, |parser| parser.block()) {
                     expression.abandon(self)?;
                     return Err(error);
                 }
@@ -2177,10 +2187,12 @@ impl Parser<'_, '_> {
                     kind: SyntaxKind::DOT,
                 })
             }
-            SyntaxKind::L_BRACKET => self.array_expr(),
+            SyntaxKind::L_BRACKET => {
+                self.with_no_block_operand(false, |parser| parser.array_expr())
+            }
             SyntaxKind::RETURN_KW => self.return_expr(),
-            SyntaxKind::IF_KW
-            | SyntaxKind::MATCH_KW
+            SyntaxKind::IF_KW => self.if_expr(),
+            SyntaxKind::MATCH_KW
             | SyntaxKind::LOOP_KW
             | SyntaxKind::WHILE_KW
             | SyntaxKind::FOR_KW
@@ -2202,6 +2214,117 @@ impl Parser<'_, '_> {
         self.bump();
         self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME_REF)?;
         expression.complete(self, SyntaxKind::IMPLICIT_MEMBER_EXPR)
+    }
+
+    fn if_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return self.recover_overdeep_expression();
+        }
+        self.nesting_depth += 1;
+        let result = self.if_expr_inner();
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn if_expr_inner(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        let result = (|| {
+            self.bump();
+            self.condition()?;
+            self.with_no_block_operand(false, |parser| parser.block())?;
+
+            if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::ELSE_KW {
+                self.bump();
+            }
+            if self.at(SyntaxKind::ELSE_KW) {
+                let else_branch = self.start();
+                let branch_result = (|| {
+                    self.bump();
+                    if self.at(SyntaxKind::IF_KW) {
+                        self.if_expr()?;
+                    } else {
+                        self.with_no_block_operand(false, |parser| parser.block())?;
+                    }
+                    Ok(())
+                })();
+                match branch_result {
+                    Ok(()) => {
+                        else_branch.complete(self, SyntaxKind::ELSE_BRANCH)?;
+                    }
+                    Err(error) => {
+                        else_branch.abandon(self)?;
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => expression.complete(self, SyntaxKind::IF_EXPR),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn condition(&mut self) -> Result<CompletedMarker, ParserError> {
+        let condition = self.start();
+        let result = if self.at(SyntaxKind::LET_KW) {
+            let let_condition = self.start();
+            let let_result = (|| {
+                self.bump();
+                self.pattern()?;
+                self.expect(SyntaxKind::EQ)?;
+                self.with_no_block_operand(true, |parser| parser.expr_bp(0))?;
+                Ok(())
+            })();
+            match let_result {
+                Ok(()) => {
+                    let_condition.complete(self, SyntaxKind::LET_CONDITION)?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let_condition.abandon(self)?;
+                    Err(error)
+                }
+            }
+        } else {
+            self.with_no_block_operand(true, |parser| parser.expr_bp(0))
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => condition.complete(self, SyntaxKind::CONDITION),
+            Err(error) => {
+                condition.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn with_no_block_operand<T>(
+        &mut self,
+        no_block_operand: bool,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParserError>,
+    ) -> Result<T, ParserError> {
+        let previous = self.no_block_operand;
+        self.no_block_operand = no_block_operand;
+        let result = parse(self);
+        self.no_block_operand = previous;
+        result
+    }
+
+    fn emit_block_in_condition(&mut self) -> Result<(), ParserError> {
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::BlockInCondition,
+            range,
+            "parenthesize a block expression used as a condition",
+        )?;
+        Ok(())
     }
 
     fn postfix_expr(&mut self, lhs: CompletedMarker) -> Result<CompletedMarker, ParserError> {
@@ -2247,12 +2370,12 @@ impl Parser<'_, '_> {
                     }
                 }
                 SyntaxKind::L_PAREN => {
-                    self.arg_list()?;
+                    self.with_no_block_operand(false, |parser| parser.arg_list())?;
                     SyntaxKind::CALL_EXPR
                 }
                 SyntaxKind::L_BRACKET => {
                     self.bump();
-                    self.expr_bp(0)?;
+                    self.with_no_block_operand(false, |parser| parser.expr_bp(0))?;
                     self.expect(SyntaxKind::R_BRACKET)?;
                     SyntaxKind::INDEX_EXPR
                 }
@@ -2566,7 +2689,9 @@ impl Parser<'_, '_> {
         let range = self.start();
         let kind = self.current();
         self.bump();
-        if self.at_expression_start() {
+        let optional_block_endpoint =
+            self.no_block_operand && self.at(SyntaxKind::L_BRACE) && kind == SyntaxKind::DOT2;
+        if self.at_expression_start() && !optional_block_endpoint {
             if let Err(error) = self.expr_bp(10) {
                 range.abandon(self)?;
                 return Err(error);
@@ -2584,7 +2709,10 @@ impl Parser<'_, '_> {
     fn return_expr(&mut self) -> Result<CompletedMarker, ParserError> {
         let expression = self.start();
         self.bump();
-        if self.current() != SyntaxKind::NEWLINE && self.at_expression_start() {
+        if self.current() != SyntaxKind::NEWLINE
+            && self.at_expression_start()
+            && !(self.no_block_operand && self.at(SyntaxKind::L_BRACE))
+        {
             if let Err(error) = self.expr_bp(0) {
                 expression.abandon(self)?;
                 return Err(error);

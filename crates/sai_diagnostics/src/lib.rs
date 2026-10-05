@@ -67,6 +67,7 @@ define_codes! {
     ExpectedToken => "EXPECTED_TOKEN",
     ExpectedExpression => "EXPECTED_EXPRESSION",
     MissingInitializer => "MISSING_INITIALIZER",
+    BlockInCondition => "BLOCK_IN_CONDITION",
     ChainedComparison => "CHAINED_COMPARISON",
     ChainedRange => "CHAINED_RANGE",
     BaseArgNotLast => "BASE_ARG_NOT_LAST",

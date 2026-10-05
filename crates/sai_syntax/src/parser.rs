@@ -27,6 +27,7 @@ pub struct Parser<'src, 'tokens> {
     active_markers: Rc<RefCell<Vec<u32>>>,
     marker_failures: Rc<RefCell<Vec<ParserError>>>,
     allow_assoc_type_bindings: bool,
+    no_block_operand: bool,
     nesting_depth: usize,
     reported_nesting_limit: bool,
     spec_failures: HashSet<usize>,
@@ -151,6 +152,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             active_markers: Rc::new(RefCell::new(Vec::new())),
             marker_failures: Rc::new(RefCell::new(Vec::new())),
             allow_assoc_type_bindings: false,
+            no_block_operand: false,
             nesting_depth: 0,
             reported_nesting_limit: false,
             spec_failures: HashSet::new(),
@@ -1449,8 +1451,8 @@ mod tests {
     }
 
     #[test]
-    fn function_parser_keeps_unimplemented_control_expressions_explicit() {
-        let source = "fn main() { if true {} }\n";
+    fn function_parser_keeps_unimplemented_match_expressions_explicit() {
+        let source = "fn main() { match true {} }\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -1461,15 +1463,137 @@ mod tests {
                 position: lexed
                     .tokens
                     .iter()
-                    .position(|token| token.kind == SyntaxKind::IF_KW)
-                    .expect("if expression starts the unsupported body"),
-                kind: SyntaxKind::IF_KW
+                    .position(|token| token.kind == SyntaxKind::MATCH_KW)
+                    .expect("match expression starts the unsupported body"),
+                kind: SyntaxKind::MATCH_KW
             })
         );
         assert!(matches!(
             parser.into_events(),
             Err(ParserError::UnconsumedTokens { .. })
         ));
+    }
+
+    #[test]
+    fn function_parser_builds_if_conditions_and_else_branches() {
+        let source = concat!(
+            "fn f(condition: Bool, value: Option<I32>) {\n",
+            "let plain = if condition { 1 } else { 2 }\n",
+            "let chain = if condition { 1 } else if condition { 2 } else { 3 }\n",
+            "let matched = if let Some(item) = value { item } else { 0 }\n",
+            "let next_line = if condition {} \n",
+            "    else {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(
+            output.errors.is_empty(),
+            "valid if and if-let expressions should parse cleanly: {:?}",
+            output.errors
+        );
+
+        let root = crate::SyntaxNode::new_root(output.root);
+        let count = |kind| {
+            root.descendants()
+                .filter(|node| node.kind() == kind)
+                .count()
+        };
+        assert_eq!(count(SyntaxKind::IF_EXPR), 5);
+        assert_eq!(count(SyntaxKind::CONDITION), 5);
+        assert_eq!(count(SyntaxKind::LET_CONDITION), 1);
+        assert_eq!(count(SyntaxKind::ELSE_BRANCH), 5);
+    }
+
+    #[test]
+    fn condition_block_restriction_resets_in_delimited_expressions() {
+        let output = parse_file(concat!(
+            "fn f(condition: Bool, index: USize) {\n",
+            "if ({ true }) {}\n",
+            "if check({ true }) {}\n",
+            "if [{}] {}\n",
+            "if index.. {}\n",
+            "if .. {}\n",
+            "if return {}\n",
+            "if unsafe {} {}\n",
+            "}\n",
+        ));
+        assert!(
+            output.errors.is_empty(),
+            "parenthesized, array, block, and optional range operands clear or respect the condition restriction: {:?}",
+            output.errors
+        );
+
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IF_EXPR)
+                .count(),
+            7
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::RANGE_EXPR)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_block_at_the_start_of_a_condition_reports_block_in_condition() {
+        let output = parse_file("fn f() { if { true } {} }\n");
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::BlockInCondition]
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK_EXPR)
+                .count(),
+            1,
+            "the invalid condition block must remain available for parenthesizing"
+        );
+    }
+
+    #[test]
+    fn required_condition_operands_still_parse_block_expressions() {
+        let output = parse_file("fn f(condition: Bool) { if condition and { true } {} }\n");
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::BlockInCondition)
+                .count(),
+            1,
+            "a required binary operand beginning with a block still reports the restriction"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_else_if_chains_report_the_shared_nesting_limit() {
+        let chain = "if condition {} else ".repeat(520) + "if condition {}";
+        let source = format!("fn f() {{ {chain} }}\n");
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded),
+            "recursive else-if parsing must use the shared nesting limit"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1,
+            "over-depth else-if recovery must preserve the containing function"
+        );
     }
 
     #[test]
