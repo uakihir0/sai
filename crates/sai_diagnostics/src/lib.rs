@@ -13,7 +13,7 @@ macro_rules! define_codes {
         }
 
         impl Code {
-            /// Subset of the documented registry corresponding to the lexical chapter.
+            /// Subset of the documented diagnostic registry implemented here.
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
 
             pub const fn as_str(self) -> &'static str {
@@ -65,6 +65,12 @@ define_codes! {
     UseAndOr => "USE_AND_OR",
     UnexpectedNewline => "UNEXPECTED_NEWLINE",
     ExpectedToken => "EXPECTED_TOKEN",
+    MissingFnBody => "MISSING_FN_BODY",
+    ImplementationLimitExceeded => "IMPLEMENTATION_LIMIT_EXCEEDED",
+    ClauseOrder => "CLAUSE_ORDER",
+    DuplicateClause => "DUPLICATE_CLAUSE",
+    InvalidAttributeTarget => "INVALID_ATTRIBUTE_TARGET",
+    RedundantPubExport => "REDUNDANT_PUB_EXPORT",
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -25,6 +25,9 @@ pub struct Parser<'src, 'tokens> {
     marker_owner: Rc<()>,
     active_markers: Rc<RefCell<Vec<u32>>>,
     marker_failures: Rc<RefCell<Vec<ParserError>>>,
+    allow_assoc_type_bindings: bool,
+    nesting_depth: usize,
+    reported_nesting_limit: bool,
 }
 
 struct DiagnosticSource<'src> {
@@ -95,6 +98,7 @@ pub enum ParserError {
     EmptyExpectedSet,
     InvalidExpectedKind { kind: SyntaxKind },
     UnsupportedItem { position: usize, kind: SyntaxKind },
+    UnsupportedSyntax { position: usize, kind: SyntaxKind },
 }
 
 impl<'src, 'tokens> Parser<'src, 'tokens> {
@@ -144,6 +148,9 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             marker_owner: Rc::new(()),
             active_markers: Rc::new(RefCell::new(Vec::new())),
             marker_failures: Rc::new(RefCell::new(Vec::new())),
+            allow_assoc_type_bindings: false,
+            nesting_depth: 0,
+            reported_nesting_limit: false,
         })
     }
 
@@ -810,10 +817,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_use_items_close_preserves_a_following_function() {
+        let output = parse_file("use sai:http.{\nfn next() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| {
+                    matches!(node.kind(), SyntaxKind::USE_DECL | SyntaxKind::FN_DECL)
+                })
+                .count(),
+            2
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+    }
+
+    #[test]
     fn missing_use_items_close_stops_before_an_unimplemented_item() {
         for source in [
-            "use sai:http.{\nfn next() {}\n",
-            "use sai:http.{Request\nfn next() {}\n",
+            "use sai:http.{\ntype Thing = U32\n",
+            "use sai:http.{Request\ntype Thing = U32\n",
         ] {
             let (snapshot_file, lexed) = lex_file(source);
             let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
@@ -822,7 +846,7 @@ mod tests {
             assert!(matches!(
                 parser.parse_source_file(),
                 Err(ParserError::UnsupportedItem {
-                    kind: SyntaxKind::FN_KW,
+                    kind: SyntaxKind::TYPE_KW,
                     ..
                 })
             ));
@@ -881,6 +905,531 @@ mod tests {
             4
         );
         assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn source_file_parses_function_signatures_and_empty_bodies() {
+        let source = concat!(
+            "pub fn add(x: I32, y: I32) -> I32 {}\n",
+            "@allow(x)\n",
+            "fn transform<T: Fn(I32) -> I32>(value: Vec<(T, U32), 4>) -> (T, U32) {}\n",
+            "fn apply(callback: fn(I32) -> I32) {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let kinds = root
+            .descendants()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+
+        for (kind, expected) in [
+            (SyntaxKind::FN_DECL, 3),
+            (SyntaxKind::PARAM_LIST, 3),
+            (SyntaxKind::BLOCK, 3),
+            (SyntaxKind::RET_TYPE, 2),
+            (SyntaxKind::GENERIC_PARAM_LIST, 1),
+            (SyntaxKind::TYPE_PARAM, 1),
+            (SyntaxKind::FN_SUGAR_BOUND, 1),
+            (SyntaxKind::GENERIC_ARG_LIST, 1),
+            (SyntaxKind::CONST_ARG, 1),
+            (SyntaxKind::FN_PTR_TYPE, 1),
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|found| **found == kind).count(),
+                expected,
+                "unexpected count for {kind:?}"
+            );
+        }
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn source_file_recovers_redundant_pub_before_exported_function() {
+        let source = "pub export fn f() {}\nfn next() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::RedundantPubExport);
+        assert_eq!(
+            output.errors[0]
+                .primary()
+                .expect("redundant visibility has a primary location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            0
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        let visibility = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::VISIBILITY)
+            .expect("function retains its visibility node");
+        assert_eq!(
+            visibility
+                .children_with_tokens()
+                .filter_map(|element| match element {
+                    crate::SyntaxElement::Token(token) => Some(token.kind()),
+                    crate::SyntaxElement::Node(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            [SyntaxKind::PUB_KW, SyntaxKind::EXPORT_KW]
+        );
+    }
+
+    #[test]
+    fn source_file_parses_borrow_owned_self_and_unsafe_function_pointer_types() {
+        let source = "unsafe async fn inspect(self: Self, value: borrow mut I32, own: owned Request, callback: unsafe fn(I32) -> I32) -> (I32,) {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let kinds = root
+            .descendants()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+
+        for (kind, expected) in [
+            (SyntaxKind::SELF_PARAM, 1),
+            (SyntaxKind::SELF_TYPE, 1),
+            (SyntaxKind::BORROW_TYPE, 1),
+            (SyntaxKind::OWNED_TYPE, 1),
+            (SyntaxKind::FN_PTR_TYPE, 1),
+            (SyntaxKind::TUPLE_TYPE, 1),
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|found| **found == kind).count(),
+                expected,
+                "unexpected count for {kind:?}"
+            );
+        }
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn source_file_parses_function_clauses_and_effectful_function_pointer_types() {
+        let source = concat!(
+            "fn identity<T: Clone effects { alloc }>(value: T) -> T\n",
+            "where T: Iterator<Item = U32> + (Clone effects { io }),\n",
+            "U32: (Fn(I32) -> I32 effects { alloc })\n",
+            "borrows { self, value.item }\n",
+            "effects { alloc, io }\n",
+            "{}\n",
+            "fn accepts(callback: fn(I32) -> I32 effects { alloc }) {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let kinds = root
+            .descendants()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+
+        for (kind, expected) in [
+            (SyntaxKind::WHERE_CLAUSE, 1),
+            (SyntaxKind::WHERE_PRED, 2),
+            (SyntaxKind::ASSOC_TYPE_BINDING, 1),
+            (SyntaxKind::BORROWS_CLAUSE, 1),
+            (SyntaxKind::PROVENANCE, 2),
+            (SyntaxKind::EFFECTS_CLAUSE, 5),
+            (SyntaxKind::EFFECT_SET, 5),
+            (SyntaxKind::FN_SUGAR_BOUND, 1),
+            (SyntaxKind::FN_PTR_TYPE, 1),
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|found| **found == kind).count(),
+                expected,
+                "unexpected count for {kind:?}"
+            );
+        }
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn effects_after_an_unparenthesized_where_bound_belong_to_the_function() {
+        let output = parse_file("fn f<T>() where T: Clone effects { io } {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+        let clauses = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::EFFECTS_CLAUSE)
+            .collect::<Vec<_>>();
+
+        assert_eq!(clauses.len(), 1);
+        assert!(
+            clauses[0]
+                .parent()
+                .is_some_and(|parent| parent.kind() == SyntaxKind::FN_DECL)
+        );
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn fn_sugar_type_arguments_do_not_allow_associated_type_bindings() {
+        let output = parse_file("fn f<T: Fn(Vec<Item = U32>) + Trait<Wrapper<Item = U32>>>() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert!(
+            !root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ASSOC_TYPE_BINDING)
+        );
+    }
+
+    #[test]
+    fn associated_type_binding_values_do_not_enable_nested_bindings() {
+        let output = parse_file("fn f<T: Trait<Item = Wrapper<Assoc = U32>>>() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASSOC_TYPE_BINDING)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn function_clause_duplicates_and_order_errors_preserve_the_function() {
+        let source = concat!(
+            "fn f()\n",
+            "effects { io }\n",
+            "borrows { self }\n",
+            "effects { net }\n",
+            "{}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ClauseOrder)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::DuplicateClause)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EFFECTS_CLAUSE)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn where_predicate_types_do_not_accept_associated_type_bindings() {
+        let output = parse_file("fn f() where Iterator<Item = U32>: Clone {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert!(
+            !root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ASSOC_TYPE_BINDING)
+        );
+    }
+
+    #[test]
+    fn deeply_nested_types_are_recovered_at_the_implementation_limit() {
+        let depth = 520;
+        let source = format!(
+            "fn deep(value: {}I32{}) {{}}\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let output = parse_file(&source);
+        let diagnostics = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded)
+            .collect::<Vec<_>>();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].data.get("limit"),
+            Some(&sai_diagnostics::Value::String("nesting depth".to_owned()))
+        );
+        assert_eq!(
+            diagnostics[0].data.get("value"),
+            Some(&sai_diagnostics::Value::Integer(513))
+        );
+        assert!(
+            crate::SyntaxNode::new_root(output.root)
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR)
+        );
+    }
+
+    #[test]
+    fn nesting_recovery_preserves_a_parameter_after_a_synchronization_comma() {
+        let source = format!("fn f(x: {}, y: I32) {{}}\n", "borrow ".repeat(512));
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let parameters = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::PARAM)
+            .collect::<Vec<_>>();
+
+        assert_eq!(parameters.len(), 2);
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| { diagnostic.code == Code::ImplementationLimitExceeded })
+                .count(),
+            1
+        );
+        assert!(
+            parameters[1]
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::PATH_TYPE)
+        );
+    }
+
+    #[test]
+    fn nesting_recovery_preserves_the_function_body() {
+        let source = format!("fn f() -> {}I32 {{}}\n", "borrow ".repeat(512));
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::BLOCK)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded)
+        );
+        assert!(
+            !output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::MissingFnBody)
+        );
+    }
+
+    #[test]
+    fn deeply_nested_attribute_arguments_are_recovered_at_the_implementation_limit() {
+        let depth = 520;
+        let nested = format!("{}value{}", "nested(".repeat(depth), ")".repeat(depth));
+        let source = format!("@allow({nested})\nfn main() {{}}\n");
+        let output = parse_file(&source);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            crate::SyntaxNode::new_root(output.root)
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_function_parameter_delimiters_still_build_a_recoverable_tree() {
+        for source in ["fn f\n", "fn f(callback: fn\n"] {
+            let output = parse_file(source);
+            let root = crate::SyntaxNode::new_root(output.root);
+            assert_eq!(
+                root.descendants()
+                    .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                    .count(),
+                1
+            );
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+            );
+            assert!(
+                !root.descendants().any(|node| {
+                    matches!(
+                        node.kind(),
+                        SyntaxKind::FN_PTR_TYPE
+                            if node
+                                .children_with_tokens()
+                                .all(|child| !matches!(child, crate::SyntaxElement::Token(token)
+                                    if token.kind() == SyntaxKind::L_PAREN
+                                        || token.kind() == SyntaxKind::R_PAREN))
+                    )
+                }),
+                "an incomplete function-pointer type must not be completed"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_generic_bounds_and_clause_lists_still_build_trees() {
+        for source in [
+            "fn f<T: Copy +>() {}\n",
+            "fn f() where T: Copy + {}\n",
+            "fn f(value: Vec<>) {}\n",
+            "fn f() effects {,} {}\n",
+            "fn f() borrows {,} {}\n",
+        ] {
+            let output = parse_file(source);
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+                "malformed input should retain a syntax diagnostic: {source}"
+            );
+            assert!(
+                crate::SyntaxNode::new_root(output.root)
+                    .descendants()
+                    .any(|node| node.kind() == SyntaxKind::FN_DECL),
+                "malformed signature should keep its function node: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_free_function_without_a_body_reports_the_documented_diagnostic() {
+        let output = parse_file("fn declaration()\n");
+        assert!(output.errors.iter().any(|diagnostic| {
+            diagnostic.code == Code::MissingFnBody
+                && diagnostic.message == "function requires a body"
+        }));
+    }
+
+    #[test]
+    fn attributes_on_parameters_and_generic_parameters_report_invalid_targets() {
+        let source = "fn invalid<@allow(foo) @allow(bar) T>(@allow(foo) @allow(bar) value: T) {}\n";
+        let output = parse_file(source);
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+                .count(),
+            2
+        );
+        let diagnostic_starts = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("invalid-target diagnostic has a location")
+                    .span
+                    .range
+                    .start()
+                    .to_usize()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostic_starts,
+            [
+                source.find("@allow(foo)").expect("generic attribute"),
+                source.rfind("@allow(foo)").expect("parameter attribute")
+            ]
+        );
+        assert_eq!(
+            crate::SyntaxNode::new_root(output.root)
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn unsupported_contract_clauses_leave_no_active_parser_markers() {
+        let source = "fn check(value: Bool)\nrequires value\n{}\n";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+
+        assert!(matches!(
+            parser.parse_source_file(),
+            Err(ParserError::UnsupportedSyntax {
+                kind: SyntaxKind::LIDENT,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parser.into_events(),
+            Err(ParserError::UnconsumedTokens { .. })
+        ));
+    }
+
+    #[test]
+    fn function_parser_reports_nonempty_bodies_as_unsupported_syntax() {
+        let source = "fn main() { return 1 }\n";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+
+        assert_eq!(
+            parser.parse_source_file(),
+            Err(ParserError::UnsupportedSyntax {
+                position: lexed
+                    .tokens
+                    .iter()
+                    .position(|token| token.kind == SyntaxKind::L_BRACE)
+                    .expect("function body starts with a brace"),
+                kind: SyntaxKind::L_BRACE
+            })
+        );
+    }
+
+    #[test]
+    fn source_file_allows_an_attribute_without_a_following_newline() {
+        let output = parse_file("@allow use sai:http\n");
+        assert!(output.errors.is_empty());
+        assert!(
+            crate::SyntaxNode::new_root(output.root)
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+        );
     }
 
     #[test]
@@ -986,7 +1535,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "fn main()\n";
+        let source = "type UserId = U32\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -994,7 +1543,7 @@ mod tests {
             parser.parse_source_file(),
             Err(ParserError::UnsupportedItem {
                 position: 0,
-                kind: SyntaxKind::FN_KW
+                kind: SyntaxKind::TYPE_KW
             })
         );
     }
