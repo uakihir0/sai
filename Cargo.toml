@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/sai_diagnostics",
+    "crates/sai_stable_hash",
     "crates/sai_vfs",
 ]
 
@@ -9,3 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+
+[workspace.dependencies]
+blake3 = "1.8.7"
+siphasher = "1.0.4"
