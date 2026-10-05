@@ -106,6 +106,7 @@ const EXPRESSION_START_KINDS: &[SyntaxKind] = &[
     SyntaxKind::ASYNC_KW,
     SyntaxKind::IF_KW,
     SyntaxKind::MATCH_KW,
+    SyntaxKind::LABEL,
     SyntaxKind::LOOP_KW,
     SyntaxKind::WHILE_KW,
     SyntaxKind::FOR_KW,
@@ -2240,12 +2241,11 @@ impl Parser<'_, '_> {
             SyntaxKind::RETURN_KW => self.return_expr(),
             SyntaxKind::IF_KW => self.if_expr(),
             SyntaxKind::MATCH_KW => self.match_expr(),
-            SyntaxKind::LOOP_KW
-            | SyntaxKind::WHILE_KW
-            | SyntaxKind::FOR_KW
-            | SyntaxKind::BREAK_KW
-            | SyntaxKind::CONTINUE_KW
-            | SyntaxKind::MOVE_KW
+            SyntaxKind::LABEL if self.nth(1) == SyntaxKind::COLON => self.loop_expr(),
+            SyntaxKind::LOOP_KW | SyntaxKind::WHILE_KW | SyntaxKind::FOR_KW => self.loop_expr(),
+            SyntaxKind::BREAK_KW => self.break_expr(),
+            SyntaxKind::CONTINUE_KW => self.continue_expr(),
+            SyntaxKind::MOVE_KW
             | SyntaxKind::FN_KW
             | SyntaxKind::ASYNC_KW
             | SyntaxKind::FSTRING_START => Err(ParserError::UnsupportedSyntax {
@@ -2313,6 +2313,73 @@ impl Parser<'_, '_> {
                 Err(error)
             }
         }
+    }
+
+    fn loop_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return self.recover_overdeep_expression();
+        }
+        self.nesting_depth += 1;
+        let result = self.loop_expr_inner();
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn loop_expr_inner(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        let result = (|| {
+            self.loop_label()?;
+            let kind = match self.current() {
+                SyntaxKind::LOOP_KW => {
+                    self.bump();
+                    self.with_no_block_operand(false, |parser| parser.block())?;
+                    SyntaxKind::LOOP_EXPR
+                }
+                SyntaxKind::WHILE_KW => {
+                    self.bump();
+                    self.condition()?;
+                    self.with_no_block_operand(false, |parser| parser.block())?;
+                    SyntaxKind::WHILE_EXPR
+                }
+                SyntaxKind::FOR_KW => {
+                    self.bump();
+                    self.eat(SyntaxKind::AWAIT_KW);
+                    self.pattern()?;
+                    self.expect(SyntaxKind::IN_KW)?;
+                    self.with_no_block_operand(true, |parser| parser.expr_bp(0))?;
+                    self.with_no_block_operand(false, |parser| parser.block())?;
+                    SyntaxKind::FOR_EXPR
+                }
+                _ => {
+                    self.expect_any(&[
+                        SyntaxKind::LOOP_KW,
+                        SyntaxKind::WHILE_KW,
+                        SyntaxKind::FOR_KW,
+                    ])?;
+                    SyntaxKind::ERROR
+                }
+            };
+            Ok(kind)
+        })();
+        match result {
+            Ok(kind) => expression.complete(self, kind),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn loop_label(&mut self) -> Result<bool, ParserError> {
+        if !self.at(SyntaxKind::LABEL) || self.nth(1) != SyntaxKind::COLON {
+            return Ok(false);
+        }
+        let label = self.start();
+        self.bump();
+        self.expect(SyntaxKind::COLON)?;
+        while self.eat_nl() {}
+        label.complete(self, SyntaxKind::LOOP_LABEL)?;
+        Ok(true)
     }
 
     fn match_expr(&mut self) -> Result<CompletedMarker, ParserError> {
@@ -2935,6 +3002,33 @@ impl Parser<'_, '_> {
             }
         }
         expression.complete(self, SyntaxKind::RETURN_EXPR)
+    }
+
+    fn break_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        self.bump();
+        if self.at(SyntaxKind::LABEL) && self.nth(1) != SyntaxKind::COLON {
+            self.bump();
+        }
+        if self.current() != SyntaxKind::NEWLINE
+            && self.at_expression_start()
+            && !(self.no_block_operand && self.at(SyntaxKind::L_BRACE))
+        {
+            if let Err(error) = self.expr_bp(0) {
+                expression.abandon(self)?;
+                return Err(error);
+            }
+        }
+        expression.complete(self, SyntaxKind::BREAK_EXPR)
+    }
+
+    fn continue_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        self.bump();
+        if self.at(SyntaxKind::LABEL) {
+            self.bump();
+        }
+        expression.complete(self, SyntaxKind::CONTINUE_EXPR)
     }
 
     fn at_expression_start(&self) -> bool {

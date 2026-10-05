@@ -1453,11 +1453,94 @@ mod tests {
     }
 
     #[test]
-    fn function_parser_keeps_unimplemented_loop_expressions_explicit() {
-        let source = "fn main() { loop {} }\n";
+    fn function_parser_builds_loop_expressions_and_jumps() {
+        let source = concat!(
+            "fn f(flag: Bool, values: I32) {\n",
+            "'outer:\n",
+            "loop {\n",
+            "if flag { break 'outer 1 }\n",
+            "continue 'outer\n",
+            "}\n",
+            "loop {\n",
+            "break\n",
+            "1\n",
+            "}\n",
+            "while let Some(item) = values {\n",
+            "break\n",
+            "}\n",
+            "for Some(item) in values {\n",
+            "continue\n",
+            "}\n",
+            "for await item in values {\n",
+            "break\n",
+            "}\n",
+            "let outside_break = break 'missing 1\n",
+            "continue 'missing\n",
+            "let parenthesized_while = while ({ flag }) {}\n",
+            "let parenthesized_for = for item in ({ values }) {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(
+            output.errors.is_empty(),
+            "loop forms and jumps should parse without semantic validation: {:?}",
+            output.errors
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let count = |kind| {
+            root.descendants()
+                .filter(|node| node.kind() == kind)
+                .count()
+        };
+        let loops = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::LOOP_EXPR)
+            .collect::<Vec<_>>();
+
+        assert_eq!(count(SyntaxKind::LOOP_EXPR), 2);
+        assert_eq!(count(SyntaxKind::LOOP_LABEL), 1);
+        assert_eq!(count(SyntaxKind::WHILE_EXPR), 2);
+        assert_eq!(count(SyntaxKind::FOR_EXPR), 3);
+        assert_eq!(count(SyntaxKind::BREAK_EXPR), 5);
+        assert_eq!(count(SyntaxKind::CONTINUE_EXPR), 3);
+        assert_eq!(count(SyntaxKind::BLOCK_EXPR), 2);
+        assert_eq!(
+            loops[1]
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            2,
+            "a newline ends a valueless break before the following expression statement"
+        );
+    }
+
+    #[test]
+    fn loop_conditions_and_for_iterables_reject_direct_blocks() {
+        let output = parse_file(concat!(
+            "fn f(values: I32) {\n",
+            "let invalid_while = while { true } {}\n",
+            "let invalid_for = for item in { values } {}\n",
+            "}\n",
+        ));
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::BlockInCondition)
+                .count(),
+            2,
+            "while conditions and for iterables apply the no-leading-block restriction"
+        );
+    }
+
+    #[test]
+    fn function_parser_keeps_unimplemented_closures_explicit() {
+        let source = "fn main() { let handler = fn() {} }\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let closure_start = source.find("fn()").expect("closure expression is present");
 
         assert_eq!(
             parser.parse_source_file(),
@@ -1465,9 +1548,12 @@ mod tests {
                 position: lexed
                     .tokens
                     .iter()
-                    .position(|token| token.kind == SyntaxKind::LOOP_KW)
-                    .expect("loop expression starts the unsupported body"),
-                kind: SyntaxKind::LOOP_KW
+                    .position(|token| {
+                        token.kind == SyntaxKind::FN_KW
+                            && token.range.start().to_usize() == closure_start
+                    })
+                    .expect("closure expression starts the unsupported body"),
+                kind: SyntaxKind::FN_KW
             })
         );
         assert!(matches!(
