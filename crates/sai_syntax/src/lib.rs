@@ -826,6 +826,9 @@ impl<'a> Lexer<'a> {
             return self.lex_doc_comment();
         }
         let ch = self.peek().ok_or(LexError::InvalidSourceSpan)?;
+        if let Some(path) = self.try_pkg_path()? {
+            return Ok(path);
+        }
         if ch == 'r'
             && self.text[self.pos..].starts_with("r#")
             && self
@@ -862,6 +865,100 @@ impl<'a> Lexer<'a> {
             return self.lex_number();
         }
         self.lex_punctuator_or_unexpected()
+    }
+
+    fn try_pkg_path(&mut self) -> Result<Option<LexedToken>, LexError> {
+        let Some(previous) = self.previous else {
+            return Ok(None);
+        };
+        let Some(token) = self.output.tokens.get(previous.index) else {
+            return Err(LexError::InvalidSourceSpan);
+        };
+        if token.flags.contains(TokenFlags::RAW) {
+            return Ok(None);
+        }
+        let previous_text = self.token_text_at(previous.index)?;
+        let allowed = matches!(token.kind, SyntaxKind::USE_KW | SyntaxKind::EXPORT_KW)
+            || (token.kind == SyntaxKind::LIDENT && matches!(previous_text, "import" | "include"));
+        if !allowed {
+            return Ok(None);
+        }
+
+        let start = self.pos;
+        let Some(namespace_end) = scan_pkg_segment(self.text, start) else {
+            return Ok(None);
+        };
+        if self.text.as_bytes().get(namespace_end) != Some(&b':') {
+            return Ok(None);
+        }
+
+        let path_start = namespace_end + 1;
+        let Some(mut end) = scan_pkg_segment(self.text, path_start) else {
+            let end = scan_malformed_pkg_path_tail(self.text, path_start);
+            self.report_at(
+                Code::MalformedPackagePath,
+                Severity::Error,
+                "malformed package path",
+                start,
+                end,
+            )?;
+            self.pos = end;
+            return Ok(Some(LexedToken {
+                kind: SyntaxKind::PKG_PATH,
+                start,
+                end,
+                flags: TokenFlags::HAS_ERROR,
+            }));
+        };
+
+        while self.text.as_bytes().get(end) == Some(&b'/') {
+            let Some(segment_end) = scan_path_segment(self.text, end + 1) else {
+                break;
+            };
+            end = segment_end;
+        }
+
+        if self
+            .text
+            .get(end..)
+            .and_then(|remaining| remaining.chars().next())
+            .is_some_and(|ch| matches!(ch, '/' | '-' | ':') || unicode_ident::is_xid_continue(ch))
+        {
+            let malformed_end = scan_malformed_pkg_path_tail(self.text, end);
+            self.report_at(
+                Code::MalformedPackagePath,
+                Severity::Error,
+                "malformed package path",
+                start,
+                malformed_end,
+            )?;
+            self.pos = malformed_end;
+            return Ok(Some(LexedToken {
+                kind: SyntaxKind::PKG_PATH,
+                start,
+                end: malformed_end,
+                flags: TokenFlags::HAS_ERROR,
+            }));
+        }
+
+        self.pos = end;
+        Ok(Some(LexedToken {
+            kind: SyntaxKind::PKG_PATH,
+            start,
+            end,
+            flags: TokenFlags::empty(),
+        }))
+    }
+
+    fn token_text_at(&self, index: usize) -> Result<&str, LexError> {
+        let token = self
+            .output
+            .tokens
+            .get(index)
+            .ok_or(LexError::InvalidSourceSpan)?;
+        self.text
+            .get(token.range.start().to_usize()..token.range.end().to_usize())
+            .ok_or(LexError::InvalidSourceSpan)
     }
 
     fn lex_doc_comment(&mut self) -> Result<LexedToken, LexError> {
@@ -1688,6 +1785,74 @@ fn unicode_name(ch: char) -> &'static str {
     }
 }
 
+fn scan_pkg_segment(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !bytes.get(start).is_some_and(u8::is_ascii_lowercase) {
+        return None;
+    }
+
+    let mut end = start + 1;
+    loop {
+        while bytes
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            end += 1;
+        }
+        if bytes.get(end) == Some(&b'-')
+            && bytes
+                .get(end + 1)
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            end += 1;
+            continue;
+        }
+        return Some(end);
+    }
+}
+
+fn scan_path_segment(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !bytes.get(start).is_some_and(u8::is_ascii_lowercase) {
+        return None;
+    }
+
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        end += 1;
+    }
+    while bytes.get(end) == Some(&b'-')
+        && bytes
+            .get(end + 1)
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        end += 1;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            end += 1;
+        }
+    }
+    Some(end)
+}
+
+fn scan_malformed_pkg_path_tail(text: &str, mut cursor: usize) -> usize {
+    while let Some(ch) = text
+        .get(cursor..)
+        .and_then(|remaining| remaining.chars().next())
+    {
+        if !matches!(ch, '/' | '-' | ':') && !unicode_ident::is_xid_continue(ch) {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    cursor
+}
+
 fn is_in_e(kind: SyntaxKind) -> bool {
     matches!(
         kind,
@@ -2096,6 +2261,76 @@ mod tests {
                 .iter()
                 .all(|token| !token.flags.contains(TokenFlags::HAS_ERROR))
         );
+    }
+
+    #[test]
+    fn lexes_package_paths_only_after_path_introducers() {
+        let text =
+            "use  sai:http/client.{HttpClient}\nimport acme:api\ninclude core:fmt\nexport app:main";
+        let output = lex_text(text);
+        let paths = output
+            .tokens
+            .iter()
+            .filter(|token| token.kind == SyntaxKind::PKG_PATH)
+            .map(|token| output.token_text(token, text))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            ["sai:http/client", "acme:api", "core:fmt", "app:main"]
+        );
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert!(
+            output
+                .tokens
+                .iter()
+                .filter(|token| token.kind == SyntaxKind::PKG_PATH)
+                .all(|token| token.flags.contains(TokenFlags::IN_E)
+                    && !token.flags.contains(TokenFlags::HAS_ERROR))
+        );
+
+        let ordinary = lex_text("value sai:http/client");
+        assert!(
+            ordinary
+                .tokens
+                .iter()
+                .all(|token| token.kind != SyntaxKind::PKG_PATH)
+        );
+
+        let raw_introducer = lex_text("r#import sai:api");
+        assert!(
+            raw_introducer
+                .tokens
+                .iter()
+                .all(|token| token.kind != SyntaxKind::PKG_PATH)
+        );
+    }
+
+    #[test]
+    fn malformed_package_paths_are_single_error_marked_tokens() {
+        for text in [
+            "use sai:",
+            "use sai:HTTP",
+            "use sai:http/Client",
+            "use sai:http/client-",
+            "use sai:http/foo-bar_baz",
+            "use sai:my--pkg",
+        ] {
+            let output = lex_text(text);
+            let path = output
+                .tokens
+                .iter()
+                .find(|token| token.kind == SyntaxKind::PKG_PATH)
+                .unwrap_or_else(|| panic!("missing PKG_PATH token for {text:?}"));
+
+            assert!(path.flags.contains(TokenFlags::HAS_ERROR), "{text:?}");
+            assert_eq!(output.errors.len(), 1, "{text:?}: {:?}", output.errors);
+            assert_eq!(output.errors[0].code, Code::MalformedPackagePath);
+            assert_eq!(
+                output.token_text(path, text),
+                text.strip_prefix("use ").unwrap()
+            );
+        }
     }
 
     #[test]
