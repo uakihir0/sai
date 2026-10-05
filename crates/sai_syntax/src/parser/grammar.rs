@@ -159,10 +159,10 @@ enum FnClauseKind {
 impl Parser<'_, '_> {
     /// Parses the currently implemented source-file grammar into parser events.
     ///
-    /// This slice supports module headers, use declarations, and function
-    /// signatures with the currently implemented block grammar. Other item forms return
-    /// [`ParserError::UnsupportedItem`] until their grammar routines are
-    /// implemented.
+    /// This slice supports module headers, use declarations, type declarations,
+    /// and function signatures with the currently implemented block grammar.
+    /// Other item forms return [`ParserError::UnsupportedItem`] until their
+    /// grammar routines are implemented.
     pub fn parse_source_file(&mut self) -> Result<(), ParserError> {
         if self.diagnostic_source.is_none() {
             return Err(ParserError::MissingDiagnosticSource);
@@ -279,26 +279,42 @@ impl Parser<'_, '_> {
         self.outer_docs()?;
         self.attributes(true)?;
 
+        let mut exported_range = None;
         if self.at_any(&[SyntaxKind::PUB_KW, SyntaxKind::EXPORT_KW]) {
             let visibility = self.start();
             let is_pub = self.at(SyntaxKind::PUB_KW);
-            let pub_range = self.current_token().map(|token| token.range);
+            let visibility_range = self.current_token().map(|token| token.range);
             self.bump();
             if is_pub && self.at(SyntaxKind::EXPORT_KW) {
-                if let Some(range) = pub_range {
+                if let Some(range) = visibility_range {
                     self.emit_parser_diagnostic(
                         sai_diagnostics::Code::RedundantPubExport,
                         range,
                         "`pub export` is redundant; use `export`",
                     )?;
                 }
+                exported_range = self.current_token().map(|token| token.range);
                 self.bump();
+            } else if !is_pub {
+                exported_range = visibility_range;
             }
             visibility.complete(self, SyntaxKind::VISIBILITY)?;
         }
 
         if self.at_fn_decl_start() {
             return self.fn_decl(declaration);
+        }
+
+        if let Some(range) = exported_range {
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::InvalidExportTarget,
+                range,
+                "only functions may be exported",
+            )?;
+        }
+
+        if self.at(SyntaxKind::TYPE_KW) {
+            return self.type_decl(declaration);
         }
 
         if !self.at(SyntaxKind::USE_KW) {
@@ -330,6 +346,208 @@ impl Parser<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    fn type_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.expect(SyntaxKind::TYPE_KW)?;
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::LT) {
+            self.generic_param_list()?;
+        }
+        if self.at(SyntaxKind::EQ) {
+            self.alias_def()?;
+        } else {
+            self.struct_def()?;
+        }
+        declaration.complete(self, SyntaxKind::TYPE_DECL)
+    }
+
+    fn struct_def(&mut self) -> Result<(), ParserError> {
+        let definition = self.start();
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::WHERE_KW {
+            self.eat_nl();
+        }
+        if self.at(SyntaxKind::WHERE_KW) {
+            self.where_clause()?;
+        }
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+        if !self.field_list()? {
+            definition.abandon(self)?;
+            return Ok(());
+        }
+        definition.complete(self, SyntaxKind::STRUCT_DEF)?;
+        Ok(())
+    }
+
+    fn field_list(&mut self) -> Result<bool, ParserError> {
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.expect(SyntaxKind::L_BRACE)?;
+            return Ok(false);
+        }
+
+        let fields = self.start();
+        self.bump();
+        while self.at(SyntaxKind::NEWLINE) && !self.field_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE) {
+                if self.field_list_boundary_after_newline() {
+                    break;
+                }
+                self.eat_nl();
+                continue;
+            }
+            if self.field_list_boundary_at(self.position) {
+                break;
+            }
+            if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER])
+                && !self.field_decl_starts_at(self.position)
+            {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+
+            if !self.field_decl_starts_at(self.position) {
+                let error = self.start();
+                if !self.eat(SyntaxKind::COMMA) {
+                    self.recover_one()?;
+                }
+                error.complete(self, SyntaxKind::ERROR)?;
+                continue;
+            }
+
+            let position = self.position;
+            self.field_decl()?;
+            if self.eat(SyntaxKind::COMMA) {
+                if self.field_list_boundary_after_newline() {
+                    break;
+                }
+                while self.eat_nl() {}
+                continue;
+            }
+            if self.at(SyntaxKind::NEWLINE) {
+                if self.field_list_boundary_after_newline() {
+                    break;
+                }
+                while self.eat_nl() {}
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect_any(&[SyntaxKind::COMMA, SyntaxKind::NEWLINE])?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        fields.complete(self, SyntaxKind::FIELD_LIST)?;
+        Ok(true)
+    }
+
+    fn field_decl(&mut self) -> Result<(), ParserError> {
+        let field = self.start();
+        self.outer_docs()?;
+        self.attributes(true)?;
+        self.eat(SyntaxKind::PUB_KW);
+        self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+        self.expect(SyntaxKind::COLON)?;
+        self.type_(true)?;
+        field.complete(self, SyntaxKind::FIELD_DECL)?;
+        Ok(())
+    }
+
+    fn field_decl_starts_at(&self, position: usize) -> bool {
+        let Some(mut position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::PUB_KW)
+        {
+            position += 1;
+        }
+        self.tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::LIDENT)
+            && self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::COLON)
+    }
+
+    fn field_list_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        self.field_list_boundary_at(position)
+    }
+
+    fn field_list_boundary_at(&self, position: usize) -> bool {
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+            || self.field_decl_starts_at(position)
+        {
+            return false;
+        }
+
+        let next_kind = self
+            .position_after_attributes(position)
+            .and_then(|position| self.tokens.get(position))
+            .map(|token| token.kind);
+        matches!(
+            next_kind,
+            Some(SyntaxKind::LET_KW | SyntaxKind::VAR_KW | SyntaxKind::ASSERT_KW)
+        ) || self.item_starts_at_after_attributes(position)
+            || next_kind.is_some_and(|kind| EXPRESSION_START_KINDS.contains(&kind))
+    }
+
+    fn alias_def(&mut self) -> Result<(), ParserError> {
+        let alias = self.start();
+        self.expect(SyntaxKind::EQ)?;
+        self.eat_nl();
+        if self.item_starts_at_after_attributes(self.position) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "expected a type before the next item",
+            )?;
+            self.start().complete(self, SyntaxKind::ERROR)?;
+        } else {
+            self.type_(true)?;
+        }
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::WHERE_KW {
+            self.eat_nl();
+        }
+        if self.at(SyntaxKind::WHERE_KW) {
+            let refinement = self.start();
+            self.bump();
+            self.expr_bp(0)?;
+            refinement.complete(self, SyntaxKind::REFINEMENT_CLAUSE)?;
+        }
+        alias.complete(self, SyntaxKind::ALIAS_DEF)?;
+        Ok(())
     }
 
     fn fn_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
@@ -573,6 +791,9 @@ impl Parser<'_, '_> {
         }
 
         while !self.at_any(&[SyntaxKind::GT, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE) || self.generic_parameter_list_recovery_boundary() {
+                break;
+            }
             let position = self.position;
             if !self.generic_param()? {
                 self.recover_one()?;
@@ -598,7 +819,9 @@ impl Parser<'_, '_> {
             }
         }
 
-        self.eat_nl();
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::GT {
+            self.eat_nl();
+        }
         self.expect(SyntaxKind::GT)?;
         params.complete(self, SyntaxKind::GENERIC_PARAM_LIST)?;
         Ok(())
@@ -990,6 +1213,7 @@ impl Parser<'_, '_> {
             while self.eat_nl() {}
             while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
                 let position = self.position;
+                let statement_starts_item = self.statement_starts_item();
                 if self.recovered_match_tail && self.line_starts_top_level_item() {
                     self.expect_close_brace()?;
                     return Ok(false);
@@ -999,6 +1223,9 @@ impl Parser<'_, '_> {
                     continue;
                 }
                 let statement_ends_with_expression = self.statement()?;
+                let recovered_item_stops_before_statement = statement_starts_item
+                    && self.at_physical_line_start()
+                    && self.statement_starts_at_after_attributes(self.position);
                 let newline = self.current_token().map(|token| token.range);
                 if self.eat_nl() {
                     if statement_ends_with_expression && self.starts_binary_only_operator() {
@@ -1012,7 +1239,9 @@ impl Parser<'_, '_> {
                 if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
                     break;
                 }
-                if self.position != position && self.at_confirmed_block_boundary() {
+                if self.position != position
+                    && (self.at_confirmed_block_boundary() || recovered_item_stops_before_statement)
+                {
                     continue;
                 }
                 if !statement_ends_with_expression && self.position == position {
@@ -1226,6 +1455,73 @@ impl Parser<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    fn generic_parameter_list_recovery_boundary(&self) -> bool {
+        if !self.at_physical_line_start()
+            || !self.statement_starts_at_after_attributes(self.position)
+        {
+            return false;
+        }
+        if !self.generic_parameter_starts_at_after_attributes(self.position) {
+            return true;
+        }
+
+        let Some(position) = self.position_after_attributes(self.position) else {
+            return false;
+        };
+        if self
+            .tokens
+            .get(position)
+            .is_none_or(|token| token.kind != SyntaxKind::CONST_KW)
+            || self
+                .tokens
+                .get(position + 1)
+                .is_none_or(|token| token.kind != SyntaxKind::UIDENT)
+            || self
+                .tokens
+                .get(position + 2)
+                .is_none_or(|token| token.kind != SyntaxKind::COLON)
+        {
+            return false;
+        }
+
+        let mut position = position + 3;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut angle_depth = 0usize;
+        while let Some(token) = self.tokens.get(position) {
+            match token.kind {
+                SyntaxKind::EQ
+                    if paren_depth == 0
+                        && bracket_depth == 0
+                        && brace_depth == 0
+                        && angle_depth == 0 =>
+                {
+                    return true;
+                }
+                SyntaxKind::COMMA | SyntaxKind::GT | SyntaxKind::NEWLINE | SyntaxKind::EOF
+                    if paren_depth == 0
+                        && bracket_depth == 0
+                        && brace_depth == 0
+                        && angle_depth == 0 =>
+                {
+                    return false;
+                }
+                SyntaxKind::L_PAREN => paren_depth += 1,
+                SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::L_BRACKET => bracket_depth += 1,
+                SyntaxKind::R_BRACKET if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::L_BRACE => brace_depth += 1,
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                SyntaxKind::LT => angle_depth += 1,
+                SyntaxKind::GT if angle_depth > 0 => angle_depth -= 1,
+                _ => {}
+            }
+            position += 1;
+        }
+        false
     }
 
     fn unsupported_item_line_starts_statement(&self) -> bool {
@@ -4298,6 +4594,12 @@ impl Parser<'_, '_> {
         while !self.at_any(&[SyntaxKind::GT, SyntaxKind::EOF])
             && !(self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::GT)
         {
+            if self.at(SyntaxKind::NEWLINE) {
+                break;
+            }
+            if self.generic_argument_list_recovery_boundary() {
+                break;
+            }
             let position = self.position;
             if !self.at_any(GENERIC_ARG_START_KINDS) {
                 self.expect_any(GENERIC_ARG_START_KINDS)?;
@@ -4339,10 +4641,238 @@ impl Parser<'_, '_> {
                 }
             }
         }
-        self.eat_nl();
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::GT {
+            self.eat_nl();
+        }
         self.expect(SyntaxKind::GT)?;
         args.complete(self, SyntaxKind::GENERIC_ARG_LIST)?;
         Ok(())
+    }
+
+    fn generic_argument_list_recovery_boundary(&self) -> bool {
+        if !self.at_physical_line_start()
+            || !self.statement_starts_at_after_attributes(self.position)
+        {
+            return false;
+        }
+        if self.item_starts_at_after_attributes(self.position) {
+            return true;
+        }
+
+        let Some(position) = self.position_after_attributes(self.position) else {
+            return false;
+        };
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        if !GENERIC_ARG_START_KINDS.contains(&token.kind) {
+            return true;
+        }
+        match token.kind {
+            SyntaxKind::LIDENT | SyntaxKind::UIDENT => {
+                !self.generic_argument_path_type_starts_at(position)
+            }
+            SyntaxKind::MINUS => !self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|next| next.kind == SyntaxKind::INT),
+            SyntaxKind::FN_KW => self.closure_body_follows_fn_type(position),
+            SyntaxKind::UNSAFE_KW => {
+                !self
+                    .tokens
+                    .get(position + 1)
+                    .is_some_and(|next| next.kind == SyntaxKind::FN_KW)
+                    || !self
+                        .tokens
+                        .get(position + 2)
+                        .is_some_and(|next| next.kind == SyntaxKind::L_PAREN)
+            }
+            _ => false,
+        }
+    }
+
+    fn generic_argument_path_type_starts_at(&self, mut position: usize) -> bool {
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::LIDENT)
+        {
+            if !self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::DOT)
+            {
+                return false;
+            }
+            position += 2;
+        }
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+        {
+            return false;
+        }
+
+        loop {
+            position += 1;
+            if self
+                .tokens
+                .get(position)
+                .is_some_and(|token| token.kind == SyntaxKind::LT)
+            {
+                let Some(after_args) = self.skip_generic_argument_list_at(position) else {
+                    return false;
+                };
+                position = after_args;
+            }
+            if self
+                .tokens
+                .get(position)
+                .is_some_and(|token| token.kind == SyntaxKind::DOT)
+            {
+                if !self
+                    .tokens
+                    .get(position + 1)
+                    .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+                {
+                    return false;
+                }
+                position += 1;
+                continue;
+            }
+            return !self
+                .tokens
+                .get(position)
+                .is_some_and(|token| token.kind == SyntaxKind::L_PAREN);
+        }
+    }
+
+    fn skip_generic_argument_list_at(&self, position: usize) -> Option<usize> {
+        if self.tokens.get(position)?.kind != SyntaxKind::LT {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (index, token) in self.tokens.iter().enumerate().skip(position) {
+            match token.kind {
+                SyntaxKind::LT => depth += 1,
+                SyntaxKind::GT => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                SyntaxKind::EOF => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn closure_body_follows_fn_type(&self, position: usize) -> bool {
+        if self
+            .tokens
+            .get(position + 1)
+            .is_none_or(|token| token.kind != SyntaxKind::L_PAREN)
+        {
+            return false;
+        }
+
+        let mut depth = 0usize;
+        let mut after_parameters = None;
+        for (index, token) in self.tokens.iter().enumerate().skip(position + 1) {
+            match token.kind {
+                SyntaxKind::L_PAREN => depth += 1,
+                SyntaxKind::R_PAREN if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        after_parameters = Some(index + 1);
+                        break;
+                    }
+                }
+                SyntaxKind::EOF => return false,
+                _ => {}
+            }
+        }
+        let Some(mut position) = after_parameters else {
+            return false;
+        };
+
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::L_BRACE)
+        {
+            return true;
+        }
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::THIN_ARROW)
+        {
+            return false;
+        }
+        position += 1;
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::L_BRACE)
+        {
+            return true;
+        }
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| TYPE_START_KINDS.contains(&token.kind))
+        {
+            return false;
+        }
+
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut angle_depth = 0usize;
+        while let Some(token) = self.tokens.get(position) {
+            if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 {
+                if token.kind == SyntaxKind::L_BRACE {
+                    return true;
+                }
+                if token.kind == SyntaxKind::LIDENT
+                    && token_is_contextual(self.source, self.tokens, position, "effects")
+                    && self
+                        .tokens
+                        .get(position + 1)
+                        .is_some_and(|next| next.kind == SyntaxKind::L_BRACE)
+                {
+                    return false;
+                }
+                if matches!(
+                    token.kind,
+                    SyntaxKind::NEWLINE
+                        | SyntaxKind::COMMA
+                        | SyntaxKind::GT
+                        | SyntaxKind::R_PAREN
+                        | SyntaxKind::R_BRACKET
+                        | SyntaxKind::R_BRACE
+                        | SyntaxKind::EOF
+                ) {
+                    return false;
+                }
+            }
+            match token.kind {
+                SyntaxKind::L_PAREN => paren_depth += 1,
+                SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::L_BRACKET => bracket_depth += 1,
+                SyntaxKind::R_BRACKET if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::L_BRACE => brace_depth += 1,
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                SyntaxKind::LT => angle_depth += 1,
+                SyntaxKind::GT if angle_depth > 0 => angle_depth -= 1,
+                _ => {}
+            }
+            position += 1;
+        }
+        false
     }
 
     fn type_arg(&mut self) -> Result<(), ParserError> {

@@ -841,6 +841,257 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_aliases_generic_aliases_and_refinements() {
+        let source = concat!(
+            "/// Public identifier type.\n",
+            "pub type UserId = U32\n",
+            "type Pair<T> = (T, T)\n",
+            "type Positive = I32\n",
+            "where self > 0\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ALIAS_DEF)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::GENERIC_PARAM_LIST)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::REFINEMENT_CLAUSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn source_file_parses_record_types_with_attributes_docs_and_where_clauses() {
+        let source = concat!(
+            "type User<T>\n",
+            "where T: Clone\n",
+            "{\n",
+            "/// User identifier.\n",
+            "@field\n",
+            "pub id: T,\n",
+            "name: Str\n",
+            "}\n",
+            "type Empty {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::STRUCT_DEF)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FIELD_LIST)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FIELD_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WHERE_CLAUSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert!(root.descendants().any(|node| {
+            node.kind() == SyntaxKind::FIELD_DECL
+                && source
+                    .get(node.text_range().start().to_usize()..node.text_range().end().to_usize())
+                    .is_some_and(|field| field.contains("pub id"))
+        }));
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn source_file_rejects_exported_nonfunction_items_and_keeps_public_aliases() {
+        let source = concat!(
+            "export type UserId = U32\n",
+            "pub type PublicId = U32\n",
+            "export use sai:http\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidExportTarget)
+                .count(),
+            2
+        );
+        let invalid_exports = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::InvalidExportTarget)
+            .collect::<Vec<_>>();
+        for (diagnostic, expected) in invalid_exports.iter().zip([
+            source.find("export").expect("type export keyword"),
+            source.rfind("export").expect("use export keyword"),
+        ]) {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("invalid export location")
+                    .span
+                    .range
+                    .start()
+                    .to_usize(),
+                expected
+            );
+        }
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ALIAS_DEF)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn malformed_record_field_recovery_consumes_an_unexpected_comma() {
+        let source = "type Broken {\n,\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::FIELD_LIST)
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR),
+            "unexpected comma should be retained under an error node"
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_record_close_preserves_a_following_expression_statement() {
+        let source = concat!(
+            "fn f() {\n",
+            "type Broken {\n",
+            "value: I32\n",
+            "consume()\n",
+            "let later = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_alias_rhs_preserves_a_following_function_item() {
+        let source = "type Broken =\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn source_file_recovers_a_missing_use_items_close_delimiter() {
         let output = parse_file("use sai:http.{Request\n");
         assert_eq!(output.errors.len(), 1);
@@ -893,8 +1144,8 @@ mod tests {
     #[test]
     fn missing_use_items_close_stops_before_an_unimplemented_item() {
         for source in [
-            "use sai:http.{\ntype Thing = U32\n",
-            "use sai:http.{Request\ntype Thing = U32\n",
+            "use sai:http.{\nenum Thing {}\n",
+            "use sai:http.{Request\nenum Thing {}\n",
         ] {
             let (snapshot_file, lexed) = lex_file(source);
             let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
@@ -903,7 +1154,7 @@ mod tests {
             assert!(matches!(
                 parser.parse_source_file(),
                 Err(ParserError::UnsupportedItem {
-                    kind: SyntaxKind::TYPE_KW,
+                    kind: SyntaxKind::ENUM_KW,
                     ..
                 })
             ));
@@ -3489,6 +3740,335 @@ mod tests {
     }
 
     #[test]
+    fn malformed_generic_parameter_list_preserves_a_function_after_a_comma() {
+        let source = "type Broken<T,\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_argument_list_preserves_a_function_after_a_comma() {
+        let source = "type Broken = Box<T,\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_parameter_list_preserves_a_block_statement_after_a_comma() {
+        let source = "fn outer() {\ntype Broken<T,\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_argument_list_preserves_a_block_statement_after_a_comma() {
+        let source = "fn outer() {\ntype Broken = Box<T,\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_parameter_list_preserves_a_const_item_after_a_comma() {
+        let source = "fn outer() {\ntype Broken<T,\nconst NEXT: USize = 1\nlet later = 2\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_parameter_list_preserves_a_call_statement_after_a_comma() {
+        let source = "fn outer() {\ntype Broken<T,\nSome()\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_argument_list_preserves_a_call_statement_after_a_comma() {
+        let source = "fn outer() {\ntype Broken = Box<T,\nSome()\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_argument_list_preserves_a_method_call_after_a_comma() {
+        let source = "fn outer() {\ntype Broken = Box<T,\nvalue.method()\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn generic_argument_recovery_keeps_a_multiline_function_pointer_type() {
+        let source = concat!(
+            "type Callback = Pair<T,\n",
+            "fn(I32),\n",
+            "fn() -> I32 effects { io },\n",
+            "pkg.Type>\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_PTR_TYPE)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_argument_list_preserves_closure_statements_after_a_comma() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Broken = Box<T,\n",
+            "fn() {}\n",
+            "fn() -> I32 { 1 }\n",
+            "let later = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_closure_return_type_keeps_its_body_after_generic_list_recovery() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Broken = Box<T,\n",
+            "fn() -> { let lost = 1 }\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_generic_argument_list_preserves_an_unsafe_block_statement() {
+        let source = "fn outer() {\ntype Broken = Box<T,\nunsafe {}\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|error| error.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::UNSAFE_BLOCK_EXPR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn multiline_const_generic_item_is_not_split_at_const_parameter() {
         let source = concat!(
             "fn outer() {\n",
@@ -4579,7 +5159,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "type UserId = U32\n";
+        let source = "enum UserId {}\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -4587,7 +5167,7 @@ mod tests {
             parser.parse_source_file(),
             Err(ParserError::UnsupportedItem {
                 position: 0,
-                kind: SyntaxKind::TYPE_KW
+                kind: SyntaxKind::ENUM_KW
             })
         );
     }

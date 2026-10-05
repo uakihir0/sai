@@ -82,6 +82,7 @@ define_codes! {
     DuplicateClause => "DUPLICATE_CLAUSE",
     InvalidAttributeTarget => "INVALID_ATTRIBUTE_TARGET",
     RedundantPubExport => "REDUNDANT_PUB_EXPORT",
+    InvalidExportTarget => "INVALID_EXPORT_TARGET",
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1607,6 +1608,10 @@ mod tests {
         assert_eq!(
             Code::from_name("NO_ASYNC_CLOSURE"),
             Some(Code::NoAsyncClosure)
+        );
+        assert_eq!(
+            Code::from_name("INVALID_EXPORT_TARGET"),
+            Some(Code::InvalidExportTarget)
         );
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));
