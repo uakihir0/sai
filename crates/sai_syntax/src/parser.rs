@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use sai_diagnostics::Diagnostic;
+use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef};
+use sai_vfs::{SnapshotFile, SourceFile, Span, TextRange, TextSize};
 
 use crate::tree::{validate_joint_tokens, validate_token_mapping};
 use crate::{Event, SyntaxKind, Token, TokenFlags};
@@ -15,9 +16,50 @@ pub struct Parser<'src, 'tokens> {
     tokens: &'tokens [Token],
     position: usize,
     events: Vec<Event>,
+    diagnostic_source: Option<DiagnosticSource<'src>>,
+    expected: ExpectedSet,
+    reported_expected_at: Option<usize>,
+    reported_expected_event: Option<usize>,
     marker_owner: Rc<()>,
     active_markers: Rc<RefCell<Vec<u32>>>,
     marker_failures: Rc<RefCell<Vec<ParserError>>>,
+}
+
+struct DiagnosticSource<'src> {
+    file: &'src SourceFile,
+    source_ref: SourceRef,
+}
+
+#[derive(Default)]
+struct ExpectedSet {
+    position: Option<usize>,
+    kinds: Vec<SyntaxKind>,
+}
+
+impl ExpectedSet {
+    fn record(&mut self, position: usize, kind: SyntaxKind) {
+        if self.position != Some(position) {
+            self.position = Some(position);
+            self.kinds.clear();
+        }
+        if !self.kinds.contains(&kind) {
+            self.kinds.push(kind);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.position = None;
+        self.kinds.clear();
+    }
+
+    fn message(&self) -> String {
+        let expected = self
+            .kinds
+            .iter()
+            .map(|kind| format!("{kind:?}"))
+            .collect::<Vec<_>>();
+        format!("expected {}", expected.join(" or "))
+    }
 }
 
 /// A start point in the parser event stream.
@@ -46,6 +88,10 @@ pub enum ParserError {
     InvalidNodeKind { position: u32, kind: SyntaxKind },
     InvalidMarkerEvent { position: u32 },
     ForeignMarker,
+    MissingDiagnosticSource,
+    InvalidDiagnosticSpan,
+    EmptyExpectedSet,
+    InvalidExpectedKind { kind: SyntaxKind },
 }
 
 impl<'src, 'tokens> Parser<'src, 'tokens> {
@@ -88,10 +134,32 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             tokens,
             position: 0,
             events: Vec::new(),
+            diagnostic_source: None,
+            expected: ExpectedSet::default(),
+            reported_expected_at: None,
+            reported_expected_event: None,
             marker_owner: Rc::new(()),
             active_markers: Rc::new(RefCell::new(Vec::new())),
             marker_failures: Rc::new(RefCell::new(Vec::new())),
         })
+    }
+
+    /// Creates a parser whose syntax diagnostics are bound to one snapshot file.
+    pub fn new_for_file(
+        file: &'src SnapshotFile,
+        tokens: &'tokens [Token],
+    ) -> Result<Self, ParserError> {
+        let source_file = file.source().as_ref();
+        let mut parser = Self::new(source_file.text(), tokens)?;
+        parser.diagnostic_source = Some(DiagnosticSource {
+            file: source_file,
+            source_ref: SourceRef {
+                path: file.path().to_owned(),
+                package: file.package().map(str::to_owned),
+                snapshot: file.document_version(),
+            },
+        });
+        Ok(parser)
     }
 
     pub fn position(&self) -> usize {
@@ -140,15 +208,53 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
     }
 
     pub fn eat(&mut self, kind: SyntaxKind) -> bool {
-        if self.current_token().is_none() || !self.at(kind) {
+        let Some(n_raw) = raw_token_count(kind) else {
             return false;
-        }
-        self.bump();
-        true
+        };
+        self.bump_as(kind, n_raw)
     }
 
     pub fn eat_nl(&mut self) -> bool {
         self.eat(SyntaxKind::NEWLINE)
+    }
+
+    /// Consumes the expected token, or emits one `EXPECTED_TOKEN` diagnostic.
+    ///
+    /// The parser must have been created with [`Parser::new_for_file`] before
+    /// this method can emit a source-bound diagnostic.
+    pub fn expect(&mut self, kind: SyntaxKind) -> Result<bool, ParserError> {
+        if !kind.is_token() {
+            return Err(ParserError::InvalidExpectedKind { kind });
+        }
+        if self.eat(kind) {
+            return Ok(true);
+        }
+        self.expected.record(self.position, kind);
+        self.emit_expected_token()?;
+        Ok(false)
+    }
+
+    /// Consumes one of the given kinds, or emits a diagnostic listing them.
+    pub fn expect_any(&mut self, kinds: &[SyntaxKind]) -> Result<bool, ParserError> {
+        if kinds.is_empty() {
+            return Err(ParserError::EmptyExpectedSet);
+        }
+        if let Some(kind) = kinds.iter().find(|kind| !kind.is_token()) {
+            return Err(ParserError::InvalidExpectedKind { kind: *kind });
+        }
+        for kind in kinds {
+            if let Some(n_raw) = raw_token_count(*kind)
+                && self.can_bump_as(*kind, n_raw)
+            {
+                self.bump_as(*kind, n_raw);
+                return Ok(true);
+            }
+        }
+        for kind in kinds {
+            self.expected.record(self.position, *kind);
+        }
+        self.emit_expected_token()?;
+        Ok(false)
     }
 
     /// Emits the current raw token unchanged and advances the cursor.
@@ -166,26 +272,32 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
 
     /// Emits one grammar token, optionally gluing several joint raw tokens.
     pub fn bump_as(&mut self, kind: SyntaxKind, n_raw: u8) -> bool {
-        let count = usize::from(n_raw);
-        if count == 0 {
+        if !self.can_bump_as(kind, n_raw) {
             return false;
         }
+        let count = usize::from(n_raw);
+        let end = self.position + count;
+        self.events.push(Event::Token { kind, n_raw });
+        self.position = end;
+        self.expected.clear();
+        self.reported_expected_at = None;
+        self.reported_expected_event = None;
+        true
+    }
+
+    fn can_bump_as(&self, kind: SyntaxKind, n_raw: u8) -> bool {
+        let count = usize::from(n_raw);
         let Some(end) = self.position.checked_add(count) else {
             return false;
         };
-        if end > self.tokens.len()
-            || (count > 1
+        count > 0
+            && end <= self.tokens.len()
+            && !(count > 1
                 && self.tokens[self.position..end]
                     .iter()
                     .any(|token| token.kind == SyntaxKind::EOF))
-            || validate_token_mapping(self.tokens, self.position, end, kind).is_err()
-            || validate_joint_tokens(self.tokens, self.position, end).is_err()
-        {
-            return false;
-        }
-        self.events.push(Event::Token { kind, n_raw });
-        self.position = end;
-        true
+            && validate_token_mapping(self.tokens, self.position, end, kind).is_ok()
+            && validate_joint_tokens(self.tokens, self.position, end).is_ok()
     }
 
     pub fn start(&mut self) -> Marker {
@@ -211,6 +323,55 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         self.events.push(Event::Error {
             diag: Box::new(diagnostic),
         });
+    }
+
+    fn emit_expected_token(&mut self) -> Result<(), ParserError> {
+        if self.reported_expected_at == Some(self.position) {
+            let event_index =
+                self.reported_expected_event
+                    .ok_or(ParserError::InvalidMarkerEvent {
+                        position: u32::try_from(self.position).unwrap_or(u32::MAX),
+                    })?;
+            let message = self.expected.message();
+            let Some(Event::Error { diag }) = self.events.get_mut(event_index) else {
+                return Err(ParserError::InvalidMarkerEvent {
+                    position: u32::try_from(self.position).unwrap_or(u32::MAX),
+                });
+            };
+            diag.message.clone_from(&message);
+            diag.primary_label = message;
+            return Ok(());
+        }
+        let Some(context) = &self.diagnostic_source else {
+            return Err(ParserError::MissingDiagnosticSource);
+        };
+        let range = self.current_token().map_or_else(
+            || {
+                TextSize::from_usize(self.source.len())
+                    .map(TextRange::empty)
+                    .ok_or(ParserError::InvalidDiagnosticSpan)
+            },
+            |token| Ok(token.range),
+        )?;
+        let location = Location::from_decoded_source(
+            context.source_ref.clone(),
+            Span::new(context.file.id(), range),
+            context.file,
+        )
+        .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        let message = self.expected.message();
+        let mut diagnostic = Diagnostic::new(
+            Code::ExpectedToken,
+            Severity::Error,
+            &message,
+            Some(location),
+        );
+        diagnostic.primary_label = message;
+        let event_index = self.events.len();
+        self.emit_error(diagnostic);
+        self.reported_expected_at = Some(self.position);
+        self.reported_expected_event = Some(event_index);
+        Ok(())
     }
 
     pub fn into_events(self) -> Result<Vec<Event>, ParserError> {
@@ -341,6 +502,19 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
     }
 }
 
+fn raw_token_count(kind: SyntaxKind) -> Option<u8> {
+    match kind {
+        SyntaxKind::SHR
+        | SyntaxKind::GE
+        | SyntaxKind::COLON2
+        | SyntaxKind::AMP2
+        | SyntaxKind::PIPE2 => Some(2),
+        SyntaxKind::SHR_EQ => Some(3),
+        _ if kind.is_token() => Some(1),
+        _ => None,
+    }
+}
+
 fn remove_active_marker(active_markers: &RefCell<Vec<u32>>, position: u32) {
     active_markers
         .borrow_mut()
@@ -436,16 +610,24 @@ mod tests {
     use crate::{GreenElement, NodeCache, build_green_tree, lex};
 
     fn lex_text(text: &str) -> crate::LexOutput {
+        lex_file(text).1
+    }
+
+    fn lex_file(text: &str) -> (SnapshotFile, crate::LexOutput) {
+        lex_file_with_bom(text, false)
+    }
+
+    fn lex_file_with_bom(text: &str, had_bom: bool) -> (SnapshotFile, crate::LexOutput) {
         let file_id = FileId::new(1);
-        let source = Arc::new(SourceFile::new(file_id, text, false).expect("source"));
-        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+        let source = Arc::new(SourceFile::new(file_id, text, had_bom).expect("source"));
+        let snapshot_file = SnapshotFile::new(
             source,
             "src/main.sai",
             Some("sai:test@0.1.0".to_owned()),
             None,
-        )])
-        .expect("snapshot");
-        lex(&snapshot, file_id).expect("lex")
+        );
+        let snapshot = WorkspaceSnapshot::new([snapshot_file.clone()]).expect("snapshot");
+        (snapshot_file, lex(&snapshot, file_id).expect("lex"))
     }
 
     #[test]
@@ -463,6 +645,180 @@ mod tests {
         assert!(parser.eat_nl());
         assert_eq!(parser.current(), SyntaxKind::EOF);
         assert_eq!(parser.position(), 2);
+    }
+
+    #[test]
+    fn expect_emits_a_snapshot_bound_diagnostic_without_consuming_the_token() {
+        let source = "name";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let file = parser.start();
+
+        assert!(
+            !parser
+                .expect(SyntaxKind::L_PAREN)
+                .expect("diagnostic source is available")
+        );
+        assert_eq!(parser.position(), 0);
+        assert_eq!(parser.bump(), SyntaxKind::LIDENT);
+        assert!(parser.eat_nl());
+        assert_eq!(parser.bump(), SyntaxKind::EOF);
+        file.complete(&mut parser, SyntaxKind::SOURCE_FILE)
+            .expect("valid node marker");
+
+        let events = parser.into_events().expect("all input was consumed");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("tree builds with a parser diagnostic");
+        assert_eq!(output.errors.len(), 1);
+        let diagnostic = &output.errors[0];
+        assert_eq!(diagnostic.code, Code::ExpectedToken);
+        let location = diagnostic.primary().expect("primary source location");
+        assert_eq!(location.file.path, "src/main.sai");
+        assert_eq!(
+            location.span.range,
+            TextRange::new(TextSize::new(0), TextSize::new(4)).unwrap()
+        );
+    }
+
+    #[test]
+    fn expect_diagnostic_locations_restore_a_leading_bom_offset() {
+        let source = "name";
+        let (snapshot_file, lexed) = lex_file_with_bom(source, true);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let file = parser.start();
+
+        assert!(!parser.expect(SyntaxKind::L_PAREN).expect("file context"));
+        assert_eq!(parser.bump(), SyntaxKind::LIDENT);
+        assert!(parser.eat_nl());
+        assert_eq!(parser.bump(), SyntaxKind::EOF);
+        file.complete(&mut parser, SyntaxKind::SOURCE_FILE)
+            .expect("valid node marker");
+
+        let events = parser.into_events().expect("all input was consumed");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("tree builds with a parser diagnostic");
+        assert_eq!(
+            output.errors[0]
+                .primary()
+                .expect("primary source location")
+                .span
+                .range,
+            TextRange::new(TextSize::new(3), TextSize::new(7)).unwrap()
+        );
+    }
+
+    #[test]
+    fn expect_diagnostic_locations_map_past_malformed_utf8_bytes() {
+        let file_id = FileId::new(2);
+        let source_file =
+            Arc::new(SourceFile::decode(file_id, b"\xEF\xBB\xBF\xFFname").expect("decoded source"));
+        let snapshot_file = SnapshotFile::new(
+            source_file.clone(),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        );
+        let snapshot = WorkspaceSnapshot::new([snapshot_file.clone()]).expect("snapshot");
+        let lexed = lex(&snapshot, file_id).expect("lex");
+        let source = source_file.text();
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let file = parser.start();
+
+        assert_eq!(parser.bump(), SyntaxKind::ERROR);
+        assert!(!parser.expect(SyntaxKind::L_PAREN).expect("file context"));
+        assert_eq!(parser.bump(), SyntaxKind::LIDENT);
+        assert!(parser.eat_nl());
+        assert_eq!(parser.bump(), SyntaxKind::EOF);
+        file.complete(&mut parser, SyntaxKind::SOURCE_FILE)
+            .expect("valid node marker");
+
+        let events = parser.into_events().expect("all input was consumed");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("tree builds with a parser diagnostic");
+        assert_eq!(
+            output.errors[0]
+                .primary()
+                .expect("primary source location")
+                .span
+                .range,
+            TextRange::new(TextSize::new(4), TextSize::new(8)).unwrap()
+        );
+    }
+
+    #[test]
+    fn expect_requires_snapshot_context_to_emit_a_diagnostic() {
+        let source = "name";
+        let lexed = lex_text(source);
+        let mut parser = Parser::new(source, &lexed.tokens).expect("valid lexer token stream");
+
+        assert_eq!(
+            parser.expect(SyntaxKind::L_PAREN),
+            Err(ParserError::MissingDiagnosticSource)
+        );
+        assert_eq!(parser.position(), 0);
+    }
+
+    #[test]
+    fn expect_any_reports_all_alternatives_once() {
+        let source = "name";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let file = parser.start();
+
+        assert!(
+            !parser
+                .expect_any(&[SyntaxKind::L_PAREN, SyntaxKind::L_BRACKET])
+                .expect("diagnostic source is available")
+        );
+        assert!(
+            !parser
+                .expect(SyntaxKind::R_PAREN)
+                .expect("same-position diagnostic is suppressed")
+        );
+        assert_eq!(parser.bump(), SyntaxKind::LIDENT);
+        assert!(parser.eat_nl());
+        assert_eq!(parser.bump(), SyntaxKind::EOF);
+        file.complete(&mut parser, SyntaxKind::SOURCE_FILE)
+            .expect("valid node marker");
+
+        let events = parser.into_events().expect("all input was consumed");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("tree builds with a parser diagnostic");
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(
+            output.errors[0].message,
+            "expected L_PAREN or L_BRACKET or R_PAREN"
+        );
+    }
+
+    #[test]
+    fn expected_token_apis_reject_empty_sets_and_node_kinds() {
+        let source = "name";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+
+        assert_eq!(parser.expect_any(&[]), Err(ParserError::EmptyExpectedSet));
+        assert_eq!(
+            parser.expect(SyntaxKind::SOURCE_FILE),
+            Err(ParserError::InvalidExpectedKind {
+                kind: SyntaxKind::SOURCE_FILE
+            })
+        );
+        assert_eq!(
+            parser.expect_any(&[SyntaxKind::L_PAREN, SyntaxKind::SOURCE_FILE]),
+            Err(ParserError::InvalidExpectedKind {
+                kind: SyntaxKind::SOURCE_FILE
+            })
+        );
     }
 
     #[test]
@@ -534,6 +890,31 @@ mod tests {
         };
         assert_eq!(token.kind(), SyntaxKind::SHR);
         assert_eq!(token.text(), ">>");
+    }
+
+    #[test]
+    fn expect_consumes_a_composite_from_its_joint_raw_tokens() {
+        let source = ">>";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let file = parser.start();
+
+        assert!(parser.expect(SyntaxKind::SHR).expect("file context"));
+        assert!(parser.eat_nl());
+        assert_eq!(parser.bump(), SyntaxKind::EOF);
+        file.complete(&mut parser, SyntaxKind::SOURCE_FILE)
+            .expect("valid node marker");
+
+        let events = parser.into_events().expect("all input was consumed");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("joint raw tokens build one composite");
+        let GreenElement::Token(token) = &output.root.children()[0] else {
+            panic!("expected the composite token");
+        };
+        assert_eq!(token.kind(), SyntaxKind::SHR);
+        assert!(output.errors.is_empty());
     }
 
     #[test]

@@ -64,6 +64,7 @@ define_codes! {
     NoDoubleColon => "NO_DOUBLE_COLON",
     UseAndOr => "USE_AND_OR",
     UnexpectedNewline => "UNEXPECTED_NEWLINE",
+    ExpectedToken => "EXPECTED_TOKEN",
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1585,6 +1586,7 @@ mod tests {
             Code::from_name("UNEXPECTED_CHARACTER"),
             Some(Code::UnexpectedCharacter)
         );
+        assert_eq!(Code::from_name("EXPECTED_TOKEN"), Some(Code::ExpectedToken));
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));
     }
