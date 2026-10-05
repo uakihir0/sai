@@ -944,6 +944,9 @@ impl Parser<'_, '_> {
                 if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
                     break;
                 }
+                if self.position != position && self.at_confirmed_block_boundary() {
+                    continue;
+                }
                 if !statement_ends_with_expression && self.position == position {
                     self.recover_to_block_separator()?;
                     while self.eat_nl() {}
@@ -1235,6 +1238,19 @@ impl Parser<'_, '_> {
         let mut previous_non_associative =
             (lhs.kind() == SyntaxKind::RANGE_EXPR).then_some(NonAssociativeOperator::Range);
         loop {
+            if self.at_any(&[
+                SyntaxKind::DOT,
+                SyntaxKind::L_PAREN,
+                SyntaxKind::L_BRACKET,
+                SyntaxKind::QUESTION,
+            ]) {
+                const POSTFIX_BINDING_POWER: u8 = 25;
+                if POSTFIX_BINDING_POWER <= min_bp {
+                    break;
+                }
+                lhs = self.postfix_expr(lhs)?;
+                continue;
+            }
             if self.at(SyntaxKind::AS_KW) {
                 const CAST_BINDING_POWER: u8 = 23;
                 if CAST_BINDING_POWER <= min_bp {
@@ -1249,17 +1265,6 @@ impl Parser<'_, '_> {
                 lhs = cast.complete(self, SyntaxKind::CAST_EXPR)?;
                 previous_non_associative = None;
                 continue;
-            }
-            if self.at_any(&[
-                SyntaxKind::DOT,
-                SyntaxKind::L_PAREN,
-                SyntaxKind::L_BRACKET,
-                SyntaxKind::QUESTION,
-            ]) {
-                return Err(ParserError::UnsupportedSyntax {
-                    position: self.position,
-                    kind: self.current(),
-                });
             }
             let Some(operator) = self.infix_operator() else {
                 break;
@@ -1621,12 +1626,14 @@ impl Parser<'_, '_> {
                 expression.complete(self, SyntaxKind::UNSAFE_BLOCK_EXPR)
             }
             SyntaxKind::DOT2 | SyntaxKind::DOT2EQ => self.prefix_range_expr(),
-            SyntaxKind::DOT if matches!(self.nth(1), SyntaxKind::UIDENT | SyntaxKind::AWAIT_KW) => {
+            SyntaxKind::DOT if self.nth(1) == SyntaxKind::UIDENT => self.implicit_member_expr(),
+            SyntaxKind::DOT if self.nth(1) == SyntaxKind::AWAIT_KW => {
                 Err(ParserError::UnsupportedSyntax {
                     position: self.position,
                     kind: SyntaxKind::DOT,
                 })
             }
+            SyntaxKind::L_BRACKET => self.array_expr(),
             SyntaxKind::RETURN_KW => self.return_expr(),
             SyntaxKind::IF_KW
             | SyntaxKind::MATCH_KW
@@ -1638,13 +1645,337 @@ impl Parser<'_, '_> {
             | SyntaxKind::MOVE_KW
             | SyntaxKind::FN_KW
             | SyntaxKind::ASYNC_KW
-            | SyntaxKind::FSTRING_START
-            | SyntaxKind::L_BRACKET => Err(ParserError::UnsupportedSyntax {
+            | SyntaxKind::FSTRING_START => Err(ParserError::UnsupportedSyntax {
                 position: self.position,
                 kind: self.current(),
             }),
             _ => self.missing_expression(),
         }
+    }
+
+    fn implicit_member_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        self.bump();
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME_REF)?;
+        expression.complete(self, SyntaxKind::IMPLICIT_MEMBER_EXPR)
+    }
+
+    fn postfix_expr(&mut self, lhs: CompletedMarker) -> Result<CompletedMarker, ParserError> {
+        let expression = lhs.precede(self);
+        let result = (|| {
+            let kind = match self.current() {
+                SyntaxKind::DOT => {
+                    self.bump();
+                    if self.at_any(IDENT_KINDS) {
+                        self.name_node(IDENT_KINDS, SyntaxKind::NAME_REF)?;
+                        if self.at(SyntaxKind::LT) {
+                            self.maybe_generic_args_expr()?;
+                        }
+                        SyntaxKind::FIELD_EXPR
+                    } else if self.at(SyntaxKind::INT) {
+                        let range = self
+                            .current_token()
+                            .map(|token| token.range)
+                            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+                        let text = self.current_text();
+                        let valid_decimal_index = !text.is_empty()
+                            && text.bytes().all(|byte| byte.is_ascii_digit())
+                            && (text == "0" || !text.starts_with('0'));
+                        self.bump();
+                        if !valid_decimal_index {
+                            self.emit_parser_diagnostic(
+                                sai_diagnostics::Code::InvalidTupleIndex,
+                                range,
+                                "tuple index must be plain decimal digits without leading zeroes",
+                            )?;
+                        }
+                        SyntaxKind::TUPLE_INDEX_EXPR
+                    } else if self.eat(SyntaxKind::AWAIT_KW) {
+                        SyntaxKind::AWAIT_EXPR
+                    } else {
+                        self.expect_any(&[
+                            SyntaxKind::LIDENT,
+                            SyntaxKind::UIDENT,
+                            SyntaxKind::INT,
+                            SyntaxKind::AWAIT_KW,
+                        ])?;
+                        SyntaxKind::FIELD_EXPR
+                    }
+                }
+                SyntaxKind::L_PAREN => {
+                    self.arg_list()?;
+                    SyntaxKind::CALL_EXPR
+                }
+                SyntaxKind::L_BRACKET => {
+                    self.bump();
+                    self.expr_bp(0)?;
+                    self.expect(SyntaxKind::R_BRACKET)?;
+                    SyntaxKind::INDEX_EXPR
+                }
+                SyntaxKind::QUESTION => {
+                    self.bump();
+                    SyntaxKind::TRY_EXPR
+                }
+                _ => {
+                    return Err(ParserError::InvalidTokenStream {
+                        position: self.position,
+                    });
+                }
+            };
+            Ok(kind)
+        })();
+        match result {
+            Ok(kind) => expression.complete(self, kind),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn array_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let array = self.start();
+        self.bump();
+        let result = (|| {
+            while !self.at_any(&[
+                SyntaxKind::R_BRACKET,
+                SyntaxKind::R_BRACE,
+                SyntaxKind::R_PAREN,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]) {
+                let position = self.position;
+                let expression = self.expr_bp(0)?;
+                if expression.kind() == SyntaxKind::ERROR
+                    && self.position == position
+                    && self.recover_to_list_separator()?
+                {
+                    break;
+                }
+                if self.eat(SyntaxKind::COMMA) {
+                    continue;
+                }
+                if self.at_any(&[
+                    SyntaxKind::R_BRACKET,
+                    SyntaxKind::R_BRACE,
+                    SyntaxKind::R_PAREN,
+                    SyntaxKind::NEWLINE,
+                    SyntaxKind::EOF,
+                ]) {
+                    break;
+                }
+                self.expect(SyntaxKind::COMMA)?;
+                if self.position == position && self.recover_to_list_separator()? {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::R_BRACKET)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => array.complete(self, SyntaxKind::ARRAY_EXPR),
+            Err(error) => {
+                array.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn arg_list(&mut self) -> Result<(), ParserError> {
+        let args = self.start();
+        self.expect(SyntaxKind::L_PAREN)?;
+        let result = (|| {
+            let mut base_arg_ranges = Vec::new();
+            while !self.at_any(&[
+                SyntaxKind::R_PAREN,
+                SyntaxKind::R_BRACE,
+                SyntaxKind::R_BRACKET,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]) {
+                if self.argument_starts_after_commas() {
+                    self.report_nonfinal_base_args(&mut base_arg_ranges)?;
+                }
+                let position = self.position;
+                if !self.arg(&mut base_arg_ranges)? && self.recover_to_list_separator()? {
+                    break;
+                }
+                if self.eat(SyntaxKind::COMMA) {
+                    continue;
+                }
+                if self.at_any(&[
+                    SyntaxKind::R_PAREN,
+                    SyntaxKind::R_BRACE,
+                    SyntaxKind::R_BRACKET,
+                    SyntaxKind::NEWLINE,
+                    SyntaxKind::EOF,
+                ]) {
+                    break;
+                }
+                if self.argument_starts_after_commas() {
+                    self.report_nonfinal_base_args(&mut base_arg_ranges)?;
+                }
+                self.expect(SyntaxKind::COMMA)?;
+                if self.position == position && self.recover_to_list_separator()? {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::R_PAREN)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                args.complete(self, SyntaxKind::ARG_LIST)?;
+                Ok(())
+            }
+            Err(error) => {
+                args.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn argument_starts_after_commas(&self) -> bool {
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::COMMA)
+        {
+            position += 1;
+        }
+        self.tokens
+            .get(position)
+            .is_some_and(|token| EXPRESSION_START_KINDS.contains(&token.kind))
+    }
+
+    fn report_nonfinal_base_args(
+        &mut self,
+        base_arg_ranges: &mut [(sai_vfs::TextRange, bool)],
+    ) -> Result<(), ParserError> {
+        for (range, is_nonfinal) in base_arg_ranges {
+            if *is_nonfinal {
+                continue;
+            }
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::BaseArgNotLast,
+                *range,
+                "record update argument must be last",
+            )?;
+            *is_nonfinal = true;
+        }
+        Ok(())
+    }
+
+    fn arg(
+        &mut self,
+        base_arg_ranges: &mut Vec<(sai_vfs::TextRange, bool)>,
+    ) -> Result<bool, ParserError> {
+        if self.at(SyntaxKind::DOT2) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            let base_arg = self.start();
+            self.bump();
+            if let Err(error) = self.expr_bp(0) {
+                base_arg.abandon(self)?;
+                return Err(error);
+            }
+            base_arg.complete(self, SyntaxKind::BASE_ARG)?;
+            base_arg_ranges.push((range, false));
+            return Ok(true);
+        }
+        if self.at(SyntaxKind::LIDENT) && self.nth(1) == SyntaxKind::COLON {
+            let named_arg = self.start();
+            self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME_REF)?;
+            self.expect(SyntaxKind::COLON)?;
+            if let Err(error) = self.expr_bp(0) {
+                named_arg.abandon(self)?;
+                return Err(error);
+            }
+            named_arg.complete(self, SyntaxKind::NAMED_ARG)?;
+            return Ok(true);
+        }
+
+        let arg = self.start();
+        let start_position = self.position;
+        let expression = match self.expr_bp(0) {
+            Ok(expression) => expression,
+            Err(error) => {
+                arg.abandon(self)?;
+                return Err(error);
+            }
+        };
+        if expression.kind() == SyntaxKind::ERROR && self.position == start_position {
+            arg.abandon(self)?;
+            return Ok(false);
+        }
+        arg.complete(self, SyntaxKind::ARG)?;
+        Ok(true)
+    }
+
+    fn at_physical_line_start(&self) -> bool {
+        self.current_token()
+            .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+    }
+
+    fn at_confirmed_block_boundary(&self) -> bool {
+        self.at_physical_line_start()
+            && (self.at_any(&[
+                SyntaxKind::LET_KW,
+                SyntaxKind::VAR_KW,
+                SyntaxKind::ASSERT_KW,
+            ]) || self.line_starts_top_level_item())
+    }
+
+    fn recover_to_list_separator(&mut self) -> Result<bool, ParserError> {
+        let error = self.start();
+        let mut delimiters = Vec::new();
+        let mut consumed = false;
+        let mut reached_line_break = false;
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if delimiters.is_empty() && kind == SyntaxKind::COMMA {
+                break;
+            }
+            let matching_nested_close = match kind {
+                SyntaxKind::R_PAREN | SyntaxKind::R_BRACKET | SyntaxKind::R_BRACE => {
+                    let expected_open = match kind {
+                        SyntaxKind::R_PAREN => SyntaxKind::L_PAREN,
+                        SyntaxKind::R_BRACKET => SyntaxKind::L_BRACKET,
+                        SyntaxKind::R_BRACE => SyntaxKind::L_BRACE,
+                        _ => unreachable!("matched a closing delimiter"),
+                    };
+                    if delimiters.last() != Some(&expected_open) {
+                        break;
+                    }
+                    delimiters.pop();
+                    true
+                }
+                _ => false,
+            };
+            if kind == SyntaxKind::NEWLINE || self.at_confirmed_block_boundary() {
+                reached_line_break = true;
+                break;
+            }
+            if !matching_nested_close {
+                match kind {
+                    SyntaxKind::L_PAREN | SyntaxKind::L_BRACKET | SyntaxKind::L_BRACE => {
+                        delimiters.push(kind);
+                    }
+                    _ => {}
+                }
+            }
+            self.bump();
+            consumed = true;
+        }
+        if consumed {
+            error.complete(self, SyntaxKind::ERROR)?;
+        } else {
+            error.abandon(self)?;
+        }
+        Ok(reached_line_break)
     }
 
     fn paren_or_tuple_expr(&mut self) -> Result<CompletedMarker, ParserError> {
@@ -2663,6 +2994,9 @@ impl Parser<'_, '_> {
         while !self.at(SyntaxKind::EOF) {
             let kind = self.current();
             if brace_depth == 0 && kind == SyntaxKind::R_BRACE {
+                break;
+            }
+            if brace_depth == 0 && self.at_confirmed_block_boundary() {
                 break;
             }
             if paren_depth == 0

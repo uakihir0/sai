@@ -501,6 +501,18 @@ pub fn build_green_tree(
     {
         return Err(TreeBuildError::InvalidSourcePartition);
     }
+    errors.sort_by(|left, right| {
+        let location_key = |diagnostic: &Diagnostic| {
+            diagnostic
+                .primary()
+                .map(|location| (location.span.range.start(), location.span.range.end()))
+        };
+        location_key(left)
+            .cmp(&location_key(right))
+            .then_with(|| left.severity.cmp(&right.severity))
+            .then_with(|| left.code.as_str().cmp(right.code.as_str()))
+            .then_with(|| left.message.cmp(&right.message))
+    });
     Ok(TreeBuildOutput { root, errors })
 }
 
@@ -512,6 +524,9 @@ fn node_delimiters(kind: SyntaxKind) -> Option<(SyntaxKind, SyntaxKind)> {
     match kind {
         SyntaxKind::ARG_LIST | SyntaxKind::PARAM_LIST | SyntaxKind::CTOR_PAT_ARGS => {
             Some((SyntaxKind::L_PAREN, SyntaxKind::R_PAREN))
+        }
+        SyntaxKind::ARRAY_EXPR | SyntaxKind::INDEX_EXPR => {
+            Some((SyntaxKind::L_BRACKET, SyntaxKind::R_BRACKET))
         }
         SyntaxKind::PAREN_TYPE
         | SyntaxKind::TUPLE_TYPE

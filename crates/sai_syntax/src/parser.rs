@@ -1473,30 +1473,48 @@ mod tests {
     }
 
     #[test]
-    fn function_parser_keeps_unimplemented_postfix_forms_explicit() {
-        for (source, kind) in [
-            ("fn f() { g() }\n", SyntaxKind::L_PAREN),
-            ("fn f() { g.field }\n", SyntaxKind::DOT),
-            ("fn f() { g[0] }\n", SyntaxKind::L_BRACKET),
-            ("fn f() { g? }\n", SyntaxKind::QUESTION),
-            ("fn f() { .Some }\n", SyntaxKind::DOT),
-            ("fn f() { g<I32>() }\n", SyntaxKind::L_PAREN),
-            ("fn f() { g<I32,>() }\n", SyntaxKind::L_PAREN),
-            ("fn f() { g<I32\n>() }\n", SyntaxKind::L_PAREN),
-        ] {
-            let (snapshot_file, lexed) = lex_file(source);
-            let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
-                .expect("valid lexer token stream");
+    fn function_parser_builds_postfix_and_array_expressions() {
+        let source = concat!(
+            "fn f() {\n",
+            "let call = g<I32>(1, name: 2)\n",
+            "let method = value.convert<U32>(4)\n",
+            "let field = value.field\n",
+            "let tuple = value.0\n",
+            "let index = values[0]\n",
+            "let propagated = result?\n",
+            "let variant = .Some(1)\n",
+            "let array = [1, 2,]\n",
+            "let awaited = future.await\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let kinds = root
+            .descendants()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
 
-            assert!(matches!(
-                parser.parse_source_file(),
-                Err(ParserError::UnsupportedSyntax { kind: found, .. }) if found == kind
-            ));
-            assert!(matches!(
-                parser.into_events(),
-                Err(ParserError::UnconsumedTokens { .. })
-            ));
+        for (kind, expected) in [
+            (SyntaxKind::CALL_EXPR, 3),
+            (SyntaxKind::FIELD_EXPR, 2),
+            (SyntaxKind::TUPLE_INDEX_EXPR, 1),
+            (SyntaxKind::INDEX_EXPR, 1),
+            (SyntaxKind::TRY_EXPR, 1),
+            (SyntaxKind::ARRAY_EXPR, 1),
+            (SyntaxKind::AWAIT_EXPR, 1),
+            (SyntaxKind::IMPLICIT_MEMBER_EXPR, 1),
+            (SyntaxKind::GENERIC_ARG_LIST, 2),
+            (SyntaxKind::ARG_LIST, 3),
+            (SyntaxKind::ARG, 3),
+            (SyntaxKind::NAMED_ARG, 1),
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|found| **found == kind).count(),
+                expected,
+                "unexpected count for {kind:?}"
+            );
         }
+        assert!(output.errors.is_empty());
 
         for source in [
             "fn f() { g<I32> }\n",
@@ -1560,6 +1578,271 @@ mod tests {
         parser
             .into_events()
             .expect("fallback consumes the malformed comparison expression");
+    }
+
+    #[test]
+    fn postfix_syntax_reports_tuple_indices_and_nonfinal_base_arguments() {
+        let output = parse_file("fn f() { value.0x10\nRecord(..base, field: value)\n}\n");
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidTupleIndex, Code::BaseArgNotLast]
+        );
+
+        let other_invalid_indices = parse_file("fn f() { value.01\nvalue.1_0\n}\n");
+        assert_eq!(
+            other_invalid_indices
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidTupleIndex)
+                .count(),
+            2,
+            "leading zeroes and underscores are invalid tuple-index spellings"
+        );
+
+        let final_base = parse_file("fn f() { Record(field: value, ..base) }\n");
+        assert!(
+            final_base
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::BaseArgNotLast),
+            "a final base argument must be accepted"
+        );
+
+        let followed_by_multiple =
+            parse_file("fn f() { Record(..base, field: value, other: value) }\n");
+        assert_eq!(
+            followed_by_multiple
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::BaseArgNotLast)
+                .count(),
+            1,
+            "each non-final base argument should be diagnosed exactly once"
+        );
+
+        let followed_by_base = parse_file("fn f() { Record(..first, ..second) }\n");
+        assert_eq!(
+            followed_by_base
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::BaseArgNotLast],
+            "only the earlier base argument is non-final"
+        );
+
+        let missing_comma = parse_file("fn f() { Record(..base field: value) }\n");
+        assert_eq!(
+            missing_comma
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::BaseArgNotLast, Code::ExpectedToken],
+            "a following argument without a comma still makes the base argument non-final"
+        );
+
+        let malformed_later_arg = parse_file("fn f() { Record(..base, field: ) }\n");
+        assert_eq!(
+            malformed_later_arg
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::BaseArgNotLast, Code::ExpectedExpression],
+            "diagnostics must remain in source-span order when a later argument is malformed"
+        );
+
+        let empty_argument_before_later_arg = parse_file("fn f() { Record(..base, , field: ) }\n");
+        assert_eq!(
+            empty_argument_before_later_arg
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                Code::BaseArgNotLast,
+                Code::ExpectedExpression,
+                Code::ExpectedExpression
+            ],
+            "base-argument diagnostics precede errors in empty and later arguments"
+        );
+
+        let malformed_base_expression = parse_file("fn f() { Record(..call(1 + ), field: ) }\n");
+        let diagnostic_ranges = malformed_base_expression
+            .errors
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("parser diagnostic has a primary span")
+                    .span
+                    .range
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            diagnostic_ranges.windows(2).all(|pair| pair[0] <= pair[1]),
+            "tree-build diagnostics should be sorted by source span"
+        );
+        assert_eq!(
+            malformed_base_expression.errors[0].code,
+            Code::BaseArgNotLast,
+            "an earlier base-argument diagnostic should precede errors in its expression"
+        );
+    }
+
+    #[test]
+    fn malformed_call_arguments_recover_without_empty_arg_nodes() {
+        let output = parse_file("fn f() { call(, 1) }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+        );
+        assert!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ARG)
+                .all(|node| !node.text_range().is_empty())
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ARG)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_nested_list_recovery_preserves_enclosing_closers() {
+        let calls = parse_file("fn f() { call(@( }\nfn g() {}\n");
+        let call_root = crate::SyntaxNode::new_root(calls.root);
+        assert_eq!(
+            call_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "an unmatched parenthesis in a call argument must not consume the block close"
+        );
+
+        let mismatched = parse_file("fn f() { call(@([) }\nfn g() {}\n");
+        let mismatched_root = crate::SyntaxNode::new_root(mismatched.root);
+        assert_eq!(
+            mismatched_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "a mismatched inner bracket must not consume the call's closing parenthesis"
+        );
+
+        let arrays = parse_file("fn f() { let first = [@( ]\nlet second = 1\n}\n");
+        let array_root = crate::SyntaxNode::new_root(arrays.root);
+        assert_eq!(
+            array_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2,
+            "an unmatched parenthesis in an array element must not consume the array close"
+        );
+
+        let newline = parse_file("fn f() { call(@(\nlet later = 2\n}\nfn g() {}\n");
+        let newline_root = crate::SyntaxNode::new_root(newline.root);
+        assert_eq!(
+            newline_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1,
+            "list recovery must stop at a statement-ending newline even inside an unmatched group: {newline_root:?}; errors={:?}",
+            newline.errors
+        );
+        assert_eq!(
+            newline_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+
+        let multiline_continuation =
+            parse_file("fn f() {\ncall(@(value,\n2), 3)\nlet later = 4\n}\n");
+        let continuation_root = crate::SyntaxNode::new_root(multiline_continuation.root);
+        assert_eq!(
+            continuation_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ARG)
+                .count(),
+            1,
+            "recovery must pass a comma-continued line inside a balanced nested group"
+        );
+        assert_eq!(
+            continuation_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1,
+            "the statement after the recovered call must remain parseable"
+        );
+        assert!(
+            multiline_continuation
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::ExpectedExpression),
+            "a recoverable malformed argument should not cause cascading delimiter errors"
+        );
+
+        let multiline_nested_close =
+            parse_file("fn f() {\ncall(@(value\n), 3)\nlet later = 4\n}\n");
+        let nested_close_root = crate::SyntaxNode::new_root(multiline_nested_close.root);
+        assert_eq!(
+            nested_close_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ARG)
+                .count(),
+            1,
+            "a matching nested closer on a new line must not close the outer call"
+        );
+        assert_eq!(
+            nested_close_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert!(
+            multiline_nested_close
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::ExpectedExpression),
+            "the nested closer should prevent cascading call diagnostics"
+        );
+
+        let balanced = parse_file("fn f() { call(@(value), 1)\nlet later = 2\n}\n");
+        let balanced_root = crate::SyntaxNode::new_root(balanced.root);
+        assert_eq!(
+            balanced_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ARG)
+                .count(),
+            1,
+            "balanced inner groups must be skipped before synchronizing on the call comma"
+        );
+        assert_eq!(
+            balanced_root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
     }
 
     #[test]

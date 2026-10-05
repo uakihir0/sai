@@ -69,6 +69,8 @@ define_codes! {
     MissingInitializer => "MISSING_INITIALIZER",
     ChainedComparison => "CHAINED_COMPARISON",
     ChainedRange => "CHAINED_RANGE",
+    BaseArgNotLast => "BASE_ARG_NOT_LAST",
+    InvalidTupleIndex => "INVALID_TUPLE_INDEX",
     MissingFnBody => "MISSING_FN_BODY",
     ImplementationLimitExceeded => "IMPLEMENTATION_LIMIT_EXCEEDED",
     ClauseOrder => "CLAUSE_ORDER",
