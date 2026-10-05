@@ -147,3 +147,27 @@
 - **Decision:** Build `EXPECTED_TOKEN` diagnostics only when a parser is created from a `SnapshotFile`. Convert the current decoded token span back to original-file byte offsets through `Location::from_decoded_source`; emit no detached diagnostic when snapshot context is missing, and report at most once per token position.
 - **Reason:** The parser reads decoded text and token ranges, while diagnostics and edits use original bytes. Snapshot-file context supplies the file path, package, document version, and decoding map required to attribute the error correctly, including BOM and malformed-UTF-8 cases.
 - **Review:** Keep tests for token retention after an expectation fails, one diagnostic for repeated expectations at the same position, alternative-token messages, empty/invalid expected sets, composite-token consumption, and decoded-to-original location conversion. Revisit the one-per-position rule when implementing `UNEXPECTED_NEWLINE` and recovery diagnostics so their precedence and suppression remain deterministic.
+
+### IR-025: Omit absent module headers and reject unimplemented item forms
+
+- **Decision:** Do not create a zero-width `MODULE_HEADER` when a file has neither inner docs nor an `unsafe module` declaration. The current source-file parser handles module headers and use declarations; other item kinds return `UnsupportedItem` instead of being wrapped as apparently valid syntax.
+- **Reason:** Green-tree invariants reject empty nodes, and treating unimplemented declarations as arbitrary tokens would create a misleading CST. The typed boundary lets the grammar grow incrementally without misclassifying valid future forms as user syntax errors.
+- **Review:** Confirm the omission of an absent `MODULE_HEADER` matches AST consumers, and decide whether `UnsupportedItem` should remain an implementation error or become a diagnostic once all Stage 0 item forms are dispatched.
+
+### IR-026: Keep attribute parsing generic and syntax-only
+
+- **Decision:** Parse item attributes with the recursive `AttrArg` grammar, retain identifiers as `NAME_REF` nodes, and defer attribute-name, target, and argument validation to later compiler stages.
+- **Reason:** The grammar explicitly makes attribute arguments generic, while the implementation plan assigns the closed name set and per-attribute rules to validation. This allows the parser to preserve unknown attributes for tooling without embedding semantic policy in syntax parsing.
+- **Review:** Confirm `NAME_REF` is the expected AST representation for attribute names, keys, and word values before adding typed attribute accessors.
+
+### IR-027: Synchronize a missing use-list close at the next line-start item
+
+- **Decision:** When a selective-use list reaches a top-level item after a physical line break, leave that item unconsumed and report the missing `}`. Recognize the boundary through `AFTER_LINE_BREAK` when the preceding comma prevents the lexer from producing a `NEWLINE` token.
+- **Reason:** Commas are not newline-ending tokens in the lexer, but they can precede a malformed list followed by a valid top-level declaration. Preserving the following declaration limits recovery to the malformed list and keeps later syntax available, including item forms whose parser is not implemented yet.
+- **Review:** Check recovery with comments, attributes, visibility, and newly added top-level item starters; retain coverage for both emitted `NEWLINE` and `AFTER_LINE_BREAK` synchronization paths.
+
+### IR-028: Demote misplaced doc comments at their parser context
+
+- **Decision:** Emit `MISPLACED_DOC_COMMENT` warnings over the original source bytes and demote misplaced outer and inner doc tokens to line-comment trivia. Keep outer docs in `DOCS` only when attached before an item and inner docs in the module header only at file start.
+- **Reason:** Placement depends on grammar context, and demotion preserves exact source text while preventing invalid documentation from appearing as attached API docs.
+- **Review:** Extend placement handling as block, field, variant, and expression grammars are added; each context must distinguish valid attachment from a misplaced comment.

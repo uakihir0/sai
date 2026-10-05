@@ -7,6 +7,8 @@ use sai_vfs::{SnapshotFile, SourceFile, Span, TextRange, TextSize};
 use crate::tree::{validate_joint_tokens, validate_token_mapping};
 use crate::{Event, SyntaxKind, Token, TokenFlags};
 
+mod grammar;
+
 /// The event-producing parser cursor used by grammar routines.
 ///
 /// It deliberately exposes raw NEWLINE tokens. Grammar productions decide
@@ -92,6 +94,7 @@ pub enum ParserError {
     InvalidDiagnosticSpan,
     EmptyExpectedSet,
     InvalidExpectedKind { kind: SyntaxKind },
+    UnsupportedItem { position: usize, kind: SyntaxKind },
 }
 
 impl<'src, 'tokens> Parser<'src, 'tokens> {
@@ -151,6 +154,11 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
     ) -> Result<Self, ParserError> {
         let source_file = file.source().as_ref();
         let mut parser = Self::new(source_file.text(), tokens)?;
+        for (position, token) in tokens.iter().enumerate() {
+            if source_file.to_original_range(token.range).is_none() {
+                return Err(ParserError::InvalidTokenStream { position });
+            }
+        }
         parser.diagnostic_source = Some(DiagnosticSource {
             file: source_file,
             source_ref: SourceRef {
@@ -230,7 +238,9 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             return Ok(true);
         }
         self.expected.record(self.position, kind);
-        self.emit_expected_token()?;
+        if self.emit_expected_token()? {
+            self.emit_missing_error_node()?;
+        }
         Ok(false)
     }
 
@@ -253,7 +263,9 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         for kind in kinds {
             self.expected.record(self.position, *kind);
         }
-        self.emit_expected_token()?;
+        if self.emit_expected_token()? {
+            self.emit_missing_error_node()?;
+        }
         Ok(false)
     }
 
@@ -325,7 +337,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         });
     }
 
-    fn emit_expected_token(&mut self) -> Result<(), ParserError> {
+    fn emit_expected_token(&mut self) -> Result<bool, ParserError> {
         if self.reported_expected_at == Some(self.position) {
             let event_index =
                 self.reported_expected_event
@@ -340,7 +352,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             };
             diag.message.clone_from(&message);
             diag.primary_label = message;
-            return Ok(());
+            return Ok(false);
         }
         let Some(context) = &self.diagnostic_source else {
             return Err(ParserError::MissingDiagnosticSource);
@@ -371,7 +383,11 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         self.emit_error(diagnostic);
         self.reported_expected_at = Some(self.position);
         self.reported_expected_event = Some(event_index);
-        Ok(())
+        Ok(true)
+    }
+
+    fn emit_missing_error_node(&mut self) -> Result<(), ParserError> {
+        self.start().complete(self, SyntaxKind::ERROR).map(|_| ())
     }
 
     pub fn into_events(self) -> Result<Vec<Event>, ParserError> {
@@ -630,6 +646,59 @@ mod tests {
         (snapshot_file, lex(&snapshot, file_id).expect("lex"))
     }
 
+    fn parse_file(text: &str) -> crate::TreeBuildOutput {
+        let (snapshot_file, lexed) = lex_file(text);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        parser
+            .parse_source_file()
+            .expect("supported source grammar");
+        let events = parser.into_events().expect("complete source event stream");
+        let mut cache = NodeCache::new();
+        build_green_tree(text, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("source tree builds")
+    }
+
+    fn assert_doc_comment_is_demoted(source: &str, spelling: &str, kind: SyntaxKind) {
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::MisplacedDocComment);
+        assert_eq!(
+            output.errors[0].severity,
+            sai_diagnostics::Severity::Warning
+        );
+        let range = output.errors[0]
+            .primary()
+            .expect("misplaced-doc diagnostic has a primary location")
+            .span
+            .range;
+        let start = source.find(spelling).expect("doc comment is in source");
+        assert_eq!(range.start().to_usize(), start);
+        assert_eq!(range.end().to_usize(), start + spelling.len());
+        assert!(
+            !root.descendants().any(|node| {
+                node.children_with_tokens().any(|element| {
+                    matches!(
+                        element,
+                        crate::SyntaxElement::Token(token) if token.kind() == kind
+                    )
+                })
+            }),
+            "misplaced doc comments should be trivia, not syntax tokens"
+        );
+        assert!(
+            !root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::DOCS)
+        );
+        assert_eq!(
+            output.root.text_len(),
+            TextSize::from_usize(source.len()).expect("source fits TextSize")
+        );
+    }
+
     #[test]
     fn token_cursor_keeps_newlines_visible_and_matches_contextual_names() {
         let source = "effects\n";
@@ -645,6 +714,289 @@ mod tests {
         assert!(parser.eat_nl());
         assert_eq!(parser.current(), SyntaxKind::EOF);
         assert_eq!(parser.position(), 2);
+    }
+
+    #[test]
+    fn source_file_parses_empty_source_and_omits_an_empty_module_header() {
+        let output = parse_file("");
+        assert_eq!(output.root.kind(), SyntaxKind::SOURCE_FILE);
+        assert_eq!(output.root.children().len(), 1);
+        assert!(matches!(
+            output.root.children().first(),
+            Some(GreenElement::Token(token)) if token.kind() == SyntaxKind::EOF
+        ));
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn source_file_parses_module_docs_and_use_items() {
+        let source = "//! Module docs\nunsafe module\n/// imports\npub use sai:http/client as http.{Request, Response as Reply}\n";
+        let output = parse_file(source);
+
+        let children = output.root.children();
+        let GreenElement::Node(module_header) = &children[0] else {
+            panic!("expected a module header");
+        };
+        assert_eq!(module_header.kind(), SyntaxKind::MODULE_HEADER);
+        assert!(module_header.children().iter().any(
+            |child| matches!(child, GreenElement::Node(node) if node.kind() == SyntaxKind::DOCS)
+        ));
+
+        let use_decl = children
+            .iter()
+            .find_map(|child| match child {
+                GreenElement::Node(node) if node.kind() == SyntaxKind::USE_DECL => Some(node),
+                _ => None,
+            })
+            .expect("use declaration");
+        assert!(use_decl.children().iter().any(
+            |child| matches!(child, GreenElement::Node(node) if node.kind() == SyntaxKind::VISIBILITY)
+        ));
+        assert!(use_decl.children().iter().any(
+            |child| matches!(child, GreenElement::Node(node) if node.kind() == SyntaxKind::DOCS)
+        ));
+        let use_items = use_decl
+            .children()
+            .iter()
+            .find_map(|child| match child {
+                GreenElement::Node(node) if node.kind() == SyntaxKind::USE_ITEMS => Some(node),
+                _ => None,
+            })
+            .expect("selective use items");
+        assert_eq!(
+            use_items
+                .children()
+                .iter()
+                .filter(|child| {
+                    matches!(child, GreenElement::Node(node) if node.kind() == SyntaxKind::USE_ITEM)
+                })
+                .count(),
+            2
+        );
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn source_file_recovers_a_missing_use_items_close_delimiter() {
+        let output = parse_file("use sai:http.{Request\n");
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert!(
+            crate::SyntaxNode::new_root(output.root.clone())
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR)
+        );
+    }
+
+    #[test]
+    fn missing_use_items_close_preserves_the_next_top_level_use() {
+        let source =
+            "use sai:http.{Request,\n/// second import\n@allow(UNUSED_IMPORTS)\nuse sai:other\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            output.root.text_len(),
+            TextSize::from_usize(source.len()).expect("source fits TextSize")
+        );
+    }
+
+    #[test]
+    fn missing_use_items_close_stops_before_an_unimplemented_item() {
+        for source in [
+            "use sai:http.{\nfn next() {}\n",
+            "use sai:http.{Request\nfn next() {}\n",
+        ] {
+            let (snapshot_file, lexed) = lex_file(source);
+            let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
+                .expect("valid lexer token stream");
+
+            assert!(matches!(
+                parser.parse_source_file(),
+                Err(ParserError::UnsupportedItem {
+                    kind: SyntaxKind::FN_KW,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_use_items_close_stops_before_contextual_item_starters() {
+        for source in [
+            "use sai:http.{Request\ntest \"later\" {}\n",
+            "use sai:http.{Request\ndistinct Thing\n",
+        ] {
+            let (snapshot_file, lexed) = lex_file(source);
+            let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
+                .expect("valid lexer token stream");
+
+            assert!(matches!(
+                parser.parse_source_file(),
+                Err(ParserError::UnsupportedItem {
+                    kind: SyntaxKind::LIDENT,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn source_file_parses_generic_attributes_on_use_declarations() {
+        let source = "@allow(check(name), option = \"value\", 42)\nuse sai:http\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+        let kinds = root
+            .descendants()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == SyntaxKind::ATTR_ARGS)
+                .count(),
+            2
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == SyntaxKind::ATTR_ARG)
+                .count(),
+            4
+        );
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn source_file_demotes_trailing_outer_doc_comments() {
+        assert_doc_comment_is_demoted(
+            "use sai:http\n/// misplaced",
+            "/// misplaced",
+            SyntaxKind::DOC_OUTER,
+        );
+    }
+
+    #[test]
+    fn source_file_demotes_inner_doc_comments_after_the_first_item() {
+        let source = "use sai:http\n//! misplaced\nuse sai:other\n";
+        assert_doc_comment_is_demoted(source, "//! misplaced", SyntaxKind::DOC_INNER);
+        let output = parse_file(source);
+        assert_eq!(
+            crate::SyntaxNode::new_root(output.root)
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn source_file_demotes_doc_comments_after_attributes() {
+        assert_doc_comment_is_demoted(
+            "@allow(UNUSED_IMPORTS)\n/// misplaced\nuse sai:http\n",
+            "/// misplaced",
+            SyntaxKind::DOC_OUTER,
+        );
+    }
+
+    #[test]
+    fn source_file_recovers_an_unclosed_attribute_before_the_next_use() {
+        let source = "@allow(UNUSED_IMPORTS\nuse sai:other\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+    }
+
+    #[test]
+    fn source_file_demotes_an_inline_doc_and_keeps_the_following_use() {
+        let source = "use sai:http /// misplaced\nuse sai:other\n";
+        assert_doc_comment_is_demoted(source, "/// misplaced", SyntaxKind::DOC_OUTER);
+        let output = parse_file(source);
+        assert_eq!(
+            crate::SyntaxNode::new_root(output.root)
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn missing_use_items_close_demotes_inner_docs_before_the_next_use() {
+        let output = parse_file("use sai:http.{Request\n//! misplaced\nuse sai:other\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(output.errors.len(), 2);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(output.errors[1].code, Code::MisplacedDocComment);
+    }
+
+    #[test]
+    fn use_items_demotes_doc_comments_between_items() {
+        let output = parse_file("use sai:http.{Request,\n/// misplaced\nResponse}\n");
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::MisplacedDocComment);
+        assert_eq!(
+            output.errors[0].severity,
+            sai_diagnostics::Severity::Warning
+        );
+    }
+
+    #[test]
+    fn source_file_recovers_a_missing_item_separator() {
+        let output = parse_file("use sai:http use sai:other\n");
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert!(
+            crate::SyntaxNode::new_root(output.root.clone())
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR)
+        );
+    }
+
+    #[test]
+    fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
+        let source = "fn main()\n";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        assert_eq!(
+            parser.parse_source_file(),
+            Err(ParserError::UnsupportedItem {
+                position: 0,
+                kind: SyntaxKind::FN_KW
+            })
+        );
     }
 
     #[test]
@@ -672,6 +1024,11 @@ mod tests {
         let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
             .expect("tree builds with a parser diagnostic");
         assert_eq!(output.errors.len(), 1);
+        let GreenElement::Node(error_node) = &output.root.children()[0] else {
+            panic!("expected a missing-token error node");
+        };
+        assert_eq!(error_node.kind(), SyntaxKind::ERROR);
+        assert_eq!(error_node.text_len().raw(), 0);
         let diagnostic = &output.errors[0];
         assert_eq!(diagnostic.code, Code::ExpectedToken);
         let location = diagnostic.primary().expect("primary source location");
@@ -793,6 +1150,10 @@ mod tests {
         let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
             .expect("tree builds with a parser diagnostic");
         assert_eq!(output.errors.len(), 1);
+        assert!(matches!(
+            &output.root.children()[0],
+            GreenElement::Node(node) if node.kind() == SyntaxKind::ERROR
+        ));
         assert_eq!(
             output.errors[0].message,
             "expected L_PAREN or L_BRACKET or R_PAREN"
