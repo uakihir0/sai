@@ -12,9 +12,9 @@
 
 ### IR-002: Use Unicode data crates for normative identifier handling
 
-- **Decision:** The lexer will use `unicode-ident` for UAX #31 XID properties and `unicode-normalization` for NFC checks.
-- **Reason:** Rust's standard library does not expose the required XID and NFC operations. Implementing partial Unicode tables locally would risk accepting invalid identifiers or rejecting valid ones, contrary to the explicit and portable behavior required by P1, P2, and P8.
-- **Review:** `docs/impl/01-architecture.md` §1.3.2 rule 4 currently limits shipped third-party crates to an enumerated set. Before these dependencies are added, amend that list and consider recording the Unicode data version used by the reference implementation.
+- **Decision:** Pin `unicode-ident` 1.0.18, `unicode-normalization` 0.1.24, and `unicode-general-category` 1.1.0, whose tables all use Unicode 16.0.0. The lexer uses them for XID properties, NFC checks, and Lu/Lt case classification. Permit these crates and `unicode-normalization`'s `tinyvec` dependency in the shipped dependency list.
+- **Reason:** Rust's standard library does not expose the required XID, NFC, and General Category operations. Pinning one Unicode data version makes identifier behavior portable and reproducible; implementing partial tables locally could accept or reject names inconsistently.
+- **Review:** Confirm the Unicode 16.0.0 baseline for v0.1. Future data upgrades must update all three crates together, amend the lexical spec and dependency allowlist, and rerun Unicode-focused conformance tests.
 
 ### IR-003: Use crate tests as the development gate before conformance exists
 
@@ -54,9 +54,9 @@
 
 ### IR-008: Start with a copy-only stable-address arena
 
-- **Decision:** The first `sai_intern::Arena` stores each `Copy` value in a stable `Box` and returns a reference tied to the arena borrow. It does not accept values with destructors.
-- **Reason:** This gives the query/type infrastructure stable addresses while avoiding destructor-order hazards for values that can refer to other allocations in the same arena. A per-value allocation is slower than a bump allocator but is straightforward to validate.
-- **Review:** Check whether the HIR/type arena values can be represented as `Copy` handles and references. If not, design and test a destructor-safe arena before using non-`Copy` values.
+- **Decision:** Keep `Arena<T: Copy>` as thread-safe stable storage and add `TypeArena<T: Copy + Eq + Hash>` for structural interning. `TypeArena` returns the same stable address for equal values with consistent `Hash`/`Eq`, including concurrent calls; a separate append-only Box owner keeps every returned address live even if a key violates that trait contract.
+- **Reason:** The type arena needs pointer equality to mean structural equality and must allow query workers to intern in parallel. Both types restrict entries to `Copy` to avoid destructor-order hazards for values that may refer to other arena allocations; the mutex-backed implementation favors a simple safety argument over allocation throughput.
+- **Review:** Benchmark contention and memory use against compiler workloads. If future HIR/type values require destructors, design and test a destructor-safe arena before storing them.
 
 ### IR-009: Use a safe radix tree for lock-free interner reads
 
@@ -81,3 +81,15 @@
 - **Decision:** Make `SourceFile` identity, decoded text, BOM state, and line index private; expose read-only accessors. Reject decoded text that starts with an unrecorded BOM.
 - **Reason:** Decoded-to-original offset conversion depends on those fields matching the retained raw bytes. Publicly replaceable fields and an unrecorded leading BOM allowed callers to invalidate that mapping after construction.
 - **Review:** Check downstream crates use the read-only API and do not need to construct or mutate partial source snapshots.
+
+### IR-014: Keep lexical query diagnostics independent of opaque snapshot IDs
+
+- **Decision:** Lexical diagnostics carry the source path, package, document version, and validated raw span, but remain unbound to the VFS snapshot object. `lex()` preserves that query value; `lex_with_fixes()` binds at the snapshot-aware boundary and plans token-level fixes for normalization, unnecessary raw prefixes, lone `!`, and semicolons. Before binding, it confirms the candidate file's raw bytes exactly match the bytes lexed.
+- **Reason:** The opaque snapshot ID is a freshness token, not lexical input. Retaining it in a query value would make equal source text produce unequal diagnostics across otherwise identical snapshots and defeat deterministic incremental equality. Comparing immutable source bytes at the later boundary prevents stale fix intents from being rebound to changed content.
+- **Review:** Ensure the diagnostic collection boundary binds or validates every location before applying snapshot-sensitive operations, and that future full-session snapshots cover all semantic inputs. Extend token-level planning to the remaining lexical fixes as their parser operations are implemented.
+
+### IR-015: Keep forbidden-character names in a closed local table
+
+- **Decision:** Map every code point admitted by the three forbidden-character classes to its Unicode name in `sai_syntax`; include both `U+XXXX` and the name in a diagnostic note.
+- **Reason:** The language defines a finite forbidden set, and a closed table avoids a runtime Unicode-name dependency while keeping diagnostic spelling stable across Rust toolchains.
+- **Review:** Check the table against the Unicode 16.0.0 source data and retain coverage for every code point admitted by `forbidden_class`.

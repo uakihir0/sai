@@ -1,0 +1,12 @@
+[package]
+name = "sai_syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sai_diagnostics = { path = "../sai_diagnostics" }
+sai_vfs = { path = "../sai_vfs" }
+unicode-general-category.workspace = true
+unicode-ident.workspace = true
+unicode-normalization.workspace = true

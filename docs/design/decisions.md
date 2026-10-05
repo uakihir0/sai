@@ -91,6 +91,11 @@ The principles of draft §2 are treated as preconditions: Wasm-first, no mandato
 - Format strings `f"...{expr}..."` are a Stage 3 feature (D-EXPR-12).
 - Comments: `//`, `/* */` (which nest), and doc comments `///` (outer) and `//!` (module-level).
 
+### D-LEX-06 Unicode data version
+
+- The v0.1 lexical rules use Unicode 16.0.0 data for XID properties, General Category, and NFC normalization.
+- Rationale: identifier acceptance, case classification, and normalization must be identical across hosts and compiler builds. Pinning one Unicode data version avoids making source compatibility depend on the host's Rust toolchain or operating system.
+
 ### D-SYN-01 Records are constructed and destructured with parentheses and labeled arguments
 
 - Construction: `User(id: id, name: "a")`. Field punning `User(id, name)` means `User(id: id, name: name)`. Update syntax: `User(name: n, ..base)`.

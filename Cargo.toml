@@ -2,7 +2,9 @@
 resolver = "3"
 members = [
     "crates/sai_diagnostics",
+    "crates/sai_intern",
     "crates/sai_stable_hash",
+    "crates/sai_syntax",
     "crates/sai_vfs",
 ]
 
@@ -14,3 +16,6 @@ rust-version = "1.85"
 [workspace.dependencies]
 blake3 = "1.8.7"
 siphasher = "1.0.4"
+unicode-general-category = "=1.1.0"
+unicode-ident = "=1.0.18"
+unicode-normalization = "=0.1.24"

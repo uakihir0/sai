@@ -2,7 +2,7 @@
 
 **Status:** Normative
 **Stage:** 0 (format strings: Stage 3)
-**Related:** [03-grammar.md](03-grammar.md), [decisions.md](../design/decisions.md) D-LEX-01..05
+**Related:** [03-grammar.md](03-grammar.md), [decisions.md](../design/decisions.md) D-LEX-01..06
 
 This chapter defines how a SAI source file (`.sai`) is turned into a sequence of tokens. `sai.package` and `sai.lock` follow separate lexical rules (see [package/01-package-contract.md](../package/01-package-contract.md)).
 
@@ -75,6 +75,7 @@ IdentContinue ::= XID_Continue
 ```
 
 1. Identifiers follow the Default Identifier Syntax of Unicode Standard Annex #31 (XID_Start / XID_Continue).
+   For v0.1, the Unicode data version is 16.0.0 ([D-LEX-06](../design/decisions.md#d-lex-06-unicode-data-version)).
 2. An identifier MUST be **in NFC**. Otherwise it is the error `IDENT_NOT_NFC`, and the normalized form is offered as a fix. Two identifiers are the same if and only if their code point sequences are equal after NFC normalization.
 3. A lone `_` is not an identifier; it is the wildcard token `_`.
 4. **Case classification** (D-LEX-02): if the first character, after removing the raw prefix `r#` and any leading `_` characters, is uppercase (General Category Lu or Lt), the identifier is a `UIDENT`. Otherwise it is a `LIDENT`. `_Foo` is a `UIDENT`, `__init` is a `LIDENT`, and an identifier consisting only of underscores (`__`) is a `LIDENT`.
