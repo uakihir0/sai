@@ -2245,13 +2245,15 @@ impl Parser<'_, '_> {
             SyntaxKind::LOOP_KW | SyntaxKind::WHILE_KW | SyntaxKind::FOR_KW => self.loop_expr(),
             SyntaxKind::BREAK_KW => self.break_expr(),
             SyntaxKind::CONTINUE_KW => self.continue_expr(),
-            SyntaxKind::MOVE_KW
-            | SyntaxKind::FN_KW
-            | SyntaxKind::ASYNC_KW
-            | SyntaxKind::FSTRING_START => Err(ParserError::UnsupportedSyntax {
-                position: self.position,
-                kind: self.current(),
-            }),
+            SyntaxKind::MOVE_KW if self.nth(1) == SyntaxKind::FN_KW => self.closure_expr(),
+            SyntaxKind::FN_KW => self.closure_expr(),
+            SyntaxKind::ASYNC_KW => self.async_block_expr(),
+            SyntaxKind::MOVE_KW | SyntaxKind::FSTRING_START => {
+                Err(ParserError::UnsupportedSyntax {
+                    position: self.position,
+                    kind: self.current(),
+                })
+            }
             _ => self.missing_expression(),
         }
     }
@@ -2380,6 +2382,129 @@ impl Parser<'_, '_> {
         while self.eat_nl() {}
         label.complete(self, SyntaxKind::LOOP_LABEL)?;
         Ok(true)
+    }
+
+    fn closure_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        let result = (|| {
+            self.eat(SyntaxKind::MOVE_KW);
+            self.expect(SyntaxKind::FN_KW)?;
+            self.closure_param_list()?;
+            if self.at(SyntaxKind::THIN_ARROW) {
+                self.ret_type()?;
+            }
+            self.with_no_block_operand(false, |parser| parser.block())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => expression.complete(self, SyntaxKind::CLOSURE_EXPR),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn closure_param_list(&mut self) -> Result<(), ParserError> {
+        let params = self.start();
+        if !self.expect(SyntaxKind::L_PAREN)? {
+            params.abandon(self)?;
+            return Ok(());
+        }
+        while !self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::L_BRACE, SyntaxKind::EOF]) {
+            if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+            let position = self.position;
+            if !self.closure_param()? {
+                if self.at(SyntaxKind::COMMA) {
+                    let error = self.start();
+                    self.bump();
+                    error.complete(self, SyntaxKind::ERROR)?;
+                    continue;
+                }
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+                continue;
+            }
+            if self.eat(SyntaxKind::COMMA) {
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::L_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect(SyntaxKind::COMMA)?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        self.expect(SyntaxKind::R_PAREN)?;
+        params.complete(self, SyntaxKind::CLOSURE_PARAM_LIST)?;
+        Ok(())
+    }
+
+    fn closure_param(&mut self) -> Result<bool, ParserError> {
+        if !self.at_any(&[
+            SyntaxKind::VAR_KW,
+            SyntaxKind::LIDENT,
+            SyntaxKind::UNDERSCORE,
+        ]) {
+            self.expect_any(&[
+                SyntaxKind::VAR_KW,
+                SyntaxKind::LIDENT,
+                SyntaxKind::UNDERSCORE,
+            ])?;
+            return Ok(false);
+        }
+        let param = self.start();
+        self.eat(SyntaxKind::VAR_KW);
+        self.name_node(
+            &[SyntaxKind::LIDENT, SyntaxKind::UNDERSCORE],
+            SyntaxKind::NAME,
+        )?;
+        if self.eat(SyntaxKind::COLON) {
+            self.type_(true)?;
+        }
+        param.complete(self, SyntaxKind::CLOSURE_PARAM)?;
+        Ok(true)
+    }
+
+    fn async_block_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        let result = (|| {
+            let async_range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.bump();
+            if self.at(SyntaxKind::FN_KW)
+                || (self.at(SyntaxKind::MOVE_KW) && self.nth(1) == SyntaxKind::FN_KW)
+            {
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::NoAsyncClosure,
+                    async_range,
+                    "async closures are not supported; return an async block from a closure",
+                )?;
+                self.closure_expr()?;
+                return Ok(SyntaxKind::ERROR);
+            }
+            self.eat(SyntaxKind::MOVE_KW);
+            self.with_no_block_operand(false, |parser| parser.block())?;
+            Ok(SyntaxKind::ASYNC_BLOCK_EXPR)
+        })();
+        match result {
+            Ok(kind) => expression.complete(self, kind),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
     }
 
     fn match_expr(&mut self) -> Result<CompletedMarker, ParserError> {

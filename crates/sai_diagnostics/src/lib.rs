@@ -52,6 +52,7 @@ define_codes! {
     UnterminatedString => "UNTERMINATED_STRING",
     InconsistentIndent => "INCONSISTENT_INDENT",
     UnterminatedChar => "UNTERMINATED_CHAR",
+    NoAsyncClosure => "NO_ASYNC_CLOSURE",
     InvalidCharLiteral => "INVALID_CHAR_LITERAL",
     MalformedRawString => "MALFORMED_RAW_STRING",
     MalformedMultilineString => "MALFORMED_MULTILINE_STRING",
@@ -1602,6 +1603,10 @@ mod tests {
             Some(Code::UnexpectedCharacter)
         );
         assert_eq!(Code::from_name("EXPECTED_TOKEN"), Some(Code::ExpectedToken));
+        assert_eq!(
+            Code::from_name("NO_ASYNC_CLOSURE"),
+            Some(Code::NoAsyncClosure)
+        );
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));
     }

@@ -1535,31 +1535,215 @@ mod tests {
     }
 
     #[test]
-    fn function_parser_keeps_unimplemented_closures_explicit() {
-        let source = "fn main() { let handler = fn() {} }\n";
-        let (snapshot_file, lexed) = lex_file(source);
-        let mut parser =
-            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
-        let closure_start = source.find("fn()").expect("closure expression is present");
+    fn function_parser_builds_closures_and_async_blocks() {
+        let source = concat!(
+            "fn f(value: I32) {\n",
+            "let handler = fn(x: I32, var state, _: I32) -> I32 { x }\n",
+            "let moved = move fn(var state) { state }\n",
+            "let task = async { value }\n",
+            "let moved_task = async move { value }\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(
+            output.errors.is_empty(),
+            "closures and async blocks should parse cleanly: {:?}",
+            output.errors
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let count = |kind| {
+            root.descendants()
+                .filter(|node| node.kind() == kind)
+                .count()
+        };
+
+        assert_eq!(count(SyntaxKind::CLOSURE_EXPR), 2);
+        assert_eq!(count(SyntaxKind::CLOSURE_PARAM_LIST), 2);
+        assert_eq!(count(SyntaxKind::CLOSURE_PARAM), 4);
+        assert_eq!(count(SyntaxKind::RET_TYPE), 1);
+        assert_eq!(count(SyntaxKind::ASYNC_BLOCK_EXPR), 2);
+    }
+
+    #[test]
+    fn async_closures_report_the_specific_diagnostic() {
+        let output = parse_file(concat!(
+            "fn f(value: I32) {\n",
+            "let invalid = async fn(x: I32) { x }\n",
+            "let also_invalid = async move fn() {}\n",
+            "}\n",
+        ));
 
         assert_eq!(
-            parser.parse_source_file(),
-            Err(ParserError::UnsupportedSyntax {
-                position: lexed
-                    .tokens
-                    .iter()
-                    .position(|token| {
-                        token.kind == SyntaxKind::FN_KW
-                            && token.range.start().to_usize() == closure_start
-                    })
-                    .expect("closure expression starts the unsupported body"),
-                kind: SyntaxKind::FN_KW
-            })
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::NoAsyncClosure, Code::NoAsyncClosure]
         );
-        assert!(matches!(
-            parser.into_events(),
-            Err(ParserError::UnconsumedTokens { .. })
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+                .count(),
+            2,
+            "the rejected closure forms remain available under ERROR nodes"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASYNC_BLOCK_EXPR)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn malformed_closure_parameters_recover_and_preserve_following_syntax() {
+        let output = parse_file(concat!(
+            "fn f() {\n",
+            "let callback = fn(x: I32, , y) { x }\n",
+            "let after = 1\n",
+            "}\n",
+            "fn next() {}\n",
         ));
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "an empty closure parameter slot is malformed"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_PARAM)
+                .count(),
+            2,
+            "only the valid parameters become CLOSURE_PARAM nodes"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "parameter-list recovery must preserve the following function"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2,
+            "parameter-list recovery must preserve the later block statement"
+        );
+    }
+
+    #[test]
+    fn closure_headers_do_not_accept_newlines_before_the_return_type_or_body() {
+        for source in [
+            "fn f() {\nlet callback = fn() -> I32\n{ 1 }\n}\n",
+            "fn f() {\nlet callback = fn()\n-> I32 { 1 }\n}\n",
+        ] {
+            let output = parse_file(source);
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+                "a closure header may not continue across a newline: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_closure_parameter_close_recovers_at_the_body_brace() {
+        let output = parse_file(concat!(
+            "fn f() {\n",
+            "let callback = fn(x { x }\n",
+            "let after = 1\n",
+            "}\n",
+            "fn next() {}\n",
+        ));
+        let root = crate::SyntaxNode::new_root(output.root);
+        let count = |kind| {
+            root.descendants()
+                .filter(|node| node.kind() == kind)
+                .count()
+        };
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "the missing parameter-list close must be diagnosed"
+        );
+        assert_eq!(count(SyntaxKind::CLOSURE_PARAM), 1);
+        assert_eq!(count(SyntaxKind::LET_STMT), 2);
+        assert_eq!(
+            count(SyntaxKind::FN_DECL),
+            2,
+            "the closure body, following statement, and next item must stay intact"
+        );
+    }
+
+    #[test]
+    fn missing_closure_parameter_comma_keeps_the_following_parameter() {
+        let output = parse_file("fn f() { let callback = fn(x y: I32) { x } }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "the missing comma must be diagnosed"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_PARAM)
+                .count(),
+            2,
+            "both valid parameters should remain available in the recovered CST"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_closures_recover_at_the_body_and_preserve_later_items() {
+        let mut source = String::from("fn f() {\nlet nested = ");
+        for _ in 0..300 {
+            source.push_str("fn() { ");
+        }
+        source.push('0');
+        for _ in 0..300 {
+            source.push_str(" }");
+        }
+        source.push_str("\n}\nfn next() {}\n");
+
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded),
+            "deep closure bodies must use bounded block recovery"
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::ExpectedToken),
+            "closure recovery must not leave the return type or body to cascade"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "recovery must preserve the following top-level function"
+        );
     }
 
     #[test]
