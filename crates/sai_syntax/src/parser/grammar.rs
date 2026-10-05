@@ -317,6 +317,10 @@ impl Parser<'_, '_> {
             return self.type_decl(declaration);
         }
 
+        if self.at(SyntaxKind::ENUM_KW) {
+            return self.enum_decl(declaration);
+        }
+
         if !self.at(SyntaxKind::USE_KW) {
             let position = self.position;
             let kind = self.current();
@@ -360,6 +364,347 @@ impl Parser<'_, '_> {
             self.struct_def()?;
         }
         declaration.complete(self, SyntaxKind::TYPE_DECL)
+    }
+
+    fn enum_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.expect(SyntaxKind::ENUM_KW)?;
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::LT) {
+            self.generic_param_list()?;
+        }
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::WHERE_KW {
+            self.eat_nl();
+        }
+        if self.at(SyntaxKind::WHERE_KW) {
+            self.where_clause()?;
+        }
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+
+        let mut has_payload_variant = false;
+        let mut first_discriminant = None;
+        self.variant_list(&mut has_payload_variant, &mut first_discriminant)?;
+        if has_payload_variant {
+            if let Some(range) = first_discriminant {
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::ExplicitDiscriminantOnDataEnum,
+                    range,
+                    "explicit discriminants are not allowed on enums with payload variants",
+                )?;
+            }
+        }
+        declaration.complete(self, SyntaxKind::ENUM_DECL)
+    }
+
+    fn variant_list(
+        &mut self,
+        has_payload_variant: &mut bool,
+        first_discriminant: &mut Option<sai_vfs::TextRange>,
+    ) -> Result<bool, ParserError> {
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.expect(SyntaxKind::L_BRACE)?;
+            return Ok(false);
+        }
+
+        let variants = self.start();
+        self.bump();
+        while self.at(SyntaxKind::NEWLINE) && !self.variant_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE) {
+                if self.variant_list_boundary_after_newline() {
+                    break;
+                }
+                self.eat_nl();
+                continue;
+            }
+            if self.variant_list_boundary_at(self.position) {
+                break;
+            }
+            if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER])
+                && !self.variant_decl_starts_at(self.position)
+            {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+
+            if !self.variant_decl_starts_at(self.position) {
+                let error = self.start();
+                if !self.eat(SyntaxKind::COMMA) {
+                    self.recover_one()?;
+                }
+                error.complete(self, SyntaxKind::ERROR)?;
+                continue;
+            }
+
+            let position = self.position;
+            let (has_payload, discriminant) = self.variant_decl()?;
+            *has_payload_variant |= has_payload;
+            if first_discriminant.is_none() {
+                *first_discriminant = discriminant;
+            }
+            if self.eat(SyntaxKind::COMMA) {
+                if self.variant_list_boundary_after_newline() {
+                    break;
+                }
+                while self.eat_nl() {}
+                continue;
+            }
+            if self.at(SyntaxKind::NEWLINE) {
+                if self.variant_list_boundary_after_newline() {
+                    break;
+                }
+                while self.eat_nl() {}
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect_any(&[SyntaxKind::COMMA, SyntaxKind::NEWLINE])?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        variants.complete(self, SyntaxKind::VARIANT_LIST)?;
+        Ok(true)
+    }
+
+    fn variant_decl(&mut self) -> Result<(bool, Option<sai_vfs::TextRange>), ParserError> {
+        let variant = self.start();
+        self.outer_docs()?;
+        self.attributes(true)?;
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        let has_payload = if self.at(SyntaxKind::L_PAREN) {
+            self.variant_shape()?;
+            true
+        } else {
+            false
+        };
+
+        let discriminant = if self.at(SyntaxKind::EQ) {
+            let discriminant = self.start();
+            let equals_range = self.current_token().map(|token| token.range);
+            self.bump();
+            self.eat(SyntaxKind::MINUS);
+            let has_integer = self.at(SyntaxKind::INT);
+            self.expect(SyntaxKind::INT)?;
+            discriminant.complete(self, SyntaxKind::DISCRIMINANT)?;
+            equals_range.filter(|_| has_integer)
+        } else {
+            None
+        };
+        variant.complete(self, SyntaxKind::VARIANT_DECL)?;
+        Ok((has_payload, discriminant))
+    }
+
+    fn variant_shape(&mut self) -> Result<(), ParserError> {
+        let is_record = self.variant_field_starts_at(self.position + 1);
+        let shape = self.start();
+        self.bump();
+        if is_record {
+            while !self.variant_field_list_boundary() {
+                if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER])
+                    && !self.variant_field_starts_at(self.position)
+                {
+                    self.misplaced_doc_comment()?;
+                    continue;
+                }
+                if !self.variant_field_starts_at(self.position) {
+                    let position = self.position;
+                    let error = self.start();
+                    if !self.eat(SyntaxKind::COMMA) {
+                        self.recover_one()?;
+                    }
+                    error.complete(self, SyntaxKind::ERROR)?;
+                    if self.position == position {
+                        break;
+                    }
+                    continue;
+                }
+                let position = self.position;
+                self.variant_field()?;
+                if self.eat(SyntaxKind::COMMA) {
+                    while self.eat_nl() {}
+                    continue;
+                }
+                if self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::EOF]) {
+                    break;
+                }
+                self.expect(SyntaxKind::COMMA)?;
+                if self.position == position {
+                    self.recover_one()?;
+                    if self.position == position {
+                        break;
+                    }
+                }
+            }
+            self.expect(SyntaxKind::R_PAREN)?;
+            shape.complete(self, SyntaxKind::RECORD_SHAPE)?;
+        } else {
+            if self.at(SyntaxKind::R_PAREN) {
+                self.expect_any(TYPE_START_KINDS)?;
+            } else {
+                self.variant_type_list(SyntaxKind::R_PAREN)?;
+            }
+            self.expect(SyntaxKind::R_PAREN)?;
+            shape.complete(self, SyntaxKind::TUPLE_SHAPE)?;
+        }
+        Ok(())
+    }
+
+    fn variant_field(&mut self) -> Result<(), ParserError> {
+        let field = self.start();
+        self.attributes(false)?;
+        self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+        self.expect(SyntaxKind::COLON)?;
+        self.type_(true)?;
+        field.complete(self, SyntaxKind::VARIANT_FIELD)?;
+        Ok(())
+    }
+
+    fn variant_field_starts_at(&self, position: usize) -> bool {
+        let Some(position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::LIDENT)
+            || !self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::COLON)
+        {
+            return false;
+        }
+
+        let ty_position = position + 2;
+        let Some(token) = self.tokens.get(ty_position) else {
+            return false;
+        };
+        TYPE_START_KINDS.contains(&token.kind)
+            && (!matches!(token.kind, SyntaxKind::LIDENT | SyntaxKind::UIDENT)
+                || self.generic_argument_path_type_starts_at(ty_position))
+    }
+
+    fn variant_field_list_boundary(&self) -> bool {
+        if self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            return true;
+        }
+        if !self.at_physical_line_start() || self.variant_field_starts_at(self.position) {
+            return false;
+        }
+
+        let next_kind = self
+            .position_after_attributes(self.position)
+            .and_then(|position| self.tokens.get(position))
+            .map(|token| token.kind);
+        matches!(
+            next_kind,
+            Some(SyntaxKind::LET_KW | SyntaxKind::VAR_KW | SyntaxKind::ASSERT_KW)
+        ) || self.item_starts_at_after_attributes(self.position)
+            || next_kind.is_some_and(|kind| EXPRESSION_START_KINDS.contains(&kind))
+    }
+
+    fn variant_decl_starts_at(&self, position: usize) -> bool {
+        let Some(position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+        {
+            return false;
+        }
+        if !self
+            .tokens
+            .get(position + 1)
+            .is_some_and(|token| token.kind == SyntaxKind::L_PAREN)
+        {
+            return true;
+        }
+
+        let shape_start = position + 2;
+        self.variant_field_starts_at(shape_start)
+            || self
+                .tokens
+                .get(shape_start)
+                .is_some_and(|token| TYPE_START_KINDS.contains(&token.kind))
+                && self.tokens.get(shape_start).is_some_and(|token| {
+                    !matches!(token.kind, SyntaxKind::LIDENT | SyntaxKind::UIDENT)
+                        || self.generic_argument_path_type_starts_at(shape_start)
+                })
+    }
+
+    fn variant_list_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        self.variant_list_boundary_at(position)
+    }
+
+    fn variant_list_boundary_at(&self, position: usize) -> bool {
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+            || self.variant_decl_starts_at(position)
+        {
+            return false;
+        }
+
+        let next_kind = self
+            .position_after_attributes(position)
+            .and_then(|position| self.tokens.get(position))
+            .map(|token| token.kind);
+        matches!(
+            next_kind,
+            Some(SyntaxKind::LET_KW | SyntaxKind::VAR_KW | SyntaxKind::ASSERT_KW)
+        ) || self.item_starts_at_after_attributes(position)
+            || next_kind.is_some_and(|kind| EXPRESSION_START_KINDS.contains(&kind))
+    }
+
+    fn variant_type_list_recovery_boundary(&self) -> bool {
+        if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            return true;
+        }
+        if !self.at_physical_line_start()
+            || !self.statement_starts_at_after_attributes(self.position)
+        {
+            return false;
+        }
+
+        let Some(position) = self.position_after_attributes(self.position) else {
+            return false;
+        };
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        if !TYPE_START_KINDS.contains(&token.kind) {
+            return true;
+        }
+        match token.kind {
+            SyntaxKind::LIDENT | SyntaxKind::UIDENT => {
+                !self.generic_argument_path_type_starts_at(position)
+            }
+            SyntaxKind::FN_KW => self.closure_body_follows_fn_type(position),
+            _ => false,
+        }
     }
 
     fn struct_def(&mut self) -> Result<(), ParserError> {
@@ -4556,8 +4901,22 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
+    fn variant_type_list(&mut self, close: SyntaxKind) -> Result<(), ParserError> {
+        self.type_list_inner(close, true)
+    }
+
     fn type_list(&mut self, close: SyntaxKind) -> Result<(), ParserError> {
-        while !self.at_any(&[close, SyntaxKind::EOF]) {
+        self.type_list_inner(close, false)
+    }
+
+    fn type_list_inner(
+        &mut self,
+        close: SyntaxKind,
+        recover_at_statement_boundary: bool,
+    ) -> Result<(), ParserError> {
+        while !self.at_any(&[close, SyntaxKind::EOF])
+            && !(recover_at_statement_boundary && self.variant_type_list_recovery_boundary())
+        {
             let position = self.position;
             if !self.at_any(TYPE_START_KINDS) {
                 self.expect_any(TYPE_START_KINDS)?;

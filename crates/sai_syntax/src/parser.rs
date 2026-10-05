@@ -1007,6 +1007,406 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_empty_generic_and_shaped_enums() {
+        let source = concat!(
+            "enum Void {}\n",
+            "pub enum Result<T, E>\n",
+            "where T: Copy\n",
+            "{\n",
+            "/// A successful result.\n",
+            "@cold\n",
+            "Ok(T),\n",
+            "Err(error: E, code: U32)\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_LIST)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TUPLE_SHAPE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::RECORD_SHAPE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_FIELD)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WHERE_CLAUSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn unit_enum_discriminants_allow_negative_values() {
+        let source = "enum Status { Pending = 0, Failed = -2 }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISCRIMINANT)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn data_enum_reports_one_error_at_its_first_explicit_discriminant() {
+        let source = "enum Mixed { Unit = 1, Value(I32) = 2, Other = 3 }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let diagnostics = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::ExplicitDiscriminantOnDataEnum)
+            .collect::<Vec<_>>();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("explicit discriminant has a primary location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("= 1").expect("first discriminant")
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISCRIMINANT)
+                .count(),
+            3
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn variant_field_attributes_are_diagnosed_but_preserved() {
+        let source = "enum Message { Error(@field code: U32) }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::InvalidAttributeTarget);
+        assert_eq!(
+            output.errors[0]
+                .primary()
+                .expect("invalid attribute has a primary location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("@field").expect("field attribute")
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::VARIANT_FIELD)
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn source_file_rejects_exported_enums_and_keeps_public_enums() {
+        let source = "export enum Hidden {}\npub enum Visible {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::InvalidExportTarget);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_enum_close_preserves_following_block_statements() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "Some(1)\n",
+            "let later = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_tuple_variant_close_preserves_following_block_statements() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32\n",
+            "1\n",
+            "let later = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_record_variant_close_preserves_following_block_statements() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(code: I32\n",
+            "Some(1)\n",
+            "let later = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_enum_close_preserves_a_named_uppercase_call_statement() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "Some(value: 1)\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_tuple_variant_close_preserves_a_closure_statement() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32\n",
+            "fn() { 1 }\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_record_variant_close_stops_at_the_enum_brace() {
+        let source = "enum E { Broken(field: I32 }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_variant_list_keeps_later_variants_and_source_text() {
+        let source = "enum E { , First, Second }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_DECL)
+                .count(),
+            2
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR)
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn malformed_record_field_recovery_consumes_an_unexpected_comma() {
         let source = "type Broken {\n,\n}\n";
         let output = parse_file(source);
@@ -1142,22 +1542,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_use_items_close_stops_before_an_unimplemented_item() {
+    fn missing_use_items_close_preserves_a_following_enum() {
         for source in [
             "use sai:http.{\nenum Thing {}\n",
             "use sai:http.{Request\nenum Thing {}\n",
         ] {
-            let (snapshot_file, lexed) = lex_file(source);
-            let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
-                .expect("valid lexer token stream");
+            let output = parse_file(source);
+            let root = crate::SyntaxNode::new_root(output.root);
 
-            assert!(matches!(
-                parser.parse_source_file(),
-                Err(ParserError::UnsupportedItem {
-                    kind: SyntaxKind::ENUM_KW,
-                    ..
-                })
-            ));
+            assert_eq!(
+                root.descendants()
+                    .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                root.descendants()
+                    .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                    .count(),
+                1
+            );
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+            );
+            assert_eq!(root.green().text_len().to_usize(), source.len());
         }
     }
 
@@ -5159,7 +5570,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "enum UserId {}\n";
+        let source = "distinct UserId = U32\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -5167,7 +5578,7 @@ mod tests {
             parser.parse_source_file(),
             Err(ParserError::UnsupportedItem {
                 position: 0,
-                kind: SyntaxKind::ENUM_KW
+                kind: SyntaxKind::LIDENT
             })
         );
     }
