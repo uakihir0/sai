@@ -472,6 +472,17 @@ impl Parser<'_, '_> {
         range: sai_vfs::TextRange,
         message: &str,
     ) -> Result<(), ParserError> {
+        let diagnostic = self.parser_diagnostic(code, range, message)?;
+        self.emit_error(diagnostic);
+        Ok(())
+    }
+
+    fn parser_diagnostic(
+        &self,
+        code: sai_diagnostics::Code,
+        range: sai_vfs::TextRange,
+        message: &str,
+    ) -> Result<sai_diagnostics::Diagnostic, ParserError> {
         let Some(context) = &self.diagnostic_source else {
             return Err(ParserError::MissingDiagnosticSource);
         };
@@ -488,8 +499,7 @@ impl Parser<'_, '_> {
             Some(location),
         );
         diagnostic.primary_label = message.to_owned();
-        self.emit_error(diagnostic);
-        Ok(())
+        Ok(diagnostic)
     }
 
     fn emit_operator_continuation_diagnostic(
@@ -1079,6 +1089,33 @@ impl Parser<'_, '_> {
     }
 
     fn statement(&mut self) -> Result<bool, ParserError> {
+        if self.statement_starts_item() {
+            self.item_in_block()?;
+            return Ok(false);
+        }
+        if self.at(SyntaxKind::AT) {
+            let item_position = self.position;
+            let attributes = self.start();
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            if let Err(error) = self.attributes(true) {
+                attributes.abandon(self)?;
+                return Err(error);
+            }
+            if self.statement_starts_item() {
+                self.emit_item_in_block_diagnostic(range, item_position)?;
+                self.parse_item_in_block(attributes)?;
+                return Ok(false);
+            }
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::InvalidAttributeTarget,
+                range,
+                "attribute is not allowed on this declaration",
+            )?;
+            attributes.complete(self, SyntaxKind::ERROR)?;
+        }
         match self.current() {
             SyntaxKind::LET_KW => self.let_stmt(),
             SyntaxKind::VAR_KW => self.var_stmt(),
@@ -1088,6 +1125,518 @@ impl Parser<'_, '_> {
             }
             _ => self.expr_stmt(),
         }
+    }
+
+    fn statement_starts_item(&self) -> bool {
+        self.item_starts_at_after_attributes(self.position)
+    }
+
+    fn item_starts_at_after_attributes(&self, position: usize) -> bool {
+        self.position_after_attributes(position)
+            .is_some_and(|position| self.item_starts_at(position))
+    }
+
+    fn position_after_attributes(&self, mut position: usize) -> Option<usize> {
+        loop {
+            while self.tokens.get(position).is_some_and(|token| {
+                matches!(token.kind, SyntaxKind::DOC_OUTER | SyntaxKind::DOC_INNER)
+            }) {
+                position += 1;
+            }
+            if self
+                .tokens
+                .get(position)
+                .is_some_and(|token| token.kind == SyntaxKind::AT)
+            {
+                position = self.skip_attribute_at(position)?;
+                while self.tokens.get(position).is_some_and(|token| {
+                    matches!(
+                        token.kind,
+                        SyntaxKind::NEWLINE | SyntaxKind::DOC_OUTER | SyntaxKind::DOC_INNER
+                    )
+                }) {
+                    position += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        Some(position)
+    }
+
+    fn statement_starts_at_after_attributes(&self, position: usize) -> bool {
+        self.position_after_attributes(position)
+            .is_some_and(|position| {
+                let kind = self.tokens.get(position).map(|token| token.kind);
+                matches!(
+                    kind,
+                    Some(SyntaxKind::LET_KW | SyntaxKind::VAR_KW | SyntaxKind::ASSERT_KW)
+                ) || self.item_starts_at(position)
+                    || kind.is_some_and(|kind| EXPRESSION_START_KINDS.contains(&kind))
+            })
+    }
+
+    fn generic_parameter_starts_at_after_attributes(&self, mut position: usize) -> bool {
+        loop {
+            while self.tokens.get(position).is_some_and(|token| {
+                matches!(token.kind, SyntaxKind::DOC_OUTER | SyntaxKind::DOC_INNER)
+            }) {
+                position += 1;
+            }
+            if self
+                .tokens
+                .get(position)
+                .is_some_and(|token| token.kind == SyntaxKind::AT)
+            {
+                let Some(after_attribute) = self.skip_attribute_at(position) else {
+                    return false;
+                };
+                position = after_attribute;
+                while self.tokens.get(position).is_some_and(|token| {
+                    matches!(
+                        token.kind,
+                        SyntaxKind::NEWLINE | SyntaxKind::DOC_OUTER | SyntaxKind::DOC_INNER
+                    )
+                }) {
+                    position += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        match self.tokens.get(position).map(|token| token.kind) {
+            Some(SyntaxKind::UIDENT) => self.tokens.get(position + 1).is_some_and(|token| {
+                matches!(
+                    token.kind,
+                    SyntaxKind::COLON | SyntaxKind::COMMA | SyntaxKind::GT
+                ) || (token.kind == SyntaxKind::NEWLINE
+                    && self
+                        .tokens
+                        .get(position + 2)
+                        .is_some_and(|next| next.kind == SyntaxKind::GT))
+            }),
+            Some(SyntaxKind::CONST_KW) => {
+                self.tokens
+                    .get(position + 1)
+                    .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+                    && self
+                        .tokens
+                        .get(position + 2)
+                        .is_some_and(|token| token.kind == SyntaxKind::COLON)
+            }
+            _ => false,
+        }
+    }
+
+    fn unsupported_item_line_starts_statement(&self) -> bool {
+        let next_position = self.position + 1;
+        let next_kind = self.tokens.get(next_position).map(|token| token.kind);
+        matches!(
+            next_kind,
+            Some(
+                SyntaxKind::LET_KW
+                    | SyntaxKind::VAR_KW
+                    | SyntaxKind::ASSERT_KW
+                    | SyntaxKind::R_BRACE
+                    | SyntaxKind::IF_KW
+                    | SyntaxKind::MATCH_KW
+                    | SyntaxKind::LOOP_KW
+                    | SyntaxKind::WHILE_KW
+                    | SyntaxKind::FOR_KW
+                    | SyntaxKind::RETURN_KW
+                    | SyntaxKind::BREAK_KW
+                    | SyntaxKind::CONTINUE_KW
+            )
+        ) || self.item_starts_at_after_attributes(next_position)
+            || (next_kind == Some(SyntaxKind::AT)
+                && self.statement_starts_at_after_attributes(next_position))
+            || (next_kind == Some(SyntaxKind::LIDENT)
+                && self
+                    .tokens
+                    .get(next_position + 1)
+                    .is_some_and(|token| token.kind == SyntaxKind::L_PAREN))
+    }
+
+    fn item_starts_at(&self, position: usize) -> bool {
+        let kind_at = |offset: usize| {
+            position
+                .checked_add(offset)
+                .and_then(|index| self.tokens.get(index))
+                .map(|token| token.kind)
+        };
+        let is_function_name = |offset: usize| kind_at(offset) == Some(SyntaxKind::LIDENT);
+
+        match kind_at(0) {
+            Some(
+                SyntaxKind::USE_KW
+                | SyntaxKind::PUB_KW
+                | SyntaxKind::EXPORT_KW
+                | SyntaxKind::TYPE_KW
+                | SyntaxKind::ENUM_KW
+                | SyntaxKind::TRAIT_KW
+                | SyntaxKind::IMPL_KW
+                | SyntaxKind::EXTERN_KW,
+            ) => true,
+            Some(SyntaxKind::CONST_KW) => kind_at(1) == Some(SyntaxKind::UIDENT),
+            Some(SyntaxKind::FN_KW) => is_function_name(1),
+            Some(SyntaxKind::ASYNC_KW) => {
+                kind_at(1) == Some(SyntaxKind::FN_KW) && is_function_name(2)
+            }
+            Some(SyntaxKind::UNSAFE_KW) => {
+                matches!(
+                    kind_at(1),
+                    Some(SyntaxKind::TRAIT_KW | SyntaxKind::IMPL_KW | SyntaxKind::EXTERN_KW)
+                ) || (kind_at(1) == Some(SyntaxKind::FN_KW) && is_function_name(2))
+                    || (kind_at(1) == Some(SyntaxKind::ASYNC_KW)
+                        && kind_at(2) == Some(SyntaxKind::FN_KW)
+                        && is_function_name(3))
+            }
+            Some(SyntaxKind::LIDENT)
+                if token_is_contextual(self.source, self.tokens, position, "distinct")
+                    || token_is_contextual(self.source, self.tokens, position, "resource")
+                    || token_is_contextual(self.source, self.tokens, position, "invariant") =>
+            {
+                kind_at(1) == Some(SyntaxKind::UIDENT)
+            }
+            Some(SyntaxKind::LIDENT)
+                if token_is_contextual(self.source, self.tokens, position, "effect")
+                    || token_is_contextual(self.source, self.tokens, position, "interface")
+                    || token_is_contextual(self.source, self.tokens, position, "world") =>
+            {
+                kind_at(1) == Some(SyntaxKind::LIDENT)
+            }
+            Some(SyntaxKind::LIDENT)
+                if token_is_contextual(self.source, self.tokens, position, "test")
+                    || token_is_contextual(self.source, self.tokens, position, "property") =>
+            {
+                kind_at(1) == Some(SyntaxKind::STRING)
+            }
+            _ => false,
+        }
+    }
+
+    fn item_in_block(&mut self) -> Result<(), ParserError> {
+        let item = self.start();
+        let item_position = self.position;
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_item_in_block_diagnostic(range, item_position)?;
+
+        self.parse_item_in_block(item)
+    }
+
+    fn emit_item_in_block_diagnostic(
+        &mut self,
+        range: sai_vfs::TextRange,
+        item_position: usize,
+    ) -> Result<(), ParserError> {
+        const MESSAGE: &str = "item declarations are not allowed inside blocks";
+        let mut diagnostic =
+            self.parser_diagnostic(sai_diagnostics::Code::ItemInBlock, range, MESSAGE)?;
+        if let Some((name, is_generic, is_unsafe, is_async, is_public, is_exported)) =
+            self.block_function_name(item_position)
+        {
+            let message = if is_generic && !is_unsafe && !is_async && !is_public && !is_exported {
+                format!(
+                    "generic function `{name}` cannot be expressed as a closure; move it outside this block"
+                )
+            } else if is_generic || is_unsafe || is_async || is_public || is_exported {
+                let mut constraints = Vec::new();
+                if is_generic {
+                    constraints.push("generic parameters");
+                }
+                if is_unsafe {
+                    constraints.push("unsafe semantics");
+                }
+                if is_async {
+                    constraints.push("async semantics");
+                }
+                if is_public {
+                    constraints.push("public visibility");
+                }
+                if is_exported {
+                    constraints.push("exported status");
+                }
+                format!(
+                    "a local closure cannot preserve the {} of function `{name}`; move it outside this block",
+                    constraints.join(", ")
+                )
+            } else {
+                format!(
+                    "replace this item with a closure expression, for example `let {name} = fn(..) {{ .. }}`"
+                )
+            };
+            diagnostic
+                .push_child(sai_diagnostics::Child {
+                    kind: sai_diagnostics::ChildKind::Help,
+                    message,
+                    location: None,
+                })
+                .map_err(|_| ParserError::InvalidDiagnosticSpan)?;
+        }
+        self.emit_error(diagnostic);
+        Ok(())
+    }
+
+    fn block_function_name(
+        &self,
+        mut position: usize,
+    ) -> Option<(String, bool, bool, bool, bool, bool)> {
+        loop {
+            while self.tokens.get(position).is_some_and(|token| {
+                matches!(token.kind, SyntaxKind::DOC_OUTER | SyntaxKind::DOC_INNER)
+            }) {
+                position += 1;
+            }
+            if self
+                .tokens
+                .get(position)
+                .is_some_and(|token| token.kind == SyntaxKind::AT)
+            {
+                position = self.skip_attribute_at(position)?;
+                while self.tokens.get(position).is_some_and(|token| {
+                    matches!(
+                        token.kind,
+                        SyntaxKind::NEWLINE | SyntaxKind::DOC_OUTER | SyntaxKind::DOC_INNER
+                    )
+                }) {
+                    position += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        let mut is_public = false;
+        let mut is_exported = false;
+        while let Some(token) = self
+            .tokens
+            .get(position)
+            .filter(|token| matches!(token.kind, SyntaxKind::PUB_KW | SyntaxKind::EXPORT_KW))
+        {
+            is_public |= token.kind == SyntaxKind::PUB_KW;
+            is_exported |= token.kind == SyntaxKind::EXPORT_KW;
+            position += 1;
+        }
+        let is_unsafe = self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::UNSAFE_KW);
+        if is_unsafe {
+            position += 1;
+        }
+        let is_async = self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::ASYNC_KW);
+        if is_async {
+            position += 1;
+        }
+        if self.tokens.get(position)?.kind != SyntaxKind::FN_KW {
+            return None;
+        }
+        let name = self.tokens.get(position + 1)?;
+        if name.kind != SyntaxKind::LIDENT {
+            return None;
+        }
+        let name = self
+            .source
+            .get(name.range.start().to_usize()..name.range.end().to_usize())
+            .map(str::to_owned)?;
+        let is_generic = self
+            .tokens
+            .get(position + 2)
+            .is_some_and(|token| token.kind == SyntaxKind::LT);
+        Some((
+            name,
+            is_generic,
+            is_unsafe,
+            is_async,
+            is_public,
+            is_exported,
+        ))
+    }
+
+    fn parse_item_in_block(&mut self, item: Marker) -> Result<(), ParserError> {
+        match self.item() {
+            Ok(_) => {}
+            Err(ParserError::UnsupportedItem { .. }) => self.recover_unsupported_block_item()?,
+            Err(error) => {
+                item.abandon(self)?;
+                return Err(error);
+            }
+        }
+        item.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
+    }
+
+    fn recover_unsupported_block_item(&mut self) -> Result<(), ParserError> {
+        let item_start = self.position;
+        let item_kind = if self.at(SyntaxKind::UNSAFE_KW) {
+            self.nth(1)
+        } else {
+            self.current()
+        };
+        let item_position = item_start + usize::from(self.at(SyntaxKind::UNSAFE_KW));
+        let contextual =
+            |spelling| token_is_contextual(self.source, self.tokens, item_position, spelling);
+        let mut body_can_follow_newline = matches!(
+            item_kind,
+            SyntaxKind::TYPE_KW
+                | SyntaxKind::ENUM_KW
+                | SyntaxKind::TRAIT_KW
+                | SyntaxKind::IMPL_KW
+                | SyntaxKind::EXTERN_KW
+        ) || (item_kind == SyntaxKind::LIDENT
+            && (contextual("invariant")
+                || contextual("resource")
+                || contextual("interface")
+                || contextual("world")
+                || contextual("test")
+                || contextual("property")));
+        let where_clause_can_follow = matches!(
+            item_kind,
+            SyntaxKind::TYPE_KW | SyntaxKind::ENUM_KW | SyntaxKind::TRAIT_KW | SyntaxKind::IMPL_KW
+        ) || (item_kind == SyntaxKind::LIDENT
+            && contextual("distinct"));
+        let generic_params_can_follow = matches!(
+            item_kind,
+            SyntaxKind::TYPE_KW | SyntaxKind::ENUM_KW | SyntaxKind::TRAIT_KW | SyntaxKind::IMPL_KW
+        ) || (item_kind == SyntaxKind::LIDENT
+            && contextual("distinct"));
+        let effect_covers_can_follow = item_kind == SyntaxKind::LIDENT && contextual("effect");
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut generic_depth = 0usize;
+        let mut generic_lookahead = true;
+        let mut generic_params_open = false;
+        let mut generic_params_seen = false;
+        let mut generic_param_expected = false;
+
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if kind == SyntaxKind::NEWLINE
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+            {
+                let next_starts_generic_parameter = generic_params_open
+                    && generic_param_expected
+                    && self.generic_parameter_starts_at_after_attributes(self.position + 1);
+                let starts_later_item_or_statement =
+                    self.unsupported_item_line_starts_statement() && !next_starts_generic_parameter;
+                let next_expression_start = self.nth(1);
+                let starts_expression_after_unclosed_parameters = generic_params_open
+                    && generic_depth > 0
+                    && !next_starts_generic_parameter
+                    && EXPRESSION_START_KINDS.contains(&next_expression_start)
+                    && next_expression_start != SyntaxKind::L_BRACE;
+                if starts_later_item_or_statement || starts_expression_after_unclosed_parameters {
+                    break;
+                }
+            }
+            if kind == SyntaxKind::NEWLINE
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && generic_depth == 0
+            {
+                let next_position = self.position + 1;
+                let next_is_where = self
+                    .tokens
+                    .get(next_position)
+                    .is_some_and(|token| token.kind == SyntaxKind::WHERE_KW);
+                let next_is_covers =
+                    token_is_contextual(self.source, self.tokens, next_position, "covers");
+                if (body_can_follow_newline && self.nth(1) == SyntaxKind::L_BRACE)
+                    || (where_clause_can_follow && next_is_where)
+                    || (effect_covers_can_follow && next_is_covers)
+                {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
+            if kind == SyntaxKind::R_BRACE && brace_depth == 0 {
+                break;
+            }
+
+            match kind {
+                SyntaxKind::L_PAREN => paren_depth += 1,
+                SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::L_BRACKET => bracket_depth += 1,
+                SyntaxKind::R_BRACKET if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::L_BRACE => {
+                    if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 {
+                        let opens_effect_set = generic_depth > 0
+                            && self.position > 0
+                            && token_is_contextual(
+                                self.source,
+                                self.tokens,
+                                self.position - 1,
+                                "effects",
+                            );
+                        if !opens_effect_set {
+                            generic_lookahead = false;
+                            generic_depth = 0;
+                            generic_params_open = false;
+                        }
+                    }
+                    brace_depth += 1;
+                }
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                SyntaxKind::EQ
+                    if paren_depth == 0
+                        && bracket_depth == 0
+                        && brace_depth == 0
+                        && generic_depth == 0 =>
+                {
+                    generic_lookahead = false;
+                    generic_params_open = false;
+                    if item_kind == SyntaxKind::TYPE_KW {
+                        body_can_follow_newline = false;
+                    }
+                }
+                SyntaxKind::LT if generic_lookahead => {
+                    if generic_depth == 0 && generic_params_can_follow && !generic_params_seen {
+                        generic_params_open = true;
+                        generic_params_seen = true;
+                        generic_param_expected = true;
+                    }
+                    generic_depth += 1;
+                }
+                SyntaxKind::GT if generic_depth > 0 => {
+                    generic_depth -= 1;
+                    if generic_depth == 0 {
+                        generic_params_open = false;
+                    }
+                }
+                SyntaxKind::COMMA
+                    if generic_params_open
+                        && generic_depth == 1
+                        && paren_depth == 0
+                        && bracket_depth == 0
+                        && brace_depth == 0 =>
+                {
+                    generic_param_expected = true;
+                }
+                SyntaxKind::UIDENT | SyntaxKind::CONST_KW
+                    if generic_params_open
+                        && generic_param_expected
+                        && generic_depth == 1
+                        && paren_depth == 0
+                        && bracket_depth == 0
+                        && brace_depth == 0 =>
+                {
+                    generic_param_expected = false;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+        Ok(())
     }
 
     fn let_stmt(&mut self) -> Result<bool, ParserError> {
@@ -3007,6 +3556,7 @@ impl Parser<'_, '_> {
                 SyntaxKind::EOF,
             ]) {
                 let position = self.position;
+                self.invalid_attributes_before_expression()?;
                 let expression = self.expr_bp(0)?;
                 if expression.kind() == SyntaxKind::ERROR
                     && self.position == position
@@ -3106,8 +3656,8 @@ impl Parser<'_, '_> {
         {
             position += 1;
         }
-        self.tokens
-            .get(position)
+        self.position_after_attributes(position)
+            .and_then(|position| self.tokens.get(position))
             .is_some_and(|token| EXPRESSION_START_KINDS.contains(&token.kind))
     }
 
@@ -3133,6 +3683,7 @@ impl Parser<'_, '_> {
         &mut self,
         base_arg_ranges: &mut Vec<(sai_vfs::TextRange, bool)>,
     ) -> Result<bool, ParserError> {
+        self.invalid_attributes_before_expression()?;
         if self.at(SyntaxKind::DOT2) {
             let range = self
                 .current_token()
@@ -3140,6 +3691,7 @@ impl Parser<'_, '_> {
                 .ok_or(ParserError::InvalidDiagnosticSpan)?;
             let base_arg = self.start();
             self.bump();
+            self.invalid_attributes_before_expression()?;
             if let Err(error) = self.expr_bp(0) {
                 base_arg.abandon(self)?;
                 return Err(error);
@@ -3152,6 +3704,7 @@ impl Parser<'_, '_> {
             let named_arg = self.start();
             self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME_REF)?;
             self.expect(SyntaxKind::COLON)?;
+            self.invalid_attributes_before_expression()?;
             if let Err(error) = self.expr_bp(0) {
                 named_arg.abandon(self)?;
                 return Err(error);
@@ -3175,6 +3728,16 @@ impl Parser<'_, '_> {
         }
         arg.complete(self, SyntaxKind::ARG)?;
         Ok(true)
+    }
+
+    fn invalid_attributes_before_expression(&mut self) -> Result<(), ParserError> {
+        if !self.at(SyntaxKind::AT) || self.skip_attribute_at(self.position).is_none() {
+            return Ok(());
+        }
+        let attributes = self.start();
+        self.attributes(false)?;
+        attributes.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
     }
 
     fn at_physical_line_start(&self) -> bool {
@@ -3247,10 +3810,12 @@ impl Parser<'_, '_> {
             return expression.complete(self, SyntaxKind::UNIT_EXPR);
         }
         let result = (|| {
+            self.invalid_attributes_before_expression()?;
             self.expr_bp(0)?;
             let is_tuple = self.eat(SyntaxKind::COMMA);
             if is_tuple {
                 while !self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::EOF]) {
+                    self.invalid_attributes_before_expression()?;
                     self.expr_bp(0)?;
                     if !self.eat(SyntaxKind::COMMA) {
                         break;

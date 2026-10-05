@@ -1713,7 +1713,7 @@ fn first_len() -> USize {
 
 A block contains only the statements of 03 `Stmt`: `let`, `var`, assignment, `assert`, and expression statements.
 
-- Items are not permitted inside blocks (D-SYN-10). This includes `fn` with a name, `type`, `enum`, `distinct`, `trait`, `impl`, `const`, `use`, `effect`, `invariant` and `test`. Each is `ITEM_IN_BLOCK`, and for `fn` the fix suggests a closure (`let f = fn(..) { .. }`).
+- Items are not permitted inside blocks (D-SYN-10). This includes `fn` with a name, `type`, `enum`, `distinct`, `trait`, `impl`, `const`, `use`, `effect`, `invariant` and `test`. Each is `ITEM_IN_BLOCK`. For a safe, synchronous, non-generic, private, non-exported `fn`, the diagnostic may suggest replacing it with a closure (`let f = fn(..) { .. }`). A generic, `unsafe`, `async`, public, or exported function must instead be moved outside the block because a local closure cannot preserve its signature, semantics, visibility, or export status.
 - `;` is never a statement terminator (`NO_SEMICOLON`, 02). Statements are terminated by NEWLINE (D-LEX-01).
 - An expression statement that begins with an implicit member (`.V`) has no expected type, so it is `IMPLICIT_MEMBER_NEEDS_TYPE`.
 

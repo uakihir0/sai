@@ -2975,6 +2975,1047 @@ mod tests {
     }
 
     #[test]
+    fn block_reports_nested_functions_and_keeps_their_syntax_under_error() {
+        let source = concat!(
+            "fn outer() {\n",
+            "fn inner() {}\n",
+            "let after = 1\n",
+            "}\n",
+            "fn sibling() {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let item_diagnostics = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+            .collect::<Vec<_>>();
+        assert_eq!(item_diagnostics.len(), 1);
+        assert!(item_diagnostics[0].children().iter().any(|child| {
+            child.kind == sai_diagnostics::ChildKind::Help
+                && child.message.contains("let inner = fn(..)")
+        }));
+        assert_eq!(
+            item_diagnostics[0]
+                .primary()
+                .expect("item-in-block location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("fn inner").expect("nested function")
+        );
+        assert!(root.descendants().any(|node| {
+            node.kind() == SyntaxKind::ERROR
+                && node
+                    .descendants()
+                    .any(|child| child.kind() == SyntaxKind::FN_DECL)
+                && source
+                    .get(node.text_range().start().to_usize()..node.text_range().end().to_usize())
+                    .is_some_and(|text| text.starts_with("fn inner"))
+        }));
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            3
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn function_expression_at_block_start_is_not_reported_as_an_item() {
+        let output = parse_file("fn outer() { fn() { value() } }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::ItemInBlock)
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+        );
+    }
+
+    #[test]
+    fn statement_attributes_are_rejected_once_and_the_statement_is_parsed() {
+        let source = concat!(
+            "fn f() {\n",
+            "@allow(foo)\n",
+            "@deny(bar)\n",
+            "let value = 1\n",
+            "@warn(lint)\n",
+            "value()\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let invalid_targets = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_targets.len(), 2);
+        assert_eq!(
+            invalid_targets[0]
+                .primary()
+                .expect("invalid attribute target location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("@allow").expect("first attribute")
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn attributed_item_in_a_block_uses_item_diagnostic_and_recovers_later_statements() {
+        let source = concat!(
+            "fn outer() {\n",
+            "@allow(foo)\n",
+            "@deny(bar)\n",
+            "fn inner() {}\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let item_diagnostic = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ItemInBlock)
+            .expect("nested attributed item diagnostic");
+        assert_eq!(
+            item_diagnostic
+                .primary()
+                .expect("item-in-block location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("@allow").expect("first item attribute")
+        );
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::InvalidAttributeTarget)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unsupported_block_items_are_recovered_as_balanced_error_nodes() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Alias<T> = (T, T)\n",
+            "let first = 1\n",
+            "type Item<T>\n",
+            "where T: Clone\n",
+            "{\n",
+            "value: T\n",
+            "}\n",
+            "unsafe trait Marker\n",
+            "{\n",
+            "}\n",
+            "test \"later\" {\n",
+            "assert true\n",
+            "}\n",
+            "let last = 2\n",
+            "}\n",
+            "fn following() {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            4
+        );
+        let error_texts = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ERROR)
+            .map(|node| {
+                source
+                    .get(node.text_range().start().to_usize()..node.text_range().end().to_usize())
+                    .expect("error node range is within source")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(error_texts.len(), 4, "{error_texts:?}");
+        assert!(
+            error_texts
+                .iter()
+                .any(|text| { text.starts_with("type Alias<T> = (T, T)") })
+        );
+        assert!(
+            error_texts
+                .iter()
+                .any(|text| { *text == "type Item<T>\nwhere T: Clone\n{\nvalue: T\n}" })
+        );
+        assert!(
+            error_texts
+                .iter()
+                .any(|text| { *text == "unsafe trait Marker\n{\n}" })
+        );
+        assert!(
+            error_texts
+                .iter()
+                .any(|text| { text.starts_with("test \"later\" {") })
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn effect_covers_recovery_keeps_a_following_block_expression() {
+        let source = concat!(
+            "fn outer() {\n",
+            "effect marker\n",
+            "covers {io}\n",
+            "{\n",
+            "assert true\n",
+            "}\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        let error_text = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .map(|node| {
+                &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+            })
+            .expect("effect item error node");
+        assert_eq!(error_text, "effect marker\ncovers {io}");
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK_EXPR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn attributes_before_expression_list_items_report_invalid_targets() {
+        let source = concat!(
+            "fn outer() {\n",
+            "consume(@first value, named: @named value, ..@base value)\n",
+            "let array = [@array value, 2]\n",
+            "let tuple = (@tuple value, 2)\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let invalid_targets = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_targets.len(), 5);
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            5
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::NAMED_ARG)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BASE_ARG)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn attributed_argument_does_not_hide_a_nonfinal_base_argument() {
+        let output = parse_file("fn f() { value(..base, @allow(foo) field: value) }\n");
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::BaseArgNotLast)
+        );
+    }
+
+    #[test]
+    fn unclosed_generic_item_recovery_preserves_later_statements() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Broken<T\n",
+            "where T: Clone\n",
+            "{\n",
+            "value: T\n",
+            "}\n",
+            "let after = 1\n",
+            "}\n",
+            "fn following() {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("malformed item error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Broken<T\nwhere T: Clone\n{\nvalue: T\n}"
+        );
+    }
+
+    #[test]
+    fn unclosed_generic_item_stops_before_an_attribute_on_a_later_statement() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Broken<T\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "let later = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        let invalid_attribute = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+            .expect("attribute before a statement is rejected");
+        assert_eq!(
+            invalid_attribute
+                .primary()
+                .expect("invalid attribute location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("@allow").expect("attribute source position")
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| {
+                node.kind() == SyntaxKind::ERROR
+                    && &source
+                        [node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+                        == "type Broken<T"
+            })
+            .expect("malformed item recovery stops before the attributed statement");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Broken<T"
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn unclosed_generic_item_stops_before_a_later_statement() {
+        let source = "fn outer() {\ntype Broken<T\nlet after = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("malformed item error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Broken<T"
+        );
+    }
+
+    #[test]
+    fn multiline_const_generic_item_is_not_split_at_const_parameter() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Item<\n",
+            "const N: USize,\n",
+            "T\n",
+            ">\n",
+            "where T: Clone\n",
+            "{\n",
+            "value: [T; N]\n",
+            "}\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("unsupported type declaration error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Item<\nconst N: USize,\nT\n>\nwhere T: Clone\n{\nvalue: [T; N]\n}"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn multiline_const_generic_impl_is_kept_as_one_item() {
+        let source = concat!(
+            "fn outer() {\n",
+            "impl<\n",
+            "const N: USize,\n",
+            "T\n",
+            "> Trait for Box<T, N> {}\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("unsupported impl error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "impl<\nconst N: USize,\nT\n> Trait for Box<T, N> {}"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn generic_bound_effect_set_does_not_end_item_recovery() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Item<\n",
+            "T: Fn() effects {io}\n",
+            ">\n",
+            "{\n",
+            "callback: T\n",
+            "}\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("unsupported type declaration error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Item<\nT: Fn() effects {io}\n>\n{\ncallback: T\n}"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn associated_type_binding_keeps_nested_generic_depth_during_item_recovery() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Item<\n",
+            "T: Trait<Assoc = Vec<I32>>\n",
+            ">\n",
+            "{\n",
+            "value: T\n",
+            "}\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("unsupported type declaration error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Item<\nT: Trait<Assoc = Vec<I32>>\n>\n{\nvalue: T\n}"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unclosed_generic_item_stops_before_a_later_literal_expression() {
+        let source = "fn outer() {\ntype Broken<T\n42\nlet after = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("malformed item error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Broken<T"
+        );
+    }
+
+    #[test]
+    fn unclosed_nested_generic_item_stops_before_a_later_literal_expression() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Broken<T: Trait<U\n",
+            "42\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("malformed item error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Broken<T: Trait<U"
+        );
+    }
+
+    #[test]
+    fn unclosed_generic_item_does_not_absorb_a_following_const_item() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Broken<T\n",
+            "const NEXT: I32 = 1\n",
+            "let after = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let error_texts = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ERROR)
+            .map(|node| {
+                &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            2
+        );
+        assert!(error_texts.contains(&"type Broken<T"));
+        assert!(error_texts.contains(&"const NEXT: I32 = 1"));
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unclosed_generic_item_stops_before_a_constructor_call() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Broken<T\n",
+            "Some()\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        let item_error = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ERROR)
+            .expect("malformed item error node");
+        assert_eq!(
+            &source[item_error.text_range().start().to_usize()
+                ..item_error.text_range().end().to_usize()],
+            "type Broken<T"
+        );
+    }
+
+    #[test]
+    fn generic_nested_function_help_does_not_suggest_a_closure() {
+        let source = concat!(
+            "fn outer() {\n",
+            "fn identity<T>(value: T) -> T { value }\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let diagnostic = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ItemInBlock)
+            .expect("nested generic function diagnostic");
+
+        let help = diagnostic
+            .children()
+            .iter()
+            .find(|child| child.kind == sai_diagnostics::ChildKind::Help)
+            .expect("generic function guidance");
+        assert!(help.message.contains("generic function `identity`"));
+        assert!(help.message.contains("move it outside this block"));
+        assert!(!help.message.contains("fn(..)"));
+    }
+
+    #[test]
+    fn unsafe_and_async_nested_functions_do_not_suggest_plain_closures() {
+        let source = concat!(
+            "fn outer() {\n",
+            "unsafe fn dangerous() {}\n",
+            "async fn future() {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let diagnostics = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+            .collect::<Vec<_>>();
+
+        assert_eq!(diagnostics.len(), 2);
+        let help_for = |name: &str| {
+            diagnostics
+                .iter()
+                .find_map(|diagnostic| {
+                    diagnostic
+                        .children()
+                        .iter()
+                        .find(|child| {
+                            child.kind == sai_diagnostics::ChildKind::Help
+                                && child.message.contains(name)
+                        })
+                        .map(|child| child.message.as_str())
+                })
+                .expect("qualified function guidance")
+        };
+        for (name, qualifier) in [("dangerous", "unsafe"), ("future", "async")] {
+            let help = help_for(name);
+            assert!(help.contains(qualifier));
+            assert!(help.contains("outside this block"));
+            assert!(!help.contains("fn(..)"));
+        }
+    }
+
+    #[test]
+    fn visibility_qualified_nested_functions_do_not_suggest_local_closures() {
+        let source = concat!(
+            "fn outer() {\n",
+            "export fn entry() {}\n",
+            "pub fn visible() {}\n",
+            "pub export fn both() {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let diagnostics = output
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+            .collect::<Vec<_>>();
+
+        assert_eq!(diagnostics.len(), 3);
+        let help_for = |name: &str| {
+            diagnostics
+                .iter()
+                .find_map(|diagnostic| {
+                    diagnostic
+                        .children()
+                        .iter()
+                        .find(|child| {
+                            child.kind == sai_diagnostics::ChildKind::Help
+                                && child.message.contains(name)
+                        })
+                        .map(|child| child.message.as_str())
+                })
+                .expect("visibility-qualified function guidance")
+        };
+        for (name, qualifier) in [
+            ("entry", "exported"),
+            ("visible", "public"),
+            ("both", "exported"),
+        ] {
+            let help = help_for(name);
+            assert!(help.contains(qualifier));
+            if name == "both" {
+                assert!(help.contains("public"));
+            }
+            assert!(help.contains("outside this block"));
+            assert!(!help.contains("fn(..)"));
+        }
+    }
+
+    #[test]
+    fn unsupported_item_recovery_keeps_a_newline_after_equals_with_its_rhs() {
+        let source = concat!(
+            "fn outer() {\n",
+            "type Alias =\n",
+            "I32\n",
+            "const VALUE: I32 =\n",
+            "42\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let error_texts = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ERROR)
+            .map(|node| {
+                &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            2
+        );
+        assert!(error_texts.contains(&"type Alias =\nI32"));
+        assert!(error_texts.contains(&"const VALUE: I32 =\n42"));
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            0
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unclosed_attribute_before_an_item_reports_item_in_block() {
+        let source = concat!(
+            "fn outer() {\n",
+            "@allow(foo\n",
+            "fn inner() {}\n",
+            "let after = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let item_diagnostic = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ItemInBlock)
+            .expect("item following malformed attributes");
+
+        assert_eq!(
+            item_diagnostic
+                .primary()
+                .expect("item-in-block location")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("@allow").expect("attribute start")
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::InvalidAttributeTarget)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn malformed_let_patterns_recover_as_error_nodes() {
         let output = parse_file("fn f() { let = 1\nlet later = 2\n}\nfn next() {}\n");
         let root = crate::SyntaxNode::new_root(output.root);
