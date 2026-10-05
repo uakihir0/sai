@@ -98,7 +98,7 @@ Punct     ::= '{' | '}' | ',' | '@' | '^' | '~' | '=' | '>=' | '>' | '<=' | '<' 
 2. A token that starts with a digit is an `INT` if it has no `.`, and a `VERSION` otherwise. A `VERSION` with only two numeric components cannot have a pre-release part.
 3. Version literals follow SemVer 2.0.0 ([02-resolver.md](02-resolver.md) §2.2), with these lexical checks:
    - A numeric component (in `INT` or `VERSION`) MUST NOT have a leading zero unless it is exactly `0`, and MUST fit in an unsigned 64-bit integer. A violation is the error `INVALID_VERSION`.
-   - A pre-release identifier MUST be non-empty. A purely numeric pre-release identifier MUST NOT have a leading zero. A violation is `INVALID_VERSION`.
+   - A pre-release identifier MUST be non-empty. A purely numeric pre-release identifier MUST NOT have a leading zero and MUST fit in an unsigned 64-bit integer. A violation is `INVALID_VERSION`.
    - A `+` directly after a `VERSION` (build metadata) is the error `BUILD_METADATA_NOT_ALLOWED` (N-G-4). Build metadata never appears in a `sai.package` or `sai.lock`.
    - A digit sequence directly followed by a letter, `_`, or a third `.` is `INVALID_VERSION` (for example `1.2.3.4`, `1x`, `1_000`).
 4. `UWORD` is used for lint codes (§1.13) and size units (§1.14). Its spelling is validated where it is used.

@@ -1,0 +1,8 @@
+[package]
+name = "sai_diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sai_vfs = { path = "../sai_vfs" }
