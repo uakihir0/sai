@@ -1,0 +1,8 @@
+[package]
+name = "sai_intern"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sai_stable_hash = { path = "../sai_stable_hash" }
