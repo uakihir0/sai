@@ -28,6 +28,7 @@ pub struct Parser<'src, 'tokens> {
     marker_failures: Rc<RefCell<Vec<ParserError>>>,
     allow_assoc_type_bindings: bool,
     no_block_operand: bool,
+    recovered_match_tail: bool,
     nesting_depth: usize,
     reported_nesting_limit: bool,
     spec_failures: HashSet<usize>,
@@ -153,6 +154,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             marker_failures: Rc::new(RefCell::new(Vec::new())),
             allow_assoc_type_bindings: false,
             no_block_operand: false,
+            recovered_match_tail: false,
             nesting_depth: 0,
             reported_nesting_limit: false,
             spec_failures: HashSet::new(),
@@ -1451,8 +1453,8 @@ mod tests {
     }
 
     #[test]
-    fn function_parser_keeps_unimplemented_match_expressions_explicit() {
-        let source = "fn main() { match true {} }\n";
+    fn function_parser_keeps_unimplemented_loop_expressions_explicit() {
+        let source = "fn main() { loop {} }\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -1463,9 +1465,9 @@ mod tests {
                 position: lexed
                     .tokens
                     .iter()
-                    .position(|token| token.kind == SyntaxKind::MATCH_KW)
-                    .expect("match expression starts the unsupported body"),
-                kind: SyntaxKind::MATCH_KW
+                    .position(|token| token.kind == SyntaxKind::LOOP_KW)
+                    .expect("loop expression starts the unsupported body"),
+                kind: SyntaxKind::LOOP_KW
             })
         );
         assert!(matches!(
@@ -1593,6 +1595,313 @@ mod tests {
                 .count(),
             1,
             "over-depth else-if recovery must preserve the containing function"
+        );
+    }
+
+    #[test]
+    fn function_parser_builds_match_arms_guards_and_nested_matches() {
+        let source = concat!(
+            "fn f(value: Option<I32>) {\n",
+            "let simple = match value {\n",
+            "Some(item) if item > 0 => item,\n",
+            "Some(_) => 0\n",
+            "None => { 0 }\n",
+            "}\n",
+            "let empty = match value {}\n",
+            "let nested = match value { .Some(item) => match item {\n",
+            "0 => 1,\n",
+            "_ => 2,\n",
+            "} }\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(
+            output.errors.is_empty(),
+            "valid match arms, guards, and nested matches should parse cleanly: {:?}",
+            output.errors
+        );
+
+        let root = crate::SyntaxNode::new_root(output.root);
+        let count = |kind| {
+            root.descendants()
+                .filter(|node| node.kind() == kind)
+                .count()
+        };
+        assert_eq!(count(SyntaxKind::MATCH_EXPR), 4);
+        assert_eq!(count(SyntaxKind::MATCH_ARM_LIST), 4);
+        assert_eq!(count(SyntaxKind::MATCH_ARM), 6);
+        assert_eq!(count(SyntaxKind::MATCH_GUARD), 1);
+        assert_eq!(count(SyntaxKind::BLOCK_EXPR), 1);
+    }
+
+    #[test]
+    fn match_scrutinees_apply_and_clear_the_block_condition_restriction() {
+        let valid = parse_file(concat!(
+            "fn f(value: Bool) {\n",
+            "let parenthesized = match ({ true }) { true => 1, false => 0 }\n",
+            "let open_range = match value.. { _ => 0 }\n",
+            "}\n",
+        ));
+        assert!(
+            valid.errors.is_empty(),
+            "parentheses clear the scrutinee restriction and open ranges stop at the arm list: {:?}",
+            valid.errors
+        );
+
+        let invalid = parse_file("fn f() { let result = match { true } { true => 1 } }\n");
+        assert_eq!(
+            invalid
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::BlockInCondition]
+        );
+    }
+
+    #[test]
+    fn match_arm_recovery_preserves_a_later_arm_after_a_missing_separator() {
+        let output =
+            parse_file("fn f(value: Option<I32>) { match value { Some(1) => 1 None => 2 } }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "adjacent same-line arms require a separator"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::MATCH_ARM)
+                .count(),
+            2,
+            "separator recovery should continue at the next pattern"
+        );
+    }
+
+    #[test]
+    fn malformed_match_arm_starts_do_not_create_empty_arm_nodes() {
+        let output = parse_file("fn f(value: I32) { match value { . => 1, _ => 2 } }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "an implicit member pattern requires an uppercase name after the dot"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::MATCH_ARM)
+                .count(),
+            1,
+            "the malformed arm must recover without completing an empty MATCH_ARM"
+        );
+    }
+
+    #[test]
+    fn mismatched_match_arm_delimiters_preserve_following_statements_and_items() {
+        let source =
+            "fn f(value: I32) { match value { (] => 1\nlet later = 2\n}\n}\nfn next() {}\n";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let parsed = parser.parse_source_file();
+        assert!(
+            parsed.is_ok(),
+            "malformed match arm should recover: {parsed:?}; cursor {} at {:?}; remaining {:?}",
+            parser.position,
+            parser.current(),
+            parser.tokens[parser.position..]
+                .iter()
+                .map(|token| token.kind)
+                .collect::<Vec<_>>()
+        );
+        let events = parser.into_events().expect("complete source event stream");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("source tree builds");
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            0,
+            "the statement inside the malformed arm tail remains in the recovery node"
+        );
+        assert!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .any(|node| {
+                    let range = node.text_range();
+                    source
+                        .get(range.start().to_usize()..range.end().to_usize())
+                        .is_some_and(|text| text.contains("let later = 2"))
+                }),
+            "recovery must retain the later statement's source in the CST"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "a malformed arm must not consume the following function"
+        );
+    }
+
+    #[test]
+    fn malformed_match_tail_with_an_unclosed_block_preserves_later_items() {
+        let source = concat!(
+            "fn f(value: Bool) { match value { (] => 1\n",
+            "let later = if value {\n",
+            "2\n",
+            "}\n",
+            "}\n",
+            "fn next() {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let match_arm_list = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::MATCH_ARM_LIST)
+            .expect("match arm list remains in the tree");
+        let match_arm_list_range = match_arm_list.text_range();
+        let match_arm_list_text =
+            &source[match_arm_list_range.start().to_usize()..match_arm_list_range.end().to_usize()];
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "an unclosed block in a malformed arm tail must not consume the next function"
+        );
+        assert!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .any(|node| {
+                    let range = node.text_range();
+                    source
+                        .get(range.start().to_usize()..range.end().to_usize())
+                        .is_some_and(|text| text.contains("let later = if value"))
+                }),
+            "the malformed tail must remain in the recovery tree"
+        );
+        assert!(
+            match_arm_list_text.ends_with("}\n}"),
+            "the nested block and match list retain their own closing braces: {match_arm_list_text:?}"
+        );
+        assert!(
+            !match_arm_list_text.contains("fn next"),
+            "the following top-level function must remain outside the match list"
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "the missing function block brace must be diagnosed at the next item"
+        );
+        assert!(
+            !output.errors.iter().any(
+                |diagnostic| diagnostic.message == "unexpected closing delimiter at file scope"
+            ),
+            "a properly owned match-list brace must not leak into file scope"
+        );
+    }
+
+    #[test]
+    fn malformed_match_tail_stops_before_a_top_level_item_without_closers() {
+        let source = "fn f(value: I32) { match value { (] => 1\nfn next() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let match_expression = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::MATCH_EXPR)
+            .expect("the malformed match expression remains in the tree");
+        let range = match_expression.text_range();
+        let match_text = &source[range.start().to_usize()..range.end().to_usize()];
+        let next_item_start = source.find("fn next").expect("next item is present");
+        let synchronization_offset = source[..next_item_start]
+            .rfind('\n')
+            .expect("the top-level item starts on a new line");
+        let empty_error_offsets = root
+            .descendants()
+            .filter(|node| {
+                let range = node.text_range();
+                node.kind() == SyntaxKind::ERROR && range.is_empty()
+            })
+            .map(|node| node.text_range().start().to_usize())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2,
+            "recovery must leave the following top-level function available to the item parser"
+        );
+        assert!(
+            !match_text.contains("fn next"),
+            "the top-level function must remain outside malformed match recovery"
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "both missing closing delimiters must be diagnosed at the synchronization point"
+        );
+        assert!(
+            empty_error_offsets
+                .iter()
+                .filter(|offset| **offset == synchronization_offset)
+                .count()
+                >= 3,
+            "the malformed arm and both missing braces retain zero-width ERROR nodes at the synchronization boundary; empty error offsets {empty_error_offsets:?}, boundary offset {synchronization_offset}"
+        );
+        assert!(
+            !output.errors.iter().any(
+                |diagnostic| diagnostic.message == "unexpected closing delimiter at file scope"
+            ),
+            "recovery must not leave an unexpected closer at file scope"
+        );
+    }
+
+    #[test]
+    fn malformed_nested_match_tail_propagates_recovery_to_the_file_scope() {
+        let source = concat!(
+            "fn f(value: Bool) {\n",
+            "if value {\n",
+            "match value { (] => 1\n",
+            "fn next() {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let functions = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            functions.len(),
+            2,
+            "nested blocks must propagate the recovery boundary so the next function stays at file scope"
+        );
+        assert!(
+            functions[1]
+                .parent()
+                .is_some_and(|parent| parent.kind() == SyntaxKind::SOURCE_FILE),
+            "the recovered function must be a direct file item"
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "the missing match-list and block closers must be diagnosed"
         );
     }
 

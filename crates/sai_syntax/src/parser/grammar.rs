@@ -181,6 +181,7 @@ impl Parser<'_, '_> {
         self.module_header()?;
 
         while !self.at(SyntaxKind::EOF) {
+            self.recovered_match_tail = false;
             if self.eat_nl() {
                 continue;
             }
@@ -192,6 +193,14 @@ impl Parser<'_, '_> {
                 while self.at(SyntaxKind::DOC_OUTER) {
                     self.misplaced_doc_comment()?;
                 }
+                continue;
+            }
+            if self.at_any(&[
+                SyntaxKind::R_PAREN,
+                SyntaxKind::R_BRACKET,
+                SyntaxKind::R_BRACE,
+            ]) {
+                self.recover_unexpected_top_level_closer()?;
                 continue;
             }
             self.item()?;
@@ -210,6 +219,22 @@ impl Parser<'_, '_> {
         }
 
         self.bump();
+        Ok(())
+    }
+
+    fn recover_unexpected_top_level_closer(&mut self) -> Result<(), ParserError> {
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::ExpectedToken,
+            range,
+            "unexpected closing delimiter at file scope",
+        )?;
+        let error = self.start();
+        self.bump();
+        error.complete(self, SyntaxKind::ERROR)?;
         Ok(())
     }
 
@@ -954,6 +979,10 @@ impl Parser<'_, '_> {
             while self.eat_nl() {}
             while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
                 let position = self.position;
+                if self.recovered_match_tail && self.line_starts_top_level_item() {
+                    self.expect_close_brace()?;
+                    return Ok(false);
+                }
                 if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
                     self.misplaced_doc_comment()?;
                     continue;
@@ -993,7 +1022,7 @@ impl Parser<'_, '_> {
             if self.eat(SyntaxKind::R_BRACE) {
                 Ok(true)
             } else {
-                self.expect(SyntaxKind::R_BRACE)?;
+                self.expect_close_brace()?;
                 Ok(false)
             }
         })();
@@ -1005,6 +1034,15 @@ impl Parser<'_, '_> {
                 Err(error)
             }
         }
+    }
+
+    fn expect_close_brace(&mut self) -> Result<bool, ParserError> {
+        let already_reported_here = self.reported_expected_at == Some(self.position);
+        let present = self.expect(SyntaxKind::R_BRACE)?;
+        if !present && already_reported_here {
+            self.emit_missing_error_node()?;
+        }
+        Ok(present)
     }
 
     fn recover_overdeep_block(&mut self) -> Result<CompletedMarker, ParserError> {
@@ -1104,6 +1142,13 @@ impl Parser<'_, '_> {
         let result = self.pattern_inner();
         self.nesting_depth -= 1;
         result
+    }
+
+    fn at_pattern_start(&self) -> bool {
+        if self.at(SyntaxKind::DOT) {
+            return self.nth(1) == SyntaxKind::UIDENT;
+        }
+        PATTERN_START_KINDS.contains(&self.current())
     }
 
     fn pattern_inner(&mut self) -> Result<CompletedMarker, ParserError> {
@@ -1912,6 +1957,7 @@ impl Parser<'_, '_> {
         let reported_nesting_limit = self.reported_nesting_limit;
         let allow_assoc_type_bindings = self.allow_assoc_type_bindings;
         let no_block_operand = self.no_block_operand;
+        let recovered_match_tail = self.recovered_match_tail;
 
         self.allow_assoc_type_bindings = false;
         let parsed = self.generic_arg_list();
@@ -1954,6 +2000,7 @@ impl Parser<'_, '_> {
         self.nesting_depth = nesting_depth;
         self.reported_nesting_limit = reported_nesting_limit;
         self.no_block_operand = no_block_operand;
+        self.recovered_match_tail = recovered_match_tail;
         self.spec_failures.insert(start_position);
 
         if let Some(error) = parser_error {
@@ -2192,8 +2239,8 @@ impl Parser<'_, '_> {
             }
             SyntaxKind::RETURN_KW => self.return_expr(),
             SyntaxKind::IF_KW => self.if_expr(),
-            SyntaxKind::MATCH_KW
-            | SyntaxKind::LOOP_KW
+            SyntaxKind::MATCH_KW => self.match_expr(),
+            SyntaxKind::LOOP_KW
             | SyntaxKind::WHILE_KW
             | SyntaxKind::FOR_KW
             | SyntaxKind::BREAK_KW
@@ -2266,6 +2313,175 @@ impl Parser<'_, '_> {
                 Err(error)
             }
         }
+    }
+
+    fn match_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        let result = (|| {
+            self.bump();
+            self.with_no_block_operand(true, |parser| parser.expr_bp(0))?;
+            while self.eat_nl() {}
+            self.with_no_block_operand(false, |parser| parser.match_arm_list())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => expression.complete(self, SyntaxKind::MATCH_EXPR),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn match_arm_list(&mut self) -> Result<CompletedMarker, ParserError> {
+        let arms = self.start();
+        let result = (|| {
+            if !self.eat(SyntaxKind::L_BRACE) {
+                self.expect(SyntaxKind::L_BRACE)?;
+                return Ok(false);
+            }
+            while self.eat_nl() {}
+            while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                let parsed = self.match_arm()?;
+                if !parsed {
+                    if self.at(SyntaxKind::COMMA) {
+                        let error = self.start();
+                        self.bump();
+                        error.complete(self, SyntaxKind::ERROR)?;
+                        continue;
+                    }
+                    if self.at_confirmed_block_boundary() {
+                        self.recover_match_arm_tail()?;
+                        break;
+                    }
+                    if !self.recover_match_arm_separator()? {
+                        break;
+                    }
+                    continue;
+                }
+                if self.eat(SyntaxKind::COMMA) {
+                    while self.eat_nl() {}
+                    continue;
+                }
+                if self.eat_nl() {
+                    while self.eat_nl() {}
+                    continue;
+                }
+                if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                    break;
+                }
+                self.expect_any(&[SyntaxKind::COMMA, SyntaxKind::NEWLINE])?;
+                if self.at(SyntaxKind::PIPE) || self.at_pattern_start() {
+                    continue;
+                }
+                if !self.recover_match_arm_separator()? {
+                    if self.at_confirmed_block_boundary() {
+                        self.recover_match_arm_tail()?;
+                    }
+                    break;
+                }
+            }
+            while self.eat_nl() {}
+            if self.eat(SyntaxKind::R_BRACE) {
+                Ok(true)
+            } else {
+                self.expect_close_brace()?;
+                Ok(false)
+            }
+        })();
+        match result {
+            Ok(true) => arms.complete(self, SyntaxKind::MATCH_ARM_LIST),
+            Ok(false) => arms.complete(self, SyntaxKind::ERROR),
+            Err(error) => {
+                arms.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn match_arm(&mut self) -> Result<bool, ParserError> {
+        let arm = self.start();
+        if !self.at(SyntaxKind::PIPE) && !self.at_pattern_start() {
+            let result = self.missing_pattern();
+            arm.abandon(self)?;
+            return result.map(|_| false);
+        }
+
+        let result = (|| {
+            self.pattern()?;
+            if self.at(SyntaxKind::IF_KW) {
+                let guard = self.start();
+                let guard_result = (|| {
+                    self.bump();
+                    self.with_no_block_operand(false, |parser| parser.expr_bp(0))?;
+                    Ok(())
+                })();
+                match guard_result {
+                    Ok(()) => {
+                        guard.complete(self, SyntaxKind::MATCH_GUARD)?;
+                    }
+                    Err(error) => {
+                        guard.abandon(self)?;
+                        return Err(error);
+                    }
+                }
+            }
+            self.expect(SyntaxKind::FAT_ARROW)?;
+            while self.eat_nl() {}
+            self.with_no_block_operand(false, |parser| parser.expr_bp(0))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                arm.complete(self, SyntaxKind::MATCH_ARM)?;
+                Ok(true)
+            }
+            Err(error) => {
+                arm.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn recover_match_arm_separator(&mut self) -> Result<bool, ParserError> {
+        let recovery_start = self.position;
+        self.recover_to_list_separator()?;
+        if self.position == recovery_start
+            && self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::R_BRACKET])
+            && self.nth(1) == SyntaxKind::FAT_ARROW
+        {
+            self.recover_one()?;
+            self.recover_to_list_separator()?;
+        }
+        let progressed = self.position != recovery_start;
+        while self.eat(SyntaxKind::COMMA) || self.eat_nl() {}
+        Ok(progressed)
+    }
+
+    fn recover_match_arm_tail(&mut self) -> Result<(), ParserError> {
+        let error = self.start();
+        let mut brace_depth = 0usize;
+        let mut consumed = false;
+        self.recovered_match_tail = true;
+        while !self.at(SyntaxKind::EOF) {
+            if self.line_starts_top_level_item() {
+                break;
+            }
+            match self.current() {
+                SyntaxKind::L_BRACE => brace_depth += 1,
+                SyntaxKind::R_BRACE if brace_depth == 0 => break,
+                SyntaxKind::R_BRACE => brace_depth -= 1,
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+        }
+        if consumed {
+            error.complete(self, SyntaxKind::ERROR)?;
+        } else {
+            error.abandon(self)?;
+        }
+        Ok(())
     }
 
     fn condition(&mut self) -> Result<CompletedMarker, ParserError> {
