@@ -28,6 +28,7 @@ pub struct Parser<'src, 'tokens> {
     marker_failures: Rc<RefCell<Vec<ParserError>>>,
     allow_assoc_type_bindings: bool,
     no_block_operand: bool,
+    stop_expression_at_line_start: bool,
     recovered_match_tail: bool,
     nesting_depth: usize,
     reported_nesting_limit: bool,
@@ -126,14 +127,18 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         for (position, token) in tokens.iter().enumerate() {
             let start = token.range.start().to_usize();
             let end = token.range.end().to_usize();
+            let zero_width_allowed = matches!(token.kind, SyntaxKind::NEWLINE | SyntaxKind::EOF)
+                || (token.kind == SyntaxKind::FSTRING_END
+                    && token.flags.contains(TokenFlags::HAS_ERROR));
             if !token.kind.is_token()
                 || validate_token_mapping(tokens, position, position + 1, token.kind).is_err()
                 || start < previous_end
                 || end > source.len()
                 || !source.is_char_boundary(start)
                 || !source.is_char_boundary(end)
-                || (token.range.is_empty()
-                    != matches!(token.kind, SyntaxKind::NEWLINE | SyntaxKind::EOF))
+                || (token.range.is_empty() && !zero_width_allowed)
+                || (!token.range.is_empty()
+                    && matches!(token.kind, SyntaxKind::NEWLINE | SyntaxKind::EOF))
                 || (token.kind == SyntaxKind::EOF && (start != source.len() || end != start))
             {
                 return Err(ParserError::InvalidTokenStream { position });
@@ -154,6 +159,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             marker_failures: Rc::new(RefCell::new(Vec::new())),
             allow_assoc_type_bindings: false,
             no_block_operand: false,
+            stop_expression_at_line_start: false,
             recovered_match_tail: false,
             nesting_depth: 0,
             reported_nesting_limit: false,
@@ -1450,6 +1456,162 @@ mod tests {
             parser.into_events(),
             Err(ParserError::UnconsumedTokens { .. })
         ));
+    }
+
+    #[test]
+    fn function_parser_builds_format_string_and_interpolation_nodes() {
+        let source = concat!(
+            "fn format(name: Str, age: I32) {\n",
+            "let message = f\"Hello {name}, age {age:pad(3)}\"\n",
+            "}\n",
+            "fn condition(value: I32) {\n",
+            "if f\"{ { value } }\" {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(
+            output.errors.is_empty(),
+            "valid format strings should parse without diagnostics: {:?}",
+            output.errors
+        );
+
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+        let fstrings = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FSTRING_EXPR)
+            .collect::<Vec<_>>();
+        let interpolations = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FSTRING_INTERP)
+            .collect::<Vec<_>>();
+        assert_eq!(fstrings.len(), 2);
+        assert_eq!(interpolations.len(), 3);
+        assert!(interpolations.iter().all(|node| {
+            node.descendants()
+                .any(|child| child.kind() == SyntaxKind::PATH_EXPR)
+        }));
+        assert!(
+            interpolations[0]
+                .children_with_tokens()
+                .all(|element| !matches!(
+                    element,
+                    crate::SyntaxElement::Token(token)
+                        if token.kind() == SyntaxKind::FSTRING_SPEC
+                ))
+        );
+        assert!(
+            interpolations[1]
+                .children_with_tokens()
+                .any(|element| matches!(
+                    element,
+                    crate::SyntaxElement::Token(token)
+                        if token.kind() == SyntaxKind::FSTRING_SPEC
+                ))
+        );
+    }
+
+    #[test]
+    fn unterminated_format_string_recovers_at_the_next_block_statement() {
+        let source = concat!(
+            "fn f(value: I32) {\n",
+            "let broken = f\"{value +\n",
+            "following()\n",
+            "let following = 2\n",
+            "}\n",
+            "fn after() {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                Code::ExpectedExpression | Code::ExpectedToken
+            )
+        }));
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::FSTRING_EXPR)
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::CALL_EXPR),
+            "the expression on the line after the malformed interpolation must survive"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2,
+            "the statement after the unterminated interpolation must survive"
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::FN_DECL
+                    && source
+                        .get(
+                            node.text_range().start().to_usize()
+                                ..node.text_range().end().to_usize()
+                        )
+                        .is_some_and(|text| text.starts_with("fn after"))),
+            "the following function must survive"
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_format_interpolations_recover_into_their_actual_expression_and_close() {
+        let source = concat!(
+            "fn f() {\n",
+            "let first = f\"{;item,}\"\n",
+            "let second = f\"{,other}\"\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let trailing_comma = source.find(",}").expect("trailing comma");
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken
+                    && diagnostic.primary().is_some_and(|location| {
+                        location.span.range.start().to_usize() == trailing_comma
+                    }))
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+        );
+        let interpolations = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FSTRING_INTERP)
+            .collect::<Vec<_>>();
+        assert_eq!(interpolations.len(), 2);
+        let interpolation_texts = interpolations
+            .iter()
+            .map(|interpolation| {
+                let range = interpolation.text_range();
+                &source[range.start().to_usize()..range.end().to_usize()]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(interpolation_texts, ["{;item,}", "{,other}"]);
+        assert!(interpolations.iter().all(|interpolation| {
+            interpolation
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::PATH_EXPR)
+                && interpolation.children_with_tokens().any(|element| {
+                    matches!(
+                        element,
+                        crate::SyntaxElement::Token(token)
+                            if token.kind() == SyntaxKind::FSTRING_INTERP_CLOSE
+                    )
+                })
+        }));
+        assert_eq!(root.green().text_len().to_usize(), source.len());
     }
 
     #[test]
@@ -3715,6 +3877,30 @@ mod tests {
         assert!(matches!(
             Parser::new(source, &tokens),
             Err(ParserError::InvalidTokenStream { position: 0 })
+        ));
+    }
+
+    #[test]
+    fn accepts_only_error_marked_zero_width_format_string_ends() {
+        let source = "f\"\n";
+        let tokens = lex_text(source).tokens;
+        let end_position = tokens
+            .iter()
+            .position(|token| token.kind == SyntaxKind::FSTRING_END)
+            .expect("unterminated format string has an end token");
+        assert!(tokens[end_position].range.is_empty());
+        assert!(
+            tokens[end_position]
+                .flags
+                .contains(crate::TokenFlags::HAS_ERROR)
+        );
+        Parser::new(source, &tokens).expect("lexer format-string recovery is a valid token stream");
+
+        let mut unmarked_tokens = tokens;
+        unmarked_tokens[end_position].flags = crate::TokenFlags::IN_E;
+        assert!(matches!(
+            Parser::new(source, &unmarked_tokens),
+            Err(ParserError::InvalidTokenStream { position }) if position == end_position
         ));
     }
 

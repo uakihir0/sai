@@ -1808,6 +1808,9 @@ impl Parser<'_, '_> {
     }
 
     fn expr_bp_inner(&mut self, min_bp: u8) -> Result<CompletedMarker, ParserError> {
+        if self.stop_expression_at_line_start && self.at_physical_line_start() {
+            return self.missing_expression();
+        }
         let prefix_bp = match self.current() {
             SyntaxKind::NOT_KW => Some(6),
             SyntaxKind::DOT2 | SyntaxKind::DOT2EQ => Some(9),
@@ -1958,6 +1961,7 @@ impl Parser<'_, '_> {
         let reported_nesting_limit = self.reported_nesting_limit;
         let allow_assoc_type_bindings = self.allow_assoc_type_bindings;
         let no_block_operand = self.no_block_operand;
+        let stop_expression_at_line_start = self.stop_expression_at_line_start;
         let recovered_match_tail = self.recovered_match_tail;
 
         self.allow_assoc_type_bindings = false;
@@ -2001,6 +2005,7 @@ impl Parser<'_, '_> {
         self.nesting_depth = nesting_depth;
         self.reported_nesting_limit = reported_nesting_limit;
         self.no_block_operand = no_block_operand;
+        self.stop_expression_at_line_start = stop_expression_at_line_start;
         self.recovered_match_tail = recovered_match_tail;
         self.spec_failures.insert(start_position);
 
@@ -2255,14 +2260,160 @@ impl Parser<'_, '_> {
             SyntaxKind::MOVE_KW if self.nth(1) == SyntaxKind::FN_KW => self.closure_expr(),
             SyntaxKind::FN_KW => self.closure_expr(),
             SyntaxKind::ASYNC_KW => self.async_block_expr(),
-            SyntaxKind::MOVE_KW | SyntaxKind::FSTRING_START => {
-                Err(ParserError::UnsupportedSyntax {
-                    position: self.position,
-                    kind: self.current(),
-                })
-            }
+            SyntaxKind::FSTRING_START => self.fstring_expr(),
+            SyntaxKind::MOVE_KW => Err(ParserError::UnsupportedSyntax {
+                position: self.position,
+                kind: self.current(),
+            }),
             _ => self.missing_expression(),
         }
+    }
+
+    fn fstring_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        let result = (|| {
+            self.expect(SyntaxKind::FSTRING_START)?;
+            while !self.at_any(&[
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]) {
+                if self.at_physical_line_start() {
+                    break;
+                }
+                match self.current() {
+                    SyntaxKind::FSTRING_TEXT => {
+                        self.bump();
+                    }
+                    SyntaxKind::FSTRING_INTERP_OPEN => {
+                        self.fstring_interpolation()?;
+                    }
+                    SyntaxKind::ERROR => {
+                        self.bump();
+                    }
+                    _ => {
+                        let unexpected = self.start();
+                        self.bump();
+                        unexpected.complete(self, SyntaxKind::ERROR)?;
+                    }
+                }
+            }
+            self.expect(SyntaxKind::FSTRING_END)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => expression.complete(self, SyntaxKind::FSTRING_EXPR),
+            Err(error) => {
+                expression.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn fstring_interpolation(&mut self) -> Result<(), ParserError> {
+        let interpolation = self.start();
+        let result = (|| {
+            self.expect(SyntaxKind::FSTRING_INTERP_OPEN)?;
+            if self.recover_fstring_interpolation_prefix()? {
+                self.with_expression_line_boundary(true, |parser| {
+                    parser.with_no_block_operand(false, |parser| parser.expr_bp(0))
+                })?;
+            }
+            let mut reported_unexpected_token = false;
+            self.recover_fstring_interpolation_junk(&mut reported_unexpected_token)?;
+            self.eat(SyntaxKind::FSTRING_SPEC);
+            self.recover_fstring_interpolation_junk(&mut reported_unexpected_token)?;
+            self.expect(SyntaxKind::FSTRING_INTERP_CLOSE)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => interpolation
+                .complete(self, SyntaxKind::FSTRING_INTERP)
+                .map(|_| ()),
+            Err(error) => {
+                interpolation.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn recover_fstring_interpolation_prefix(&mut self) -> Result<bool, ParserError> {
+        let mut reported_missing_expression = false;
+        if !self.at_expression_start()
+            && !self.at_any(&[
+                SyntaxKind::FSTRING_SPEC,
+                SyntaxKind::FSTRING_INTERP_CLOSE,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ])
+            && !self.at(SyntaxKind::ERROR)
+            && !self.at_physical_line_start()
+        {
+            self.missing_expression()?;
+            reported_missing_expression = true;
+        }
+        while !self.at_expression_start()
+            && !self.at_any(&[
+                SyntaxKind::FSTRING_SPEC,
+                SyntaxKind::FSTRING_INTERP_CLOSE,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ])
+            && !self.at_physical_line_start()
+        {
+            if self.at(SyntaxKind::ERROR) {
+                self.bump();
+            } else {
+                if !reported_missing_expression {
+                    self.missing_expression()?;
+                    reported_missing_expression = true;
+                }
+                let unexpected = self.start();
+                self.bump();
+                unexpected.complete(self, SyntaxKind::ERROR)?;
+            }
+        }
+        if !self.at_expression_start() && !reported_missing_expression {
+            self.missing_expression()?;
+        }
+        Ok(self.at_expression_start())
+    }
+
+    fn recover_fstring_interpolation_junk(
+        &mut self,
+        reported_unexpected_token: &mut bool,
+    ) -> Result<(), ParserError> {
+        while !self.at_any(&[
+            SyntaxKind::FSTRING_SPEC,
+            SyntaxKind::FSTRING_INTERP_CLOSE,
+            SyntaxKind::FSTRING_END,
+            SyntaxKind::NEWLINE,
+            SyntaxKind::EOF,
+        ]) && !self.at_physical_line_start()
+        {
+            if self.at(SyntaxKind::ERROR) {
+                self.bump();
+            } else {
+                if !*reported_unexpected_token {
+                    let range = self
+                        .current_token()
+                        .map(|token| token.range)
+                        .ok_or(ParserError::InvalidDiagnosticSpan)?;
+                    self.emit_parser_diagnostic(
+                        sai_diagnostics::Code::ExpectedToken,
+                        range,
+                        "expected `}` to close format string interpolation",
+                    )?;
+                    *reported_unexpected_token = true;
+                }
+                let unexpected = self.start();
+                self.bump();
+                unexpected.complete(self, SyntaxKind::ERROR)?;
+            }
+        }
+        Ok(())
     }
 
     fn implicit_member_expr(&mut self) -> Result<CompletedMarker, ParserError> {
@@ -2743,6 +2894,18 @@ impl Parser<'_, '_> {
         self.no_block_operand = no_block_operand;
         let result = parse(self);
         self.no_block_operand = previous;
+        result
+    }
+
+    fn with_expression_line_boundary<T>(
+        &mut self,
+        stop_at_line_start: bool,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParserError>,
+    ) -> Result<T, ParserError> {
+        let previous = self.stop_expression_at_line_start;
+        self.stop_expression_at_line_start = stop_at_line_start;
+        let result = parse(self);
+        self.stop_expression_at_line_start = previous;
         result
     }
 

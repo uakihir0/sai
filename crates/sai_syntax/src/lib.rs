@@ -673,18 +673,13 @@ pub fn lex(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<LexOutput, L
                 lexer.output.sort_diagnostics()?;
                 return Ok(lexer.output);
             }
+            if lexer.starts_with("f\"") {
+                lexer.lex_fstring()?;
+                continue;
+            }
             lexer.lex_token()?
         };
-        lexer.maybe_emit_newline_before(token)?;
-        let is_semicolon =
-            token.kind == SyntaxKind::ERROR && lexer.text.get(token.start..token.end) == Some(";");
-        let can_arm_semicolon_newline = is_semicolon
-            && !lexer.newline_emitted_since_previous
-            && lexer.previous.is_some_and(|previous| previous.in_e);
-        let index = lexer.push_token(token)?;
-        if can_arm_semicolon_newline {
-            lexer.arm_newline(NewlineTrigger::Semicolon(index));
-        }
+        lexer.push_next_token(token)?;
     }
 }
 
@@ -701,6 +696,22 @@ enum Bracket {
     Paren,
     Square,
     Brace,
+    Interpolation,
+}
+
+#[derive(Clone, Copy)]
+enum FStringTextStop {
+    Interpolation,
+    Quote,
+    LineBreak,
+    Eof,
+}
+
+#[derive(Clone, Copy)]
+enum FStringInterpolationEnd {
+    Closed,
+    EndedString,
+    Unterminated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1204,6 +1215,591 @@ impl<'a> Lexer<'a> {
             return self.lex_number();
         }
         self.lex_punctuator_or_unexpected()
+    }
+
+    fn lex_fstring(&mut self) -> Result<(), LexError> {
+        let string_start = self.pos;
+        self.pos += 2;
+        let (stop, mut flags) = self.scan_fstring_text()?;
+        if matches!(stop, FStringTextStop::LineBreak | FStringTextStop::Eof) {
+            flags.insert(TokenFlags::HAS_ERROR);
+        }
+        if matches!(stop, FStringTextStop::LineBreak | FStringTextStop::Eof)
+            && self.pos > string_start + 2
+        {
+            self.push_fstring_token(
+                SyntaxKind::FSTRING_START,
+                string_start,
+                string_start + 2,
+                TokenFlags::empty(),
+            )?;
+            self.push_fstring_token(SyntaxKind::FSTRING_END, string_start + 2, self.pos, flags)?;
+        } else {
+            self.push_fstring_token(SyntaxKind::FSTRING_START, string_start, self.pos, flags)?;
+        }
+
+        match stop {
+            FStringTextStop::Quote => {
+                let end_start = self.pos;
+                self.pos += 1;
+                self.push_fstring_token(
+                    SyntaxKind::FSTRING_END,
+                    end_start,
+                    self.pos,
+                    TokenFlags::empty(),
+                )?;
+                Ok(())
+            }
+            FStringTextStop::Interpolation => loop {
+                match self.lex_fstring_interpolation()? {
+                    FStringInterpolationEnd::EndedString => return Ok(()),
+                    FStringInterpolationEnd::Unterminated => {
+                        self.push_missing_fstring_end()?;
+                        return Ok(());
+                    }
+                    FStringInterpolationEnd::Closed => {}
+                }
+
+                let text_start = self.pos;
+                let (stop, mut flags) = self.scan_fstring_text()?;
+                match stop {
+                    FStringTextStop::Interpolation => {
+                        if self.pos > text_start {
+                            self.push_fstring_token(
+                                SyntaxKind::FSTRING_TEXT,
+                                text_start,
+                                self.pos,
+                                flags,
+                            )?;
+                        }
+                    }
+                    FStringTextStop::Quote => {
+                        let end_start = text_start;
+                        self.pos += 1;
+                        self.push_fstring_token(
+                            SyntaxKind::FSTRING_END,
+                            end_start,
+                            self.pos,
+                            flags,
+                        )?;
+                        return Ok(());
+                    }
+                    FStringTextStop::LineBreak | FStringTextStop::Eof => {
+                        flags.insert(TokenFlags::HAS_ERROR);
+                        if self.pos > text_start {
+                            self.push_fstring_token(
+                                SyntaxKind::FSTRING_END,
+                                text_start,
+                                self.pos,
+                                flags,
+                            )?;
+                        } else {
+                            self.push_missing_fstring_end()?;
+                        }
+                        self.report_unterminated_fstring(string_start, stop)?;
+                        return Ok(());
+                    }
+                }
+
+                if matches!(stop, FStringTextStop::Interpolation) {
+                    continue;
+                }
+            },
+            FStringTextStop::LineBreak | FStringTextStop::Eof => {
+                if self.pos == string_start + 2 {
+                    self.push_missing_fstring_end()?;
+                }
+                self.report_unterminated_fstring(string_start, stop)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn push_missing_fstring_end(&mut self) -> Result<(), LexError> {
+        self.push_fstring_token(
+            SyntaxKind::FSTRING_END,
+            self.pos,
+            self.pos,
+            TokenFlags::HAS_ERROR,
+        )?;
+        Ok(())
+    }
+
+    fn scan_fstring_text(&mut self) -> Result<(FStringTextStop, TokenFlags), LexError> {
+        let mut flags = TokenFlags::empty();
+        loop {
+            let Some(ch) = self.peek() else {
+                return Ok((FStringTextStop::Eof, flags));
+            };
+            match ch {
+                '"' => return Ok((FStringTextStop::Quote, flags)),
+                '{' if self.starts_with("{{") => {
+                    self.pos += 2;
+                }
+                '{' => return Ok((FStringTextStop::Interpolation, flags)),
+                '}' if self.starts_with("}}") => {
+                    self.pos += 2;
+                }
+                '}' => {
+                    let start = self.pos;
+                    self.bump_char();
+                    self.report_at(
+                        Code::InvalidInterpolation,
+                        Severity::Error,
+                        "unmatched `}` in format string; write `}}` for a literal brace",
+                        start,
+                        self.pos,
+                    )?;
+                    flags.insert(TokenFlags::HAS_ERROR);
+                }
+                '\n' | '\r' => return Ok((FStringTextStop::LineBreak, flags)),
+                '\\' => {
+                    if self.invalid_utf8_at_offset(self.pos + 1)? {
+                        self.pos += 1;
+                        self.bump_char().ok_or(LexError::InvalidSourceSpan)?;
+                        flags.insert(TokenFlags::HAS_ERROR);
+                        continue;
+                    }
+                    if self.text[self.pos + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| matches!(next, '\n' | '\r'))
+                    {
+                        let start = self.pos;
+                        self.pos += 1;
+                        self.report_at(
+                            Code::InvalidEscape,
+                            Severity::Error,
+                            "invalid escape sequence",
+                            start,
+                            self.pos,
+                        )?;
+                        flags.insert(TokenFlags::HAS_ERROR);
+                        continue;
+                    }
+                    let start = self.pos;
+                    let escape = scan_escape(self.text, start, EscapeMode::SimpleString);
+                    if !escape.valid {
+                        flags.insert(TokenFlags::HAS_ERROR);
+                        if !escape.line_break_follows
+                            && !self.range_contains_invalid_utf8(start, escape.end)?
+                        {
+                            self.report_at(
+                                Code::InvalidEscape,
+                                Severity::Error,
+                                "invalid escape sequence",
+                                start,
+                                escape.end,
+                            )?;
+                        }
+                    }
+                    self.pos = escape.end;
+                }
+                _ => {
+                    if self.invalid_utf8_at_pos()? {
+                        flags.insert(TokenFlags::HAS_ERROR);
+                    }
+                    self.bump_char();
+                }
+            }
+        }
+    }
+
+    fn push_fstring_token(
+        &mut self,
+        kind: SyntaxKind,
+        start: usize,
+        end: usize,
+        mut flags: TokenFlags,
+    ) -> Result<usize, LexError> {
+        let range = self.text_range(start, end)?;
+        let forbidden = self.text[start..end]
+            .chars()
+            .any(|ch| forbidden_class(ch).is_some());
+        if kind == SyntaxKind::ERROR && forbidden {
+            self.check_forbidden(range)?;
+            flags.insert(TokenFlags::HAS_ERROR);
+        } else if self.text[start..end]
+            .chars()
+            .any(|ch| forbidden_class(ch) == Some(ForbiddenClass::Bidi))
+        {
+            self.check_bidi(range)?;
+            flags.insert(TokenFlags::HAS_ERROR);
+        }
+        self.push_next_token(LexedToken {
+            kind,
+            start,
+            end,
+            flags,
+        })
+    }
+
+    fn check_forbidden(&mut self, range: TextRange) -> Result<(), LexError> {
+        let start = range.start().to_usize();
+        let end = range.end().to_usize();
+        let mut cursor = start;
+        while cursor < end {
+            let ch = self.text[cursor..end]
+                .chars()
+                .next()
+                .ok_or(LexError::InvalidSourceSpan)?;
+            let Some(class) = forbidden_class(ch) else {
+                cursor += ch.len_utf8();
+                continue;
+            };
+            let run_start = cursor;
+            cursor += ch.len_utf8();
+            while cursor < end {
+                let next = self.text[cursor..end]
+                    .chars()
+                    .next()
+                    .ok_or(LexError::InvalidSourceSpan)?;
+                if forbidden_class(next) != Some(class) {
+                    break;
+                }
+                cursor += next.len_utf8();
+            }
+            self.report_forbidden_at(format!("forbidden {class:?} character"), run_start, cursor)?;
+        }
+        Ok(())
+    }
+
+    fn report_unterminated_fstring(
+        &mut self,
+        string_start: usize,
+        stop: FStringTextStop,
+    ) -> Result<(), LexError> {
+        let secondary = match stop {
+            FStringTextStop::LineBreak => {
+                let break_start = self.pos;
+                let break_end = if self.text.as_bytes().get(break_start) == Some(&b'\r')
+                    && self.text.as_bytes().get(break_start + 1) == Some(&b'\n')
+                {
+                    break_start + 2
+                } else {
+                    break_start + 1
+                };
+                Some((break_start, break_end))
+            }
+            FStringTextStop::Eof => None,
+            FStringTextStop::Interpolation | FStringTextStop::Quote => {
+                return Err(LexError::InvalidSourceSpan);
+            }
+        };
+        self.report_unterminated_literal(
+            Code::UnterminatedString,
+            "unterminated string literal",
+            string_start + 1,
+            secondary,
+        )
+    }
+
+    fn lex_fstring_interpolation(&mut self) -> Result<FStringInterpolationEnd, LexError> {
+        let open_start = self.pos;
+        self.pos += 1;
+        self.push_next_token(self.token(SyntaxKind::FSTRING_INTERP_OPEN, open_start, self.pos))?;
+
+        let mut has_expression_token = false;
+        let mut has_format_spec = false;
+        loop {
+            if let Some((line_start, line_end)) = self.fstring_interpolation_line_break() {
+                self.report_at(
+                    Code::InvalidInterpolation,
+                    Severity::Error,
+                    "line break in format string interpolation",
+                    line_start,
+                    line_end,
+                )?;
+                self.pop_bracket(Bracket::Interpolation);
+                return Ok(FStringInterpolationEnd::Unterminated);
+            }
+
+            self.lex_trivia()?;
+            if self.at_eof() {
+                self.report_at(
+                    Code::InvalidInterpolation,
+                    Severity::Error,
+                    "unterminated format string interpolation",
+                    open_start,
+                    self.pos,
+                )?;
+                self.pop_bracket(Bracket::Interpolation);
+                return Ok(FStringInterpolationEnd::Unterminated);
+            }
+
+            if self.peek() == Some('}') && self.brackets.last() == Some(&Bracket::Interpolation) {
+                if !has_expression_token {
+                    self.report_at(
+                        Code::InvalidInterpolation,
+                        Severity::Error,
+                        "empty format string interpolation",
+                        open_start,
+                        self.pos + 1,
+                    )?;
+                }
+                let close_start = self.pos;
+                self.pos += 1;
+                self.push_next_token(self.token(
+                    SyntaxKind::FSTRING_INTERP_CLOSE,
+                    close_start,
+                    self.pos,
+                ))?;
+                return Ok(FStringInterpolationEnd::Closed);
+            }
+
+            if self.peek() == Some(':') && self.brackets.last() == Some(&Bracket::Interpolation) {
+                let parsed = self.lex_fstring_spec(has_format_spec)?;
+                if parsed {
+                    has_format_spec = true;
+                } else if self.peek() == Some('"') {
+                    let end_start = self.pos;
+                    self.pos += 1;
+                    self.pop_bracket(Bracket::Interpolation);
+                    self.push_fstring_token(
+                        SyntaxKind::FSTRING_END,
+                        end_start,
+                        self.pos,
+                        TokenFlags::HAS_ERROR,
+                    )?;
+                    return Ok(FStringInterpolationEnd::EndedString);
+                }
+                continue;
+            }
+
+            if let Some(quote_end) = self.nested_string_opening_end() {
+                let literal_start = self.pos;
+                self.report_at(
+                    Code::InvalidInterpolation,
+                    Severity::Error,
+                    "string literal inside format string interpolation",
+                    literal_start,
+                    quote_end,
+                )?;
+                self.pop_bracket(Bracket::Interpolation);
+                self.pos = quote_end;
+                self.push_fstring_token(
+                    SyntaxKind::FSTRING_END,
+                    literal_start,
+                    quote_end,
+                    TokenFlags::HAS_ERROR,
+                )?;
+                return Ok(FStringInterpolationEnd::EndedString);
+            }
+
+            let token = self.lex_token()?;
+            has_expression_token = true;
+            self.push_next_token(token)?;
+        }
+    }
+
+    fn fstring_interpolation_line_break(&self) -> Option<(usize, usize)> {
+        let bytes = self.text.as_bytes();
+        let mut cursor = self.pos;
+        loop {
+            while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+                cursor += 1;
+            }
+            if matches!(bytes.get(cursor), Some(b'\n' | b'\r')) {
+                let end =
+                    if bytes.get(cursor) == Some(&b'\r') && bytes.get(cursor + 1) == Some(&b'\n') {
+                        cursor + 2
+                    } else {
+                        cursor + 1
+                    };
+                return Some((cursor, end));
+            }
+            if self.text.get(cursor..)?.starts_with("//") {
+                while cursor < bytes.len() && !matches!(bytes[cursor], b'\r' | b'\n') {
+                    cursor += self.text[cursor..].chars().next()?.len_utf8();
+                }
+                continue;
+            }
+            if self.text.get(cursor..)?.starts_with("/*") {
+                cursor += 2;
+                let mut depth = 1_u32;
+                while cursor < bytes.len() && depth != 0 {
+                    if matches!(bytes.get(cursor), Some(b'\n' | b'\r')) {
+                        let end = if bytes.get(cursor) == Some(&b'\r')
+                            && bytes.get(cursor + 1) == Some(&b'\n')
+                        {
+                            cursor + 2
+                        } else {
+                            cursor + 1
+                        };
+                        return Some((cursor, end));
+                    }
+                    if self.text[cursor..].starts_with("/*") {
+                        depth = depth.saturating_add(1);
+                        cursor += 2;
+                    } else if self.text[cursor..].starts_with("*/") {
+                        depth -= 1;
+                        cursor += 2;
+                    } else {
+                        cursor += self.text[cursor..].chars().next()?.len_utf8();
+                    }
+                }
+                continue;
+            }
+            return None;
+        }
+    }
+
+    fn nested_string_opening_end(&self) -> Option<usize> {
+        if self.starts_with("\"") {
+            return Some(self.pos + 1);
+        }
+        if self.starts_with("f\"") || self.starts_with("b\"") {
+            return Some(self.pos + 2);
+        }
+        if self.starts_with("br") {
+            if let Some((quote_start, _)) = self.raw_string_opener(2) {
+                return Some(quote_start + 1);
+            }
+        }
+        if self.peek() == Some('r') {
+            if let Some((quote_start, _)) = self.raw_string_opener(1) {
+                return Some(quote_start + 1);
+            }
+        }
+        None
+    }
+
+    fn lex_fstring_spec(&mut self, already_seen: bool) -> Result<bool, LexError> {
+        let start = self.pos;
+        let mut end = start + 1;
+        let mut flags = TokenFlags::empty();
+        let mut valid = !already_seen;
+        let raw = self
+            .text
+            .get(end..)
+            .is_some_and(|rest| rest.starts_with("r#"))
+            && self
+                .text
+                .get(end + 2..)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(is_ident_start);
+        let name_start = end + usize::from(raw) * 2;
+        let name_first = self
+            .text
+            .get(name_start..)
+            .and_then(|rest| rest.chars().next());
+        if let Some(first) = name_first.filter(|ch| is_ident_start(*ch)) {
+            end = name_start + first.len_utf8();
+            while let Some(ch) = self
+                .text
+                .get(end..)
+                .and_then(|rest| rest.chars().next())
+                .filter(|ch| unicode_ident::is_xid_continue(*ch))
+            {
+                end += ch.len_utf8();
+            }
+            let name = &self.text[name_start..end];
+            let strict_keyword =
+                !raw && matches!(keyword_class(name), Some(KeywordClass::Strict(_)));
+            valid &= name != "_" && case_kind(name) == SyntaxKind::LIDENT && !strict_keyword;
+            if !name.is_ascii() {
+                flags.insert(TokenFlags::NON_ASCII);
+            }
+            if !is_nfc(name) {
+                let normalized = name.nfc().collect::<String>();
+                self.report_at(
+                    Code::IdentNotNfc,
+                    Severity::Error,
+                    format!("identifier is not NFC-normalized; use `{normalized}`"),
+                    name_start,
+                    end,
+                )?;
+                flags.insert(TokenFlags::HAS_ERROR);
+            }
+            if raw && matches!(name, "self" | "Self" | "_") {
+                self.report_at(
+                    Code::InvalidRawIdent,
+                    Severity::Error,
+                    "r#self, r#Self, and r#_ are not valid raw identifiers",
+                    start + 1,
+                    end,
+                )?;
+                flags.insert(TokenFlags::HAS_ERROR);
+            }
+            if !raw {
+                if let Some(KeywordClass::Reserved(code)) = keyword_class(name) {
+                    let message = match code {
+                        Code::NoNull => "null-like values are not part of SAI; use Option and None",
+                        Code::NoExceptions => "exceptions are not part of SAI; use Result and ?",
+                        _ => "reserved word cannot be used as an identifier",
+                    };
+                    self.report_at(code, Severity::Error, message, name_start, end)?;
+                    flags.insert(TokenFlags::HAS_ERROR);
+                }
+            }
+        } else {
+            valid = false;
+        }
+
+        if valid && self.text.as_bytes().get(end) == Some(&b'(') {
+            let number_start = end + 1;
+            if self
+                .text
+                .as_bytes()
+                .get(number_start)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.pos = number_start;
+                let previous = self.previous;
+                self.previous = None;
+                let number = self.lex_number();
+                self.previous = previous;
+                let number = number?;
+                if number.flags.contains(TokenFlags::HAS_ERROR) {
+                    flags.insert(TokenFlags::HAS_ERROR);
+                }
+                valid = number.kind == SyntaxKind::INT;
+                end = number.end;
+                if self.text.as_bytes().get(end) == Some(&b')') {
+                    end += 1;
+                } else {
+                    valid = false;
+                }
+            } else {
+                valid = false;
+            }
+        }
+
+        if valid {
+            let after = skip_trivia(self.text, end);
+            valid = self.text.as_bytes().get(after) == Some(&b'}');
+        }
+
+        if valid {
+            self.pos = end;
+            self.push_fstring_token(SyntaxKind::FSTRING_SPEC, start, end, flags)?;
+            return Ok(true);
+        }
+
+        self.pos = start;
+        while let Some(ch) = self.peek() {
+            if matches!(ch, '}' | '\n' | '\r' | '"') {
+                break;
+            }
+            if ch == '\\' {
+                let escape = scan_escape(self.text, self.pos, EscapeMode::SimpleString);
+                if escape.line_break_follows {
+                    break;
+                }
+                self.pos = escape.end.max(self.pos + 1);
+                continue;
+            }
+            self.bump_char();
+        }
+        self.report_at(
+            Code::InvalidFormatSpec,
+            Severity::Error,
+            "invalid format specifier",
+            start,
+            self.pos,
+        )?;
+        self.push_fstring_token(SyntaxKind::ERROR, start, self.pos, TokenFlags::HAS_ERROR)?;
+        Ok(false)
     }
 
     fn raw_string_opener(&self, prefix_len: usize) -> Option<(usize, usize)> {
@@ -2579,6 +3175,7 @@ impl<'a> Lexer<'a> {
         if is_in_e(token.kind) {
             token.flags.insert(TokenFlags::IN_E);
         }
+        let in_e = token.flags.contains(TokenFlags::IN_E);
 
         let index = self.output.tokens.len();
         self.output.tokens.push(Token {
@@ -2591,12 +3188,23 @@ impl<'a> Lexer<'a> {
 
         if token.kind != SyntaxKind::NEWLINE && token.kind != SyntaxKind::EOF {
             self.update_brackets(token.kind);
-            self.previous = Some(PreviousToken {
-                index,
-                in_e: is_in_e(token.kind),
-            });
+            self.previous = Some(PreviousToken { index, in_e });
             self.newline_emitted_since_previous = false;
             self.after_line_break = false;
+        }
+        Ok(index)
+    }
+
+    fn push_next_token(&mut self, token: LexedToken) -> Result<usize, LexError> {
+        self.maybe_emit_newline_before(token)?;
+        let is_semicolon =
+            token.kind == SyntaxKind::ERROR && self.text.get(token.start..token.end) == Some(";");
+        let can_arm_semicolon_newline = is_semicolon
+            && !self.newline_emitted_since_previous
+            && self.previous.is_some_and(|previous| previous.in_e);
+        let index = self.push_token(token)?;
+        if can_arm_semicolon_newline {
+            self.arm_newline(NewlineTrigger::Semicolon(index));
         }
         Ok(index)
     }
@@ -2606,16 +3214,37 @@ impl<'a> Lexer<'a> {
             SyntaxKind::L_PAREN => self.brackets.push(Bracket::Paren),
             SyntaxKind::L_BRACKET => self.brackets.push(Bracket::Square),
             SyntaxKind::L_BRACE => self.brackets.push(Bracket::Brace),
+            SyntaxKind::FSTRING_INTERP_OPEN => self.brackets.push(Bracket::Interpolation),
             SyntaxKind::R_PAREN => self.pop_bracket(Bracket::Paren),
             SyntaxKind::R_BRACKET => self.pop_bracket(Bracket::Square),
             SyntaxKind::R_BRACE => self.pop_bracket(Bracket::Brace),
+            SyntaxKind::FSTRING_INTERP_CLOSE => self.pop_bracket(Bracket::Interpolation),
             _ => {}
         }
     }
 
     fn pop_bracket(&mut self, close: Bracket) {
-        if let Some(index) = self.brackets.iter().rposition(|bracket| *bracket == close) {
-            self.brackets.truncate(index);
+        if close == Bracket::Interpolation {
+            if let Some(index) = self
+                .brackets
+                .iter()
+                .rposition(|bracket| *bracket == Bracket::Interpolation)
+            {
+                self.brackets.truncate(index);
+            }
+            return;
+        }
+
+        let boundary = self
+            .brackets
+            .iter()
+            .rposition(|bracket| *bracket == Bracket::Interpolation)
+            .map_or(0, |index| index + 1);
+        if let Some(relative_index) = self.brackets[boundary..]
+            .iter()
+            .rposition(|bracket| *bracket == close)
+        {
+            self.brackets.truncate(boundary + relative_index);
         }
     }
 
@@ -3585,6 +4214,420 @@ mod tests {
             "\"line\\ntext\""
         );
         assert_eq!(output.token_text(&output.tokens[1], text), "b\"\\x41\"");
+    }
+
+    #[test]
+    fn lexes_format_string_segments_and_format_specifiers() {
+        let text = "f\"Hello {name}, age {age:pad(3)} {{!}}\"";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [
+                SyntaxKind::FSTRING_START,
+                SyntaxKind::FSTRING_INTERP_OPEN,
+                SyntaxKind::LIDENT,
+                SyntaxKind::FSTRING_INTERP_CLOSE,
+                SyntaxKind::FSTRING_TEXT,
+                SyntaxKind::FSTRING_INTERP_OPEN,
+                SyntaxKind::LIDENT,
+                SyntaxKind::FSTRING_SPEC,
+                SyntaxKind::FSTRING_INTERP_CLOSE,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert_eq!(
+            output.tokens[..10]
+                .iter()
+                .map(|token| output.token_text(token, text))
+                .collect::<Vec<_>>(),
+            [
+                "f\"Hello ",
+                "{",
+                "name",
+                "}",
+                ", age ",
+                "{",
+                "age",
+                ":pad(3)",
+                "}",
+                " {{!}}\"",
+            ]
+        );
+        assert!(output.tokens[9].flags.contains(TokenFlags::IN_E));
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_every_trivia_is_attached_once(&output);
+    }
+
+    #[test]
+    fn format_specifier_propagates_malformed_width_errors() {
+        let text = "f\"{value:pad(01)}\"";
+        let output = lex_text(text);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::MalformedNumber)
+        );
+        let specifier = output
+            .tokens
+            .iter()
+            .find(|token| token.kind == SyntaxKind::FSTRING_SPEC)
+            .expect("valid format specifier token");
+        assert_eq!(output.token_text(specifier, text), ":pad(01)");
+        assert!(specifier.flags.contains(TokenFlags::HAS_ERROR));
+    }
+
+    #[test]
+    fn lexes_empty_and_plain_format_strings_and_escaped_braces() {
+        let text = "f\"\" f\"plain {{text}} \\n {value}\"";
+        let output = lex_text(text);
+
+        assert_eq!(
+            kinds(&output),
+            [
+                SyntaxKind::FSTRING_START,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::FSTRING_START,
+                SyntaxKind::FSTRING_INTERP_OPEN,
+                SyntaxKind::LIDENT,
+                SyntaxKind::FSTRING_INTERP_CLOSE,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert_eq!(output.token_text(&output.tokens[0], text), "f\"");
+        assert_eq!(output.token_text(&output.tokens[1], text), "\"");
+        assert_eq!(
+            output.token_text(&output.tokens[2], text),
+            "f\"plain {{text}} \\n "
+        );
+        assert_eq!(output.token_text(&output.tokens[6], text), "\"");
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_every_trivia_is_attached_once(&output);
+    }
+
+    #[test]
+    fn format_string_text_allows_non_ascii_whitespace() {
+        let text = "f\"\u{00a0}\"";
+        let output = lex_text(text);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(output.tokens[0].kind, SyntaxKind::FSTRING_START);
+        assert_eq!(output.token_text(&output.tokens[0], text), "f\"\u{00a0}");
+        assert!(!output.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+        assert_eq!(output.tokens[1].kind, SyntaxKind::FSTRING_END);
+        assert_eq!(output.token_text(&output.tokens[1], text), "\"");
+        assert!(!output.tokens[1].flags.contains(TokenFlags::HAS_ERROR));
+    }
+
+    #[test]
+    fn format_string_interpolation_counts_nested_braces_before_format_specs() {
+        let text = "f\"{if ready { value } else { fallback }:debug}\"";
+        let output = lex_text(text);
+
+        assert_eq!(
+            output
+                .tokens
+                .iter()
+                .filter(|token| token.kind == SyntaxKind::FSTRING_INTERP_OPEN)
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .tokens
+                .iter()
+                .filter(|token| token.kind == SyntaxKind::FSTRING_INTERP_CLOSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .tokens
+                .iter()
+                .find(|token| token.kind == SyntaxKind::FSTRING_SPEC)
+                .map(|token| output.token_text(token, text)),
+            Some(":debug")
+        );
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn malformed_format_string_interpolations_report_targeted_diagnostics() {
+        let unmatched = lex_text("f\"unmatched }\"");
+        assert_eq!(unmatched.errors[0].code, Code::InvalidInterpolation);
+        assert!(unmatched.tokens[0].flags.contains(TokenFlags::HAS_ERROR));
+
+        let empty = lex_text("f\"{}\"");
+        assert_eq!(empty.errors.len(), 1);
+        assert_eq!(empty.errors[0].code, Code::InvalidInterpolation);
+
+        let malformed_spec = lex_text("f\"{age:pad(width)}\"");
+        assert_eq!(malformed_spec.errors.len(), 1);
+        assert_eq!(malformed_spec.errors[0].code, Code::InvalidFormatSpec);
+        assert!(
+            malformed_spec
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::ERROR
+                    && malformed_spec.token_text(token, "f\"{age:pad(width)}\"") == ":pad(width)")
+        );
+        assert!(
+            malformed_spec
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::FSTRING_INTERP_CLOSE)
+        );
+
+        let unclosed_spec = lex_text("f\"{value:pad\"");
+        assert_eq!(unclosed_spec.errors.len(), 1);
+        assert_eq!(unclosed_spec.errors[0].code, Code::InvalidFormatSpec);
+        assert!(
+            unclosed_spec
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::FSTRING_END)
+        );
+
+        let escaped_quote = r#"f"{x:pad(width)\"tail}""#;
+        let escaped_quote_output = lex_text(escaped_quote);
+        assert_eq!(
+            escaped_quote_output
+                .errors
+                .iter()
+                .map(|error| error.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidFormatSpec]
+        );
+        assert!(escaped_quote_output.tokens.iter().any(|token| {
+            token.kind == SyntaxKind::ERROR
+                && escaped_quote_output.token_text(token, escaped_quote) == r#":pad(width)\"tail"#
+        }));
+        assert!(
+            escaped_quote_output
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::FSTRING_INTERP_CLOSE)
+        );
+        assert!(
+            escaped_quote_output
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::FSTRING_END)
+        );
+        assert!(!escaped_quote_output.tokens.iter().any(|token| {
+            token.kind == SyntaxKind::LIDENT
+                && escaped_quote_output.token_text(token, escaped_quote) == "tail"
+        }));
+
+        let bidi_spec = "f\"{x:bad\u{202e}}\"";
+        let bidi_output = lex_text(bidi_spec);
+        assert!(
+            bidi_output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InvalidFormatSpec)
+        );
+        assert!(
+            bidi_output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ForbiddenCharacter)
+        );
+
+        let foreign_whitespace_spec = "f\"{x:pad(\u{00a0})}\"";
+        let foreign_whitespace_output = lex_text(foreign_whitespace_spec);
+        assert!(
+            foreign_whitespace_output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InvalidFormatSpec)
+        );
+        assert!(
+            foreign_whitespace_output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ForbiddenCharacter)
+        );
+    }
+
+    #[test]
+    fn unterminated_format_strings_use_end_tokens_without_reclassifying_operators() {
+        let eof = lex_text("f\"unfinished");
+        assert_eq!(
+            kinds(&eof),
+            [
+                SyntaxKind::FSTRING_START,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert_eq!(eof.token_text(&eof.tokens[0], "f\"unfinished"), "f\"");
+        assert_eq!(
+            eof.token_text(&eof.tokens[1], "f\"unfinished"),
+            "unfinished"
+        );
+        assert!(eof.tokens[1].flags.contains(TokenFlags::IN_E));
+        assert_eq!(eof.errors[0].code, Code::UnterminatedString);
+
+        let empty = lex_text("f\"\nnext");
+        assert_eq!(
+            kinds(&empty),
+            [
+                SyntaxKind::FSTRING_START,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::LIDENT,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert!(
+            !empty.tokens[0].flags.contains(TokenFlags::IN_E),
+            "an unterminated start token must not be promoted into the E set"
+        );
+        assert!(empty.tokens[1].range.is_empty());
+        assert!(empty.tokens[1].flags.contains(TokenFlags::HAS_ERROR));
+        assert!(empty.tokens[1].flags.contains(TokenFlags::IN_E));
+        assert!(empty.tokens[3].flags.contains(TokenFlags::AFTER_LINE_BREAK));
+
+        let empty_eof = lex_text("f\"");
+        assert_eq!(
+            kinds(&empty_eof),
+            [
+                SyntaxKind::FSTRING_START,
+                SyntaxKind::FSTRING_END,
+                SyntaxKind::NEWLINE,
+                SyntaxKind::EOF,
+            ]
+        );
+        assert!(empty_eof.tokens[1].range.is_empty());
+        assert!(empty_eof.tokens[1].flags.contains(TokenFlags::HAS_ERROR));
+
+        let interpolation_eof = lex_text("f\"{value}");
+        assert_eq!(
+            interpolation_eof
+                .tokens
+                .iter()
+                .filter(|token| token.kind == SyntaxKind::FSTRING_END)
+                .count(),
+            1
+        );
+        assert!(
+            interpolation_eof
+                .tokens
+                .iter()
+                .find(|token| token.kind == SyntaxKind::FSTRING_END)
+                .is_some_and(|token| {
+                    token.range.is_empty() && token.flags.contains(TokenFlags::HAS_ERROR)
+                })
+        );
+
+        let broken_expression = lex_text("f\"{value +\nnext");
+        let next = broken_expression
+            .tokens
+            .iter()
+            .position(|token| {
+                token.kind == SyntaxKind::LIDENT
+                    && broken_expression.token_text(token, "f\"{value +\nnext") == "next"
+            })
+            .expect("following line identifier remains lexed");
+        assert_eq!(
+            broken_expression.tokens[next - 1].kind,
+            SyntaxKind::NEWLINE,
+            "the unterminated interpolation must end before the following line"
+        );
+        assert_eq!(
+            broken_expression.tokens[next - 2].kind,
+            SyntaxKind::FSTRING_END
+        );
+        assert!(
+            !broken_expression.tokens[next - 3]
+                .flags
+                .contains(TokenFlags::IN_E),
+            "the unfinished operator must not be promoted into the E set"
+        );
+        assert_eq!(broken_expression.errors[0].code, Code::InvalidInterpolation);
+    }
+
+    #[test]
+    fn interpolation_brackets_do_not_close_outer_delimiters() {
+        let text = "(f\"{value)}\"\nnext)";
+        let output = lex_text(text);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert!(
+            output
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::FSTRING_INTERP_CLOSE)
+        );
+        let fstring_end = output
+            .tokens
+            .iter()
+            .position(|token| token.kind == SyntaxKind::FSTRING_END)
+            .expect("format string terminates");
+        let next = output
+            .tokens
+            .iter()
+            .position(|token| {
+                token.kind == SyntaxKind::LIDENT && output.token_text(token, text) == "next"
+            })
+            .expect("following identifier remains in the outer group");
+        assert!(fstring_end < next);
+        assert!(
+            !output.tokens[fstring_end + 1..next]
+                .iter()
+                .any(|token| token.kind == SyntaxKind::NEWLINE)
+        );
+        assert_eq!(
+            output
+                .tokens
+                .iter()
+                .filter(|token| token.kind == SyntaxKind::R_PAREN)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn format_string_errors_preserve_line_recovery_and_reject_nested_strings() {
+        let text = "f\"{name\nfn after() {}\n";
+        let output = lex_text(text);
+        assert_eq!(output.errors[0].code, Code::InvalidInterpolation);
+        assert!(
+            output
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::FN_KW)
+        );
+        assert!(
+            output
+                .tokens
+                .windows(2)
+                .any(|tokens| tokens[0].kind == SyntaxKind::NEWLINE
+                    && tokens[1].kind == SyntaxKind::FN_KW)
+        );
+
+        let nested = lex_text(r#"f"{value "tail"#);
+        assert!(
+            nested
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InvalidInterpolation)
+        );
+        assert!(
+            nested
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::FSTRING_END)
+        );
     }
 
     #[test]

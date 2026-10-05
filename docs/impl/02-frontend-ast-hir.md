@@ -89,6 +89,8 @@ The lexer checks every character against spec/02 §2.1 item 4, using three class
 
 "Literals" means string, byte string, format string text, character, and byte literals (N-E-3). Each maximal run of forbidden characters of the same class is reported once as `FORBIDDEN_CHARACTER`, with a note naming the first character by code point and Unicode name. Outside comments and literals the run becomes an `ERROR` token (§2.4.12). Inside a comment or literal it stays part of that comment or literal, so the tree is unaffected; a literal containing one gets `HAS_ERROR`.
 
+The table controls which classes are forbidden in each context: C0 controls and foreign whitespace are permitted inside comments and literals, while bidi controls are forbidden everywhere. For f-strings, only `FSTRING_START`, `FSTRING_TEXT`, and `FSTRING_END` carry literal text; interpolation expressions and format-specifier syntax follow the ordinary source rules.
+
 ### 2.2.4 Shebang
 
 If the text starts with `#!`, the first line up to (not including) its line break is a `SHEBANG` trivia piece attached as leading trivia of the first token (§2.6.3). It is never a token, so it does not affect NEWLINE generation.
@@ -912,7 +914,7 @@ pub enum GreenElement { Node(GreenNode), Token(GreenToken) }
 pub struct GreenToken(Arc<GreenTokenData>);
 pub struct GreenTokenData {
     kind: SyntaxKind,
-    text: SmolStr,                   // token text only; empty for NEWLINE and EOF
+    text: SmolStr,                   // token text only; may be empty for NEWLINE, EOF, or an error-marked FSTRING_END
     leading: Box<[GreenTrivia]>,
     trailing: Box<[GreenTrivia]>,
 }
@@ -992,7 +994,7 @@ The tree builder and the parser guarantee, and `debug_assert`-check in test buil
 
 1. **Losslessness.** Concatenating the leading trivia, text, and trailing trivia of all tokens of the root, in order, yields the input text exactly (after BOM removal; the BOM is restored from `SourceFile::had_bom` by tools that write files).
 2. **Exactly one root.** The root is `SOURCE_FILE`, and its last token is `EOF`.
-3. **Tokens in order.** Token offsets are strictly increasing, except that zero-width `NEWLINE` tokens may share an offset with the next token.
+3. **Tokens in order.** Token offsets are nondecreasing. Zero-width `NEWLINE` tokens and error-marked zero-width `FSTRING_END` tokens may share an offset with adjacent tokens.
 4. **Every token belongs to a node.** No token is a direct child of a token. `ERROR` nodes may contain any tokens and nodes.
 5. **No empty nodes**, except `ARG_LIST`, `PARAM_LIST`, `CTOR_PAT_ARGS`, `FIELD_LIST`, `VARIANT_LIST`, `ITEM_LIST`, `MATCH_ARM_LIST`, `EFFECT_SET`, `USE_ITEMS`, and `BLOCK`, which always contain their brackets, and `ERROR` nodes created by `expect` failures, which may be empty (zero-width) to mark the position of a missing construct.
 6. **Determinism.** The same text always produces the same green tree, bit for bit.

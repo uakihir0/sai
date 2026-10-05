@@ -310,8 +310,8 @@ impl SyntaxNode {
     }
 
     /// Looks up token text at an absolute source offset in the cached token
-    /// index. Synthetic zero-width NEWLINE tokens are omitted; EOF remains
-    /// addressable at the end of the file.
+    /// index. Synthetic zero-width NEWLINE tokens are omitted; EOF and
+    /// error-marked zero-width FSTRING_END tokens remain addressable.
     pub fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset {
         let index = self
             .1
@@ -323,10 +323,23 @@ impl SyntaxNode {
         let node_entry = index.nodes.get(node_id).expect("node index is valid");
         let token_entries = &index.tokens[node_entry.token_start..node_entry.token_end];
         let first = token_entries.partition_point(|entry| entry.text_range.end() < offset);
-        let mut matches = token_entries[first..]
+        let matching_entries = token_entries[first..]
             .iter()
             .take_while(|entry| entry.text_range.start() <= offset)
             .filter(|entry| offset <= entry.text_range.end())
+            .collect::<Vec<_>>();
+        let match_start = if offset == self.full_range().end()
+            && matching_entries
+                .last()
+                .is_some_and(|entry| entry.green.kind() == crate::SyntaxKind::EOF)
+            && matching_entries.len() > 2
+        {
+            matching_entries.len() - 2
+        } else {
+            0
+        };
+        let mut matches = matching_entries[match_start..]
+            .iter()
             .take(2)
             .map(|entry| SyntaxToken {
                 green: entry.green.clone(),
@@ -693,6 +706,30 @@ mod tests {
         };
 
         assert_eq!(left.kind(), SyntaxKind::LIDENT);
+        assert_eq!(right.kind(), SyntaxKind::EOF);
+    }
+
+    #[test]
+    fn token_at_offset_keeps_empty_format_string_end_tokens() {
+        let root = flat_root("f\"\nnext");
+        let TokenAtOffset::Between(left, right) = root.token_at_offset(TextSize::new(2)) else {
+            panic!("expected the format string start and its empty error end");
+        };
+
+        assert_eq!(left.kind(), SyntaxKind::FSTRING_START);
+        assert_eq!(right.kind(), SyntaxKind::FSTRING_END);
+        assert_eq!(right.text(), "");
+    }
+
+    #[test]
+    fn token_at_eof_keeps_empty_format_string_end_and_eof_addressable() {
+        let root = flat_root("f\"");
+        let TokenAtOffset::Between(left, right) = root.token_at_offset(TextSize::new(2)) else {
+            panic!("expected the empty format string end and EOF");
+        };
+
+        assert_eq!(left.kind(), SyntaxKind::FSTRING_END);
+        assert_eq!(left.text(), "");
         assert_eq!(right.kind(), SyntaxKind::EOF);
     }
 
