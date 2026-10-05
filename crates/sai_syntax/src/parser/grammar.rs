@@ -49,6 +49,74 @@ const PARAM_START_KINDS: &[SyntaxKind] = &[
 ];
 const GENERIC_PARAM_START_KINDS: &[SyntaxKind] =
     &[SyntaxKind::UIDENT, SyntaxKind::CONST_KW, SyntaxKind::AT];
+const EXPRESSION_START_KINDS: &[SyntaxKind] = &[
+    SyntaxKind::LIDENT,
+    SyntaxKind::UIDENT,
+    SyntaxKind::INT,
+    SyntaxKind::FLOAT,
+    SyntaxKind::STRING,
+    SyntaxKind::BYTE_STRING,
+    SyntaxKind::CHAR,
+    SyntaxKind::BYTE,
+    SyntaxKind::TRUE_KW,
+    SyntaxKind::FALSE_KW,
+    SyntaxKind::SELF_KW,
+    SyntaxKind::SELF_TYPE_KW,
+    SyntaxKind::L_PAREN,
+    SyntaxKind::L_BRACKET,
+    SyntaxKind::L_BRACE,
+    SyntaxKind::DOT,
+    SyntaxKind::MINUS,
+    SyntaxKind::TILDE,
+    SyntaxKind::STAR,
+    SyntaxKind::BORROW_KW,
+    SyntaxKind::NOT_KW,
+    SyntaxKind::DOT2,
+    SyntaxKind::DOT2EQ,
+    SyntaxKind::FSTRING_START,
+    SyntaxKind::UNSAFE_KW,
+    SyntaxKind::ASYNC_KW,
+    SyntaxKind::IF_KW,
+    SyntaxKind::MATCH_KW,
+    SyntaxKind::LOOP_KW,
+    SyntaxKind::WHILE_KW,
+    SyntaxKind::FOR_KW,
+    SyntaxKind::MOVE_KW,
+    SyntaxKind::FN_KW,
+    SyntaxKind::RETURN_KW,
+    SyntaxKind::BREAK_KW,
+    SyntaxKind::CONTINUE_KW,
+];
+const GENERIC_EXPR_FOLLOW_KINDS: &[SyntaxKind] = &[
+    SyntaxKind::L_PAREN,
+    SyntaxKind::DOT,
+    SyntaxKind::R_PAREN,
+    SyntaxKind::R_BRACKET,
+    SyntaxKind::R_BRACE,
+    SyntaxKind::COMMA,
+    SyntaxKind::QUESTION,
+    SyntaxKind::NEWLINE,
+    SyntaxKind::FAT_ARROW,
+    SyntaxKind::L_BRACE,
+    SyntaxKind::EOF,
+];
+
+#[derive(Clone, Copy)]
+enum NonAssociativeOperator {
+    Comparison,
+    Range,
+}
+
+#[derive(Clone, Copy)]
+struct InfixOperator {
+    kind: SyntaxKind,
+    left_bp: u8,
+    right_bp: u8,
+    node_kind: SyntaxKind,
+    non_associative: Option<NonAssociativeOperator>,
+    deprecated_boolean_operator: bool,
+    raw_count: u8,
+}
 
 #[derive(Clone, Copy)]
 enum FnClauseKind {
@@ -63,7 +131,7 @@ impl Parser<'_, '_> {
     /// Parses the currently implemented source-file grammar into parser events.
     ///
     /// This slice supports module headers, use declarations, and function
-    /// signatures with empty bodies. Other item forms return
+    /// signatures with the currently implemented block grammar. Other item forms return
     /// [`ParserError::UnsupportedItem`] until their grammar routines are
     /// implemented.
     pub fn parse_source_file(&mut self) -> Result<(), ParserError> {
@@ -236,13 +304,10 @@ impl Parser<'_, '_> {
             self.eat_nl();
         }
         if self.at(SyntaxKind::L_BRACE) {
-            if !self.empty_block_ahead() {
-                let position = self.position;
-                let kind = self.current();
+            if let Err(error) = self.block() {
                 declaration.abandon(self)?;
-                return Err(ParserError::UnsupportedSyntax { position, kind });
+                return Err(error);
             }
-            self.empty_block()?;
         } else {
             self.emit_missing_fn_body()?;
         }
@@ -369,6 +434,39 @@ impl Parser<'_, '_> {
             Some(location),
         );
         diagnostic.primary_label = message.to_owned();
+        self.emit_error(diagnostic);
+        Ok(())
+    }
+
+    fn emit_operator_continuation_diagnostic(
+        &mut self,
+        newline_range: sai_vfs::TextRange,
+    ) -> Result<(), ParserError> {
+        let Some(context) = &self.diagnostic_source else {
+            return Err(ParserError::MissingDiagnosticSource);
+        };
+        let location = sai_diagnostics::Location::from_decoded_source(
+            context.source_ref.clone(),
+            sai_vfs::Span::new(context.file.id(), newline_range),
+            context.file,
+        )
+        .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        let message = "unexpected newline before a binary operator";
+        let mut diagnostic = sai_diagnostics::Diagnostic::new(
+            sai_diagnostics::Code::UnexpectedNewline,
+            sai_diagnostics::Severity::Error,
+            message,
+            Some(location),
+        );
+        diagnostic.primary_label = message.to_owned();
+        diagnostic
+            .push_child(sai_diagnostics::Child {
+                kind: sai_diagnostics::ChildKind::Note,
+                message: "move the operator to the end of the previous line or parenthesize the expression"
+                    .to_owned(),
+                location: None,
+            })
+            .map_err(|_| ParserError::InvalidDiagnosticSpan)?;
         self.emit_error(diagnostic);
         Ok(())
     }
@@ -808,30 +906,1016 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    fn empty_block_ahead(&self) -> bool {
-        if !self.at(SyntaxKind::L_BRACE) {
-            return false;
+    fn block(&mut self) -> Result<CompletedMarker, ParserError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return self.recover_overdeep_block();
         }
-        let mut position = self.position + 1;
-        while self
-            .tokens
-            .get(position)
-            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
-        {
-            position += 1;
-        }
-        self.tokens
-            .get(position)
-            .is_some_and(|token| matches!(token.kind, SyntaxKind::R_BRACE | SyntaxKind::EOF))
+        self.nesting_depth += 1;
+        let result = self.block_inner();
+        self.nesting_depth -= 1;
+        result
     }
 
-    fn empty_block(&mut self) -> Result<(), ParserError> {
+    fn block_inner(&mut self) -> Result<CompletedMarker, ParserError> {
         let block = self.start();
-        self.expect(SyntaxKind::L_BRACE)?;
-        while self.eat_nl() {}
-        self.expect(SyntaxKind::R_BRACE)?;
-        block.complete(self, SyntaxKind::BLOCK)?;
+        let result = (|| {
+            if !self.eat(SyntaxKind::L_BRACE) {
+                self.expect(SyntaxKind::L_BRACE)?;
+                return Ok(false);
+            }
+            while self.eat_nl() {}
+            while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                let position = self.position;
+                if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
+                    self.misplaced_doc_comment()?;
+                    continue;
+                }
+                let statement_ends_with_expression = self.statement()?;
+                let newline = self.current_token().map(|token| token.range);
+                if self.eat_nl() {
+                    if statement_ends_with_expression && self.starts_binary_only_operator() {
+                        let newline = newline.ok_or(ParserError::InvalidDiagnosticSpan)?;
+                        self.emit_operator_continuation_diagnostic(newline)?;
+                        self.recover_operator_continuation()?;
+                    }
+                    while self.eat_nl() {}
+                    continue;
+                }
+                if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                    break;
+                }
+                if !statement_ends_with_expression && self.position == position {
+                    self.recover_to_block_separator()?;
+                    while self.eat_nl() {}
+                    continue;
+                }
+                self.expect(SyntaxKind::NEWLINE)?;
+                self.recover_to_block_separator()?;
+                if self.position == position
+                    && !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF])
+                {
+                    self.recover_one()?;
+                }
+                while self.eat_nl() {}
+            }
+            while self.eat_nl() {}
+            if self.eat(SyntaxKind::R_BRACE) {
+                Ok(true)
+            } else {
+                self.expect(SyntaxKind::R_BRACE)?;
+                Ok(false)
+            }
+        })();
+        match result {
+            Ok(true) => block.complete(self, SyntaxKind::BLOCK),
+            Ok(false) => block.complete(self, SyntaxKind::ERROR),
+            Err(error) => {
+                block.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn recover_overdeep_block(&mut self) -> Result<CompletedMarker, ParserError> {
+        let error = self.start();
+        let range = self.current_token().map(|token| token.range);
+        let mut brace_depth = 0usize;
+        let mut consumed = false;
+        while !self.at(SyntaxKind::EOF) {
+            match self.current() {
+                SyntaxKind::L_BRACE => brace_depth += 1,
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                SyntaxKind::R_BRACE => break,
+                SyntaxKind::NEWLINE if brace_depth == 0 => break,
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+            if consumed && brace_depth == 0 {
+                break;
+            }
+        }
+        let completed = if consumed {
+            error.complete(self, SyntaxKind::ERROR)?
+        } else {
+            error.abandon(self)?;
+            let empty = self.start();
+            empty.complete(self, SyntaxKind::ERROR)?
+        };
+        if let Some(range) = range {
+            self.report_nesting_limit(range)?;
+        }
+        Ok(completed)
+    }
+
+    fn statement(&mut self) -> Result<bool, ParserError> {
+        match self.current() {
+            SyntaxKind::LET_KW => self.let_stmt(),
+            SyntaxKind::VAR_KW => self.var_stmt(),
+            SyntaxKind::ASSERT_KW => {
+                self.assert_stmt()?;
+                Ok(false)
+            }
+            _ => self.expr_stmt(),
+        }
+    }
+
+    fn let_stmt(&mut self) -> Result<bool, ParserError> {
+        let statement = self.start();
+        let result = (|| {
+            self.bump();
+            self.binding_pattern()?;
+            if self.eat(SyntaxKind::COLON) {
+                self.type_(true)?;
+            }
+            let mut ends_with_expression = if self.eat(SyntaxKind::EQ) {
+                self.eat_nl();
+                self.expr_bp(0)?;
+                true
+            } else {
+                self.emit_missing_initializer()?;
+                self.start().complete(self, SyntaxKind::ERROR)?;
+                false
+            };
+            if self.at(SyntaxKind::ELSE_KW)
+                || (self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::ELSE_KW)
+            {
+                ends_with_expression = false;
+                let else_clause = self.start();
+                self.eat_nl();
+                self.bump();
+                self.eat_nl();
+                if let Err(error) = self.block() {
+                    else_clause.abandon(self)?;
+                    return Err(error);
+                }
+                else_clause.complete(self, SyntaxKind::LET_ELSE)?;
+            }
+            Ok(ends_with_expression)
+        })();
+        match result {
+            Ok(ends_with_expression) => {
+                statement.complete(self, SyntaxKind::LET_STMT)?;
+                Ok(ends_with_expression)
+            }
+            Err(error) => {
+                statement.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn binding_pattern(&mut self) -> Result<(), ParserError> {
+        if self.at(SyntaxKind::UNDERSCORE) {
+            let wildcard = self.start();
+            self.bump();
+            wildcard.complete(self, SyntaxKind::WILDCARD_PAT)?;
+            return Ok(());
+        }
+        if !self.at(SyntaxKind::LIDENT) {
+            self.expect(SyntaxKind::LIDENT)?;
+            return Ok(());
+        }
+        let pattern = self.start();
+        self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+        pattern.complete(self, SyntaxKind::BINDING_PAT)?;
         Ok(())
+    }
+
+    fn var_stmt(&mut self) -> Result<bool, ParserError> {
+        let statement = self.start();
+        let result = (|| {
+            self.bump();
+            self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+            if self.eat(SyntaxKind::COLON) {
+                self.type_(true)?;
+            }
+            let ends_with_expression = if self.eat(SyntaxKind::EQ) {
+                self.eat_nl();
+                self.expr_bp(0)?;
+                true
+            } else {
+                self.emit_missing_initializer()?;
+                self.start().complete(self, SyntaxKind::ERROR)?;
+                false
+            };
+            Ok(ends_with_expression)
+        })();
+        match result {
+            Ok(ends_with_expression) => {
+                statement.complete(self, SyntaxKind::VAR_STMT)?;
+                Ok(ends_with_expression)
+            }
+            Err(error) => {
+                statement.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn assert_stmt(&mut self) -> Result<(), ParserError> {
+        let statement = self.start();
+        self.bump();
+        let result = (|| {
+            self.expr_bp(0)?;
+            if self.eat(SyntaxKind::COMMA) {
+                self.expr_bp(0)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                statement.complete(self, SyntaxKind::ASSERT_STMT)?;
+                Ok(())
+            }
+            Err(error) => {
+                statement.abandon(self)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn expr_stmt(&mut self) -> Result<bool, ParserError> {
+        let start_position = self.position;
+        let lhs = self.expr_bp(0)?;
+        if lhs.kind() == SyntaxKind::ERROR && self.position == start_position {
+            return Ok(false);
+        }
+        if let Some((kind, raw_count)) = self.assignment_operator() {
+            let statement = lhs.precede(self);
+            let result = (|| {
+                self.bump_as(kind, raw_count);
+                self.eat_nl();
+                self.expr_bp(0)?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    statement.complete(self, SyntaxKind::ASSIGN_STMT)?;
+                    Ok(true)
+                }
+                Err(error) => {
+                    statement.abandon(self)?;
+                    Err(error)
+                }
+            }
+        } else {
+            lhs.precede(self).complete(self, SyntaxKind::EXPR_STMT)?;
+            Ok(true)
+        }
+    }
+
+    fn assignment_operator(&self) -> Option<(SyntaxKind, u8)> {
+        if self.can_bump_as(SyntaxKind::SHR_EQ, 3) {
+            return Some((SyntaxKind::SHR_EQ, 3));
+        }
+        match self.current() {
+            SyntaxKind::EQ
+            | SyntaxKind::PLUS_EQ
+            | SyntaxKind::MINUS_EQ
+            | SyntaxKind::STAR_EQ
+            | SyntaxKind::SLASH_EQ
+            | SyntaxKind::PERCENT_EQ
+            | SyntaxKind::PLUS_PERCENT_EQ
+            | SyntaxKind::MINUS_PERCENT_EQ
+            | SyntaxKind::STAR_PERCENT_EQ
+            | SyntaxKind::AMP_EQ
+            | SyntaxKind::PIPE_EQ
+            | SyntaxKind::CARET_EQ
+            | SyntaxKind::SHL_EQ => Some((self.current(), 1)),
+            _ => None,
+        }
+    }
+
+    fn emit_missing_initializer(&mut self) -> Result<(), ParserError> {
+        let range = self.current_token().map_or_else(
+            || {
+                sai_vfs::TextSize::from_usize(self.source.len())
+                    .map(sai_vfs::TextRange::empty)
+                    .ok_or(ParserError::InvalidDiagnosticSpan)
+            },
+            |token| Ok(token.range),
+        )?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::MissingInitializer,
+            range,
+            "`let` and `var` statements require an initializer",
+        )?;
+        Ok(())
+    }
+
+    fn expr_bp(&mut self, min_bp: u8) -> Result<CompletedMarker, ParserError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return self.recover_overdeep_expression();
+        }
+        self.nesting_depth += 1;
+        let result = self.expr_bp_inner(min_bp);
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn expr_bp_inner(&mut self, min_bp: u8) -> Result<CompletedMarker, ParserError> {
+        let prefix_bp = match self.current() {
+            SyntaxKind::NOT_KW => Some(6),
+            SyntaxKind::DOT2 | SyntaxKind::DOT2EQ => Some(9),
+            _ => None,
+        };
+        if prefix_bp.is_some_and(|prefix_bp| min_bp > prefix_bp) {
+            return self.missing_expression();
+        }
+        let lhs = self.prefix_or_primary()?;
+        self.expr_bp_loop(lhs, min_bp)
+    }
+
+    fn expr_bp_loop(
+        &mut self,
+        mut lhs: CompletedMarker,
+        min_bp: u8,
+    ) -> Result<CompletedMarker, ParserError> {
+        let mut previous_non_associative =
+            (lhs.kind() == SyntaxKind::RANGE_EXPR).then_some(NonAssociativeOperator::Range);
+        loop {
+            if self.at(SyntaxKind::AS_KW) {
+                const CAST_BINDING_POWER: u8 = 23;
+                if CAST_BINDING_POWER <= min_bp {
+                    break;
+                }
+                let cast = lhs.precede(self);
+                self.bump();
+                if let Err(error) = self.type_no_fx() {
+                    cast.abandon(self)?;
+                    return Err(error);
+                }
+                lhs = cast.complete(self, SyntaxKind::CAST_EXPR)?;
+                previous_non_associative = None;
+                continue;
+            }
+            if lhs.kind() == SyntaxKind::PATH_EXPR && self.generic_expr_args_follow() {
+                return Err(ParserError::UnsupportedSyntax {
+                    position: self.position,
+                    kind: SyntaxKind::LT,
+                });
+            }
+            if self.at_any(&[
+                SyntaxKind::DOT,
+                SyntaxKind::L_PAREN,
+                SyntaxKind::L_BRACKET,
+                SyntaxKind::QUESTION,
+            ]) {
+                return Err(ParserError::UnsupportedSyntax {
+                    position: self.position,
+                    kind: self.current(),
+                });
+            }
+            let Some(operator) = self.infix_operator() else {
+                break;
+            };
+            if operator.left_bp <= min_bp {
+                break;
+            }
+            let operator_range = self.operator_range(operator.raw_count)?;
+            let chained = operator
+                .non_associative
+                .zip(previous_non_associative)
+                .is_some_and(|(current, previous)| {
+                    std::mem::discriminant(&current) == std::mem::discriminant(&previous)
+                });
+            let parent = lhs.precede(self);
+            let result = (|| {
+                if !self.bump_as(operator.kind, operator.raw_count) {
+                    return Err(ParserError::InvalidTokenStream {
+                        position: self.position,
+                    });
+                }
+                if operator.deprecated_boolean_operator {
+                    self.emit_parser_diagnostic(
+                        sai_diagnostics::Code::UseAndOr,
+                        operator_range,
+                        "use `and` or `or` instead of `&&` or `||`",
+                    )?;
+                }
+                if chained {
+                    let (code, message) = match operator.non_associative {
+                        Some(NonAssociativeOperator::Comparison) => (
+                            sai_diagnostics::Code::ChainedComparison,
+                            "comparison operators cannot be chained",
+                        ),
+                        Some(NonAssociativeOperator::Range) => (
+                            sai_diagnostics::Code::ChainedRange,
+                            "range operators cannot be chained",
+                        ),
+                        None => unreachable!("only non-associative operators can be chained"),
+                    };
+                    self.emit_parser_diagnostic(code, operator_range, message)?;
+                }
+                if operator.node_kind == SyntaxKind::RANGE_EXPR {
+                    if self.at_expression_start() {
+                        self.expr_bp(operator.right_bp)?;
+                    } else if operator.kind == SyntaxKind::DOT2EQ
+                        || self
+                            .infix_operator()
+                            .is_some_and(|next| next.left_bp > operator.left_bp)
+                    {
+                        if self.at(SyntaxKind::NEWLINE) {
+                            self.missing_expression_after_operator()?;
+                        } else {
+                            self.missing_expression()?;
+                        }
+                    }
+                } else if self.at(SyntaxKind::NEWLINE) {
+                    self.missing_expression_after_operator()?;
+                } else {
+                    self.expr_bp(operator.right_bp)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                parent.abandon(self)?;
+                return Err(error);
+            }
+            lhs = parent.complete(self, operator.node_kind)?;
+            previous_non_associative = operator.non_associative;
+        }
+        Ok(lhs)
+    }
+
+    fn generic_expr_args_follow(&self) -> bool {
+        if !self.at(SyntaxKind::LT) {
+            return false;
+        }
+        let Some(previous) = self
+            .position
+            .checked_sub(1)
+            .and_then(|position| self.tokens.get(position))
+        else {
+            return false;
+        };
+        if !matches!(previous.kind, SyntaxKind::LIDENT | SyntaxKind::UIDENT)
+            || !previous.flags.contains(crate::TokenFlags::JOINT)
+        {
+            return false;
+        }
+
+        let mut angle_depth = 0usize;
+        let mut delimiters = Vec::<(SyntaxKind, usize, bool)>::new();
+        let mut at_item_start = false;
+        let mut saw_item = false;
+        let mut previous_top_level_kind = None;
+
+        for position in self.position..self.tokens.len() {
+            let Some(token) = self.tokens.get(position) else {
+                return false;
+            };
+            let kind = token.kind;
+            let offset = position - self.position;
+            let at_top_level = angle_depth == 1 && delimiters.is_empty();
+            let starts_effect_set = kind == SyntaxKind::LIDENT
+                && self.nth(offset + 1) == SyntaxKind::L_BRACE
+                && token_is_contextual(self.source, self.tokens, position, "effects");
+
+            if kind == SyntaxKind::LIDENT
+                && !delimiters.iter().any(|(_, _, effect_set)| *effect_set)
+                && self.nth(offset + 1) != SyntaxKind::DOT
+                && !starts_effect_set
+            {
+                return false;
+            }
+
+            if at_top_level
+                && !at_item_start
+                && matches!(
+                    kind,
+                    SyntaxKind::PLUS
+                        | SyntaxKind::MINUS
+                        | SyntaxKind::PLUS_PERCENT
+                        | SyntaxKind::MINUS_PERCENT
+                        | SyntaxKind::STAR
+                        | SyntaxKind::STAR_PERCENT
+                        | SyntaxKind::SLASH
+                        | SyntaxKind::PERCENT
+                        | SyntaxKind::EQ2
+                        | SyntaxKind::NEQ
+                        | SyntaxKind::LE
+                        | SyntaxKind::AMP
+                        | SyntaxKind::AMP2
+                        | SyntaxKind::PIPE
+                        | SyntaxKind::PIPE2
+                        | SyntaxKind::CARET
+                        | SyntaxKind::SHL
+                        | SyntaxKind::AND_KW
+                        | SyntaxKind::OR_KW
+                        | SyntaxKind::AS_KW
+                        | SyntaxKind::FAT_ARROW
+                )
+            {
+                return false;
+            }
+
+            if at_top_level
+                && !at_item_start
+                && GENERIC_ARG_START_KINDS.contains(&kind)
+                && !starts_effect_set
+                && previous_top_level_kind.is_some_and(|previous| {
+                    matches!(
+                        previous,
+                        SyntaxKind::LIDENT
+                            | SyntaxKind::UIDENT
+                            | SyntaxKind::UNDERSCORE
+                            | SyntaxKind::SELF_TYPE_KW
+                            | SyntaxKind::INT
+                            | SyntaxKind::CHAR
+                            | SyntaxKind::TRUE_KW
+                            | SyntaxKind::FALSE_KW
+                            | SyntaxKind::R_PAREN
+                            | SyntaxKind::R_BRACKET
+                            | SyntaxKind::R_BRACE
+                            | SyntaxKind::GT
+                    )
+                })
+            {
+                return false;
+            }
+
+            if at_top_level && kind == SyntaxKind::NEWLINE {
+                if saw_item && self.nth(offset + 1) == SyntaxKind::GT {
+                    return GENERIC_EXPR_FOLLOW_KINDS.contains(&self.nth(offset + 2));
+                }
+                return false;
+            }
+
+            if at_item_start && at_top_level {
+                if kind == SyntaxKind::GT {
+                    return saw_item && GENERIC_EXPR_FOLLOW_KINDS.contains(&self.nth(offset + 1));
+                }
+                if !GENERIC_ARG_START_KINDS.contains(&kind) {
+                    return false;
+                }
+                if kind == SyntaxKind::MINUS && self.nth(offset + 1) != SyntaxKind::INT {
+                    return false;
+                }
+                at_item_start = false;
+                saw_item = true;
+            }
+
+            match kind {
+                SyntaxKind::LT => {
+                    angle_depth += 1;
+                    if angle_depth == 1 {
+                        at_item_start = true;
+                    }
+                }
+                SyntaxKind::GT if angle_depth > 0 => {
+                    if delimiters
+                        .last()
+                        .is_some_and(|(_, opening_angle_depth, _)| {
+                            angle_depth <= *opening_angle_depth
+                        })
+                    {
+                        return false;
+                    }
+                    angle_depth -= 1;
+                    if angle_depth == 0 {
+                        return delimiters.is_empty()
+                            && saw_item
+                            && GENERIC_EXPR_FOLLOW_KINDS.contains(&self.nth(offset + 1));
+                    }
+                }
+                SyntaxKind::GT => return false,
+                SyntaxKind::L_PAREN => delimiters.push((SyntaxKind::R_PAREN, angle_depth, false)),
+                SyntaxKind::L_BRACKET => {
+                    delimiters.push((SyntaxKind::R_BRACKET, angle_depth, false));
+                }
+                SyntaxKind::L_BRACE => delimiters.push((
+                    SyntaxKind::R_BRACE,
+                    angle_depth,
+                    position.checked_sub(1).is_some_and(|previous| {
+                        token_is_contextual(self.source, self.tokens, previous, "effects")
+                    }),
+                )),
+                SyntaxKind::R_PAREN | SyntaxKind::R_BRACKET | SyntaxKind::R_BRACE => {
+                    if delimiters
+                        .last()
+                        .is_some_and(|(close, _, _)| *close == kind)
+                    {
+                        delimiters.pop();
+                    } else {
+                        return false;
+                    }
+                }
+                SyntaxKind::COMMA if at_top_level => at_item_start = true,
+                SyntaxKind::NEWLINE if at_top_level => return false,
+                SyntaxKind::EOF => return false,
+                _ => {}
+            }
+            if angle_depth == 1 && delimiters.is_empty() {
+                if kind == SyntaxKind::COMMA {
+                    previous_top_level_kind = None;
+                } else {
+                    previous_top_level_kind = Some(kind);
+                }
+            }
+        }
+        false
+    }
+
+    fn infix_operator(&self) -> Option<InfixOperator> {
+        if self.can_bump_as(SyntaxKind::SHR_EQ, 3) {
+            return None;
+        }
+        if self.can_bump_as(SyntaxKind::PIPE2, 2) {
+            return Some(InfixOperator {
+                kind: SyntaxKind::PIPE2,
+                left_bp: 1,
+                right_bp: 2,
+                node_kind: SyntaxKind::BIN_EXPR,
+                non_associative: None,
+                deprecated_boolean_operator: true,
+                raw_count: 2,
+            });
+        }
+        if self.can_bump_as(SyntaxKind::AMP2, 2) {
+            return Some(InfixOperator {
+                kind: SyntaxKind::AMP2,
+                left_bp: 3,
+                right_bp: 4,
+                node_kind: SyntaxKind::BIN_EXPR,
+                non_associative: None,
+                deprecated_boolean_operator: true,
+                raw_count: 2,
+            });
+        }
+        let kind = self.current();
+        let (left_bp, right_bp, non_associative, deprecated_boolean_operator) = match kind {
+            SyntaxKind::OR_KW => (1, 2, None, false),
+            SyntaxKind::PIPE2 => (1, 2, None, true),
+            SyntaxKind::AND_KW => (3, 4, None, false),
+            SyntaxKind::AMP2 => (3, 4, None, true),
+            SyntaxKind::GT if self.can_bump_as(SyntaxKind::SHR, 2) => (17, 18, None, false),
+            SyntaxKind::GT if self.can_bump_as(SyntaxKind::GE, 2) => {
+                (7, 8, Some(NonAssociativeOperator::Comparison), false)
+            }
+            SyntaxKind::EQ2
+            | SyntaxKind::NEQ
+            | SyntaxKind::LT
+            | SyntaxKind::LE
+            | SyntaxKind::GT => (7, 8, Some(NonAssociativeOperator::Comparison), false),
+            SyntaxKind::DOT2 => (9, 10, Some(NonAssociativeOperator::Range), false),
+            SyntaxKind::DOT2EQ => (9, 10, Some(NonAssociativeOperator::Range), false),
+            SyntaxKind::PIPE => (11, 12, None, false),
+            SyntaxKind::CARET => (13, 14, None, false),
+            SyntaxKind::AMP => (15, 16, None, false),
+            SyntaxKind::SHL => (17, 18, None, false),
+            SyntaxKind::PLUS
+            | SyntaxKind::MINUS
+            | SyntaxKind::PLUS_PERCENT
+            | SyntaxKind::MINUS_PERCENT => (19, 20, None, false),
+            SyntaxKind::STAR
+            | SyntaxKind::SLASH
+            | SyntaxKind::PERCENT
+            | SyntaxKind::STAR_PERCENT => (21, 22, None, false),
+            _ => return None,
+        };
+        let (kind, raw_count) = if kind == SyntaxKind::GT {
+            if self.can_bump_as(SyntaxKind::SHR, 2) {
+                (SyntaxKind::SHR, 2)
+            } else if self.can_bump_as(SyntaxKind::GE, 2) {
+                (SyntaxKind::GE, 2)
+            } else {
+                (SyntaxKind::GT, 1)
+            }
+        } else if matches!(kind, SyntaxKind::AMP2 | SyntaxKind::PIPE2) {
+            (kind, 2)
+        } else {
+            (kind, 1)
+        };
+        Some(InfixOperator {
+            kind,
+            left_bp,
+            right_bp,
+            node_kind: if matches!(kind, SyntaxKind::DOT2 | SyntaxKind::DOT2EQ) {
+                SyntaxKind::RANGE_EXPR
+            } else {
+                SyntaxKind::BIN_EXPR
+            },
+            non_associative,
+            deprecated_boolean_operator,
+            raw_count,
+        })
+    }
+
+    fn starts_binary_only_operator(&self) -> bool {
+        self.infix_operator().is_some_and(|operator| {
+            matches!(
+                operator.kind,
+                SyntaxKind::PLUS
+                    | SyntaxKind::SLASH
+                    | SyntaxKind::PERCENT
+                    | SyntaxKind::PLUS_PERCENT
+                    | SyntaxKind::MINUS_PERCENT
+                    | SyntaxKind::STAR_PERCENT
+                    | SyntaxKind::EQ2
+                    | SyntaxKind::NEQ
+                    | SyntaxKind::LT
+                    | SyntaxKind::LE
+                    | SyntaxKind::GT
+                    | SyntaxKind::GE
+                    | SyntaxKind::SHR
+                    | SyntaxKind::PIPE
+                    | SyntaxKind::PIPE2
+                    | SyntaxKind::CARET
+                    | SyntaxKind::AMP
+                    | SyntaxKind::AMP2
+                    | SyntaxKind::SHL
+            )
+        })
+    }
+
+    fn prefix_or_primary(&mut self) -> Result<CompletedMarker, ParserError> {
+        if self.at(SyntaxKind::NOT_KW) {
+            let prefix = self.start();
+            self.bump();
+            let result = self.expr_bp(6);
+            return match result {
+                Ok(_) => prefix.complete(self, SyntaxKind::PREFIX_EXPR),
+                Err(error) => {
+                    prefix.abandon(self)?;
+                    Err(error)
+                }
+            };
+        }
+        if self.at_any(&[
+            SyntaxKind::MINUS,
+            SyntaxKind::TILDE,
+            SyntaxKind::STAR,
+            SyntaxKind::BORROW_KW,
+        ]) {
+            let prefix = self.start();
+            let is_borrow = self.at(SyntaxKind::BORROW_KW);
+            self.bump();
+            if is_borrow {
+                self.eat(SyntaxKind::MUT_KW);
+            }
+            let result = self.expr_bp(24);
+            return match result {
+                Ok(_) => prefix.complete(self, SyntaxKind::PREFIX_EXPR),
+                Err(error) => {
+                    prefix.abandon(self)?;
+                    Err(error)
+                }
+            };
+        }
+        self.primary_expr()
+    }
+
+    fn primary_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        match self.current() {
+            SyntaxKind::INT
+            | SyntaxKind::FLOAT
+            | SyntaxKind::STRING
+            | SyntaxKind::BYTE_STRING
+            | SyntaxKind::CHAR
+            | SyntaxKind::BYTE
+            | SyntaxKind::TRUE_KW
+            | SyntaxKind::FALSE_KW => {
+                let literal = self.start();
+                self.bump();
+                literal.complete(self, SyntaxKind::LITERAL)
+            }
+            SyntaxKind::LIDENT | SyntaxKind::UIDENT => {
+                let path = self.start();
+                self.name_node(IDENT_KINDS, SyntaxKind::NAME_REF)?;
+                path.complete(self, SyntaxKind::PATH_EXPR)
+            }
+            SyntaxKind::SELF_KW => {
+                let expression = self.start();
+                self.bump();
+                expression.complete(self, SyntaxKind::SELF_EXPR)
+            }
+            SyntaxKind::SELF_TYPE_KW => {
+                let expression = self.start();
+                self.bump();
+                expression.complete(self, SyntaxKind::SELF_TYPE_EXPR)
+            }
+            SyntaxKind::L_PAREN => self.paren_or_tuple_expr(),
+            SyntaxKind::L_BRACE => {
+                let expression = self.start();
+                if let Err(error) = self.block() {
+                    expression.abandon(self)?;
+                    return Err(error);
+                }
+                expression.complete(self, SyntaxKind::BLOCK_EXPR)
+            }
+            SyntaxKind::UNSAFE_KW => {
+                let expression = self.start();
+                self.bump();
+                if !self.at(SyntaxKind::L_BRACE) {
+                    let position = self.position;
+                    let kind = self.current();
+                    expression.abandon(self)?;
+                    return Err(ParserError::UnsupportedSyntax { position, kind });
+                }
+                if let Err(error) = self.block() {
+                    expression.abandon(self)?;
+                    return Err(error);
+                }
+                expression.complete(self, SyntaxKind::UNSAFE_BLOCK_EXPR)
+            }
+            SyntaxKind::DOT2 | SyntaxKind::DOT2EQ => self.prefix_range_expr(),
+            SyntaxKind::DOT if matches!(self.nth(1), SyntaxKind::UIDENT | SyntaxKind::AWAIT_KW) => {
+                Err(ParserError::UnsupportedSyntax {
+                    position: self.position,
+                    kind: SyntaxKind::DOT,
+                })
+            }
+            SyntaxKind::RETURN_KW => self.return_expr(),
+            SyntaxKind::IF_KW
+            | SyntaxKind::MATCH_KW
+            | SyntaxKind::LOOP_KW
+            | SyntaxKind::WHILE_KW
+            | SyntaxKind::FOR_KW
+            | SyntaxKind::BREAK_KW
+            | SyntaxKind::CONTINUE_KW
+            | SyntaxKind::MOVE_KW
+            | SyntaxKind::FN_KW
+            | SyntaxKind::ASYNC_KW
+            | SyntaxKind::FSTRING_START
+            | SyntaxKind::L_BRACKET => Err(ParserError::UnsupportedSyntax {
+                position: self.position,
+                kind: self.current(),
+            }),
+            _ => self.missing_expression(),
+        }
+    }
+
+    fn paren_or_tuple_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        self.bump();
+        if self.eat(SyntaxKind::R_PAREN) {
+            return expression.complete(self, SyntaxKind::UNIT_EXPR);
+        }
+        let result = (|| {
+            self.expr_bp(0)?;
+            let is_tuple = self.eat(SyntaxKind::COMMA);
+            if is_tuple {
+                while !self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::EOF]) {
+                    self.expr_bp(0)?;
+                    if !self.eat(SyntaxKind::COMMA) {
+                        break;
+                    }
+                }
+            }
+            Ok(is_tuple)
+        })();
+        let is_tuple = match result {
+            Ok(is_tuple) => is_tuple,
+            Err(error) => {
+                expression.abandon(self)?;
+                return Err(error);
+            }
+        };
+        if !self.eat(SyntaxKind::R_PAREN) {
+            self.expect(SyntaxKind::R_PAREN)?;
+            return expression.complete(self, SyntaxKind::ERROR);
+        }
+        expression.complete(
+            self,
+            if is_tuple {
+                SyntaxKind::TUPLE_EXPR
+            } else {
+                SyntaxKind::PAREN_EXPR
+            },
+        )
+    }
+
+    fn prefix_range_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let range = self.start();
+        let kind = self.current();
+        self.bump();
+        if self.at_expression_start() {
+            if let Err(error) = self.expr_bp(10) {
+                range.abandon(self)?;
+                return Err(error);
+            }
+        } else if kind == SyntaxKind::DOT2EQ {
+            if self.at(SyntaxKind::NEWLINE) {
+                self.missing_expression_after_operator()?;
+            } else {
+                self.missing_expression()?;
+            }
+        }
+        range.complete(self, SyntaxKind::RANGE_EXPR)
+    }
+
+    fn return_expr(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.start();
+        self.bump();
+        if self.current() != SyntaxKind::NEWLINE && self.at_expression_start() {
+            if let Err(error) = self.expr_bp(0) {
+                expression.abandon(self)?;
+                return Err(error);
+            }
+        }
+        expression.complete(self, SyntaxKind::RETURN_EXPR)
+    }
+
+    fn at_expression_start(&self) -> bool {
+        self.at_any(EXPRESSION_START_KINDS)
+    }
+
+    fn missing_expression(&mut self) -> Result<CompletedMarker, ParserError> {
+        for kind in EXPRESSION_START_KINDS {
+            self.expected.record(self.position, *kind);
+        }
+        self.emit_expected_expression()?;
+        self.start().complete(self, SyntaxKind::ERROR)
+    }
+
+    fn missing_expression_after_operator(&mut self) -> Result<CompletedMarker, ParserError> {
+        let expression = self.missing_expression()?;
+        self.add_expected_expression_note(
+            "put the operand on the same line as the operator or parenthesize the expression",
+        )?;
+        Ok(expression)
+    }
+
+    fn operator_range(&self, raw_count: u8) -> Result<sai_vfs::TextRange, ParserError> {
+        let first = self
+            .tokens
+            .get(self.position)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        let last_position = self
+            .position
+            .checked_add(usize::from(raw_count) - 1)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        let last = self
+            .tokens
+            .get(last_position)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        sai_vfs::TextRange::new(first.range.start(), last.range.end())
+            .ok_or(ParserError::InvalidDiagnosticSpan)
+    }
+
+    fn recover_overdeep_expression(&mut self) -> Result<CompletedMarker, ParserError> {
+        let error = self.start();
+        let range = self.current_token().map(|token| token.range);
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut saw_delimiter = false;
+        let mut consumed = false;
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && matches!(
+                    kind,
+                    SyntaxKind::NEWLINE
+                        | SyntaxKind::COMMA
+                        | SyntaxKind::R_PAREN
+                        | SyntaxKind::R_BRACKET
+                        | SyntaxKind::R_BRACE
+                )
+            {
+                break;
+            }
+            match kind {
+                SyntaxKind::L_PAREN => {
+                    paren_depth += 1;
+                    saw_delimiter = true;
+                }
+                SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::R_PAREN => break,
+                SyntaxKind::L_BRACKET => {
+                    bracket_depth += 1;
+                    saw_delimiter = true;
+                }
+                SyntaxKind::R_BRACKET if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::R_BRACKET => break,
+                SyntaxKind::L_BRACE => {
+                    brace_depth += 1;
+                    saw_delimiter = true;
+                }
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                SyntaxKind::R_BRACE => break,
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+            if saw_delimiter && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                break;
+            }
+        }
+        let completed = if consumed {
+            error.complete(self, SyntaxKind::ERROR)?
+        } else {
+            error.abandon(self)?;
+            self.start().complete(self, SyntaxKind::ERROR)?
+        };
+        if let Some(range) = range {
+            self.report_nesting_limit(range)?;
+        }
+        Ok(completed)
     }
 
     fn type_no_fx(&mut self) -> Result<(), ParserError> {
@@ -1667,6 +2751,82 @@ impl Parser<'_, '_> {
             self.bump();
         }
         error.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
+    }
+
+    fn recover_to_block_separator(&mut self) -> Result<(), ParserError> {
+        let error = self.start();
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut consumed = false;
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if brace_depth == 0 && kind == SyntaxKind::R_BRACE {
+                break;
+            }
+            if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && kind == SyntaxKind::NEWLINE
+            {
+                break;
+            }
+            match kind {
+                SyntaxKind::L_PAREN => paren_depth += 1,
+                SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::L_BRACKET => bracket_depth += 1,
+                SyntaxKind::R_BRACKET if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::L_BRACE => brace_depth += 1,
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+        }
+        if consumed {
+            error.complete(self, SyntaxKind::ERROR)?;
+        } else {
+            error.abandon(self)?;
+        }
+        Ok(())
+    }
+
+    fn recover_operator_continuation(&mut self) -> Result<(), ParserError> {
+        let error = self.start();
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut consumed = false;
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if brace_depth == 0 && kind == SyntaxKind::R_BRACE {
+                break;
+            }
+            if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && kind == SyntaxKind::NEWLINE
+            {
+                break;
+            }
+            match kind {
+                SyntaxKind::L_PAREN => paren_depth += 1,
+                SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::L_BRACKET => bracket_depth += 1,
+                SyntaxKind::R_BRACKET if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::L_BRACE => brace_depth += 1,
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+        }
+        if consumed {
+            error.complete(self, SyntaxKind::ERROR)?;
+        } else {
+            error.abandon(self)?;
+        }
         Ok(())
     }
 }

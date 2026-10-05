@@ -345,6 +345,46 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
     }
 
     fn emit_expected_token(&mut self) -> Result<bool, ParserError> {
+        self.emit_expected_diagnostic(Code::ExpectedToken)
+    }
+
+    pub(super) fn emit_expected_expression(&mut self) -> Result<bool, ParserError> {
+        self.emit_expected_diagnostic(Code::ExpectedExpression)
+    }
+
+    pub(super) fn add_expected_expression_note(
+        &mut self,
+        message: &str,
+    ) -> Result<(), ParserError> {
+        if self.reported_expected_at != Some(self.position) {
+            return Err(ParserError::InvalidMarkerEvent {
+                position: u32::try_from(self.position).unwrap_or(u32::MAX),
+            });
+        }
+        let event_index = self
+            .reported_expected_event
+            .ok_or(ParserError::InvalidMarkerEvent {
+                position: u32::try_from(self.position).unwrap_or(u32::MAX),
+            })?;
+        let Some(Event::Error { diag }) = self.events.get_mut(event_index) else {
+            return Err(ParserError::InvalidMarkerEvent {
+                position: u32::try_from(self.position).unwrap_or(u32::MAX),
+            });
+        };
+        if diag.code != Code::ExpectedExpression {
+            return Err(ParserError::InvalidMarkerEvent {
+                position: u32::try_from(self.position).unwrap_or(u32::MAX),
+            });
+        }
+        diag.push_child(sai_diagnostics::Child {
+            kind: sai_diagnostics::ChildKind::Note,
+            message: message.to_owned(),
+            location: None,
+        })
+        .map_err(|_| ParserError::InvalidDiagnosticSpan)
+    }
+
+    fn emit_expected_diagnostic(&mut self, code: Code) -> Result<bool, ParserError> {
         if self.reported_expected_at == Some(self.position) {
             let event_index =
                 self.reported_expected_event
@@ -357,6 +397,15 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
                     position: u32::try_from(self.position).unwrap_or(u32::MAX),
                 });
             };
+            if !matches!(
+                (diag.code, code),
+                (Code::ExpectedExpression, Code::ExpectedToken)
+                    | (Code::ExpectedToken, Code::ExpectedExpression)
+            ) {
+                diag.code = code;
+            } else {
+                diag.code = Code::ExpectedExpression;
+            }
             diag.message.clone_from(&message);
             diag.primary_label = message;
             return Ok(false);
@@ -379,12 +428,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         )
         .ok_or(ParserError::InvalidDiagnosticSpan)?;
         let message = self.expected.message();
-        let mut diagnostic = Diagnostic::new(
-            Code::ExpectedToken,
-            Severity::Error,
-            &message,
-            Some(location),
-        );
+        let mut diagnostic = Diagnostic::new(code, Severity::Error, &message, Some(location));
         diagnostic.primary_label = message;
         let event_index = self.events.len();
         self.emit_error(diagnostic);
@@ -1402,8 +1446,8 @@ mod tests {
     }
 
     #[test]
-    fn function_parser_reports_nonempty_bodies_as_unsupported_syntax() {
-        let source = "fn main() { return 1 }\n";
+    fn function_parser_keeps_unimplemented_control_expressions_explicit() {
+        let source = "fn main() { if true {} }\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -1414,10 +1458,519 @@ mod tests {
                 position: lexed
                     .tokens
                     .iter()
-                    .position(|token| token.kind == SyntaxKind::L_BRACE)
-                    .expect("function body starts with a brace"),
-                kind: SyntaxKind::L_BRACE
+                    .position(|token| token.kind == SyntaxKind::IF_KW)
+                    .expect("if expression starts the unsupported body"),
+                kind: SyntaxKind::IF_KW
             })
+        );
+        assert!(matches!(
+            parser.into_events(),
+            Err(ParserError::UnconsumedTokens { .. })
+        ));
+    }
+
+    #[test]
+    fn function_parser_keeps_unimplemented_postfix_forms_explicit() {
+        for (source, kind) in [
+            ("fn f() { g() }\n", SyntaxKind::L_PAREN),
+            ("fn f() { g.field }\n", SyntaxKind::DOT),
+            ("fn f() { g[0] }\n", SyntaxKind::L_BRACKET),
+            ("fn f() { g? }\n", SyntaxKind::QUESTION),
+            ("fn f() { .Some }\n", SyntaxKind::DOT),
+            ("fn f() { g<I32> }\n", SyntaxKind::LT),
+            ("fn f() { g<foo.Bar> }\n", SyntaxKind::LT),
+            ("fn f() { g<I32,>() }\n", SyntaxKind::LT),
+            ("fn f() { g<I32\n>() }\n", SyntaxKind::LT),
+        ] {
+            let (snapshot_file, lexed) = lex_file(source);
+            let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
+                .expect("valid lexer token stream");
+
+            assert!(matches!(
+                parser.parse_source_file(),
+                Err(ParserError::UnsupportedSyntax { kind: found, .. }) if found == kind
+            ));
+            assert!(matches!(
+                parser.into_events(),
+                Err(ParserError::UnconsumedTokens { .. })
+            ));
+        }
+
+        assert!(parse_file("fn f() { a < b }\n").errors.is_empty());
+        let comparison = parse_file("fn f() { a < B > c }\n");
+        assert_eq!(
+            comparison
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ChainedComparison)
+                .count(),
+            1
+        );
+
+        let (snapshot_file, lexed) = lex_file("fn f() { g<(b)> }\n");
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        parser
+            .parse_source_file()
+            .expect("failed generic speculation falls back to comparisons");
+        parser
+            .into_events()
+            .expect("fallback consumes the malformed comparison expression");
+
+        let malformed = parse_file("fn f() { g<B + C>(d) }\n");
+        assert_eq!(
+            malformed
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ChainedComparison)
+                .count(),
+            1,
+            "an invalid type argument must fall back to comparison parsing"
+        );
+
+        assert!(
+            parse_file("fn f() { g<(B > ()) }\n").errors.is_empty(),
+            "a comparison operator inside a grouped expression must not close generic lookahead"
+        );
+
+        let (snapshot_file, lexed) = lex_file("fn f() { g<I32 U32> }\n");
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        parser
+            .parse_source_file()
+            .expect("missing generic-argument commas fall back to comparisons");
+        parser
+            .into_events()
+            .expect("fallback consumes the malformed comparison expression");
+    }
+
+    #[test]
+    fn source_file_parses_basic_block_statements_and_expressions() {
+        let source = concat!(
+            "fn main() {\n",
+            "let total: I32 = 1 + 2 * 3\n",
+            "var current = total\n",
+            "current += 4\n",
+            "assert current > 0\n",
+            "return current\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let kinds = root
+            .descendants()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+
+        for (kind, expected) in [
+            (SyntaxKind::BLOCK, 1),
+            (SyntaxKind::LET_STMT, 1),
+            (SyntaxKind::VAR_STMT, 1),
+            (SyntaxKind::ASSIGN_STMT, 1),
+            (SyntaxKind::ASSERT_STMT, 1),
+            (SyntaxKind::EXPR_STMT, 1),
+            (SyntaxKind::RETURN_EXPR, 1),
+            (SyntaxKind::BIN_EXPR, 3),
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|found| **found == kind).count(),
+                expected,
+                "unexpected count for {kind:?}"
+            );
+        }
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn expression_parser_builds_precedence_and_left_associative_nodes() {
+        let output = parse_file("fn f() { a + b * c }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+        let statement = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EXPR_STMT)
+            .expect("expression statement");
+        let outer = statement
+            .children()
+            .find(|node| node.kind() == SyntaxKind::BIN_EXPR)
+            .expect("outer addition");
+        let outer_children = outer.children().map(|node| node.kind()).collect::<Vec<_>>();
+        assert_eq!(
+            outer_children,
+            [SyntaxKind::PATH_EXPR, SyntaxKind::BIN_EXPR]
+        );
+        let inner = outer
+            .children()
+            .find(|node| node.kind() == SyntaxKind::BIN_EXPR)
+            .expect("multiplication binds more tightly");
+        assert_eq!(
+            inner.children().map(|node| node.kind()).collect::<Vec<_>>(),
+            [SyntaxKind::PATH_EXPR, SyntaxKind::PATH_EXPR]
+        );
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn expression_parser_enforces_prefix_binding_power() {
+        let accepted = parse_file("fn f() { not a == b and c }\n");
+        let accepted_root = crate::SyntaxNode::new_root(accepted.root);
+        let prefix = accepted_root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::PREFIX_EXPR)
+            .expect("logical not expression");
+        assert!(
+            prefix
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::BIN_EXPR),
+            "not binds less tightly than comparisons"
+        );
+        assert!(accepted.errors.is_empty());
+
+        let rejected = parse_file(concat!(
+            "fn f() {\n",
+            "true == not false\n",
+            "x * ..y\n",
+            "a.. + b\n",
+            "}\n",
+        ));
+        assert_eq!(
+            rejected
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+                .count(),
+            3,
+            "{:#?}",
+            rejected.errors
+        );
+    }
+
+    #[test]
+    fn expression_parser_keeps_casts_as_recovery_nodes() {
+        let output = parse_file("fn f() { a * b as I32 }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+        let multiplication = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::BIN_EXPR)
+            .expect("multiplication expression");
+        assert_eq!(
+            multiplication
+                .children()
+                .map(|node| node.kind())
+                .collect::<Vec<_>>(),
+            [SyntaxKind::PATH_EXPR, SyntaxKind::CAST_EXPR]
+        );
+        assert!(output.errors.is_empty());
+    }
+
+    #[test]
+    fn expression_parser_glues_composite_operators_and_reports_nonassociative_chains() {
+        let source = concat!(
+            "fn f() {\n",
+            "let shifted = 8 >> 1\n",
+            "let compared = shifted >= 4\n",
+            "var assigned = shifted\n",
+            "assigned >>= 1\n",
+            "a < b < c\n",
+            "d..e..f\n",
+            "a && b\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let codes = output
+            .errors
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            [Code::ChainedComparison, Code::ChainedRange, Code::UseAndOr]
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::RANGE_EXPR)
+        );
+        assert!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASSIGN_STMT)
+                .count()
+                == 1
+        );
+    }
+
+    #[test]
+    fn expression_parser_reports_a_chain_after_a_prefix_range() {
+        let output = parse_file("fn f() { ..a..b }\n");
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ChainedRange)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_block_expressions_recover_without_invalid_delimiter_nodes() {
+        let output = parse_file("fn f() { let value = (1 + 2 }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn block_errors_report_missing_expressions_and_initializers() {
+        let output = parse_file("fn f() {\nlet missing\nlet value = 1 +\n}\n");
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::MissingInitializer)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+        );
+    }
+
+    #[test]
+    fn malformed_let_patterns_recover_as_error_nodes() {
+        let output = parse_file("fn f() { let = 1\nlet later = 2\n}\nfn next() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn block_separator_recovery_preserves_a_same_line_closing_brace() {
+        let output = parse_file("fn f() { a b }\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ExpectedToken)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn block_separator_recovery_balances_nested_delimiters() {
+        let output = parse_file("fn f() { a { b\nc } }\nfn next() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ExpectedToken)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn block_recovers_binary_operators_moved_to_the_next_line() {
+        let output = parse_file("fn f() {\na\n+ b\n}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::UnexpectedNewline);
+        assert!(
+            output.errors[0]
+                .children()
+                .iter()
+                .any(|child| child.kind == sai_diagnostics::ChildKind::Note)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            1
+        );
+
+        let unary = parse_file("fn f() {\na\n- b\n}\n");
+        assert!(
+            unary
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::UnexpectedNewline),
+            "a leading minus can begin a prefix expression"
+        );
+
+        let remainder = parse_file("fn f() {\na\n-% b\n}\n");
+        assert_eq!(remainder.errors.len(), 1);
+        assert_eq!(remainder.errors[0].code, Code::UnexpectedNewline);
+        assert_eq!(
+            crate::SyntaxNode::new_root(remainder.root)
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_expression_starts_do_not_create_empty_expression_statements() {
+        let output = parse_file("fn f() { +\n}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .all(|node| !node.text_range().is_empty()),
+            "a zero-width missing expression must remain a bare ERROR node"
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+        );
+        let expected_expression = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+            .expect("invalid expression start diagnostic");
+        assert!(
+            !expected_expression.message.contains("NEWLINE"),
+            "statement recovery must not add a separator expectation at the expression start"
+        );
+    }
+
+    #[test]
+    fn missing_binary_operands_at_newlines_include_guidance() {
+        let output = parse_file("fn f() {\na >\nb\n}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::BIN_EXPR)
+        );
+        let diagnostic = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+            .expect("missing right operand is diagnosed");
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.kind == sai_diagnostics::ChildKind::Note),
+            "the expected-expression diagnostic should explain how to continue the expression"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_expression_recovery_preserves_later_statements_and_items() {
+        let depth = 520;
+        let source = format!(
+            "fn deep() {{ {}{{ 1 }}{} \nlet after = 2\n}}\nfn next() {{}}\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert!(
+            !output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "block expressions inside overdeep expressions must not cause delimiter errors"
         );
     }
 
