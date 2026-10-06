@@ -1233,6 +1233,164 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_interfaces_and_resource_members() {
+        let source = concat!(
+            "pub interface storage\n",
+            "{\n",
+            "/// A storage entry.\n",
+            "type Entry { pub key: Str }\n",
+            "type Error = Str\n",
+            "enum Status { Ready, Failed }\n",
+            "resource Handle\n",
+            "resource File {\n",
+            "/// Close the file.\n",
+            "fn close(self: borrow Self)\n",
+            "fn size(self: borrow Self) -> U64\n",
+            "}\n",
+            "fn open(path: Str) -> File\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INTERFACE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IFACE_RESOURCE)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ITEM_LIST)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn interface_function_bodies_are_reported_and_wrapped_as_errors() {
+        let source = concat!(
+            "interface storage {\n",
+            "fn open() {}\n",
+            "resource File {\n",
+            "fn close(self: borrow Self) {}\n",
+            "}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::InterfaceFnBody),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_interface_close_preserves_a_following_constant() {
+        let source = "interface storage {\nfn open()\nconst READY: Bool = true\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INTERFACE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_interface_close_keeps_valid_members_inside_the_interface() {
+        let source = concat!(
+            "interface storage {\n",
+            "fn open()\n",
+            "type Later = Str\n",
+            "enum Status { Ready }\n",
+            "resource File\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let interface = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::INTERFACE_DECL)
+            .expect("interface declaration");
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            interface
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            interface
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::TYPE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            interface
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            interface
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::IFACE_RESOURCE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn source_file_parses_effect_declarations_and_covers_sets() {
         let source = concat!(
             "pub effect filesystem\n",

@@ -157,6 +157,13 @@ enum FnClauseKind {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+enum FnBodyPolicy {
+    Required,
+    Optional,
+    Forbidden,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ImplTargetKind {
     Trait,
     Inherent,
@@ -166,10 +173,9 @@ enum ImplTargetKind {
 impl Parser<'_, '_> {
     /// Parses the currently implemented source-file grammar into parser events.
     ///
-    /// This slice supports module headers, use declarations, type declarations,
-    /// and function signatures with the currently implemented block grammar.
-    /// Other item forms return [`ParserError::UnsupportedItem`] until their
-    /// grammar routines are implemented.
+    /// Item and expression forms are supported as their grammar routines are
+    /// implemented. Unsupported forms return [`ParserError::UnsupportedItem`]
+    /// or [`ParserError::UnsupportedSyntax`] for the enclosing recovery path.
     pub fn parse_source_file(&mut self) -> Result<(), ParserError> {
         if self.diagnostic_source.is_none() {
             return Err(ParserError::MissingDiagnosticSource);
@@ -312,7 +318,7 @@ impl Parser<'_, '_> {
         }
 
         if self.at_fn_decl_start() {
-            return self.fn_decl(declaration, false);
+            return self.fn_decl(declaration, FnBodyPolicy::Required);
         }
 
         if let Some(range) = exported_range {
@@ -378,6 +384,10 @@ impl Parser<'_, '_> {
 
         if self.at_contextual("effect") && self.nth(1) == SyntaxKind::LIDENT {
             return self.effect_decl(declaration);
+        }
+
+        if self.at_contextual("interface") && self.nth(1) == SyntaxKind::LIDENT {
+            return self.interface_decl(declaration);
         }
 
         if !self.at(SyntaxKind::USE_KW) {
@@ -650,6 +660,305 @@ impl Parser<'_, '_> {
         declaration.complete(self, SyntaxKind::RESOURCE_DECL)
     }
 
+    fn interface_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+        self.interface_item_list()?;
+        declaration.complete(self, SyntaxKind::INTERFACE_DECL)
+    }
+
+    fn interface_item_list(&mut self) -> Result<(), ParserError> {
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.expect(SyntaxKind::L_BRACE)?;
+            return Ok(());
+        }
+        let items = self.start();
+        self.bump();
+        while self.at(SyntaxKind::NEWLINE) && !self.interface_item_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE) && self.interface_item_list_boundary_after_newline() {
+                break;
+            }
+            if self.at(SyntaxKind::DOC_INNER)
+                || (self.at(SyntaxKind::DOC_OUTER)
+                    && !self.interface_item_starts_at_after_attributes(self.position))
+            {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+            let position = self.position;
+            self.interface_item()?;
+            if self.at(SyntaxKind::NEWLINE) && self.interface_item_list_boundary_after_newline() {
+                break;
+            }
+            if self.eat(SyntaxKind::NEWLINE) {
+                while self.at(SyntaxKind::NEWLINE)
+                    && !self.interface_item_list_boundary_after_newline()
+                {
+                    self.eat_nl();
+                }
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect(SyntaxKind::NEWLINE)?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        if !self.interface_item_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        items.complete(self, SyntaxKind::ITEM_LIST)?;
+        Ok(())
+    }
+
+    fn interface_item_list_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK)
+            && !self.interface_item_starts_at_after_attributes(position)
+            && self.item_starts_at_after_attributes(position)
+    }
+
+    fn interface_item_starts_at_after_attributes(&self, position: usize) -> bool {
+        let Some(mut position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| matches!(token.kind, SyntaxKind::PUB_KW | SyntaxKind::EXPORT_KW))
+        {
+            position += 1;
+        }
+        match self.tokens.get(position).map(|token| token.kind) {
+            Some(SyntaxKind::TYPE_KW | SyntaxKind::ENUM_KW | SyntaxKind::FN_KW) => true,
+            Some(SyntaxKind::ASYNC_KW) => self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::FN_KW),
+            Some(SyntaxKind::UNSAFE_KW) => self.fn_decl_starts_at(position),
+            Some(SyntaxKind::LIDENT)
+                if token_is_contextual(self.source, self.tokens, position, "resource") =>
+            {
+                self.tokens
+                    .get(position + 1)
+                    .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+            }
+            _ => false,
+        }
+    }
+
+    fn interface_item(&mut self) -> Result<(), ParserError> {
+        let declaration = self.start();
+        self.outer_docs()?;
+        self.attributes(true)?;
+        if self.at_any(&[SyntaxKind::PUB_KW, SyntaxKind::EXPORT_KW]) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "interface items do not have a visibility marker",
+            )?;
+            let visibility = self.start();
+            self.bump();
+            visibility.complete(self, SyntaxKind::ERROR)?;
+        }
+        if self.at(SyntaxKind::TYPE_KW) {
+            self.type_decl(declaration)?;
+            return Ok(());
+        }
+        if self.at(SyntaxKind::ENUM_KW) {
+            self.enum_decl(declaration)?;
+            return Ok(());
+        }
+        if self.at_contextual("resource") && self.nth(1) == SyntaxKind::UIDENT {
+            self.iface_resource(declaration)?;
+            return Ok(());
+        }
+        if self.at_fn_decl_start() {
+            self.fn_decl(declaration, FnBodyPolicy::Forbidden)?;
+            return Ok(());
+        }
+
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::ExpectedToken,
+            range,
+            "expected an interface type, enum, resource, or function",
+        )?;
+        self.recover_one()?;
+        declaration.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
+    }
+
+    fn iface_resource(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+        if self.at(SyntaxKind::L_BRACE) {
+            self.iface_resource_item_list()?;
+        }
+        declaration.complete(self, SyntaxKind::IFACE_RESOURCE)
+    }
+
+    fn iface_resource_item_list(&mut self) -> Result<(), ParserError> {
+        let items = self.start();
+        self.bump();
+        while self.at(SyntaxKind::NEWLINE)
+            && !self.iface_resource_item_list_boundary_after_newline()
+        {
+            self.eat_nl();
+        }
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE)
+                && self.iface_resource_item_list_boundary_after_newline()
+            {
+                break;
+            }
+            if self.at(SyntaxKind::DOC_INNER)
+                || (self.at(SyntaxKind::DOC_OUTER)
+                    && !self.iface_resource_item_starts_at_after_attributes(self.position))
+            {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+            let position = self.position;
+            self.iface_resource_item()?;
+            if self.at(SyntaxKind::NEWLINE)
+                && self.iface_resource_item_list_boundary_after_newline()
+            {
+                break;
+            }
+            if self.eat(SyntaxKind::NEWLINE) {
+                while self.at(SyntaxKind::NEWLINE)
+                    && !self.iface_resource_item_list_boundary_after_newline()
+                {
+                    self.eat_nl();
+                }
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect(SyntaxKind::NEWLINE)?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        if !self.iface_resource_item_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        items.complete(self, SyntaxKind::ITEM_LIST)?;
+        Ok(())
+    }
+
+    fn iface_resource_item_list_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK)
+            && !self.iface_resource_item_starts_at_after_attributes(position)
+            && self.item_starts_at_after_attributes(position)
+    }
+
+    fn iface_resource_item_starts_at_after_attributes(&self, position: usize) -> bool {
+        let Some(mut position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| matches!(token.kind, SyntaxKind::PUB_KW | SyntaxKind::EXPORT_KW))
+        {
+            position += 1;
+        }
+        self.fn_decl_starts_at(position)
+    }
+
+    fn iface_resource_item(&mut self) -> Result<(), ParserError> {
+        let declaration = self.start();
+        self.outer_docs()?;
+        self.attributes(true)?;
+        if self.at_any(&[SyntaxKind::PUB_KW, SyntaxKind::EXPORT_KW]) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "interface resource items do not have a visibility marker",
+            )?;
+            let visibility = self.start();
+            self.bump();
+            visibility.complete(self, SyntaxKind::ERROR)?;
+        }
+        if self.at_fn_decl_start() {
+            self.fn_decl(declaration, FnBodyPolicy::Forbidden)?;
+            return Ok(());
+        }
+
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::ExpectedToken,
+            range,
+            "expected a function in the interface resource",
+        )?;
+        self.recover_one()?;
+        declaration.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
+    }
+
     fn trait_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
         self.eat(SyntaxKind::UNSAFE_KW);
         self.expect(SyntaxKind::TRAIT_KW)?;
@@ -813,7 +1122,7 @@ impl Parser<'_, '_> {
         }
         if self.at_fn_decl_start() {
             let function = self.start();
-            self.fn_decl(function, true)?;
+            self.fn_decl(function, FnBodyPolicy::Optional)?;
             return Ok(());
         }
 
@@ -1185,7 +1494,7 @@ impl Parser<'_, '_> {
         }
         if self.at_fn_decl_start() {
             let function = self.start();
-            self.fn_decl(function, false)?;
+            self.fn_decl(function, FnBodyPolicy::Required)?;
             return Ok(false);
         }
 
@@ -2144,7 +2453,7 @@ impl Parser<'_, '_> {
     fn fn_decl(
         &mut self,
         declaration: Marker,
-        allow_missing_body: bool,
+        body_policy: FnBodyPolicy,
     ) -> Result<CompletedMarker, ParserError> {
         self.eat(SyntaxKind::UNSAFE_KW);
         self.eat(SyntaxKind::ASYNC_KW);
@@ -2171,11 +2480,28 @@ impl Parser<'_, '_> {
             self.eat_nl();
         }
         if self.at(SyntaxKind::L_BRACE) {
-            if let Err(error) = self.block() {
-                declaration.abandon(self)?;
-                return Err(error);
+            if body_policy == FnBodyPolicy::Forbidden {
+                let range = self
+                    .current_token()
+                    .map(|token| token.range)
+                    .ok_or(ParserError::InvalidDiagnosticSpan)?;
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::InterfaceFnBody,
+                    range,
+                    "interface and world functions cannot have a body",
+                )?;
             }
-        } else if !allow_missing_body {
+            let body = match self.block() {
+                Ok(body) => body,
+                Err(error) => {
+                    declaration.abandon(self)?;
+                    return Err(error);
+                }
+            };
+            if body_policy == FnBodyPolicy::Forbidden {
+                body.precede(self).complete(self, SyntaxKind::ERROR)?;
+            }
+        } else if body_policy == FnBodyPolicy::Required {
             self.emit_missing_fn_body()?;
         }
 

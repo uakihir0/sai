@@ -85,6 +85,7 @@ define_codes! {
     RedundantPubExport => "REDUNDANT_PUB_EXPORT",
     InvalidExportTarget => "INVALID_EXPORT_TARGET",
     ExplicitDiscriminantOnDataEnum => "EXPLICIT_DISCRIMINANT_ON_DATA_ENUM",
+    InterfaceFnBody => "INTERFACE_FN_BODY",
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1622,6 +1623,10 @@ mod tests {
         assert_eq!(
             Code::from_name("EXPLICIT_DISCRIMINANT_ON_DATA_ENUM"),
             Some(Code::ExplicitDiscriminantOnDataEnum)
+        );
+        assert_eq!(
+            Code::from_name("INTERFACE_FN_BODY"),
+            Some(Code::InterfaceFnBody)
         );
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));
