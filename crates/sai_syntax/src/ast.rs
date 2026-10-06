@@ -1261,6 +1261,24 @@ impl LiteralPat {
     }
 }
 
+impl ConstArg {
+    pub fn minus_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::MINUS)
+    }
+
+    pub fn value_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kinds(
+            self.syntax(),
+            &[
+                SyntaxKind::INT,
+                SyntaxKind::CHAR,
+                SyntaxKind::TRUE_KW,
+                SyntaxKind::FALSE_KW,
+            ],
+        )
+    }
+}
+
 impl Discriminant {
     pub fn minus_token(&self) -> Option<SyntaxToken> {
         direct_token_of_kind(self.syntax(), SyntaxKind::MINUS)

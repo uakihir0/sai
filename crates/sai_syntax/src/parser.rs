@@ -3725,12 +3725,12 @@ mod tests {
     #[test]
     fn generated_type_and_generic_argument_roles_follow_parsed_children() {
         use crate::ast::{
-            AssocTypeBinding, AstNode, BorrowType, CastExpr, GenericArgList, OwnedType, ParenType,
-            PathType, SelfType, TupleType,
+            AssocTypeBinding, AstNode, BorrowType, CastExpr, ConstArg, GenericArgList, OwnedType,
+            ParenType, PathType, SelfType, TupleType,
         };
 
         let source = concat!(
-            "fn types<T: pkg.Trait<I32, U8, 3, 4, Item = U8, Other = I32>>(\n",
+            "fn types<T: pkg.Trait<I32, U8, -3, 4, 'c', true, false, Item = U8, Other = I32>>(\n",
             "         value: borrow mut pkg.Foo<I32>,\n",
             "         shared: borrow I32,\n",
             "         nested: borrow borrow mut I32,\n",
@@ -3780,14 +3780,58 @@ mod tests {
             .filter_map(GenericArgList::cast)
             .find(|args| {
                 args.type_args().count() == 2
-                    && args.const_args().count() == 2
+                    && args.const_args().count() == 5
                     && args.assoc_type_bindings().count() == 2
             })
             .expect("mixed trait generic arguments");
         let type_args = generic_args.type_args().collect::<Vec<_>>();
         assert_eq!(type_args.len(), 2);
         assert!(type_args.iter().all(|argument| argument.ty().is_some()));
-        assert_eq!(generic_args.const_args().count(), 2);
+        let const_args = generic_args.const_args().collect::<Vec<_>>();
+        assert_eq!(const_args.len(), 5);
+        assert_eq!(
+            const_args[0]
+                .minus_token()
+                .expect("negative const argument sign")
+                .text(),
+            "-",
+        );
+        assert_eq!(
+            const_args[0]
+                .value_token()
+                .expect("negative const argument value")
+                .text(),
+            "3",
+        );
+        assert!(const_args[1].minus_token().is_none());
+        assert_eq!(
+            const_args[1]
+                .value_token()
+                .expect("integer const argument value")
+                .text(),
+            "4",
+        );
+        assert_eq!(
+            const_args[2]
+                .value_token()
+                .expect("character const argument value")
+                .text(),
+            "'c'",
+        );
+        assert_eq!(
+            const_args[3]
+                .value_token()
+                .expect("true const argument value")
+                .text(),
+            "true",
+        );
+        assert_eq!(
+            const_args[4]
+                .value_token()
+                .expect("false const argument value")
+                .text(),
+            "false",
+        );
         let bindings = generic_args
             .assoc_type_bindings()
             .collect::<Vec<AssocTypeBinding>>();
@@ -3797,6 +3841,22 @@ mod tests {
                 .iter()
                 .all(|binding| binding.name().is_some() && binding.ty().is_some())
         );
+
+        let incomplete_const = parse_file("type Broken = Foo<-,>\n");
+        assert!(!incomplete_const.errors.is_empty());
+        let incomplete_const_root = crate::SyntaxNode::new_root(incomplete_const.root);
+        let incomplete_const = incomplete_const_root
+            .descendants()
+            .find_map(ConstArg::cast)
+            .expect("recovered const argument");
+        assert_eq!(
+            incomplete_const
+                .minus_token()
+                .expect("recovered const argument sign")
+                .text(),
+            "-",
+        );
+        assert!(incomplete_const.value_token().is_none());
 
         let owned = root
             .descendants()
