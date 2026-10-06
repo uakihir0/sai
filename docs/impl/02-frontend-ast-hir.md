@@ -1116,8 +1116,8 @@ The HIR is the desugared, owner-partitioned representation of a package's source
 ```rust
 pub struct PackageId;                           // opaque session-local package identity (impl/01)
 pub struct DefIndex(u32);
-pub struct DefId { pub package: PackageId, pub index: DefIndex }
-pub struct LocalDefId { pub index: DefIndex }  // a DefId of the package being compiled
+pub struct DefId;                               // package + index; local DefIds retain a private table scope
+pub struct LocalDefId;                           // opaque package- and definition-table-scoped local DefId
 
 pub struct DefPath { pub package: PackageId, pub data: Vec<DisambiguatedDefPathData> }
 pub struct DisambiguatedDefPathData { pub data: DefPathData, pub disambiguator: u32 }
@@ -1187,6 +1187,10 @@ The canonical package key is encoded first as a length-prefixed UTF-8 string. Th
 Every component ends with its little-endian `u32` disambiguator. `Impl` encodes its little-endian `u64` header hash before that value. `ExternBlock` encodes its ABI string, a one-byte module-presence flag, and the optional module string. `WorldItem` encodes a one-byte import flag before its name. Components with no string or hash payload encode only their tag and disambiguator. These tag assignments are persistent format and MUST NOT be reused or renumbered.
 
 **`DefIndex` assignment.** `LocalDefId`s are interned from `DefPath`s by the query system, so a definition keeps its `LocalDefId` across revisions as long as its `DefPath` exists. Foreign `DefId`s are read from the dependency's metadata, where definitions are numbered in ascending `DefPathHash` order.
+
+In the reference implementation, each `LocalDefId` carries its package and the identity of the package's session-local definition table in addition to its `DefIndex`. This prevents an index from one table from resolving to an unrelated definition in another table. `to_def_id()` uses the package stored in the local ID.
+
+A local `DefId` retains that definition-table identity so two accidentally distinct tables for the same package cannot compare as the same definition. A foreign `DefId` is created from its metadata package and `DefIndex` and has no local-table identity.
 
 **`HirId` assignment.** Within an owner, `ItemLocalId`s are assigned in pre-order of HIR node creation during lowering, starting with 0 for the owner node. Desugared nodes are numbered at the position of the construct they replace, in the order in which §2.9 lists their children. The numbering depends only on the owner's own source, so an edit inside one owner never changes another owner's `HirId`s.
 

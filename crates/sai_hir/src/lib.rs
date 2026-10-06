@@ -1,29 +1,96 @@
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
-pub use sai_intern::{BindingId, DefIndex, ItemLocalId, PackageId, Symbol};
-use sai_intern::{Interner, InternerSessionId, LookupError, PackageIdError, PackageInterner};
+pub use sai_intern::{BindingId, DefIndex, IndexVec, ItemLocalId, PackageId, Symbol};
+use sai_intern::{
+    IndexVecError, Interner, InternerSessionId, LookupError, PackageIdError, PackageInterner,
+};
 use sai_stable_hash::StableHasher;
 pub use sai_vfs::{FileId, TextRange};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct DefId {
     pub package: PackageId,
     pub index: DefIndex,
+    scope: Option<DefPathInternerId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+impl DefId {
+    pub const fn from_foreign(package: PackageId, index: DefIndex) -> Self {
+        Self {
+            package,
+            index,
+            scope: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for DefId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DefId")
+            .field("package", &self.package)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
+static NEXT_DEF_PATH_INTERNER_ID: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct DefPathInternerId(u32);
+
+fn next_def_path_interner_id() -> Option<DefPathInternerId> {
+    let mut id = NEXT_DEF_PATH_INTERNER_ID.load(Ordering::Relaxed);
+    loop {
+        let next = id.checked_add(1)?;
+        match NEXT_DEF_PATH_INTERNER_ID.compare_exchange_weak(
+            id,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(DefPathInternerId(id)),
+            Err(observed) => id = observed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct LocalDefId {
-    pub index: DefIndex,
+    package: PackageId,
+    index: DefIndex,
+    interner: DefPathInternerId,
 }
 
 impl LocalDefId {
-    pub const fn to_def_id(self, package: PackageId) -> DefId {
+    pub const fn package(self) -> PackageId {
+        self.package
+    }
+
+    pub const fn index(self) -> DefIndex {
+        self.index
+    }
+
+    pub const fn to_def_id(self) -> DefId {
         DefId {
-            package,
+            package: self.package,
             index: self.index,
+            scope: Some(self.interner),
         }
+    }
+}
+
+impl std::fmt::Debug for LocalDefId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalDefId")
+            .field("package", &self.package)
+            .field("index", &self.index)
+            .finish()
     }
 }
 
@@ -376,6 +443,129 @@ fn write_stable_string(hasher: &mut StableHasher, value: &str) {
     hasher.write_raw_bytes(value.as_bytes());
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DefPathInternerError {
+    Package(PackageIdError),
+    InternerSessionMismatch,
+    ForeignDefinitionId,
+    WrongPackage,
+    TooManyInternerInstances,
+    TooManyDefinitions,
+    LockPoisoned,
+}
+
+#[derive(Default)]
+struct DefPathStorage {
+    by_path: HashMap<DefPath, LocalDefId>,
+    paths: IndexVec<DefIndex, DefPath>,
+}
+
+/// Session-local, append-only interning of definition paths for one package.
+pub struct DefPathInterner {
+    package: PackageId,
+    package_interner: InternerSessionId,
+    symbol_interner: InternerSessionId,
+    id: DefPathInternerId,
+    storage: Mutex<DefPathStorage>,
+}
+
+impl DefPathInterner {
+    pub fn new(
+        package: PackageId,
+        packages: &PackageInterner,
+        symbols: &Interner,
+    ) -> Result<Self, DefPathInternerError> {
+        if package.session_id() != packages.session_id() {
+            return Err(DefPathInternerError::InternerSessionMismatch);
+        }
+        packages
+            .resolve(package)
+            .map_err(DefPathInternerError::Package)?;
+        let id =
+            next_def_path_interner_id().ok_or(DefPathInternerError::TooManyInternerInstances)?;
+
+        Ok(Self {
+            package,
+            package_interner: packages.session_id(),
+            symbol_interner: symbols.session_id(),
+            id,
+            storage: Mutex::new(DefPathStorage::default()),
+        })
+    }
+
+    pub fn intern(&self, path: DefPath) -> Result<LocalDefId, DefPathInternerError> {
+        if path.package_interner != self.package_interner
+            || path.symbol_interner != self.symbol_interner
+        {
+            return Err(DefPathInternerError::InternerSessionMismatch);
+        }
+        if path.package != self.package {
+            return Err(DefPathInternerError::WrongPackage);
+        }
+
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|_| DefPathInternerError::LockPoisoned)?;
+        if let Some(id) = storage.by_path.get(&path) {
+            return Ok(*id);
+        }
+
+        let index = storage
+            .paths
+            .push(path.clone())
+            .map_err(|IndexVecError::TooManyElements| DefPathInternerError::TooManyDefinitions)?;
+        let id = LocalDefId {
+            package: self.package,
+            index,
+            interner: self.id,
+        };
+        storage.by_path.insert(path, id);
+        Ok(id)
+    }
+
+    pub fn resolve(&self, id: LocalDefId) -> Result<Option<DefPath>, DefPathInternerError> {
+        if id.interner != self.id {
+            return Err(DefPathInternerError::ForeignDefinitionId);
+        }
+        if id.package != self.package {
+            return Err(DefPathInternerError::WrongPackage);
+        }
+
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| DefPathInternerError::LockPoisoned)?;
+        Ok(storage.paths.get(id.index).cloned())
+    }
+
+    pub fn resolve_def_id(&self, id: DefId) -> Result<Option<DefPath>, DefPathInternerError> {
+        if id.scope != Some(self.id) {
+            return Err(DefPathInternerError::ForeignDefinitionId);
+        }
+        if id.package != self.package {
+            return Err(DefPathInternerError::WrongPackage);
+        }
+
+        self.resolve(LocalDefId {
+            package: id.package,
+            index: id.index,
+            interner: self.id,
+        })
+    }
+
+    pub fn len(&self) -> Result<usize, DefPathInternerError> {
+        self.storage
+            .lock()
+            .map(|storage| storage.paths.len())
+            .map_err(|_| DefPathInternerError::LockPoisoned)
+    }
+
+    pub fn is_empty(&self) -> Result<bool, DefPathInternerError> {
+        self.len().map(|len| len == 0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OwnerId {
     pub def_id: LocalDefId,
@@ -446,6 +636,26 @@ pub enum Mutability {
 mod tests {
     use super::*;
     use sai_intern::{IndexVec, PackageInterner};
+    use std::thread;
+
+    fn def_path(
+        package: PackageId,
+        packages: &PackageInterner,
+        symbols: &Interner,
+        name: &str,
+    ) -> DefPath {
+        let name = symbols.intern(name).expect("symbol interns");
+        DefPath::new(
+            package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(name),
+                disambiguator: 0,
+            }],
+            packages,
+            symbols,
+        )
+        .expect("path belongs to its interners")
+    }
 
     #[test]
     fn definition_and_owner_ids_keep_their_scopes() {
@@ -453,14 +663,20 @@ mod tests {
         let package = packages
             .intern("acme:app#1.0")
             .expect("package key interns");
-        let mut definitions = IndexVec::<DefIndex, ()>::new();
-        let index = definitions.push(()).expect("definition index fits");
-        let local_def = LocalDefId { index };
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let path = def_path(package, &packages, &symbols, "Widget");
+        let local_def = paths.intern(path.clone()).expect("definition path interns");
+        let index = local_def.index();
         let owner = OwnerId { def_id: local_def };
         let mut local_ids = IndexVec::<ItemLocalId, ()>::new();
         let local_id = local_ids.push(()).expect("HIR local ID fits");
 
-        assert_eq!(local_def.to_def_id(package), DefId { package, index });
+        assert_eq!(local_def.package(), package);
+        let def_id = local_def.to_def_id();
+        assert_eq!(def_id.package, package);
+        assert_eq!(def_id.index, index);
+        assert_eq!(paths.resolve_def_id(def_id), Ok(Some(path)));
         assert_eq!(HirId { owner, local_id }.owner, owner);
         assert_eq!(BodyId { owner }.owner, owner);
     }
@@ -669,5 +885,114 @@ mod tests {
             DefPathHash::compute(&path, &packages, &Interner::new()),
             Err(DefPathError::InternerSessionMismatch)
         );
+    }
+
+    #[test]
+    fn definition_paths_are_interned_idempotently_and_resolve_by_local_id() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let path = def_path(package, &packages, &symbols, "Widget");
+        let later_path = def_path(package, &packages, &symbols, "Later");
+
+        let id = paths.intern(path.clone()).unwrap();
+        assert_eq!(paths.intern(path.clone()), Ok(id));
+        assert_eq!(paths.resolve(id), Ok(Some(path)));
+        let later_id = paths.intern(later_path.clone()).unwrap();
+        assert_ne!(id, later_id);
+        assert_eq!(
+            paths.resolve(id),
+            Ok(Some(def_path(package, &packages, &symbols, "Widget")))
+        );
+        assert_eq!(paths.resolve(later_id), Ok(Some(later_path)));
+        assert_eq!(paths.len(), Ok(2));
+        assert_eq!(paths.is_empty(), Ok(false));
+    }
+
+    #[test]
+    fn definition_path_interner_rejects_other_packages_and_sessions() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let other_package = packages.intern("acme:other#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+
+        assert_eq!(
+            paths.intern(def_path(other_package, &packages, &symbols, "Widget")),
+            Err(DefPathInternerError::WrongPackage)
+        );
+
+        let other_paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let first_id = paths
+            .intern(def_path(package, &packages, &symbols, "First"))
+            .unwrap();
+        let other_id = other_paths
+            .intern(def_path(package, &packages, &symbols, "Other"))
+            .unwrap();
+        assert_eq!(first_id.index(), other_id.index());
+        assert_ne!(first_id, other_id);
+        let first_def_id = first_id.to_def_id();
+        let other_def_id = other_id.to_def_id();
+        assert_ne!(first_def_id, other_def_id);
+        let foreign_def_id = DefId::from_foreign(package, first_id.index());
+        assert_ne!(first_def_id, foreign_def_id);
+        assert_eq!(
+            paths.resolve(other_id),
+            Err(DefPathInternerError::ForeignDefinitionId)
+        );
+        assert_eq!(
+            other_paths.resolve(first_id),
+            Err(DefPathInternerError::ForeignDefinitionId)
+        );
+        assert_eq!(
+            paths.resolve_def_id(other_def_id),
+            Err(DefPathInternerError::ForeignDefinitionId)
+        );
+        assert_eq!(
+            other_paths.resolve_def_id(first_def_id),
+            Err(DefPathInternerError::ForeignDefinitionId)
+        );
+        assert_eq!(
+            paths.resolve_def_id(foreign_def_id),
+            Err(DefPathInternerError::ForeignDefinitionId)
+        );
+
+        let foreign_packages = PackageInterner::new();
+        let foreign_package = foreign_packages.intern("acme:app#1.0").unwrap();
+        let foreign_symbols = Interner::new();
+        assert_eq!(
+            paths.intern(def_path(
+                foreign_package,
+                &foreign_packages,
+                &foreign_symbols,
+                "Widget"
+            )),
+            Err(DefPathInternerError::InternerSessionMismatch)
+        );
+    }
+
+    #[test]
+    fn concurrent_definition_path_interning_returns_one_local_id() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = Arc::new(DefPathInterner::new(package, &packages, &symbols).unwrap());
+        let path = def_path(package, &packages, &symbols, "Widget");
+
+        let workers = (0..16)
+            .map(|_| {
+                let paths = Arc::clone(&paths);
+                let path = path.clone();
+                thread::spawn(move || paths.intern(path).expect("path interns"))
+            })
+            .collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker completes"))
+            .collect::<Vec<_>>();
+
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(paths.len(), Ok(1));
     }
 }
