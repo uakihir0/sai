@@ -18,6 +18,7 @@ pub struct Parser<'src, 'tokens> {
     source: &'src str,
     tokens: &'tokens [Token],
     matching_r_parens: Vec<usize>,
+    matching_r_braces: Vec<usize>,
     position: usize,
     events: Vec<Event>,
     diagnostic_source: Option<DiagnosticSource<'src>>,
@@ -34,6 +35,7 @@ pub struct Parser<'src, 'tokens> {
     nesting_depth: usize,
     reported_nesting_limit: bool,
     spec_failures: HashSet<usize>,
+    variant_call_boundary_cache: RefCell<Vec<Option<bool>>>,
 }
 
 fn compute_matching_r_parens(tokens: &[Token]) -> Vec<usize> {
@@ -51,6 +53,23 @@ fn compute_matching_r_parens(tokens: &[Token]) -> Vec<usize> {
         }
     }
     matching_r_parens
+}
+
+fn compute_matching_r_braces(tokens: &[Token]) -> Vec<usize> {
+    let mut matching_r_braces = vec![usize::MAX; tokens.len()];
+    let mut open_braces = Vec::new();
+    for (position, token) in tokens.iter().enumerate() {
+        match token.kind {
+            SyntaxKind::L_BRACE => open_braces.push(position),
+            SyntaxKind::R_BRACE => {
+                if let Some(open_position) = open_braces.pop() {
+                    matching_r_braces[open_position] = position;
+                }
+            }
+            _ => {}
+        }
+    }
+    matching_r_braces
 }
 
 struct DiagnosticSource<'src> {
@@ -164,10 +183,12 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             previous_end = end;
         }
         let matching_r_parens = compute_matching_r_parens(tokens);
+        let matching_r_braces = compute_matching_r_braces(tokens);
         Ok(Parser {
             source,
             tokens,
             matching_r_parens,
+            matching_r_braces,
             position: 0,
             events: Vec::new(),
             diagnostic_source: None,
@@ -184,6 +205,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             nesting_depth: 0,
             reported_nesting_limit: false,
             spec_failures: HashSet::new(),
+            variant_call_boundary_cache: RefCell::new(vec![None; tokens.len()]),
         })
     }
 
@@ -1101,6 +1123,33 @@ mod tests {
     }
 
     #[test]
+    fn enum_variants_accept_nested_types_and_function_pointer_payloads() {
+        let source = concat!(
+            "enum Callback {\n",
+            "Apply(fn(Vec<I32>) -> (I32, U32) effects { io })\n",
+            "Borrowed(borrow (owned I32))\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_PTR_TYPE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn unit_enum_discriminants_allow_negative_values() {
         let source = "enum Status { Pending = 0, Failed = -2 }\n";
         let output = parse_file(source);
@@ -1483,6 +1532,179 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_traits_associated_types_and_optional_method_bodies() {
+        let source = concat!(
+            "pub trait Container<T>: Clone where T: Copy {\n",
+            "type Item: Clone\n",
+            "fn next<U>(self: borrow Self) -> Item where U: Clone\n",
+            "fn verify(self: borrow Self) -> Bool\n",
+            "requires true\n",
+            "ensures result\n",
+            "fn default_value(value: T) -> T { value }\n",
+            "}\n",
+            "unsafe trait Marker {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TRAIT_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASSOC_TYPE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::REQUIRES_CLAUSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENSURES_CLAUSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ITEM_LIST)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn trait_item_outer_docs_attach_to_the_declaration() {
+        let source = "trait Documented {\n/// method docs\nfn method()\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn exported_traits_and_visibility_on_trait_items_are_diagnosed() {
+        let source = "export trait Hidden {}\npub trait Visible { pub fn method() }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidExportTarget)
+                .count(),
+            1
+        );
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ExpectedToken)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TRAIT_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn trait_declaration_in_block_is_recovered_as_an_item() {
+        let source = "fn outer() {\ntrait Local { fn value() }\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ItemInBlock);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TRAIT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_trait_close_preserves_following_declarations() {
+        let source = "trait Missing {\nfn method()\nenum Later {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TRAIT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_enum_close_preserves_following_block_statements() {
         let source = concat!(
             "fn f() {\n",
@@ -1665,6 +1887,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_enum_close_preserves_a_call_with_a_parenthesized_type_prefix_expression() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "Some(borrow (Self) + 1)\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let expressions = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+            .collect::<Vec<_>>();
+
+        assert_eq!(expressions.len(), 1);
+        assert_eq!(
+            &source[expressions[0].text_range().start().to_usize()
+                ..expressions[0].text_range().end().to_usize()],
+            "Some(borrow (Self) + 1)"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_enum_close_preserves_calls_with_type_prefix_expression_arguments() {
         let mut source = String::from(concat!(
             "fn f() {\n",
@@ -1691,6 +1945,78 @@ mod tests {
         assert_eq!(expression_texts.len(), 130);
         assert_eq!(expression_texts[0], "Some(borrow value + 1)");
         assert_eq!(expression_texts[1], "Some(Self + 1)");
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn enum_variant_type_lookahead_handles_deep_prefix_parentheses_iteratively() {
+        let nesting = 10_000;
+        let mut source = String::from("enum Deep {\nValue(");
+        for _ in 0..nesting {
+            source.push_str("borrow (");
+        }
+        source.push_str("U32");
+        for _ in 0..nesting {
+            source.push(')');
+        }
+        source.push_str(")\n}\n");
+
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn enum_expression_call_boundary_lookahead_caches_chain_results() {
+        let call_count = 512;
+        let mut source = String::from(concat!("fn f() {\n", "enum Broken {\n", "Value(I32)\n",));
+        for index in 0..call_count {
+            source.push_str(&format!("Some(borrow value{index} + 1)\n"));
+        }
+        source.push_str("Last(I32)\nlet later = 2\n}\n");
+
+        let (snapshot_file, lexed) = lex_file(&source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        parser
+            .parse_source_file()
+            .expect("supported source grammar");
+        let cached_boundaries = parser
+            .variant_call_boundary_cache
+            .borrow()
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        assert!(
+            cached_boundaries >= call_count,
+            "each lookahead result should be cached; found {cached_boundaries} for {call_count} calls"
+        );
+        let events = parser.into_events().expect("complete source event stream");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(&source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("source tree builds");
+        let root = crate::SyntaxNode::new_root(output.root);
         assert_eq!(
             root.descendants()
                 .filter(|node| node.kind() == SyntaxKind::LET_STMT)
@@ -2763,23 +3089,25 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_contract_clauses_leave_no_active_parser_markers() {
-        let source = "fn check(value: Bool)\nrequires value\n{}\n";
-        let (snapshot_file, lexed) = lex_file(source);
-        let mut parser =
-            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+    fn function_parser_builds_requires_and_ensures_clauses() {
+        let source = "fn check(value: Bool)\nrequires value\nensures result\n{}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
 
-        assert!(matches!(
-            parser.parse_source_file(),
-            Err(ParserError::UnsupportedSyntax {
-                kind: SyntaxKind::LIDENT,
-                ..
-            })
-        ));
-        assert!(matches!(
-            parser.into_events(),
-            Err(ParserError::UnconsumedTokens { .. })
-        ));
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::REQUIRES_CLAUSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENSURES_CLAUSE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
     }
 
     #[test]
@@ -6232,7 +6560,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "trait UserId\n";
+        let source = "impl Tr for U32\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -6240,7 +6568,7 @@ mod tests {
             parser.parse_source_file(),
             Err(ParserError::UnsupportedItem {
                 position: 0,
-                kind: SyntaxKind::TRAIT_KW
+                kind: SyntaxKind::IMPL_KW
             })
         );
     }
