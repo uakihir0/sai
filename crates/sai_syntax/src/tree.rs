@@ -543,6 +543,7 @@ fn node_delimiters(kind: SyntaxKind) -> Option<(SyntaxKind, SyntaxKind)> {
         | SyntaxKind::VARIANT_LIST
         | SyntaxKind::ITEM_LIST
         | SyntaxKind::MATCH_ARM_LIST
+        | SyntaxKind::INVARIANT_EXPR_LIST
         | SyntaxKind::EFFECT_SET
         | SyntaxKind::USE_ITEMS
         | SyntaxKind::BLOCK => Some((SyntaxKind::L_BRACE, SyntaxKind::R_BRACE)),

@@ -290,6 +290,7 @@ pub enum SyntaxKind {
     NAME,
     NAME_REF,
     CAST_EXPR,
+    INVARIANT_EXPR_LIST,
 }
 
 impl SyntaxKind {

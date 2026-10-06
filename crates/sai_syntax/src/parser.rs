@@ -1078,6 +1078,161 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_invariant_predicates_with_braced_separators() {
+        let source = concat!(
+            "invariant Account\n",
+            "{\n",
+            "self.balance >= 0,\n",
+            "self.enabled\n",
+            "self.name != \"\"\n",
+            "}\n",
+            "fn local() { let invariant = 1 }\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INVARIANT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INVARIANT_EXPR_LIST)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BIN_EXPR)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn invariant_without_a_close_preserves_the_following_function() {
+        let source = "invariant Account {\nself.balance >= 0\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INVARIANT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn line_start_closure_is_an_invariant_expression_not_an_item_boundary() {
+        let source = "invariant Closure {\nfn() { true }\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INVARIANT_EXPR_LIST)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn invariant_visibility_and_block_placement_are_diagnosed() {
+        let source = concat!(
+            "pub invariant Account { true }\n",
+            "export invariant Other { false }\n",
+            "fn outer() {\n",
+            "invariant Local { true }\n",
+            "let later = 1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 3, "{:?}", output.errors);
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::InvalidExportTarget)
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ItemInBlock)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INVARIANT_DECL)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn invariant_requires_at_least_one_predicate() {
+        let output = parse_file("invariant Empty {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedExpression);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::INVARIANT_EXPR_LIST)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn source_file_parses_record_types_with_attributes_docs_and_where_clauses() {
         let source = concat!(
             "type User<T>\n",

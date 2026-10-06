@@ -323,14 +323,20 @@ impl Parser<'_, '_> {
             )?;
         }
 
+        let public_impl = self.at(SyntaxKind::IMPL_KW)
+            || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::IMPL_KW);
+        let public_invariant = self.at_contextual("invariant") && self.nth(1) == SyntaxKind::UIDENT;
         if let Some(range) = public_range
-            && (self.at(SyntaxKind::IMPL_KW)
-                || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::IMPL_KW))
+            && (public_impl || public_invariant)
         {
             self.emit_parser_diagnostic(
                 sai_diagnostics::Code::ExpectedToken,
                 range,
-                "impl blocks do not have a visibility marker",
+                if public_impl {
+                    "impl blocks do not have a visibility marker"
+                } else {
+                    "invariant declarations do not have a visibility marker"
+                },
             )?;
         }
 
@@ -364,6 +370,10 @@ impl Parser<'_, '_> {
 
         if self.at(SyntaxKind::CONST_KW) {
             return self.const_decl(declaration);
+        }
+
+        if self.at_contextual("invariant") && self.nth(1) == SyntaxKind::UIDENT {
+            return self.invariant_decl(declaration);
         }
 
         if !self.at(SyntaxKind::USE_KW) {
@@ -448,6 +458,96 @@ impl Parser<'_, '_> {
             self.expr_bp(0)?;
         }
         declaration.complete(self, SyntaxKind::CONST_DECL)
+    }
+
+    fn invariant_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+        self.invariant_expr_list()?;
+        declaration.complete(self, SyntaxKind::INVARIANT_DECL)
+    }
+
+    fn invariant_expr_list(&mut self) -> Result<(), ParserError> {
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.expect(SyntaxKind::L_BRACE)?;
+            return Ok(());
+        }
+        let expressions = self.start();
+        self.bump();
+        self.eat_nl();
+        let mut has_expression = false;
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE) {
+                if self.invariant_expr_list_boundary_after_newline() {
+                    break;
+                }
+                self.eat_nl();
+                continue;
+            }
+            if self.at_physical_line_start() && self.item_starts_at_after_attributes(self.position)
+            {
+                break;
+            }
+
+            let position = self.position;
+            self.expr_bp(0)?;
+            has_expression = true;
+            if self.eat(SyntaxKind::COMMA) {
+                self.eat_nl();
+                continue;
+            }
+            if self.at(SyntaxKind::NEWLINE) {
+                if self.invariant_expr_list_boundary_after_newline() {
+                    break;
+                }
+                self.eat_nl();
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            if self.at_expression_start() {
+                self.expect_any(&[SyntaxKind::COMMA, SyntaxKind::NEWLINE])?;
+                continue;
+            }
+            self.expect_any(&[SyntaxKind::COMMA, SyntaxKind::NEWLINE])?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        if !has_expression {
+            self.missing_expression()?;
+        }
+        if !self.invariant_expr_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        expressions.complete(self, SyntaxKind::INVARIANT_EXPR_LIST)?;
+        Ok(())
+    }
+
+    fn invariant_expr_list_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        self.tokens
+            .get(position)
+            .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+            && self.item_starts_at_after_attributes(position)
     }
 
     fn enum_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
