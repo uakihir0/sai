@@ -1242,7 +1242,7 @@ The fields are private. Read-only accessors expose `owner()`, `node_to_syntax()`
 
 ### 2.8.5 Data structures
 
-HIR nodes are allocated in an arena owned by the `HirOwner` value. `'hir` is the arena lifetime.
+HIR nodes are allocated in a typed arena owned by the query session. `HirOwner` is a logical owner whose node and body fields borrow from that arena; it does not contain the arena that stores those values. The session arena outlives its memoized HIR owners and reclaims its allocations together. This avoids making `HirOwner` self-referential. `'hir` is the arena-borrow lifetime.
 
 ```rust
 pub struct HirOwner<'hir> {
@@ -1461,7 +1461,7 @@ pub enum GenericArg<'hir> { Type(&'hir Ty<'hir>), Const(ConstArg), Binding { nam
 pub enum ConstArg { Int { value: Option<u128>, negated: bool }, Char(char), Bool(bool) }
 ```
 
-**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `Name`, `Ty`, `Path`, `GenericArgs`, and `Bound` compare and hash their semantic contents while excluding source spans, so moving syntax does not change their value equality. The records are `Copy` and borrow child nodes and lists; `sai_intern::Arena::alloc_slice` now provides stable storage for copied lists, though a per-owner aggregate HIR arena is not yet implemented. Item, function, expression, pattern, body structures, and syntax-to-HIR lowering remain follow-up work.
+**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `Name`, `Ty`, `Path`, `GenericArgs`, and `Bound` compare and hash their semantic contents while excluding source spans, so moving syntax does not change their value equality. The records are `Copy` and borrow child nodes and lists; `sai_intern::Arena::alloc_slice` provides stable storage for copied lists, and `sai_hir::arena::HirArena` groups typed arenas for these nodes and lists. `HirOwner` does not yet own this arena. Item, function, expression, pattern, body structures, and syntax-to-HIR lowering remain follow-up work.
 
 Notes on the shape:
 

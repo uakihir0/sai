@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod arena;
 pub mod attrs;
 pub mod item_tree;
 pub mod source_map;
