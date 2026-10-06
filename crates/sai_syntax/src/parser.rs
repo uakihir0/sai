@@ -2374,6 +2374,150 @@ mod tests {
     }
 
     #[test]
+    fn item_statement_and_pattern_unions_cover_their_grammar_nodes() {
+        use crate::ast::{AstNode, Item, Pattern, Stmt};
+
+        let source = concat!(
+            "use sai:http\n",
+            "fn statements(value: U32) {\n",
+            "let first = value\n",
+            "var second = first\n",
+            "assert first, second\n",
+            "second = first\n",
+            "second\n",
+            "}\n",
+            "type Record<const N: USize, T> { field: T }\n",
+            "enum State { Ready, Value(code: U32) }\n",
+            "distinct Count = U32\n",
+            "const MAX: U32 = 10\n",
+            "invariant Record {\nself.field >= 0\n}\n",
+            "effect io\n",
+            "resource File\n",
+            "trait Convert {\ntype Output\nfn convert()\n}\n",
+            "impl Convert for Record {\ntype Output = I32\nfn convert() {}\n}\n",
+            "interface storage {\nresource Handle {\nfn close(self: borrow Self)\n}\nfn open() -> Handle\n}\n",
+            "world client {\nimport wasi:http/outgoing-handler\nexport fn serve()\ninclude common.base\n}\n",
+            "extern \"wasm\" module \"env\" {\nfn read()\n}\n",
+            "fn patterns(value: Option<U32>) {\n",
+            "match value {\n",
+            "_ => 0,\n",
+            "0 | 1 => 1,\n",
+            "name @ _ => 2,\n",
+            "Some(item) => 3,\n",
+            ".Closed => 4,\n",
+            "(left, right) => 5,\n",
+            "(item) => 6,\n",
+            "[head, ..tail] => 7,\n",
+            "0..=9 => 8\n",
+            "}\n",
+            "}\n",
+            "test \"works\" {}\n",
+            "property \"holds\"() {}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let nodes = root.descendants().collect::<Vec<_>>();
+
+        for node in &nodes {
+            let kind = node.kind();
+            let item = Item::cast((*node).clone());
+            assert_eq!(
+                Item::can_cast(kind),
+                item.is_some(),
+                "Item cast for {kind:?}"
+            );
+            assert_eq!(
+                item.as_ref().map(|item| item.syntax().kind()),
+                Item::can_cast(kind).then_some(kind),
+                "Item syntax for {kind:?}"
+            );
+            let stmt = Stmt::cast((*node).clone());
+            assert_eq!(
+                Stmt::can_cast(kind),
+                stmt.is_some(),
+                "Stmt cast for {kind:?}"
+            );
+            assert_eq!(
+                stmt.as_ref().map(|stmt| stmt.syntax().kind()),
+                Stmt::can_cast(kind).then_some(kind),
+                "Stmt syntax for {kind:?}"
+            );
+            let pattern = Pattern::cast((*node).clone());
+            assert_eq!(
+                Pattern::can_cast(kind),
+                pattern.is_some(),
+                "Pattern cast for {kind:?}"
+            );
+            assert_eq!(
+                pattern.as_ref().map(|pattern| pattern.syntax().kind()),
+                Pattern::can_cast(kind).then_some(kind),
+                "Pattern syntax for {kind:?}"
+            );
+        }
+
+        for kind in [
+            SyntaxKind::USE_DECL,
+            SyntaxKind::FN_DECL,
+            SyntaxKind::TYPE_DECL,
+            SyntaxKind::ENUM_DECL,
+            SyntaxKind::DISTINCT_DECL,
+            SyntaxKind::RESOURCE_DECL,
+            SyntaxKind::TRAIT_DECL,
+            SyntaxKind::IMPL_DECL,
+            SyntaxKind::CONST_DECL,
+            SyntaxKind::INVARIANT_DECL,
+            SyntaxKind::EFFECT_DECL,
+            SyntaxKind::INTERFACE_DECL,
+            SyntaxKind::WORLD_DECL,
+            SyntaxKind::EXTERN_BLOCK,
+            SyntaxKind::TEST_DECL,
+            SyntaxKind::PROPERTY_DECL,
+        ] {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.kind() == kind && Item::cast((*node).clone()).is_some()),
+                "Item union is missing {kind:?}"
+            );
+        }
+        for kind in [
+            SyntaxKind::LET_STMT,
+            SyntaxKind::VAR_STMT,
+            SyntaxKind::ASSERT_STMT,
+            SyntaxKind::ASSIGN_STMT,
+            SyntaxKind::EXPR_STMT,
+        ] {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.kind() == kind && Stmt::cast((*node).clone()).is_some()),
+                "Stmt union is missing {kind:?}"
+            );
+        }
+        for kind in [
+            SyntaxKind::WILDCARD_PAT,
+            SyntaxKind::OR_PAT,
+            SyntaxKind::AT_PAT,
+            SyntaxKind::BINDING_PAT,
+            SyntaxKind::LITERAL_PAT,
+            SyntaxKind::CTOR_PAT,
+            SyntaxKind::IMPLICIT_MEMBER_PAT,
+            SyntaxKind::TUPLE_PAT,
+            SyntaxKind::PAREN_PAT,
+            SyntaxKind::SLICE_PAT,
+            SyntaxKind::RANGE_PAT,
+        ] {
+            assert!(
+                nodes.iter().any(|node| {
+                    node.kind() == kind && Pattern::cast((*node).clone()).is_some()
+                }),
+                "Pattern union is missing {kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn typed_ast_accessors_remain_optional_for_incomplete_declarations() {
         use crate::ast::{AstNode, SourceFile};
 

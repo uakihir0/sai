@@ -307,15 +307,73 @@ macro_rules! ast_token {
     };
 }
 
+macro_rules! ast_union {
+    ($name:ident { $($variant:ident($node:ident, $kind:ident)),+ $(,)? }) => {
+        #[derive(Clone, Debug)]
+        pub enum $name {
+            $($variant($node)),+
+        }
+
+        impl AstNode for $name {
+            fn can_cast(kind: SyntaxKind) -> bool {
+                matches!(kind, $(SyntaxKind::$kind)|+)
+            }
+
+            fn cast(node: SyntaxNode) -> Option<Self> {
+                match node.kind() {
+                    $(SyntaxKind::$kind => Some(Self::$variant($node::cast(node)?)),)+
+                    _ => None,
+                }
+            }
+
+            fn syntax(&self) -> &SyntaxNode {
+                match self {
+                    $(Self::$variant(node) => node.syntax(),)+
+                }
+            }
+        }
+    };
+}
+
 ast_node!(SourceFile, SOURCE_FILE);
 ast_node!(TestDecl, TEST_DECL);
 ast_node!(PropertyDecl, PROPERTY_DECL);
+ast_node!(UseDecl, USE_DECL);
+ast_node!(FnDecl, FN_DECL);
+ast_node!(TypeDecl, TYPE_DECL);
+ast_node!(EnumDecl, ENUM_DECL);
+ast_node!(DistinctDecl, DISTINCT_DECL);
+ast_node!(ResourceDecl, RESOURCE_DECL);
+ast_node!(TraitDecl, TRAIT_DECL);
+ast_node!(ImplDecl, IMPL_DECL);
+ast_node!(ConstDecl, CONST_DECL);
+ast_node!(InvariantDecl, INVARIANT_DECL);
+ast_node!(EffectDecl, EFFECT_DECL);
+ast_node!(InterfaceDecl, INTERFACE_DECL);
+ast_node!(WorldDecl, WORLD_DECL);
+ast_node!(ExternBlock, EXTERN_BLOCK);
 ast_node!(Block, BLOCK);
+ast_node!(LetStmt, LET_STMT);
+ast_node!(VarStmt, VAR_STMT);
+ast_node!(AssignStmt, ASSIGN_STMT);
+ast_node!(AssertStmt, ASSERT_STMT);
+ast_node!(ExprStmt, EXPR_STMT);
 ast_node!(ParamList, PARAM_LIST);
 ast_node!(Param, PARAM);
 ast_node!(TypeParam, TYPE_PARAM);
 ast_node!(ConstParam, CONST_PARAM);
 ast_node!(Name, NAME);
+ast_node!(OrPat, OR_PAT);
+ast_node!(AtPat, AT_PAT);
+ast_node!(WildcardPat, WILDCARD_PAT);
+ast_node!(BindingPat, BINDING_PAT);
+ast_node!(LiteralPat, LITERAL_PAT);
+ast_node!(RangePat, RANGE_PAT);
+ast_node!(TuplePat, TUPLE_PAT);
+ast_node!(ParenPat, PAREN_PAT);
+ast_node!(SlicePat, SLICE_PAT);
+ast_node!(CtorPat, CTOR_PAT);
+ast_node!(ImplicitMemberPat, IMPLICIT_MEMBER_PAT);
 ast_node!(TupleIndexExpr, TUPLE_INDEX_EXPR);
 ast_node!(FStringExpr, FSTRING_EXPR);
 ast_node!(FStringInterp, FSTRING_INTERP);
@@ -350,6 +408,14 @@ ast_node!(CallExpr, CALL_EXPR);
 ast_node!(IndexExpr, INDEX_EXPR);
 ast_node!(TryExpr, TRY_EXPR);
 ast_node!(CastExpr, CAST_EXPR);
+ast_node!(PathType, PATH_TYPE);
+ast_node!(SelfType, SELF_TYPE);
+ast_node!(BorrowType, BORROW_TYPE);
+ast_node!(OwnedType, OWNED_TYPE);
+ast_node!(TupleType, TUPLE_TYPE);
+ast_node!(ParenType, PAREN_TYPE);
+ast_node!(InferType, INFER_TYPE);
+ast_node!(FnPtrType, FN_PTR_TYPE);
 
 ast_token!(IntLit, INT);
 ast_token!(FloatLit, FLOAT);
@@ -521,6 +587,47 @@ impl AstNode for Expr {
         }
     }
 }
+
+ast_union!(Item {
+    Use(UseDecl, USE_DECL),
+    Function(FnDecl, FN_DECL),
+    Type(TypeDecl, TYPE_DECL),
+    Enum(EnumDecl, ENUM_DECL),
+    Distinct(DistinctDecl, DISTINCT_DECL),
+    Resource(ResourceDecl, RESOURCE_DECL),
+    Trait(TraitDecl, TRAIT_DECL),
+    Impl(ImplDecl, IMPL_DECL),
+    Const(ConstDecl, CONST_DECL),
+    Invariant(InvariantDecl, INVARIANT_DECL),
+    Effect(EffectDecl, EFFECT_DECL),
+    Interface(InterfaceDecl, INTERFACE_DECL),
+    World(WorldDecl, WORLD_DECL),
+    ExternBlock(ExternBlock, EXTERN_BLOCK),
+    Test(TestDecl, TEST_DECL),
+    Property(PropertyDecl, PROPERTY_DECL),
+});
+
+ast_union!(Stmt {
+    Let(LetStmt, LET_STMT),
+    Var(VarStmt, VAR_STMT),
+    Assign(AssignStmt, ASSIGN_STMT),
+    Assert(AssertStmt, ASSERT_STMT),
+    Expr(ExprStmt, EXPR_STMT),
+});
+
+ast_union!(Pattern {
+    Or(OrPat, OR_PAT),
+    At(AtPat, AT_PAT),
+    Wildcard(WildcardPat, WILDCARD_PAT),
+    Binding(BindingPat, BINDING_PAT),
+    Literal(LiteralPat, LITERAL_PAT),
+    Range(RangePat, RANGE_PAT),
+    Tuple(TuplePat, TUPLE_PAT),
+    Parenthesized(ParenPat, PAREN_PAT),
+    Slice(SlicePat, SLICE_PAT),
+    Constructor(CtorPat, CTOR_PAT),
+    ImplicitMember(ImplicitMemberPat, IMPLICIT_MEMBER_PAT),
+});
 
 #[derive(Clone, Debug)]
 pub enum FStringPiece<'a> {
@@ -844,69 +951,16 @@ fn push_fstring_text<'a>(pieces: &mut Vec<FStringPiece<'a>>, text: Cow<'a, str>)
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum Type {
-    PathType(PathType),
-    SelfType(SelfType),
-    BorrowType(BorrowType),
-    OwnedType(OwnedType),
-    TupleType(TupleType),
-    ParenType(ParenType),
-    InferType(InferType),
-    FnPtrType(FnPtrType),
-}
-
-ast_node!(PathType, PATH_TYPE);
-ast_node!(SelfType, SELF_TYPE);
-ast_node!(BorrowType, BORROW_TYPE);
-ast_node!(OwnedType, OWNED_TYPE);
-ast_node!(TupleType, TUPLE_TYPE);
-ast_node!(ParenType, PAREN_TYPE);
-ast_node!(InferType, INFER_TYPE);
-ast_node!(FnPtrType, FN_PTR_TYPE);
-
-impl AstNode for Type {
-    fn can_cast(kind: SyntaxKind) -> bool {
-        matches!(
-            kind,
-            SyntaxKind::PATH_TYPE
-                | SyntaxKind::SELF_TYPE
-                | SyntaxKind::BORROW_TYPE
-                | SyntaxKind::OWNED_TYPE
-                | SyntaxKind::TUPLE_TYPE
-                | SyntaxKind::PAREN_TYPE
-                | SyntaxKind::INFER_TYPE
-                | SyntaxKind::FN_PTR_TYPE
-        )
-    }
-
-    fn cast(node: SyntaxNode) -> Option<Self> {
-        Some(match node.kind() {
-            SyntaxKind::PATH_TYPE => Self::PathType(PathType::cast(node)?),
-            SyntaxKind::SELF_TYPE => Self::SelfType(SelfType::cast(node)?),
-            SyntaxKind::BORROW_TYPE => Self::BorrowType(BorrowType::cast(node)?),
-            SyntaxKind::OWNED_TYPE => Self::OwnedType(OwnedType::cast(node)?),
-            SyntaxKind::TUPLE_TYPE => Self::TupleType(TupleType::cast(node)?),
-            SyntaxKind::PAREN_TYPE => Self::ParenType(ParenType::cast(node)?),
-            SyntaxKind::INFER_TYPE => Self::InferType(InferType::cast(node)?),
-            SyntaxKind::FN_PTR_TYPE => Self::FnPtrType(FnPtrType::cast(node)?),
-            _ => return None,
-        })
-    }
-
-    fn syntax(&self) -> &SyntaxNode {
-        match self {
-            Self::PathType(node) => node.syntax(),
-            Self::SelfType(node) => node.syntax(),
-            Self::BorrowType(node) => node.syntax(),
-            Self::OwnedType(node) => node.syntax(),
-            Self::TupleType(node) => node.syntax(),
-            Self::ParenType(node) => node.syntax(),
-            Self::InferType(node) => node.syntax(),
-            Self::FnPtrType(node) => node.syntax(),
-        }
-    }
-}
+ast_union!(Type {
+    PathType(PathType, PATH_TYPE),
+    SelfType(SelfType, SELF_TYPE),
+    BorrowType(BorrowType, BORROW_TYPE),
+    OwnedType(OwnedType, OWNED_TYPE),
+    TupleType(TupleType, TUPLE_TYPE),
+    ParenType(ParenType, PAREN_TYPE),
+    InferType(InferType, INFER_TYPE),
+    FnPtrType(FnPtrType, FN_PTR_TYPE),
+});
 
 fn direct_child<N: AstNode>(node: &SyntaxNode) -> Option<N> {
     node.children().find_map(N::cast)
