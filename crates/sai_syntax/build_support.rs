@@ -27,6 +27,7 @@ enum ChildSelector {
 enum AccessorKind {
     Child,
     Children,
+    ChildrenBefore,
     Token,
 }
 
@@ -103,10 +104,14 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                     accessors: Vec::new(),
                 });
             }
-            Some(kind @ ("child" | "child_before" | "child_after" | "children" | "token")) => {
+            Some(
+                kind @ ("child" | "child_before" | "child_after" | "children" | "children_before"
+                | "token"),
+            ) => {
                 let expected_fields = match kind {
                     "child" => 5,
                     "child_before" | "child_after" => 6,
+                    "children_before" => 5,
                     _ => 4,
                 };
                 if fields.len() != expected_fields {
@@ -116,6 +121,7 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                         match kind {
                             "child" => " <index>",
                             "child_before" | "child_after" => " <TOKEN_KIND> <index>",
+                            "children_before" => " <TOKEN_KIND>",
                             _ => "",
                         },
                     );
@@ -132,6 +138,7 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                 let accessor_kind = match kind {
                     "child" | "child_before" | "child_after" => AccessorKind::Child,
                     "children" => AccessorKind::Children,
+                    "children_before" => AccessorKind::ChildrenBefore,
                     "token" => AccessorKind::Token,
                     _ => unreachable!(),
                 };
@@ -159,6 +166,19 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                                 syntax_kind: syntax_kind.to_owned(),
                                 index,
                             }
+                        })
+                    }
+                    "children_before" => {
+                        let syntax_kind = fields[4];
+                        if !is_syntax_kind_name(syntax_kind) {
+                            panic!(
+                                "sai.ungram:{}: invalid child boundary token kind `{syntax_kind}`",
+                                line_index + 1
+                            );
+                        }
+                        Some(ChildSelector::BeforeToken {
+                            syntax_kind: syntax_kind.to_owned(),
+                            index: 0,
                         })
                     }
                     _ => None,
@@ -205,7 +225,7 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
             );
         }
         match accessor.kind {
-            AccessorKind::Child | AccessorKind::Children => {
+            AccessorKind::Child | AccessorKind::Children | AccessorKind::ChildrenBefore => {
                 if !ast_names.contains(&accessor.ty)
                     && !existing_types.unions.contains(&accessor.ty)
                 {
@@ -758,6 +778,18 @@ pub(crate) fn generate_nodes(nodes: &[Node]) -> String {
                     "impl {} {{ pub fn {}(&self) -> impl Iterator<Item = {}> + '_ {{ self.syntax().children().filter_map({}::cast) }} }}",
                     node.ast_name, accessor.name, accessor.ty, accessor.ty
                 ),
+                AccessorKind::ChildrenBefore => {
+                    let Some(ChildSelector::BeforeToken { syntax_kind, .. }) =
+                        accessor.selector.as_ref()
+                    else {
+                        panic!("children_before roles have a token boundary");
+                    };
+                    writeln!(
+                        generated,
+                        "impl {} {{ pub fn {}(&self) -> impl Iterator<Item = {}> + '_ {{ direct_children_before(self.syntax(), SyntaxKind::{syntax_kind}) }} }}",
+                        node.ast_name, accessor.name, accessor.ty
+                    )
+                }
                 AccessorKind::Token => writeln!(
                     generated,
                     "impl {} {{ pub fn {}(&self) -> Option<{}> {{ direct_token(self.syntax()) }} }}",
@@ -943,6 +975,7 @@ mod tests {
                 "child Parent child Type 0\n",
                 "child_before Parent before Child COMMA 0\n",
                 "child_after Parent after Child COMMA 0\n",
+                "children_before Parent preceding Child COMMA\n",
                 "token Parent token StringLit",
             ),
             &existing,
@@ -957,6 +990,7 @@ mod tests {
         assert!(generated.contains("direct_child_at(self.syntax(), 1)"));
         assert!(generated.contains("direct_child_before(self.syntax(), SyntaxKind::COMMA, 0)"));
         assert!(generated.contains("direct_child_after(self.syntax(), SyntaxKind::COMMA, 0)"));
+        assert!(generated.contains("direct_children_before(self.syntax(), SyntaxKind::COMMA)"));
         assert!(generated.contains("pub fn token(&self) -> Option<StringLit>"));
     }
 
@@ -976,7 +1010,32 @@ mod tests {
             concat!(
                 "node Parent PARENT\n",
                 "node Child CHILD\n",
+                "children_before Parent before Child COMMA",
+            ),
+            &ExistingAstTypes::default(),
+        );
+        validate_node_kinds(&nodes, "pub enum SyntaxKind { COMMA, EOF, PARENT, CHILD }");
+
+        let nodes = parse_nodes(
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
                 "child_after Parent after Child MISSING_TOKEN 0",
+            ),
+            &ExistingAstTypes::default(),
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_node_kinds(&nodes, "pub enum SyntaxKind { COMMA, EOF, PARENT, CHILD }")
+            })
+            .is_err()
+        );
+
+        let nodes = parse_nodes(
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "children_before Parent before Child CHILD",
             ),
             &ExistingAstTypes::default(),
         );

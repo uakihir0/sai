@@ -838,6 +838,20 @@ fn direct_child_at<N: AstNode>(node: &SyntaxNode, index: usize) -> Option<N> {
     node.children().filter_map(N::cast).nth(index)
 }
 
+fn direct_children_before<N: AstNode>(
+    node: &SyntaxNode,
+    boundary: SyntaxKind,
+) -> impl Iterator<Item = N> + '_ {
+    node.children_with_tokens()
+        .take_while(
+            move |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == boundary),
+        )
+        .filter_map(|element| match element {
+            SyntaxElement::Node(child) => N::cast(child),
+            SyntaxElement::Token(_) => None,
+        })
+}
+
 fn direct_child_before<N: AstNode>(
     node: &SyntaxNode,
     boundary: SyntaxKind,

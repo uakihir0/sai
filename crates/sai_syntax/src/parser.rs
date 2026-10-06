@@ -2844,6 +2844,50 @@ mod tests {
     }
 
     #[test]
+    fn generated_function_pointer_roles_stop_at_the_return_arrow() {
+        use crate::ast::{AstNode, FnPtrType};
+
+        let source = concat!(
+            "type Callback = fn(I32, U8) -> Bool\n",
+            "type Predicate = fn(I32, U8)\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let function_pointers = root
+            .descendants()
+            .filter_map(FnPtrType::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(function_pointers.len(), 2);
+
+        let callback_params = function_pointers[0].params().collect::<Vec<_>>();
+        assert_eq!(callback_params.len(), 2);
+        assert!(
+            callback_params
+                .iter()
+                .all(|ty| ty.syntax().kind() == SyntaxKind::PATH_TYPE)
+        );
+        assert!(
+            function_pointers[0]
+                .ret_type()
+                .is_some_and(|ty| ty.syntax().kind() == SyntaxKind::PATH_TYPE)
+        );
+
+        assert_eq!(function_pointers[1].params().count(), 2);
+        assert!(function_pointers[1].ret_type().is_none());
+
+        let incomplete_return = parse_file("type Broken = fn(I32) ->\n");
+        assert!(!incomplete_return.errors.is_empty());
+        let incomplete_return_root = crate::SyntaxNode::new_root(incomplete_return.root);
+        let incomplete_return = incomplete_return_root
+            .descendants()
+            .find_map(FnPtrType::cast)
+            .expect("recovered function pointer type");
+        assert_eq!(incomplete_return.params().count(), 1);
+        assert!(incomplete_return.ret_type().is_none());
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,

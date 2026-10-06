@@ -154,9 +154,9 @@ node CastExpr CAST_EXPR
 node InvariantExprList INVARIANT_EXPR_LIST
 node Error ERROR
 
-# Direct child roles: child selects by zero-based same-type position; child_before and
-# child_after select relative to a direct token boundary; children is repeated, and token
-# names an AstToken.
+# Direct child roles: child selects by zero-based same-type position; child_before,
+# child_after, and children_before select relative to a direct token boundary; children
+# is repeated, and token names an AstToken.
 children SourceFile items Item
 children SourceFile test_decls TestDecl
 children SourceFile property_decls PropertyDecl
@@ -262,6 +262,8 @@ children GenericArgList assoc_type_bindings AssocTypeBinding
 child TypeArg ty Type 0
 child AssocTypeBinding name NameRef 0
 child AssocTypeBinding ty Type 0
+children_before FnPtrType params Type THIN_ARROW
+child_after FnPtrType ret_type Type THIN_ARROW 0
 child CastExpr expression Expr 0
 child CastExpr ty Type 0
 child BinExpr lhs Expr 0
