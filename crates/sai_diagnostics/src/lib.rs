@@ -80,6 +80,7 @@ define_codes! {
     ImplementationLimitExceeded => "IMPLEMENTATION_LIMIT_EXCEEDED",
     ClauseOrder => "CLAUSE_ORDER",
     DuplicateClause => "DUPLICATE_CLAUSE",
+    VisibilityOnTraitImplItem => "VISIBILITY_ON_TRAIT_IMPL_ITEM",
     InvalidAttributeTarget => "INVALID_ATTRIBUTE_TARGET",
     RedundantPubExport => "REDUNDANT_PUB_EXPORT",
     InvalidExportTarget => "INVALID_EXPORT_TARGET",
@@ -1606,6 +1607,10 @@ mod tests {
             Some(Code::UnexpectedCharacter)
         );
         assert_eq!(Code::from_name("EXPECTED_TOKEN"), Some(Code::ExpectedToken));
+        assert_eq!(
+            Code::from_name("VISIBILITY_ON_TRAIT_IMPL_ITEM"),
+            Some(Code::VisibilityOnTraitImplItem)
+        );
         assert_eq!(
             Code::from_name("NO_ASYNC_CLOSURE"),
             Some(Code::NoAsyncClosure)

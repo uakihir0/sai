@@ -1474,7 +1474,11 @@ mod tests {
             root.descendants()
                 .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
                 .count(),
-            2
+            2,
+            "{:?}",
+            root.descendants()
+                .map(|node| node.kind())
+                .collect::<Vec<_>>()
         );
 
         let source = "resource File {\nname: Str\nfn later() {}\n";
@@ -1583,6 +1587,286 @@ mod tests {
                 .filter(|node| node.kind() == SyntaxKind::ITEM_LIST)
                 .count(),
             2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn source_file_parses_trait_inherent_and_interface_impls() {
+        let source = concat!(
+            "trait Convert<T> {\n",
+            "type Output\n",
+            "fn convert(value: T) -> T\n",
+            "}\n",
+            "unsafe impl<T> Convert<T, Output = T> for Box<T> where T: Copy {\n",
+            "/// concrete associated output\n",
+            "type Output = T\n",
+            "@inline\n",
+            "fn convert(value: T) -> T { value }\n",
+            "}\n",
+            "impl Box<I32> {\n",
+            "pub fn identity(value: I32) -> I32 { value }\n",
+            "}\n",
+            "impl wasi.http {\n",
+            "fn get() -> I32 { 1 }\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IMPL_DECL)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASSOC_TYPE_DEF)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::MOD_PATH)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            4
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn trait_and_interface_impl_items_reject_public_visibility() {
+        let source = concat!(
+            "impl Convert for Value {\n",
+            "pub fn convert() {}\n",
+            "}\n",
+            "impl wasi.http {\n",
+            "pub fn get() {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::VisibilityOnTraitImplItem)
+                .count(),
+            2,
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IMPL_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn public_impl_marker_is_diagnosed_without_losing_the_impl() {
+        let source = "pub impl Value {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IMPL_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn export_markers_on_impls_and_impl_items_are_diagnosed() {
+        let source = concat!(
+            "export impl Value {}\n",
+            "impl Convert for Value {\n",
+            "export type Output = Value\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        assert_eq!(
+            output.errors[0].code,
+            Code::InvalidExportTarget,
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(output.errors[1].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IMPL_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASSOC_TYPE_DEF)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_impl_close_preserves_following_declarations() {
+        let source = "impl Value {\nfn method() {}\nenum Later {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IMPL_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_associated_type_rhs_preserves_the_next_impl_method() {
+        let source = "impl Value {\ntype Output =\nfn method() {}\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASSOC_TYPE_DEF)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn associated_types_cannot_have_visibility_markers() {
+        let source = "impl Convert for Value {\npub type Output = Value\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ASSOC_TYPE_DEF)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn impl_declaration_in_block_is_recovered_as_an_item() {
+        let source = "fn outer() {\nimpl Value { fn method() {} }\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ItemInBlock);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::IMPL_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn inherent_impl_methods_require_bodies() {
+        let source = "impl Value {\nfn missing()\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::MissingFnBody);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
         );
         assert_eq!(root.green().text_len().to_usize(), source.len());
     }
@@ -6560,7 +6844,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "impl Tr for U32\n";
+        let source = "const VALUE: U32 = 1\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -6568,7 +6852,7 @@ mod tests {
             parser.parse_source_file(),
             Err(ParserError::UnsupportedItem {
                 position: 0,
-                kind: SyntaxKind::IMPL_KW
+                kind: SyntaxKind::CONST_KW
             })
         );
     }

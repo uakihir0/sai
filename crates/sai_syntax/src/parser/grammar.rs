@@ -156,6 +156,13 @@ enum FnClauseKind {
     Ensures,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImplTargetKind {
+    Trait,
+    Inherent,
+    Interface,
+}
+
 impl Parser<'_, '_> {
     /// Parses the currently implemented source-file grammar into parser events.
     ///
@@ -280,6 +287,7 @@ impl Parser<'_, '_> {
         self.attributes(true)?;
 
         let mut exported_range = None;
+        let mut public_range = None;
         if self.at_any(&[SyntaxKind::PUB_KW, SyntaxKind::EXPORT_KW]) {
             let visibility = self.start();
             let is_pub = self.at(SyntaxKind::PUB_KW);
@@ -297,6 +305,8 @@ impl Parser<'_, '_> {
                 self.bump();
             } else if !is_pub {
                 exported_range = visibility_range;
+            } else {
+                public_range = visibility_range;
             }
             visibility.complete(self, SyntaxKind::VISIBILITY)?;
         }
@@ -310,6 +320,17 @@ impl Parser<'_, '_> {
                 sai_diagnostics::Code::InvalidExportTarget,
                 range,
                 "only functions may be exported",
+            )?;
+        }
+
+        if let Some(range) = public_range
+            && (self.at(SyntaxKind::IMPL_KW)
+                || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::IMPL_KW))
+        {
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "impl blocks do not have a visibility marker",
             )?;
         }
 
@@ -335,6 +356,12 @@ impl Parser<'_, '_> {
             return self.trait_decl(declaration);
         }
 
+        if self.at(SyntaxKind::IMPL_KW)
+            || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::IMPL_KW)
+        {
+            return self.impl_decl(declaration);
+        }
+
         if !self.at(SyntaxKind::USE_KW) {
             let position = self.position;
             let kind = self.current();
@@ -355,12 +382,23 @@ impl Parser<'_, '_> {
     }
 
     fn at_fn_decl_start(&self) -> bool {
-        match self.current() {
-            SyntaxKind::FN_KW => true,
-            SyntaxKind::ASYNC_KW => self.nth(1) == SyntaxKind::FN_KW,
-            SyntaxKind::UNSAFE_KW => {
-                self.nth(1) == SyntaxKind::FN_KW
-                    || (self.nth(1) == SyntaxKind::ASYNC_KW && self.nth(2) == SyntaxKind::FN_KW)
+        self.fn_decl_starts_at(self.position)
+    }
+
+    fn fn_decl_starts_at(&self, position: usize) -> bool {
+        let kind_at = |offset: usize| {
+            position
+                .checked_add(offset)
+                .and_then(|index| self.tokens.get(index))
+                .map(|token| token.kind)
+        };
+        match kind_at(0) {
+            Some(SyntaxKind::FN_KW) => true,
+            Some(SyntaxKind::ASYNC_KW) => kind_at(1) == Some(SyntaxKind::FN_KW),
+            Some(SyntaxKind::UNSAFE_KW) => {
+                kind_at(1) == Some(SyntaxKind::FN_KW)
+                    || (kind_at(1) == Some(SyntaxKind::ASYNC_KW)
+                        && kind_at(2) == Some(SyntaxKind::FN_KW))
             }
             _ => false,
         }
@@ -648,6 +686,367 @@ impl Parser<'_, '_> {
         }
         declaration.complete(self, SyntaxKind::ASSOC_TYPE_DECL)?;
         Ok(())
+    }
+
+    fn impl_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.eat(SyntaxKind::UNSAFE_KW);
+        self.expect(SyntaxKind::IMPL_KW)?;
+        if self.at(SyntaxKind::LT) {
+            self.generic_param_list()?;
+        }
+
+        let target_kind;
+        if !self.impl_header_has_for_at(self.position)
+            && self.mod_path_end_at(self.position).is_some()
+        {
+            self.mod_path()?;
+            target_kind = ImplTargetKind::Interface;
+        } else {
+            let is_trait_impl = self.impl_header_has_for_at(self.position);
+            let previous = self.allow_assoc_type_bindings;
+            self.allow_assoc_type_bindings = is_trait_impl;
+            let target_result = if self.at_any(TYPE_START_KINDS) {
+                self.type_(true)
+            } else {
+                self.expect_any(TYPE_START_KINDS).map(|_| ())
+            };
+            self.allow_assoc_type_bindings = previous;
+            target_result?;
+            if self.eat(SyntaxKind::FOR_KW) {
+                target_kind = ImplTargetKind::Trait;
+                if self.at_any(TYPE_START_KINDS) {
+                    self.type_(true)?;
+                } else {
+                    self.expect_any(TYPE_START_KINDS)?;
+                }
+            } else {
+                target_kind = ImplTargetKind::Inherent;
+            }
+        }
+
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::WHERE_KW {
+            self.eat_nl();
+        }
+        if self.at(SyntaxKind::WHERE_KW) {
+            self.where_clause()?;
+        }
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+        self.impl_item_list(target_kind)?;
+        declaration.complete(self, SyntaxKind::IMPL_DECL)
+    }
+
+    fn impl_header_has_for_at(&self, mut position: usize) -> bool {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut angle_depth = 0usize;
+        while let Some(token) = self.tokens.get(position) {
+            if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 {
+                match token.kind {
+                    SyntaxKind::FOR_KW => return true,
+                    SyntaxKind::WHERE_KW
+                    | SyntaxKind::NEWLINE
+                    | SyntaxKind::L_BRACE
+                    | SyntaxKind::EOF => return false,
+                    _ => {}
+                }
+            }
+            match token.kind {
+                SyntaxKind::L_PAREN => paren_depth += 1,
+                SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                SyntaxKind::R_PAREN => return false,
+                SyntaxKind::L_BRACKET => bracket_depth += 1,
+                SyntaxKind::R_BRACKET if bracket_depth > 0 => bracket_depth -= 1,
+                SyntaxKind::R_BRACKET => return false,
+                SyntaxKind::L_BRACE => brace_depth += 1,
+                SyntaxKind::R_BRACE if brace_depth > 0 => brace_depth -= 1,
+                SyntaxKind::R_BRACE => return false,
+                SyntaxKind::LT => angle_depth += 1,
+                SyntaxKind::GT if angle_depth > 0 => angle_depth -= 1,
+                SyntaxKind::GT => return false,
+                _ => {}
+            }
+            position += 1;
+        }
+        false
+    }
+
+    fn mod_path_end_at(&self, mut position: usize) -> Option<usize> {
+        if self
+            .tokens
+            .get(position)
+            .is_none_or(|token| token.kind != SyntaxKind::LIDENT)
+        {
+            return None;
+        }
+        position += 1;
+        while self.tokens.get(position).is_some_and(|token| {
+            token.kind == SyntaxKind::DOT
+                && self
+                    .tokens
+                    .get(position + 1)
+                    .is_some_and(|next| next.kind == SyntaxKind::LIDENT)
+        }) {
+            position += 2;
+        }
+        self.tokens
+            .get(position)
+            .is_some_and(|token| {
+                matches!(
+                    token.kind,
+                    SyntaxKind::WHERE_KW
+                        | SyntaxKind::NEWLINE
+                        | SyntaxKind::L_BRACE
+                        | SyntaxKind::EOF
+                )
+            })
+            .then_some(position)
+    }
+
+    fn mod_path(&mut self) -> Result<(), ParserError> {
+        let path = self.start();
+        self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME_REF)?;
+        while self.eat(SyntaxKind::DOT) {
+            self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME_REF)?;
+        }
+        path.complete(self, SyntaxKind::MOD_PATH)?;
+        Ok(())
+    }
+
+    fn assoc_type_def(&mut self) -> Result<bool, ParserError> {
+        let definition = self.start();
+        self.expect(SyntaxKind::TYPE_KW)?;
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        self.expect(SyntaxKind::EQ)?;
+        let missing_type =
+            self.at_physical_line_start() && self.item_starts_at_after_attributes(self.position);
+        if missing_type {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "expected a type before the next item",
+            )?;
+            self.start().complete(self, SyntaxKind::ERROR)?;
+        } else if self.at_any(TYPE_START_KINDS) {
+            self.type_(true)?;
+        } else {
+            self.expect_any(TYPE_START_KINDS)?;
+        }
+        definition.complete(self, SyntaxKind::ASSOC_TYPE_DEF)?;
+        Ok(missing_type)
+    }
+
+    fn impl_item_list(&mut self, target_kind: ImplTargetKind) -> Result<(), ParserError> {
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.expect(SyntaxKind::L_BRACE)?;
+            return Ok(());
+        }
+        let items = self.start();
+        self.bump();
+        while self.at(SyntaxKind::NEWLINE) && !self.impl_item_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE) && self.impl_item_list_boundary_after_newline() {
+                break;
+            }
+            if self.at(SyntaxKind::DOC_INNER)
+                || (self.at(SyntaxKind::DOC_OUTER)
+                    && !self.impl_item_starts_at_after_attributes(self.position))
+            {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+            let position = self.position;
+            let missing_assoc_type = self.impl_item(target_kind)?;
+            if missing_assoc_type
+                && self.at_physical_line_start()
+                && self.impl_item_starts_at_after_attributes(self.position)
+            {
+                continue;
+            }
+            if self.at(SyntaxKind::NEWLINE) && self.impl_item_list_boundary_after_newline() {
+                break;
+            }
+            if self.eat(SyntaxKind::NEWLINE) {
+                while self.at(SyntaxKind::NEWLINE) && !self.impl_item_list_boundary_after_newline()
+                {
+                    self.eat_nl();
+                }
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect(SyntaxKind::NEWLINE)?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        if !self.impl_item_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        items.complete(self, SyntaxKind::ITEM_LIST)?;
+        Ok(())
+    }
+
+    fn impl_item_list_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        if !token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK)
+            || self.impl_item_starts_at_after_attributes(position)
+        {
+            return false;
+        }
+        self.statement_starts_at_after_attributes(position)
+    }
+
+    fn impl_item_starts_at_after_attributes(&self, position: usize) -> bool {
+        let Some(mut position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| matches!(token.kind, SyntaxKind::PUB_KW | SyntaxKind::EXPORT_KW))
+        {
+            position += 1;
+        }
+        match self.tokens.get(position).map(|token| token.kind) {
+            Some(SyntaxKind::TYPE_KW) => {
+                self.tokens
+                    .get(position + 1)
+                    .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+                    && self
+                        .tokens
+                        .get(position + 2)
+                        .is_some_and(|token| token.kind == SyntaxKind::EQ)
+            }
+            Some(SyntaxKind::FN_KW) => true,
+            Some(SyntaxKind::ASYNC_KW) => self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::FN_KW),
+            Some(SyntaxKind::UNSAFE_KW) => {
+                self.tokens
+                    .get(position + 1)
+                    .is_some_and(|token| token.kind == SyntaxKind::FN_KW)
+                    || (self
+                        .tokens
+                        .get(position + 1)
+                        .is_some_and(|token| token.kind == SyntaxKind::ASYNC_KW)
+                        && self
+                            .tokens
+                            .get(position + 2)
+                            .is_some_and(|token| token.kind == SyntaxKind::FN_KW))
+            }
+            _ => false,
+        }
+    }
+
+    fn impl_item(&mut self, target_kind: ImplTargetKind) -> Result<bool, ParserError> {
+        self.outer_docs()?;
+        self.attributes(true)?;
+        if self.at(SyntaxKind::PUB_KW) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            let is_function = self.fn_decl_starts_at(self.position + 1);
+            if is_function
+                && matches!(
+                    target_kind,
+                    ImplTargetKind::Trait | ImplTargetKind::Interface
+                )
+            {
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::VisibilityOnTraitImplItem,
+                    range,
+                    "`pub` is not allowed on an item of a trait or interface impl",
+                )?;
+                let visibility = self.start();
+                self.bump();
+                visibility.complete(self, SyntaxKind::ERROR)?;
+            } else if is_function && target_kind == ImplTargetKind::Inherent {
+                let visibility = self.start();
+                self.bump();
+                visibility.complete(self, SyntaxKind::VISIBILITY)?;
+            } else {
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::ExpectedToken,
+                    range,
+                    if matches!(
+                        target_kind,
+                        ImplTargetKind::Trait | ImplTargetKind::Interface
+                    ) {
+                        "`pub` cannot be applied to an associated type in a trait or interface impl"
+                    } else {
+                        "`pub` is allowed only on a function in an inherent impl"
+                    },
+                )?;
+                let visibility = self.start();
+                self.bump();
+                visibility.complete(self, SyntaxKind::ERROR)?;
+            }
+        } else if self.at(SyntaxKind::EXPORT_KW) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "impl items cannot be exported",
+            )?;
+            let visibility = self.start();
+            self.bump();
+            visibility.complete(self, SyntaxKind::ERROR)?;
+        }
+
+        if self.at(SyntaxKind::TYPE_KW) {
+            return self.assoc_type_def();
+        }
+        if self.at_fn_decl_start() {
+            let function = self.start();
+            self.fn_decl(function, false)?;
+            return Ok(false);
+        }
+
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::ExpectedToken,
+            range,
+            "expected an associated type definition or function in the impl",
+        )?;
+        let error = self.start();
+        self.recover_one()?;
+        error.complete(self, SyntaxKind::ERROR)?;
+        Ok(false)
     }
 
     fn variant_list(
