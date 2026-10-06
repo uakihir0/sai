@@ -4628,6 +4628,13 @@ mod tests {
         assert_eq!(declarations.len(), 3);
 
         let user = &declarations[0];
+        assert_eq!(
+            user.name()
+                .and_then(|name| name.token())
+                .expect("record type name")
+                .text(),
+            "User",
+        );
         assert!(user.generic_params().is_some());
         assert!(user.alias_def().is_none());
         let record = user.struct_def().expect("record definition");
@@ -4645,6 +4652,14 @@ mod tests {
         assert!(fields[1].ty().is_some());
 
         let positive = &declarations[1];
+        assert_eq!(
+            positive
+                .name()
+                .and_then(|name| name.token())
+                .expect("alias type name")
+                .text(),
+            "Positive",
+        );
         assert!(positive.struct_def().is_none());
         let alias = positive.alias_def().expect("alias definition");
         assert!(alias.ty().is_some());
@@ -4667,6 +4682,18 @@ mod tests {
             .expect("recovered alias definition");
         assert!(malformed_alias.ty().is_none());
         assert!(malformed_alias.refinement().is_none());
+        let malformed_type = malformed_root
+            .descendants()
+            .find_map(TypeDecl::cast)
+            .expect("recovered type declaration");
+        assert_eq!(
+            malformed_type
+                .name()
+                .and_then(|name| name.token())
+                .expect("recovered type name")
+                .text(),
+            "Broken",
+        );
     }
 
     #[test]

@@ -360,6 +360,7 @@ child BinExpr rhs Expr 1
 child TypeDecl docs Docs 0
 children TypeDecl attrs Attribute
 child TypeDecl visibility Visibility 0
+child TypeDecl name Name 0
 child TypeDecl generic_params GenericParamList 0
 child TypeDecl struct_def StructDef 0
 child TypeDecl alias_def AliasDef 0
