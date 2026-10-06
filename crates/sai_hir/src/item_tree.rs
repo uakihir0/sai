@@ -30,6 +30,28 @@ pub enum AttrName {
 }
 
 impl AttrName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Derive => "derive",
+            Self::ExportName => "export_name",
+            Self::Inline => "inline",
+            Self::ImportName => "import_name",
+            Self::Cold => "cold",
+            Self::Repr => "repr",
+            Self::MustUse => "must_use",
+            Self::Flags => "flags",
+            Self::Deprecated => "deprecated",
+            Self::Target => "target",
+            Self::Allow => "allow",
+            Self::Cases => "cases",
+            Self::Warn => "warn",
+            Self::Seed => "seed",
+            Self::Deny => "deny",
+            Self::Doc => "doc",
+            Self::PanicHook => "panic_hook",
+        }
+    }
+
     pub fn from_source_name(name: &str) -> Option<Self> {
         if !sai_syntax::ATTRIBUTE_NAMES.contains(&name) {
             return None;
@@ -99,7 +121,10 @@ pub enum RawAttrArg {
     },
     KeyValue {
         key: Symbol,
+        raw: bool,
         value: RawAttrValue,
+        /// Current-snapshot source location of the value token.
+        value_span: Span,
         /// Current-snapshot source location; excluded from structural equality.
         span: Span,
     },
@@ -127,15 +152,17 @@ impl PartialEq for RawAttrArg {
             (
                 Self::KeyValue {
                     key: left_key,
+                    raw: left_raw,
                     value: left_value,
                     ..
                 },
                 Self::KeyValue {
                     key: right_key,
+                    raw: right_raw,
                     value: right_value,
                     ..
                 },
-            ) => left_key == right_key && left_value == right_value,
+            ) => left_key == right_key && left_raw == right_raw && left_value == right_value,
             _ => false,
         }
     }
@@ -1248,6 +1275,11 @@ fn raw_attr_arg(
         |element| matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::EQ),
     );
     if has_equals {
+        let raw = if let Some(name) = arg.name() {
+            node_text(source, name.syntax())?.starts_with("r#")
+        } else {
+            false
+        };
         let Some(key) = arg
             .name()
             .map(|name| name_symbol(source, &name, symbols))
@@ -1255,14 +1287,32 @@ fn raw_attr_arg(
         else {
             return Ok(None);
         };
-        let value = if let Some(value) = arg.value() {
-            Some(RawAttrValue::Word(name_symbol(source, &value, symbols)?))
+        let (value, value_span) = if let Some(value) = arg.value() {
+            (
+                RawAttrValue::Word(name_symbol(source, &value, symbols)?),
+                Span::new(file, value.syntax().text_range()),
+            )
         } else if let Some(value) = arg.string() {
-            Some(RawAttrValue::Str(value.value().into_owned()))
+            (
+                RawAttrValue::Str(value.value().into_owned()),
+                Span::new(file, value.syntax().text_range()),
+            )
         } else {
-            arg.integer().map(|value| RawAttrValue::Int(value.value()))
+            let Some(value) = arg.integer() else {
+                return Ok(None);
+            };
+            (
+                RawAttrValue::Int(value.value()),
+                Span::new(file, value.syntax().text_range()),
+            )
         };
-        return Ok(value.map(|value| RawAttrArg::KeyValue { key, value, span }));
+        return Ok(Some(RawAttrArg::KeyValue {
+            key,
+            raw,
+            value,
+            value_span,
+            span,
+        }));
     }
 
     if let Some(name) = arg.name() {

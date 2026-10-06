@@ -75,6 +75,7 @@ dependencies = [
 name = "sai_hir"
 version = "0.1.0"
 dependencies = [
+ "sai_diagnostics",
  "sai_intern",
  "sai_stable_hash",
  "sai_syntax",
