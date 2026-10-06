@@ -2,6 +2,7 @@ use crate::SpanCtxt;
 use crate::arena::HirArena;
 use crate::expressions::{Expr, ExprKind};
 use crate::literals::Lit;
+use crate::patterns::{Pat, PatKind};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
@@ -45,34 +46,76 @@ pub fn lower_literal<'hir>(
     let kind = if contains_error_node(literal.syntax()) {
         ExprKind::Err
     } else {
-        match literal.token() {
-            Some(ast::LiteralToken::Int(token)) if token.syntax().has_error() => ExprKind::Err,
-            Some(ast::LiteralToken::Int(token)) => ExprKind::Lit(Lit::Int {
-                value: token.value(),
-                negated: false,
-            }),
-            Some(ast::LiteralToken::Float(token)) if token.syntax().has_error() => ExprKind::Err,
-            Some(ast::LiteralToken::Float(token)) => {
-                let text = token.syntax().text().replace('_', "");
-                ExprKind::Lit(Lit::Float {
-                    text: symbols.intern(&text)?,
-                    negated: false,
-                })
-            }
-            Some(ast::LiteralToken::String(token)) => {
-                ExprKind::Lit(Lit::Str(symbols.intern(token.value().as_ref())?))
-            }
-            Some(ast::LiteralToken::ByteString(token)) => {
-                ExprKind::Lit(Lit::ByteStr(arena.alloc_bytes(token.value().as_ref())))
-            }
-            Some(ast::LiteralToken::Char(token)) => ExprKind::Lit(Lit::Char(token.value())),
-            Some(ast::LiteralToken::Byte(token)) => ExprKind::Lit(Lit::Byte(token.value())),
-            Some(ast::LiteralToken::True(_)) => ExprKind::Lit(Lit::Bool(true)),
-            Some(ast::LiteralToken::False(_)) => ExprKind::Lit(Lit::Bool(false)),
-            None => ExprKind::Err,
-        }
+        literal
+            .token()
+            .map(|token| decode_literal(token, arena, symbols, true, false))
+            .transpose()?
+            .flatten()
+            .map(ExprKind::Lit)
+            .unwrap_or(ExprKind::Err)
     };
     Ok(arena.alloc_expr(Expr { hir_id, kind, span }))
+}
+
+/// Lower a literal pattern, preserving its direct minus sign for integer
+/// patterns and mapping parser-rejected float patterns to `PatKind::Err`.
+pub fn lower_literal_pat<'hir>(
+    literal: &ast::LiteralPat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(literal.syntax(), SpanCtxt::Root)?;
+    let negative = literal.minus_token().is_some();
+    let kind = if contains_error_node(literal.syntax()) {
+        PatKind::Err
+    } else {
+        literal
+            .value_token()
+            .and_then(ast::LiteralToken::cast)
+            .map(|token| decode_literal(token, arena, symbols, false, negative))
+            .transpose()?
+            .flatten()
+            .map(PatKind::Lit)
+            .unwrap_or(PatKind::Err)
+    };
+    Ok(arena.alloc_pat(Pat { hir_id, kind, span }))
+}
+
+fn decode_literal<'hir>(
+    token: ast::LiteralToken,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    allow_float: bool,
+    negated: bool,
+) -> Result<Option<Lit<'hir>>, HirLoweringError> {
+    let literal = match token {
+        ast::LiteralToken::Int(token) if !token.syntax().has_error() => Some(Lit::Int {
+            value: token.value(),
+            negated,
+        }),
+        ast::LiteralToken::Float(token)
+            if allow_float && !negated && !token.syntax().has_error() =>
+        {
+            let text = token.syntax().text().replace('_', "");
+            Some(Lit::Float {
+                text: symbols.intern(&text)?,
+                negated: false,
+            })
+        }
+        ast::LiteralToken::String(token) if !negated => {
+            Some(Lit::Str(symbols.intern(token.value().as_ref())?))
+        }
+        ast::LiteralToken::ByteString(token) if !negated => {
+            Some(Lit::ByteStr(arena.alloc_bytes(token.value().as_ref())))
+        }
+        ast::LiteralToken::Char(token) if !negated => Some(Lit::Char(token.value())),
+        ast::LiteralToken::Byte(token) if !negated => Some(Lit::Byte(token.value())),
+        ast::LiteralToken::True(_) if !negated => Some(Lit::Bool(true)),
+        ast::LiteralToken::False(_) if !negated => Some(Lit::Bool(false)),
+        _ => None,
+    };
+    Ok(literal)
 }
 
 fn contains_error_node(syntax: &SyntaxNode) -> bool {
@@ -280,5 +323,82 @@ mod tests {
         );
         assert_eq!(lowered[2].kind, ExprKind::Lit(Lit::Char('\u{fffd}')));
         assert_eq!(lowered[3].kind, ExprKind::Lit(Lit::Byte(0)));
+    }
+
+    #[test]
+    fn lowers_literal_patterns_and_preserves_negative_integer_values() {
+        let file = crate::FileId::new(64);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            r#"fn f() { match value { -42 => (), 340282366920938463463374607431768211456 => (), "text\n" => (), b"bytes\x21" => (), 'x' => (), b'y' => (), true => (), false => (), 1__2 => (), 1.5 => (), -2.5 => () } }"#,
+        );
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::LiteralPat::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 11);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::FloatPattern)
+                .count(),
+            2
+        );
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns
+            .iter()
+            .map(|pattern| lower_literal_pat(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("literal patterns lower");
+
+        assert_eq!(
+            lowered[0].kind,
+            PatKind::Lit(Lit::Int {
+                value: Some(42),
+                negated: true,
+            })
+        );
+        assert_eq!(
+            lowered[1].kind,
+            PatKind::Lit(Lit::Int {
+                value: None,
+                negated: false,
+            })
+        );
+        let decoded_string = match lowered[2].kind {
+            PatKind::Lit(Lit::Str(value)) => symbols.resolve(value).expect("string resolves"),
+            _ => panic!("string pattern lowers to PatKind::Lit"),
+        };
+        assert_eq!(decoded_string.as_ref(), "text\n");
+        assert_eq!(lowered[3].kind, PatKind::Lit(Lit::ByteStr(b"bytes!")));
+        assert_eq!(lowered[4].kind, PatKind::Lit(Lit::Char('x')));
+        assert_eq!(lowered[5].kind, PatKind::Lit(Lit::Byte(b'y')));
+        assert_eq!(lowered[6].kind, PatKind::Lit(Lit::Bool(true)));
+        assert_eq!(lowered[7].kind, PatKind::Lit(Lit::Bool(false)));
+        assert_eq!(lowered[8].kind, PatKind::Err);
+        assert_eq!(lowered[9].kind, PatKind::Err);
+        assert_eq!(lowered[10].kind, PatKind::Err);
+        assert!(
+            lowered
+                .iter()
+                .enumerate()
+                .all(|(index, pattern)| pattern.hir_id.local_id.raw() == index as u32 + 1)
+        );
+        for (pattern, syntax) in lowered.iter().zip(&patterns) {
+            assert_eq!(pattern.span.range, syntax.syntax().text_range());
+            assert_eq!(pattern.span.file, file);
+            assert_eq!(pattern.span.ctxt, SpanCtxt::Root);
+        }
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), patterns.len() + 1);
     }
 }
