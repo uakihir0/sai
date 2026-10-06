@@ -5,6 +5,25 @@ use crate::{EscapeMode, EscapeValue};
 const REPLACEMENT_CHAR: char = '\u{fffd}';
 const REPLACEMENT_BYTES: &[u8] = "\u{fffd}".as_bytes();
 
+#[derive(Clone, Copy)]
+pub(crate) enum FStringTextSegment {
+    Start,
+    Middle,
+    End,
+}
+
+pub(crate) fn decode_fstring_text(literal: &str, segment: FStringTextSegment) -> Cow<'_, str> {
+    let content = match segment {
+        FStringTextSegment::Start => literal.strip_prefix("f\"").unwrap_or(""),
+        FStringTextSegment::Middle => literal,
+        FStringTextSegment::End if has_unescaped_closing_quote(literal) => {
+            literal.strip_suffix('"').unwrap_or(literal)
+        }
+        FStringTextSegment::End => literal,
+    };
+    decode_fstring_content(content)
+}
+
 pub(crate) fn decode_string_value(literal: &str) -> Cow<'_, str> {
     if literal.starts_with('r') {
         return raw_string_body(literal, 1)
@@ -141,6 +160,56 @@ fn decode_escaped_content<'a>(content: &'a str, mode: EscapeMode) -> Cow<'a, str
                 decoded.push(REPLACEMENT_CHAR);
             }
             position = escape.end.max(position + 1).min(content.len());
+            continue;
+        }
+
+        let end = position + ch.len_utf8();
+        if crate::forbidden_class(ch) == Some(crate::ForbiddenClass::Bidi) {
+            decoded.push(REPLACEMENT_CHAR);
+        } else {
+            decoded.push(ch);
+        }
+        position = end;
+    }
+    Cow::Owned(decoded)
+}
+
+fn decode_fstring_content(content: &str) -> Cow<'_, str> {
+    if !content.contains('\\')
+        && !content.contains('{')
+        && !content.contains('}')
+        && !plain_text_needs_decoding(content)
+    {
+        return Cow::Borrowed(content);
+    }
+
+    let mut decoded = String::with_capacity(content.len());
+    let mut position = 0;
+    while position < content.len() {
+        let Some(ch) = content[position..].chars().next() else {
+            decoded.push(REPLACEMENT_CHAR);
+            break;
+        };
+        if ch == '\\' {
+            let escape = crate::scan_escape(content, position, EscapeMode::SimpleString);
+            if escape.valid {
+                if let Some(EscapeValue::Scalar(value)) = escape.value {
+                    decoded.push(value);
+                }
+            } else {
+                decoded.push(REPLACEMENT_CHAR);
+            }
+            position = escape.end.max(position + 1).min(content.len());
+            continue;
+        }
+        if matches!(ch, '{' | '}') {
+            if content.as_bytes().get(position + 1) == Some(&(ch as u8)) {
+                decoded.push(ch);
+                position += 2;
+            } else {
+                decoded.push(REPLACEMENT_CHAR);
+                position += ch.len_utf8();
+            }
             continue;
         }
 

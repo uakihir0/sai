@@ -5684,6 +5684,179 @@ let byte_non_ascii = b"€"
     }
 
     #[test]
+    fn typed_fstring_views_decode_text_interpolations_and_specs() {
+        use crate::ast::{AstNode, Expr, FStringExpr, FStringPiece};
+        use std::borrow::Cow;
+
+        let source = r###"fn format(name: Str, age: I32) {
+let message = f"Hello {{name}} {name}, age {age:pad(3)}!"
+let plain = f"Hi {name}!"
+}"###;
+        let output = parse_file(source);
+        assert!(
+            output.errors.is_empty(),
+            "valid format strings should parse without diagnostics: {:?}",
+            output.errors
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let fstrings = root
+            .descendants()
+            .filter_map(FStringExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(fstrings.len(), 2);
+        assert!(matches!(
+            Expr::cast(fstrings[0].syntax().clone()),
+            Some(Expr::FormatString(_))
+        ));
+        let interpolation = fstrings[0]
+            .syntax()
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FSTRING_INTERP)
+            .expect("f-string should contain an interpolation node");
+        assert!(matches!(
+            Expr::cast(interpolation),
+            Some(Expr::FormatStringInterpolation(_))
+        ));
+
+        let pieces = fstrings[0].pieces().collect::<Vec<_>>();
+        assert_eq!(pieces.len(), 5);
+        assert!(matches!(
+            &pieces[0],
+            FStringPiece::Text(text) if text == "Hello {name} "
+        ));
+        assert!(matches!(
+            &pieces[1],
+            FStringPiece::Interp {
+                expr: Some(Expr::Path(_)),
+                spec: None,
+            }
+        ));
+        assert!(matches!(
+            &pieces[2],
+            FStringPiece::Text(text) if text == ", age "
+        ));
+        match &pieces[3] {
+            FStringPiece::Interp {
+                expr: Some(Expr::Path(_)),
+                spec: Some(spec),
+            } => {
+                assert_eq!(spec.name(), "pad");
+                assert_eq!(spec.arg(), Some(3));
+            }
+            piece => panic!("expected typed interpolation with format spec, got {piece:?}"),
+        }
+        assert!(matches!(
+            &pieces[4],
+            FStringPiece::Text(text) if text == "!"
+        ));
+
+        let plain_pieces = fstrings[1].pieces().collect::<Vec<_>>();
+        assert!(matches!(
+            plain_pieces.as_slice(),
+            [
+                FStringPiece::Text(Cow::Borrowed("Hi ")),
+                FStringPiece::Interp {
+                    expr: Some(Expr::Path(_)),
+                    spec: None
+                },
+                FStringPiece::Text(Cow::Borrowed("!"))
+            ]
+        ));
+    }
+
+    #[test]
+    fn format_spec_accessors_handle_raw_names_radices_and_invalid_numbers() {
+        use crate::ast::{AstNode, AstToken, FStringExpr, FStringPiece, FormatSpec};
+
+        let source = r###"fn format(value: I32) {
+let raw = f"{value:r#pad(0xA)}"
+let malformed = f"{value:pad(01)}"
+}"###;
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let fstrings = root
+            .descendants()
+            .filter_map(FStringExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(fstrings.len(), 2);
+
+        let first = fstrings[0].pieces().collect::<Vec<_>>();
+        let FStringPiece::Interp {
+            spec: Some(spec), ..
+        } = &first[0]
+        else {
+            panic!("expected raw-name format spec");
+        };
+        assert_eq!(spec.name(), "pad");
+        assert_eq!(spec.arg(), Some(10));
+
+        let second = fstrings[1].pieces().collect::<Vec<_>>();
+        let FStringPiece::Interp {
+            spec: Some(spec), ..
+        } = &second[0]
+        else {
+            panic!("expected malformed-number format spec token");
+        };
+        assert_eq!(spec.name(), "pad");
+        assert_eq!(spec.arg(), None);
+        assert!(spec.syntax().has_error());
+
+        assert!(FormatSpec::can_cast(SyntaxKind::FSTRING_SPEC));
+        assert!(!FormatSpec::can_cast(SyntaxKind::STRING));
+    }
+
+    #[test]
+    fn fstring_values_recover_invalid_text_missing_expressions_and_large_spec_args() {
+        use crate::ast::{AstNode, AstToken, FStringExpr, FStringPiece};
+
+        let source = r###"fn format(value: I32) {
+let bad = f"bad\q }"
+let empty = f"{}"
+let large = f"{value:pad(340282366920938463463374607431768211456)}"
+}"###;
+        let output = parse_file(source);
+        let (_, lexed) = lex_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let fstrings = root
+            .descendants()
+            .filter_map(FStringExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(fstrings.len(), 3);
+        assert!(lexed.errors.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                Code::InvalidEscape | Code::InvalidInterpolation
+            )
+        }));
+
+        let bad = fstrings[0].pieces().collect::<Vec<_>>();
+        assert!(matches!(
+            bad.as_slice(),
+            [FStringPiece::Text(text)] if text == "bad\u{fffd} \u{fffd}"
+        ));
+
+        let empty = fstrings[1].pieces().collect::<Vec<_>>();
+        assert!(matches!(
+            empty.as_slice(),
+            [FStringPiece::Interp {
+                expr: None,
+                spec: None
+            }]
+        ));
+
+        let large = fstrings[2].pieces().collect::<Vec<_>>();
+        let FStringPiece::Interp {
+            spec: Some(spec), ..
+        } = &large[0]
+        else {
+            panic!("expected large format spec argument");
+        };
+        assert_eq!(spec.name(), "pad");
+        assert_eq!(spec.arg(), None);
+        assert!(!spec.syntax().has_error());
+    }
+
+    #[test]
     fn unterminated_format_string_recovers_at_the_next_block_statement() {
         let source = concat!(
             "fn f(value: I32) {\n",
