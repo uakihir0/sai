@@ -503,8 +503,10 @@ impl Parser<'_, '_> {
         let public_invariant = self.at_contextual("invariant") && self.nth(1) == SyntaxKind::UIDENT;
         let public_extern = self.at(SyntaxKind::EXTERN_KW)
             || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::EXTERN_KW);
+        let public_test = self.at_contextual("test") && self.nth(1) == SyntaxKind::STRING;
+        let public_property = self.at_contextual("property") && self.nth(1) == SyntaxKind::STRING;
         if let Some(range) = public_range
-            && (public_impl || public_invariant || public_extern)
+            && (public_impl || public_invariant || public_extern || public_test || public_property)
         {
             self.emit_parser_diagnostic(
                 sai_diagnostics::Code::ExpectedToken,
@@ -513,6 +515,10 @@ impl Parser<'_, '_> {
                     "impl blocks do not have a visibility marker"
                 } else if public_extern {
                     "extern blocks do not have a visibility marker"
+                } else if public_test {
+                    "test declarations do not have a visibility marker"
+                } else if public_property {
+                    "property declarations do not have a visibility marker"
                 } else {
                     "invariant declarations do not have a visibility marker"
                 },
@@ -571,6 +577,14 @@ impl Parser<'_, '_> {
             || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::EXTERN_KW)
         {
             return self.extern_block(declaration);
+        }
+
+        if self.at_contextual("test") && self.nth(1) == SyntaxKind::STRING {
+            return self.test_decl(declaration);
+        }
+
+        if self.at_contextual("property") && self.nth(1) == SyntaxKind::STRING {
+            return self.property_decl(declaration);
         }
 
         if !self.at(SyntaxKind::USE_KW) {
@@ -1676,6 +1690,137 @@ impl Parser<'_, '_> {
             error.abandon(self)?;
         }
         Ok(preserve_top_level)
+    }
+
+    fn test_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.expect(SyntaxKind::STRING)?;
+        self.eat_nl();
+        self.block()?;
+        declaration.complete(self, SyntaxKind::TEST_DECL)
+    }
+
+    fn property_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.expect(SyntaxKind::STRING)?;
+        self.property_param_list()?;
+        self.eat_nl();
+        self.block()?;
+        declaration.complete(self, SyntaxKind::PROPERTY_DECL)
+    }
+
+    fn property_param_list(&mut self) -> Result<(), ParserError> {
+        let params = self.start();
+        if !self.expect(SyntaxKind::L_PAREN)? {
+            params.abandon(self)?;
+            return Ok(());
+        }
+        while !self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::L_BRACE, SyntaxKind::EOF]) {
+            if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+            let position = self.position;
+            if self.at(SyntaxKind::AT) || self.property_named_param_starts_at(position) {
+                self.property_param()?;
+            } else {
+                let range = self
+                    .current_token()
+                    .map(|token| token.range)
+                    .ok_or(ParserError::InvalidDiagnosticSpan)?;
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::ExpectedToken,
+                    range,
+                    "expected a named property parameter",
+                )?;
+                self.recover_property_param()?;
+            }
+            if self.eat(SyntaxKind::COMMA) {
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_PAREN, SyntaxKind::L_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect(SyntaxKind::COMMA)?;
+            if self.position == position {
+                self.recover_property_param()?;
+                if self.position == position && !self.eat(SyntaxKind::COMMA) {
+                    break;
+                }
+            }
+        }
+        self.expect(SyntaxKind::R_PAREN)?;
+        params.complete(self, SyntaxKind::PARAM_LIST)?;
+        Ok(())
+    }
+
+    fn property_named_param_starts_at(&self, position: usize) -> bool {
+        let name_position = if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::VAR_KW)
+        {
+            position + 1
+        } else {
+            position
+        };
+        self.tokens
+            .get(name_position)
+            .is_some_and(|token| matches!(token.kind, SyntaxKind::LIDENT | SyntaxKind::UNDERSCORE))
+    }
+
+    fn property_param(&mut self) -> Result<(), ParserError> {
+        let param = self.start();
+        self.attributes(false)?;
+        self.eat(SyntaxKind::VAR_KW);
+        self.name_node(
+            &[SyntaxKind::LIDENT, SyntaxKind::UNDERSCORE],
+            SyntaxKind::NAME,
+        )?;
+        self.expect(SyntaxKind::COLON)?;
+        self.type_(true)?;
+        param.complete(self, SyntaxKind::PARAM)?;
+        Ok(())
+    }
+
+    fn recover_property_param(&mut self) -> Result<(), ParserError> {
+        let error = self.start();
+        let mut delimiters = Vec::new();
+        let mut consumed = false;
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if delimiters.is_empty()
+                && self.at_any(&[SyntaxKind::COMMA, SyntaxKind::R_PAREN, SyntaxKind::L_BRACE])
+            {
+                break;
+            }
+            if kind == SyntaxKind::R_BRACE && delimiters.last() != Some(&SyntaxKind::L_BRACE) {
+                break;
+            }
+            match kind {
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACKET | SyntaxKind::L_BRACE => {
+                    delimiters.push(kind);
+                }
+                SyntaxKind::R_PAREN if delimiters.last() == Some(&SyntaxKind::L_PAREN) => {
+                    delimiters.pop();
+                }
+                SyntaxKind::R_BRACKET if delimiters.last() == Some(&SyntaxKind::L_BRACKET) => {
+                    delimiters.pop();
+                }
+                SyntaxKind::R_BRACE if delimiters.last() == Some(&SyntaxKind::L_BRACE) => {
+                    delimiters.pop();
+                }
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+        }
+        if consumed {
+            error.complete(self, SyntaxKind::ERROR)?;
+        } else {
+            error.abandon(self)?;
+        }
+        Ok(())
     }
 
     fn trait_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {

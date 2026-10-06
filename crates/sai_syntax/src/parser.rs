@@ -2121,6 +2121,190 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_test_and_property_declarations() {
+        let source = concat!(
+            "/// Basic assertion.\n",
+            "test \"basic\" {\n",
+            "assert true\n",
+            "}\n",
+            "@target(\"wasm32-wasi\")\n",
+            "property \"generated\" (value: U32, var bound: U32, _: Bool,) {\n",
+            "assert value < bound\n",
+            "}\n",
+            "property \"no parameters\" () {}\n",
+            "fn identifiers() {\n",
+            "let test = 1\n",
+            "let property = test\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TEST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::PROPERTY_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::PARAM_LIST)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::PARAM)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn property_parameter_attributes_report_invalid_target_inside_param() {
+        let source = "property \"attributed\" (@allow(unused) value: U32) {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let param = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::PARAM)
+            .expect("property parameter");
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::InvalidAttributeTarget);
+        assert!(
+            param
+                .children()
+                .any(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn test_and_property_visibility_and_self_parameters_are_rejected() {
+        let source = concat!(
+            "pub test \"public\" {}\n",
+            "export property \"exported\" () {}\n",
+            "property \"receiver\" (self: U32) {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let codes = output
+            .errors
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            codes,
+            [
+                Code::ExpectedToken,
+                Code::InvalidExportTarget,
+                Code::ExpectedToken,
+            ],
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TEST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::PROPERTY_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            0
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn test_and_property_declarations_inside_blocks_report_item_in_block() {
+        let source = concat!(
+            "fn local() {\n",
+            "test \"nested\" {}\n",
+            "property \"nested property\" () {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::ItemInBlock),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TEST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::PROPERTY_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn test_declaration_without_a_body_preserves_the_following_item() {
+        let source = "test \"missing body\"\nconst READY: Bool = true\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TEST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn source_file_parses_effect_declarations_and_covers_sets() {
         let source = concat!(
             "pub effect filesystem\n",
@@ -4142,19 +4326,32 @@ mod tests {
     }
 
     #[test]
-    fn missing_use_items_close_stops_before_contextual_item_starters() {
+    fn missing_use_items_close_preserves_a_following_test_declaration() {
         let source = "use sai:http.{Request\ntest \"later\" {}\n";
-        let (snapshot_file, lexed) = lex_file(source);
-        let mut parser =
-            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
 
-        assert!(matches!(
-            parser.parse_source_file(),
-            Err(ParserError::UnsupportedItem {
-                kind: SyntaxKind::LIDENT,
-                ..
-            })
-        ));
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::TEST_DECL)
+                .count(),
+            1
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
     }
 
     #[test]
