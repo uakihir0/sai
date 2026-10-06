@@ -160,6 +160,17 @@ node Error ERROR
 children SourceFile items Item
 children SourceFile test_decls TestDecl
 children SourceFile property_decls PropertyDecl
+child SourceFile module_header ModuleHeader 0
+child ModuleHeader docs Docs 0
+child UseDecl docs Docs 0
+child UseDecl visibility Visibility 0
+token UseDecl package PkgPath
+child UseDecl alias UseAlias 0
+child UseDecl items UseItems 0
+child UseAlias name Name 0
+children UseItems items UseItem
+child UseItem name NameRef 0
+child_after UseItem alias Name AS_KW 0
 child FnDecl name Name 0
 child FnDecl generic_params GenericParamList 0
 child FnDecl params ParamList 0

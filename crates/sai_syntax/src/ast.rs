@@ -1018,6 +1018,22 @@ impl FnDecl {
     }
 }
 
+impl ModuleHeader {
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::UNSAFE_KW)
+    }
+}
+
+impl Visibility {
+    pub fn pub_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::PUB_KW)
+    }
+
+    pub fn export_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::EXPORT_KW)
+    }
+}
+
 impl SelfParam {
     pub fn is_mutable(&self) -> bool {
         direct_token_of_kind(self.syntax(), SyntaxKind::VAR_KW).is_some()

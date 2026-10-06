@@ -883,6 +883,111 @@ mod tests {
     }
 
     #[test]
+    fn module_header_and_use_accessors_expose_docs_visibility_and_aliases() {
+        use crate::ast::{AstNode, AstToken, SourceFile, UseDecl, Visibility};
+
+        let source = concat!(
+            "//! Module docs\n",
+            "//! Additional module docs\n",
+            "unsafe module\n",
+            "/// Selective imports.\n",
+            "pub use sai:http/client as http.{Request, Response as Reply}\n",
+            "use sai:core\n",
+            "export fn run() {}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let source_file = SourceFile::cast(root.clone()).expect("source file");
+        let header = source_file.module_header().expect("module header");
+        assert!(header.unsafe_token().is_some());
+        assert!(header.docs().is_some());
+
+        fn node_text<'a>(source: &'a str, node: &crate::SyntaxNode) -> &'a str {
+            &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+        }
+
+        let uses = root
+            .descendants()
+            .filter_map(UseDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(uses.len(), 2);
+
+        let selective_use = &uses[0];
+        assert!(selective_use.docs().is_some());
+        let visibility = selective_use.visibility().expect("pub visibility");
+        assert!(visibility.pub_token().is_some());
+        assert!(visibility.export_token().is_none());
+        assert_eq!(
+            selective_use
+                .package()
+                .expect("package path")
+                .syntax()
+                .text(),
+            "sai:http/client"
+        );
+        assert_eq!(
+            node_text(
+                source,
+                selective_use
+                    .alias()
+                    .and_then(|alias| alias.name())
+                    .expect("module alias")
+                    .syntax()
+            ),
+            "http"
+        );
+        let use_items = selective_use.items().expect("selected items");
+        let items = use_items.items().collect::<Vec<_>>();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            node_text(
+                source,
+                items[0].name().expect("first imported name").syntax()
+            ),
+            "Request"
+        );
+        assert!(items[0].alias().is_none());
+        assert_eq!(
+            node_text(
+                source,
+                items[1].name().expect("second imported name").syntax()
+            ),
+            "Response"
+        );
+        assert_eq!(
+            node_text(source, items[1].alias().expect("renamed import").syntax()),
+            "Reply"
+        );
+
+        let root_use = &uses[1];
+        assert!(root_use.docs().is_none());
+        assert!(root_use.visibility().is_none());
+        assert_eq!(
+            root_use.package().expect("root package").syntax().text(),
+            "sai:core"
+        );
+        assert!(root_use.alias().is_none());
+        assert!(root_use.items().is_none());
+
+        let export = root
+            .descendants()
+            .filter_map(Visibility::cast)
+            .find(|visibility| visibility.export_token().is_some())
+            .expect("export visibility");
+        assert!(export.pub_token().is_none());
+
+        let empty = parse_file("");
+        let empty_root = crate::SyntaxNode::new_root(empty.root);
+        assert!(
+            SourceFile::cast(empty_root)
+                .expect("empty source file")
+                .module_header()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn source_file_parses_aliases_generic_aliases_and_refinements() {
         let source = concat!(
             "/// Public identifier type.\n",
