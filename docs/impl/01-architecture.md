@@ -197,8 +197,8 @@ The compiler refers to everything through small integer identifiers. The table l
 
 | Identifier | Representation | Interns | Assigned by |
 |---|---|---|---|
-| `Symbol` | `u32` | a string: identifier, keyword text, path segment | `sai_intern` |
-| `PackageId` | `u32` | the package key: identity and compatibility line for a graph node ([package/02](../package/02-resolver.md) §2.1 item 2), including the root and the workspace members with the line of their declared version; identity alone for `sai:core` and `sai:alloc` (N-G-35) | `intern_package` |
+| `Symbol` | opaque `(session ID, local u32)` | a string: identifier, keyword text, path segment | `sai_intern` |
+| `PackageId` | opaque `(session ID, local u32)` | the package key: identity and compatibility line for a graph node ([package/02](../package/02-resolver.md) §2.1 item 2), including the root and the workspace members with the line of their declared version; identity alone for `sai:core` and `sai:alloc` (N-G-35) | `intern_package` |
 | `FileId` | `u32` | the pair (`PackageId`, source-relative path) | `intern_file` (§1.7.1) |
 | `LocalDefId` | `DefIndex` (`u32`) | a `DefPath` of the package being compiled | `intern_def_path` |
 | `DefId` of a foreign package | (`PackageId`, `DefIndex`) | the position of the definition in the package metadata, in `DefPathHash` order | §1.6.5 |

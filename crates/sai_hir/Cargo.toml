@@ -1,0 +1,10 @@
+[package]
+name = "sai_hir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sai_intern = { path = "../sai_intern" }
+sai_stable_hash = { path = "../sai_stable_hash" }
+sai_vfs = { path = "../sai_vfs" }

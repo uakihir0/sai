@@ -1114,7 +1114,7 @@ The HIR is the desugared, owner-partitioned representation of a package's source
 ### 2.8.2 Identifiers
 
 ```rust
-pub struct PackageId(u32);                     // interned package identity (impl/01)
+pub struct PackageId;                           // opaque session-local package identity (impl/01)
 pub struct DefIndex(u32);
 pub struct DefId { pub package: PackageId, pub index: DefIndex }
 pub struct LocalDefId { pub index: DefIndex }  // a DefId of the package being compiled
@@ -1156,6 +1156,35 @@ pub struct BindingId(u32);                     // local binding within an owner'
 **Impl disambiguation** (N-E-20). `header_hash` is the low 64 bits of the stable hash of the impl header's token sequence: the kinds and texts of all tokens from `impl` up to (not including) the `{` of the item list, excluding trivia and NEWLINE tokens. So an impl keeps its `DefPath` when other impls are added, removed, or reordered, and when its body changes. Changing the header (for example adding a bound) gives the impl a new identity.
 
 **`DefPathHash`** is a 128-bit stable hash (SipHash-1-3 with a fixed zero key, 128-bit output) of the package identity string defined by [package/01-package-contract.md](../package/01-package-contract.md) (namespace, name, and compatibility line) followed by the components of the `DefPath`, each encoded as a tag byte, the length-prefixed UTF-8 of its symbol or string, and the little-endian `u64` hash or `u32` disambiguator. It is independent of `DefIndex`, file names (beyond the module path), and source positions. `DefPathHash` is the key for every persistent artifact (incremental caches, `.sai/index` entries of D-TOOL-02, and mangled symbol names in impl/06); `DefIndex` is never persisted.
+
+The canonical package key is encoded first as a length-prefixed UTF-8 string. The stable component tags are:
+
+| Tag | `DefPathData` |
+|---|---|
+| `0x01` | `Module` |
+| `0x02` | `TypeNs` |
+| `0x03` | `ValueNs` |
+| `0x04` | `Interface` |
+| `0x05` | `World` |
+| `0x06` | `Effect` |
+| `0x07` | `Field` |
+| `0x08` | `Variant` |
+| `0x09` | `AssocType` |
+| `0x0A` | `AssocFn` |
+| `0x0B` | `TypeParam` |
+| `0x0C` | `ConstParam` |
+| `0x0D` | `Impl` |
+| `0x0E` | `DerivedImpl` |
+| `0x0F` | `Invariant` |
+| `0x10` | `ExternBlock` |
+| `0x11` | `Test` |
+| `0x12` | `Property` |
+| `0x13` | `Closure` |
+| `0x14` | `AsyncBlock` |
+| `0x15` | `WorldItem` |
+| `0x16` | `WorldInclude` |
+
+Every component ends with its little-endian `u32` disambiguator. `Impl` encodes its little-endian `u64` header hash before that value. `ExternBlock` encodes its ABI string, a one-byte module-presence flag, and the optional module string. `WorldItem` encodes a one-byte import flag before its name. Components with no string or hash payload encode only their tag and disambiguator. These tag assignments are persistent format and MUST NOT be reused or renumbered.
 
 **`DefIndex` assignment.** `LocalDefId`s are interned from `DefPath`s by the query system, so a definition keeps its `LocalDefId` across revisions as long as its `DefPath` exists. Foreign `DefId`s are read from the dependency's metadata, where definitions are numbered in ascending `DefPathHash` order.
 

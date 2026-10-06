@@ -3,21 +3,64 @@
 use sai_stable_hash::{StableHash, StableHasher, fingerprint};
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const SHARD_COUNT: usize = 16;
 const RADIX: usize = 256;
+static NEXT_INTERNER_SESSION_ID: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct InternerSessionId(u32);
+
+impl std::fmt::Debug for InternerSessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InternerSessionId")
+    }
+}
+
+fn next_interner_session_id() -> InternerSessionId {
+    let mut id = NEXT_INTERNER_SESSION_ID.load(Ordering::Relaxed);
+    loop {
+        let next = id
+            .checked_add(1)
+            .expect("interner session ID space exhausted");
+        match NEXT_INTERNER_SESSION_ID.compare_exchange_weak(
+            id,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return InternerSessionId(id),
+            Err(observed) => id = observed,
+        }
+    }
+}
 
 /// A session-local interned string identity.
 ///
 /// Symbols are intentionally not `StableHash`: persisted or cross-session
 /// values must hash the resolved string, never this session-local integer.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Symbol(u32);
+#[repr(C)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct Symbol {
+    index: u32,
+    session_id: InternerSessionId,
+}
 
 impl Symbol {
     pub const fn raw(self) -> u32 {
-        self.0
+        self.index
+    }
+
+    pub const fn session_id(self) -> InternerSessionId {
+        self.session_id
+    }
+}
+
+impl std::fmt::Debug for Symbol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("Symbol").field(&self.index).finish()
     }
 }
 
@@ -25,12 +68,29 @@ impl Symbol {
 ///
 /// The numeric value is an implementation detail and must not be persisted;
 /// stable package identity is the canonical package key string.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PackageId(u32);
+#[repr(C)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct PackageId {
+    index: u32,
+    session_id: InternerSessionId,
+}
 
 impl PackageId {
     pub const fn raw(self) -> u32 {
-        self.0
+        self.index
+    }
+
+    pub const fn session_id(self) -> InternerSessionId {
+        self.session_id
+    }
+}
+
+impl std::fmt::Debug for PackageId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("PackageId")
+            .field(&self.index)
+            .finish()
     }
 }
 
@@ -135,6 +195,7 @@ pub struct Interner {
     shards: [RwLock<Shard>; SHARD_COUNT],
     values: AppendOnlyVec<Arc<str>>,
     next_id: Mutex<u64>,
+    session_id: InternerSessionId,
 }
 
 impl Interner {
@@ -143,7 +204,12 @@ impl Interner {
             shards: std::array::from_fn(|_| RwLock::new(Shard::default())),
             values: AppendOnlyVec::new(),
             next_id: Mutex::new(0),
+            session_id: next_interner_session_id(),
         }
+    }
+
+    pub const fn session_id(&self) -> InternerSessionId {
+        self.session_id
     }
 
     pub fn intern(&self, value: &str) -> Result<Symbol, InternError> {
@@ -160,7 +226,10 @@ impl Interner {
             return Err(InternError::TooManySymbols);
         }
         let raw = u32::try_from(*next_id).map_err(|_| InternError::TooManySymbols)?;
-        let symbol = Symbol(raw);
+        let symbol = Symbol {
+            index: raw,
+            session_id: self.session_id,
+        };
         let value: Arc<str> = Arc::from(value);
         self.values
             .set(raw, Arc::clone(&value))
@@ -171,8 +240,11 @@ impl Interner {
     }
 
     pub fn resolve(&self, symbol: Symbol) -> Result<Arc<str>, LookupError> {
+        if symbol.session_id != self.session_id {
+            return Err(LookupError::UnknownSymbol);
+        }
         self.values
-            .get(symbol.0)
+            .get(symbol.index)
             .cloned()
             .ok_or(LookupError::UnknownSymbol)
     }
@@ -202,14 +274,21 @@ struct PackageStorage {
 /// A session-local interner for canonical package identity keys.
 ///
 /// Callers must validate and canonicalize keys before interning them.
-#[derive(Default)]
 pub struct PackageInterner {
     storage: Mutex<PackageStorage>,
+    session_id: InternerSessionId,
 }
 
 impl PackageInterner {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            storage: Mutex::new(PackageStorage::default()),
+            session_id: next_interner_session_id(),
+        }
+    }
+
+    pub const fn session_id(&self) -> InternerSessionId {
+        self.session_id
     }
 
     pub fn intern(&self, key: &str) -> Result<PackageId, PackageIdError> {
@@ -222,7 +301,10 @@ impl PackageInterner {
         }
 
         let raw = u32::try_from(storage.keys.len()).map_err(|_| PackageIdError::TooManyPackages)?;
-        let id = PackageId(raw);
+        let id = PackageId {
+            index: raw,
+            session_id: self.session_id,
+        };
         let key: Arc<str> = Arc::from(key);
         storage.keys.push(Arc::clone(&key));
         storage.by_key.insert(key, id);
@@ -230,11 +312,14 @@ impl PackageInterner {
     }
 
     pub fn resolve(&self, id: PackageId) -> Result<Arc<str>, PackageIdError> {
+        if id.session_id != self.session_id {
+            return Err(PackageIdError::UnknownPackage);
+        }
         let storage = self
             .storage
             .lock()
             .map_err(|_| PackageIdError::LockPoisoned)?;
-        let index = usize::try_from(id.0).map_err(|_| PackageIdError::UnknownPackage)?;
+        let index = usize::try_from(id.index).map_err(|_| PackageIdError::UnknownPackage)?;
         storage
             .keys
             .get(index)
@@ -251,6 +336,12 @@ impl PackageInterner {
 
     pub fn is_empty(&self) -> Result<bool, PackageIdError> {
         self.len().map(|len| len == 0)
+    }
+}
+
+impl Default for PackageInterner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -570,11 +661,21 @@ mod tests {
     fn distinct_interners_have_session_local_symbols() {
         let first = Interner::new();
         let second = Interner::new();
+        let first_symbol = first.intern("one").unwrap();
+        let second_symbol = second.intern("two").unwrap();
 
-        assert_eq!(first.intern("one"), Ok(Symbol(0)));
-        assert_eq!(second.intern("two"), Ok(Symbol(0)));
-        assert_eq!(&*first.resolve(Symbol(0)).expect("symbol exists"), "one");
-        assert_eq!(&*second.resolve(Symbol(0)).expect("symbol exists"), "two");
+        assert_eq!(first_symbol.raw(), 0);
+        assert_eq!(second_symbol.raw(), 0);
+        assert_ne!(first_symbol, second_symbol);
+        assert_eq!(&*first.resolve(first_symbol).expect("symbol exists"), "one");
+        assert_eq!(
+            first.resolve(second_symbol),
+            Err(LookupError::UnknownSymbol)
+        );
+        assert_eq!(
+            &*second.resolve(second_symbol).expect("symbol exists"),
+            "two"
+        );
     }
 
     #[test]
@@ -591,8 +692,11 @@ mod tests {
             &*packages.resolve(app).expect("app package resolves"),
             "acme:app#1.0"
         );
+        let other_session_package = PackageInterner::new().intern("acme:other#1").unwrap();
+        assert_eq!(other_session_package.raw(), app.raw());
+        assert_ne!(other_session_package, app);
         assert_eq!(
-            packages.resolve(PackageId(9)),
+            packages.resolve(other_session_package),
             Err(PackageIdError::UnknownPackage)
         );
         assert_eq!(packages.len(), Ok(2));

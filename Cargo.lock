@@ -72,6 +72,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sai_hir"
+version = "0.1.0"
+dependencies = [
+ "sai_intern",
+ "sai_stable_hash",
+ "sai_vfs",
+]
+
+[[package]]
 name = "sai_intern"
 version = "0.1.0"
 dependencies = [
