@@ -1,5 +1,8 @@
 use crate::body::{Body, BodyParam, Contract, FnParam};
 use crate::expressions::{Arg, Arm, Block, Closure, ClosureParam, Expr, FmtPiece, Stmt};
+use crate::items::{
+    DerivedImpl, ExternItem, FieldDef, ImplItem, InterfaceItem, Item, TraitItem, Variant, WorldItem,
+};
 use crate::literals::Lit;
 use crate::patterns::{Pat, PatArg};
 use crate::types::{
@@ -56,7 +59,26 @@ pub struct HirArena<'hir> {
     contracts: Arena<Contract<'hir>>,
     contract_lists: Arena<Contract<'hir>>,
     hir_id_lists: Arena<crate::HirId>,
+    owner_id_lists: Arena<crate::OwnerId>,
     expr_ref_lists: Arena<&'hir Expr<'hir>>,
+    items: Arena<Item<'hir>>,
+    item_lists: Arena<Item<'hir>>,
+    trait_items: Arena<TraitItem<'hir>>,
+    trait_item_lists: Arena<TraitItem<'hir>>,
+    impl_items: Arena<ImplItem<'hir>>,
+    impl_item_lists: Arena<ImplItem<'hir>>,
+    extern_items: Arena<ExternItem<'hir>>,
+    extern_item_lists: Arena<ExternItem<'hir>>,
+    field_defs: Arena<FieldDef<'hir>>,
+    field_def_lists: Arena<FieldDef<'hir>>,
+    variants: Arena<Variant<'hir>>,
+    variant_lists: Arena<Variant<'hir>>,
+    derived_impls: Arena<DerivedImpl>,
+    derived_impl_lists: Arena<DerivedImpl>,
+    interface_items: Arena<InterfaceItem<'hir>>,
+    interface_item_lists: Arena<InterfaceItem<'hir>>,
+    world_items: Arena<WorldItem<'hir>>,
+    world_item_lists: Arena<WorldItem<'hir>>,
 }
 
 impl<'hir> HirArena<'hir> {
@@ -108,7 +130,26 @@ impl<'hir> HirArena<'hir> {
             contracts: Arena::new(),
             contract_lists: Arena::new(),
             hir_id_lists: Arena::new(),
+            owner_id_lists: Arena::new(),
             expr_ref_lists: Arena::new(),
+            items: Arena::new(),
+            item_lists: Arena::new(),
+            trait_items: Arena::new(),
+            trait_item_lists: Arena::new(),
+            impl_items: Arena::new(),
+            impl_item_lists: Arena::new(),
+            extern_items: Arena::new(),
+            extern_item_lists: Arena::new(),
+            field_defs: Arena::new(),
+            field_def_lists: Arena::new(),
+            variants: Arena::new(),
+            variant_lists: Arena::new(),
+            derived_impls: Arena::new(),
+            derived_impl_lists: Arena::new(),
+            interface_items: Arena::new(),
+            interface_item_lists: Arena::new(),
+            world_items: Arena::new(),
+            world_item_lists: Arena::new(),
         }
     }
 
@@ -206,6 +247,12 @@ impl<'hir> HirArena<'hir> {
 
     pub fn alloc_bytes(&'hir self, bytes: &[u8]) -> &'hir [u8] {
         self.byte_strings.alloc_slice(bytes)
+    }
+
+    /// Copy UTF-8 text into arena-backed storage.
+    pub fn alloc_str(&'hir self, text: &str) -> &'hir str {
+        std::str::from_utf8(self.byte_strings.alloc_slice(text.as_bytes()))
+            .expect("text copied from a valid UTF-8 string")
     }
 
     pub fn alloc_pat(&'hir self, pat: Pat<'hir>) -> &'hir Pat<'hir> {
@@ -311,8 +358,90 @@ impl<'hir> HirArena<'hir> {
         self.hir_id_lists.alloc_slice(ids)
     }
 
+    pub fn alloc_owner_ids(&'hir self, ids: &[crate::OwnerId]) -> &'hir [crate::OwnerId] {
+        self.owner_id_lists.alloc_slice(ids)
+    }
+
     pub fn alloc_expr_refs(&'hir self, exprs: &[&'hir Expr<'hir>]) -> &'hir [&'hir Expr<'hir>] {
         self.expr_ref_lists.alloc_slice(exprs)
+    }
+
+    pub fn alloc_item(&'hir self, item: Item<'hir>) -> &'hir Item<'hir> {
+        self.items.alloc(item)
+    }
+
+    pub fn alloc_items(&'hir self, items: &[Item<'hir>]) -> &'hir [Item<'hir>] {
+        self.item_lists.alloc_slice(items)
+    }
+
+    pub fn alloc_trait_item(&'hir self, item: TraitItem<'hir>) -> &'hir TraitItem<'hir> {
+        self.trait_items.alloc(item)
+    }
+
+    pub fn alloc_trait_items(&'hir self, items: &[TraitItem<'hir>]) -> &'hir [TraitItem<'hir>] {
+        self.trait_item_lists.alloc_slice(items)
+    }
+
+    pub fn alloc_impl_item(&'hir self, item: ImplItem<'hir>) -> &'hir ImplItem<'hir> {
+        self.impl_items.alloc(item)
+    }
+
+    pub fn alloc_impl_items(&'hir self, items: &[ImplItem<'hir>]) -> &'hir [ImplItem<'hir>] {
+        self.impl_item_lists.alloc_slice(items)
+    }
+
+    pub fn alloc_extern_item(&'hir self, item: ExternItem<'hir>) -> &'hir ExternItem<'hir> {
+        self.extern_items.alloc(item)
+    }
+
+    pub fn alloc_extern_items(&'hir self, items: &[ExternItem<'hir>]) -> &'hir [ExternItem<'hir>] {
+        self.extern_item_lists.alloc_slice(items)
+    }
+
+    pub fn alloc_field_def(&'hir self, field: FieldDef<'hir>) -> &'hir FieldDef<'hir> {
+        self.field_defs.alloc(field)
+    }
+
+    pub fn alloc_field_defs(&'hir self, fields: &[FieldDef<'hir>]) -> &'hir [FieldDef<'hir>] {
+        self.field_def_lists.alloc_slice(fields)
+    }
+
+    pub fn alloc_variant(&'hir self, variant: Variant<'hir>) -> &'hir Variant<'hir> {
+        self.variants.alloc(variant)
+    }
+
+    pub fn alloc_variants(&'hir self, variants: &[Variant<'hir>]) -> &'hir [Variant<'hir>] {
+        self.variant_lists.alloc_slice(variants)
+    }
+
+    pub fn alloc_derived_impl(&'hir self, derived: DerivedImpl) -> &'hir DerivedImpl {
+        self.derived_impls.alloc(derived)
+    }
+
+    pub fn alloc_derived_impls(&'hir self, derived: &[DerivedImpl]) -> &'hir [DerivedImpl] {
+        self.derived_impl_lists.alloc_slice(derived)
+    }
+
+    pub fn alloc_interface_item(
+        &'hir self,
+        item: InterfaceItem<'hir>,
+    ) -> &'hir InterfaceItem<'hir> {
+        self.interface_items.alloc(item)
+    }
+
+    pub fn alloc_interface_items(
+        &'hir self,
+        items: &[InterfaceItem<'hir>],
+    ) -> &'hir [InterfaceItem<'hir>] {
+        self.interface_item_lists.alloc_slice(items)
+    }
+
+    pub fn alloc_world_item(&'hir self, item: WorldItem<'hir>) -> &'hir WorldItem<'hir> {
+        self.world_items.alloc(item)
+    }
+
+    pub fn alloc_world_items(&'hir self, items: &[WorldItem<'hir>]) -> &'hir [WorldItem<'hir>] {
+        self.world_item_lists.alloc_slice(items)
     }
 }
 

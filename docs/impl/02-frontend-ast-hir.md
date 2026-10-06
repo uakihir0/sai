@@ -1286,8 +1286,8 @@ pub enum ItemKind<'hir> {
     Interface { items: &'hir [OwnerId] },
     World { items: &'hir [OwnerId] },
     ExternBlock { safety: Safety, abi: ExternAbi, module: Option<Symbol>, items: &'hir [OwnerId] },
-    Test { name: SmolStr },
-    Property { name: SmolStr, params: &'hir [BodyParam<'hir>] },
+    Test { name: &'hir str },
+    Property { name: &'hir str, params: &'hir [BodyParam] },
 }
 pub enum ExternAbi { Wasm, C, Err }
 pub enum ImplKind<'hir> {
@@ -1341,7 +1341,7 @@ pub enum VariantShape<'hir> { Unit, Tuple(&'hir [Ty<'hir>]), Record(&'hir [Field
 
 pub struct Body<'hir> {
     pub owner: OwnerId,
-    pub params: &'hir [BodyParam<'hir>],      // one per FnParam or property parameter, in order
+    pub params: &'hir [BodyParam],            // one per FnParam or property parameter, in order
     pub value: &'hir Expr<'hir>,              // the function block, the const initializer, or the predicate
     pub contracts: &'hir [Contract<'hir>],    // requires and ensures, in source order
     pub invariant_preds: &'hir [&'hir Expr<'hir>],  // only for invariant owners: one predicate per listed expression
@@ -1461,7 +1461,7 @@ pub enum GenericArg<'hir> { Type(&'hir Ty<'hir>), Const(ConstArg), Binding { nam
 pub enum ConstArg { Int { value: Option<u128>, negated: bool }, Char(char), Bool(bool) }
 ```
 
-**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `sai_hir::literals` and `sai_hir::patterns` define decoded HIR literals and the complete pattern node family. `sai_hir::expressions` defines expression, block, statement, match-arm, closure, and format-string nodes; `sai_hir::body` defines function signatures, body parameters, contracts, and bodies. Source-bearing records compare and hash their semantic contents while excluding spans, so moving syntax does not change their value equality. `Lit::ByteStr` borrows its bytes from the arena. The session-owned `sai_hir::arena::HirArena` provides typed storage for type, pattern, expression, statement, block, arm, closure, body, literal, and child-list data. Item/function declarations and syntax-to-HIR lowering remain follow-up work.
+**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `sai_hir::literals` and `sai_hir::patterns` define decoded HIR literals and the complete pattern node family. `sai_hir::expressions` defines expression, block, statement, match-arm, closure, and format-string nodes; `sai_hir::body` defines function signatures, body parameters, contracts, and bodies. `sai_hir::items` defines `HirOwner`, all ordinary, associated, extern, interface, and world item nodes, fields, variants, and derived-impl owners. Source-bearing records compare and hash their semantic contents while excluding spans, so moving syntax does not change their value equality. `Lit::ByteStr` borrows its bytes from the arena. Test/property names and WIT package paths use arena-backed `&str` values in place of the planned `SmolStr`; the crate has no `SmolStr` dependency, and borrowed strings keep item values `Copy`. The session-owned `sai_hir::arena::HirArena` provides typed storage for type, pattern, expression, statement, block, arm, closure, body, item, field, variant, literal, string, and child-list data. Syntax-to-HIR lowering remains follow-up work.
 
 Notes on the shape:
 

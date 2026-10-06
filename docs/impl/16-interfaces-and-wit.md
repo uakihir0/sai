@@ -568,10 +568,12 @@ pub enum WorldItemKind<'hir> {
     Include(WorldRef<'hir>),
 }
 pub enum WorldRef<'hir> {
-    Pkg { hir_id: HirId, path: SmolStr, span: Span },   // a PKG_PATH, resolved by §16.8.1
+    Pkg { hir_id: HirId, path: &'hir str, span: Span }, // a PKG_PATH, resolved by §16.8.1
     Mod(Path<'hir>),                                    // a ModPath
 }
 ```
+
+The reference implementation stores the package path in the query-session HIR arena; this uses `&'hir str` in place of `SmolStr` so world-item nodes remain copyable.
 
 `MemberRole` is decided syntactically by spec/13 §13.2.4:
 
