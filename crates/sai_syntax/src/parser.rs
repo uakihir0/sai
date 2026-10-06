@@ -3240,7 +3240,11 @@ mod tests {
         let Stmt::Let(let_else_stmt) = &statements[1] else {
             unreachable!();
         };
-        assert!(let_else_stmt.else_clause().is_some());
+        let else_block = let_else_stmt
+            .else_clause()
+            .and_then(|else_clause| else_clause.block())
+            .expect("let-else block");
+        assert_eq!(else_block.statements().count(), 1);
 
         let Stmt::Var(var_stmt) = &statements[2] else {
             unreachable!();

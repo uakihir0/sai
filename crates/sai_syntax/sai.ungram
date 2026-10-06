@@ -239,6 +239,7 @@ child LetStmt pattern Pattern 0
 child LetStmt ty Type 0
 child LetStmt initializer Expr 0
 child LetStmt else_clause LetElse 0
+child LetElse block Block 0
 child VarStmt name Name 0
 child VarStmt ty Type 0
 child VarStmt initializer Expr 0

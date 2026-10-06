@@ -1060,6 +1060,7 @@ pub trait AstToken: Sized {
 - **Item metadata and attribute roles.** Declarations expose their outer docs and repeated attributes, with visibility accessors on syntax forms that permit it. Attributes expose their names and optional argument lists; argument lists iterate nested arguments, which distinguish an argument name, nested calls, an identifier value after `=`, and direct string or integer tokens. Attributes on parameters remain reachable even when the parser reports their target as invalid.
 - **Pattern binding roles.** `BindingPat` exposes an optional `BindingMode`; explicit mode nodes map to `var`, `borrow`, or `borrow mut` through `BindingMode::kind()`. A missing mode node represents the ordinary by-value binding. Slice-rest bindings use the same accessor path.
 - **Type modifier roles.** Borrow types expose their optional `mut` token; `owned` types expose their source marker; and function-pointer types expose their optional `unsafe` marker. These direct-token accessors preserve the distinction between safe and unsafe function pointers and between shared and mutable borrows.
+- **Let-else role.** `LetElse::block()` exposes the block executed when its pattern fails. It remains optional on a recovered incomplete tree.
 
 ### 2.7.2 Accessors
 
