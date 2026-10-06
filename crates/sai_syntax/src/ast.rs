@@ -1,7 +1,8 @@
 use std::{borrow::Cow, collections::HashMap, marker::PhantomData};
 
-use sai_vfs::FileId;
+use sai_vfs::{FileId, WorkspaceSnapshot};
 
+use crate::red::RootIdentity;
 use crate::{
     SyntaxElement, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, SyntaxToken,
 };
@@ -191,6 +192,15 @@ impl AstIdMap {
             && root.kind() == SyntaxKind::SOURCE_FILE
             && root.parent().is_none()
             && self.identity == root.root_identity()
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        snapshot.file(self.file).is_some()
+            && self.identity
+                == (RootIdentity::Snapshot {
+                    file: self.file,
+                    id: snapshot.id(),
+                })
     }
 
     pub const fn file(&self) -> FileId {

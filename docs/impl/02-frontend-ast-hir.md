@@ -1091,7 +1091,7 @@ Value decoders run the same scanning functions as the lexer (§2.3.2), in value 
 
 ### 2.7.4 `AstPtr` and `AstIdMap`
 
-- `AstPtr<N>` is a typed `SyntaxNodePtr`. HIR source maps (§2.8.4) store `AstPtr`s, which are valid for the snapshot the HIR was built from.
+- `AstPtr<N>` is a typed `SyntaxNodePtr`. HIR source maps (§2.8.4) store `SyntaxNodePtr`s because one map can refer to heterogeneous syntax-node kinds; these pointers are valid for the snapshot the HIR was built from.
 - `AstIdMap` (query `ast_id_map(FileId)`) assigns each **item-like node**—a source node that can become a `DefId` or is stored in the item tree with its own source identity—an `ErasedAstId(u32)`, which is its index in a pre-order traversal of item-like nodes only. This includes `USE_DECL`, whose item-tree entry has an AstId although a use declaration defines no name. Expressions, statements, and patterns never get an `AstId`; generic parameters do. Closure and async-block `DefId`s are derived from owner-local ordinals and do not have an `AstId`.
 - Because only item-like nodes are numbered, an edit inside a function body does not change the `ErasedAstId` indices of the file's item-like nodes. The typed `AstId<N>` also carries its file and workspace-snapshot scope, so an ID cannot be reused with any map from a new snapshot, even if this file's source is unchanged. Adding or removing an item shifts the erased indices of later items; the `DefId`s of those items do not change, because `DefId`s are derived from `DefPath`s, not from `AstId`s (§2.8.2).
 - `AstId<N>` is a typed `ErasedAstId` scoped to its file and snapshot. `ast_id_map.get(id) -> Option<AstPtr<N>>` and `ast_id_map.ast_id(&node) -> Option<AstId<N>>` return `Some` for item-like nodes and IDs from the current map; IDs from another file or snapshot and non-item nodes are rejected. `AstIdMap` requires a snapshot-bound `SOURCE_FILE` root; roots created with `new_root` are tree-local and cannot produce reusable `AstId`s.
@@ -1223,18 +1223,22 @@ pub enum DesugaringKind {
 }
 
 pub struct HirSourceMap {
-    pub owner: OwnerId,
-    pub node_to_syntax: IndexVec<ItemLocalId, SyntaxNodePtr>,  // total: every HIR node has a source node
-    pub syntax_to_nodes: FxHashMap<SyntaxNodePtr, SmallVec<[ItemLocalId; 1]>>,
-    pub binding_to_syntax: IndexVec<BindingId, SyntaxNodePtr>,
-    pub diagnostics: Vec<Diagnostic>,
+    owner: OwnerId,
+    node_to_syntax: IndexVec<ItemLocalId, SyntaxNodePtr>,  // total: every HIR node has a source node
+    syntax_to_nodes: FxHashMap<SyntaxNodePtr, SmallVec<[ItemLocalId; 1]>>,
+    binding_to_syntax: IndexVec<BindingId, SyntaxNodePtr>,
+    diagnostics: Vec<Diagnostic>,
 }
 ```
+
+The fields are private. Read-only accessors expose `owner()`, `node_to_syntax()`, `syntax_to_nodes()`, `binding_to_syntax()`, and `diagnostics()`.
 
 - Every HIR node has a span. The span of a desugared node is the range of the source construct it was generated from, with `SpanCtxt::Desugared(kind)`. For example, every synthetic node of a `for` loop has the range of the `for` expression (or of the iterator expression, for the `into_iter` call) and the context `ForLoop`.
 - Diagnostics MUST be reported against the user-visible construct. The diagnostics layer (impl/11) uses the desugaring context to choose the wording ("this `for` loop's iterator …") and to suppress diagnostics that make sense only for user-written code (for example `UNREACHABLE_PATTERN` on a synthesized arm, §2.9.1).
 - `node_to_syntax` is total. Several HIR nodes may map to one syntax node (all nodes of a desugaring); a syntax node may map to no HIR node (for example a `PAREN_EXPR`, which is not lowered to a node of its own, maps to the node of its content).
 - The source map is a separate query (`hir_source_map`), so that HIR consumers that do not need positions are not invalidated by edits that only move text.
+
+**Current implementation slice.** `HirSourceMapBuilder` binds a map to one owner and one parsed file root, requiring the supplied `AstIdMap` to match both that root and the supplied workspace snapshot. It maps the owner node to local ID zero, checks every added node and binding against the same file and syntax-tree identity, and builds both node-to-syntax and syntax-to-node mappings; repeated HIR nodes may therefore share one syntax pointer. Diagnostics are bound to that same snapshot and rejected if their locations or existing snapshot binding do not match. The completed map exposes read-only accessors so callers cannot break the correspondence between its forward and reverse mappings. Spans, HIR node allocation, and the `hir_source_map` query are not implemented yet, so the map is not yet integrated with HIR lowering. The reverse map currently uses the standard-library `HashMap` and `Vec` in place of the planned `FxHashMap` and `SmallVec`; the workspace has no existing dependencies for those types, and this choice avoids adding dependencies before profiling establishes a need.
 
 ### 2.8.5 Data structures
 
