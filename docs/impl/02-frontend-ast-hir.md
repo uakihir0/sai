@@ -572,6 +572,8 @@ Each emitted NEWLINE records, in a side table `LexOutput::newline_causes: Vec<Ne
 
 The parser is a hand-written recursive-descent parser. Expressions are parsed with a Pratt (precedence-climbing) loop driven by the D-SYN-05 table (§2.5.6). The parser does not build the tree directly. It produces a flat list of events, which a tree builder turns into the green tree (§2.6) afterwards.
 
+The public `parse(snapshot, file_id)` entry point lexes and parses a file, merges lexical and parser diagnostics in source order, and returns a red root bound to that exact workspace snapshot. Low-level use of `Parser` and `build_green_tree` produces an unbound green tree; callers outside `sai_syntax` obtain a snapshot-bound root through `parse`.
+
 ```rust
 pub enum Event {
     Start { kind: SyntaxKind, forward_parent: Option<u32> },   // forward_parent supports `precede`
@@ -1022,7 +1024,7 @@ The tree builder and the parser guarantee, and `debug_assert`-check in test buil
 
 ### 2.6.7 Node identity and reparsing
 
-- A `SyntaxNodePtr { file: FileId, kind: SyntaxKind, range: TextRange }` identifies a node within one snapshot of a file. It is resolved by descending from the root to the node with exactly this kind and range. It is invalid after any edit to the file. Stable cross-edit identity is provided by `AstId` (§2.7.4) and, for tooling, by the symbol identities of impl/12.
+- A `SyntaxNodePtr` records the `FileId`, workspace-snapshot identity, pre-order node index in the red-tree index, `SyntaxKind`, and `TextRange` of a node. The node index distinguishes malformed zero-width nodes that share a kind and range and resolves in constant time when the same snapshot's red root is recreated. The public `parse(snapshot, file_id)` entry point binds its root to that snapshot after building the tree from the snapshot's source; the lower-level root-binding constructor is crate-private. An unbound syntax root gives pointers valid only for that red tree. A pointer resolves only against the same file root from the exact workspace snapshot, so any edit that creates a new snapshot invalidates it, even when another file changed. `AstId` has the same snapshot scope (§2.7.4); stable cross-edit identity is provided by `DefId` (§2.8.2) and, for tooling, by the symbol identities of impl/12.
 - v0.1 always reparses the whole file after an edit (N-E-17). The `parse` query is per file, and the downstream queries (`ast_id_map`, `def_collector`, `hir_owner`) compare their outputs structurally, so an edit inside one function body does not invalidate the item tree or other owners (§2.8.3). Incremental reparsing of blocks is permitted as an optimization only if it produces a tree identical to a full reparse.
 
 ---
@@ -1076,9 +1078,11 @@ Value decoders run the same scanning functions as the lexer (§2.3.2), in value 
 ### 2.7.4 `AstPtr` and `AstIdMap`
 
 - `AstPtr<N>` is a typed `SyntaxNodePtr`. HIR source maps (§2.8.4) store `AstPtr`s, which are valid for the snapshot the HIR was built from.
-- `AstIdMap` (query `ast_id_map(FileId)`) assigns each **item-like node** (every node that can become a `DefId`: items, trait and impl items, fields, variants, interface and world items, extern items, tests, properties) an `ErasedAstId(u32)`, which is its index in a pre-order traversal of item-like nodes only. Expressions, statements, and patterns never get an `AstId`.
-- Because only item-like nodes are numbered, an edit inside a function body does not change any `AstId` in the file, and the `def_collector` result keyed by `AstId` stays equal. Adding or removing an item shifts the `AstId`s of later items; the `DefId`s of those items do not change, because `DefId`s are derived from `DefPath`s, not from `AstId`s (§2.8.2).
-- `AstId<N>` is a typed `ErasedAstId`. `ast_id_map.get(id) -> AstPtr<N>` and `ast_id_map.ast_id(&node) -> AstId<N>` are total for item-like nodes of the current snapshot.
+- `AstIdMap` (query `ast_id_map(FileId)`) assigns each **item-like node**—a source node that can become a `DefId` or is stored in the item tree with its own source identity—an `ErasedAstId(u32)`, which is its index in a pre-order traversal of item-like nodes only. This includes `USE_DECL`, whose item-tree entry has an AstId although a use declaration defines no name. Expressions, statements, and patterns never get an `AstId`; generic parameters do. Closure and async-block `DefId`s are derived from owner-local ordinals and do not have an `AstId`.
+- Because only item-like nodes are numbered, an edit inside a function body does not change the `ErasedAstId` indices of the file's item-like nodes. The typed `AstId<N>` also carries its file and workspace-snapshot scope, so an ID cannot be reused with any map from a new snapshot, even if this file's source is unchanged. Adding or removing an item shifts the erased indices of later items; the `DefId`s of those items do not change, because `DefId`s are derived from `DefPath`s, not from `AstId`s (§2.8.2).
+- `AstId<N>` is a typed `ErasedAstId` scoped to its file and snapshot. `ast_id_map.get(id) -> Option<AstPtr<N>>` and `ast_id_map.ast_id(&node) -> Option<AstId<N>>` return `Some` for item-like nodes and IDs from the current map; IDs from another file or snapshot and non-item nodes are rejected. `AstIdMap` requires a snapshot-bound `SOURCE_FILE` root; roots created with `new_root` are tree-local and cannot produce reusable `AstId`s.
+
+**Current implementation slice.** `parse(snapshot, file_id)` builds a lossless tree from the snapshot source, binds its root to the snapshot identity, and returns lexical and parser diagnostics in source order. Lower-level `Parser` and `build_green_tree` use remains unbound. `SyntaxNodePtr::new` and `AstPtr::new` are fallible; for snapshot-bound roots they reject a `FileId` that does not match the root, while an unbound tree uses the caller-supplied file only as a pointer namespace. Pointers store the file, workspace-snapshot identity, pre-order red-node index, kind, and range, so the node index disambiguates identical kinds and ranges without retaining every ancestor path. Roots created with `new_root` instead receive a tree-local identity. `AstPtr<N>` adds a typed AST view. `AstId<N>` carries its file and snapshot identity along with its erased index, so a same-kind ID from another map cannot accidentally resolve to an item in this map; only the erased numeric index is stable across an edit that preserves item order. `AstIdMap` accepts only a snapshot-bound `SOURCE_FILE` root and assigns pre-order IDs to source items and their item-like children, including generic parameters, `USE_DECL`, and `EXTERN_BLOCK` because the item tree stores them. It rejects a mismatched file, non-file root, or unbound root at construction and returns `None` for nodes from another snapshot, an out-of-range ID, or a kind mismatch.
 
 ---
 
@@ -1149,13 +1153,13 @@ pub struct BindingId(u32);                     // local binding within an owner'
 
 | Change | Effect on identifiers |
 |---|---|
-| Edit inside a function body (no closures added or removed before an existing one) | That owner's `HirId`s and `BindingId`s may change. No `DefId`, `DefPath`, or `AstId` changes. The `ItemTree` (§2.8.7) is unchanged. |
+| Edit inside a function body (no closures added or removed before an existing one) | That owner's `HirId`s and `BindingId`s may change. No `DefId` or `DefPath` changes; item-like nodes keep their `ErasedAstId` indices. Typed `AstId`s are newly scoped to the new workspace snapshot. The `ItemTree` (§2.8.7) is unchanged. |
 | Add or remove a closure in a body | `Closure` disambiguators of later closures in the same owner shift. Other owners are unaffected. |
-| Add, remove, or reorder items in a file | `AstId`s of later items shift; `DefPath`s and `DefId`s of other items do not change. |
+| Add, remove, or reorder items in a file | The `ErasedAstId` indices of later item-like nodes shift, and typed `AstId`s are newly scoped to the new snapshot; `DefPath`s and `DefId`s of other items do not change. |
 | Rename an item | The item gets a new `DefPath`. Symbol identity across the rename is preserved by impl/12 through `.sai/index` (D-TOOL-02), which maps the old `DefPathHash` to the persisted symbol ID. |
 | Move an item to another module | New `DefPath`; same treatment as a rename. |
 | Edit an impl header | The impl and its items get new `DefPath`s. |
-| Edit whitespace or comments | No identifier changes, including `HirId`s (lowering ignores trivia). Spans change, and are recomputed; spans are never part of a query key. |
+| Edit whitespace or comments | No `DefId`, `DefPath`, `HirId`, `BindingId`, or `ErasedAstId` index changes (lowering ignores trivia). Typed `AstId`s are newly scoped to the new snapshot. Spans change, and are recomputed; spans are never part of a query key. |
 
 Spans are stored in HIR nodes but are excluded from the equality used for early cutoff of downstream queries; queries that need positions read them from the source map (§2.8.4) and depend on it explicitly.
 
@@ -1438,7 +1442,7 @@ pub struct UseEntry { pub ast_id: ErasedAstId, pub is_pub: bool, pub pkg_path: S
 pub struct ItemTreeEntry {
     pub ast_id: ErasedAstId,
     pub kind: ItemTreeKind,                   // Fn, Struct, Alias, Refined, Enum, Distinct, Resource, Trait, Impl, Const, Invariant,
-                                              // Effect, Interface, World, ExternBlock, Test, Property
+                                              // Effect, Interface, World, ExternBlock, Test, Property, TypeParam, ConstParam
     pub name: Symbol,                         // Symbol::ERROR if missing
     pub vis: Visibility,
     pub raw_attrs: Vec<RawAttr>,
@@ -1446,6 +1450,8 @@ pub struct ItemTreeEntry {
     pub header_hash: Option<u64>,             // impls only (§2.8.2)
 }
 ```
+
+`TypeParam` and `ConstParam` are the `ItemTreeKind` variants for generic-parameter children. Each generic parameter is an `ItemTreeEntry` with its own `AstId`, name, kind, and nested position in its parent's `children`.
 
 The item tree is equal (by value) across edits that do not touch item headers, so the module tree, import resolution, and item signatures in impl/03 are not recomputed for edits inside bodies.
 

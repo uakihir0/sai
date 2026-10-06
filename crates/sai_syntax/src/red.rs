@@ -1,8 +1,9 @@
 use std::cell::{Cell, OnceCell};
 use std::fmt::{self, Formatter};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use sai_vfs::{TextRange, TextSize};
+use sai_vfs::{FileId, TextRange, TextSize, WorkspaceSnapshot, WorkspaceSnapshotId};
 
 use crate::{GreenElement, GreenNode, GreenToken};
 
@@ -18,8 +19,50 @@ struct NodeData {
 }
 
 struct RedTreeCache {
+    identity: RootIdentity,
     index: RedTreeIndex,
     token_index: OnceCell<RedTokenIndex>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RootIdentity {
+    Snapshot {
+        file: FileId,
+        id: WorkspaceSnapshotId,
+    },
+    Tree(u64),
+}
+
+impl RootIdentity {
+    fn belongs_to_file(self, file: FileId) -> bool {
+        match self {
+            Self::Snapshot {
+                file: snapshot_file,
+                ..
+            } => snapshot_file == file,
+            Self::Tree(_) => true,
+        }
+    }
+}
+
+static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_tree_id() -> u64 {
+    let mut current = NEXT_TREE_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("syntax tree identity space exhausted");
+        match NEXT_TREE_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 struct RedTreeIndex {
@@ -35,6 +78,7 @@ struct RedTokenIndex {
 struct NodeIndexEntry {
     green: GreenNode,
     offset: TextSize,
+    text_range: TextRange,
     child_ids_start: usize,
     red_data: Option<Rc<NodeData>>,
 }
@@ -53,6 +97,75 @@ pub struct SyntaxToken {
     parent: SyntaxNode,
     index_in_parent: u32,
     offset: TextSize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyntaxRootError {
+    FileNotInSnapshot,
+    SourceMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyntaxNodePtrError {
+    FileMismatch,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SyntaxNodePtr {
+    file: FileId,
+    identity: RootIdentity,
+    node_index: usize,
+    kind: crate::SyntaxKind,
+    range: TextRange,
+}
+
+impl SyntaxNodePtr {
+    pub fn new(file: FileId, node: &SyntaxNode) -> Result<Self, SyntaxNodePtrError> {
+        if !node.belongs_to_file(file) {
+            return Err(SyntaxNodePtrError::FileMismatch);
+        }
+
+        Ok(Self {
+            file,
+            identity: node.1.identity,
+            node_index: resolve_node_index(&node.0, &node.1.index)
+                .expect("a syntax node belongs to its red tree index"),
+            kind: node.kind(),
+            range: node.text_range(),
+        })
+    }
+
+    pub const fn file(&self) -> FileId {
+        self.file
+    }
+
+    pub const fn kind(&self) -> crate::SyntaxKind {
+        self.kind
+    }
+
+    pub const fn text_range(&self) -> TextRange {
+        self.range
+    }
+
+    pub fn resolve(&self, file: FileId, root: &SyntaxNode) -> Option<SyntaxNode> {
+        if file != self.file
+            || !self.identity.belongs_to_file(file)
+            || root.1.identity != self.identity
+        {
+            return None;
+        }
+
+        let data = root
+            .1
+            .index
+            .nodes
+            .get(self.node_index)?
+            .red_data
+            .as_ref()?
+            .clone();
+        let node = SyntaxNode(data, root.1.clone());
+        (node.kind() == self.kind && node.text_range() == self.range).then_some(node)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +240,32 @@ impl Iterator for Descendants {
 
 impl SyntaxNode {
     pub fn new_root(green: GreenNode) -> Self {
+        Self::new_root_with_identity(green, RootIdentity::Tree(next_tree_id()))
+    }
+
+    pub(crate) fn new_root_in_snapshot(
+        green: GreenNode,
+        file: FileId,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Self, SyntaxRootError> {
+        let source = snapshot
+            .file(file)
+            .map(|file| file.source())
+            .ok_or(SyntaxRootError::FileNotInSnapshot)?;
+        if !green_text_matches_source(&green, source.text()) {
+            return Err(SyntaxRootError::SourceMismatch);
+        }
+
+        Ok(Self::new_root_with_identity(
+            green,
+            RootIdentity::Snapshot {
+                file,
+                id: snapshot.id(),
+            },
+        ))
+    }
+
+    fn new_root_with_identity(green: GreenNode, identity: RootIdentity) -> Self {
         let root = Rc::new(NodeData {
             green,
             parent: None,
@@ -135,6 +274,7 @@ impl SyntaxNode {
             index_id: Cell::new(Some(0)),
         });
         let cache = Rc::new(RedTreeCache {
+            identity,
             index: build_red_node_index(root.clone()),
             token_index: OnceCell::new(),
         });
@@ -143,6 +283,14 @@ impl SyntaxNode {
 
     pub fn green(&self) -> &GreenNode {
         &self.0.green
+    }
+
+    pub(crate) fn root_identity(&self) -> RootIdentity {
+        self.1.identity
+    }
+
+    pub(crate) fn belongs_to_file(&self, file: FileId) -> bool {
+        self.1.identity.belongs_to_file(file)
     }
 
     pub fn kind(&self) -> crate::SyntaxKind {
@@ -175,6 +323,12 @@ impl SyntaxNode {
     /// The range of source text excluding the first token's leading and last
     /// token's trailing trivia.
     pub fn text_range(&self) -> TextRange {
+        if let Some(node_id) = resolve_node_index(&self.0, &self.1.index)
+            && let Some(entry) = self.1.index.nodes.get(node_id)
+        {
+            return entry.text_range;
+        }
+
         match (self.first_token(), self.last_token()) {
             (Some(first), Some(last)) => {
                 TextRange::new(first.text_range().start(), last.text_range().end())
@@ -372,6 +526,7 @@ fn build_red_node_index(root: Rc<NodeData>) -> RedTreeIndex {
     let mut nodes = vec![NodeIndexEntry {
         green: root.green.clone(),
         offset: root.offset,
+        text_range: TextRange::empty(root.offset),
         child_ids_start: 0,
         red_data: Some(root.clone()),
     }];
@@ -419,6 +574,7 @@ fn build_red_node_index(root: Rc<NodeData>) -> RedTreeIndex {
                 nodes.push(NodeIndexEntry {
                     green,
                     offset: child_offset,
+                    text_range: TextRange::empty(child_offset),
                     child_ids_start: child_node_ids.len(),
                     red_data: Some(child_data),
                 });
@@ -435,10 +591,94 @@ fn build_red_node_index(root: Rc<NodeData>) -> RedTreeIndex {
         }
     }
 
+    let mut contains_tokens = vec![false; nodes.len()];
+    for node_id in (0..nodes.len()).rev() {
+        let green = nodes[node_id].green.clone();
+        let offset = nodes[node_id].offset;
+        let child_ids_start = nodes[node_id].child_ids_start;
+        let mut first_token_start = None;
+        let mut last_token_end = None;
+
+        for (child_index, child) in green.children().iter().enumerate() {
+            let child_range = match child {
+                GreenElement::Node(_) => {
+                    let child_id = child_node_ids[child_ids_start + child_index];
+                    debug_assert_ne!(child_id, usize::MAX);
+                    contains_tokens[child_id].then_some(nodes[child_id].text_range)
+                }
+                GreenElement::Token(token) => {
+                    let child_offset = add_size(
+                        offset,
+                        green
+                            .child_offset(child_index)
+                            .unwrap_or_else(|| TextSize::new(0)),
+                    );
+                    Some(token_text_range(token, child_offset))
+                }
+            };
+            if let Some(range) = child_range {
+                first_token_start.get_or_insert(range.start());
+                last_token_end = Some(range.end());
+            }
+        }
+
+        let text_range = match (first_token_start, last_token_end) {
+            (Some(start), Some(end)) => {
+                TextRange::new(start, end).unwrap_or_else(|| TextRange::empty(start))
+            }
+            _ => TextRange::empty(offset),
+        };
+        contains_tokens[node_id] = first_token_start.is_some();
+        nodes[node_id].text_range = text_range;
+    }
+
     RedTreeIndex {
         nodes: nodes.into_boxed_slice(),
         child_node_ids: child_node_ids.into_boxed_slice(),
     }
+}
+
+fn green_text_matches_source(green: &GreenNode, source: &str) -> bool {
+    if usize::try_from(green.text_len().raw()).ok() != Some(source.len()) {
+        return false;
+    }
+
+    let source = source.as_bytes();
+    let mut offset = 0;
+    let mut stack = green.children().iter().rev().collect::<Vec<_>>();
+    while let Some(element) = stack.pop() {
+        match element {
+            GreenElement::Node(node) => stack.extend(node.children().iter().rev()),
+            GreenElement::Token(token) => {
+                for trivia in token.leading_trivia() {
+                    if !consume_source_bytes(source, &mut offset, trivia.text()) {
+                        return false;
+                    }
+                }
+                if !consume_source_bytes(source, &mut offset, token.text()) {
+                    return false;
+                }
+                for trivia in token.trailing_trivia() {
+                    if !consume_source_bytes(source, &mut offset, trivia.text()) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    offset == source.len()
+}
+
+fn consume_source_bytes(source: &[u8], offset: &mut usize, expected: &str) -> bool {
+    let Some(end) = (*offset).checked_add(expected.len()) else {
+        return false;
+    };
+    if source.get(*offset..end) != Some(expected.as_bytes()) {
+        return false;
+    }
+    *offset = end;
+    true
 }
 
 fn build_red_token_index(index: &RedTreeIndex) -> RedTokenIndex {
@@ -730,6 +970,22 @@ mod tests {
             .expect("build green tree");
         let root = SyntaxNode::new_root(tree.root);
         let index = &root.1.index;
+
+        for node in root.descendants() {
+            let expected_range = match (node.first_token(), node.last_token()) {
+                (Some(first), Some(last)) => {
+                    TextRange::new(first.text_range().start(), last.text_range().end())
+                        .unwrap_or_else(|| TextRange::empty(first.text_range().start()))
+                }
+                _ => TextRange::empty(node.offset()),
+            };
+            assert_eq!(
+                node.text_range(),
+                expected_range,
+                "cached range for {:?}",
+                node.kind()
+            );
+        }
 
         assert_eq!(index.nodes.len(), 4);
         assert_eq!(

@@ -18,7 +18,10 @@ mod parser;
 mod red;
 mod tree;
 pub use parser::{CompletedMarker, Marker, Parser, ParserError};
-pub use red::{Descendants, SyntaxElement, SyntaxNode, SyntaxToken, TokenAtOffset};
+pub use red::{
+    Descendants, SyntaxElement, SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, SyntaxRootError,
+    SyntaxToken, TokenAtOffset,
+};
 pub use tree::{
     Event, GreenElement, GreenNode, GreenToken, GreenTrivia, NodeCache, TreeBuildError,
     TreeBuildOutput, build_green_tree,
@@ -409,6 +412,22 @@ pub enum LexError {
     FixPlanningFailed,
 }
 
+/// A parsed file whose syntax root is bound to the snapshot that supplied it.
+#[derive(Clone, Debug)]
+pub struct Parse {
+    pub root: SyntaxNode,
+    pub errors: Vec<Diagnostic>,
+}
+
+/// An internal failure while producing a snapshot-bound parse result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseError {
+    Lex(LexError),
+    Parser(ParserError),
+    Tree(TreeBuildError),
+    SnapshotBinding(SyntaxRootError),
+}
+
 impl LexOutput {
     pub fn token_text<'a>(&self, token: &Token, source: &'a str) -> &'a str {
         &source[token.range.start().to_usize()..token.range.end().to_usize()]
@@ -685,6 +704,45 @@ pub fn lex(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<LexOutput, L
         };
         lexer.push_next_token(token)?;
     }
+}
+
+/// Lexes and parses one file, then binds its red root to the exact snapshot
+/// source used by the parser. Returned diagnostics are ordered by source range.
+pub fn parse(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<Parse, ParseError> {
+    let file = snapshot
+        .file(file_id)
+        .ok_or(ParseError::Lex(LexError::MissingFile))?;
+    let lexed = lex(snapshot, file_id).map_err(ParseError::Lex)?;
+    let mut parser = Parser::new_for_file(file, &lexed.tokens).map_err(ParseError::Parser)?;
+    parser.parse_source_file().map_err(ParseError::Parser)?;
+    let events = parser.into_events().map_err(ParseError::Parser)?;
+    let mut cache = NodeCache::new();
+    let tree = build_green_tree(
+        file.source().text(),
+        &lexed.tokens,
+        &lexed.trivia,
+        events,
+        &mut cache,
+    )
+    .map_err(ParseError::Tree)?;
+    let root = SyntaxNode::new_root_in_snapshot(tree.root, file_id, snapshot)
+        .map_err(ParseError::SnapshotBinding)?;
+
+    let mut errors = lexed.errors;
+    errors.extend(tree.errors);
+    errors.sort_by(|left, right| {
+        let location_key = |diagnostic: &Diagnostic| {
+            diagnostic
+                .primary()
+                .map(|location| (location.span.range.start(), location.span.range.end()))
+        };
+        location_key(left)
+            .cmp(&location_key(right))
+            .then_with(|| left.severity.cmp(&right.severity))
+            .then_with(|| left.code.as_str().cmp(right.code.as_str()))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    Ok(Parse { root, errors })
 }
 
 #[derive(Clone, Copy)]
@@ -5439,6 +5497,46 @@ mod tests {
                 .map(|error| error.code)
                 .collect::<Vec<_>>(),
             [Code::InvalidEscape, Code::InvalidUtf8]
+        );
+    }
+
+    #[test]
+    fn parse_merges_lexical_and_parser_diagnostics_in_source_order() {
+        let file_id = FileId::new(1);
+        let source = "fn f() {\nlet = 1\nlet other = \"\\q\"\n}\n";
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file_id, source, false).expect("source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("snapshot");
+
+        let parsed = parse(&snapshot, file_id).expect("parse the snapshot file");
+        let ranges = parsed
+            .errors
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .map(|location| (location.span.range.start(), location.span.range.end()))
+            })
+            .collect::<Vec<_>>();
+        let mut sorted_ranges = ranges.clone();
+        sorted_ranges.sort();
+
+        assert_eq!(ranges, sorted_ranges);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::InvalidEscape)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
         );
     }
 

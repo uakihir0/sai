@@ -1,6 +1,10 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap, marker::PhantomData};
 
-use crate::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
+use sai_vfs::FileId;
+
+use crate::{
+    SyntaxElement, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, SyntaxToken,
+};
 
 pub trait AstNode: Sized {
     fn can_cast(kind: SyntaxKind) -> bool;
@@ -12,6 +16,253 @@ pub trait AstToken: Sized {
     fn can_cast(kind: SyntaxKind) -> bool;
     fn cast(token: SyntaxToken) -> Option<Self>;
     fn syntax(&self) -> &SyntaxToken;
+}
+
+pub struct AstPtr<N: AstNode> {
+    raw: SyntaxNodePtr,
+    marker: PhantomData<fn() -> N>,
+}
+
+impl<N: AstNode> Clone for AstPtr<N> {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<N: AstNode> std::fmt::Debug for AstPtr<N> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("AstPtr").field(&self.raw).finish()
+    }
+}
+
+impl<N: AstNode> PartialEq for AstPtr<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<N: AstNode> Eq for AstPtr<N> {}
+
+impl<N: AstNode> std::hash::Hash for AstPtr<N> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.raw, state);
+    }
+}
+
+impl<N: AstNode> AstPtr<N> {
+    pub fn new(file: FileId, node: &N) -> Result<Self, SyntaxNodePtrError> {
+        Ok(Self {
+            raw: SyntaxNodePtr::new(file, node.syntax())?,
+            marker: PhantomData,
+        })
+    }
+
+    pub const fn file(&self) -> FileId {
+        self.raw.file()
+    }
+
+    pub fn syntax_node_ptr(&self) -> SyntaxNodePtr {
+        self.raw.clone()
+    }
+
+    pub fn resolve(&self, file: FileId, root: &SyntaxNode) -> Option<N> {
+        N::cast(self.raw.resolve(file, root)?)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ErasedAstId(u32);
+
+impl ErasedAstId {
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+pub struct AstId<N: AstNode> {
+    raw: ErasedAstId,
+    file: FileId,
+    identity: crate::red::RootIdentity,
+    marker: PhantomData<fn() -> N>,
+}
+
+impl<N: AstNode> Copy for AstId<N> {}
+
+impl<N: AstNode> Clone for AstId<N> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<N: AstNode> std::fmt::Debug for AstId<N> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("AstId").field(&self.raw).finish()
+    }
+}
+
+impl<N: AstNode> PartialEq for AstId<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw && self.file == other.file && self.identity == other.identity
+    }
+}
+
+impl<N: AstNode> Eq for AstId<N> {}
+
+impl<N: AstNode> std::hash::Hash for AstId<N> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&(&self.raw, &self.file, &self.identity), state);
+    }
+}
+
+impl<N: AstNode> AstId<N> {
+    pub fn from_erased(map: &AstIdMap, raw: ErasedAstId) -> Option<Self> {
+        let pointer = map.pointer(raw)?;
+        N::can_cast(pointer.kind()).then_some(Self {
+            raw,
+            file: map.file,
+            identity: map.identity,
+            marker: PhantomData,
+        })
+    }
+
+    pub const fn erase(self) -> ErasedAstId {
+        self.raw
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AstIdMapError {
+    FileMismatch,
+    NotFileRoot,
+    UnboundRoot,
+    TooManyNodes,
+}
+
+#[derive(Clone, Debug)]
+pub struct AstIdMap {
+    file: FileId,
+    identity: crate::red::RootIdentity,
+    pointers: Box<[SyntaxNodePtr]>,
+    ids: HashMap<SyntaxNodePtr, ErasedAstId>,
+}
+
+impl AstIdMap {
+    pub fn new(file: FileId, root: &SyntaxNode) -> Result<Self, AstIdMapError> {
+        if !root.belongs_to_file(file) {
+            return Err(AstIdMapError::FileMismatch);
+        }
+        if root.kind() != SyntaxKind::SOURCE_FILE || root.parent().is_some() {
+            return Err(AstIdMapError::NotFileRoot);
+        }
+        if matches!(root.root_identity(), crate::red::RootIdentity::Tree(_)) {
+            return Err(AstIdMapError::UnboundRoot);
+        }
+
+        let mut pointers = Vec::new();
+        let mut ids = HashMap::new();
+        for node in root.descendants().filter(|node| is_item_like(node.kind())) {
+            let raw = ErasedAstId::new(
+                u32::try_from(pointers.len()).map_err(|_| AstIdMapError::TooManyNodes)?,
+            );
+            let pointer =
+                SyntaxNodePtr::new(file, &node).map_err(|_| AstIdMapError::FileMismatch)?;
+            ids.insert(pointer.clone(), raw);
+            pointers.push(pointer);
+        }
+
+        Ok(Self {
+            file,
+            identity: root.root_identity(),
+            pointers: pointers.into_boxed_slice(),
+            ids,
+        })
+    }
+
+    pub const fn file(&self) -> FileId {
+        self.file
+    }
+
+    pub fn len(&self) -> usize {
+        self.pointers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pointers.is_empty()
+    }
+
+    pub fn pointer(&self, id: ErasedAstId) -> Option<SyntaxNodePtr> {
+        self.pointers
+            .get(usize::try_from(id.index()).ok()?)
+            .cloned()
+    }
+
+    pub fn get<N: AstNode>(&self, id: AstId<N>) -> Option<AstPtr<N>> {
+        if id.file != self.file || id.identity != self.identity {
+            return None;
+        }
+        let raw = self.pointer(id.erase())?;
+        N::can_cast(raw.kind()).then_some(AstPtr {
+            raw,
+            marker: PhantomData,
+        })
+    }
+
+    pub fn ast_id<N: AstNode>(&self, node: &N) -> Option<AstId<N>> {
+        if self.identity != node.syntax().root_identity()
+            || !node.syntax().belongs_to_file(self.file)
+        {
+            return None;
+        }
+
+        let pointer = SyntaxNodePtr::new(self.file, node.syntax()).ok()?;
+        let raw = *self.ids.get(&pointer)?;
+        Some(AstId {
+            raw,
+            file: self.file,
+            identity: self.identity,
+            marker: PhantomData,
+        })
+    }
+}
+
+fn is_item_like(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::USE_DECL
+            | SyntaxKind::FN_DECL
+            | SyntaxKind::TYPE_PARAM
+            | SyntaxKind::CONST_PARAM
+            | SyntaxKind::TYPE_DECL
+            | SyntaxKind::DISTINCT_DECL
+            | SyntaxKind::ENUM_DECL
+            | SyntaxKind::FIELD_DECL
+            | SyntaxKind::VARIANT_DECL
+            | SyntaxKind::VARIANT_FIELD
+            | SyntaxKind::RESOURCE_DECL
+            | SyntaxKind::TRAIT_DECL
+            | SyntaxKind::ASSOC_TYPE_DECL
+            | SyntaxKind::IMPL_DECL
+            | SyntaxKind::ASSOC_TYPE_DEF
+            | SyntaxKind::CONST_DECL
+            | SyntaxKind::INVARIANT_DECL
+            | SyntaxKind::EFFECT_DECL
+            | SyntaxKind::INTERFACE_DECL
+            | SyntaxKind::IFACE_RESOURCE
+            | SyntaxKind::WORLD_DECL
+            | SyntaxKind::WORLD_IMPORT
+            | SyntaxKind::WORLD_EXPORT
+            | SyntaxKind::WORLD_INCLUDE
+            | SyntaxKind::EXTERN_BLOCK
+            | SyntaxKind::TEST_DECL
+            | SyntaxKind::PROPERTY_DECL
+    )
 }
 
 macro_rules! ast_node {
@@ -62,6 +313,8 @@ ast_node!(PropertyDecl, PROPERTY_DECL);
 ast_node!(Block, BLOCK);
 ast_node!(ParamList, PARAM_LIST);
 ast_node!(Param, PARAM);
+ast_node!(TypeParam, TYPE_PARAM);
+ast_node!(ConstParam, CONST_PARAM);
 ast_node!(Name, NAME);
 ast_node!(TupleIndexExpr, TUPLE_INDEX_EXPR);
 ast_node!(FStringExpr, FSTRING_EXPR);

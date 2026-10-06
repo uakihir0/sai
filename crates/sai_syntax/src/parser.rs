@@ -5857,6 +5857,372 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
     }
 
     #[test]
+    fn syntax_node_and_ast_pointers_check_file_and_node_kind() {
+        use crate::ast::{AstNode, AstPtr, TestDecl};
+        use sai_vfs::{FileId, SnapshotFile, SourceFile, WorkspaceSnapshot};
+
+        let source = "// leading comment\ntest \"works\" {} // trailing comment\n";
+        let output = parse_file(source);
+        let file = FileId::new(42);
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file, source, false).expect("source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("snapshot");
+        let parsed = crate::parse(&snapshot, file).expect("parse the snapshot source");
+        assert!(parsed.errors.is_empty(), "{}", parsed.errors.len());
+        assert!(matches!(
+            crate::SyntaxNode::new_root_in_snapshot(
+                output.root.clone(),
+                FileId::new(43),
+                &snapshot
+            ),
+            Err(crate::SyntaxRootError::FileNotInSnapshot)
+        ));
+        let root = parsed.root;
+        let test = root
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("test declaration");
+        assert!(matches!(
+            crate::SyntaxNodePtr::new(FileId::new(43), test.syntax()),
+            Err(crate::SyntaxNodePtrError::FileMismatch)
+        ));
+        assert!(matches!(
+            AstPtr::new(FileId::new(43), &test),
+            Err(crate::SyntaxNodePtrError::FileMismatch)
+        ));
+
+        let raw = crate::SyntaxNodePtr::new(file, test.syntax()).expect("matching file identity");
+        assert_eq!(
+            raw.resolve(file, &root).map(|node| node.kind()),
+            Some(SyntaxKind::TEST_DECL)
+        );
+        assert!(raw.resolve(FileId::new(43), &root).is_none());
+
+        let typed = AstPtr::new(file, &test).expect("matching file identity");
+        assert_eq!(
+            typed.resolve(file, &root).map(|node| node.syntax().kind()),
+            Some(SyntaxKind::TEST_DECL)
+        );
+        assert!(typed.resolve(FileId::new(43), &root).is_none());
+
+        let reparsed_same_snapshot =
+            crate::SyntaxNode::new_root_in_snapshot(output.root.clone(), file, &snapshot)
+                .expect("green tree matches the same file snapshot");
+        assert!(typed.resolve(file, &reparsed_same_snapshot).is_some());
+
+        let same_source_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file, source, false).expect("same source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("new snapshot with unchanged file contents");
+        let same_source_root = crate::parse(&same_source_snapshot, file)
+            .expect("parse unchanged source in the new snapshot")
+            .root;
+        assert!(raw.resolve(file, &same_source_root).is_none());
+        assert!(typed.resolve(file, &same_source_root).is_none());
+
+        let edited_source = "test \"fails\" {}\n";
+        let edited_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file, edited_source, false).expect("edited source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("edited snapshot");
+        assert!(matches!(
+            crate::SyntaxNode::new_root_in_snapshot(output.root.clone(), file, &edited_snapshot),
+            Err(crate::SyntaxRootError::SourceMismatch)
+        ));
+        let edited_root = crate::SyntaxNode::new_root_in_snapshot(
+            parse_file(edited_source).root,
+            file,
+            &edited_snapshot,
+        )
+        .expect("edited tree matches the edited snapshot");
+        assert!(typed.resolve(file, &edited_root).is_none());
+
+        let other_file = FileId::new(43);
+        let other_file_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(other_file, source, false).expect("other file source")),
+            "src/other.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("other file snapshot");
+        let other_file_root = crate::SyntaxNode::new_root_in_snapshot(
+            parse_file(source).root,
+            other_file,
+            &other_file_snapshot,
+        )
+        .expect("tree matches the other file snapshot");
+        assert!(typed.resolve(file, &other_file_root).is_none());
+    }
+
+    #[test]
+    fn ast_id_map_numbers_item_like_nodes_in_preorder() {
+        use crate::ast::{
+            AstId, AstIdMap, AstIdMapError, AstNode, ConstParam, ErasedAstId, Expr, PropertyDecl,
+            TestDecl, TypeParam,
+        };
+        use sai_vfs::{FileId, SnapshotFile, SourceFile, WorkspaceSnapshot};
+
+        let source = concat!(
+            "use sai:http\n",
+            "fn before() { let local = 1 }\n",
+            "type Record<const N: USize, T> { field: T }\n",
+            "enum State { Ready, Value(code: U32) }\n",
+            "distinct Count = U32\n",
+            "const MAX: U32 = 10\n",
+            "invariant Record {\nself.field >= 0\n}\n",
+            "effect io\n",
+            "resource File\n",
+            "trait Convert {\ntype Output\nfn convert()\n}\n",
+            "impl Convert for Record {\ntype Output = I32\nfn convert() {}\n}\n",
+            "interface storage {\nresource Handle {\nfn close(self: borrow Self)\n}\nfn open() -> Handle\n}\n",
+            "world client {\nimport wasi:http/outgoing-handler\nexport fn serve()\ninclude common.base\n}\n",
+            "extern \"wasm\" module \"env\" {\nfn read()\n}\n",
+            "test \"works\" {}\n",
+            "property \"holds\"() {}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let file = FileId::new(7);
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file, source, false).expect("source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("snapshot");
+        let root = crate::SyntaxNode::new_root_in_snapshot(output.root, file, &snapshot)
+            .expect("green tree matches the file in this snapshot");
+        let map = AstIdMap::new(file, &root).expect("item count fits ErasedAstId");
+        assert!(matches!(
+            AstIdMap::new(FileId::new(8), &root),
+            Err(AstIdMapError::FileMismatch)
+        ));
+        let second_fn = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FN_DECL)
+            .expect("function declaration");
+        assert!(matches!(
+            AstIdMap::new(file, &second_fn),
+            Err(AstIdMapError::NotFileRoot)
+        ));
+        let unbound_root = crate::SyntaxNode::new_root(parse_file(source).root);
+        assert!(matches!(
+            AstIdMap::new(file, &unbound_root),
+            Err(AstIdMapError::UnboundRoot)
+        ));
+        let test = root
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("test declaration");
+        let test_id = map.ast_id(&test).expect("current test node has an AST ID");
+        let test_ptr = map.get(test_id).expect("current test ID has a pointer");
+        let same_source_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file, source, false).expect("same source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("new snapshot with unchanged file contents");
+        let same_source_root = crate::parse(&same_source_snapshot, file)
+            .expect("parse unchanged source in the new snapshot")
+            .root;
+        let same_source_map =
+            AstIdMap::new(file, &same_source_root).expect("same-source snapshot map");
+        let same_source_test = same_source_root
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("test declaration in same-source snapshot");
+        let same_source_test_id = same_source_map
+            .ast_id(&same_source_test)
+            .expect("same-source test node has an AST ID");
+        assert_eq!(test_id.erase(), same_source_test_id.erase());
+        assert!(map.get(same_source_test_id).is_none());
+        assert!(same_source_map.get(test_id).is_none());
+        assert!(test_ptr.resolve(file, &same_source_root).is_none());
+
+        let other_file = FileId::new(8);
+        let other_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(other_file, source, false).expect("other file source")),
+            "src/other.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("other file snapshot");
+        let other_root = crate::SyntaxNode::new_root_in_snapshot(
+            parse_file(source).root,
+            other_file,
+            &other_snapshot,
+        )
+        .expect("tree matches the other file snapshot");
+        let other_map = AstIdMap::new(other_file, &other_root).expect("other file map");
+        let other_test = other_root
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("test declaration in other file");
+        let other_test_id = other_map
+            .ast_id(&other_test)
+            .expect("other file test node has an AST ID");
+        assert!(map.get(other_test_id).is_none());
+        let second_version = source.replace("test \"works\"", "test \"other\"");
+        let same_file_new_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(
+                SourceFile::new(file, second_version.as_str(), false)
+                    .expect("second version source"),
+            ),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("second snapshot for the same file");
+        let same_file_new_root = crate::SyntaxNode::new_root_in_snapshot(
+            parse_file(&second_version).root,
+            file,
+            &same_file_new_snapshot,
+        )
+        .expect("tree matches the second file snapshot");
+        let same_file_new_map =
+            AstIdMap::new(file, &same_file_new_root).expect("second map for the same file");
+        let same_file_new_test = same_file_new_root
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("test declaration in second snapshot");
+        let same_file_new_test_id = same_file_new_map
+            .ast_id(&same_file_new_test)
+            .expect("test declaration has an AST ID in second snapshot");
+        assert_eq!(test_id.erase(), same_file_new_test_id.erase());
+        assert!(map.get(same_file_new_test_id).is_none());
+        let item_kinds = [
+            SyntaxKind::USE_DECL,
+            SyntaxKind::FN_DECL,
+            SyntaxKind::CONST_PARAM,
+            SyntaxKind::TYPE_PARAM,
+            SyntaxKind::TYPE_DECL,
+            SyntaxKind::FIELD_DECL,
+            SyntaxKind::ENUM_DECL,
+            SyntaxKind::VARIANT_DECL,
+            SyntaxKind::VARIANT_FIELD,
+            SyntaxKind::DISTINCT_DECL,
+            SyntaxKind::CONST_DECL,
+            SyntaxKind::INVARIANT_DECL,
+            SyntaxKind::EFFECT_DECL,
+            SyntaxKind::RESOURCE_DECL,
+            SyntaxKind::TRAIT_DECL,
+            SyntaxKind::ASSOC_TYPE_DECL,
+            SyntaxKind::IMPL_DECL,
+            SyntaxKind::ASSOC_TYPE_DEF,
+            SyntaxKind::INTERFACE_DECL,
+            SyntaxKind::IFACE_RESOURCE,
+            SyntaxKind::WORLD_DECL,
+            SyntaxKind::WORLD_IMPORT,
+            SyntaxKind::WORLD_EXPORT,
+            SyntaxKind::WORLD_INCLUDE,
+            SyntaxKind::EXTERN_BLOCK,
+            SyntaxKind::TEST_DECL,
+            SyntaxKind::PROPERTY_DECL,
+        ];
+        let expected = root
+            .descendants()
+            .filter(|node| item_kinds.contains(&node.kind()))
+            .map(|node| crate::SyntaxNodePtr::new(file, &node).expect("matching file identity"))
+            .collect::<Vec<_>>();
+        assert_eq!(map.len(), expected.len());
+        for (index, pointer) in expected.iter().enumerate() {
+            assert_eq!(
+                map.pointer(ErasedAstId::new(index as u32)),
+                Some(pointer.clone()),
+                "item-like node {index} should retain pre-order"
+            );
+        }
+
+        let property = root
+            .descendants()
+            .find_map(PropertyDecl::cast)
+            .expect("property declaration");
+        let property_id = map
+            .ast_id(&property)
+            .expect("current property node has an AST ID");
+        assert!(map.get(test_id).is_some());
+        assert!(map.get(property_id).is_some());
+        assert_eq!(map.get(test_id), map.get(test_id));
+        assert_eq!(map.ast_id(&test), Some(test_id));
+        assert!(AstId::<TestDecl>::from_erased(&map, ErasedAstId::new(u32::MAX)).is_none());
+        let same_snapshot_root =
+            crate::SyntaxNode::new_root_in_snapshot(parse_file(source).root, file, &snapshot)
+                .expect("tree matches the same file snapshot");
+        let same_snapshot_test = same_snapshot_root
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("test declaration in recreated red tree");
+        assert_eq!(
+            map.ast_id(&same_snapshot_test).map(AstId::erase),
+            Some(test_id.erase())
+        );
+
+        let const_param = root
+            .descendants()
+            .find_map(ConstParam::cast)
+            .expect("const generic parameter");
+        let type_param = root
+            .descendants()
+            .find_map(TypeParam::cast)
+            .expect("type generic parameter");
+        assert!(map.ast_id(&const_param).is_some());
+        assert!(map.ast_id(&type_param).is_some());
+
+        let literal = root
+            .descendants()
+            .find_map(Expr::cast)
+            .expect("function body expression");
+        assert!(map.ast_id(&literal).is_none());
+
+        let reparsed = crate::SyntaxNode::new_root(parse_file(source).root);
+        let reparsed_test = reparsed
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("reparsed test declaration");
+        assert!(map.ast_id(&reparsed_test).is_none());
+
+        let edited_source = source.replace("let local = 1", "let local = 123456");
+        let edited_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file, edited_source.as_str(), false).expect("edited source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("edited snapshot");
+        let edited_root = crate::SyntaxNode::new_root_in_snapshot(
+            parse_file(&edited_source).root,
+            file,
+            &edited_snapshot,
+        )
+        .expect("tree matches the edited file snapshot");
+        let edited_map =
+            AstIdMap::new(file, &edited_root).expect("edited item count fits ErasedAstId");
+        let edited_test = edited_root
+            .descendants()
+            .find_map(TestDecl::cast)
+            .expect("test declaration after body edit");
+        assert_eq!(
+            edited_map
+                .ast_id(&edited_test)
+                .expect("edited test node has an AST ID")
+                .erase(),
+            test_id.erase(),
+            "editing a function body must not renumber later item-like nodes"
+        );
+    }
+
+    #[test]
     fn unterminated_format_string_recovers_at_the_next_block_statement() {
         let source = concat!(
             "fn f(value: I32) {\n",
@@ -6667,6 +7033,36 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
             })
             .map(|node| node.text_range().start().to_usize())
             .collect::<Vec<_>>();
+        let empty_error_nodes = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ERROR && node.text_range().is_empty())
+            .collect::<Vec<_>>();
+        let pointers = empty_error_nodes
+            .iter()
+            .map(|node| {
+                crate::SyntaxNodePtr::new(sai_vfs::FileId::new(1), node)
+                    .expect("unbound syntax roots accept an explicit file identity")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            pointers.len() >= 3,
+            "fixture must include the coincident empty recovery nodes"
+        );
+        assert_eq!(
+            pointers.iter().collect::<HashSet<_>>().len(),
+            pointers.len(),
+            "pre-order node indices must distinguish nodes with identical kind and range"
+        );
+        for pointer in &pointers {
+            let resolved = pointer
+                .resolve(sai_vfs::FileId::new(1), &root)
+                .expect("pointer should resolve within its tree");
+            assert_eq!(
+                &crate::SyntaxNodePtr::new(sai_vfs::FileId::new(1), &resolved)
+                    .expect("unbound syntax roots accept an explicit file identity"),
+                pointer
+            );
+        }
 
         assert_eq!(
             root.descendants()
