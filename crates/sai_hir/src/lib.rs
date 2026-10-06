@@ -2,6 +2,7 @@
 
 pub mod arena;
 pub mod attrs;
+pub mod expressions;
 pub mod item_tree;
 pub mod literals;
 pub mod patterns;

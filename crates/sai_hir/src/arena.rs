@@ -1,3 +1,4 @@
+use crate::expressions::{Arg, Arm, Block, Closure, ClosureParam, Expr, FmtPiece, Stmt};
 use crate::literals::Lit;
 use crate::patterns::{Pat, PatArg};
 use crate::types::{
@@ -6,7 +7,7 @@ use crate::types::{
 };
 use sai_intern::Arena;
 
-/// Stable storage for HIR type and pattern nodes and their borrowed child lists.
+/// Stable storage for HIR nodes and their borrowed child lists.
 pub struct HirArena<'hir> {
     tys: Arena<Ty<'hir>>,
     ty_lists: Arena<Ty<'hir>>,
@@ -33,6 +34,19 @@ pub struct HirArena<'hir> {
     pat_lists: Arena<Pat<'hir>>,
     pat_args: Arena<PatArg<'hir>>,
     pat_arg_lists: Arena<PatArg<'hir>>,
+    exprs: Arena<Expr<'hir>>,
+    expr_lists: Arena<Expr<'hir>>,
+    args: Arena<Arg<'hir>>,
+    arg_lists: Arena<Arg<'hir>>,
+    arms: Arena<Arm<'hir>>,
+    arm_lists: Arena<Arm<'hir>>,
+    closures: Arena<Closure<'hir>>,
+    closure_params: Arena<ClosureParam<'hir>>,
+    closure_param_lists: Arena<ClosureParam<'hir>>,
+    fmt_piece_lists: Arena<FmtPiece<'hir>>,
+    blocks: Arena<Block<'hir>>,
+    stmts: Arena<Stmt<'hir>>,
+    stmt_lists: Arena<Stmt<'hir>>,
 }
 
 impl<'hir> HirArena<'hir> {
@@ -63,6 +77,19 @@ impl<'hir> HirArena<'hir> {
             pat_lists: Arena::new(),
             pat_args: Arena::new(),
             pat_arg_lists: Arena::new(),
+            exprs: Arena::new(),
+            expr_lists: Arena::new(),
+            args: Arena::new(),
+            arg_lists: Arena::new(),
+            arms: Arena::new(),
+            arm_lists: Arena::new(),
+            closures: Arena::new(),
+            closure_params: Arena::new(),
+            closure_param_lists: Arena::new(),
+            fmt_piece_lists: Arena::new(),
+            blocks: Arena::new(),
+            stmts: Arena::new(),
+            stmt_lists: Arena::new(),
         }
     }
 
@@ -177,6 +204,61 @@ impl<'hir> HirArena<'hir> {
     pub fn alloc_pat_args(&'hir self, args: &[PatArg<'hir>]) -> &'hir [PatArg<'hir>] {
         self.pat_arg_lists.alloc_slice(args)
     }
+
+    pub fn alloc_expr(&'hir self, expr: Expr<'hir>) -> &'hir Expr<'hir> {
+        self.exprs.alloc(expr)
+    }
+
+    pub fn alloc_exprs(&'hir self, exprs: &[Expr<'hir>]) -> &'hir [Expr<'hir>] {
+        self.expr_lists.alloc_slice(exprs)
+    }
+
+    pub fn alloc_arg(&'hir self, arg: Arg<'hir>) -> &'hir Arg<'hir> {
+        self.args.alloc(arg)
+    }
+
+    pub fn alloc_args(&'hir self, args: &[Arg<'hir>]) -> &'hir [Arg<'hir>] {
+        self.arg_lists.alloc_slice(args)
+    }
+
+    pub fn alloc_arm(&'hir self, arm: Arm<'hir>) -> &'hir Arm<'hir> {
+        self.arms.alloc(arm)
+    }
+
+    pub fn alloc_arms(&'hir self, arms: &[Arm<'hir>]) -> &'hir [Arm<'hir>] {
+        self.arm_lists.alloc_slice(arms)
+    }
+
+    pub fn alloc_closure(&'hir self, closure: Closure<'hir>) -> &'hir Closure<'hir> {
+        self.closures.alloc(closure)
+    }
+
+    pub fn alloc_closure_param(&'hir self, param: ClosureParam<'hir>) -> &'hir ClosureParam<'hir> {
+        self.closure_params.alloc(param)
+    }
+
+    pub fn alloc_closure_params(
+        &'hir self,
+        params: &[ClosureParam<'hir>],
+    ) -> &'hir [ClosureParam<'hir>] {
+        self.closure_param_lists.alloc_slice(params)
+    }
+
+    pub fn alloc_fmt_pieces(&'hir self, pieces: &[FmtPiece<'hir>]) -> &'hir [FmtPiece<'hir>] {
+        self.fmt_piece_lists.alloc_slice(pieces)
+    }
+
+    pub fn alloc_block(&'hir self, block: Block<'hir>) -> &'hir Block<'hir> {
+        self.blocks.alloc(block)
+    }
+
+    pub fn alloc_stmt(&'hir self, stmt: Stmt<'hir>) -> &'hir Stmt<'hir> {
+        self.stmts.alloc(stmt)
+    }
+
+    pub fn alloc_stmts(&'hir self, stmts: &[Stmt<'hir>]) -> &'hir [Stmt<'hir>] {
+        self.stmt_lists.alloc_slice(stmts)
+    }
 }
 
 impl Default for HirArena<'_> {
@@ -188,6 +270,7 @@ impl Default for HirArena<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::{CaptureBy, ExprKind, FmtSpec, MatchSource, StmtKind};
     use crate::patterns::PatKind;
     use crate::types::{
         BoundKind, ConstArg, FnTraitKind, GenericArg, GenericParamKind, LangItem, PathRoot, TyKind,
@@ -346,5 +429,125 @@ mod tests {
 
         assert_eq!(patterns[0].kind, PatKind::Lit(Lit::ByteStr(&[0, 255, 128])));
         assert_eq!(bytes, &[0, 255, 128]);
+    }
+
+    #[test]
+    fn arena_stores_expression_block_statement_arm_and_closure_graphs() {
+        let arena = HirArena::new();
+        let hir_id = test_hir_id();
+        let symbols = Interner::new();
+        let literal = arena.alloc_expr(Expr {
+            hir_id,
+            kind: ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            }),
+            span: span(3),
+        });
+        let tuple_items = arena.alloc_exprs(&[*literal, *literal]);
+        let tuple = arena.alloc_expr(Expr {
+            hir_id,
+            kind: ExprKind::Tuple(tuple_items),
+            span: span(2),
+        });
+        let argument = arena.alloc_arg(Arg {
+            name: None,
+            expr: tuple,
+        });
+        let arguments = arena.alloc_args(&[*argument]);
+        let stmt = arena.alloc_stmt(Stmt {
+            hir_id,
+            kind: StmtKind::Assert {
+                cond: tuple,
+                msg: Some(literal),
+                cond_text: symbols.intern("1 == 1").expect("symbol interns"),
+            },
+            span: span(1),
+        });
+        let stmts = arena.alloc_stmts(&[*stmt]);
+        let block = arena.alloc_block(Block {
+            hir_id,
+            stmts,
+            tail: Some(tuple),
+            safety: crate::Safety::Safe,
+            span: span(0),
+        });
+        let pat = arena.alloc_pat(Pat {
+            hir_id,
+            kind: PatKind::Wild,
+            span: span(4),
+        });
+        let arm = arena.alloc_arm(Arm {
+            hir_id,
+            pat,
+            guard: None,
+            body: tuple,
+            span: span(4),
+            synthesized: true,
+        });
+        let arms = arena.alloc_arms(&[*arm]);
+        let match_expr = arena.alloc_expr(Expr {
+            hir_id,
+            kind: ExprKind::Match {
+                scrutinee: tuple,
+                arms,
+                source: MatchSource::IfLet,
+            },
+            span: span(4),
+        });
+        let closure_param = arena.alloc_closure_param(ClosureParam {
+            hir_id,
+            binding: crate::BindingId::default(),
+            name: None,
+            mutable: false,
+            ty: None,
+        });
+        let closure_params = arena.alloc_closure_params(&[*closure_param]);
+        let closure = arena.alloc_closure(Closure {
+            def_id: hir_id.owner.def_id,
+            capture: CaptureBy::Move,
+            params: closure_params,
+            ret: None,
+            body: block,
+        });
+        let closure_expr = arena.alloc_expr(Expr {
+            hir_id,
+            kind: ExprKind::Closure(closure),
+            span: span(5),
+        });
+        let fmt_pieces = arena.alloc_fmt_pieces(&[
+            FmtPiece::Text(symbols.intern("value=").expect("symbol interns")),
+            FmtPiece::Arg {
+                expr: tuple,
+                spec: Some(FmtSpec {
+                    name: symbols.intern("hex").expect("symbol interns"),
+                    arg: Some(16),
+                    span: span(6),
+                }),
+            },
+        ]);
+        let fmt_expr = arena.alloc_expr(Expr {
+            hir_id,
+            kind: ExprKind::FormatString(fmt_pieces),
+            span: span(6),
+        });
+
+        for offset in 0..128 {
+            arena.alloc_expr(Expr {
+                hir_id,
+                kind: ExprKind::Err,
+                span: span(offset),
+            });
+        }
+
+        assert_eq!(tuple_items.len(), 2);
+        assert_eq!(arguments[0].expr, tuple);
+        assert_eq!(block.stmts.len(), 1);
+        assert!(arms[0].synthesized);
+        assert_eq!(closure.params.len(), 1);
+        assert_eq!(fmt_pieces.len(), 2);
+        assert!(matches!(match_expr.kind, ExprKind::Match { .. }));
+        assert!(matches!(closure_expr.kind, ExprKind::Closure(_)));
+        assert!(matches!(fmt_expr.kind, ExprKind::FormatString(_)));
     }
 }
