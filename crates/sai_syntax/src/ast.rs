@@ -345,6 +345,7 @@ ast_token!(CharLit, CHAR);
 ast_token!(ByteLit, BYTE);
 ast_token!(FormatSpec, FSTRING_SPEC);
 ast_token!(PkgPath, PKG_PATH);
+ast_token!(Label, LABEL);
 
 #[derive(Clone, Debug)]
 pub enum Expr {

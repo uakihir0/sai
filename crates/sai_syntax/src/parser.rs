@@ -3070,8 +3070,9 @@ mod tests {
     #[test]
     fn generated_control_flow_roles_follow_parsed_children() {
         use crate::ast::{
-            AstNode, AsyncBlockExpr, BreakExpr, ClosureExpr, ForExpr, IfExpr, LoopExpr, MatchExpr,
-            PrefixExpr, RegionExpr, ReturnExpr, UnsafeBlockExpr, WhileExpr,
+            AstNode, AstToken, AsyncBlockExpr, BreakExpr, ClosureExpr, ContinueExpr, ForExpr,
+            IfExpr, LoopExpr, MatchExpr, PrefixExpr, RegionExpr, ReturnExpr, UnsafeBlockExpr,
+            WhileExpr,
         };
 
         let source = concat!(
@@ -3085,8 +3086,11 @@ mod tests {
             "}\n",
             "'outer:\n",
             "loop { break 'outer 1 }\n",
-            "while let Some(item) = values { break }\n",
-            "for item in values { continue }\n",
+            "'middle:\n",
+            "while let Some(item) = values { continue 'middle\nbreak }\n",
+            "'inner:\n",
+            "for item in values { continue 'inner }\n",
+            "loop { continue\nbreak }\n",
             "let callback = fn(x: I32) -> I32 { x }\n",
             "let plain_callback = fn(y) { y }\n",
             "let task = async { values }\n",
@@ -3143,18 +3147,37 @@ mod tests {
         assert!(arms[0].expression().is_some());
         assert!(arms[1].guard().is_none());
 
-        let loop_expr = root
+        let loops = root
             .descendants()
-            .find_map(LoopExpr::cast)
-            .expect("loop expression");
-        assert!(loop_expr.label().is_some());
-        assert!(loop_expr.body().is_some());
+            .filter_map(LoopExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(loops.len(), 2);
+        assert_eq!(
+            loops[0]
+                .label()
+                .and_then(|label| label.label())
+                .expect("loop label token")
+                .syntax()
+                .text(),
+            "'outer"
+        );
+        assert!(loops[0].body().is_some());
+        assert!(loops[1].label().is_none());
+        assert!(loops[1].body().is_some());
 
         let while_expr = root
             .descendants()
             .find_map(WhileExpr::cast)
             .expect("while expression");
-        assert!(while_expr.label().is_none());
+        assert_eq!(
+            while_expr
+                .label()
+                .and_then(|label| label.label())
+                .expect("while label token")
+                .syntax()
+                .text(),
+            "'middle"
+        );
         let while_condition = while_expr.condition().expect("while condition");
         assert!(while_condition.let_condition().is_some());
         assert!(while_expr.body().is_some());
@@ -3163,7 +3186,15 @@ mod tests {
             .descendants()
             .find_map(ForExpr::cast)
             .expect("for expression");
-        assert!(for_expr.label().is_none());
+        assert_eq!(
+            for_expr
+                .label()
+                .and_then(|label| label.label())
+                .expect("for label token")
+                .syntax()
+                .text(),
+            "'inner"
+        );
         assert!(for_expr.pattern().is_some());
         assert!(for_expr.iterable().is_some());
         assert!(for_expr.body().is_some());
@@ -3220,12 +3251,70 @@ mod tests {
                 .all(|node| crate::ast::BlockExpr::cast(node).unwrap().block().is_some())
         );
 
-        assert!(
-            root.descendants()
-                .find_map(BreakExpr::cast)
-                .and_then(|expression| expression.value())
-                .is_some()
+        let breaks = root
+            .descendants()
+            .filter_map(BreakExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(breaks.len(), 3);
+        assert_eq!(
+            breaks[0]
+                .label()
+                .expect("break label token")
+                .syntax()
+                .text(),
+            "'outer"
         );
+        assert!(breaks[0].value().is_some());
+        assert!(breaks[1].label().is_none());
+        assert!(breaks[1].value().is_none());
+        assert!(breaks[2].label().is_none());
+        assert!(breaks[2].value().is_none());
+
+        let continues = root
+            .descendants()
+            .filter_map(ContinueExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(continues.len(), 3);
+        assert_eq!(
+            continues[0]
+                .label()
+                .expect("while continue label")
+                .syntax()
+                .text(),
+            "'middle"
+        );
+        assert_eq!(
+            continues[1]
+                .label()
+                .expect("for continue label")
+                .syntax()
+                .text(),
+            "'inner"
+        );
+        assert!(continues[2].label().is_none());
+
+        let nested_loop_break =
+            parse_file("fn nested_loop_break() { loop { break 'value: loop { break } } }\n");
+        assert!(
+            nested_loop_break.errors.is_empty(),
+            "{:?}",
+            nested_loop_break.errors
+        );
+        let nested_loop_root = crate::SyntaxNode::new_root(nested_loop_break.root);
+        let nested_loop_break = nested_loop_root
+            .descendants()
+            .find_map(BreakExpr::cast)
+            .expect("break whose value is a labeled loop");
+        assert!(nested_loop_break.label().is_none());
+        assert_eq!(
+            nested_loop_break
+                .value()
+                .expect("labeled loop break value")
+                .syntax()
+                .kind(),
+            SyntaxKind::LOOP_EXPR
+        );
+
         assert!(
             root.descendants()
                 .find_map(ReturnExpr::cast)
