@@ -520,44 +520,74 @@ impl<I: Idx, T: StableHash> StableHash for IndexVec<I, T> {
     }
 }
 
-/// A per-session arena for copyable values with stable addresses.
+/// A per-session arena for copyable values and slices with stable addresses.
 ///
 /// Restricting values to `Copy` ensures that dropping arena entries cannot run
 /// user destructors that observe other entries while the arena is being torn
 /// down.
 pub struct Arena<T: Copy> {
-    values: Mutex<Vec<Box<T>>>,
+    storage: Mutex<ArenaStorage<T>>,
+}
+
+struct ArenaStorage<T> {
+    values: Vec<Box<T>>,
+    slices: Vec<Box<[T]>>,
 }
 
 impl<T: Copy> Arena<T> {
     pub fn new() -> Self {
         Self {
-            values: Mutex::new(Vec::new()),
+            storage: Mutex::new(ArenaStorage {
+                values: Vec::new(),
+                slices: Vec::new(),
+            }),
         }
     }
 
     pub fn alloc(&self, value: T) -> &T {
         let boxed = Box::new(value);
         let pointer = &*boxed as *const T;
-        self.values
+        self.storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values
             .push(boxed);
 
-        // SAFETY: the Box allocation is retained in `self.values`, which never
-        // removes or moves its pointee. The returned reference is tied to
-        // `&self`, so it cannot outlive the arena. `T: Copy` also guarantees
-        // that arena teardown does not run a destructor that could observe
-        // another allocation after its lifetime ends. The mutex only protects
-        // the owning vector; the pointee's address is stable after unlock.
+        // SAFETY: the Box allocation is retained in `self.storage.values`,
+        // which never removes or moves its pointee. The returned reference is
+        // tied to `&self`, so it cannot outlive the arena. `T: Copy` also
+        // guarantees that arena teardown does not run a destructor that could
+        // observe another allocation after its lifetime ends. The mutex only
+        // protects the owning vector; the pointee's address is stable after
+        // unlock.
         unsafe { &*pointer }
     }
 
-    pub fn len(&self) -> usize {
-        self.values
+    /// Copies a slice into the arena and returns a stable reference to it.
+    pub fn alloc_slice(&self, values: &[T]) -> &[T] {
+        let boxed = values.to_vec().into_boxed_slice();
+        let pointer = boxed.as_ref() as *const [T];
+        self.storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+            .slices
+            .push(boxed);
+
+        // SAFETY: the Box allocation is retained in `self.storage.slices`,
+        // which never removes or moves its pointee. The returned reference is
+        // tied to `&self`, so it cannot outlive the arena. `T: Copy` guarantees
+        // that teardown cannot run an element destructor that observes other
+        // allocations after their lifetimes end.
+        unsafe { &*pointer }
+    }
+
+    /// Returns the number of individually allocated values and slices.
+    pub fn len(&self) -> usize {
+        let storage = self
+            .storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        storage.values.len() + storage.slices.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -776,6 +806,49 @@ mod tests {
         assert_eq!(first_ptr, first as *const [u32; 3]);
         assert_eq!(first, &[1, 2, 3]);
         assert_eq!(arena.len(), 129);
+    }
+
+    #[test]
+    fn arena_slice_allocations_keep_their_addresses_stable() {
+        let arena = Arena::new();
+        let first = arena.alloc_slice(&[1_u32, 2, 3]);
+        let first_ptr = first.as_ptr();
+
+        for value in 0..128_u32 {
+            arena.alloc_slice(&[value; 3]);
+        }
+        let empty = arena.alloc_slice(&[]);
+
+        assert_eq!(first_ptr, first.as_ptr());
+        assert_eq!(first, &[1, 2, 3]);
+        assert!(empty.is_empty());
+        assert_eq!(arena.len(), 130);
+    }
+
+    #[test]
+    fn arena_slice_allocations_support_concurrent_access() {
+        let arena = Arc::new(Arena::new());
+        let first = arena.alloc_slice(&[0xABCD_u32, 0x1234]);
+        let first_address = first.as_ptr() as usize;
+        let workers = (0..16)
+            .map(|worker| {
+                let arena = Arc::clone(&arena);
+                thread::spawn(move || {
+                    for offset in 0..32_u32 {
+                        let value = worker * 32 + offset;
+                        assert_eq!(arena.alloc_slice(&[value; 2]), &[value; 2]);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("worker completes");
+        }
+
+        assert_eq!(first.as_ptr() as usize, first_address);
+        assert_eq!(first, &[0xABCD, 0x1234]);
+        assert_eq!(arena.len(), 1 + 16 * 32);
     }
 
     #[test]
