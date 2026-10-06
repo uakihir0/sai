@@ -340,3 +340,20 @@ child CoversClause set EffectSet 0
 child EffectsClause set EffectSet 0
 children EffectSet effects EffectRef
 children EffectRef segments NameRef
+child TraitDecl name Name 0
+child TraitDecl generic_params GenericParamList 0
+child TraitDecl bounds BoundList 0
+child TraitDecl where_clause WhereClause 0
+child TraitDecl items ItemList 0
+child AssocTypeDecl name Name 0
+child AssocTypeDecl bounds BoundList 0
+child ImplDecl generic_params GenericParamList 0
+child_after ImplDecl for_type Type FOR_KW 0
+child ImplDecl interface_path ModPath 0
+child ImplDecl where_clause WhereClause 0
+child ImplDecl items ItemList 0
+children ItemList functions FnDecl
+children ItemList assoc_type_decls AssocTypeDecl
+children ItemList assoc_type_defs AssocTypeDef
+child AssocTypeDef name Name 0
+child AssocTypeDef ty Type 0

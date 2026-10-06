@@ -1053,6 +1053,7 @@ pub trait AstToken: Sized {
 - **Enum declaration roles.** Enums expose their name, generic parameters, optional where clause, and variant list. Variants expose docs, attributes, their name, optional tuple or record shape, and optional discriminants; tuple shapes iterate types, record shapes iterate named fields, and discriminants expose the integer token and optional minus token separately.
 - **Distinct and resource roles.** Distinct declarations expose their name, generic parameters, optional base type and refinement, plus `inner_pub_token()` for the constructor-visibility marker. Resources expose their name and optional field list; the shared `FieldDecl` accessors describe resource fields.
 - **Const, invariant, and effect roles.** Constants expose name, type, and initializer; invariants expose their name and predicate list; effects expose their name and optional covers clause. Covers clauses and function effects clauses expose their effect sets, which iterate effect references, whose segments are individually accessible.
+- **Trait and impl roles.** Traits expose their name, generic parameters, bounds, optional where clause, and item list. Item lists provide separate iterators for functions, associated type declarations, and associated type definitions. Impl blocks expose generic parameters, where clauses, item lists, and target accessors that distinguish trait references/`for` types, inherent types, and interface paths; unsafe markers remain directly accessible.
 
 ### 2.7.2 Accessors
 

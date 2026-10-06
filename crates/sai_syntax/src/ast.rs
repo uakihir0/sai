@@ -964,3 +964,29 @@ impl DistinctDecl {
         direct_token_of_kind(self.syntax(), SyntaxKind::PUB_KW)
     }
 }
+
+impl TraitDecl {
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::UNSAFE_KW)
+    }
+}
+
+impl ImplDecl {
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::UNSAFE_KW)
+    }
+
+    pub fn trait_ref(&self) -> Option<Type> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::FOR_KW)
+            .and_then(|_| direct_child_before(self.syntax(), SyntaxKind::FOR_KW, 0))
+    }
+
+    pub fn inherent_type(&self) -> Option<Type> {
+        if direct_token_of_kind(self.syntax(), SyntaxKind::FOR_KW).is_some()
+            || self.interface_path().is_some()
+        {
+            return None;
+        }
+        direct_child_at(self.syntax(), 0)
+    }
+}

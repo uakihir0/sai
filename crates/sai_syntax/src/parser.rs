@@ -5423,6 +5423,135 @@ let byte_non_ascii = b"€"
     }
 
     #[test]
+    fn trait_and_impl_accessors_expose_bounds_targets_and_member_kinds() {
+        use crate::ast::{AstNode, ImplDecl, TraitDecl};
+
+        let source = concat!(
+            "trait Convert<T>: Clone where T: Copy {\n",
+            "type Output: Clone\n",
+            "fn convert(value: T) -> T\n",
+            "}\n",
+            "unsafe trait Marker {}\n",
+            "unsafe impl<T> Convert<T, Output = T> for Box<T> where T: Copy {\n",
+            "type Output = T\n",
+            "fn convert(value: T) -> T { value }\n",
+            "}\n",
+            "impl Box<I32> {\n",
+            "pub fn identity(value: I32) -> I32 { value }\n",
+            "}\n",
+            "impl wasi.http {\n",
+            "fn get() -> I32 { 1 }\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let traits = root
+            .descendants()
+            .filter_map(TraitDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(traits.len(), 2);
+        let convert = &traits[0];
+        assert!(convert.name().is_some());
+        assert!(convert.generic_params().is_some());
+        assert!(convert.bounds().is_some());
+        assert!(convert.where_clause().is_some());
+        assert!(convert.unsafe_token().is_none());
+        let trait_items = convert.items().expect("trait item list");
+        assert_eq!(trait_items.functions().count(), 1);
+        let assoc_type = trait_items
+            .assoc_type_decls()
+            .next()
+            .expect("trait associated type declaration");
+        assert!(assoc_type.name().is_some());
+        assert!(assoc_type.bounds().is_some());
+        assert_eq!(trait_items.assoc_type_defs().count(), 0);
+
+        let marker = &traits[1];
+        assert!(marker.unsafe_token().is_some());
+        let marker_items = marker.items().expect("empty trait item list");
+        assert_eq!(marker_items.functions().count(), 0);
+        assert_eq!(marker_items.assoc_type_decls().count(), 0);
+
+        let impls = root
+            .descendants()
+            .filter_map(ImplDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(impls.len(), 3);
+        let trait_impl = &impls[0];
+        assert!(trait_impl.unsafe_token().is_some());
+        assert!(trait_impl.generic_params().is_some());
+        let trait_ref = trait_impl
+            .trait_ref()
+            .expect("trait reference before `for`");
+        let trait_ref_range = trait_ref.syntax().text_range();
+        assert_eq!(
+            &source[trait_ref_range.start().to_usize()..trait_ref_range.end().to_usize()],
+            "Convert<T, Output = T>"
+        );
+        let for_type = trait_impl
+            .for_type()
+            .expect("implementation type after `for`");
+        let for_type_range = for_type.syntax().text_range();
+        assert_eq!(
+            &source[for_type_range.start().to_usize()..for_type_range.end().to_usize()],
+            "Box<T>"
+        );
+        assert!(trait_impl.inherent_type().is_none());
+        assert!(trait_impl.interface_path().is_none());
+        assert!(trait_impl.where_clause().is_some());
+        let impl_items = trait_impl.items().expect("trait impl item list");
+        assert_eq!(impl_items.functions().count(), 1);
+        assert_eq!(impl_items.assoc_type_decls().count(), 0);
+        let assoc_def = impl_items
+            .assoc_type_defs()
+            .next()
+            .expect("impl associated type definition");
+        assert!(assoc_def.name().is_some());
+        assert!(assoc_def.ty().is_some());
+
+        let inherent_impl = &impls[1];
+        assert!(inherent_impl.trait_ref().is_none());
+        assert!(inherent_impl.for_type().is_none());
+        assert!(inherent_impl.inherent_type().is_some());
+        assert!(inherent_impl.interface_path().is_none());
+        assert_eq!(
+            inherent_impl
+                .items()
+                .expect("inherent impl item list")
+                .functions()
+                .count(),
+            1
+        );
+
+        let interface_impl = &impls[2];
+        assert!(interface_impl.trait_ref().is_none());
+        assert!(interface_impl.for_type().is_none());
+        assert!(interface_impl.inherent_type().is_none());
+        assert!(interface_impl.interface_path().is_some());
+        assert_eq!(
+            interface_impl
+                .items()
+                .expect("interface impl item list")
+                .functions()
+                .count(),
+            1
+        );
+
+        let malformed = parse_file("impl Convert for {\n}\n");
+        assert!(!malformed.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed.root);
+        let malformed_impl = malformed_root
+            .descendants()
+            .find_map(ImplDecl::cast)
+            .expect("recovered trait impl");
+        assert!(malformed_impl.trait_ref().is_some());
+        assert!(malformed_impl.for_type().is_none());
+        assert!(malformed_impl.inherent_type().is_none());
+    }
+
+    #[test]
     fn source_file_parses_trait_inherent_and_interface_impls() {
         let source = concat!(
             "trait Convert<T> {\n",
