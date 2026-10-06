@@ -2,11 +2,11 @@ use crate::SpanCtxt;
 use crate::arena::HirArena;
 use crate::expressions::{Expr, ExprKind};
 use crate::literals::Lit;
-use crate::patterns::{Pat, PatKind};
+use crate::patterns::{Pat, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
-    SyntaxKind, SyntaxNode,
+    SyntaxElement, SyntaxKind, SyntaxNode,
     ast::{self, AstNode, AstToken},
 };
 
@@ -83,6 +83,61 @@ pub fn lower_literal_pat<'hir>(
     Ok(arena.alloc_pat(Pat { hir_id, kind, span }))
 }
 
+/// Lower a range pattern with literal endpoints.
+///
+/// Constant-path endpoints are rejected explicitly until path lowering is
+/// available. Invalid endpoint syntax becomes `PatKind::Err`.
+pub fn lower_range_pat<'hir>(
+    range: &ast::RangePat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    if contains_error_node(range.syntax()) {
+        return lower_error_pattern(range.syntax(), arena, source_map);
+    }
+
+    let start_syntax = range.start();
+    let end_syntax = range.end();
+    if start_syntax
+        .as_ref()
+        .is_some_and(|endpoint| matches!(endpoint, ast::RangePatEndpoint::ConstantPath(_)))
+        || end_syntax
+            .as_ref()
+            .is_some_and(|endpoint| matches!(endpoint, ast::RangePatEndpoint::ConstantPath(_)))
+    {
+        return Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::CONST_PATH));
+    }
+
+    let start = start_syntax
+        .map(|endpoint| lower_range_endpoint(endpoint, arena, symbols))
+        .transpose()?;
+    let end = end_syntax
+        .map(|endpoint| lower_range_endpoint(endpoint, arena, symbols))
+        .transpose()?;
+    let inclusive = range.syntax().children_with_tokens().any(|element| {
+        matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::DOT2EQ)
+    });
+    let invalid_shape = if inclusive {
+        end.is_none()
+    } else {
+        start.is_none()
+    };
+    let invalid_endpoint = start.is_some_and(|endpoint| endpoint.is_none())
+        || end.is_some_and(|endpoint| endpoint.is_none());
+    let (hir_id, span) = source_map.add_node_with_span(range.syntax(), SpanCtxt::Root)?;
+    let kind = if invalid_shape || invalid_endpoint {
+        PatKind::Err
+    } else {
+        PatKind::Range {
+            start: start.flatten(),
+            end: end.flatten(),
+            inclusive,
+        }
+    };
+    Ok(arena.alloc_pat(Pat { hir_id, kind, span }))
+}
+
 /// Lower the pattern forms that do not require recursive child construction
 /// beyond parenthesis stripping.
 ///
@@ -109,6 +164,7 @@ pub fn lower_pattern<'hir>(
             }))
         }
         ast::Pattern::Literal(literal) => lower_literal_pat(literal, arena, symbols, source_map),
+        ast::Pattern::Range(range) => lower_range_pat(range, arena, symbols, source_map),
         ast::Pattern::Parenthesized(paren) => match paren.pattern() {
             Some(inner) => lower_pattern(&inner, arena, symbols, source_map),
             None => lower_error_pattern(paren.syntax(), arena, source_map),
@@ -128,6 +184,31 @@ fn lower_error_pattern<'hir>(
         kind: PatKind::Err,
         span,
     }))
+}
+
+fn lower_range_endpoint<'hir>(
+    endpoint: ast::RangePatEndpoint,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+) -> Result<Option<PatRangeEnd<'hir>>, HirLoweringError> {
+    match endpoint {
+        ast::RangePatEndpoint::Literal(literal) => {
+            if contains_error_node(literal.syntax()) {
+                return Ok(None);
+            }
+            let negative = literal.minus_token().is_some();
+            let decoded = literal
+                .value_token()
+                .and_then(ast::LiteralToken::cast)
+                .map(|token| decode_literal(token, arena, symbols, false, negative))
+                .transpose()?
+                .flatten();
+            Ok(decoded.map(PatRangeEnd::Lit))
+        }
+        ast::RangePatEndpoint::ConstantPath(path) => {
+            Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()))
+        }
+    }
 }
 
 fn decode_literal<'hir>(
@@ -508,5 +589,151 @@ mod tests {
 
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 4);
+    }
+
+    #[test]
+    fn lowers_open_inclusive_and_literal_range_patterns() {
+        let file = crate::FileId::new(66);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() { match value { 1..=4 => (), ..=8 => (), 9.. => (), 'a'..'z' => (), b'A'..=b'Z' => (), 1..2 => (), -2..=-1 => (), 1..=2.5 => (), Low..=High => () } }\n",
+        );
+        let function = function_node(&parsed.root);
+        let ranges = function
+            .descendants()
+            .filter_map(ast::RangePat::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(ranges.len(), 9);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::FloatPattern)
+                .count(),
+            1
+        );
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let patterns = ranges[..8]
+            .iter()
+            .map(|range| ast::Pattern::cast(range.syntax().clone()).expect("range pattern variant"))
+            .collect::<Vec<_>>();
+        let lowered = patterns
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("literal range patterns lower");
+
+        assert_eq!(
+            lowered[0].kind,
+            PatKind::Range {
+                start: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(1),
+                    negated: false,
+                })),
+                end: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(4),
+                    negated: false,
+                })),
+                inclusive: true,
+            }
+        );
+        assert_eq!(
+            lowered[1].kind,
+            PatKind::Range {
+                start: None,
+                end: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(8),
+                    negated: false,
+                })),
+                inclusive: true,
+            }
+        );
+        assert_eq!(
+            lowered[2].kind,
+            PatKind::Range {
+                start: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(9),
+                    negated: false,
+                })),
+                end: None,
+                inclusive: false,
+            }
+        );
+        assert_eq!(
+            lowered[3].kind,
+            PatKind::Range {
+                start: Some(PatRangeEnd::Lit(Lit::Char('a'))),
+                end: Some(PatRangeEnd::Lit(Lit::Char('z'))),
+                inclusive: false,
+            }
+        );
+        assert_eq!(
+            lowered[4].kind,
+            PatKind::Range {
+                start: Some(PatRangeEnd::Lit(Lit::Byte(b'A'))),
+                end: Some(PatRangeEnd::Lit(Lit::Byte(b'Z'))),
+                inclusive: true,
+            }
+        );
+        assert_eq!(
+            lowered[5].kind,
+            PatKind::Range {
+                start: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(1),
+                    negated: false,
+                })),
+                end: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(2),
+                    negated: false,
+                })),
+                inclusive: false,
+            }
+        );
+        assert_eq!(
+            lowered[6].kind,
+            PatKind::Range {
+                start: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(2),
+                    negated: true,
+                })),
+                end: Some(PatRangeEnd::Lit(Lit::Int {
+                    value: Some(1),
+                    negated: true,
+                })),
+                inclusive: true,
+            }
+        );
+        assert_eq!(lowered[7].kind, PatKind::Err);
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|pattern| pattern.hir_id.local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        for (pattern, syntax) in lowered.iter().zip(&patterns) {
+            assert_eq!(pattern.span.range, syntax.syntax().text_range());
+            assert_eq!(pattern.span.file, file);
+            assert_eq!(pattern.span.ctxt, SpanCtxt::Root);
+        }
+        assert_eq!(
+            lower_pattern(
+                &ast::Pattern::cast(ranges[8].syntax().clone()).expect("const range pattern"),
+                &arena,
+                &symbols,
+                &mut source_map,
+            )
+            .unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::CONST_PATH)
+        );
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 9);
     }
 }
