@@ -952,3 +952,9 @@ impl LiteralPat {
         )
     }
 }
+
+impl Discriminant {
+    pub fn minus_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::MINUS)
+    }
+}

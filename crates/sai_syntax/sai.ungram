@@ -305,3 +305,20 @@ child FieldDecl ty Type 0
 child AliasDef ty Type 0
 child AliasDef refinement RefinementClause 0
 child RefinementClause expression Expr 0
+child EnumDecl name Name 0
+child EnumDecl generic_params GenericParamList 0
+child EnumDecl where_clause WhereClause 0
+child EnumDecl variants VariantList 0
+children VariantList variants VariantDecl
+child VariantDecl docs Docs 0
+children VariantDecl attrs Attribute
+child VariantDecl name Name 0
+child VariantDecl tuple_shape TupleShape 0
+child VariantDecl record_shape RecordShape 0
+child VariantDecl discriminant Discriminant 0
+children TupleShape types Type
+children RecordShape fields VariantField
+children VariantField attrs Attribute
+child VariantField name Name 0
+child VariantField ty Type 0
+token Discriminant integer IntLit

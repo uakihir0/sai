@@ -4587,6 +4587,119 @@ let byte_non_ascii = b"€"
     }
 
     #[test]
+    fn enum_accessors_expose_variants_shapes_fields_and_signed_discriminants() {
+        use crate::ast::{AstNode, EnumDecl};
+
+        let source = concat!(
+            "enum Result<T, E>\n",
+            "where T: Copy\n",
+            "{\n",
+            "/// A successful result.\n",
+            "@cold\n",
+            "Ok(T),\n",
+            "Err(@field code: E)\n",
+            "}\n",
+            "enum Status { Pending = 0, Failed = -2 }\n",
+            "enum Void {}\n",
+        );
+        let output = parse_file(source);
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidAttributeTarget]
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let declarations = root
+            .descendants()
+            .filter_map(EnumDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 3);
+
+        let result = &declarations[0];
+        assert!(result.name().is_some());
+        assert!(result.generic_params().is_some());
+        assert!(result.where_clause().is_some());
+        let variants = result
+            .variants()
+            .expect("enum variant list")
+            .variants()
+            .collect::<Vec<_>>();
+        assert_eq!(variants.len(), 2);
+
+        let ok = &variants[0];
+        assert!(ok.docs().is_some());
+        assert_eq!(ok.attrs().count(), 1);
+        assert!(ok.name().is_some());
+        assert!(ok.discriminant().is_none());
+        assert!(ok.record_shape().is_none());
+        assert_eq!(
+            ok.tuple_shape()
+                .expect("tuple variant shape")
+                .types()
+                .count(),
+            1
+        );
+
+        let err = &variants[1];
+        assert!(err.docs().is_none());
+        assert_eq!(err.attrs().count(), 0);
+        assert!(err.name().is_some());
+        assert!(err.tuple_shape().is_none());
+        assert!(err.discriminant().is_none());
+        let fields = err
+            .record_shape()
+            .expect("record variant shape")
+            .fields()
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].attrs().count(), 1);
+        assert!(fields[0].name().is_some());
+        assert!(fields[0].ty().is_some());
+
+        let status_variants = declarations[1]
+            .variants()
+            .expect("unit enum variant list")
+            .variants()
+            .collect::<Vec<_>>();
+        let pending = status_variants[0]
+            .discriminant()
+            .expect("positive discriminant");
+        assert_eq!(
+            pending.integer().and_then(|integer| integer.value()),
+            Some(0)
+        );
+        assert!(pending.minus_token().is_none());
+        let failed = status_variants[1]
+            .discriminant()
+            .expect("negative discriminant");
+        assert_eq!(
+            failed.integer().and_then(|integer| integer.value()),
+            Some(2)
+        );
+        assert_eq!(failed.minus_token().expect("discriminant sign").text(), "-");
+
+        assert_eq!(
+            declarations[2]
+                .variants()
+                .expect("empty enum variant list")
+                .variants()
+                .count(),
+            0
+        );
+        let malformed = parse_file("enum Broken\n");
+        assert!(!malformed.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed.root);
+        let malformed_enum = malformed_root
+            .descendants()
+            .find_map(EnumDecl::cast)
+            .expect("recovered enum");
+        assert!(malformed_enum.variants().is_none());
+    }
+
+    #[test]
     fn enum_variants_accept_nested_types_and_function_pointer_payloads() {
         let source = concat!(
             "enum Callback {\n",
