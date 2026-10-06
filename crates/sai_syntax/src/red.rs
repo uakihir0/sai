@@ -565,6 +565,10 @@ impl SyntaxToken {
         &self.green
     }
 
+    pub fn has_error(&self) -> bool {
+        self.green.has_error()
+    }
+
     pub fn parent(&self) -> &SyntaxNode {
         &self.parent
     }
@@ -744,6 +748,22 @@ mod tests {
                 .expect("red handle was materialized");
             assert_eq!(data.index_id.get(), Some(node_id));
         }
+    }
+
+    #[test]
+    fn syntax_tokens_expose_preserved_literal_error_flags() {
+        let root = flat_root("1__2 3");
+        let literal_error_flags = root
+            .children_with_tokens()
+            .filter_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::INT => {
+                    Some(token.has_error())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(literal_error_flags, [true, false]);
     }
 
     #[test]

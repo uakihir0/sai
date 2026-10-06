@@ -170,7 +170,7 @@ bitflags! {
         const AFTER_LINE_BREAK   = 1 << 1;  // at least one line break (in trivia) between the previous token and this one
         const RESERVED           = 1 << 2;  // LIDENT whose text is a reserved word
         const RAW                = 1 << 3;  // LIDENT/UIDENT written with r#
-        const HAS_ERROR          = 1 << 4;  // literal with a reported lexical error (value is recovered)
+        const HAS_ERROR          = 1 << 4;  // token with a reported lexical error
         const IN_E               = 1 << 5;  // counts as a member of E for NEWLINE generation (§2.4.11)
     }
 }
@@ -936,6 +936,7 @@ pub struct GreenTokenData {
     text: SmolStr,                   // token text only; may be empty for NEWLINE, EOF, or an error-marked FSTRING_END
     leading: Box<[GreenTrivia]>,
     trailing: Box<[GreenTrivia]>,
+    has_error: bool,                 // preserves TokenFlags::HAS_ERROR for AST value decoders
 }
 pub struct GreenTrivia { kind: TriviaKind, text: SmolStr }
 
@@ -943,6 +944,7 @@ pub struct NodeCache { /* hash-consing of tokens and of nodes with at most 3 chi
 ```
 
 - Trivia is stored on tokens (leading and trailing lists), not as sibling elements (N-E-16). This makes every comment belong to exactly one token, which is what the formatter (impl/14) and semantic edits (impl/12) need in order to move comments together with the code they describe.
+- Green tokens retain the lexer's `HAS_ERROR` bit for any token with a reported lexical error, including malformed literals and package paths. AST literal decoders use it to avoid treating malformed literal text as a valid value. Other lexer flags are not part of the persistent syntax tree.
 - The tree builder interns tokens and small nodes through a `NodeCache` owned by the `parse` query invocation. Interning is an optimization only; equality of green nodes is structural.
 - `text_len` of a token is the sum of the lengths of its leading trivia, its text, and its trailing trivia.
 

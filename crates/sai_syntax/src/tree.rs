@@ -48,6 +48,7 @@ struct GreenTokenData {
     text: Box<str>,
     leading: Box<[GreenTrivia]>,
     trailing: Box<[GreenTrivia]>,
+    has_error: bool,
     full_text_len: TextSize,
 }
 
@@ -69,6 +70,10 @@ impl GreenToken {
 
     pub fn trailing_trivia(&self) -> &[GreenTrivia] {
         &self.0.trailing
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.0.has_error
     }
 
     pub fn full_text_len(&self) -> TextSize {
@@ -235,6 +240,7 @@ impl NodeCache {
         text: &str,
         leading: Vec<GreenTrivia>,
         trailing: Vec<GreenTrivia>,
+        has_error: bool,
     ) -> Result<GreenToken, TreeBuildError> {
         let mut full_text_len = TextSize::new(0);
         for trivia in &leading {
@@ -250,6 +256,7 @@ impl NodeCache {
             text: text.into(),
             leading: leading.into_boxed_slice(),
             trailing: trailing.into_boxed_slice(),
+            has_error,
             full_text_len,
         }));
         if let Some(interned) = self.tokens.get(&token) {
@@ -469,7 +476,10 @@ pub fn build_green_tree(
                     source,
                     TextRange::new(text_start, text_end).ok_or(TreeBuildError::InvalidSpan)?,
                 )?;
-                let token = cache.token(kind, text, leading, trailing)?;
+                let has_error = tokens[raw_token..end]
+                    .iter()
+                    .any(|token| token.flags.contains(TokenFlags::HAS_ERROR));
+                let token = cache.token(kind, text, leading, trailing, has_error)?;
                 let frame = frames
                     .last_mut()
                     .ok_or(TreeBuildError::InvalidEventStream)?;
@@ -819,6 +829,82 @@ mod tests {
             tree.root.last_token().map(GreenToken::kind),
             Some(SyntaxKind::EOF)
         );
+    }
+
+    #[test]
+    fn green_tokens_preserve_literal_error_flags() {
+        let source = r#"1__2 "bad\q" 3"#;
+        let lexed = lex_text(source);
+        let mut cache = NodeCache::new();
+        let tree = build_green_tree(
+            source,
+            &lexed.tokens,
+            &lexed.trivia,
+            flat_events(&lexed.tokens),
+            &mut cache,
+        )
+        .expect("build tree");
+        let mut tokens = Vec::new();
+        all_tokens(&tree.root, &mut tokens);
+        let literals = tokens
+            .iter()
+            .filter(|token| matches!(token.kind(), SyntaxKind::INT | SyntaxKind::STRING))
+            .map(|token| (token.kind(), token.has_error()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            literals,
+            [
+                (SyntaxKind::INT, true),
+                (SyntaxKind::STRING, true),
+                (SyntaxKind::INT, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn green_tokens_preserve_nonliteral_lexical_error_flags() {
+        let source = "use acme:my--pkg";
+        let lexed = lex_text(source);
+        assert!(
+            lexed
+                .tokens
+                .iter()
+                .any(|token| token.kind == SyntaxKind::PKG_PATH
+                    && token.flags.contains(TokenFlags::HAS_ERROR))
+        );
+        let mut cache = NodeCache::new();
+        let tree = build_green_tree(
+            source,
+            &lexed.tokens,
+            &lexed.trivia,
+            flat_events(&lexed.tokens),
+            &mut cache,
+        )
+        .expect("build tree");
+        let mut tokens = Vec::new();
+        all_tokens(&tree.root, &mut tokens);
+
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind() == SyntaxKind::PKG_PATH && token.has_error())
+        );
+    }
+
+    #[test]
+    fn green_token_interning_distinguishes_error_metadata() {
+        let mut cache = NodeCache::new();
+        let valid = cache
+            .token(SyntaxKind::INT, "1", Vec::new(), Vec::new(), false)
+            .expect("valid token");
+        let errored = cache
+            .token(SyntaxKind::INT, "1", Vec::new(), Vec::new(), true)
+            .expect("errored token");
+
+        assert!(!valid.has_error());
+        assert!(errored.has_error());
+        assert_ne!(valid, errored);
     }
 
     #[test]
@@ -1179,7 +1265,7 @@ mod tests {
     fn small_nodes_are_interned_by_structural_children() {
         let mut cache = NodeCache::new();
         let token = cache
-            .token(SyntaxKind::LIDENT, "name", Vec::new(), Vec::new())
+            .token(SyntaxKind::LIDENT, "name", Vec::new(), Vec::new(), false)
             .expect("token");
         let make_large_child = |cache: &mut NodeCache| {
             cache
@@ -1221,10 +1307,10 @@ mod tests {
 
         let mut left_cache = NodeCache::new();
         let left_plus = left_cache
-            .token(SyntaxKind::PLUS, "+", Vec::new(), Vec::new())
+            .token(SyntaxKind::PLUS, "+", Vec::new(), Vec::new(), false)
             .expect("plus token");
         let left_rhs = left_cache
-            .token(SyntaxKind::LIDENT, "rhs", Vec::new(), Vec::new())
+            .token(SyntaxKind::LIDENT, "rhs", Vec::new(), Vec::new(), false)
             .expect("rhs token");
         let mut left = left_cache
             .node(
@@ -1247,10 +1333,10 @@ mod tests {
 
         let mut right_cache = NodeCache::new();
         let right_plus = right_cache
-            .token(SyntaxKind::PLUS, "+", Vec::new(), Vec::new())
+            .token(SyntaxKind::PLUS, "+", Vec::new(), Vec::new(), false)
             .expect("plus token");
         let right_rhs = right_cache
-            .token(SyntaxKind::LIDENT, "rhs", Vec::new(), Vec::new())
+            .token(SyntaxKind::LIDENT, "rhs", Vec::new(), Vec::new(), false)
             .expect("rhs token");
         let mut right = right_cache
             .node(
