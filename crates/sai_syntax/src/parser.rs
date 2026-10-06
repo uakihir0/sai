@@ -2562,6 +2562,169 @@ mod tests {
     }
 
     #[test]
+    fn generated_postfix_collection_and_argument_roles_follow_parsed_children() {
+        use crate::ast::{
+            ArgList, ArrayExpr, AstNode, AwaitExpr, CallExpr, FStringInterp, FieldExpr, IndexExpr,
+            ParenExpr, PathExpr, TryExpr, TupleExpr, TupleIndexExpr,
+        };
+
+        let source = concat!(
+            "fn expressions(values: I32, future: I32, base: I32) {\n",
+            "let generic = g<I32>\n",
+            "let grouped = (values)\n",
+            "let tuple = (values, 2,)\n",
+            "let array = [1, values,]\n",
+            "let call = invoke(1, 2, named: values, other: 3, ..base)\n",
+            "let field = values.member\n",
+            "let tuple_index = values.0\n",
+            "let indexed = values[0]\n",
+            "let propagated = values?\n",
+            "let awaited = future.await\n",
+            "let formatted = f\"{values:pad(3)}\"\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let generic_path = root
+            .descendants()
+            .filter_map(PathExpr::cast)
+            .find(|path| path.generic_args().is_some())
+            .expect("generic path");
+        assert!(generic_path.name().is_some());
+
+        let grouped = root
+            .descendants()
+            .find_map(ParenExpr::cast)
+            .expect("parenthesized expression");
+        assert!(grouped.expression().is_some());
+        let tuple = root
+            .descendants()
+            .find_map(TupleExpr::cast)
+            .expect("tuple expression");
+        assert_eq!(tuple.elements().count(), 2);
+        let array = root
+            .descendants()
+            .find_map(ArrayExpr::cast)
+            .expect("array expression");
+        assert_eq!(array.elements().count(), 2);
+
+        let call = root
+            .descendants()
+            .find_map(CallExpr::cast)
+            .expect("call expression");
+        assert!(call.callee().is_some());
+        let args = call.args().expect("call argument list");
+        let positional_args = args.positional_args().collect::<Vec<_>>();
+        assert_eq!(positional_args.len(), 2);
+        let named_args = args.named_args().collect::<Vec<_>>();
+        assert_eq!(named_args.len(), 2);
+        assert_eq!(args.base_args().count(), 1);
+        assert!(positional_args[0].expression().is_some());
+        assert!(positional_args[1].expression().is_some());
+        assert!(named_args.iter().all(|argument| argument.name().is_some()));
+        assert!(
+            named_args
+                .iter()
+                .all(|argument| argument.expression().is_some())
+        );
+        assert!(
+            args.base_args()
+                .next()
+                .expect("base argument")
+                .expression()
+                .is_some()
+        );
+
+        let field = root
+            .descendants()
+            .find_map(FieldExpr::cast)
+            .expect("field expression");
+        assert!(field.base().is_some());
+        assert!(field.name().is_some());
+        let tuple_index = root
+            .descendants()
+            .find_map(TupleIndexExpr::cast)
+            .expect("tuple-index expression");
+        assert!(tuple_index.base().is_some());
+        assert_eq!(tuple_index.index(), Some(0));
+        let index = root
+            .descendants()
+            .find_map(IndexExpr::cast)
+            .expect("index expression");
+        assert_eq!(index.base().unwrap().syntax().kind(), SyntaxKind::PATH_EXPR);
+        assert_eq!(index.index().unwrap().syntax().kind(), SyntaxKind::LITERAL);
+        assert!(
+            root.descendants()
+                .find_map(TryExpr::cast)
+                .and_then(|expression| expression.operand())
+                .is_some()
+        );
+        assert!(
+            root.descendants()
+                .find_map(AwaitExpr::cast)
+                .and_then(|expression| expression.operand())
+                .is_some()
+        );
+
+        let interpolation = root
+            .descendants()
+            .find_map(FStringInterp::cast)
+            .expect("format-string interpolation");
+        assert!(interpolation.expression().is_some());
+        assert!(interpolation.spec().is_some());
+        let argument_lists = root
+            .descendants()
+            .filter_map(ArgList::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(argument_lists.len(), 1);
+
+        let missing_index = parse_file("fn broken() { let indexed = values[] }\n");
+        assert!(!missing_index.errors.is_empty());
+        let missing_index_root = crate::SyntaxNode::new_root(missing_index.root);
+        let missing_index = missing_index_root
+            .descendants()
+            .find_map(IndexExpr::cast)
+            .expect("recovered index expression");
+        assert_eq!(
+            missing_index.base().unwrap().syntax().kind(),
+            SyntaxKind::PATH_EXPR
+        );
+        assert!(missing_index.index().is_none());
+
+        let malformed_args = parse_file("fn broken() { call(, 1) }\n");
+        assert!(!malformed_args.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed_args.root);
+        let recovered_args = malformed_root
+            .descendants()
+            .find_map(ArgList::cast)
+            .expect("recovered call argument list");
+        let recovered_positional = recovered_args.positional_args().collect::<Vec<_>>();
+        assert_eq!(recovered_positional.len(), 1);
+        assert!(recovered_positional[0].expression().is_some());
+
+        let repeated_base_args =
+            parse_file("fn broken() { Record(1, 2, first: 3, second: 4, ..base, ..other) }\n");
+        assert_eq!(
+            repeated_base_args
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::BaseArgNotLast]
+        );
+        let repeated_base_root = crate::SyntaxNode::new_root(repeated_base_args.root);
+        let repeated_args = repeated_base_root
+            .descendants()
+            .find_map(ArgList::cast)
+            .expect("recovered record argument list");
+        assert_eq!(repeated_args.positional_args().count(), 2);
+        assert_eq!(repeated_args.named_args().count(), 2);
+        assert_eq!(repeated_args.base_args().count(), 2);
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,

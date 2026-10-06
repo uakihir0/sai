@@ -225,5 +225,28 @@ child AsyncBlockExpr body Block 0
 child ReturnExpr value Expr 0
 child BreakExpr value Expr 0
 child PrefixExpr operand Expr 0
+child PathExpr name NameRef 0
+child PathExpr generic_args GenericArgList 0
+child ParenExpr expression Expr 0
+children TupleExpr elements Expr
+children ArrayExpr elements Expr
+child FieldExpr base Expr 0
+child FieldExpr name NameRef 0
+child TupleIndexExpr base Expr 0
+child CallExpr callee Expr 0
+child CallExpr args ArgList 0
+child_before IndexExpr base Expr L_BRACKET 0
+child_after IndexExpr index Expr L_BRACKET 0
+child TryExpr operand Expr 0
+child AwaitExpr operand Expr 0
+children ArgList positional_args Arg
+children ArgList named_args NamedArg
+children ArgList base_args BaseArg
+child Arg expression Expr 0
+child NamedArg name NameRef 0
+child NamedArg expression Expr 0
+child BaseArg expression Expr 0
+child FStringInterp expression Expr 0
+token FStringInterp spec FormatSpec
 child BinExpr lhs Expr 0
 child BinExpr rhs Expr 1
