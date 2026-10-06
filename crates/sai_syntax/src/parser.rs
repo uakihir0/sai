@@ -1367,6 +1367,110 @@ mod tests {
     }
 
     #[test]
+    fn missing_enum_close_preserves_a_closure_argument_call() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "Some(fn() { 1 })\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_enum_close_preserves_an_unsafe_block_statement() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "unsafe { 1 }\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::UNSAFE_BLOCK_EXPR)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_tuple_variant_close_preserves_an_unsafe_block_statement() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32\n",
+            "unsafe { 1 }\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::UNSAFE_BLOCK_EXPR)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_record_variant_close_stops_at_the_enum_brace() {
         let source = "enum E { Broken(field: I32 }\n";
         let output = parse_file(source);
@@ -1381,6 +1485,39 @@ mod tests {
         assert_eq!(
             root.descendants()
                 .filter(|node| node.kind() == SyntaxKind::ENUM_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn record_variant_with_a_missing_field_type_is_still_recognized() {
+        let source = "enum E {\nV(field:)\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::RECORD_SHAPE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_FIELD)
                 .count(),
             1
         );

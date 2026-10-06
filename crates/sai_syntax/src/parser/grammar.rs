@@ -569,9 +569,11 @@ impl Parser<'_, '_> {
     }
 
     fn variant_field_starts_at(&self, position: usize) -> bool {
-        let Some(position) = self.position_after_attributes(position) else {
-            return false;
-        };
+        self.variant_field_type_position(position).is_some()
+    }
+
+    fn variant_field_type_position(&self, position: usize) -> Option<usize> {
+        let position = self.position_after_attributes(position)?;
         if !self
             .tokens
             .get(position)
@@ -581,16 +583,31 @@ impl Parser<'_, '_> {
                 .get(position + 1)
                 .is_some_and(|token| token.kind == SyntaxKind::COLON)
         {
+            return None;
+        }
+
+        Some(position + 2)
+    }
+
+    fn variant_payload_type_starts_at(&self, position: usize) -> bool {
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        if !TYPE_START_KINDS.contains(&token.kind) {
             return false;
         }
 
-        let ty_position = position + 2;
-        let Some(token) = self.tokens.get(ty_position) else {
-            return false;
-        };
-        TYPE_START_KINDS.contains(&token.kind)
-            && (!matches!(token.kind, SyntaxKind::LIDENT | SyntaxKind::UIDENT)
-                || self.generic_argument_path_type_starts_at(ty_position))
+        match token.kind {
+            SyntaxKind::LIDENT | SyntaxKind::UIDENT => {
+                self.generic_argument_path_type_starts_at(position)
+            }
+            SyntaxKind::FN_KW => !self.closure_body_follows_fn_type(position),
+            SyntaxKind::UNSAFE_KW => self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|next| next.kind == SyntaxKind::FN_KW),
+            _ => true,
+        }
     }
 
     fn variant_field_list_boundary(&self) -> bool {
@@ -633,14 +650,33 @@ impl Parser<'_, '_> {
 
         let shape_start = position + 2;
         self.variant_field_starts_at(shape_start)
-            || self
+            || self.variant_payload_type_starts_at(shape_start)
+    }
+
+    fn variant_decl_starts_like_expression_at(&self, position: usize) -> bool {
+        let Some(position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+            || !self
                 .tokens
-                .get(shape_start)
-                .is_some_and(|token| TYPE_START_KINDS.contains(&token.kind))
-                && self.tokens.get(shape_start).is_some_and(|token| {
-                    !matches!(token.kind, SyntaxKind::LIDENT | SyntaxKind::UIDENT)
-                        || self.generic_argument_path_type_starts_at(shape_start)
-                })
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::L_PAREN)
+        {
+            return false;
+        }
+
+        let shape_start = position + 2;
+        let value_start = self
+            .variant_field_type_position(shape_start)
+            .unwrap_or(shape_start);
+        self.tokens
+            .get(value_start)
+            .is_some_and(|token| EXPRESSION_START_KINDS.contains(&token.kind))
+            && !self.variant_payload_type_starts_at(value_start)
     }
 
     fn variant_list_boundary_after_newline(&self) -> bool {
@@ -663,7 +699,11 @@ impl Parser<'_, '_> {
             .tokens
             .get(position)
             .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
-            || self.variant_decl_starts_at(position)
+        {
+            return false;
+        }
+        if self.variant_decl_starts_at(position)
+            && !self.variant_decl_starts_like_expression_at(position)
         {
             return false;
         }
@@ -703,6 +743,10 @@ impl Parser<'_, '_> {
                 !self.generic_argument_path_type_starts_at(position)
             }
             SyntaxKind::FN_KW => self.closure_body_follows_fn_type(position),
+            SyntaxKind::UNSAFE_KW => !self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|next| next.kind == SyntaxKind::FN_KW),
             _ => false,
         }
     }
