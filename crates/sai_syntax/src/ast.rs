@@ -1221,6 +1221,24 @@ impl BindingMode {
     }
 }
 
+impl BorrowType {
+    pub fn mut_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::MUT_KW)
+    }
+}
+
+impl OwnedType {
+    pub fn owned_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::OWNED_KW)
+    }
+}
+
+impl FnPtrType {
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::UNSAFE_KW)
+    }
+}
+
 impl LiteralPat {
     pub fn minus_token(&self) -> Option<SyntaxToken> {
         direct_token_of_kind(self.syntax(), SyntaxKind::MINUS)

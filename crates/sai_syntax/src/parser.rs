@@ -3728,6 +3728,8 @@ mod tests {
         let source = concat!(
             "fn types<T: pkg.Trait<I32, U8, 3, 4, Item = U8, Other = I32>>(\n",
             "         value: borrow mut pkg.Foo<I32>,\n",
+            "         shared: borrow I32,\n",
+            "         nested: borrow borrow mut I32,\n",
             "         owned_value: owned I32,\n",
             "         pair: (I32, U8),\n",
             "         grouped: (I32),\n",
@@ -3739,11 +3741,25 @@ mod tests {
         assert!(output.errors.is_empty(), "{:?}", output.errors);
         let root = crate::SyntaxNode::new_root(output.root);
 
-        let borrowed = root
+        let borrow_types = root
             .descendants()
-            .find_map(BorrowType::cast)
-            .expect("borrow type");
-        assert!(borrowed.ty().is_some());
+            .filter_map(BorrowType::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(borrow_types.len(), 4);
+        assert!(borrow_types[0].ty().is_some());
+        assert_eq!(
+            borrow_types[0].mut_token().expect("mutable borrow").text(),
+            "mut"
+        );
+        assert!(borrow_types[1].mut_token().is_none());
+        assert!(borrow_types[2].mut_token().is_none());
+        assert_eq!(
+            borrow_types[3]
+                .mut_token()
+                .expect("nested mutable borrow")
+                .text(),
+            "mut"
+        );
 
         let path = root
             .descendants()
@@ -3778,12 +3794,12 @@ mod tests {
                 .all(|binding| binding.name().is_some() && binding.ty().is_some())
         );
 
-        assert!(
-            root.descendants()
-                .find_map(OwnedType::cast)
-                .and_then(|ty| ty.ty())
-                .is_some()
-        );
+        let owned = root
+            .descendants()
+            .find_map(OwnedType::cast)
+            .expect("owned type");
+        assert!(owned.ty().is_some());
+        assert_eq!(owned.owned_token().expect("owned marker").text(), "owned");
         assert_eq!(
             root.descendants()
                 .find_map(TupleType::cast)
@@ -3835,6 +3851,7 @@ mod tests {
             .find_map(BorrowType::cast)
             .expect("recovered borrow type");
         assert!(incomplete_borrow.ty().is_none());
+        assert!(incomplete_borrow.mut_token().is_none());
     }
 
     #[test]
@@ -3844,6 +3861,8 @@ mod tests {
         let source = concat!(
             "type Callback = fn(I32, U8) -> Bool\n",
             "type Predicate = fn(I32, U8)\n",
+            "type UnsafeCallback = unsafe fn(I32) -> Bool\n",
+            "type Nested = fn(unsafe fn())\n",
         );
         let output = parse_file(source);
         assert!(output.errors.is_empty(), "{:?}", output.errors);
@@ -3852,7 +3871,25 @@ mod tests {
             .descendants()
             .filter_map(FnPtrType::cast)
             .collect::<Vec<_>>();
-        assert_eq!(function_pointers.len(), 2);
+        assert_eq!(function_pointers.len(), 5);
+        assert!(function_pointers[0].unsafe_token().is_none());
+        assert!(function_pointers[1].unsafe_token().is_none());
+        assert_eq!(
+            function_pointers[2]
+                .unsafe_token()
+                .expect("unsafe function pointer")
+                .text(),
+            "unsafe"
+        );
+        assert!(function_pointers[3].unsafe_token().is_none());
+        assert_eq!(function_pointers[3].params().count(), 1);
+        assert_eq!(
+            function_pointers[4]
+                .unsafe_token()
+                .expect("nested unsafe function pointer")
+                .text(),
+            "unsafe"
+        );
 
         let callback_params = function_pointers[0].params().collect::<Vec<_>>();
         assert_eq!(callback_params.len(), 2);
