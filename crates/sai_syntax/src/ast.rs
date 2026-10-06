@@ -62,7 +62,78 @@ ast_node!(ParamList, PARAM_LIST);
 ast_node!(Param, PARAM);
 ast_node!(Name, NAME);
 
+ast_token!(IntLit, INT);
+ast_token!(FloatLit, FLOAT);
 ast_token!(StringLit, STRING);
+
+impl IntLit {
+    pub fn value(&self) -> Option<u128> {
+        if self.syntax().has_error() {
+            return None;
+        }
+
+        let text = self.syntax().text().as_bytes();
+        let (radix, digits) = if let Some(digits) = text.strip_prefix(b"0x") {
+            (16, digits)
+        } else if let Some(digits) = text.strip_prefix(b"0o") {
+            (8, digits)
+        } else if let Some(digits) = text.strip_prefix(b"0b") {
+            (2, digits)
+        } else {
+            (10, text)
+        };
+        if digits.is_empty() {
+            return None;
+        }
+
+        let mut value = 0_u128;
+        let mut previous_was_digit = false;
+        for byte in digits {
+            if *byte == b'_' {
+                if !previous_was_digit {
+                    return None;
+                }
+                previous_was_digit = false;
+                continue;
+            }
+
+            let digit = crate::digit_value(*byte)?;
+            if digit >= radix {
+                return None;
+            }
+            value = value
+                .checked_mul(u128::from(radix))?
+                .checked_add(u128::from(digit))?;
+            previous_was_digit = true;
+        }
+
+        previous_was_digit.then_some(value)
+    }
+}
+
+impl FloatLit {
+    pub fn value_f64(&self) -> Option<f64> {
+        self.parse_value()
+    }
+
+    pub fn value_f32(&self) -> Option<f32> {
+        self.parse_value()
+    }
+
+    fn parse_value<T: std::str::FromStr>(&self) -> Option<T> {
+        if self.syntax().has_error() {
+            return None;
+        }
+
+        let text = self.syntax().text();
+        if text.contains('_') {
+            let cleaned = text.replace('_', "");
+            cleaned.parse::<T>().ok()
+        } else {
+            text.parse::<T>().ok()
+        }
+    }
+}
 
 impl SourceFile {
     pub fn test_decls(&self) -> impl Iterator<Item = TestDecl> + '_ {

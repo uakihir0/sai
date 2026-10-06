@@ -2402,6 +2402,91 @@ mod tests {
     }
 
     #[test]
+    fn integer_ast_values_decode_radices_and_respect_error_and_range_flags() {
+        use crate::ast::{AstToken, IntLit};
+
+        let source = concat!(
+            "fn numbers() {\n",
+            "let decimal = 123\n",
+            "let hexadecimal = 0xff\n",
+            "let binary = 0b10_01\n",
+            "let octal = 0o17\n",
+            "let maximum = 340282366920938463463374607431768211455\n",
+            "let overflow = 340282366920938463463374607431768211456\n",
+            "let malformed = 1__2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut values = Vec::new();
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                if let crate::SyntaxElement::Token(token) = element
+                    && let Some(literal) = IntLit::cast(token)
+                {
+                    values.push(literal.value());
+                }
+            }
+        }
+
+        assert_eq!(
+            values,
+            [
+                Some(123),
+                Some(255),
+                Some(9),
+                Some(15),
+                Some(u128::MAX),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn float_ast_values_remove_separators_and_preserve_overflow() {
+        use crate::ast::{AstToken, FloatLit};
+
+        let source = concat!(
+            "fn floats() {\n",
+            "let decimal = 1_2.5_0e+2\n",
+            "let rounded32 = 0.1\n",
+            "let double_rounding = 1.000000059604644775390626\n",
+            "let infinity = 1e99999\n",
+            "let malformed = 1.0__0\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut values = Vec::new();
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                if let crate::SyntaxElement::Token(token) = element
+                    && let Some(literal) = FloatLit::cast(token)
+                {
+                    values.push((literal.value_f64(), literal.value_f32()));
+                }
+            }
+        }
+
+        assert_eq!(values.len(), 5);
+        assert_eq!(values[0], (Some(1250.0), Some(1250.0)));
+        assert_eq!(values[1], (Some(0.1), Some(0.1_f32)));
+        assert_eq!(
+            values[2].1.map(f32::to_bits),
+            Some(0x3f80_0001),
+            "direct f32 parsing must avoid a double-rounding regression"
+        );
+        assert_eq!(
+            values[2].0.map(|value| (value as f32).to_bits()),
+            Some(1.0_f32.to_bits())
+        );
+        assert_eq!(values[3].0, Some(f64::INFINITY));
+        assert!(values[3].1.is_some_and(f32::is_infinite));
+        assert_eq!(values[4], (None, None));
+    }
+
+    #[test]
     fn property_parameter_attributes_report_invalid_target_inside_param() {
         let source = "property \"attributed\" (@allow(unused) value: U32) {}\n";
         let output = parse_file(source);

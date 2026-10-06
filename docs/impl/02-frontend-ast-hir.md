@@ -1046,14 +1046,14 @@ pub trait AstToken: Sized {
 
 - An AST view is a newtype around a `SyntaxNode` of one kind (`struct FnDecl(SyntaxNode)`), or an enum over several kinds (`enum Expr { Literal(Literal), BinExpr(BinExpr), ... }`, `enum Item`, `enum Pattern`, `enum Type`, `enum Stmt`).
 - The views and their accessors are generated at build time from a grammar description file (`sai.ungram`) that lists, for each node kind, its children with their roles. The generator also emits the node-kind list of §2.6.5, so the two cannot drift. The grammar description is checked against spec/03 by the conformance tests (impl/15).
-- **Current implementation slice.** `AstNode` and `AstToken` are introduced with typed views for test/property declarations, their parameters, names, blocks, string tokens, and the type-node union. These initial wrappers are maintained in `ast.rs`; `StringLit` currently exposes raw token text, while escape decoding and the other value decoders of §2.7.3 are deferred. The compact red-node index is materialized at root creation so structural accessors can return cached handles without allocating; the token-offset index remains lazy. The `sai.ungram` source and build-time generator, along with the remaining views and accessors, are not implemented yet.
+- **Current implementation slice.** `AstNode` and `AstToken` are introduced with typed views for test/property declarations, their parameters, names, blocks, integer and float literals, string tokens, and the type-node union. These initial wrappers are maintained in `ast.rs`. `IntLit::value` and `FloatLit::{value_f64, value_f32}` are implemented; `StringLit` exposes raw token text, while escape decoding and the other value decoders of §2.7.3 are deferred. The compact red-node index is materialized at root creation so structural accessors can return cached handles without allocating; the token-offset index remains lazy. The `sai.ungram` source and build-time generator, along with the remaining views and accessors, are not implemented yet.
 
 ### 2.7.2 Accessors
 
 - Every **structural role accessor** returns an `Option` (or an iterator), because the tree may be incomplete: `FnDecl::name() -> Option<Name>`, `FnDecl::params() -> Option<ParamList>`, `FnDecl::body() -> Option<Block>`, `BinExpr::lhs() -> Option<Expr>`, `BinExpr::op() -> Option<(SyntaxToken, BinOp)>`, `BinExpr::rhs() -> Option<Expr>`. Token text, decoded literal values, and scalar predicates may return their value directly.
 - When two children have the same kind, the accessor names the role, and the child is found by position (`BinExpr::lhs` is the first `Expr` child, `rhs` the second; `RangeExpr::start` is the `Expr` child before the operator token and `end` the one after it).
 - Composite tokens: `BinExpr::op` returns `BinOp::Shr` for a glued `SHR` token, and so on. Recovery forms (`COLON2`, `AMP2`, `PIPE2`) map to the operators they were reported as.
-- Accessors never panic and never allocate except for iterators.
+- Structural accessors never panic and never allocate except for iterators. Literal value decoders do not panic; they may allocate when removing numeric separators or when their documented `Cow` result must own decoded text.
 
 ### 2.7.3 Literal values
 
@@ -1070,6 +1070,8 @@ Value decoders run the same scanning functions as the lexer (§2.3.2), in value 
 | `FStringExpr` | `pieces() -> impl Iterator<Item = FStringPiece>` | `Text(Cow<str>)` with `{{` and `}}` decoded, or `Interp { expr: Option<Expr>, spec: Option<FormatSpec> }` |
 | `FormatSpec` | `name() -> &str`, `arg() -> Option<u128>` | |
 | `TupleIndexExpr` | `index() -> Option<u32>` | `None` if the digits do not fit in `u32`; impl/03 then reports `TUPLE_INDEX_OUT_OF_RANGE` ([spec/06](../spec/06-expressions-and-statements.md)) |
+
+**Current implementation slice.** `IntLit::value()` and `FloatLit::{value_f64(), value_f32()}` are implemented. Integer values use checked accumulation without allocating; float values remove `_` into a temporary string only when the spelling contains separators, then parse directly to the requested IEEE width. The remaining rows are deferred.
 
 ### 2.7.4 `AstPtr` and `AstIdMap`
 
