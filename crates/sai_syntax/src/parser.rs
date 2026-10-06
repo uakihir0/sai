@@ -1401,6 +1401,34 @@ mod tests {
     }
 
     #[test]
+    fn missing_enum_close_preserves_a_nested_tuple_call_statement() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "Some((1))\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_enum_close_preserves_an_unsafe_block_statement() {
         let source = concat!(
             "fn f() {\n",
@@ -1428,6 +1456,46 @@ mod tests {
                 .filter(|node| node.kind() == SyntaxKind::BLOCK)
                 .count(),
             2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_tuple_variant_close_preserves_a_parenthesized_statement() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32\n",
+            "(1)\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            1
         );
         assert_eq!(root.green().text_len().to_usize(), source.len());
     }
@@ -1518,6 +1586,27 @@ mod tests {
         assert_eq!(
             root.descendants()
                 .filter(|node| node.kind() == SyntaxKind::VARIANT_FIELD)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn tuple_variant_with_a_non_type_payload_is_diagnosed() {
+        let source = "enum E {\nV(1)\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VARIANT_DECL)
                 .count(),
             1
         );

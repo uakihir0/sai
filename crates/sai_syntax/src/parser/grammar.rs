@@ -602,12 +602,21 @@ impl Parser<'_, '_> {
                 self.generic_argument_path_type_starts_at(position)
             }
             SyntaxKind::FN_KW => !self.closure_body_follows_fn_type(position),
+            SyntaxKind::L_PAREN => self.variant_parenthesized_type_starts_at(position),
             SyntaxKind::UNSAFE_KW => self
                 .tokens
                 .get(position + 1)
                 .is_some_and(|next| next.kind == SyntaxKind::FN_KW),
             _ => true,
         }
+    }
+
+    fn variant_parenthesized_type_starts_at(&self, position: usize) -> bool {
+        let inner_position = position + 1;
+        self.tokens
+            .get(inner_position)
+            .is_some_and(|token| token.kind == SyntaxKind::R_PAREN)
+            || self.variant_payload_type_starts_at(inner_position)
     }
 
     fn variant_field_list_boundary(&self) -> bool {
@@ -648,9 +657,7 @@ impl Parser<'_, '_> {
             return true;
         }
 
-        let shape_start = position + 2;
-        self.variant_field_starts_at(shape_start)
-            || self.variant_payload_type_starts_at(shape_start)
+        true
     }
 
     fn variant_decl_starts_like_expression_at(&self, position: usize) -> bool {
@@ -670,13 +677,84 @@ impl Parser<'_, '_> {
         }
 
         let shape_start = position + 2;
-        let value_start = self
-            .variant_field_type_position(shape_start)
-            .unwrap_or(shape_start);
-        self.tokens
-            .get(value_start)
-            .is_some_and(|token| EXPRESSION_START_KINDS.contains(&token.kind))
-            && !self.variant_payload_type_starts_at(value_start)
+        if let Some(value_start) = self.variant_field_type_position(shape_start) {
+            return self
+                .tokens
+                .get(value_start)
+                .is_some_and(|token| EXPRESSION_START_KINDS.contains(&token.kind))
+                && !self.variant_payload_type_starts_at(value_start);
+        }
+
+        self.tokens.get(shape_start).is_some_and(|token| {
+            token.kind == SyntaxKind::R_PAREN
+                || (EXPRESSION_START_KINDS.contains(&token.kind)
+                    && !self.variant_payload_type_starts_at(shape_start))
+        })
+    }
+
+    fn variant_call_followed_by_statement(&self, position: usize) -> bool {
+        let Some(position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if !self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
+            || !self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::L_PAREN)
+        {
+            return false;
+        }
+
+        let mut depth = 0usize;
+        let mut after_call = None;
+        for (index, token) in self.tokens.iter().enumerate().skip(position + 1) {
+            match token.kind {
+                SyntaxKind::L_PAREN => depth += 1,
+                SyntaxKind::R_PAREN => {
+                    let Some(next_depth) = depth.checked_sub(1) else {
+                        return false;
+                    };
+                    depth = next_depth;
+                    if depth == 0 {
+                        after_call = Some(index + 1);
+                        break;
+                    }
+                }
+                SyntaxKind::EOF => return false,
+                _ => {}
+            }
+        }
+        let Some(mut next_position) = after_call else {
+            return false;
+        };
+        while self.tokens.get(next_position).is_some_and(|token| {
+            matches!(
+                token.kind,
+                SyntaxKind::NEWLINE | SyntaxKind::DOC_OUTER | SyntaxKind::DOC_INNER
+            )
+        }) {
+            next_position += 1;
+        }
+        if !self
+            .tokens
+            .get(next_position)
+            .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+            || self.variant_decl_starts_at(next_position)
+        {
+            return false;
+        }
+        let Some(next_position) = self.position_after_attributes(next_position) else {
+            return false;
+        };
+        let next_kind = self.tokens.get(next_position).map(|token| token.kind);
+        matches!(
+            next_kind,
+            Some(SyntaxKind::LET_KW | SyntaxKind::VAR_KW | SyntaxKind::ASSERT_KW)
+        ) || self.item_starts_at(next_position)
+            || next_kind.is_some_and(|kind| EXPRESSION_START_KINDS.contains(&kind))
     }
 
     fn variant_list_boundary_after_newline(&self) -> bool {
@@ -703,7 +781,8 @@ impl Parser<'_, '_> {
             return false;
         }
         if self.variant_decl_starts_at(position)
-            && !self.variant_decl_starts_like_expression_at(position)
+            && !(self.variant_decl_starts_like_expression_at(position)
+                && self.variant_call_followed_by_statement(position))
         {
             return false;
         }
@@ -743,6 +822,7 @@ impl Parser<'_, '_> {
                 !self.generic_argument_path_type_starts_at(position)
             }
             SyntaxKind::FN_KW => self.closure_body_follows_fn_type(position),
+            SyntaxKind::L_PAREN => !self.variant_parenthesized_type_starts_at(position),
             SyntaxKind::UNSAFE_KW => !self
                 .tokens
                 .get(position + 1)
