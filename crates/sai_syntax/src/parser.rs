@@ -2725,6 +2725,125 @@ mod tests {
     }
 
     #[test]
+    fn generated_type_and_generic_argument_roles_follow_parsed_children() {
+        use crate::ast::{
+            AssocTypeBinding, AstNode, BorrowType, CastExpr, GenericArgList, OwnedType, ParenType,
+            PathType, SelfType, TupleType,
+        };
+
+        let source = concat!(
+            "fn types<T: pkg.Trait<I32, U8, 3, 4, Item = U8, Other = I32>>(\n",
+            "         value: borrow mut pkg.Foo<I32>,\n",
+            "         owned_value: owned I32,\n",
+            "         pair: (I32, U8),\n",
+            "         grouped: (I32),\n",
+            "         self_ty: Self.Nested) {\n",
+            "let casted = value as I32\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let borrowed = root
+            .descendants()
+            .find_map(BorrowType::cast)
+            .expect("borrow type");
+        assert!(borrowed.ty().is_some());
+
+        let path = root
+            .descendants()
+            .filter_map(PathType::cast)
+            .find(|path| path.segments().count() == 2)
+            .expect("qualified path type");
+        let segments = path.segments().collect::<Vec<_>>();
+        assert!(segments[0].generic_args().is_none());
+        assert!(segments[1].generic_args().is_some());
+        assert!(segments.iter().all(|segment| segment.name().is_some()));
+
+        let generic_args = root
+            .descendants()
+            .filter_map(GenericArgList::cast)
+            .find(|args| {
+                args.type_args().count() == 2
+                    && args.const_args().count() == 2
+                    && args.assoc_type_bindings().count() == 2
+            })
+            .expect("mixed trait generic arguments");
+        let type_args = generic_args.type_args().collect::<Vec<_>>();
+        assert_eq!(type_args.len(), 2);
+        assert!(type_args.iter().all(|argument| argument.ty().is_some()));
+        assert_eq!(generic_args.const_args().count(), 2);
+        let bindings = generic_args
+            .assoc_type_bindings()
+            .collect::<Vec<AssocTypeBinding>>();
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| binding.name().is_some() && binding.ty().is_some())
+        );
+
+        assert!(
+            root.descendants()
+                .find_map(OwnedType::cast)
+                .and_then(|ty| ty.ty())
+                .is_some()
+        );
+        assert_eq!(
+            root.descendants()
+                .find_map(TupleType::cast)
+                .expect("tuple type")
+                .elements()
+                .count(),
+            2
+        );
+        assert!(
+            root.descendants()
+                .find_map(ParenType::cast)
+                .and_then(|ty| ty.ty())
+                .is_some()
+        );
+        let self_type = root
+            .descendants()
+            .find_map(SelfType::cast)
+            .expect("self type");
+        assert_eq!(self_type.segments().count(), 1);
+        assert!(self_type.segments().all(|segment| segment.name().is_some()));
+
+        let cast = root
+            .descendants()
+            .find_map(CastExpr::cast)
+            .expect("cast expression");
+        assert!(cast.expression().is_some());
+        assert!(cast.ty().is_some());
+        assert_eq!(
+            root.descendants().filter_map(GenericArgList::cast).count(),
+            2
+        );
+
+        let incomplete_path = parse_file("type Broken = pkg.\n");
+        assert!(!incomplete_path.errors.is_empty());
+        let incomplete_path_root = crate::SyntaxNode::new_root(incomplete_path.root);
+        let incomplete_path = incomplete_path_root
+            .descendants()
+            .find_map(PathType::cast)
+            .expect("recovered path type");
+        let recovered_segments = incomplete_path.segments().collect::<Vec<_>>();
+        assert_eq!(recovered_segments.len(), 1);
+        assert!(recovered_segments[0].name().is_some());
+
+        let incomplete_borrow = parse_file("type Broken = borrow\n");
+        assert!(!incomplete_borrow.errors.is_empty());
+        let incomplete_borrow_root = crate::SyntaxNode::new_root(incomplete_borrow.root);
+        let incomplete_borrow = incomplete_borrow_root
+            .descendants()
+            .find_map(BorrowType::cast)
+            .expect("recovered borrow type");
+        assert!(incomplete_borrow.ty().is_none());
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,

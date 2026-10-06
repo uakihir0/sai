@@ -248,5 +248,21 @@ child NamedArg expression Expr 0
 child BaseArg expression Expr 0
 child FStringInterp expression Expr 0
 token FStringInterp spec FormatSpec
+children PathType segments PathSegment
+child PathSegment name NameRef 0
+child PathSegment generic_args GenericArgList 0
+children SelfType segments PathSegment
+child BorrowType ty Type 0
+child OwnedType ty Type 0
+children TupleType elements Type
+child ParenType ty Type 0
+children GenericArgList type_args TypeArg
+children GenericArgList const_args ConstArg
+children GenericArgList assoc_type_bindings AssocTypeBinding
+child TypeArg ty Type 0
+child AssocTypeBinding name NameRef 0
+child AssocTypeBinding ty Type 0
+child CastExpr expression Expr 0
+child CastExpr ty Type 0
 child BinExpr lhs Expr 0
 child BinExpr rhs Expr 1
