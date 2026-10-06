@@ -161,18 +161,50 @@ children SourceFile items Item
 children SourceFile test_decls TestDecl
 children SourceFile property_decls PropertyDecl
 child FnDecl name Name 0
+child FnDecl generic_params GenericParamList 0
 child FnDecl params ParamList 0
 child FnDecl ret_type RetType 0
 child FnDecl body Block 0
+child FnDecl where_clause WhereClause 0
+child FnDecl borrows_clause BorrowsClause 0
+child FnDecl effects_clause EffectsClause 0
+children FnDecl requires_clauses RequiresClause
+children FnDecl ensures_clauses EnsuresClause
 token TestDecl name StringLit
 child TestDecl body Block 0
 token PropertyDecl name StringLit
 child PropertyDecl params ParamList 0
 child PropertyDecl body Block 0
 children ParamList params Param
+child ParamList self_param SelfParam 0
 child Param name Name 0
 child Param ty Type 0
+child SelfParam ty Type 0
 child RetType ty Type 0
+children WhereClause predicates WherePred
+child WherePred ty Type 0
+children WherePred trait_bounds TraitBound
+children WherePred fn_sugar_bounds FnSugarBound
+child TraitBound path PathType 0
+child TraitBound effects EffectsClause 0
+child FnSugarBound name NameRef 0
+children_before FnSugarBound params Type THIN_ARROW
+child_after FnSugarBound ret_type Type THIN_ARROW 0
+child FnSugarBound effects EffectsClause 0
+children BorrowsClause provenances Provenance
+children Provenance segments NameRef
+child RequiresClause expression Expr 0
+child EnsuresClause expression Expr 0
+children GenericParamList type_params TypeParam
+children GenericParamList const_params ConstParam
+children TypeParam attrs Attribute
+child TypeParam name Name 0
+child TypeParam bounds BoundList 0
+children ConstParam attrs Attribute
+child ConstParam name Name 0
+child ConstParam ty Type 0
+children BoundList trait_bounds TraitBound
+children BoundList fn_sugar_bounds FnSugarBound
 children Block statements Stmt
 child LetStmt pattern Pattern 0
 child LetStmt ty Type 0

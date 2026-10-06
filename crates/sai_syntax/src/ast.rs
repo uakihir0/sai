@@ -536,6 +536,16 @@ ast_union!(Stmt {
     Expr(ExprStmt, EXPR_STMT),
 });
 
+ast_union!(GenericParam {
+    Type(TypeParam, TYPE_PARAM),
+    Const(ConstParam, CONST_PARAM),
+});
+
+ast_union!(Bound {
+    Trait(TraitBound, TRAIT_BOUND),
+    FnSugar(FnSugarBound, FN_SUGAR_BOUND),
+});
+
 ast_union!(Pattern {
     Or(OrPat, OR_PAT),
     At(AtPat, AT_PAT),
@@ -995,5 +1005,39 @@ impl ImplDecl {
 impl ExternBlock {
     pub fn unsafe_token(&self) -> Option<SyntaxToken> {
         direct_token_of_kind(self.syntax(), SyntaxKind::UNSAFE_KW)
+    }
+}
+
+impl FnDecl {
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::UNSAFE_KW)
+    }
+
+    pub fn async_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::ASYNC_KW)
+    }
+}
+
+impl SelfParam {
+    pub fn is_mutable(&self) -> bool {
+        direct_token_of_kind(self.syntax(), SyntaxKind::VAR_KW).is_some()
+    }
+}
+
+impl GenericParamList {
+    pub fn params(&self) -> impl Iterator<Item = GenericParam> + '_ {
+        self.syntax().children().filter_map(GenericParam::cast)
+    }
+}
+
+impl BoundList {
+    pub fn bounds(&self) -> impl Iterator<Item = Bound> + '_ {
+        self.syntax().children().filter_map(Bound::cast)
+    }
+}
+
+impl WherePred {
+    pub fn bounds(&self) -> impl Iterator<Item = Bound> + '_ {
+        self.syntax().children().filter_map(Bound::cast)
     }
 }

@@ -1432,6 +1432,223 @@ mod tests {
     }
 
     #[test]
+    fn function_clause_accessors_expose_self_bounds_and_repeated_contracts() {
+        use crate::ast::{AstNode, Bound, FnDecl, GenericParam};
+
+        let source = concat!(
+            "impl<T> Box<T> {\n",
+            "unsafe async fn inspect<U: Clone + Fn(I32) -> I32 + Send, const N: U32>(var self: borrow mut Self, value: U) -> U\n",
+            "where U: Clone + (Fn(I32) -> I32 effects { io }) + Send, I32: Copy, Bool: Fn()\n",
+            "borrows { self.field, value }\n",
+            "effects { alloc }\n",
+            "requires value == value\n",
+            "requires true\n",
+            "ensures true\n",
+            "ensures value == value\n",
+            "{ value }\n",
+            "fn plain() {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let function = root
+            .descendants()
+            .find_map(FnDecl::cast)
+            .expect("function declaration");
+        fn node_text<'a>(source: &'a str, node: &crate::SyntaxNode) -> &'a str {
+            &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+        }
+
+        assert!(function.unsafe_token().is_some());
+        assert!(function.async_token().is_some());
+        let generic_params = function.generic_params().expect("generic parameters");
+        let generic_params = generic_params.params().collect::<Vec<_>>();
+        assert_eq!(generic_params.len(), 2);
+        let type_param = match &generic_params[0] {
+            GenericParam::Type(param) => param,
+            GenericParam::Const(_) => panic!("first generic parameter should be a type"),
+        };
+        assert_eq!(
+            type_param
+                .name()
+                .map(|name| node_text(source, name.syntax())),
+            Some("U")
+        );
+        let generic_bounds = type_param
+            .bounds()
+            .expect("type parameter bounds")
+            .bounds()
+            .collect::<Vec<_>>();
+        assert_eq!(generic_bounds.len(), 3);
+        assert!(matches!(generic_bounds[0], Bound::Trait(_)));
+        assert!(matches!(generic_bounds[1], Bound::FnSugar(_)));
+        assert!(matches!(generic_bounds[2], Bound::Trait(_)));
+        let const_param = match &generic_params[1] {
+            GenericParam::Const(param) => param,
+            GenericParam::Type(_) => panic!("second generic parameter should be const"),
+        };
+        assert_eq!(
+            const_param
+                .name()
+                .map(|name| node_text(source, name.syntax())),
+            Some("N")
+        );
+        assert_eq!(
+            node_text(
+                source,
+                const_param.ty().expect("const parameter type").syntax()
+            ),
+            "U32"
+        );
+        let params = function.params().expect("parameter list");
+        assert_eq!(params.params().count(), 1);
+        let self_param = params.self_param().expect("self parameter");
+        assert!(self_param.is_mutable());
+        assert_eq!(
+            node_text(source, self_param.ty().expect("self type").syntax()),
+            "borrow mut Self"
+        );
+        assert_eq!(
+            node_text(
+                source,
+                function
+                    .ret_type()
+                    .and_then(|ret_type| ret_type.ty())
+                    .expect("return type")
+                    .syntax()
+            ),
+            "U"
+        );
+
+        let where_clause = function.where_clause().expect("where clause");
+        let predicates = where_clause.predicates().collect::<Vec<_>>();
+        assert_eq!(predicates.len(), 3);
+        let ordered_where_bounds = predicates[0].bounds().collect::<Vec<_>>();
+        assert_eq!(ordered_where_bounds.len(), 3);
+        assert!(matches!(ordered_where_bounds[0], Bound::Trait(_)));
+        assert!(matches!(ordered_where_bounds[1], Bound::FnSugar(_)));
+        assert!(matches!(ordered_where_bounds[2], Bound::Trait(_)));
+        assert_eq!(
+            node_text(source, predicates[0].ty().expect("predicate type").syntax()),
+            "U"
+        );
+        assert_eq!(predicates[0].trait_bounds().count(), 2);
+        let fn_bound = predicates[0]
+            .fn_sugar_bounds()
+            .next()
+            .expect("Fn sugar bound");
+        assert_eq!(fn_bound.params().count(), 1);
+        assert_eq!(
+            node_text(
+                source,
+                fn_bound.ret_type().expect("Fn bound return type").syntax()
+            ),
+            "I32"
+        );
+        assert_eq!(
+            fn_bound
+                .effects()
+                .and_then(|effects| effects.set())
+                .expect("Fn bound effects")
+                .effects()
+                .count(),
+            1
+        );
+        assert_eq!(predicates[1].trait_bounds().count(), 1);
+        assert!(predicates[1].fn_sugar_bounds().next().is_none());
+        let fn_bound_without_return = predicates[2]
+            .fn_sugar_bounds()
+            .next()
+            .expect("Fn bound without return type");
+        assert_eq!(fn_bound_without_return.params().count(), 0);
+        assert!(fn_bound_without_return.ret_type().is_none());
+
+        let provenances = function
+            .borrows_clause()
+            .expect("borrows clause")
+            .provenances()
+            .collect::<Vec<_>>();
+        assert_eq!(provenances.len(), 2);
+        assert_eq!(provenances[0].segments().count(), 2);
+        assert_eq!(provenances[1].segments().count(), 1);
+        assert_eq!(
+            function
+                .effects_clause()
+                .and_then(|effects| effects.set())
+                .expect("function effects")
+                .effects()
+                .count(),
+            1
+        );
+
+        let requires = function.requires_clauses().collect::<Vec<_>>();
+        assert_eq!(requires.len(), 2);
+        assert_eq!(
+            node_text(
+                source,
+                requires[0]
+                    .expression()
+                    .expect("first precondition")
+                    .syntax()
+            ),
+            "value == value"
+        );
+        assert_eq!(
+            node_text(
+                source,
+                requires[1]
+                    .expression()
+                    .expect("second precondition")
+                    .syntax()
+            ),
+            "true"
+        );
+        let ensures = function.ensures_clauses().collect::<Vec<_>>();
+        assert_eq!(ensures.len(), 2);
+        assert_eq!(
+            node_text(
+                source,
+                ensures[0]
+                    .expression()
+                    .expect("first postcondition")
+                    .syntax()
+            ),
+            "true"
+        );
+        assert_eq!(
+            node_text(
+                source,
+                ensures[1]
+                    .expression()
+                    .expect("second postcondition")
+                    .syntax()
+            ),
+            "value == value"
+        );
+
+        let plain_function = root
+            .descendants()
+            .filter_map(FnDecl::cast)
+            .nth(1)
+            .expect("plain function");
+        assert!(plain_function.unsafe_token().is_none());
+        assert!(plain_function.async_token().is_none());
+        assert!(plain_function.generic_params().is_none());
+        assert!(
+            plain_function
+                .params()
+                .and_then(|params| params.self_param())
+                .is_none()
+        );
+        assert!(plain_function.where_clause().is_none());
+        assert!(plain_function.borrows_clause().is_none());
+        assert!(plain_function.effects_clause().is_none());
+        assert_eq!(plain_function.requires_clauses().count(), 0);
+        assert_eq!(plain_function.ensures_clauses().count(), 0);
+    }
+
+    #[test]
     fn interface_function_bodies_are_reported_and_wrapped_as_errors() {
         let source = concat!(
             "interface storage {\n",
