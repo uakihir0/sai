@@ -961,7 +961,7 @@ pub struct SyntaxToken { parent: SyntaxNode, index_in_parent: u32, offset: TextS
 pub enum SyntaxElement { Node(SyntaxNode), Token(SyntaxToken) }
 ```
 
-- Red nodes are created lazily during traversal and are cheap handles. They are not `Send`; a thread that needs a tree creates its own red root from the shared green root.
+- Red node handles and a compact node/child index are materialized when a red root is created. Structural traversal then clones cached `Rc` handles without allocating per child. The token-offset index is built lazily on the first `token_at_offset` call. Red nodes are not `Send`; a thread that needs a tree creates its own red root from the shared green root.
 - `SyntaxNode::text_range()` excludes the leading trivia of the first token and the trailing trivia of the last token. `full_range()` includes them. Diagnostics and AST pointers use `text_range()`.
 - Traversal API: `children`, `children_with_tokens`, `parent`, `ancestors`, `descendants` (pre-order), `first_token`, `last_token`, `token_at_offset(offset) -> TokenAtOffset` (none, single, or between two tokens), and `covering_element(range)`.
 
@@ -1044,10 +1044,11 @@ pub trait AstToken: Sized {
 
 - An AST view is a newtype around a `SyntaxNode` of one kind (`struct FnDecl(SyntaxNode)`), or an enum over several kinds (`enum Expr { Literal(Literal), BinExpr(BinExpr), ... }`, `enum Item`, `enum Pattern`, `enum Type`, `enum Stmt`).
 - The views and their accessors are generated at build time from a grammar description file (`sai.ungram`) that lists, for each node kind, its children with their roles. The generator also emits the node-kind list of §2.6.5, so the two cannot drift. The grammar description is checked against spec/03 by the conformance tests (impl/15).
+- **Current implementation slice.** `AstNode` and `AstToken` are introduced with typed views for test/property declarations, their parameters, names, blocks, string tokens, and the type-node union. These initial wrappers are maintained in `ast.rs`; `StringLit` currently exposes raw token text, while escape decoding and the other value decoders of §2.7.3 are deferred. The compact red-node index is materialized at root creation so structural accessors can return cached handles without allocating; the token-offset index remains lazy. The `sai.ungram` source and build-time generator, along with the remaining views and accessors, are not implemented yet.
 
 ### 2.7.2 Accessors
 
-- Every accessor returns an `Option` (or an iterator), because the tree may be incomplete: `FnDecl::name() -> Option<Name>`, `FnDecl::params() -> Option<ParamList>`, `FnDecl::body() -> Option<Block>`, `BinExpr::lhs() -> Option<Expr>`, `BinExpr::op() -> Option<(SyntaxToken, BinOp)>`, `BinExpr::rhs() -> Option<Expr>`.
+- Every **structural role accessor** returns an `Option` (or an iterator), because the tree may be incomplete: `FnDecl::name() -> Option<Name>`, `FnDecl::params() -> Option<ParamList>`, `FnDecl::body() -> Option<Block>`, `BinExpr::lhs() -> Option<Expr>`, `BinExpr::op() -> Option<(SyntaxToken, BinOp)>`, `BinExpr::rhs() -> Option<Expr>`. Token text, decoded literal values, and scalar predicates may return their value directly.
 - When two children have the same kind, the accessor names the role, and the child is found by position (`BinExpr::lhs` is the first `Expr` child, `rhs` the second; `RangeExpr::start` is the `Expr` child before the operator token and `end` the one after it).
 - Composite tokens: `BinExpr::op` returns `BinOp::Shr` for a glued `SHR` token, and so on. Recovery forms (`COLON2`, `AMP2`, `PIPE2`) map to the operators they were reported as.
 - Accessors never panic and never allocate except for iterators.

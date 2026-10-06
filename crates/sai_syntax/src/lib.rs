@@ -2,6 +2,8 @@
 
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
+pub mod ast;
+
 use sai_diagnostics::{
     Applicability, Child, ChildKind, Code, Diagnostic, Fix, FixOperation, FixOperationName,
     FixOperationPlanner, Location, NodeGroup, NodeId, OperationPlanError, Severity, SourceRef,

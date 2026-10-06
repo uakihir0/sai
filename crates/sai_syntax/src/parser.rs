@@ -2181,6 +2181,227 @@ mod tests {
     }
 
     #[test]
+    fn typed_ast_views_expose_test_property_and_parameter_roles() {
+        use crate::ast::{AstNode, Type};
+
+        let source = concat!(
+            "test \"basic\" {}\n",
+            "property \"generated\" (value: U32, var bound: Bool, _: U32) {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let file = crate::ast::SourceFile::cast(root.clone()).expect("source file view");
+        let test = file.test_decls().next().expect("test declaration");
+        let property = file.property_decls().next().expect("property declaration");
+        let params = property.params().expect("property parameters");
+        let params = params.params().collect::<Vec<_>>();
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(test.name().expect("test name").text(), "\"basic\"");
+        assert_eq!(
+            test.body().expect("test body").syntax().kind(),
+            SyntaxKind::BLOCK
+        );
+        assert_eq!(
+            property.name().expect("property name").text(),
+            "\"generated\""
+        );
+        assert_eq!(params.len(), 3);
+        assert_eq!(
+            params[0]
+                .name()
+                .and_then(|name| name.token())
+                .expect("first parameter name")
+                .text(),
+            "value"
+        );
+        assert!(!params[0].is_mutable());
+        assert!(matches!(params[0].ty(), Some(Type::PathType(_))));
+        assert_eq!(
+            params[1]
+                .name()
+                .and_then(|name| name.token())
+                .expect("mutable parameter name")
+                .text(),
+            "bound"
+        );
+        assert!(params[1].is_mutable());
+        assert!(matches!(params[1].ty(), Some(Type::PathType(_))));
+        assert_eq!(
+            params[2]
+                .name()
+                .and_then(|name| name.token())
+                .expect("unnamed parameter token")
+                .text(),
+            "_"
+        );
+        assert!(!Type::can_cast(SyntaxKind::BLOCK));
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
+        use crate::ast::{
+            AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,
+            ParamList, ParenType, PathType, PropertyDecl, SelfType, SourceFile, StringLit,
+            TestDecl, TupleType, Type,
+        };
+
+        let source = concat!(
+            "test \"basic\" {}\n",
+            "property \"types\" (\n",
+            "path: U32,\n",
+            "self_type: Self,\n",
+            "borrowed: borrow U32,\n",
+            "owned_value: owned U32,\n",
+            "tuple: (U32, Bool),\n",
+            "parenthesized: (U32),\n",
+            "inferred: _,\n",
+            "function: fn() -> U32,\n",
+            ") {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let kinds = root
+            .descendants()
+            .map(|node| node.kind())
+            .collect::<Vec<_>>();
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        for kind in kinds {
+            let node = root
+                .descendants()
+                .find(|node| node.kind() == kind)
+                .expect("kind came from this tree");
+            assert_eq!(
+                SourceFile::can_cast(kind),
+                SourceFile::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                TestDecl::can_cast(kind),
+                TestDecl::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                PropertyDecl::can_cast(kind),
+                PropertyDecl::cast(node.clone()).is_some()
+            );
+            assert_eq!(Block::can_cast(kind), Block::cast(node.clone()).is_some());
+            assert_eq!(
+                ParamList::can_cast(kind),
+                ParamList::cast(node.clone()).is_some()
+            );
+            assert_eq!(Param::can_cast(kind), Param::cast(node.clone()).is_some());
+            assert_eq!(Name::can_cast(kind), Name::cast(node.clone()).is_some());
+            assert_eq!(Type::can_cast(kind), Type::cast(node.clone()).is_some());
+            assert_eq!(
+                PathType::can_cast(kind),
+                PathType::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                SelfType::can_cast(kind),
+                SelfType::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                BorrowType::can_cast(kind),
+                BorrowType::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                OwnedType::can_cast(kind),
+                OwnedType::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                TupleType::can_cast(kind),
+                TupleType::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                ParenType::can_cast(kind),
+                ParenType::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                InferType::can_cast(kind),
+                InferType::cast(node.clone()).is_some()
+            );
+            assert_eq!(
+                FnPtrType::can_cast(kind),
+                FnPtrType::cast(node.clone()).is_some()
+            );
+        }
+
+        let file = SourceFile::cast(root.clone()).expect("source file view");
+        let string = file.test_decls().next().unwrap().name().unwrap();
+        assert!(StringLit::can_cast(string.syntax().kind()));
+        assert!(StringLit::cast(string.syntax().clone()).is_some());
+        let non_string = file
+            .property_decls()
+            .next()
+            .unwrap()
+            .params()
+            .unwrap()
+            .params()
+            .next()
+            .unwrap()
+            .name()
+            .unwrap()
+            .token()
+            .unwrap();
+        assert!(!StringLit::can_cast(non_string.kind()));
+        assert!(StringLit::cast(non_string).is_none());
+
+        let property_types = file
+            .property_decls()
+            .next()
+            .unwrap()
+            .params()
+            .unwrap()
+            .params()
+            .filter_map(|param| param.ty())
+            .map(|ty| ty.syntax().kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            property_types,
+            [
+                SyntaxKind::PATH_TYPE,
+                SyntaxKind::SELF_TYPE,
+                SyntaxKind::BORROW_TYPE,
+                SyntaxKind::OWNED_TYPE,
+                SyntaxKind::TUPLE_TYPE,
+                SyntaxKind::PAREN_TYPE,
+                SyntaxKind::INFER_TYPE,
+                SyntaxKind::FN_PTR_TYPE,
+            ]
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn typed_ast_accessors_remain_optional_for_incomplete_declarations() {
+        use crate::ast::{AstNode, SourceFile};
+
+        let source = concat!(
+            "property \"without parameters\" {}\n",
+            "property \"without type\" (value:) {}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let file = SourceFile::cast(root.clone()).expect("source file view");
+        let properties = file.property_decls().collect::<Vec<_>>();
+
+        assert_eq!(properties.len(), 2);
+        assert!(properties.iter().all(|property| property.name().is_some()));
+        assert!(properties[0].params().is_none());
+        assert!(properties[0].body().is_some());
+        let missing_type = properties[1]
+            .params()
+            .and_then(|params| params.params().next())
+            .expect("parameter remains available");
+        assert!(missing_type.name().is_some());
+        assert!(missing_type.ty().is_none());
+        assert!(properties[1].body().is_some());
+        assert!(!output.errors.is_empty());
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn property_parameter_attributes_report_invalid_target_inside_param() {
         let source = "property \"attributed\" (@allow(unused) value: U32) {}\n";
         let output = parse_file(source);

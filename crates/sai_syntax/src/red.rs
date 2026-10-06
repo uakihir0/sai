@@ -1,4 +1,4 @@
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, OnceCell};
 use std::fmt::{self, Formatter};
 use std::rc::Rc;
 
@@ -18,24 +18,25 @@ struct NodeData {
 }
 
 struct RedTreeCache {
-    root: Rc<NodeData>,
-    index: OnceCell<RedTreeIndex>,
+    index: RedTreeIndex,
+    token_index: OnceCell<RedTokenIndex>,
 }
 
 struct RedTreeIndex {
     nodes: Box<[NodeIndexEntry]>,
+    child_node_ids: Box<[usize]>,
+}
+
+struct RedTokenIndex {
     tokens: Box<[TokenIndexEntry]>,
+    node_ranges: Box<[(usize, usize)]>,
 }
 
 struct NodeIndexEntry {
     green: GreenNode,
-    parent: Option<usize>,
-    index_in_parent: Option<u32>,
     offset: TextSize,
-    child_node_ids: Box<[Option<usize>]>,
-    token_start: usize,
-    token_end: usize,
-    red_data: RefCell<Option<Rc<NodeData>>>,
+    child_ids_start: usize,
+    red_data: Option<Rc<NodeData>>,
 }
 
 struct TokenIndexEntry {
@@ -84,45 +85,30 @@ impl fmt::Debug for SyntaxNode {
 
 impl Drop for SyntaxNode {
     fn drop(&mut self) {
-        let placeholder = Rc::new(NodeData {
-            green: self.0.green.clone(),
-            parent: None,
-            index_in_parent: self.0.index_in_parent,
-            offset: self.0.offset,
-            index_id: Cell::new(None),
-        });
-        let mut current = Some(std::mem::replace(&mut self.0, placeholder));
-        while let Some(node) = current {
-            match Rc::try_unwrap(node) {
-                Ok(mut data) => current = data.parent.take(),
-                Err(node) => {
-                    drop(node);
-                    break;
-                }
+        loop {
+            if Rc::strong_count(&self.0) != 1 {
+                break;
             }
+
+            let parent = Rc::get_mut(&mut self.0).and_then(|data| data.parent.take());
+            let Some(parent) = parent else {
+                break;
+            };
+            let node = std::mem::replace(&mut self.0, parent);
+            drop(node);
         }
     }
 }
 
 impl Drop for RedTreeCache {
     fn drop(&mut self) {
-        let Some(mut index) = self.index.take() else {
-            return;
-        };
-        let mut pending = Vec::new();
-        for entry in &mut index.nodes {
-            if let Some(data) = entry.red_data.get_mut().take() {
-                pending.push(data);
-            }
-        }
-        while let Some(node) = pending.pop() {
-            match Rc::try_unwrap(node) {
-                Ok(mut data) => {
+        for entry in self.index.nodes.iter_mut().rev() {
+            if let Some(data) = entry.red_data.take() {
+                if let Ok(mut data) = Rc::try_unwrap(data) {
                     if let Some(parent) = data.parent.take() {
-                        pending.push(parent);
+                        drop(parent);
                     }
                 }
-                Err(node) => drop(node),
             }
         }
     }
@@ -149,8 +135,8 @@ impl SyntaxNode {
             index_id: Cell::new(Some(0)),
         });
         let cache = Rc::new(RedTreeCache {
-            root: root.clone(),
-            index: OnceCell::new(),
+            index: build_red_node_index(root.clone()),
+            token_index: OnceCell::new(),
         });
         Self(root, cache)
     }
@@ -201,12 +187,11 @@ impl SyntaxNode {
     pub fn children_with_tokens(&self) -> impl Iterator<Item = SyntaxElement> + '_ {
         let parent = self.0.clone();
         let cache = self.1.clone();
-        let parent_index_id = self.0.index_id.get().or_else(|| {
-            self.1
-                .index
-                .get()
-                .and_then(|index| resolve_node_index(&self.0, index))
-        });
+        let parent_index_id = self
+            .0
+            .index_id
+            .get()
+            .or_else(|| resolve_node_index(&self.0, &self.1.index));
         self.green()
             .children()
             .iter()
@@ -221,11 +206,16 @@ impl SyntaxNode {
                 let child_index_id = parent_index_id.and_then(|parent_id| {
                     cache
                         .index
-                        .get()
-                        .and_then(|tree| tree.nodes.get(parent_id))
-                        .and_then(|entry| entry.child_node_ids.get(index))
+                        .nodes
+                        .get(parent_id)
+                        .and_then(|entry| {
+                            cache
+                                .index
+                                .child_node_ids
+                                .get(entry.child_ids_start.checked_add(index)?)
+                        })
                         .copied()
-                        .flatten()
+                        .filter(|node_id| *node_id != usize::MAX)
                 });
                 let index = u32::try_from(index).unwrap_or(u32::MAX);
                 match child {
@@ -315,30 +305,31 @@ impl SyntaxNode {
     pub fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset {
         let index = self
             .1
-            .index
-            .get_or_init(|| build_red_tree_index(self.1.root.clone()));
-        let Some(node_id) = resolve_node_index(&self.0, index) else {
+            .token_index
+            .get_or_init(|| build_red_token_index(&self.1.index));
+        let Some(node_id) = resolve_node_index(&self.0, &self.1.index) else {
             return TokenAtOffset::None;
         };
-        let node_entry = index.nodes.get(node_id).expect("node index is valid");
-        let token_entries = &index.tokens[node_entry.token_start..node_entry.token_end];
+        let (token_start, token_end) = index
+            .node_ranges
+            .get(node_id)
+            .copied()
+            .expect("node index is valid");
+        let token_entries = &index.tokens[token_start..token_end];
         let first = token_entries.partition_point(|entry| entry.text_range.end() < offset);
-        let matching_entries = token_entries[first..]
-            .iter()
-            .take_while(|entry| entry.text_range.start() <= offset)
-            .filter(|entry| offset <= entry.text_range.end())
-            .collect::<Vec<_>>();
+        let after_last = token_entries.partition_point(|entry| entry.text_range.start() <= offset);
+        let matching_count = after_last.saturating_sub(first);
         let match_start = if offset == self.full_range().end()
-            && matching_entries
-                .last()
+            && matching_count > 2
+            && token_entries
+                .get(after_last.saturating_sub(1))
                 .is_some_and(|entry| entry.green.kind() == crate::SyntaxKind::EOF)
-            && matching_entries.len() > 2
         {
-            matching_entries.len() - 2
+            after_last - 2
         } else {
-            0
+            first
         };
-        let mut matches = matching_entries[match_start..]
+        let mut matches = token_entries[match_start..after_last]
             .iter()
             .take(2)
             .map(|entry| SyntaxToken {
@@ -375,24 +366,19 @@ impl SyntaxNode {
     }
 }
 
-fn build_red_tree_index(root: Rc<NodeData>) -> RedTreeIndex {
+fn build_red_node_index(root: Rc<NodeData>) -> RedTreeIndex {
     let root_child_count = root.green.children().len();
+    let mut child_node_ids = vec![usize::MAX; root_child_count];
     let mut nodes = vec![NodeIndexEntry {
         green: root.green.clone(),
-        parent: None,
-        index_in_parent: None,
         offset: root.offset,
-        child_node_ids: vec![None; root_child_count].into_boxed_slice(),
-        token_start: 0,
-        token_end: 0,
-        red_data: RefCell::new(Some(root.clone())),
+        child_ids_start: 0,
+        red_data: Some(root.clone()),
     }];
-    let mut tokens = Vec::new();
     let mut stack = vec![(0_usize, 0_usize)];
 
     while let Some((parent_id, child_index)) = stack.last().copied() {
         if child_index >= nodes[parent_id].green.children().len() {
-            nodes[parent_id].token_end = tokens.len();
             stack.pop();
             continue;
         }
@@ -412,24 +398,86 @@ fn build_red_tree_index(root: Rc<NodeData>) -> RedTreeIndex {
         match child {
             GreenElement::Node(green) => {
                 let child_id = nodes.len();
-                nodes[parent_id].child_node_ids[child_index] = Some(child_id);
+                let parent_child_id_index = nodes[parent_id]
+                    .child_ids_start
+                    .checked_add(child_index)
+                    .expect("child index is within the node");
+                child_node_ids[parent_child_id_index] = child_id;
                 let child_count = green.children().len();
-                nodes.push(NodeIndexEntry {
-                    green,
-                    parent: Some(parent_id),
+                let parent_data = nodes[parent_id]
+                    .red_data
+                    .as_ref()
+                    .expect("indexed parent has a red node")
+                    .clone();
+                let child_data = Rc::new(NodeData {
+                    green: green.clone(),
+                    parent: Some(parent_data),
                     index_in_parent: Some(index_in_parent),
                     offset: child_offset,
-                    child_node_ids: vec![None; child_count].into_boxed_slice(),
-                    token_start: tokens.len(),
-                    token_end: tokens.len(),
-                    red_data: RefCell::new(None),
+                    index_id: Cell::new(Some(child_id)),
                 });
+                nodes.push(NodeIndexEntry {
+                    green,
+                    offset: child_offset,
+                    child_ids_start: child_node_ids.len(),
+                    red_data: Some(child_data),
+                });
+                child_node_ids.resize(
+                    child_node_ids
+                        .len()
+                        .checked_add(child_count)
+                        .expect("child index length fits in memory"),
+                    usize::MAX,
+                );
+                stack.push((child_id, 0));
+            }
+            GreenElement::Token(_) => {}
+        }
+    }
+
+    RedTreeIndex {
+        nodes: nodes.into_boxed_slice(),
+        child_node_ids: child_node_ids.into_boxed_slice(),
+    }
+}
+
+fn build_red_token_index(index: &RedTreeIndex) -> RedTokenIndex {
+    let mut tokens = Vec::new();
+    let mut node_ranges = vec![(0, 0); index.nodes.len()];
+    let mut stack = vec![(0_usize, 0_usize)];
+
+    while let Some((parent_id, child_index)) = stack.last().copied() {
+        if child_index == 0 {
+            node_ranges[parent_id].0 = tokens.len();
+        }
+        let parent = &index.nodes[parent_id];
+        if child_index >= parent.green.children().len() {
+            node_ranges[parent_id].1 = tokens.len();
+            stack.pop();
+            continue;
+        }
+        stack.last_mut().expect("stack is non-empty").1 += 1;
+        let Some(child) = parent.green.children().get(child_index) else {
+            continue;
+        };
+        let child_offset = add_size(
+            parent.offset,
+            parent
+                .green
+                .child_offset(child_index)
+                .unwrap_or_else(|| TextSize::new(0)),
+        );
+        let index_in_parent = u32::try_from(child_index).unwrap_or(u32::MAX);
+        match child {
+            GreenElement::Node(_) => {
+                let child_id = index.child_node_ids[parent.child_ids_start + child_index];
+                debug_assert_ne!(child_id, usize::MAX);
                 stack.push((child_id, 0));
             }
             GreenElement::Token(green) if green.kind() != crate::SyntaxKind::NEWLINE => {
                 tokens.push(TokenIndexEntry {
-                    text_range: token_text_range(&green, child_offset),
-                    green,
+                    text_range: token_text_range(green, child_offset),
+                    green: green.clone(),
                     parent_node_id: parent_id,
                     index_in_parent,
                     offset: child_offset,
@@ -439,9 +487,9 @@ fn build_red_tree_index(root: Rc<NodeData>) -> RedTreeIndex {
         }
     }
 
-    RedTreeIndex {
-        nodes: nodes.into_boxed_slice(),
+    RedTokenIndex {
         tokens: tokens.into_boxed_slice(),
+        node_ranges: node_ranges.into_boxed_slice(),
     }
 }
 
@@ -478,11 +526,11 @@ fn resolve_node_index(node: &Rc<NodeData>, index: &RedTreeIndex) -> Option<usize
     while let Some(data) = path.pop() {
         let child_index = usize::try_from(data.index_in_parent?).ok()?;
         let parent_entry = index.nodes.get(parent_id)?;
-        let node_id = parent_entry
-            .child_node_ids
-            .get(child_index)
-            .copied()
-            .flatten()?;
+        let child_id_index = parent_entry.child_ids_start.checked_add(child_index)?;
+        let node_id = *index.child_node_ids.get(child_id_index)?;
+        if node_id == usize::MAX {
+            return None;
+        }
         let node_entry = index.nodes.get(node_id)?;
         if node_entry.offset != data.offset || !node_entry.green.ptr_eq(&data.green) {
             return None;
@@ -494,35 +542,14 @@ fn resolve_node_index(node: &Rc<NodeData>, index: &RedTreeIndex) -> Option<usize
 }
 
 fn red_node_for_index(cache: Rc<RedTreeCache>, node_id: usize) -> SyntaxNode {
-    let index = cache
+    let data = cache
         .index
-        .get()
-        .expect("red-node index is initialized before resolving a token");
-    let mut current_id = node_id;
-    let mut path = Vec::<usize>::new();
-
-    loop {
-        let entry = index.nodes.get(current_id).expect("node index is valid");
-        let existing_data = entry.red_data.borrow().clone();
-        if let Some(data) = existing_data {
-            let mut parent = data;
-            for path_id in path.into_iter().rev() {
-                let entry = index.nodes.get(path_id).expect("node path index is valid");
-                let data = Rc::new(NodeData {
-                    green: entry.green.clone(),
-                    parent: Some(parent.clone()),
-                    index_in_parent: entry.index_in_parent,
-                    offset: entry.offset,
-                    index_id: Cell::new(Some(path_id)),
-                });
-                *entry.red_data.borrow_mut() = Some(data.clone());
-                parent = data;
-            }
-            return SyntaxNode(parent, cache.clone());
-        }
-        path.push(current_id);
-        current_id = entry.parent.expect("the root red node is strongly owned");
-    }
+        .nodes
+        .get(node_id)
+        .and_then(|entry| entry.red_data.as_ref())
+        .expect("indexed node has a cached red handle")
+        .clone();
+    SyntaxNode(data, cache)
 }
 
 impl SyntaxToken {
@@ -649,6 +676,77 @@ mod tests {
     }
 
     #[test]
+    fn root_construction_materializes_red_handles_for_every_node() {
+        let source = "a+b";
+        let lexed = lex_text(source);
+        let events = vec![
+            Event::Start {
+                kind: SyntaxKind::SOURCE_FILE,
+                forward_parent: None,
+            },
+            Event::Start {
+                kind: SyntaxKind::BIN_EXPR,
+                forward_parent: None,
+            },
+            Event::Start {
+                kind: SyntaxKind::LITERAL,
+                forward_parent: None,
+            },
+            Event::Token {
+                kind: SyntaxKind::LIDENT,
+                n_raw: 1,
+            },
+            Event::Finish,
+            Event::Token {
+                kind: SyntaxKind::PLUS,
+                n_raw: 1,
+            },
+            Event::Start {
+                kind: SyntaxKind::LITERAL,
+                forward_parent: None,
+            },
+            Event::Token {
+                kind: SyntaxKind::LIDENT,
+                n_raw: 1,
+            },
+            Event::Finish,
+            Event::Finish,
+            Event::Token {
+                kind: SyntaxKind::NEWLINE,
+                n_raw: 1,
+            },
+            Event::Token {
+                kind: SyntaxKind::EOF,
+                n_raw: 1,
+            },
+            Event::Finish,
+        ];
+        let mut cache = NodeCache::new();
+        let tree = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("build green tree");
+        let root = SyntaxNode::new_root(tree.root);
+        let index = &root.1.index;
+
+        assert_eq!(index.nodes.len(), 4);
+        assert_eq!(
+            index
+                .child_node_ids
+                .iter()
+                .filter(|node_id| **node_id != usize::MAX)
+                .count(),
+            3
+        );
+        for (node_id, entry) in index.nodes.iter().enumerate() {
+            let data = entry
+                .red_data
+                .as_ref()
+                .cloned()
+                .expect("red handle was materialized");
+            assert_eq!(data.index_id.get(), Some(node_id));
+        }
+    }
+
+    #[test]
     fn red_tree_offsets_and_ranges_distinguish_full_text_from_token_text() {
         let source = "  a+b";
         let root = flat_root(source);
@@ -747,8 +845,9 @@ mod tests {
     }
 
     #[test]
-    fn token_offset_index_is_shared_and_sorted() {
+    fn red_tree_index_is_shared_and_token_offsets_are_sorted() {
         let root = flat_root("a+b");
+        assert!(root.1.token_index.get().is_none());
         assert!(matches!(
             root.token_at_offset(TextSize::new(3)),
             TokenAtOffset::Between(_, _)
@@ -757,7 +856,11 @@ mod tests {
             root.token_at_offset(TextSize::new(1)),
             TokenAtOffset::Between(_, _)
         ));
-        let entries = root.1.index.get().expect("offset lookup builds the index");
+        let entries = root
+            .1
+            .token_index
+            .get()
+            .expect("offset lookup builds the token index");
         assert_eq!(entries.tokens.len(), 4);
         assert!(
             entries
