@@ -7,6 +7,7 @@ pub mod expressions;
 pub mod item_tree;
 pub mod items;
 pub mod literals;
+pub mod lower;
 pub mod patterns;
 pub mod source_map;
 pub mod types;

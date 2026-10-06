@@ -1480,6 +1480,8 @@ Notes on the shape:
 4. An `ERROR` node that contains a complete expression (for example the operator-continuation recovery of §2.5.11) is lowered to `Err`; the contained expression is not lowered.
 5. A `CAST_EXPR` (§2.5.6) is the exception to item 4: it is lowered to `ExprKind::AsCast` with its operand and its type (a missing type is `TyKind::Err`), and lowering reports nothing. The node is kept so that the type checker can report `NO_AS_CAST` with a fix chosen from the operand's type ([impl/03](03-name-resolution-and-type-checking.md) §3.10.3). No later stage sees it: the body is tainted by that error, and a tainted body is not lowered to MIR ([impl/04](04-mir.md) §4.4.1).
 
+**Current implementation slice.** `sai_hir::lower::lower_literal` lowers integer, float, string, byte-string, character, byte, and boolean syntax literals to `ExprKind::Lit`. Strings are decoded and interned, byte strings are copied into the HIR arena, and underscores are removed from the retained float spelling so separator-only edits do not change its HIR value. Missing tokens, `ERROR` nodes, and malformed numeric tokens become `ExprKind::Err` without adding diagnostics. Error-marked string, byte-string, character, and byte tokens keep the replacement values returned by their total AST decoders, while their existing syntax diagnostics remain authoritative. The source-map builder supplies the HIR ID and snapshot-validated span. Unary-minus folding and other expression, pattern, and type error lowering remain follow-up work.
+
 ### 2.8.7 Item tree
 
 The query `def_collector(FileId) -> ItemTree` produces a summary of a file's item-like nodes without bodies:
