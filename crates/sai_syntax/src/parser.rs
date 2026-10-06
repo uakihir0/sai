@@ -2487,6 +2487,39 @@ mod tests {
     }
 
     #[test]
+    fn tuple_index_ast_values_require_plain_decimal_u32() {
+        use crate::ast::{AstNode, TupleIndexExpr};
+
+        let source = concat!(
+            "fn indices() {\n",
+            "let zero = value.0\n",
+            "let maximum = value.4294967295\n",
+            "let overflow = value.4294967296\n",
+            "let leading_zero = value.01\n",
+            "let separator = value.1_0\n",
+            "let prefix = value.0x1\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let values = root
+            .descendants()
+            .filter_map(TupleIndexExpr::cast)
+            .map(|index| index.index())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, [Some(0), Some(u32::MAX), None, None, None, None]);
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidTupleIndex)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     fn property_parameter_attributes_report_invalid_target_inside_param() {
         let source = "property \"attributed\" (@allow(unused) value: U32) {}\n";
         let output = parse_file(source);

@@ -1046,7 +1046,7 @@ pub trait AstToken: Sized {
 
 - An AST view is a newtype around a `SyntaxNode` of one kind (`struct FnDecl(SyntaxNode)`), or an enum over several kinds (`enum Expr { Literal(Literal), BinExpr(BinExpr), ... }`, `enum Item`, `enum Pattern`, `enum Type`, `enum Stmt`).
 - The views and their accessors are generated at build time from a grammar description file (`sai.ungram`) that lists, for each node kind, its children with their roles. The generator also emits the node-kind list of §2.6.5, so the two cannot drift. The grammar description is checked against spec/03 by the conformance tests (impl/15).
-- **Current implementation slice.** `AstNode` and `AstToken` are introduced with typed views for test/property declarations, their parameters, names, blocks, integer and float literals, string tokens, and the type-node union. These initial wrappers are maintained in `ast.rs`. `IntLit::value` and `FloatLit::{value_f64, value_f32}` are implemented; `StringLit` exposes raw token text, while escape decoding and the other value decoders of §2.7.3 are deferred. The compact red-node index is materialized at root creation so structural accessors can return cached handles without allocating; the token-offset index remains lazy. The `sai.ungram` source and build-time generator, along with the remaining views and accessors, are not implemented yet.
+- **Current implementation slice.** `AstNode` and `AstToken` are introduced with typed views for test/property declarations, their parameters, names, blocks, tuple indexes, integer and float literals, string tokens, and the type-node union. These initial wrappers are maintained in `ast.rs`. `IntLit::value`, `FloatLit::{value_f64, value_f32}`, and `TupleIndexExpr::index` are implemented; `StringLit` exposes raw token text, while escape decoding and the other value decoders of §2.7.3 are deferred. The compact red-node index is materialized at root creation so structural accessors can return cached handles without allocating; the token-offset index remains lazy. The `sai.ungram` source and build-time generator, along with the remaining views and accessors, are not implemented yet.
 
 ### 2.7.2 Accessors
 
@@ -1071,7 +1071,7 @@ Value decoders run the same scanning functions as the lexer (§2.3.2), in value 
 | `FormatSpec` | `name() -> &str`, `arg() -> Option<u128>` | |
 | `TupleIndexExpr` | `index() -> Option<u32>` | `None` if the digits do not fit in `u32`; impl/03 then reports `TUPLE_INDEX_OUT_OF_RANGE` ([spec/06](../spec/06-expressions-and-statements.md)) |
 
-**Current implementation slice.** `IntLit::value()` and `FloatLit::{value_f64(), value_f32()}` are implemented. Integer values use checked accumulation without allocating; float values remove `_` into a temporary string only when the spelling contains separators, then parse directly to the requested IEEE width. The remaining rows are deferred.
+**Current implementation slice.** `IntLit::value()`, `FloatLit::{value_f64(), value_f32()}`, and `TupleIndexExpr::index()` are implemented. Integer values use checked accumulation without allocating; float values remove `_` into a temporary string only when the spelling contains separators, then parse directly to the requested IEEE width. Tuple indexes accept only plain decimal spellings without leading zeroes and return `None` when they do not fit in `u32`. The remaining rows are deferred.
 
 ### 2.7.4 `AstPtr` and `AstIdMap`
 

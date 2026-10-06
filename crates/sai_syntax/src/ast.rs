@@ -61,6 +61,7 @@ ast_node!(Block, BLOCK);
 ast_node!(ParamList, PARAM_LIST);
 ast_node!(Param, PARAM);
 ast_node!(Name, NAME);
+ast_node!(TupleIndexExpr, TUPLE_INDEX_EXPR);
 
 ast_token!(IntLit, INT);
 ast_token!(FloatLit, FLOAT);
@@ -132,6 +133,20 @@ impl FloatLit {
         } else {
             text.parse::<T>().ok()
         }
+    }
+}
+
+impl TupleIndexExpr {
+    pub fn index(&self) -> Option<u32> {
+        let literal = direct_token::<IntLit>(self.syntax())?;
+        let text = literal.syntax().text();
+        if text.is_empty()
+            || !text.bytes().all(|byte| byte.is_ascii_digit())
+            || (text.len() > 1 && text.starts_with('0'))
+        {
+            return None;
+        }
+        text.parse().ok()
     }
 }
 
