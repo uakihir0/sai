@@ -3567,6 +3567,74 @@ mod tests {
     }
 
     #[test]
+    fn type_and_record_accessors_expose_declaration_children_and_recovery() {
+        use crate::ast::{AstNode, TypeDecl};
+
+        let source = concat!(
+            "type User<T>\n",
+            "where T: Clone\n",
+            "{\n",
+            "/// User identifier.\n",
+            "@field\n",
+            "pub id: T,\n",
+            "name: Str\n",
+            "}\n",
+            "type Positive = I32\n",
+            "where self > 0\n",
+            "type Empty {}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let declarations = root
+            .descendants()
+            .filter_map(TypeDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 3);
+
+        let user = &declarations[0];
+        assert!(user.generic_params().is_some());
+        assert!(user.alias_def().is_none());
+        let record = user.struct_def().expect("record definition");
+        assert!(record.where_clause().is_some());
+        let fields = record.fields().expect("record field list");
+        let fields = fields.fields().collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        assert!(fields[0].docs().is_some());
+        assert_eq!(fields[0].attrs().count(), 1);
+        assert!(fields[0].name().is_some());
+        assert!(fields[0].ty().is_some());
+        assert!(fields[1].docs().is_none());
+        assert_eq!(fields[1].attrs().count(), 0);
+        assert!(fields[1].name().is_some());
+        assert!(fields[1].ty().is_some());
+
+        let positive = &declarations[1];
+        assert!(positive.struct_def().is_none());
+        let alias = positive.alias_def().expect("alias definition");
+        assert!(alias.ty().is_some());
+        let refinement = alias.refinement().expect("refinement clause");
+        assert!(refinement.expression().is_some());
+
+        let empty = declarations[2]
+            .struct_def()
+            .and_then(|definition| definition.fields())
+            .expect("empty record field list");
+        assert_eq!(empty.fields().count(), 0);
+
+        let malformed = parse_file("type Broken =\n");
+        assert!(!malformed.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed.root);
+        let malformed_alias = malformed_root
+            .descendants()
+            .find_map(TypeDecl::cast)
+            .and_then(|declaration| declaration.alias_def())
+            .expect("recovered alias definition");
+        assert!(malformed_alias.ty().is_none());
+        assert!(malformed_alias.refinement().is_none());
+    }
+
+    #[test]
     fn integer_ast_values_decode_radices_and_respect_error_and_range_flags() {
         use crate::ast::{AstToken, IntLit};
 

@@ -292,3 +292,16 @@ child CastExpr expression Expr 0
 child CastExpr ty Type 0
 child BinExpr lhs Expr 0
 child BinExpr rhs Expr 1
+child TypeDecl generic_params GenericParamList 0
+child TypeDecl struct_def StructDef 0
+child TypeDecl alias_def AliasDef 0
+child StructDef where_clause WhereClause 0
+child StructDef fields FieldList 0
+children FieldList fields FieldDecl
+child FieldDecl docs Docs 0
+children FieldDecl attrs Attribute
+child FieldDecl name Name 0
+child FieldDecl ty Type 0
+child AliasDef ty Type 0
+child AliasDef refinement RefinementClause 0
+child RefinementClause expression Expr 0
