@@ -1733,6 +1733,8 @@ Attributes are a closed set (D-SYN-09). Their targets, argument grammars, and me
    Any other name is `UNKNOWN_ATTRIBUTE` (error, spec/03), reported at the name. If exactly one table name has an edit distance of at most 2 (Damerau–Levenshtein over bytes), the diagnostic carries a fix that replaces the name; if several do, it carries none, so the fix never depends on a tie-break (P8). An unknown attribute is kept in the CST (for the formatter) and is omitted from every `RawAttr` list, so no later stage sees it.
 4. Raw identifiers are not attribute names: `@r#derive` is `UNKNOWN_ATTRIBUTE`.
 
+**Current implementation slice.** The snapshot-bound `parse` query walks every `ATTRIBUTE` after building the CST and checks its exact source spelling against `ATTRIBUTE_NAMES`. It reports `UNKNOWN_ATTRIBUTE` over the name, including for raw identifiers. It attaches a machine-applicable `replace_node` fix when exactly one table entry is within byte-wise Damerau–Levenshtein distance 2; ties and more distant names have no fix. The candidate set is length-filtered before distance calculation, so arbitrarily long unknown names do not allocate a correspondingly large distance matrix. `AttrName::from_source_name` uses the same table when the item tree decodes recognized attributes.
+
 ### 2.10.2 Raw and validated attributes
 
 The item tree and the HIR carry attributes in a decoded but unvalidated form:

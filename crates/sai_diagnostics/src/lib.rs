@@ -82,6 +82,7 @@ define_codes! {
     DuplicateClause => "DUPLICATE_CLAUSE",
     VisibilityOnTraitImplItem => "VISIBILITY_ON_TRAIT_IMPL_ITEM",
     InvalidAttributeTarget => "INVALID_ATTRIBUTE_TARGET",
+    UnknownAttribute => "UNKNOWN_ATTRIBUTE",
     RedundantPubExport => "REDUNDANT_PUB_EXPORT",
     InvalidExportTarget => "INVALID_EXPORT_TARGET",
     ExplicitDiscriminantOnDataEnum => "EXPLICIT_DISCRIMINANT_ON_DATA_ENUM",

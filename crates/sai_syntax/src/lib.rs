@@ -760,6 +760,8 @@ pub fn parse(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<Parse, Par
 
     let mut errors = lexed.errors;
     errors.extend(tree.errors);
+    report_unknown_attributes(&root, &lexed.tokens, snapshot, file_id, &mut errors)
+        .map_err(ParseError::Lex)?;
     errors.sort_by(|left, right| {
         let location_key = |diagnostic: &Diagnostic| {
             diagnostic
@@ -773,6 +775,144 @@ pub fn parse(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<Parse, Par
             .then_with(|| left.message.cmp(&right.message))
     });
     Ok(Parse { root, errors })
+}
+
+fn report_unknown_attributes(
+    root: &SyntaxNode,
+    tokens: &[Token],
+    snapshot: &WorkspaceSnapshot,
+    file_id: FileId,
+    errors: &mut Vec<Diagnostic>,
+) -> Result<(), LexError> {
+    use ast::AstNode;
+
+    let file = snapshot.file(file_id).ok_or(LexError::MissingFile)?;
+    let source = file.source();
+    let source_ref = SourceRef {
+        path: file.path().to_owned(),
+        package: file.package().map(str::to_owned),
+        snapshot: file.document_version(),
+    };
+
+    for attribute in root.descendants().filter_map(ast::Attribute::cast) {
+        let Some(name) = attribute.name() else {
+            continue;
+        };
+        let range = name.syntax().text_range();
+        let source_name = source
+            .text()
+            .get(range.start().to_usize()..range.end().to_usize())
+            .ok_or(LexError::InvalidSourceSpan)?;
+        if ATTRIBUTE_NAMES.contains(&source_name) {
+            continue;
+        }
+
+        let span = Span::new(file_id, range);
+        let location = Location::from_decoded_source(source_ref.clone(), span, source)
+            .ok_or(LexError::InvalidSourceSpan)?;
+        let mut diagnostic = Diagnostic::new(
+            Code::UnknownAttribute,
+            Severity::Error,
+            format!("unknown attribute `@{source_name}`"),
+            Some(location),
+        );
+
+        if let Some(suggestion) = unique_attribute_suggestion(source_name) {
+            let token_index = tokens
+                .iter()
+                .position(|token| token.range == range)
+                .and_then(|index| u64::try_from(index).ok())
+                .ok_or(LexError::FixPlanningFailed)?;
+            let operation = FixOperation::new(
+                FixOperationName::ReplaceNode,
+                NodeId::new(NodeGroup::Token, token_index),
+                ValueObject::from([("text".to_owned(), Value::String(suggestion.to_owned()))]),
+            )
+            .map_err(|_| LexError::FixPlanningFailed)?;
+            let primary = diagnostic
+                .primary()
+                .cloned()
+                .ok_or(LexError::FixPlanningFailed)?;
+            let planner = LexicalFixPlanner {
+                token_index,
+                decoded_range: range,
+                operation: FixOperationName::ReplaceNode,
+                replacement: suggestion,
+            };
+            let fix = Fix::new(
+                format!("replace with `@{suggestion}`"),
+                Applicability::MachineApplicable,
+                operation,
+                Vec::new(),
+                &primary,
+                snapshot,
+                &planner,
+            )
+            .map_err(|_| LexError::FixPlanningFailed)?;
+            diagnostic = diagnostic
+                .with_workspace_snapshot(snapshot)
+                .map_err(|_| LexError::FixPlanningFailed)?;
+            diagnostic
+                .push_fix(fix)
+                .map_err(|_| LexError::FixPlanningFailed)?;
+        }
+
+        errors.push(diagnostic);
+    }
+    Ok(())
+}
+
+fn unique_attribute_suggestion(name: &str) -> Option<&'static str> {
+    let mut suggestions = ATTRIBUTE_NAMES
+        .iter()
+        .copied()
+        .filter(|candidate| name.len().abs_diff(candidate.len()) <= 2)
+        .filter(|candidate| damerau_levenshtein(name.as_bytes(), candidate.as_bytes()) <= 2);
+    let suggestion = suggestions.next()?;
+    suggestions.next().is_none().then_some(suggestion)
+}
+
+fn damerau_levenshtein(left: &[u8], right: &[u8]) -> usize {
+    let max_distance = left.len().saturating_add(right.len());
+    let mut distances = vec![vec![0; right.len() + 2]; left.len() + 2];
+    distances[0][0] = max_distance;
+    for row in 0..=left.len() {
+        distances[row + 1][0] = max_distance;
+        distances[row + 1][1] = row;
+    }
+    for column in 0..=right.len() {
+        distances[0][column + 1] = max_distance;
+        distances[1][column + 1] = column;
+    }
+
+    let mut last_row = [0; 256];
+    for row in 1..=left.len() {
+        let mut last_match_column = 0;
+        for column in 1..=right.len() {
+            let prior_row = last_row[right[column - 1] as usize];
+            let prior_column = last_match_column;
+            let mut substitution_cost = 1;
+            if left[row - 1] == right[column - 1] {
+                substitution_cost = 0;
+                last_match_column = column;
+            }
+
+            distances[row + 1][column + 1] = [
+                distances[row][column] + substitution_cost,
+                distances[row + 1][column] + 1,
+                distances[row][column + 1] + 1,
+                distances[prior_row][prior_column]
+                    + (row - prior_row - 1)
+                    + 1
+                    + (column - prior_column - 1),
+            ]
+            .into_iter()
+            .min()
+            .unwrap_or(max_distance);
+        }
+        last_row[left[row - 1] as usize] = row;
+    }
+    distances[left.len() + 1][right.len() + 1]
 }
 
 #[derive(Clone, Copy)]
@@ -3902,6 +4042,19 @@ mod tests {
         lex(&snapshot, FileId::new(1)).expect("lex succeeds")
     }
 
+    fn parse_text(text: &str) -> (WorkspaceSnapshot, Parse) {
+        let file_id = FileId::new(1);
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file_id, text, false).expect("source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("snapshot");
+        let parsed = parse(&snapshot, file_id).expect("parse succeeds");
+        (snapshot, parsed)
+    }
+
     fn kinds(output: &LexOutput) -> Vec<SyntaxKind> {
         output.tokens.iter().map(|token| token.kind).collect()
     }
@@ -5568,6 +5721,103 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
         );
+    }
+
+    #[test]
+    fn unknown_attribute_has_a_snapshot_validated_unique_name_fix() {
+        let source = "@dervie\nfn run() {}\n";
+        let (snapshot, parsed) = parse_text(source);
+        let diagnostic = parsed
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownAttribute)
+            .expect("unknown attribute diagnostic");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        let primary = diagnostic.primary().expect("name location");
+        let start = primary.span.range.start().to_usize();
+        let end = primary.span.range.end().to_usize();
+        assert_eq!(&source[start..end], "dervie");
+        assert_eq!(diagnostic.fixes().len(), 1);
+
+        let fix = &diagnostic.fixes()[0];
+        assert_eq!(fix.operation().name(), FixOperationName::ReplaceNode);
+        assert_eq!(fix.operation().node().group(), NodeGroup::Token);
+        assert_eq!(
+            fix.operation().args().get("text"),
+            Some(&Value::String("derive".to_owned()))
+        );
+        assert_eq!(fix.edits().len(), 1);
+        assert_eq!(fix.edits()[0].new_text, "derive");
+        assert_eq!(fix.edits()[0].range.range, primary.span.range);
+        assert_eq!(fix.title(), "replace with `@derive`");
+        assert!(
+            diagnostic
+                .clone()
+                .with_workspace_snapshot(&snapshot)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unknown_raw_attribute_is_diagnosed_and_can_suggest_removing_raw_prefix() {
+        let (_, parsed) = parse_text("@r#derive\nfn run() {}\n");
+        let diagnostic = parsed
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownAttribute)
+            .expect("raw attribute is unknown");
+
+        assert_eq!(diagnostic.fixes().len(), 1);
+        assert_eq!(diagnostic.fixes()[0].edits()[0].new_text, "derive");
+    }
+
+    #[test]
+    fn unknown_attribute_fix_uses_original_offsets_after_a_bom() {
+        let file_id = FileId::new(1);
+        let raw_source = b"\xEF\xBB\xBF@dervie\r\nfn run() {}\r\n";
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::decode(file_id, raw_source).expect("source")),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        )])
+        .expect("snapshot");
+        let parsed = parse(&snapshot, file_id).expect("parse succeeds");
+        let diagnostic = parsed
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownAttribute)
+            .expect("unknown attribute diagnostic");
+        let primary = diagnostic.primary().expect("name location");
+        assert_eq!(primary.span.range.start(), TextSize::new(4));
+        assert_eq!(
+            diagnostic.fixes()[0].edits()[0].range.range,
+            primary.span.range
+        );
+        assert_eq!(diagnostic.fixes()[0].edits()[0].new_text, "derive");
+    }
+
+    #[test]
+    fn unknown_attributes_without_a_unique_close_name_have_no_fix() {
+        for source in ["@col\nfn run() {}\n", "@zzzzzz\nfn run() {}\n"] {
+            let (_, parsed) = parse_text(source);
+            let diagnostic = parsed
+                .errors
+                .iter()
+                .find(|diagnostic| diagnostic.code == Code::UnknownAttribute)
+                .expect("unknown attribute diagnostic");
+            assert!(diagnostic.fixes().is_empty(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn attribute_name_distance_is_damerau_levenshtein_over_bytes() {
+        assert_eq!(damerau_levenshtein(b"ca", b"ac"), 1);
+        assert_eq!(damerau_levenshtein(b"", b"SAI"), 3);
+        assert_eq!(unique_attribute_suggestion("dervie"), Some("derive"));
+        assert_eq!(unique_attribute_suggestion("col"), None);
+        assert_eq!(unique_attribute_suggestion("zzzzzz"), None);
     }
 
     #[test]
