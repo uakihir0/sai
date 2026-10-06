@@ -3,6 +3,7 @@
 pub mod attrs;
 pub mod item_tree;
 pub mod source_map;
+pub mod types;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};

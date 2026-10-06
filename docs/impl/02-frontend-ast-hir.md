@@ -1461,6 +1461,8 @@ pub enum GenericArg<'hir> { Type(&'hir Ty<'hir>), Const(ConstArg), Binding { nam
 pub enum ConstArg { Int { value: Option<u128>, negated: bool }, Char(char), Bool(bool) }
 ```
 
+**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `Name`, `Ty`, `Path`, `GenericArgs`, and `Bound` compare and hash their semantic contents while excluding source spans, so moving syntax does not change their value equality. The records are `Copy` and borrow child nodes and lists; stable storage for lowered lists is not yet provided. Item, function, expression, pattern, body structures, and syntax-to-HIR lowering remain follow-up work.
+
 Notes on the shape:
 
 - `owned T` is lowered to the HIR of `T` (D-OWN-01); `(T)` is lowered to `T`; `PAREN_EXPR` and `PAREN_PAT` are lowered to their content. The CST keeps them for the formatter.
