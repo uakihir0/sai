@@ -838,6 +838,40 @@ fn direct_child_at<N: AstNode>(node: &SyntaxNode, index: usize) -> Option<N> {
     node.children().filter_map(N::cast).nth(index)
 }
 
+fn direct_child_before<N: AstNode>(
+    node: &SyntaxNode,
+    boundary: SyntaxKind,
+    index: usize,
+) -> Option<N> {
+    node.children_with_tokens()
+        .take_while(
+            |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == boundary),
+        )
+        .filter_map(|element| match element {
+            SyntaxElement::Node(child) => N::cast(child),
+            SyntaxElement::Token(_) => None,
+        })
+        .nth(index)
+}
+
+fn direct_child_after<N: AstNode>(
+    node: &SyntaxNode,
+    boundary: SyntaxKind,
+    index: usize,
+) -> Option<N> {
+    let mut found_boundary = false;
+    node.children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == boundary => {
+                found_boundary = true;
+                None
+            }
+            SyntaxElement::Node(child) if found_boundary => N::cast(child),
+            _ => None,
+        })
+        .nth(index)
+}
+
 fn direct_token<T: AstToken>(node: &SyntaxNode) -> Option<T> {
     node.children_with_tokens()
         .find_map(|element| match element {

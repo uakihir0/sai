@@ -154,10 +154,16 @@ node CastExpr CAST_EXPR
 node InvariantExprList INVARIANT_EXPR_LIST
 node Error ERROR
 
-# Direct child roles: child takes a zero-based same-type position, children is repeated,
-# and token names an AstToken.
+# Direct child roles: child selects by zero-based same-type position; child_before and
+# child_after select relative to a direct token boundary; children is repeated, and token
+# names an AstToken.
+children SourceFile items Item
 children SourceFile test_decls TestDecl
 children SourceFile property_decls PropertyDecl
+child FnDecl name Name 0
+child FnDecl params ParamList 0
+child FnDecl ret_type RetType 0
+child FnDecl body Block 0
 token TestDecl name StringLit
 child TestDecl body Block 0
 token PropertyDecl name StringLit
@@ -166,5 +172,19 @@ child PropertyDecl body Block 0
 children ParamList params Param
 child Param name Name 0
 child Param ty Type 0
+child RetType ty Type 0
+children Block statements Stmt
+child LetStmt pattern Pattern 0
+child LetStmt ty Type 0
+child LetStmt initializer Expr 0
+child LetStmt else_clause LetElse 0
+child VarStmt name Name 0
+child VarStmt ty Type 0
+child VarStmt initializer Expr 0
+child AssignStmt lhs Expr 0
+child AssignStmt rhs Expr 1
+child_before AssertStmt condition Expr COMMA 0
+child_after AssertStmt message Expr COMMA 0
+child ExprStmt expression Expr 0
 child BinExpr lhs Expr 0
 child BinExpr rhs Expr 1

@@ -13,7 +13,14 @@ struct Accessor {
     kind: AccessorKind,
     name: String,
     ty: String,
-    index: Option<usize>,
+    selector: Option<ChildSelector>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ChildSelector {
+    Position(usize),
+    BeforeToken { syntax_kind: String, index: usize },
+    AfterToken { syntax_kind: String, index: usize },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -96,13 +103,21 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                     accessors: Vec::new(),
                 });
             }
-            Some(kind @ ("child" | "children" | "token")) => {
-                let expected_fields = if kind == "child" { 5 } else { 4 };
+            Some(kind @ ("child" | "child_before" | "child_after" | "children" | "token")) => {
+                let expected_fields = match kind {
+                    "child" => 5,
+                    "child_before" | "child_after" => 6,
+                    _ => 4,
+                };
                 if fields.len() != expected_fields {
                     panic!(
                         "sai.ungram:{}: expected `{kind} <Parent> <role> <AstType>{}`",
                         line_index + 1,
-                        if kind == "child" { " <index>" } else { "" },
+                        match kind {
+                            "child" => " <index>",
+                            "child_before" | "child_after" => " <TOKEN_KIND> <index>",
+                            _ => "",
+                        },
                     );
                 }
                 let role_name = fields[2];
@@ -115,21 +130,38 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                     );
                 }
                 let accessor_kind = match kind {
-                    "child" => AccessorKind::Child,
+                    "child" | "child_before" | "child_after" => AccessorKind::Child,
                     "children" => AccessorKind::Children,
                     "token" => AccessorKind::Token,
                     _ => unreachable!(),
                 };
-                let index = if kind == "child" {
-                    Some(fields[4].parse::<usize>().unwrap_or_else(|_| {
-                        panic!(
-                            "sai.ungram:{}: child position `{}` is not a non-negative integer",
-                            line_index + 1,
-                            fields[4]
-                        )
-                    }))
-                } else {
-                    None
+                let selector = match kind {
+                    "child" => Some(ChildSelector::Position(parse_child_index(
+                        fields[4],
+                        line_index + 1,
+                    ))),
+                    "child_before" | "child_after" => {
+                        let syntax_kind = fields[4];
+                        if !is_syntax_kind_name(syntax_kind) {
+                            panic!(
+                                "sai.ungram:{}: invalid child boundary token kind `{syntax_kind}`",
+                                line_index + 1
+                            );
+                        }
+                        let index = parse_child_index(fields[5], line_index + 1);
+                        Some(if kind == "child_before" {
+                            ChildSelector::BeforeToken {
+                                syntax_kind: syntax_kind.to_owned(),
+                                index,
+                            }
+                        } else {
+                            ChildSelector::AfterToken {
+                                syntax_kind: syntax_kind.to_owned(),
+                                index,
+                            }
+                        })
+                    }
+                    _ => None,
                 };
                 accessors.push((
                     line_index + 1,
@@ -138,12 +170,12 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                         kind: accessor_kind,
                         name: role_name.to_owned(),
                         ty: fields[3].to_owned(),
-                        index,
+                        selector,
                     },
                 ));
             }
             Some(_) | None => panic!(
-                "sai.ungram:{}: expected a `node`, `child`, `children`, or `token` declaration",
+                "sai.ungram:{}: expected a `node`, child-role, `children`, or `token` declaration",
                 line_index + 1
             ),
         }
@@ -151,7 +183,7 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
 
     assert!(!nodes.is_empty(), "sai.ungram declares no syntax nodes");
     let mut declared_roles = BTreeSet::new();
-    let mut declared_child_positions = BTreeSet::new();
+    let mut declared_child_selectors = BTreeSet::new();
     for (line, parent_name, accessor) in accessors {
         let Some(parent) = nodes.iter_mut().find(|node| node.ast_name == parent_name) else {
             panic!("sai.ungram:{line}: unknown AST node `{parent_name}`");
@@ -183,15 +215,18 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                     );
                 }
                 if accessor.kind == AccessorKind::Child {
-                    let index = accessor.index.expect("child roles have a position");
-                    if !declared_child_positions.insert((
+                    let selector = accessor
+                        .selector
+                        .as_ref()
+                        .expect("child roles have a selector");
+                    if !declared_child_selectors.insert((
                         parent_name.clone(),
                         accessor.ty.clone(),
-                        index,
+                        selector.clone(),
                     )) {
                         panic!(
-                            "sai.ungram:{line}: two AST roles select {} child {}",
-                            accessor.ty, index
+                            "sai.ungram:{line}: two AST roles select {} child {:?}",
+                            accessor.ty, selector
                         );
                     }
                 }
@@ -208,6 +243,19 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
         parent.accessors.push(accessor);
     }
     nodes
+}
+
+fn parse_child_index(value: &str, line: usize) -> usize {
+    value.parse::<usize>().unwrap_or_else(|_| {
+        panic!("sai.ungram:{line}: child position `{value}` is not a non-negative integer")
+    })
+}
+
+fn is_syntax_kind_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn is_rust_type_name(name: &str) -> bool {
@@ -455,6 +503,33 @@ pub(crate) fn validate_node_kinds(nodes: &[Node], syntax_source: &str) {
         unique_variants.len(),
         "SyntaxKind contains duplicate variants"
     );
+    for node in nodes {
+        for accessor in &node.accessors {
+            let syntax_kind = match accessor.selector.as_ref() {
+                Some(ChildSelector::BeforeToken { syntax_kind, .. })
+                | Some(ChildSelector::AfterToken { syntax_kind, .. }) => Some(syntax_kind),
+                _ => None,
+            };
+            if let Some(syntax_kind) = syntax_kind
+                && !variants.contains(syntax_kind)
+            {
+                panic!(
+                    "sai.ungram child role `{}::{}` uses unknown SyntaxKind `{syntax_kind}`",
+                    node.ast_name, accessor.name
+                );
+            }
+            if let Some(syntax_kind) = syntax_kind
+                && nodes
+                    .iter()
+                    .any(|node| node.syntax_kind == syntax_kind.as_str())
+            {
+                panic!(
+                    "sai.ungram child role `{}::{}` uses node kind `{syntax_kind}` as a token boundary",
+                    node.ast_name, accessor.name
+                );
+            }
+        }
+    }
     let eof_index = variants
         .iter()
         .position(|name| name == "EOF")
@@ -656,14 +731,28 @@ pub(crate) fn generate_nodes(nodes: &[Node]) -> String {
         .expect("write to generated source");
         for accessor in &node.accessors {
             match accessor.kind {
-                AccessorKind::Child => writeln!(
-                    generated,
-                    "impl {} {{ pub fn {}(&self) -> Option<{}> {{ direct_child_at(self.syntax(), {}) }} }}",
-                    node.ast_name,
-                    accessor.name,
-                    accessor.ty,
-                    accessor.index.expect("child roles have a position")
-                ),
+                AccessorKind::Child => {
+                    let selector = accessor
+                        .selector
+                        .as_ref()
+                        .expect("child roles have a selector");
+                    let accessor_expression = match selector {
+                        ChildSelector::Position(index) => {
+                            format!("direct_child_at(self.syntax(), {index})")
+                        }
+                        ChildSelector::BeforeToken { syntax_kind, index } => format!(
+                            "direct_child_before(self.syntax(), SyntaxKind::{syntax_kind}, {index})"
+                        ),
+                        ChildSelector::AfterToken { syntax_kind, index } => format!(
+                            "direct_child_after(self.syntax(), SyntaxKind::{syntax_kind}, {index})"
+                        ),
+                    };
+                    writeln!(
+                        generated,
+                        "impl {} {{ pub fn {}(&self) -> Option<{}> {{ {} }} }}",
+                        node.ast_name, accessor.name, accessor.ty, accessor_expression
+                    )
+                }
                 AccessorKind::Children => writeln!(
                     generated,
                     "impl {} {{ pub fn {}(&self) -> impl Iterator<Item = {}> + '_ {{ self.syntax().children().filter_map({}::cast) }} }}",
@@ -852,6 +941,8 @@ mod tests {
                 "child Parent first Child 0\n",
                 "child Parent second Child 1\n",
                 "child Parent child Type 0\n",
+                "child_before Parent before Child COMMA 0\n",
+                "child_after Parent after Child COMMA 0\n",
                 "token Parent token StringLit",
             ),
             &existing,
@@ -864,7 +955,52 @@ mod tests {
         assert!(generated.contains("pub fn child(&self) -> Option<Type>"));
         assert!(generated.contains("direct_child_at(self.syntax(), 0)"));
         assert!(generated.contains("direct_child_at(self.syntax(), 1)"));
+        assert!(generated.contains("direct_child_before(self.syntax(), SyntaxKind::COMMA, 0)"));
+        assert!(generated.contains("direct_child_after(self.syntax(), SyntaxKind::COMMA, 0)"));
         assert!(generated.contains("pub fn token(&self) -> Option<StringLit>"));
+    }
+
+    #[test]
+    fn child_boundary_roles_validate_syntax_token_kinds() {
+        let nodes = parse_nodes(
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child_before Parent before Child COMMA 0",
+            ),
+            &ExistingAstTypes::default(),
+        );
+        validate_node_kinds(&nodes, "pub enum SyntaxKind { COMMA, EOF, PARENT, CHILD }");
+
+        let nodes = parse_nodes(
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child_after Parent after Child MISSING_TOKEN 0",
+            ),
+            &ExistingAstTypes::default(),
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_node_kinds(&nodes, "pub enum SyntaxKind { COMMA, EOF, PARENT, CHILD }")
+            })
+            .is_err()
+        );
+
+        let nodes = parse_nodes(
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child_before Parent before Child CHILD 0",
+            ),
+            &ExistingAstTypes::default(),
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                validate_node_kinds(&nodes, "pub enum SyntaxKind { COMMA, EOF, PARENT, CHILD }")
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -2277,6 +2277,118 @@ mod tests {
     }
 
     #[test]
+    fn generated_function_and_statement_roles_follow_parsed_children() {
+        use crate::ast::{AstNode, Item, Stmt};
+
+        let source = concat!(
+            "fn compute(seed: I32) -> I32 {\n",
+            "let total: I32 = seed + 1\n",
+            "let maybe = seed else { return 0 }\n",
+            "var current: I32 = total\n",
+            "current += 2\n",
+            "assert current > 0, \"positive\"\n",
+            "return current\n",
+            "}\n",
+            "test \"smoke\" {}\n",
+            "property \"simple\" (input: I32) {}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+
+        let root = crate::SyntaxNode::new_root(output.root);
+        let file = crate::ast::SourceFile::cast(root).expect("source file");
+        assert_eq!(file.items().count(), 3);
+        let function = match file.items().next().expect("one item") {
+            Item::Function(function) => function,
+            item => panic!("expected function, got {:?}", item.syntax().kind()),
+        };
+        let name = function.name().expect("function name");
+        assert_eq!(name.token().expect("name token").text(), "compute");
+        assert_eq!(
+            function.params().expect("parameter list").params().count(),
+            1
+        );
+        assert!(
+            function
+                .ret_type()
+                .and_then(|ret_type| ret_type.ty())
+                .is_some()
+        );
+
+        let body = function.body().expect("function body");
+        let statements = body.statements().collect::<Vec<_>>();
+        assert_eq!(statements.len(), 6);
+        assert!(matches!(statements[0], Stmt::Let(_)));
+        assert!(matches!(statements[1], Stmt::Let(_)));
+        assert!(matches!(statements[2], Stmt::Var(_)));
+        assert!(matches!(statements[3], Stmt::Assign(_)));
+        assert!(matches!(statements[4], Stmt::Assert(_)));
+        assert!(matches!(statements[5], Stmt::Expr(_)));
+
+        let Stmt::Let(let_stmt) = &statements[0] else {
+            unreachable!();
+        };
+        assert!(let_stmt.pattern().is_some());
+        assert!(let_stmt.ty().is_some());
+        assert!(let_stmt.initializer().is_some());
+
+        let Stmt::Let(let_else_stmt) = &statements[1] else {
+            unreachable!();
+        };
+        assert!(let_else_stmt.else_clause().is_some());
+
+        let Stmt::Var(var_stmt) = &statements[2] else {
+            unreachable!();
+        };
+        assert!(var_stmt.name().is_some());
+        assert!(var_stmt.ty().is_some());
+        assert!(var_stmt.initializer().is_some());
+
+        let Stmt::Assign(assign_stmt) = &statements[3] else {
+            unreachable!();
+        };
+        let lhs = assign_stmt.lhs().expect("assignment left side");
+        let rhs = assign_stmt.rhs().expect("assignment right side");
+        assert_eq!(
+            &source[lhs.syntax().text_range().start().to_usize()
+                ..lhs.syntax().text_range().end().to_usize()],
+            "current"
+        );
+        assert_eq!(
+            &source[rhs.syntax().text_range().start().to_usize()
+                ..rhs.syntax().text_range().end().to_usize()],
+            "2"
+        );
+
+        let Stmt::Assert(assert_stmt) = &statements[4] else {
+            unreachable!();
+        };
+        assert!(assert_stmt.condition().is_some());
+        assert!(assert_stmt.message().is_some());
+
+        let Stmt::Expr(expr_stmt) = &statements[5] else {
+            unreachable!();
+        };
+        assert!(expr_stmt.expression().is_some());
+
+        let malformed = parse_file("fn broken() {\nassert , \"message\"\n}\n");
+        assert!(!malformed.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed.root);
+        let malformed_assert = malformed_root
+            .descendants()
+            .find_map(crate::ast::AssertStmt::cast)
+            .expect("recovered assert statement");
+        assert!(malformed_assert.condition().is_none());
+        let message = malformed_assert.message().expect("message expression");
+        let range = message.syntax().text_range();
+        assert_eq!(
+            &"fn broken() {\nassert , \"message\"\n}\n"
+                [range.start().to_usize()..range.end().to_usize()],
+            "\"message\""
+        );
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,
