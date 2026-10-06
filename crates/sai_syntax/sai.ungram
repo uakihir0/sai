@@ -328,3 +328,15 @@ child DistinctDecl base_type Type 0
 child DistinctDecl refinement RefinementClause 0
 child ResourceDecl name Name 0
 child ResourceDecl fields FieldList 0
+child ConstDecl name Name 0
+child ConstDecl ty Type 0
+child ConstDecl initializer Expr 0
+child InvariantDecl name Name 0
+child InvariantDecl predicates InvariantExprList 0
+children InvariantExprList expressions Expr
+child EffectDecl name Name 0
+child EffectDecl covers CoversClause 0
+child CoversClause set EffectSet 0
+child EffectsClause set EffectSet 0
+children EffectSet effects EffectRef
+children EffectRef segments NameRef

@@ -1052,6 +1052,7 @@ pub trait AstToken: Sized {
 - **Current item-declaration roles.** `TypeDecl` exposes its optional generic parameters and either its record or alias definition. Record definitions expose their optional where clause and field list; fields expose docs, repeated attributes, name, and type. Alias definitions expose their type and optional refinement clause, whose expression is separately accessible. All node-valued accessors remain optional for incomplete syntax, while repeated fields and attributes use iterators.
 - **Enum declaration roles.** Enums expose their name, generic parameters, optional where clause, and variant list. Variants expose docs, attributes, their name, optional tuple or record shape, and optional discriminants; tuple shapes iterate types, record shapes iterate named fields, and discriminants expose the integer token and optional minus token separately.
 - **Distinct and resource roles.** Distinct declarations expose their name, generic parameters, optional base type and refinement, plus `inner_pub_token()` for the constructor-visibility marker. Resources expose their name and optional field list; the shared `FieldDecl` accessors describe resource fields.
+- **Const, invariant, and effect roles.** Constants expose name, type, and initializer; invariants expose their name and predicate list; effects expose their name and optional covers clause. Covers clauses and function effects clauses expose their effect sets, which iterate effect references, whose segments are individually accessible.
 
 ### 2.7.2 Accessors
 

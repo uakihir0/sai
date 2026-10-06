@@ -4318,6 +4318,134 @@ let byte_non_ascii = b"€"
     }
 
     #[test]
+    fn const_invariant_and_effect_accessors_expose_values_predicates_and_paths() {
+        use crate::ast::{AstNode, ConstDecl, EffectDecl, EffectsClause, FnDecl, InvariantDecl};
+
+        let source = concat!(
+            "const PORT: U16 = 443\n",
+            "invariant Account {\n",
+            "self.balance >= 0\n",
+            "self.name != \"\"\n",
+            "}\n",
+            "effect filesystem\n",
+            "covers { io, wasi.http, alloc }\n",
+            "effect pure\n",
+            "effect safe covers {}\n",
+            "fn local() effects { net.remote, io } {}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let constant = root
+            .descendants()
+            .find_map(ConstDecl::cast)
+            .expect("constant declaration");
+        assert!(constant.name().is_some());
+        assert!(constant.ty().is_some());
+        assert!(constant.initializer().is_some());
+
+        let invariant = root
+            .descendants()
+            .find_map(InvariantDecl::cast)
+            .expect("invariant declaration");
+        assert!(invariant.name().is_some());
+        let predicates = invariant
+            .predicates()
+            .expect("invariant expression list")
+            .expressions()
+            .collect::<Vec<_>>();
+        assert_eq!(predicates.len(), 2);
+
+        let effects = root
+            .descendants()
+            .filter_map(EffectDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(effects.len(), 3);
+        assert!(effects.iter().all(|effect| effect.name().is_some()));
+        let filesystem_set = effects[0]
+            .covers()
+            .and_then(|covers| covers.set())
+            .expect("covers effect set");
+        let references = filesystem_set.effects().collect::<Vec<_>>();
+        assert_eq!(references.len(), 3);
+        assert_eq!(references[0].segments().count(), 1);
+        assert_eq!(references[1].segments().count(), 2);
+        assert_eq!(references[2].segments().count(), 1);
+        assert!(effects[1].covers().is_none());
+        assert_eq!(
+            effects[2]
+                .covers()
+                .and_then(|covers| covers.set())
+                .expect("empty covers set")
+                .effects()
+                .count(),
+            0
+        );
+
+        let effects_clause = root
+            .descendants()
+            .find_map(EffectsClause::cast)
+            .expect("function effects clause");
+        let function_effects = effects_clause.set().expect("function effect set");
+        let function_refs = function_effects.effects().collect::<Vec<_>>();
+        assert_eq!(function_refs.len(), 2);
+        assert_eq!(function_refs[0].segments().count(), 2);
+        assert_eq!(function_refs[1].segments().count(), 1);
+
+        let malformed = parse_file("const BROKEN: I32 =\nfn later() {}\ninvariant Empty {}\n");
+        assert!(!malformed.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed.root);
+        let malformed_constant = malformed_root
+            .descendants()
+            .find_map(ConstDecl::cast)
+            .expect("recovered constant");
+        assert!(malformed_constant.name().is_some());
+        assert!(malformed_constant.ty().is_some());
+        assert!(malformed_constant.initializer().is_none());
+        let empty_invariant = malformed_root
+            .descendants()
+            .find_map(InvariantDecl::cast)
+            .expect("empty invariant");
+        assert_eq!(
+            empty_invariant
+                .predicates()
+                .expect("retained empty predicate list")
+                .expressions()
+                .count(),
+            0
+        );
+
+        let malformed_covers = parse_file("effect broken covers\nfn later() {}\n");
+        assert!(
+            malformed_covers
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        let malformed_covers_root = crate::SyntaxNode::new_root(malformed_covers.root);
+        let broken_effect = malformed_covers_root
+            .descendants()
+            .find_map(EffectDecl::cast)
+            .expect("recovered effect declaration");
+        assert!(broken_effect.covers().is_some());
+        assert!(
+            broken_effect
+                .covers()
+                .and_then(|covers| covers.set())
+                .is_none()
+        );
+        let later = malformed_covers_root
+            .descendants()
+            .find_map(FnDecl::cast)
+            .expect("function after incomplete covers clause");
+        assert_eq!(
+            later.syntax().parent().map(|parent| parent.kind()),
+            Some(SyntaxKind::SOURCE_FILE)
+        );
+    }
+
+    #[test]
     fn exported_effects_are_diagnosed_but_kept_in_the_tree() {
         let source = "export effect network\npub effect public_io\n";
         let output = parse_file(source);
