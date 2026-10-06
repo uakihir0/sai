@@ -390,6 +390,10 @@ impl Parser<'_, '_> {
             return self.interface_decl(declaration);
         }
 
+        if self.at_contextual("world") && self.nth(1) == SyntaxKind::LIDENT {
+            return self.world_decl(declaration);
+        }
+
         if !self.at(SyntaxKind::USE_KW) {
             let position = self.position;
             let kind = self.current();
@@ -956,6 +960,195 @@ impl Parser<'_, '_> {
         )?;
         self.recover_one()?;
         declaration.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
+    }
+
+    fn world_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+        self.world_item_list()?;
+        declaration.complete(self, SyntaxKind::WORLD_DECL)
+    }
+
+    fn world_item_list(&mut self) -> Result<(), ParserError> {
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.expect(SyntaxKind::L_BRACE)?;
+            return Ok(());
+        }
+        let items = self.start();
+        self.bump();
+        while self.at(SyntaxKind::NEWLINE) && !self.world_item_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE) && self.world_item_list_boundary_after_newline() {
+                break;
+            }
+            if self.at(SyntaxKind::DOC_INNER)
+                || (self.at(SyntaxKind::DOC_OUTER)
+                    && !self.world_item_starts_at_after_attributes(self.position))
+            {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+            let position = self.position;
+            self.world_item()?;
+            if self.at(SyntaxKind::NEWLINE) && self.world_item_list_boundary_after_newline() {
+                break;
+            }
+            if self.eat(SyntaxKind::NEWLINE) {
+                while self.at(SyntaxKind::NEWLINE) && !self.world_item_list_boundary_after_newline()
+                {
+                    self.eat_nl();
+                }
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect(SyntaxKind::NEWLINE)?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        if !self.world_item_list_boundary_after_newline() {
+            self.eat_nl();
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        items.complete(self, SyntaxKind::ITEM_LIST)?;
+        Ok(())
+    }
+
+    fn world_item_list_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK)
+            && !self.world_item_starts_at_after_attributes(position)
+            && self.item_starts_at_after_attributes(position)
+    }
+
+    fn world_item_starts_at_after_attributes(&self, position: usize) -> bool {
+        let Some(position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        match self.tokens.get(position).map(|token| token.kind) {
+            Some(SyntaxKind::EXPORT_KW) => true,
+            Some(SyntaxKind::LIDENT) => {
+                token_is_contextual(self.source, self.tokens, position, "import")
+                    || token_is_contextual(self.source, self.tokens, position, "include")
+            }
+            _ => false,
+        }
+    }
+
+    fn world_item(&mut self) -> Result<(), ParserError> {
+        let item = self.start();
+        self.outer_docs()?;
+        self.attributes(false)?;
+        if self.at(SyntaxKind::PUB_KW) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "world items do not have a visibility marker",
+            )?;
+            let visibility = self.start();
+            self.bump();
+            visibility.complete(self, SyntaxKind::ERROR)?;
+        }
+
+        if self.at_contextual("import") {
+            self.bump();
+            if self.at_fn_decl_start() {
+                let function = self.start();
+                self.fn_decl(function, FnBodyPolicy::Forbidden)?;
+            } else {
+                self.world_ref(true)?;
+            }
+            item.complete(self, SyntaxKind::WORLD_IMPORT)?;
+            return Ok(());
+        }
+        if self.at(SyntaxKind::EXPORT_KW) {
+            self.bump();
+            if self.at_fn_decl_start() {
+                let function = self.start();
+                self.fn_decl(function, FnBodyPolicy::Forbidden)?;
+            } else {
+                self.world_ref(true)?;
+            }
+            item.complete(self, SyntaxKind::WORLD_EXPORT)?;
+            return Ok(());
+        }
+        if self.at_contextual("include") {
+            self.bump();
+            self.world_ref(false)?;
+            item.complete(self, SyntaxKind::WORLD_INCLUDE)?;
+            return Ok(());
+        }
+
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::ExpectedToken,
+            range,
+            "expected `import`, `export`, or `include` in the world",
+        )?;
+        self.recover_one()?;
+        item.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
+    }
+
+    fn world_ref(&mut self, require_interface: bool) -> Result<(), ParserError> {
+        let reference = self.start();
+        if let Some(token) = self.current_token()
+            && token.kind == SyntaxKind::PKG_PATH
+        {
+            if require_interface {
+                let text = self
+                    .source
+                    .get(token.range.start().to_usize()..token.range.end().to_usize());
+                if text.is_some_and(|text| !text.contains('/')) {
+                    self.emit_parser_diagnostic(
+                        sai_diagnostics::Code::WorldImportNeedsInterface,
+                        token.range,
+                        "world imports and exports must name an interface, not a whole package",
+                    )?;
+                }
+            }
+            self.bump();
+        } else if self.at(SyntaxKind::LIDENT) {
+            self.mod_path()?;
+        } else {
+            let position = self.position;
+            self.expect_any(&[SyntaxKind::PKG_PATH, SyntaxKind::LIDENT])?;
+            if self.position == position {
+                self.recover_one()?;
+            }
+        }
+        reference.complete(self, SyntaxKind::WORLD_REF)?;
         Ok(())
     }
 
@@ -2455,11 +2648,47 @@ impl Parser<'_, '_> {
         declaration: Marker,
         body_policy: FnBodyPolicy,
     ) -> Result<CompletedMarker, ParserError> {
+        let unsafe_range = self
+            .at(SyntaxKind::UNSAFE_KW)
+            .then(|| self.current_token().map(|token| token.range))
+            .flatten();
         self.eat(SyntaxKind::UNSAFE_KW);
+        let async_range = self
+            .at(SyntaxKind::ASYNC_KW)
+            .then(|| self.current_token().map(|token| token.range))
+            .flatten();
         self.eat(SyntaxKind::ASYNC_KW);
         self.expect(SyntaxKind::FN_KW)?;
         self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+        if body_policy == FnBodyPolicy::Forbidden
+            && let Some(range) = async_range
+        {
+            self.emit_staged_feature_diagnostic(
+                range,
+                5,
+                "async-fn",
+                "async functions in interfaces and worlds require Stage 5",
+            )?;
+        }
+        if body_policy == FnBodyPolicy::Forbidden
+            && let Some(range) = unsafe_range
+        {
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::InterfaceFnClause,
+                range,
+                "interface and world functions cannot be unsafe",
+            )?;
+        }
         if self.at(SyntaxKind::LT) {
+            if body_policy == FnBodyPolicy::Forbidden
+                && let Some(range) = self.current_token().map(|token| token.range)
+            {
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::GenericInterfaceItem,
+                    range,
+                    "interface and world functions cannot be generic",
+                )?;
+            }
             self.generic_param_list()?;
         }
         self.param_list()?;
@@ -2471,7 +2700,7 @@ impl Parser<'_, '_> {
             self.ret_type()?;
         }
 
-        if let Err(error) = self.fn_clauses() {
+        if let Err(error) = self.fn_clauses(body_policy == FnBodyPolicy::Forbidden) {
             declaration.abandon(self)?;
             return Err(error);
         }
@@ -2508,7 +2737,7 @@ impl Parser<'_, '_> {
         declaration.complete(self, SyntaxKind::FN_DECL)
     }
 
-    fn fn_clauses(&mut self) -> Result<(), ParserError> {
+    fn fn_clauses(&mut self, interface_function: bool) -> Result<(), ParserError> {
         let mut last_rank = 0;
         let mut seen_where = false;
         let mut seen_borrows = false;
@@ -2534,6 +2763,23 @@ impl Parser<'_, '_> {
                 break;
             };
             let range = self.current_token().map(|token| token.range);
+            if interface_function && let Some(range) = range {
+                let (code, message) = match kind {
+                    FnClauseKind::Where => (
+                        sai_diagnostics::Code::GenericInterfaceItem,
+                        "interface and world functions cannot have a `where` clause",
+                    ),
+                    FnClauseKind::Borrows | FnClauseKind::Requires | FnClauseKind::Ensures => (
+                        sai_diagnostics::Code::InterfaceFnClause,
+                        "interface and world functions cannot have this clause",
+                    ),
+                    FnClauseKind::Effects => (
+                        sai_diagnostics::Code::EffectsOnInterfaceFn,
+                        "interface and world functions cannot have an `effects` clause",
+                    ),
+                };
+                self.emit_parser_diagnostic(code, range, message)?;
+            }
             if rank < last_rank {
                 if let Some(range) = range {
                     self.emit_parser_diagnostic(
@@ -2615,6 +2861,26 @@ impl Parser<'_, '_> {
         message: &str,
     ) -> Result<(), ParserError> {
         let diagnostic = self.parser_diagnostic(code, range, message)?;
+        self.emit_error(diagnostic);
+        Ok(())
+    }
+
+    fn emit_staged_feature_diagnostic(
+        &mut self,
+        range: sai_vfs::TextRange,
+        stage: u128,
+        feature: &str,
+        message: &str,
+    ) -> Result<(), ParserError> {
+        let mut diagnostic =
+            self.parser_diagnostic(sai_diagnostics::Code::FeatureNotImplemented, range, message)?;
+        diagnostic
+            .data
+            .insert("stage".to_owned(), sai_diagnostics::Value::Integer(stage));
+        diagnostic.data.insert(
+            "feature".to_owned(),
+            sai_diagnostics::Value::String(feature.to_owned()),
+        );
         self.emit_error(diagnostic);
         Ok(())
     }

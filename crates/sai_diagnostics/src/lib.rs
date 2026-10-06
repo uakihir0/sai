@@ -85,7 +85,12 @@ define_codes! {
     RedundantPubExport => "REDUNDANT_PUB_EXPORT",
     InvalidExportTarget => "INVALID_EXPORT_TARGET",
     ExplicitDiscriminantOnDataEnum => "EXPLICIT_DISCRIMINANT_ON_DATA_ENUM",
+    FeatureNotImplemented => "FEATURE_NOT_IMPLEMENTED",
+    GenericInterfaceItem => "GENERIC_INTERFACE_ITEM",
+    InterfaceFnClause => "INTERFACE_FN_CLAUSE",
+    EffectsOnInterfaceFn => "EFFECTS_ON_INTERFACE_FN",
     InterfaceFnBody => "INTERFACE_FN_BODY",
+    WorldImportNeedsInterface => "WORLD_IMPORT_NEEDS_INTERFACE",
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1625,8 +1630,28 @@ mod tests {
             Some(Code::ExplicitDiscriminantOnDataEnum)
         );
         assert_eq!(
+            Code::from_name("FEATURE_NOT_IMPLEMENTED"),
+            Some(Code::FeatureNotImplemented)
+        );
+        assert_eq!(
+            Code::from_name("GENERIC_INTERFACE_ITEM"),
+            Some(Code::GenericInterfaceItem)
+        );
+        assert_eq!(
+            Code::from_name("INTERFACE_FN_CLAUSE"),
+            Some(Code::InterfaceFnClause)
+        );
+        assert_eq!(
+            Code::from_name("EFFECTS_ON_INTERFACE_FN"),
+            Some(Code::EffectsOnInterfaceFn)
+        );
+        assert_eq!(
             Code::from_name("INTERFACE_FN_BODY"),
             Some(Code::InterfaceFnBody)
+        );
+        assert_eq!(
+            Code::from_name("WORLD_IMPORT_NEEDS_INTERFACE"),
+            Some(Code::WorldImportNeedsInterface)
         );
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));

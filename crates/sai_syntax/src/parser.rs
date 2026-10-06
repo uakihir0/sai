@@ -1319,6 +1319,44 @@ mod tests {
     }
 
     #[test]
+    fn interface_function_heads_reject_generics_clauses_and_async() {
+        let source = concat!(
+            "interface storage {\n",
+            "fn generic<T>()\n",
+            "fn precondition() requires true\n",
+            "fn effectful() effects { alloc }\n",
+            "async fn later()\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let codes = output
+            .errors
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            codes,
+            [
+                Code::GenericInterfaceItem,
+                Code::InterfaceFnClause,
+                Code::EffectsOnInterfaceFn,
+                Code::FeatureNotImplemented,
+            ],
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            4
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_interface_close_preserves_a_following_constant() {
         let source = "interface storage {\nfn open()\nconst READY: Bool = true\n";
         let output = parse_file(source);
@@ -1386,6 +1424,313 @@ mod tests {
                 .filter(|node| node.kind() == SyntaxKind::IFACE_RESOURCE)
                 .count(),
             1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn source_file_parses_world_references_and_function_items() {
+        let source = concat!(
+            "pub world client {\n",
+            "/// External handler.\n",
+            "import wasi:http/outgoing-handler\n",
+            "export storage\n",
+            "include common.base\n",
+            "import fn clock() -> U64\n",
+            "export fn run(input: Str) -> U64\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_IMPORT)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_EXPORT)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_INCLUDE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_REF)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::MOD_PATH)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn world_imports_and_exports_must_name_an_interface() {
+        let source = "world client {\nimport wasi:http\nexport wasi:cli\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::WorldImportNeedsInterface),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_REF)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn world_function_bodies_are_reported_and_wrapped_as_errors() {
+        let source = "world client {\nimport fn clock() {}\nexport fn run() {}\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::InterfaceFnBody),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn world_function_heads_reject_generics_and_clauses() {
+        let source = concat!(
+            "world client {\n",
+            "import unsafe fn generic<T>()\n",
+            "export fn constrained() where T: Copy requires true\n",
+            "export fn borrowed() borrows { value }\n",
+            "import fn postcondition() ensures true\n",
+            "import fn effectful() effects { alloc }\n",
+            "export async fn asynchronous()\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let codes = output
+            .errors
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            codes,
+            [
+                Code::InterfaceFnClause,
+                Code::GenericInterfaceItem,
+                Code::GenericInterfaceItem,
+                Code::InterfaceFnClause,
+                Code::InterfaceFnClause,
+                Code::InterfaceFnClause,
+                Code::EffectsOnInterfaceFn,
+                Code::FeatureNotImplemented,
+            ],
+            "{:?}",
+            output.errors
+        );
+        let async_diagnostic = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+            .expect("async function diagnostic");
+        assert_eq!(
+            async_diagnostic.data.get("stage"),
+            Some(&sai_diagnostics::Value::Integer(5))
+        );
+        assert_eq!(
+            async_diagnostic.data.get("feature"),
+            Some(&sai_diagnostics::Value::String("async-fn".to_owned()))
+        );
+        let async_span = async_diagnostic
+            .primary()
+            .expect("async diagnostic location")
+            .span
+            .range;
+        assert_eq!(
+            &source[async_span.start().to_usize()..async_span.end().to_usize()],
+            "async"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            6
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_world_reference_is_consumed_without_recovery_cascades() {
+        let source = "world client {\nimport Invalid\ninclude valid.world\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let world_refs = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::WORLD_REF)
+            .collect::<Vec<_>>();
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(world_refs.len(), 2);
+        assert_eq!(
+            world_refs[0]
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            2
+        );
+        assert_eq!(world_refs[0].first_token().unwrap().text(), "Invalid");
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_INCLUDE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_world_close_preserves_a_following_constant() {
+        let source = "world client {\nimport wasi:io/streams\nconst READY: Bool = true\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_world_close_keeps_an_exported_function_as_a_world_item() {
+        let source = "world client {\ninclude wasi:http/proxy\nexport fn run()\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let world = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::WORLD_DECL)
+            .expect("world declaration");
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            world
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn world_item_attributes_are_rejected_but_preserved() {
+        let source = "world client {\n@custom\nimport wasi:http/ping\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::InvalidAttributeTarget);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_IMPORT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn world_keywords_remain_identifiers_in_function_bodies() {
+        let source = concat!(
+            "fn local() {\n",
+            "let world = 1\n",
+            "let import = world\n",
+            "let include = import\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_DECL)
+                .count(),
+            0
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            3
         );
         assert_eq!(root.green().text_len().to_usize(), source.len());
     }
