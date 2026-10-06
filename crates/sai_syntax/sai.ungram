@@ -357,3 +357,26 @@ children ItemList assoc_type_decls AssocTypeDecl
 children ItemList assoc_type_defs AssocTypeDef
 child AssocTypeDef name Name 0
 child AssocTypeDef ty Type 0
+child InterfaceDecl name Name 0
+child InterfaceDecl items ItemList 0
+child IfaceResource name Name 0
+child IfaceResource items ItemList 0
+child WorldDecl name Name 0
+child WorldDecl items ItemList 0
+children ItemList types TypeDecl
+children ItemList enums EnumDecl
+children ItemList iface_resources IfaceResource
+children ItemList world_imports WorldImport
+children ItemList world_exports WorldExport
+children ItemList world_includes WorldInclude
+child WorldImport function FnDecl 0
+child WorldImport reference WorldRef 0
+child WorldExport function FnDecl 0
+child WorldExport reference WorldRef 0
+child WorldInclude reference WorldRef 0
+token WorldRef package PkgPath
+child WorldRef mod_path ModPath 0
+token ExternBlock abi StringLit
+child ExternBlock module ExternModule 0
+child ExternBlock items ItemList 0
+token ExternModule value StringLit

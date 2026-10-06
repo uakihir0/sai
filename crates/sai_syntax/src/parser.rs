@@ -1282,6 +1282,156 @@ mod tests {
     }
 
     #[test]
+    fn interface_world_and_extern_accessors_expose_nested_items_and_references() {
+        use crate::ast::{
+            AstNode, AstToken, ExternBlock, IfaceResource, InterfaceDecl, WorldDecl, WorldExport,
+            WorldImport, WorldInclude,
+        };
+
+        let source = concat!(
+            "interface storage {\n",
+            "type Entry { key: Str }\n",
+            "enum Status { Ready, Failed }\n",
+            "resource Handle\n",
+            "resource File {\n",
+            "fn close(self: borrow Self)\n",
+            "}\n",
+            "fn open(path: Str) -> File\n",
+            "}\n",
+            "world client {\n",
+            "/// External handler.\n",
+            "import wasi:http/outgoing-handler\n",
+            "export storage\n",
+            "include common.base\n",
+            "import fn clock() -> U64\n",
+            "export fn run(input: Str) -> U64\n",
+            "}\n",
+            "extern \"\\u{77}asm\" module r#\"host\"# {\n",
+            "fn log(message: Str)\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let interface = root
+            .descendants()
+            .find_map(InterfaceDecl::cast)
+            .expect("interface declaration");
+        assert!(interface.name().is_some());
+        let interface_items = interface.items().expect("interface item list");
+        assert_eq!(interface_items.types().count(), 1);
+        assert_eq!(interface_items.enums().count(), 1);
+        assert_eq!(interface_items.functions().count(), 1);
+        let interface_resources = interface_items
+            .iface_resources()
+            .collect::<Vec<IfaceResource>>();
+        assert_eq!(interface_resources.len(), 2);
+        assert!(
+            interface_resources
+                .iter()
+                .all(|resource| resource.name().is_some())
+        );
+        assert!(interface_resources[0].items().is_none());
+        assert_eq!(
+            interface_resources[1]
+                .items()
+                .expect("interface resource methods")
+                .functions()
+                .count(),
+            1
+        );
+
+        let world = root
+            .descendants()
+            .find_map(WorldDecl::cast)
+            .expect("world declaration");
+        assert!(world.name().is_some());
+        let world_items = world.items().expect("world item list");
+        let imports = world_items.world_imports().collect::<Vec<WorldImport>>();
+        assert_eq!(imports.len(), 2);
+        let package_ref = imports[0].reference().expect("package reference on import");
+        assert_eq!(
+            package_ref
+                .package()
+                .expect("external package path")
+                .syntax()
+                .text(),
+            "wasi:http/outgoing-handler"
+        );
+        assert!(package_ref.mod_path().is_none());
+        assert!(imports[0].function().is_none());
+        assert!(imports[1].reference().is_none());
+        assert!(imports[1].function().is_some());
+
+        let exports = world_items.world_exports().collect::<Vec<WorldExport>>();
+        assert_eq!(exports.len(), 2);
+        let module_ref = exports[0].reference().expect("module reference on export");
+        assert!(module_ref.package().is_none());
+        assert!(module_ref.mod_path().is_some());
+        assert!(exports[0].function().is_none());
+        assert!(exports[1].reference().is_none());
+        assert!(exports[1].function().is_some());
+
+        let includes = world_items.world_includes().collect::<Vec<WorldInclude>>();
+        assert_eq!(includes.len(), 1);
+        assert!(
+            includes[0]
+                .reference()
+                .and_then(|reference| reference.mod_path())
+                .is_some()
+        );
+
+        let extern_block = root
+            .descendants()
+            .find_map(ExternBlock::cast)
+            .expect("extern block");
+        assert!(extern_block.unsafe_token().is_none());
+        assert_eq!(
+            extern_block
+                .abi()
+                .expect("ABI string token")
+                .value()
+                .as_ref(),
+            "wasm"
+        );
+        assert_eq!(
+            extern_block
+                .module()
+                .and_then(|module| module.value())
+                .expect("extern module name")
+                .value()
+                .as_ref(),
+            "host"
+        );
+        assert_eq!(
+            extern_block
+                .items()
+                .expect("extern item list")
+                .functions()
+                .count(),
+            1
+        );
+
+        let unsafe_extern = parse_file("unsafe extern \"C\" {\nfn puts(value: Ptr<U8>)\n}\n");
+        assert_eq!(
+            unsafe_extern
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::FeatureNotImplemented]
+        );
+        let unsafe_extern_root = crate::SyntaxNode::new_root(unsafe_extern.root);
+        let unsafe_extern = unsafe_extern_root
+            .descendants()
+            .find_map(ExternBlock::cast)
+            .expect("unsafe extern block");
+        assert!(unsafe_extern.unsafe_token().is_some());
+        assert!(unsafe_extern.module().is_none());
+    }
+
+    #[test]
     fn interface_function_bodies_are_reported_and_wrapped_as_errors() {
         let source = concat!(
             "interface storage {\n",

@@ -344,6 +344,7 @@ ast_token!(ByteStringLit, BYTE_STRING);
 ast_token!(CharLit, CHAR);
 ast_token!(ByteLit, BYTE);
 ast_token!(FormatSpec, FSTRING_SPEC);
+ast_token!(PkgPath, PKG_PATH);
 
 #[derive(Clone, Debug)]
 pub enum Expr {
@@ -988,5 +989,11 @@ impl ImplDecl {
             return None;
         }
         direct_child_at(self.syntax(), 0)
+    }
+}
+
+impl ExternBlock {
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::UNSAFE_KW)
     }
 }
