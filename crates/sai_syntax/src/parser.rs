@@ -3140,6 +3140,127 @@ mod tests {
     }
 
     #[test]
+    fn literal_pattern_accessors_separate_the_sign_from_the_value_token() {
+        use crate::ast::{AstNode, AstToken, IntLit, LiteralPat};
+
+        let output = parse_file(concat!(
+            "fn literals() {\n",
+            "let -12 = input\n",
+            "let 34 = input\n",
+            "let \"text\" = input\n",
+            "let b\"bytes\" = input\n",
+            "let 'x' = input\n",
+            "let b'x' = input\n",
+            "let true = input\n",
+            "let false = input\n",
+            "let 1.25 = input\n",
+            "let -2.5 = input\n",
+            "}\n",
+        ));
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::FloatPattern, Code::FloatPattern]
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let patterns = root
+            .descendants()
+            .filter_map(LiteralPat::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 10);
+        assert_eq!(
+            patterns
+                .iter()
+                .map(|pattern| { pattern.value_token().expect("literal value token").kind() })
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::INT,
+                SyntaxKind::INT,
+                SyntaxKind::STRING,
+                SyntaxKind::BYTE_STRING,
+                SyntaxKind::CHAR,
+                SyntaxKind::BYTE,
+                SyntaxKind::TRUE_KW,
+                SyntaxKind::FALSE_KW,
+                SyntaxKind::FLOAT,
+                SyntaxKind::FLOAT,
+            ]
+        );
+        let minus = patterns[0].minus_token().expect("negative integer sign");
+        assert_eq!(minus.kind(), SyntaxKind::MINUS);
+        assert_eq!(minus.text(), "-");
+        assert_eq!(patterns[0].value_token().unwrap().text(), "12");
+        assert!(
+            patterns[1..]
+                .iter()
+                .take(8)
+                .all(|pattern| pattern.minus_token().is_none())
+        );
+        assert!(patterns[8].minus_token().is_none());
+        assert_eq!(
+            patterns[9]
+                .minus_token()
+                .expect("negative float sign")
+                .kind(),
+            SyntaxKind::MINUS
+        );
+        assert_eq!(
+            IntLit::cast(patterns[0].value_token().unwrap())
+                .expect("integer token view")
+                .value(),
+            Some(12)
+        );
+
+        let invalid_signed_char = parse_file("fn broken() { let -'a' = input }\n");
+        assert!(
+            invalid_signed_char
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        let invalid_signed_char_root = crate::SyntaxNode::new_root(invalid_signed_char.root);
+        let invalid_signed_char = invalid_signed_char_root
+            .descendants()
+            .find_map(LiteralPat::cast)
+            .expect("recovered signed literal pattern");
+        assert!(invalid_signed_char.minus_token().is_some());
+        assert!(
+            invalid_signed_char.value_token().is_none(),
+            "a char token rejected after the sign is not the literal's value"
+        );
+
+        let missing_value = parse_file("fn broken() { let - = input }\n");
+        assert!(!missing_value.errors.is_empty());
+        let missing_value_root = crate::SyntaxNode::new_root(missing_value.root);
+        let missing_value = missing_value_root
+            .descendants()
+            .find_map(LiteralPat::cast)
+            .expect("recovered literal pattern");
+        assert!(missing_value.minus_token().is_some());
+        assert!(missing_value.value_token().is_none());
+
+        let malformed_integer = parse_file("fn broken() { let 1__2 = input }\n");
+        let malformed_integer_root = crate::SyntaxNode::new_root(malformed_integer.root);
+        let malformed_integer = malformed_integer_root
+            .descendants()
+            .find_map(LiteralPat::cast)
+            .expect("malformed integer pattern");
+        let malformed_token = malformed_integer
+            .value_token()
+            .expect("malformed integer token remains in the tree");
+        assert!(malformed_token.has_error());
+        assert!(
+            IntLit::cast(malformed_token)
+                .expect("malformed integer token view")
+                .value()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,

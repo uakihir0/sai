@@ -914,3 +914,41 @@ fn direct_token<T: AstToken>(node: &SyntaxNode) -> Option<T> {
             SyntaxElement::Node(_) => None,
         })
 }
+
+fn direct_token_of_kind(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
+    node.children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == kind => Some(token),
+            SyntaxElement::Node(_) | SyntaxElement::Token(_) => None,
+        })
+}
+
+fn direct_token_of_kinds(node: &SyntaxNode, kinds: &[SyntaxKind]) -> Option<SyntaxToken> {
+    node.children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if kinds.contains(&token.kind()) => Some(token),
+            SyntaxElement::Node(_) | SyntaxElement::Token(_) => None,
+        })
+}
+
+impl LiteralPat {
+    pub fn minus_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::MINUS)
+    }
+
+    pub fn value_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kinds(
+            self.syntax(),
+            &[
+                SyntaxKind::INT,
+                SyntaxKind::FLOAT,
+                SyntaxKind::STRING,
+                SyntaxKind::BYTE_STRING,
+                SyntaxKind::CHAR,
+                SyntaxKind::BYTE,
+                SyntaxKind::TRUE_KW,
+                SyntaxKind::FALSE_KW,
+            ],
+        )
+    }
+}
