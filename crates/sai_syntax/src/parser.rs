@@ -3093,6 +3093,53 @@ mod tests {
     }
 
     #[test]
+    fn literal_expression_accessors_cover_all_literal_tokens() {
+        use crate::ast::{AstNode, AstToken, LiteralExpr, LiteralToken};
+
+        let cases = [
+            ("0", "int"),
+            ("1.5", "float"),
+            ("\"text\"", "string"),
+            ("b\"bytes\"", "byte string"),
+            ("'c'", "character"),
+            ("b'c'", "byte"),
+            ("true", "true"),
+            ("false", "false"),
+        ];
+        let source = format!(
+            "fn literals() {{\n{}\n}}\n",
+            cases
+                .iter()
+                .map(|(literal, _)| literal.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let output = parse_file(&source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let literals = root
+            .descendants()
+            .filter_map(LiteralExpr::cast)
+            .map(|literal| literal.token().expect("literal token"))
+            .collect::<Vec<_>>();
+        assert_eq!(literals.len(), cases.len());
+        for (literal, (text, kind)) in literals.iter().zip(cases) {
+            let matched_kind = match literal {
+                LiteralToken::Int(_) => "int",
+                LiteralToken::Float(_) => "float",
+                LiteralToken::String(_) => "string",
+                LiteralToken::ByteString(_) => "byte string",
+                LiteralToken::Char(_) => "character",
+                LiteralToken::Byte(_) => "byte",
+                LiteralToken::True(_) => "true",
+                LiteralToken::False(_) => "false",
+            };
+            assert_eq!(literal.syntax().text(), text);
+            assert_eq!(matched_kind, kind);
+        }
+    }
+
+    #[test]
     fn generated_function_and_statement_roles_follow_parsed_children() {
         use crate::ast::{AstNode, Item, Stmt};
 

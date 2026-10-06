@@ -575,6 +575,60 @@ pub enum FStringPiece<'a> {
     },
 }
 
+#[derive(Clone, Debug)]
+pub enum LiteralToken {
+    Int(IntLit),
+    Float(FloatLit),
+    String(StringLit),
+    ByteString(ByteStringLit),
+    Char(CharLit),
+    Byte(ByteLit),
+    True(SyntaxToken),
+    False(SyntaxToken),
+}
+
+impl AstToken for LiteralToken {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        matches!(
+            kind,
+            SyntaxKind::INT
+                | SyntaxKind::FLOAT
+                | SyntaxKind::STRING
+                | SyntaxKind::BYTE_STRING
+                | SyntaxKind::CHAR
+                | SyntaxKind::BYTE
+                | SyntaxKind::TRUE_KW
+                | SyntaxKind::FALSE_KW
+        )
+    }
+
+    fn cast(token: SyntaxToken) -> Option<Self> {
+        match token.kind() {
+            SyntaxKind::INT => Some(Self::Int(IntLit::cast(token)?)),
+            SyntaxKind::FLOAT => Some(Self::Float(FloatLit::cast(token)?)),
+            SyntaxKind::STRING => Some(Self::String(StringLit::cast(token)?)),
+            SyntaxKind::BYTE_STRING => Some(Self::ByteString(ByteStringLit::cast(token)?)),
+            SyntaxKind::CHAR => Some(Self::Char(CharLit::cast(token)?)),
+            SyntaxKind::BYTE => Some(Self::Byte(ByteLit::cast(token)?)),
+            SyntaxKind::TRUE_KW => Some(Self::True(token)),
+            SyntaxKind::FALSE_KW => Some(Self::False(token)),
+            _ => None,
+        }
+    }
+
+    fn syntax(&self) -> &SyntaxToken {
+        match self {
+            Self::Int(token) => token.syntax(),
+            Self::Float(token) => token.syntax(),
+            Self::String(token) => token.syntax(),
+            Self::ByteString(token) => token.syntax(),
+            Self::Char(token) => token.syntax(),
+            Self::Byte(token) => token.syntax(),
+            Self::True(token) | Self::False(token) => token,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BinOp {
     Or,
@@ -1079,6 +1133,12 @@ impl BinExpr {
         )?;
         let op = BinOp::from_syntax_kind(token.kind())?;
         Some((token, op))
+    }
+}
+
+impl LiteralExpr {
+    pub fn token(&self) -> Option<LiteralToken> {
+        direct_token(self.syntax())
     }
 }
 
