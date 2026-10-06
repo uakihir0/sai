@@ -958,3 +958,9 @@ impl Discriminant {
         direct_token_of_kind(self.syntax(), SyntaxKind::MINUS)
     }
 }
+
+impl DistinctDecl {
+    pub fn inner_pub_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::PUB_KW)
+    }
+}

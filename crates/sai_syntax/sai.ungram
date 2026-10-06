@@ -322,3 +322,9 @@ children VariantField attrs Attribute
 child VariantField name Name 0
 child VariantField ty Type 0
 token Discriminant integer IntLit
+child DistinctDecl name Name 0
+child DistinctDecl generic_params GenericParamList 0
+child DistinctDecl base_type Type 0
+child DistinctDecl refinement RefinementClause 0
+child ResourceDecl name Name 0
+child ResourceDecl fields FieldList 0

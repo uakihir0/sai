@@ -4855,6 +4855,106 @@ let byte_non_ascii = b"€"
     }
 
     #[test]
+    fn distinct_and_resource_accessors_expose_bases_fields_and_inner_visibility() {
+        use crate::ast::{AstNode, DistinctDecl, ResourceDecl};
+
+        let source = concat!(
+            "distinct UserId = U64\n",
+            "pub distinct Money = pub I64\n",
+            "pub distinct Opaque = U32\n",
+            "distinct Meters<T> = T\n",
+            "distinct Age = U8\n",
+            "where self <= 150\n",
+            "resource Session\n",
+            "resource File {\n",
+            "pub name: Str\n",
+            "owner: U32\n",
+            "}\n",
+            "resource Empty {}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let distincts = root
+            .descendants()
+            .filter_map(DistinctDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(distincts.len(), 5);
+        assert!(distincts.iter().all(|decl| decl.name().is_some()));
+        assert!(distincts.iter().all(|decl| decl.base_type().is_some()));
+        assert!(distincts[0].generic_params().is_none());
+        assert!(distincts[3].generic_params().is_some());
+        assert!(distincts[0].inner_pub_token().is_none());
+        assert!(distincts[2].inner_pub_token().is_none());
+        assert!(distincts[3].inner_pub_token().is_none());
+        let inner_pub = distincts[1]
+            .inner_pub_token()
+            .expect("constructor visibility token");
+        assert_eq!(inner_pub.text(), "pub");
+        assert_eq!(
+            inner_pub.text_range().start().to_usize(),
+            source.find("pub I64").expect("inner visibility marker")
+        );
+        assert!(distincts[0].refinement().is_none());
+        assert!(distincts[1].refinement().is_none());
+        assert!(distincts[2].refinement().is_none());
+        assert!(distincts[3].refinement().is_none());
+        assert!(
+            distincts[4]
+                .refinement()
+                .and_then(|refinement| refinement.expression())
+                .is_some()
+        );
+
+        let resources = root
+            .descendants()
+            .filter_map(ResourceDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(resources.len(), 3);
+        assert!(resources.iter().all(|resource| resource.name().is_some()));
+        assert!(resources[0].fields().is_none());
+        let file_fields = resources[1]
+            .fields()
+            .expect("resource field list")
+            .fields()
+            .collect::<Vec<_>>();
+        assert_eq!(file_fields.len(), 2);
+        assert!(
+            file_fields[0]
+                .name()
+                .and_then(|name| name.syntax().first_token())
+                .is_some_and(|token| token.text() == "name")
+        );
+        assert!(file_fields[0].ty().is_some());
+        assert!(
+            file_fields[1]
+                .name()
+                .and_then(|name| name.syntax().first_token())
+                .is_some_and(|token| token.text() == "owner")
+        );
+        assert!(file_fields[1].ty().is_some());
+        assert_eq!(
+            resources[2]
+                .fields()
+                .expect("empty resource field list")
+                .fields()
+                .count(),
+            0
+        );
+
+        let malformed = parse_file("distinct Broken =\nfn later() {}\n");
+        assert!(!malformed.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed.root);
+        let malformed_distinct = malformed_root
+            .descendants()
+            .find_map(DistinctDecl::cast)
+            .expect("recovered distinct declaration");
+        assert!(malformed_distinct.name().is_some());
+        assert!(malformed_distinct.base_type().is_none());
+        assert!(malformed_distinct.refinement().is_none());
+    }
+
+    #[test]
     fn distinct_base_type_can_follow_a_suppressed_physical_newline() {
         let source = concat!(
             "distinct UserId =\n",
@@ -5029,6 +5129,8 @@ let byte_non_ascii = b"€"
 
     #[test]
     fn exported_resources_are_diagnosed_and_missing_resource_close_preserves_next_item() {
+        use crate::ast::{AstNode, FnDecl, ResourceDecl};
+
         let exported = "export resource Handle\npub resource Empty {}\n";
         let output = parse_file(exported);
         let root = crate::SyntaxNode::new_root(output.root);
@@ -5079,6 +5181,30 @@ let byte_non_ascii = b"€"
                 .filter(|node| node.kind() == SyntaxKind::FN_DECL)
                 .count(),
             1
+        );
+        let resource = root
+            .descendants()
+            .find_map(ResourceDecl::cast)
+            .expect("recovered resource declaration");
+        let fields = resource
+            .fields()
+            .expect("recovered resource field list")
+            .fields()
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 1);
+        assert!(
+            fields[0]
+                .name()
+                .and_then(|name| name.syntax().first_token())
+                .is_some_and(|token| token.text() == "name")
+        );
+        let later = root
+            .descendants()
+            .find_map(FnDecl::cast)
+            .expect("following function");
+        assert_eq!(
+            later.syntax().parent().map(|parent| parent.kind()),
+            Some(SyntaxKind::SOURCE_FILE)
         );
         assert_eq!(root.green().text_len().to_usize(), source.len());
     }
