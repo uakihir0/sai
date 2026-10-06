@@ -708,59 +708,11 @@ fn decode_char_body(body: &str, mode: crate::EscapeMode) -> Option<crate::Escape
         .then_some(crate::EscapeValue::Scalar(value))
 }
 
-impl SourceFile {
-    pub fn test_decls(&self) -> impl Iterator<Item = TestDecl> + '_ {
-        self.syntax().children().filter_map(TestDecl::cast)
-    }
-
-    pub fn property_decls(&self) -> impl Iterator<Item = PropertyDecl> + '_ {
-        self.syntax().children().filter_map(PropertyDecl::cast)
-    }
-}
-
-impl TestDecl {
-    pub fn name(&self) -> Option<StringLit> {
-        direct_token(self.syntax())
-    }
-
-    pub fn body(&self) -> Option<Block> {
-        direct_child(self.syntax())
-    }
-}
-
-impl PropertyDecl {
-    pub fn name(&self) -> Option<StringLit> {
-        direct_token(self.syntax())
-    }
-
-    pub fn params(&self) -> Option<ParamList> {
-        direct_child(self.syntax())
-    }
-
-    pub fn body(&self) -> Option<Block> {
-        direct_child(self.syntax())
-    }
-}
-
-impl ParamList {
-    pub fn params(&self) -> impl Iterator<Item = Param> + '_ {
-        self.syntax().children().filter_map(Param::cast)
-    }
-}
-
 impl Param {
     pub fn is_mutable(&self) -> bool {
         self.syntax()
             .children_with_tokens()
             .any(|element| matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::VAR_KW))
-    }
-
-    pub fn name(&self) -> Option<Name> {
-        direct_child(self.syntax())
-    }
-
-    pub fn ty(&self) -> Option<Type> {
-        self.syntax().children().find_map(Type::cast)
     }
 }
 
@@ -882,8 +834,8 @@ ast_union!(Type {
     FnPtrType(FnPtrType, FN_PTR_TYPE),
 });
 
-fn direct_child<N: AstNode>(node: &SyntaxNode) -> Option<N> {
-    node.children().find_map(N::cast)
+fn direct_child_at<N: AstNode>(node: &SyntaxNode, index: usize) -> Option<N> {
+    node.children().filter_map(N::cast).nth(index)
 }
 
 fn direct_token<T: AstToken>(node: &SyntaxNode) -> Option<T> {

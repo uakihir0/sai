@@ -2249,6 +2249,34 @@ mod tests {
     }
 
     #[test]
+    fn generated_binary_expression_roles_select_distinct_same_type_children() {
+        use crate::ast::{AstNode, BinExpr};
+
+        let source = "fn compare() { left + right }\n";
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let binary = root
+            .descendants()
+            .find_map(BinExpr::cast)
+            .expect("binary expression");
+        let lhs = binary.lhs().expect("left operand");
+        let rhs = binary.rhs().expect("right operand");
+
+        let lhs_range = lhs.syntax().text_range();
+        let rhs_range = rhs.syntax().text_range();
+        assert_eq!(
+            &source[lhs_range.start().to_usize()..lhs_range.end().to_usize()],
+            "left"
+        );
+        assert_eq!(
+            &source[rhs_range.start().to_usize()..rhs_range.end().to_usize()],
+            "right"
+        );
+        assert_ne!(lhs_range, rhs_range);
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,
@@ -2337,15 +2365,15 @@ mod tests {
         }
 
         let file = SourceFile::cast(root.clone()).expect("source file view");
-        let string = file.test_decls().next().unwrap().name().unwrap();
+        let test_decl = file.test_decls().next().unwrap();
+        assert!(test_decl.body().is_some());
+        let string = test_decl.name().unwrap();
         assert!(StringLit::can_cast(string.syntax().kind()));
         assert!(StringLit::cast(string.syntax().clone()).is_some());
-        let non_string = file
-            .property_decls()
-            .next()
-            .unwrap()
-            .params()
-            .unwrap()
+        let property = file.property_decls().next().unwrap();
+        assert!(property.body().is_some());
+        let params = property.params().unwrap();
+        let non_string = params
             .params()
             .next()
             .unwrap()
@@ -3155,6 +3183,8 @@ let byte_non_ascii = b"€"
 
     #[test]
     fn test_declaration_without_a_body_preserves_the_following_item() {
+        use crate::ast::{AstNode, SourceFile};
+
         let source = "test \"missing body\"\nconst READY: Bool = true\n";
         let output = parse_file(source);
         let root = crate::SyntaxNode::new_root(output.root);
@@ -3167,6 +3197,12 @@ let byte_non_ascii = b"€"
                 .count(),
             1
         );
+        let file = SourceFile::cast(root.clone()).expect("source file view");
+        let test = file
+            .test_decls()
+            .next()
+            .expect("recovered test declaration");
+        assert!(test.body().is_none());
         assert_eq!(
             root.descendants()
                 .filter(|node| node.kind() == SyntaxKind::CONST_DECL)

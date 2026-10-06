@@ -153,3 +153,18 @@ node NameRef NAME_REF
 node CastExpr CAST_EXPR
 node InvariantExprList INVARIANT_EXPR_LIST
 node Error ERROR
+
+# Direct child roles: child takes a zero-based same-type position, children is repeated,
+# and token names an AstToken.
+children SourceFile test_decls TestDecl
+children SourceFile property_decls PropertyDecl
+token TestDecl name StringLit
+child TestDecl body Block 0
+token PropertyDecl name StringLit
+child PropertyDecl params ParamList 0
+child PropertyDecl body Block 0
+children ParamList params Param
+child Param name Name 0
+child Param ty Type 0
+child BinExpr lhs Expr 0
+child BinExpr rhs Expr 1

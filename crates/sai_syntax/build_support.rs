@@ -1,16 +1,41 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 #[derive(Debug)]
 pub(crate) struct Node {
     pub(crate) ast_name: String,
     pub(crate) syntax_kind: String,
+    accessors: Vec<Accessor>,
 }
 
-pub(crate) fn parse_nodes(grammar: &str, existing_types: &BTreeSet<String>) -> Vec<Node> {
+#[derive(Debug)]
+struct Accessor {
+    kind: AccessorKind,
+    name: String,
+    ty: String,
+    index: Option<usize>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AccessorKind {
+    Child,
+    Children,
+    Token,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ExistingAstTypes {
+    names: BTreeSet<String>,
+    unions: BTreeSet<String>,
+    tokens: BTreeSet<String>,
+    methods: BTreeMap<String, BTreeSet<String>>,
+}
+
+pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> Vec<Node> {
     let mut nodes = Vec::new();
     let mut ast_names = BTreeSet::new();
     let mut syntax_kinds = BTreeSet::new();
+    let mut accessors = Vec::new();
 
     for (line_index, line) in grammar.lines().enumerate() {
         let line = line
@@ -22,54 +47,166 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &BTreeSet<String>) -> V
         }
 
         let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 || fields[0] != "node" {
-            panic!(
-                "sai.ungram:{}: expected `node <AstName> <SYNTAX_KIND>`",
+        match fields.first().copied() {
+            Some("node") => {
+                if fields.len() != 3 {
+                    panic!(
+                        "sai.ungram:{}: expected `node <AstName> <SYNTAX_KIND>`",
+                        line_index + 1
+                    );
+                }
+                let ast_name = fields[1];
+                let syntax_kind = fields[2];
+                if !is_rust_type_name(ast_name) {
+                    panic!(
+                        "sai.ungram:{}: invalid AST node name `{ast_name}`",
+                        line_index + 1
+                    );
+                }
+                if existing_types.names.contains(ast_name) {
+                    panic!(
+                        "sai.ungram:{}: AST node name `{ast_name}` conflicts with a type already in ast.rs",
+                        line_index + 1
+                    );
+                }
+                if !syntax_kind
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                {
+                    panic!(
+                        "sai.ungram:{}: invalid syntax kind `{syntax_kind}`",
+                        line_index + 1
+                    );
+                }
+                if !ast_names.insert(ast_name.to_owned()) {
+                    panic!(
+                        "sai.ungram:{}: duplicate AST node name `{ast_name}`",
+                        line_index + 1
+                    );
+                }
+                if !syntax_kinds.insert(syntax_kind.to_owned()) {
+                    panic!(
+                        "sai.ungram:{}: duplicate syntax kind `{syntax_kind}`",
+                        line_index + 1
+                    );
+                }
+                nodes.push(Node {
+                    ast_name: ast_name.to_owned(),
+                    syntax_kind: syntax_kind.to_owned(),
+                    accessors: Vec::new(),
+                });
+            }
+            Some(kind @ ("child" | "children" | "token")) => {
+                let expected_fields = if kind == "child" { 5 } else { 4 };
+                if fields.len() != expected_fields {
+                    panic!(
+                        "sai.ungram:{}: expected `{kind} <Parent> <role> <AstType>{}`",
+                        line_index + 1,
+                        if kind == "child" { " <index>" } else { "" },
+                    );
+                }
+                let role_name = fields[2];
+                if !is_rust_value_name(role_name)
+                    || matches!(role_name, "can_cast" | "cast" | "syntax")
+                {
+                    panic!(
+                        "sai.ungram:{}: invalid AST role name `{role_name}`",
+                        line_index + 1
+                    );
+                }
+                let accessor_kind = match kind {
+                    "child" => AccessorKind::Child,
+                    "children" => AccessorKind::Children,
+                    "token" => AccessorKind::Token,
+                    _ => unreachable!(),
+                };
+                let index = if kind == "child" {
+                    Some(fields[4].parse::<usize>().unwrap_or_else(|_| {
+                        panic!(
+                            "sai.ungram:{}: child position `{}` is not a non-negative integer",
+                            line_index + 1,
+                            fields[4]
+                        )
+                    }))
+                } else {
+                    None
+                };
+                accessors.push((
+                    line_index + 1,
+                    fields[1].to_owned(),
+                    Accessor {
+                        kind: accessor_kind,
+                        name: role_name.to_owned(),
+                        ty: fields[3].to_owned(),
+                        index,
+                    },
+                ));
+            }
+            Some(_) | None => panic!(
+                "sai.ungram:{}: expected a `node`, `child`, `children`, or `token` declaration",
                 line_index + 1
-            );
+            ),
         }
-        let ast_name = fields[1];
-        let syntax_kind = fields[2];
-        if !is_rust_type_name(ast_name) {
-            panic!(
-                "sai.ungram:{}: invalid AST node name `{ast_name}`",
-                line_index + 1
-            );
-        }
-        if existing_types.contains(ast_name) {
-            panic!(
-                "sai.ungram:{}: AST node name `{ast_name}` conflicts with a type already in ast.rs",
-                line_index + 1
-            );
-        }
-        if !syntax_kind
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-        {
-            panic!(
-                "sai.ungram:{}: invalid syntax kind `{syntax_kind}`",
-                line_index + 1
-            );
-        }
-        if !ast_names.insert(ast_name.to_owned()) {
-            panic!(
-                "sai.ungram:{}: duplicate AST node name `{ast_name}`",
-                line_index + 1
-            );
-        }
-        if !syntax_kinds.insert(syntax_kind.to_owned()) {
-            panic!(
-                "sai.ungram:{}: duplicate syntax kind `{syntax_kind}`",
-                line_index + 1
-            );
-        }
-        nodes.push(Node {
-            ast_name: ast_name.to_owned(),
-            syntax_kind: syntax_kind.to_owned(),
-        });
     }
 
     assert!(!nodes.is_empty(), "sai.ungram declares no syntax nodes");
+    let mut declared_roles = BTreeSet::new();
+    let mut declared_child_positions = BTreeSet::new();
+    for (line, parent_name, accessor) in accessors {
+        let Some(parent) = nodes.iter_mut().find(|node| node.ast_name == parent_name) else {
+            panic!("sai.ungram:{line}: unknown AST node `{parent_name}`");
+        };
+        if existing_types
+            .methods
+            .get(&parent_name)
+            .is_some_and(|methods| methods.contains(&accessor.name))
+        {
+            panic!(
+                "sai.ungram:{line}: AST role `{}::{}` conflicts with a hand-written accessor",
+                parent_name, accessor.name
+            );
+        }
+        if !declared_roles.insert((parent_name.clone(), accessor.name.clone())) {
+            panic!(
+                "sai.ungram:{line}: duplicate AST role `{}::{}`",
+                parent_name, accessor.name
+            );
+        }
+        match accessor.kind {
+            AccessorKind::Child | AccessorKind::Children => {
+                if !ast_names.contains(&accessor.ty)
+                    && !existing_types.unions.contains(&accessor.ty)
+                {
+                    panic!(
+                        "sai.ungram:{line}: `{}` is not a known AST node or union",
+                        accessor.ty
+                    );
+                }
+                if accessor.kind == AccessorKind::Child {
+                    let index = accessor.index.expect("child roles have a position");
+                    if !declared_child_positions.insert((
+                        parent_name.clone(),
+                        accessor.ty.clone(),
+                        index,
+                    )) {
+                        panic!(
+                            "sai.ungram:{line}: two AST roles select {} child {}",
+                            accessor.ty, index
+                        );
+                    }
+                }
+            }
+            AccessorKind::Token => {
+                if !existing_types.tokens.contains(&accessor.ty) {
+                    panic!(
+                        "sai.ungram:{line}: `{}` is not a known AST token",
+                        accessor.ty
+                    );
+                }
+            }
+        }
+        parent.accessors.push(accessor);
+    }
     nodes
 }
 
@@ -80,8 +217,70 @@ fn is_rust_type_name(name: &str) -> bool {
         && name != "Self"
 }
 
-pub(crate) fn existing_ast_type_names(ast_source: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
+fn is_rust_value_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_lowercase() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && name != "_"
+        && !matches!(
+            name,
+            "abstract"
+                | "as"
+                | "async"
+                | "await"
+                | "become"
+                | "box"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "do"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "final"
+                | "fn"
+                | "for"
+                | "gen"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "macro"
+                | "mod"
+                | "move"
+                | "mut"
+                | "override"
+                | "pub"
+                | "priv"
+                | "ref"
+                | "return"
+                | "self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "try"
+                | "type"
+                | "typeof"
+                | "unsafe"
+                | "unsized"
+                | "union"
+                | "use"
+                | "virtual"
+                | "where"
+                | "while"
+                | "yield"
+        )
+}
+
+pub(crate) fn existing_ast_types(ast_source: &str) -> ExistingAstTypes {
+    let mut types = ExistingAstTypes::default();
     let declaration_prefixes = [
         "pub(crate) struct ",
         "pub(crate) enum ",
@@ -104,23 +303,36 @@ pub(crate) fn existing_ast_type_names(ast_source: &str) -> BTreeSet<String> {
             .find_map(|prefix| line.strip_prefix(prefix))
             .and_then(first_identifier)
         {
-            names.insert(name.to_owned());
+            types.names.insert(name.to_owned());
         }
 
         if let Some(rest) = line.strip_prefix("ast_token!(") {
             if let Some(name) = first_identifier(rest) {
-                names.insert(name.to_owned());
+                types.names.insert(name.to_owned());
+                types.tokens.insert(name.to_owned());
             }
         }
         if let Some(rest) = line.strip_prefix("ast_union!(") {
             if let Some(name) = first_identifier(rest) {
-                names.insert(name.to_owned());
+                types.names.insert(name.to_owned());
+                types.unions.insert(name.to_owned());
             }
         }
     }
 
-    names.extend(imported_type_names(ast_source));
-    names.extend(
+    for line in ast_source.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("pub enum ") {
+            if let Some(name) = first_identifier(rest) {
+                if ast_source.contains(&format!("impl AstNode for {name}")) {
+                    types.unions.insert(name.to_owned());
+                }
+            }
+        }
+    }
+
+    types.names.extend(imported_type_names(ast_source));
+    types.names.extend(
         [
             "Box",
             "Clone",
@@ -148,7 +360,42 @@ pub(crate) fn existing_ast_type_names(ast_source: &str) -> BTreeSet<String> {
         .into_iter()
         .map(str::to_owned),
     );
-    names
+    types.methods = existing_ast_methods(ast_source);
+    types
+}
+
+fn existing_ast_methods(ast_source: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut methods = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut current_impl = None::<String>;
+
+    for line in ast_source.lines() {
+        let trimmed = line.trim();
+        if !line.chars().next().is_some_and(char::is_whitespace) {
+            current_impl = trimmed.strip_prefix("impl ").and_then(|header| {
+                if header.contains(" for ") {
+                    None
+                } else {
+                    first_identifier(header).map(str::to_owned)
+                }
+            });
+            continue;
+        }
+
+        let Some(parent) = current_impl.as_ref() else {
+            continue;
+        };
+        let method = ["pub(crate) fn ", "pub fn ", "pub const fn ", "fn "]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+            .and_then(first_identifier);
+        if let Some(method) = method {
+            methods
+                .entry(parent.clone())
+                .or_default()
+                .insert(method.to_owned());
+        }
+    }
+    methods
 }
 
 fn first_identifier(source: &str) -> Option<&str> {
@@ -407,6 +654,29 @@ pub(crate) fn generate_nodes(nodes: &[Node]) -> String {
             node.ast_name, node.syntax_kind
         )
         .expect("write to generated source");
+        for accessor in &node.accessors {
+            match accessor.kind {
+                AccessorKind::Child => writeln!(
+                    generated,
+                    "impl {} {{ pub fn {}(&self) -> Option<{}> {{ direct_child_at(self.syntax(), {}) }} }}",
+                    node.ast_name,
+                    accessor.name,
+                    accessor.ty,
+                    accessor.index.expect("child roles have a position")
+                ),
+                AccessorKind::Children => writeln!(
+                    generated,
+                    "impl {} {{ pub fn {}(&self) -> impl Iterator<Item = {}> + '_ {{ self.syntax().children().filter_map({}::cast) }} }}",
+                    node.ast_name, accessor.name, accessor.ty, accessor.ty
+                ),
+                AccessorKind::Token => writeln!(
+                    generated,
+                    "impl {} {{ pub fn {}(&self) -> Option<{}> {{ direct_token(self.syntax()) }} }}",
+                    node.ast_name, accessor.name, accessor.ty
+                ),
+            }
+            .expect("write to generated source");
+        }
     }
 
     generated.push_str("\npub const AST_NODE_KINDS: &[SyntaxKind] = &[\n");
@@ -420,13 +690,17 @@ pub(crate) fn generate_nodes(nodes: &[Node]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, existing_ast_type_names, generate_nodes, parse_nodes, validate_node_kinds};
+    use super::{
+        ExistingAstTypes, Node, existing_ast_types, generate_nodes, parse_nodes,
+        validate_node_kinds,
+    };
     use std::collections::BTreeSet;
 
     fn node(ast_name: &str, syntax_kind: &str) -> Node {
         Node {
             ast_name: ast_name.to_owned(),
             syntax_kind: syntax_kind.to_owned(),
+            accessors: Vec::new(),
         }
     }
 
@@ -535,31 +809,114 @@ mod tests {
             "ast_token!(Name, NAME);\n",
             "ast_union!(Type {",
         );
-        let existing = existing_ast_type_names(ast_source);
-        assert!(existing.contains("Cow"));
-        assert!(existing.contains("HashMap"));
-        assert!(existing.contains("SyntaxElement"));
-        assert!(existing.contains("SyntaxKind"));
-        assert!(existing.contains("Expr"));
-        assert!(existing.contains("Name"));
-        assert!(existing.contains("Type"));
-        assert!(existing.contains("Option"));
+        let existing = existing_ast_types(ast_source);
+        assert!(existing.names.contains("Cow"));
+        assert!(existing.names.contains("HashMap"));
+        assert!(existing.names.contains("SyntaxElement"));
+        assert!(existing.names.contains("SyntaxKind"));
+        assert!(existing.names.contains("Expr"));
+        assert!(existing.names.contains("Name"));
+        assert!(existing.names.contains("Type"));
+        assert!(existing.names.contains("Option"));
+        assert!(existing.tokens.contains("Name"));
+        assert!(existing.unions.contains("Type"));
 
-        let result =
-            std::panic::catch_unwind(|| parse_nodes("node Self SOURCE_FILE", &BTreeSet::new()));
+        let result = std::panic::catch_unwind(|| {
+            parse_nodes("node Self SOURCE_FILE", &ExistingAstTypes::default())
+        });
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_nodes_rejects_existing_ast_type_names() {
-        let existing = BTreeSet::from(["Expr".to_owned()]);
+        let existing = ExistingAstTypes {
+            names: BTreeSet::from(["Expr".to_owned()]),
+            ..ExistingAstTypes::default()
+        };
         let result = std::panic::catch_unwind(|| parse_nodes("node Expr SOURCE_FILE", &existing));
         assert!(result.is_err());
     }
 
     #[test]
+    fn parse_nodes_validates_and_attaches_child_roles() {
+        let existing = ExistingAstTypes {
+            unions: BTreeSet::from(["Type".to_owned()]),
+            tokens: BTreeSet::from(["StringLit".to_owned()]),
+            ..ExistingAstTypes::default()
+        };
+        let nodes = parse_nodes(
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "children Parent children Child\n",
+                "child Parent first Child 0\n",
+                "child Parent second Child 1\n",
+                "child Parent child Type 0\n",
+                "token Parent token StringLit",
+            ),
+            &existing,
+        );
+
+        let generated = generate_nodes(&nodes);
+        assert!(generated.contains("pub fn children(&self) -> impl Iterator<Item = Child>"));
+        assert!(generated.contains("pub fn first(&self) -> Option<Child>"));
+        assert!(generated.contains("pub fn second(&self) -> Option<Child>"));
+        assert!(generated.contains("pub fn child(&self) -> Option<Type>"));
+        assert!(generated.contains("direct_child_at(self.syntax(), 0)"));
+        assert!(generated.contains("direct_child_at(self.syntax(), 1)"));
+        assert!(generated.contains("pub fn token(&self) -> Option<StringLit>"));
+    }
+
+    #[test]
+    fn parse_nodes_rejects_duplicate_and_unknown_child_roles() {
+        let existing = ExistingAstTypes::default();
+        let duplicate = concat!(
+            "node Parent PARENT\n",
+            "node Child CHILD\n",
+            "child Parent item Child 0\n",
+            "children Parent item Child",
+        );
+        assert!(std::panic::catch_unwind(|| parse_nodes(duplicate, &existing)).is_err());
+
+        let unknown_parent = "node Child CHILD\nchild Missing item Child 0";
+        assert!(std::panic::catch_unwind(|| parse_nodes(unknown_parent, &existing)).is_err());
+
+        let unknown_type = "node Parent PARENT\nchild Parent item Missing 0";
+        assert!(std::panic::catch_unwind(|| parse_nodes(unknown_type, &existing)).is_err());
+    }
+
+    #[test]
+    fn parse_nodes_rejects_two_roles_selecting_the_same_child_position() {
+        let grammar = concat!(
+            "node Parent PARENT\n",
+            "node Child CHILD\n",
+            "child Parent lhs Child 0\n",
+            "child Parent rhs Child 0",
+        );
+        assert!(
+            std::panic::catch_unwind(|| parse_nodes(grammar, &ExistingAstTypes::default()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_nodes_rejects_trait_and_hand_written_accessor_collisions() {
+        let existing = existing_ast_types("impl Parent {\n    pub fn label(&self) {}\n}");
+        let handwritten = "node Parent PARENT\nchild Parent label Parent 0";
+        assert!(std::panic::catch_unwind(|| parse_nodes(handwritten, &existing)).is_err());
+
+        let trait_method = "node Parent PARENT\nchild Parent syntax Parent 0";
+        assert!(
+            std::panic::catch_unwind(|| {
+                parse_nodes(trait_method, &ExistingAstTypes::default())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn generated_wrappers_and_node_kinds_share_the_declared_inventory() {
-        let existing = BTreeSet::new();
+        let existing = ExistingAstTypes::default();
         let nodes = parse_nodes("node Error ERROR\nnode SourceFile SOURCE_FILE", &existing);
         let generated = generate_nodes(&nodes);
         assert!(generated.contains("ast_node!(Error, ERROR);"));

@@ -13,7 +13,7 @@ fn main() {
     let grammar = fs::read_to_string("sai.ungram").expect("read sai.ungram");
     let syntax_source = fs::read_to_string("src/lib.rs").expect("read SyntaxKind declaration");
     let ast_source = fs::read_to_string("src/ast.rs").expect("read existing AST declarations");
-    let existing_types = build_support::existing_ast_type_names(&ast_source);
+    let existing_types = build_support::existing_ast_types(&ast_source);
     let nodes = build_support::parse_nodes(&grammar, &existing_types);
     build_support::validate_node_kinds(&nodes, &syntax_source);
 
