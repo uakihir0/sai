@@ -1,4 +1,4 @@
-use crate::{BindingId, HirId, IndexVec, IndexVecError, ItemLocalId, OwnerId};
+use crate::{BindingId, HirId, IndexVec, IndexVecError, ItemLocalId, OwnerId, Span, SpanCtxt};
 use sai_diagnostics::Diagnostic;
 use sai_syntax::{SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, ast::AstIdMap};
 use std::collections::HashMap;
@@ -114,11 +114,63 @@ impl<'root> HirSourceMapBuilder<'root> {
         })
     }
 
+    /// Record a HIR node and return its span after validating the syntax node
+    /// against this builder's file root.
+    pub fn add_node_with_span(
+        &mut self,
+        syntax: &SyntaxNode,
+        ctxt: SpanCtxt,
+    ) -> Result<(HirId, Span), HirSourceMapError> {
+        let pointer = syntax_pointer(self.file, self.root, syntax)?;
+        let span = Span {
+            file: self.file,
+            range: syntax.text_range(),
+            ctxt,
+        };
+        let local_id = self.push_node_pointer(pointer)?;
+        Ok((
+            HirId {
+                owner: self.owner,
+                local_id,
+            },
+            span,
+        ))
+    }
+
+    /// Return a span for syntax proven to belong to this builder's file root.
+    pub fn span_for(&self, syntax: &SyntaxNode, ctxt: SpanCtxt) -> Result<Span, HirSourceMapError> {
+        syntax_pointer(self.file, self.root, syntax)?;
+        Ok(Span {
+            file: self.file,
+            range: syntax.text_range(),
+            ctxt,
+        })
+    }
+
     pub fn add_binding(&mut self, syntax: &SyntaxNode) -> Result<BindingId, HirSourceMapError> {
         let pointer = syntax_pointer(self.file, self.root, syntax)?;
         self.binding_to_syntax
             .push(pointer)
             .map_err(|IndexVecError::TooManyElements| HirSourceMapError::TooManyBindings)
+    }
+
+    /// Record a binding and return its validated source span.
+    pub fn add_binding_with_span(
+        &mut self,
+        syntax: &SyntaxNode,
+        ctxt: SpanCtxt,
+    ) -> Result<(BindingId, Span), HirSourceMapError> {
+        let pointer = syntax_pointer(self.file, self.root, syntax)?;
+        let span = Span {
+            file: self.file,
+            range: syntax.text_range(),
+            ctxt,
+        };
+        let binding = self
+            .binding_to_syntax
+            .push(pointer)
+            .map_err(|IndexVecError::TooManyElements| HirSourceMapError::TooManyBindings)?;
+        Ok((binding, span))
     }
 
     pub fn push_diagnostic(&mut self, diagnostic: Diagnostic) -> Result<(), HirSourceMapError> {
@@ -289,6 +341,67 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn lowering_span_helpers_bind_ranges_to_validated_hir_nodes_and_bindings() {
+        let file = crate::FileId::new(53);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(x: I32) { for i in x {} }\n");
+        let function = function_node(&parsed.root);
+        let function_ast =
+            sai_syntax::ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let name = function_ast.name().expect("function name");
+        let parameter_name = function_ast
+            .params()
+            .and_then(|params| params.params().next())
+            .and_then(|param| param.name())
+            .expect("parameter name");
+        let for_loop = function
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FOR_EXPR)
+            .expect("for expression");
+        let owner = owner_id("f");
+        let mut builder =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("builder");
+
+        let (node_id, node_span) = builder
+            .add_node_with_span(name.syntax(), SpanCtxt::Root)
+            .expect("node span");
+        assert_eq!(node_id.local_id.raw(), 1);
+        assert_eq!(node_span.file, file);
+        assert_eq!(node_span.range, name.syntax().text_range());
+        assert_eq!(node_span.ctxt, SpanCtxt::Root);
+
+        let desugared_ctxt = SpanCtxt::Desugared(crate::DesugaringKind::ForLoop);
+        let desugared_span = builder
+            .span_for(&for_loop, desugared_ctxt)
+            .expect("desugared span");
+        assert_eq!(desugared_span.range, for_loop.text_range());
+        assert_eq!(desugared_span.ctxt, desugared_ctxt);
+        let (binding_id, binding_span) = builder
+            .add_binding_with_span(parameter_name.syntax(), SpanCtxt::Root)
+            .expect("binding span");
+        assert_eq!(binding_id.raw(), 0);
+        assert_eq!(binding_span.file, file);
+        assert_eq!(binding_span.range, parameter_name.syntax().text_range());
+        assert_eq!(binding_span.ctxt, SpanCtxt::Root);
+
+        let unrecorded_span = builder
+            .span_for(&function, SpanCtxt::Root)
+            .expect("owner span");
+        assert_eq!(unrecorded_span.range, function.text_range());
+        let map = builder.finish();
+        assert_eq!(
+            map.syntax_for_node(node_id).unwrap().kind(),
+            SyntaxKind::NAME
+        );
+        assert_eq!(
+            map.syntax_for_binding(binding_id).unwrap().kind(),
+            SyntaxKind::NAME
+        );
+        assert_eq!(map.node_to_syntax().len(), 2);
+        assert_eq!(map.binding_to_syntax().len(), 1);
     }
 
     #[test]
