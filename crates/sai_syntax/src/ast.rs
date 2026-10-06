@@ -66,6 +66,8 @@ ast_node!(TupleIndexExpr, TUPLE_INDEX_EXPR);
 ast_token!(IntLit, INT);
 ast_token!(FloatLit, FLOAT);
 ast_token!(StringLit, STRING);
+ast_token!(CharLit, CHAR);
+ast_token!(ByteLit, BYTE);
 
 impl IntLit {
     pub fn value(&self) -> Option<u128> {
@@ -136,6 +138,52 @@ impl FloatLit {
     }
 }
 
+impl CharLit {
+    pub fn value(&self) -> char {
+        if self.syntax().has_error() {
+            return '\u{fffd}';
+        }
+
+        let Some(body) = self
+            .syntax()
+            .text()
+            .strip_prefix('\'')
+            .and_then(|text| text.strip_suffix('\''))
+        else {
+            return '\u{fffd}';
+        };
+        match decode_char_body(body, crate::EscapeMode::Char) {
+            Some(crate::EscapeValue::Scalar(value)) => value,
+            Some(crate::EscapeValue::Byte(value)) => char::from(value),
+            None => '\u{fffd}',
+        }
+    }
+}
+
+impl ByteLit {
+    pub fn value(&self) -> u8 {
+        if self.syntax().has_error() {
+            return 0;
+        }
+
+        let Some(body) = self
+            .syntax()
+            .text()
+            .strip_prefix("b'")
+            .and_then(|text| text.strip_suffix('\''))
+        else {
+            return 0;
+        };
+        match decode_char_body(body, crate::EscapeMode::Byte) {
+            Some(crate::EscapeValue::Byte(value)) => value,
+            Some(crate::EscapeValue::Scalar(value)) => {
+                u8::try_from(u32::from(value)).unwrap_or_default()
+            }
+            None => 0,
+        }
+    }
+}
+
 impl TupleIndexExpr {
     pub fn index(&self) -> Option<u32> {
         let literal = direct_token::<IntLit>(self.syntax())?;
@@ -148,6 +196,23 @@ impl TupleIndexExpr {
         }
         text.parse().ok()
     }
+}
+
+fn decode_char_body(body: &str, mode: crate::EscapeMode) -> Option<crate::EscapeValue> {
+    if body.starts_with('\\') {
+        let escape = crate::scan_escape(body, 0, mode);
+        if !escape.valid || escape.end != body.len() {
+            return None;
+        }
+        return escape.value;
+    }
+
+    let mut chars = body.chars();
+    let value = chars.next()?;
+    chars
+        .next()
+        .is_none()
+        .then_some(crate::EscapeValue::Scalar(value))
 }
 
 impl SourceFile {

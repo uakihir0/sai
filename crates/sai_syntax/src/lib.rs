@@ -734,10 +734,17 @@ enum EscapeMode {
 }
 
 #[derive(Clone, Copy)]
+enum EscapeValue {
+    Scalar(char),
+    Byte(u8),
+}
+
+#[derive(Clone, Copy)]
 struct EscapeScan {
     end: usize,
     valid: bool,
     line_break_follows: bool,
+    value: Option<EscapeValue>,
 }
 
 #[derive(Clone, Copy)]
@@ -3520,11 +3527,13 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
         end,
         valid: false,
         line_break_follows: false,
+        value: None,
     };
-    let valid = |end| EscapeScan {
+    let valid = |end, value| EscapeScan {
         end,
         valid: true,
         line_break_follows: false,
+        value: Some(value),
     };
     let Some(escaped) = text
         .get(start + 1..)
@@ -3540,6 +3549,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
                 end: start + 1,
                 valid: false,
                 line_break_follows: true,
+                value: None,
             };
         }
         if escaped == '\n' {
@@ -3554,6 +3564,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
                 end,
                 valid: true,
                 line_break_follows: true,
+                value: None,
             };
         }
         if text.as_bytes().get(end) != Some(&b'\n') {
@@ -3561,6 +3572,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
                 end: start + 1,
                 valid: false,
                 line_break_follows: true,
+                value: None,
             };
         }
         end += 1;
@@ -3575,11 +3587,22 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
             end,
             valid: true,
             line_break_follows: true,
+            value: None,
         };
     }
 
-    if matches!(escaped, 'n' | 'r' | 't' | '\\' | '\'' | '"' | '0') {
-        return valid(end);
+    let simple_value = match escaped {
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        '\\' => Some('\\'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        '0' => Some('\0'),
+        _ => None,
+    };
+    if let Some(value) = simple_value {
+        return valid(end, EscapeValue::Scalar(value));
     }
 
     if escaped == 'u' {
@@ -3635,15 +3658,12 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
         if closed {
             end += 1;
         }
-        let valid_scalar = (1..=6).contains(&digits)
-            && !malformed_digit
-            && closed
-            && char::from_u32(scalar).is_some();
-        return if valid_scalar {
-            valid(end)
-        } else {
-            invalid(end)
-        };
+        if (1..=6).contains(&digits) && !malformed_digit && closed {
+            if let Some(value) = char::from_u32(scalar) {
+                return valid(end, EscapeValue::Scalar(value));
+            }
+        }
+        return invalid(end);
     }
 
     if escaped == 'x' {
@@ -3654,13 +3674,18 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
             end += 1;
             digits += 1;
         }
-        return if byte_mode && digits == 2 {
-            valid(end)
-        } else if byte_mode {
-            invalid(end)
-        } else {
-            invalid(end.max(digits_start))
-        };
+        if byte_mode && digits == 2 {
+            let value = text.as_bytes().get(digits_start..end).and_then(|digits| {
+                let mut digits = digits.iter();
+                let high = digit_value(*digits.next()?)?;
+                let low = digit_value(*digits.next()?)?;
+                u8::try_from(high * 16 + low).ok()
+            });
+            if let Some(value) = value {
+                return valid(end, EscapeValue::Byte(value));
+            }
+        }
+        return invalid(end.max(digits_start));
     }
 
     invalid(end)

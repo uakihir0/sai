@@ -2520,6 +2520,112 @@ mod tests {
     }
 
     #[test]
+    fn character_ast_values_decode_escapes_and_recover_invalid_literals() {
+        use crate::ast::{AstToken, ByteLit, CharLit};
+
+        let source = r#"fn literals() {
+let basic_char = 'a'
+let unicode_char = 'é'
+let escaped_char = '\u{1f642}'
+let invalid_escape_char = '\q'
+let multiscalar_char = 'ab'
+let escaped_quote = '\''
+let escaped_backslash = '\\'
+let null_char = '\0'
+let basic_byte = b'A'
+let escaped_quote_byte = b'\''
+let escaped_backslash_byte = b'\\'
+let escaped_byte = b'\n'
+let hex_byte = b'\xFF'
+let invalid_escape_byte = b'\u{41}'
+let non_ascii_byte = b'€'
+let null_byte = b'\0'
+let unclosed_char = '
+let unclosed_byte = b'
+}"#;
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut chars = Vec::new();
+        let mut bytes = Vec::new();
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                let crate::SyntaxElement::Token(token) = element else {
+                    continue;
+                };
+                if let Some(literal) = CharLit::cast(token.clone()) {
+                    chars.push(literal.value());
+                }
+                if let Some(literal) = ByteLit::cast(token) {
+                    bytes.push(literal.value());
+                }
+            }
+        }
+
+        assert_eq!(
+            chars,
+            [
+                'a', 'é', '🙂', '\u{fffd}', '\u{fffd}', '\'', '\\', '\0', '\u{fffd}',
+            ]
+        );
+        assert_eq!(bytes, [b'A', b'\'', b'\\', b'\n', 0xff, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn malformed_utf8_character_literals_use_ast_fallback_values() {
+        use crate::ast::{AstToken, ByteLit, CharLit};
+
+        let file_id = sai_vfs::FileId::new(2);
+        let source_file = Arc::new(
+            SourceFile::decode(
+                file_id,
+                b"fn literals() {\nlet invalid_utf8_char = '\xff'\nlet invalid_utf8_byte = b'\xff'\n}\n",
+            )
+            .expect("decoded source"),
+        );
+        let snapshot_file = SnapshotFile::new(
+            source_file.clone(),
+            "src/main.sai",
+            Some("sai:test@0.1.0".to_owned()),
+            None,
+        );
+        let snapshot = WorkspaceSnapshot::new([snapshot_file.clone()]).expect("snapshot");
+        let lexed = crate::lex(&snapshot, file_id).expect("lexed source");
+        let source = source_file.text();
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid token stream");
+        parser
+            .parse_source_file()
+            .expect("supported source grammar");
+        let events = parser.into_events().expect("complete source event stream");
+        let mut cache = NodeCache::new();
+        let output = build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+            .expect("source tree builds");
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut char_literal = None;
+        let mut byte_literal = None;
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                let crate::SyntaxElement::Token(token) = element else {
+                    continue;
+                };
+                if char_literal.is_none() {
+                    char_literal = CharLit::cast(token.clone());
+                }
+                if byte_literal.is_none() {
+                    byte_literal = ByteLit::cast(token);
+                }
+            }
+        }
+        let char_literal = char_literal.expect("character token is retained");
+        let byte_literal = byte_literal.expect("byte token is retained");
+
+        assert!(char_literal.syntax().has_error());
+        assert_eq!(char_literal.value(), '\u{fffd}');
+        assert!(byte_literal.syntax().has_error());
+        assert_eq!(byte_literal.value(), 0);
+    }
+
+    #[test]
     fn property_parameter_attributes_report_invalid_target_inside_param() {
         let source = "property \"attributed\" (@allow(unused) value: U32) {}\n";
         let output = parse_file(source);
