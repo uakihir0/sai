@@ -1,10 +1,12 @@
+use crate::literals::Lit;
+use crate::patterns::{Pat, PatArg};
 use crate::types::{
     Bound, EffectRef, GenericArg, GenericArgs, GenericParam, Generics, Name, Path, PathSegment,
     Provenance, Ty, WherePred,
 };
 use sai_intern::Arena;
 
-/// Stable storage for HIR type nodes and their borrowed child lists.
+/// Stable storage for HIR type and pattern nodes and their borrowed child lists.
 pub struct HirArena<'hir> {
     tys: Arena<Ty<'hir>>,
     ty_lists: Arena<Ty<'hir>>,
@@ -25,6 +27,12 @@ pub struct HirArena<'hir> {
     provenances: Arena<Provenance<'hir>>,
     provenance_lists: Arena<Provenance<'hir>>,
     name_lists: Arena<Name>,
+    literals: Arena<Lit<'hir>>,
+    byte_strings: Arena<u8>,
+    pats: Arena<Pat<'hir>>,
+    pat_lists: Arena<Pat<'hir>>,
+    pat_args: Arena<PatArg<'hir>>,
+    pat_arg_lists: Arena<PatArg<'hir>>,
 }
 
 impl<'hir> HirArena<'hir> {
@@ -49,6 +57,12 @@ impl<'hir> HirArena<'hir> {
             provenances: Arena::new(),
             provenance_lists: Arena::new(),
             name_lists: Arena::new(),
+            literals: Arena::new(),
+            byte_strings: Arena::new(),
+            pats: Arena::new(),
+            pat_lists: Arena::new(),
+            pat_args: Arena::new(),
+            pat_arg_lists: Arena::new(),
         }
     }
 
@@ -139,6 +153,30 @@ impl<'hir> HirArena<'hir> {
     pub fn alloc_names(&'hir self, names: &[Name]) -> &'hir [Name] {
         self.name_lists.alloc_slice(names)
     }
+
+    pub fn alloc_lit(&'hir self, literal: Lit<'hir>) -> &'hir Lit<'hir> {
+        self.literals.alloc(literal)
+    }
+
+    pub fn alloc_bytes(&'hir self, bytes: &[u8]) -> &'hir [u8] {
+        self.byte_strings.alloc_slice(bytes)
+    }
+
+    pub fn alloc_pat(&'hir self, pat: Pat<'hir>) -> &'hir Pat<'hir> {
+        self.pats.alloc(pat)
+    }
+
+    pub fn alloc_pats(&'hir self, pats: &[Pat<'hir>]) -> &'hir [Pat<'hir>] {
+        self.pat_lists.alloc_slice(pats)
+    }
+
+    pub fn alloc_pat_arg(&'hir self, arg: PatArg<'hir>) -> &'hir PatArg<'hir> {
+        self.pat_args.alloc(arg)
+    }
+
+    pub fn alloc_pat_args(&'hir self, args: &[PatArg<'hir>]) -> &'hir [PatArg<'hir>] {
+        self.pat_arg_lists.alloc_slice(args)
+    }
 }
 
 impl Default for HirArena<'_> {
@@ -150,6 +188,7 @@ impl Default for HirArena<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patterns::PatKind;
     use crate::types::{
         BoundKind, ConstArg, FnTraitKind, GenericArg, GenericParamKind, LangItem, PathRoot, TyKind,
     };
@@ -286,5 +325,26 @@ mod tests {
         assert_eq!(generics.where_preds.len(), 1);
         assert_eq!(effects[0].segments, &[option_name]);
         assert_eq!(provenances[0].fields, &[option_name]);
+    }
+
+    #[test]
+    fn arena_stores_pattern_nodes_and_byte_string_payloads() {
+        let arena = HirArena::new();
+        let hir_id = test_hir_id();
+        let bytes = arena.alloc_bytes(&[0, 255, 128]);
+        let literal = arena.alloc_lit(Lit::ByteStr(bytes));
+        let pattern = arena.alloc_pat(Pat {
+            hir_id,
+            kind: PatKind::Lit(*literal),
+            span: span(0),
+        });
+        let patterns = arena.alloc_pats(&[*pattern]);
+
+        for value in 0..128_u8 {
+            arena.alloc_bytes(&[value; 4]);
+        }
+
+        assert_eq!(patterns[0].kind, PatKind::Lit(Lit::ByteStr(&[0, 255, 128])));
+        assert_eq!(bytes, &[0, 255, 128]);
     }
 }

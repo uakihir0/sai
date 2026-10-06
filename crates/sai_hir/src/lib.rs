@@ -3,6 +3,8 @@
 pub mod arena;
 pub mod attrs;
 pub mod item_tree;
+pub mod literals;
+pub mod patterns;
 pub mod source_map;
 pub mod types;
 

@@ -1371,7 +1371,7 @@ Expressions, statements, patterns, and types:
 ```rust
 pub struct Expr<'hir> { pub hir_id: HirId, pub kind: ExprKind<'hir>, pub span: Span }
 pub enum ExprKind<'hir> {
-    Lit(Lit),
+    Lit(Lit<'hir>),
     Path(Path<'hir>),                                     // one segment; `self` is PathRoot::SelfValue, `Self` is PathRoot::SelfType
     ImplicitMember(Name),                                 // `.Variant`; resolved against the expected type (impl/03)
     Field { base: &'hir Expr<'hir>, name: Name, args: Option<&'hir GenericArgs<'hir>> },   // `a.b`, unresolved meaning
@@ -1402,7 +1402,7 @@ pub enum ExprKind<'hir> {
     AsCast { operand: &'hir Expr<'hir>, ty: &'hir Ty<'hir> },   // `CAST_EXPR`; always `NO_AS_CAST` (impl/03 §3.10.3)
     Err,
 }
-pub enum Lit { Int { value: Option<u128>, negated: bool }, Float { text: Symbol, negated: bool }, Str(Symbol), ByteStr(Arc<[u8]>), Char(char), Byte(u8), Bool(bool) }
+pub enum Lit<'hir> { Int { value: Option<u128>, negated: bool }, Float { text: Symbol, negated: bool }, Str(Symbol), ByteStr(&'hir [u8]), Char(char), Byte(u8), Bool(bool) }
 pub struct Arg<'hir> { pub name: Option<Name>, pub expr: &'hir Expr<'hir> }      // record punning is decided by impl/03
 pub enum UnOp { Neg, BitNot, Not, Deref }
 pub enum BinOp { Add, Sub, Mul, Div, Rem, WrapAdd, WrapSub, WrapMul, BitAnd, BitOr, BitXor, Shl, Shr, Eq, Ne, Lt, Le, Gt, Ge, And, Or }
@@ -1430,7 +1430,7 @@ pub struct Pat<'hir> { pub hir_id: HirId, pub kind: PatKind<'hir>, pub span: Spa
 pub enum PatKind<'hir> {
     Wild,
     Binding { mode: BindingMode, name: Name, binding: BindingId, sub: Option<&'hir Pat<'hir>> },   // `sub` for `x @ p`
-    Lit(Lit),
+    Lit(Lit<'hir>),
     Range { start: Option<PatRangeEnd<'hir>>, end: Option<PatRangeEnd<'hir>>, inclusive: bool },
     Tuple(&'hir [Pat<'hir>]),
     Slice { before: &'hir [Pat<'hir>], rest: Option<Option<&'hir Pat<'hir>>>, after: &'hir [Pat<'hir>] },
@@ -1441,7 +1441,7 @@ pub enum PatKind<'hir> {
 }
 pub enum BindingMode { Value, Var, Borrow, BorrowMut }
 pub struct PatArg<'hir> { pub name: Option<Name>, pub pat: &'hir Pat<'hir> }   // record punning is decided by impl/03
-pub enum PatRangeEnd<'hir> { Lit(Lit), Path(Path<'hir>) }
+pub enum PatRangeEnd<'hir> { Lit(Lit<'hir>), Path(Path<'hir>) }
 
 pub struct Ty<'hir> { pub hir_id: HirId, pub kind: TyKind<'hir>, pub span: Span }
 pub enum TyKind<'hir> {
@@ -1461,7 +1461,7 @@ pub enum GenericArg<'hir> { Type(&'hir Ty<'hir>), Const(ConstArg), Binding { nam
 pub enum ConstArg { Int { value: Option<u128>, negated: bool }, Char(char), Bool(bool) }
 ```
 
-**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `Name`, `Ty`, `Path`, `GenericArgs`, and `Bound` compare and hash their semantic contents while excluding source spans, so moving syntax does not change their value equality. The records are `Copy` and borrow child nodes and lists; `sai_intern::Arena::alloc_slice` provides stable storage for copied lists, and `sai_hir::arena::HirArena` groups typed arenas for these nodes and lists. `HirOwner` does not yet own this arena. Item, function, expression, pattern, body structures, and syntax-to-HIR lowering remain follow-up work.
+**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `sai_hir::literals` and `sai_hir::patterns` define decoded HIR literals and the complete pattern node family. `Name`, `Ty`, `Path`, `GenericArgs`, `Bound`, and `Pat` compare and hash their semantic contents while excluding source spans, so moving syntax does not change their value equality. The records are `Copy` and borrow child nodes and lists; `sai_intern::Arena::alloc_slice` provides stable storage for copied lists, and the session-owned `sai_hir::arena::HirArena` groups typed arenas for type, pattern, and literal data. Item, function, expression, body structures, and syntax-to-HIR lowering remain follow-up work.
 
 Notes on the shape:
 
