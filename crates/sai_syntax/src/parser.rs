@@ -3058,6 +3058,41 @@ mod tests {
     }
 
     #[test]
+    fn prefix_expression_operator_roles_cover_all_operators() {
+        use crate::ast::{AstNode, PrefixExpr, PrefixOp};
+
+        let cases = [
+            ("-value", "-", PrefixOp::Neg),
+            ("~value", "~", PrefixOp::BitNot),
+            ("*value", "*", PrefixOp::Deref),
+            ("borrow value", "borrow", PrefixOp::Borrow),
+            ("borrow mut value", "borrow", PrefixOp::BorrowMut),
+            ("not value", "not", PrefixOp::Not),
+        ];
+        let source = format!(
+            "fn prefixes() {{\n{}\n}}\n",
+            cases
+                .iter()
+                .map(|(expression, _, _)| expression.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let output = parse_file(&source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let prefixes = root
+            .descendants()
+            .filter_map(PrefixExpr::cast)
+            .map(|expression| expression.op().expect("prefix operator"))
+            .collect::<Vec<_>>();
+        assert_eq!(prefixes.len(), cases.len());
+        for ((token, op), (_, text, expected)) in prefixes.iter().zip(cases) {
+            assert_eq!(token.text(), text);
+            assert_eq!(*op, expected);
+        }
+    }
+
+    #[test]
     fn generated_function_and_statement_roles_follow_parsed_children() {
         use crate::ast::{AstNode, Item, Stmt};
 

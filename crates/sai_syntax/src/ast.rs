@@ -669,6 +669,16 @@ impl AssignOp {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PrefixOp {
+    Neg,
+    BitNot,
+    Deref,
+    Borrow,
+    BorrowMut,
+    Not,
+}
+
 impl IntLit {
     pub fn value(&self) -> Option<u128> {
         if self.syntax().has_error() {
@@ -1094,6 +1104,35 @@ impl AssignStmt {
             ],
         )?;
         let op = AssignOp::from_syntax_kind(token.kind())?;
+        Some((token, op))
+    }
+}
+
+impl PrefixExpr {
+    pub fn op(&self) -> Option<(SyntaxToken, PrefixOp)> {
+        let token = direct_token_of_kinds(
+            self.syntax(),
+            &[
+                SyntaxKind::MINUS,
+                SyntaxKind::TILDE,
+                SyntaxKind::STAR,
+                SyntaxKind::BORROW_KW,
+                SyntaxKind::NOT_KW,
+            ],
+        )?;
+        let op = match token.kind() {
+            SyntaxKind::MINUS => PrefixOp::Neg,
+            SyntaxKind::TILDE => PrefixOp::BitNot,
+            SyntaxKind::STAR => PrefixOp::Deref,
+            SyntaxKind::BORROW_KW
+                if direct_token_of_kind(self.syntax(), SyntaxKind::MUT_KW).is_some() =>
+            {
+                PrefixOp::BorrowMut
+            }
+            SyntaxKind::BORROW_KW => PrefixOp::Borrow,
+            SyntaxKind::NOT_KW => PrefixOp::Not,
+            _ => return None,
+        };
         Some((token, op))
     }
 }
