@@ -629,6 +629,46 @@ impl BinOp {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AssignOp {
+    Set,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    WrappingAdd,
+    WrappingSub,
+    WrappingMul,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+}
+
+impl AssignOp {
+    fn from_syntax_kind(kind: SyntaxKind) -> Option<Self> {
+        Some(match kind {
+            SyntaxKind::EQ => Self::Set,
+            SyntaxKind::PLUS_EQ => Self::Add,
+            SyntaxKind::MINUS_EQ => Self::Sub,
+            SyntaxKind::STAR_EQ => Self::Mul,
+            SyntaxKind::SLASH_EQ => Self::Div,
+            SyntaxKind::PERCENT_EQ => Self::Rem,
+            SyntaxKind::PLUS_PERCENT_EQ => Self::WrappingAdd,
+            SyntaxKind::MINUS_PERCENT_EQ => Self::WrappingSub,
+            SyntaxKind::STAR_PERCENT_EQ => Self::WrappingMul,
+            SyntaxKind::AMP_EQ => Self::BitAnd,
+            SyntaxKind::PIPE_EQ => Self::BitOr,
+            SyntaxKind::CARET_EQ => Self::BitXor,
+            SyntaxKind::SHL_EQ => Self::Shl,
+            SyntaxKind::SHR_EQ => Self::Shr,
+            _ => return None,
+        })
+    }
+}
+
 impl IntLit {
     pub fn value(&self) -> Option<u128> {
         if self.syntax().has_error() {
@@ -1028,6 +1068,32 @@ impl BinExpr {
             ],
         )?;
         let op = BinOp::from_syntax_kind(token.kind())?;
+        Some((token, op))
+    }
+}
+
+impl AssignStmt {
+    pub fn op(&self) -> Option<(SyntaxToken, AssignOp)> {
+        let token = direct_token_of_kinds(
+            self.syntax(),
+            &[
+                SyntaxKind::EQ,
+                SyntaxKind::PLUS_EQ,
+                SyntaxKind::MINUS_EQ,
+                SyntaxKind::STAR_EQ,
+                SyntaxKind::SLASH_EQ,
+                SyntaxKind::PERCENT_EQ,
+                SyntaxKind::PLUS_PERCENT_EQ,
+                SyntaxKind::MINUS_PERCENT_EQ,
+                SyntaxKind::STAR_PERCENT_EQ,
+                SyntaxKind::AMP_EQ,
+                SyntaxKind::PIPE_EQ,
+                SyntaxKind::CARET_EQ,
+                SyntaxKind::SHL_EQ,
+                SyntaxKind::SHR_EQ,
+            ],
+        )?;
+        let op = AssignOp::from_syntax_kind(token.kind())?;
         Some((token, op))
     }
 }

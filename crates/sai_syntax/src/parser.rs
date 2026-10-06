@@ -3015,6 +3015,49 @@ mod tests {
     }
 
     #[test]
+    fn assignment_statement_operator_roles_cover_all_operators() {
+        use crate::ast::{AssignOp, AssignStmt, AstNode};
+
+        let cases = [
+            ("=", AssignOp::Set),
+            ("+=", AssignOp::Add),
+            ("-=", AssignOp::Sub),
+            ("*=", AssignOp::Mul),
+            ("/=", AssignOp::Div),
+            ("%=", AssignOp::Rem),
+            ("+%=", AssignOp::WrappingAdd),
+            ("-%=", AssignOp::WrappingSub),
+            ("*%=", AssignOp::WrappingMul),
+            ("&=", AssignOp::BitAnd),
+            ("|=", AssignOp::BitOr),
+            ("^=", AssignOp::BitXor),
+            ("<<=", AssignOp::Shl),
+            (">>=", AssignOp::Shr),
+        ];
+        let source = format!(
+            "fn assignments() {{\n{}\n}}\n",
+            cases
+                .iter()
+                .map(|(operator, _)| format!("place {operator} value"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let output = parse_file(&source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let assignments = root
+            .descendants()
+            .filter_map(AssignStmt::cast)
+            .map(|statement| statement.op().expect("assignment operator"))
+            .collect::<Vec<_>>();
+        assert_eq!(assignments.len(), cases.len());
+        for ((token, op), (text, expected)) in assignments.iter().zip(cases) {
+            assert_eq!(token.text(), text);
+            assert_eq!(*op, expected);
+        }
+    }
+
+    #[test]
     fn generated_function_and_statement_roles_follow_parsed_children() {
         use crate::ast::{AstNode, Item, Stmt};
 
