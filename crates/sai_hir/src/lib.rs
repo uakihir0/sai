@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod attrs;
 pub mod item_tree;
 
 use std::collections::HashMap;

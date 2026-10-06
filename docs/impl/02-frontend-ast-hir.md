@@ -1796,14 +1796,31 @@ Every field holds the first valid occurrence; the span is kept so that later sta
 | attributes that exclude each other | `CONFLICTING_ATTRIBUTES` (spec/15) | `@cold` with `@inline` |
 | a derive name is one of the fixed names | `UNKNOWN_DERIVE` (spec/05) | `@derive(Debug)` |
 
-A failed check drops that attribute (or argument) from `ValidatedAttrs`; the remaining attributes are still validated. The set of allowed targets, the argument grammar of each attribute, and the exclusion pairs are those of spec/15, encoded in a static table `ATTR_SCHEMAS: [AttrSchema; 17]` indexed by `AttrName`:
+A failed check drops that attribute (or argument) from `ValidatedAttrs`; the remaining attributes are still validated. The set of allowed targets, the argument grammar of each attribute, the exclusion pairs, and the special target cases are those of spec/15, encoded in a static `ATTRIBUTE_SCHEMAS: [AttrSchema; 17]` table indexed by `AttrName`:
 
 ```rust
 pub struct AttrSchema {
-    pub targets: TargetKindSet,                // bit set over TargetKind (below)
-    pub args: ArgGrammar,                      // None, Word(&[&str]), Str, Int, CodeList, DeriveList, Repr, Target, Deprecated
+    pub name: AttrName,
+    pub stage: u8,
+    pub targets: &'static [TargetRule],
+    pub args: ArgGrammar,
     pub repeatable: bool,                      // true only for Allow, Warn, Deny
-    pub conflicts: &'static [AttrName],
+    pub conflicts: &'static [AttributeConflict],
+    pub special_target_cases: &'static [SpecialTargetCase],
+}
+pub struct TargetRule { pub kind: TargetKind, pub condition: TargetCondition }
+pub enum TargetCondition {
+    Any, ModuleLevel, HasBody, IsExported, InherentImpl,
+    ExternWasmOrUnsafeC, ExternWasm, InsideInterface, TraitDeclaration,
+}
+pub enum ArgGrammar {
+    None, DeriveList, Inline, OptionalNonEmptyString, Deprecated, LintCodes, NonEmptyString,
+    Repr, TargetPredicate, IntegerRange { min: u64, max: u64 }, Word(&'static str),
+}
+pub struct AttributeConflict { pub other: AttrName, pub condition: ConflictCondition }
+pub enum ConflictCondition { Always, InlineIsHint }
+pub enum SpecialTargetCase {
+    DeriveOnResource, ReprInsideInterface, FlagsOutsideInterface,
 }
 pub enum TargetKind {
     Fn, TraitFn, ImplFn, ExternFn, InterfaceFn, Record, Enum, Distinct, Refined, Alias, Resource, Trait, Impl,
@@ -1811,9 +1828,11 @@ pub enum TargetKind {
 }
 ```
 
+**Current implementation slice.** `sai_hir::attrs` defines all 17 schemas, the 25 target kinds, argument grammar categories, context conditions, special target cases, repeatability, and conditional conflicts. The context conditions preserve restrictions such as trait functions requiring a body for `@inline`, `@export_name` requiring an exported function, and import-name attributes requiring an allowed extern ABI. The special cases encode the distinct diagnostics for `@derive` on a resource, `@repr` inside an interface, and `@flags` outside an interface. Validation and diagnostic construction are the next implementation step.
+
 `@derive` names are matched textually against the fixed list of spec/05 §5.12.1 and are never resolved in scope; lowering maps them to `LangItem`s for the `DerivedImpl` owners of §2.9.17. Whether a valid name is derivable for the declaration kind is a semantic check (`DERIVE_NOT_SUPPORTED`, §2.10.4).
 
-Lint-level attributes are validated here only for shape: each argument MUST be a `Word` whose text is an UPPER_SNAKE code or group name. Whether the name is a known lint (`UNKNOWN_LINT`), a hard error (`NOT_A_LINT`), or conflicts with another level on the same node (`CONFLICTING_LINT_LEVEL`) is decided against the lint registry of impl/11 by the query `lint_levels(OwnerId)`, which builds a tree of `(span, LintAttr)` scopes for the owner from its own `lint_levels` and those of its enclosing items. The precedence of levels is owned by spec/15, and its application to diagnostics by impl/11.
+Lint-level attributes are validated here only for shape: each argument MUST be a plain `Word` whose text is an UPPER_SNAKE lint code. Groups and wildcards are not accepted (§15.15.5). Whether the name is a known lint (`UNKNOWN_LINT`), a hard error (`NOT_A_LINT`), or conflicts with another level on the same node (`CONFLICTING_LINT_LEVEL`) is decided against the lint registry of impl/11 by the query `lint_levels(OwnerId)`, which builds a tree of `(span, LintAttr)` scopes for the owner from its own `lint_levels` and those of its enclosing items. The precedence of levels is owned by spec/15, and its application to diagnostics by impl/11.
 
 **`@target` and item collection.** `@target` is the only attribute that changes which items exist. Its predicate is decoded from the item tree's `RawAttr` without a `DefId` (the decoding function is shared with the `attrs` query, so the diagnostics are identical) and evaluated during item collection against the target of the build (impl/03 §3.3.1). An item whose predicate is false is not collected: it gets no `DefId`, no HIR owner, and no diagnostics beyond those of parsing (§2.10.1), because it does not exist for this build. The CST keeps it, so the formatter and semantic tooling still see it.
 
