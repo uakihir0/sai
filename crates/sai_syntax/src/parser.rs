@@ -2956,6 +2956,65 @@ mod tests {
     }
 
     #[test]
+    fn binary_expression_operator_roles_cover_all_operators() {
+        use crate::ast::{AstNode, BinExpr, BinOp};
+
+        let cases = [
+            ("or", BinOp::Or),
+            ("and", BinOp::And),
+            ("==", BinOp::Eq),
+            ("!=", BinOp::Ne),
+            ("<", BinOp::Lt),
+            ("<=", BinOp::Le),
+            (">", BinOp::Gt),
+            (">=", BinOp::Ge),
+            ("|", BinOp::BitOr),
+            ("^", BinOp::BitXor),
+            ("&", BinOp::BitAnd),
+            ("<<", BinOp::Shl),
+            (">>", BinOp::Shr),
+            ("+", BinOp::Add),
+            ("-", BinOp::Sub),
+            ("+%", BinOp::WrappingAdd),
+            ("-%", BinOp::WrappingSub),
+            ("*", BinOp::Mul),
+            ("/", BinOp::Div),
+            ("%", BinOp::Rem),
+            ("*%", BinOp::WrappingMul),
+            ("||", BinOp::Or),
+            ("&&", BinOp::And),
+        ];
+        let source = format!(
+            "fn operators() {{\n{}\n}}\n",
+            cases
+                .iter()
+                .map(|(operator, _)| format!("left {operator} right"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let output = parse_file(&source);
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::UseAndOr, Code::UseAndOr]
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let binary = root
+            .descendants()
+            .filter_map(BinExpr::cast)
+            .map(|expression| expression.op().expect("binary operator"))
+            .collect::<Vec<_>>();
+        assert_eq!(binary.len(), cases.len());
+        for ((token, op), (text, expected)) in binary.iter().zip(cases) {
+            assert_eq!(token.text(), text);
+            assert_eq!(*op, expected);
+        }
+    }
+
+    #[test]
     fn generated_function_and_statement_roles_follow_parsed_children() {
         use crate::ast::{AstNode, Item, Stmt};
 

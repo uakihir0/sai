@@ -575,6 +575,60 @@ pub enum FStringPiece<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BinOp {
+    Or,
+    And,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    BitOr,
+    BitXor,
+    BitAnd,
+    Shl,
+    Shr,
+    Add,
+    Sub,
+    WrappingAdd,
+    WrappingSub,
+    Mul,
+    Div,
+    Rem,
+    WrappingMul,
+}
+
+impl BinOp {
+    fn from_syntax_kind(kind: SyntaxKind) -> Option<Self> {
+        Some(match kind {
+            SyntaxKind::OR_KW | SyntaxKind::PIPE2 => Self::Or,
+            SyntaxKind::AND_KW | SyntaxKind::AMP2 => Self::And,
+            SyntaxKind::EQ2 => Self::Eq,
+            SyntaxKind::NEQ => Self::Ne,
+            SyntaxKind::LT => Self::Lt,
+            SyntaxKind::LE => Self::Le,
+            SyntaxKind::GT => Self::Gt,
+            SyntaxKind::GE => Self::Ge,
+            SyntaxKind::PIPE => Self::BitOr,
+            SyntaxKind::CARET => Self::BitXor,
+            SyntaxKind::AMP => Self::BitAnd,
+            SyntaxKind::SHL => Self::Shl,
+            SyntaxKind::SHR => Self::Shr,
+            SyntaxKind::PLUS => Self::Add,
+            SyntaxKind::MINUS => Self::Sub,
+            SyntaxKind::PLUS_PERCENT => Self::WrappingAdd,
+            SyntaxKind::MINUS_PERCENT => Self::WrappingSub,
+            SyntaxKind::STAR => Self::Mul,
+            SyntaxKind::SLASH => Self::Div,
+            SyntaxKind::PERCENT => Self::Rem,
+            SyntaxKind::STAR_PERCENT => Self::WrappingMul,
+            _ => return None,
+        })
+    }
+}
+
 impl IntLit {
     pub fn value(&self) -> Option<u128> {
         if self.syntax().has_error() {
@@ -941,6 +995,41 @@ fn direct_token_of_kinds(node: &SyntaxNode, kinds: &[SyntaxKind]) -> Option<Synt
             SyntaxElement::Token(token) if kinds.contains(&token.kind()) => Some(token),
             SyntaxElement::Node(_) | SyntaxElement::Token(_) => None,
         })
+}
+
+impl BinExpr {
+    pub fn op(&self) -> Option<(SyntaxToken, BinOp)> {
+        let token = direct_token_of_kinds(
+            self.syntax(),
+            &[
+                SyntaxKind::OR_KW,
+                SyntaxKind::AND_KW,
+                SyntaxKind::EQ2,
+                SyntaxKind::NEQ,
+                SyntaxKind::LT,
+                SyntaxKind::LE,
+                SyntaxKind::GT,
+                SyntaxKind::GE,
+                SyntaxKind::PIPE,
+                SyntaxKind::PIPE2,
+                SyntaxKind::CARET,
+                SyntaxKind::AMP,
+                SyntaxKind::AMP2,
+                SyntaxKind::SHL,
+                SyntaxKind::SHR,
+                SyntaxKind::PLUS,
+                SyntaxKind::MINUS,
+                SyntaxKind::PLUS_PERCENT,
+                SyntaxKind::MINUS_PERCENT,
+                SyntaxKind::STAR,
+                SyntaxKind::SLASH,
+                SyntaxKind::PERCENT,
+                SyntaxKind::STAR_PERCENT,
+            ],
+        )?;
+        let op = BinOp::from_syntax_kind(token.kind())?;
+        Some((token, op))
+    }
 }
 
 impl LiteralPat {
