@@ -264,6 +264,26 @@ child AssocTypeBinding name NameRef 0
 child AssocTypeBinding ty Type 0
 children_before FnPtrType params Type THIN_ARROW
 child_after FnPtrType ret_type Type THIN_ARROW 0
+children OrPat alternatives Pattern
+child_before AtPat binding BindingPat AT 0
+child_after AtPat pattern Pattern AT 0
+child BindingPat mode BindingMode 0
+child BindingPat name Name 0
+children TuplePat elements Pattern
+child ParenPat pattern Pattern 0
+children SlicePat elements Pattern
+children SlicePat rest_patterns RestPat
+child RestPat binding BindingPat 0
+child CtorPat path ConstPath 0
+child CtorPat args CtorPatArgs 0
+children CtorPatArgs positional_patterns Pattern
+children CtorPatArgs named_args NamedPatArg
+children CtorPatArgs rest_patterns RestPat
+child NamedPatArg name NameRef 0
+child NamedPatArg pattern Pattern 0
+child ImplicitMemberPat name NameRef 0
+child ImplicitMemberPat args CtorPatArgs 0
+children ConstPath segments NameRef
 child CastExpr expression Expr 0
 child CastExpr ty Type 0
 child BinExpr lhs Expr 0

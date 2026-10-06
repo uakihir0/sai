@@ -2888,6 +2888,137 @@ mod tests {
     }
 
     #[test]
+    fn generated_pattern_roles_follow_parsed_children() {
+        use crate::ast::{
+            AstNode, AtPat, BindingPat, ConstPath, CtorPat, ImplicitMemberPat, NamedPatArg, OrPat,
+            ParenPat, SlicePat, TuplePat,
+        };
+
+        let source = concat!(
+            "fn patterns() {\n",
+            "let (a, borrow mut b, var c,) = tuple\n",
+            "let named @ User(id: var value, ..) = user\n",
+            "let | .Some(x) | pkg.http.Status.Ok = result\n",
+            "let (grouped) = value\n",
+            "let () = unit\n",
+            "let [first, ..borrow rest, last] = values\n",
+            "let Pair(positional, field: named, ..) = pair\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let tuple = root
+            .descendants()
+            .filter_map(TuplePat::cast)
+            .find(|pattern| pattern.elements().count() == 3)
+            .expect("tuple pattern");
+        assert_eq!(tuple.elements().count(), 3);
+
+        let parenthesized = root
+            .descendants()
+            .find_map(ParenPat::cast)
+            .expect("parenthesized pattern");
+        assert!(parenthesized.pattern().is_some());
+
+        let at = root
+            .descendants()
+            .find_map(AtPat::cast)
+            .expect("at pattern");
+        assert!(at.binding().is_some());
+        assert!(at.pattern().is_some());
+
+        let bindings = root
+            .descendants()
+            .filter_map(BindingPat::cast)
+            .collect::<Vec<_>>();
+        assert!(bindings.iter().all(|binding| binding.name().is_some()));
+        assert!(bindings.iter().any(|binding| binding.mode().is_some()));
+
+        let alternatives = root
+            .descendants()
+            .find_map(OrPat::cast)
+            .expect("or pattern")
+            .alternatives()
+            .collect::<Vec<_>>();
+        assert_eq!(alternatives.len(), 2);
+
+        let slice = root
+            .descendants()
+            .find_map(SlicePat::cast)
+            .expect("slice pattern");
+        assert_eq!(slice.elements().count(), 2);
+        let slice_rest = slice.rest_patterns().next().expect("slice rest pattern");
+        assert!(
+            slice_rest
+                .binding()
+                .is_some_and(|binding| binding.mode().is_some() && binding.name().is_some())
+        );
+
+        let constructor = root
+            .descendants()
+            .filter_map(CtorPat::cast)
+            .find(|pattern| {
+                pattern
+                    .args()
+                    .is_some_and(|args| args.positional_patterns().count() == 1)
+            })
+            .expect("constructor pattern");
+        assert!(constructor.path().is_some());
+        let args = constructor.args().expect("constructor pattern arguments");
+        assert_eq!(args.positional_patterns().count(), 1);
+        let named_args = args.named_args().collect::<Vec<NamedPatArg>>();
+        assert_eq!(named_args.len(), 1);
+        assert!(named_args[0].name().is_some());
+        assert!(named_args[0].pattern().is_some());
+        let constructor_rest = args.rest_patterns().next().expect("constructor rest");
+        assert!(constructor_rest.binding().is_none());
+
+        let implicit_member = root
+            .descendants()
+            .filter_map(ImplicitMemberPat::cast)
+            .find(|pattern| pattern.args().is_some())
+            .expect("implicit member pattern");
+        assert!(implicit_member.name().is_some());
+        assert_eq!(
+            implicit_member
+                .args()
+                .expect("implicit member arguments")
+                .positional_patterns()
+                .count(),
+            1
+        );
+
+        let qualified_path = root
+            .descendants()
+            .filter_map(ConstPath::cast)
+            .find(|path| path.segments().count() > 1)
+            .expect("qualified constant path");
+        assert_eq!(qualified_path.segments().count(), 4);
+
+        let malformed_at = parse_file("fn broken() { let named @ = source }\n");
+        assert!(!malformed_at.errors.is_empty());
+        let malformed_root = crate::SyntaxNode::new_root(malformed_at.root);
+        let malformed_at = malformed_root
+            .descendants()
+            .find_map(AtPat::cast)
+            .expect("recovered at pattern");
+        assert!(malformed_at.binding().is_some());
+        assert!(malformed_at.pattern().is_none());
+
+        let empty_slice = parse_file("fn empty() { let [] = values }\n");
+        assert!(empty_slice.errors.is_empty(), "{:?}", empty_slice.errors);
+        let empty_slice_root = crate::SyntaxNode::new_root(empty_slice.root);
+        let empty_slice = empty_slice_root
+            .descendants()
+            .find_map(SlicePat::cast)
+            .expect("empty slice pattern");
+        assert_eq!(empty_slice.elements().count(), 0);
+        assert_eq!(empty_slice.rest_patterns().count(), 0);
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,
