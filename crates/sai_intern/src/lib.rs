@@ -49,6 +49,19 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    /// Sentinel for a missing or already-diagnosed name.
+    ///
+    /// It is not owned by an interner session and cannot be resolved. The
+    /// maximum `u32` index is reserved so a source symbol can never alias it.
+    pub const ERROR: Self = Self {
+        index: u32::MAX,
+        session_id: InternerSessionId(0),
+    };
+
+    pub const fn is_error(self) -> bool {
+        self.index == u32::MAX && self.session_id.0 == 0
+    }
+
     pub const fn raw(self) -> u32 {
         self.index
     }
@@ -60,7 +73,11 @@ impl Symbol {
 
 impl std::fmt::Debug for Symbol {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_tuple("Symbol").field(&self.index).finish()
+        if self.is_error() {
+            formatter.write_str("Symbol::ERROR")
+        } else {
+            formatter.debug_tuple("Symbol").field(&self.index).finish()
+        }
     }
 }
 
@@ -222,7 +239,7 @@ impl Interner {
         }
 
         let mut next_id = self.next_id.lock().map_err(|_| InternError::LockPoisoned)?;
-        if *next_id > u32::MAX as u64 {
+        if *next_id >= u32::MAX as u64 {
             return Err(InternError::TooManySymbols);
         }
         let raw = u32::try_from(*next_id).map_err(|_| InternError::TooManySymbols)?;
@@ -240,7 +257,7 @@ impl Interner {
     }
 
     pub fn resolve(&self, symbol: Symbol) -> Result<Arc<str>, LookupError> {
-        if symbol.session_id != self.session_id {
+        if symbol.is_error() || symbol.session_id != self.session_id {
             return Err(LookupError::UnknownSymbol);
         }
         self.values
@@ -637,6 +654,25 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(&*interner.resolve(first).expect("symbol exists"), "sai");
         assert_eq!(interner.len(), Ok(1));
+    }
+
+    #[test]
+    fn error_symbol_is_a_non_resolvable_sentinel() {
+        let first = Interner::new();
+        let second = Interner::new();
+        let symbol = first.intern("sai").expect("intern succeeds");
+
+        assert!(Symbol::ERROR.is_error());
+        assert_ne!(Symbol::ERROR, symbol);
+        assert_eq!(
+            first.resolve(Symbol::ERROR),
+            Err(LookupError::UnknownSymbol)
+        );
+        assert_eq!(
+            second.resolve(Symbol::ERROR),
+            Err(LookupError::UnknownSymbol)
+        );
+        assert_eq!(format!("{:?}", Symbol::ERROR), "Symbol::ERROR");
     }
 
     #[test]

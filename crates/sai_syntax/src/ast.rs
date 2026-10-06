@@ -185,6 +185,14 @@ impl AstIdMap {
         })
     }
 
+    pub fn matches_root(&self, file: FileId, root: &SyntaxNode) -> bool {
+        self.file == file
+            && root.belongs_to_file(file)
+            && root.kind() == SyntaxKind::SOURCE_FILE
+            && root.parent().is_none()
+            && self.identity == root.root_identity()
+    }
+
     pub const fn file(&self) -> FileId {
         self.file
     }

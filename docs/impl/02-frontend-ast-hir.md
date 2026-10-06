@@ -1186,6 +1186,8 @@ The canonical package key is encoded first as a length-prefixed UTF-8 string. Th
 
 Every component ends with its little-endian `u32` disambiguator. `Impl` encodes its little-endian `u64` header hash before that value. `ExternBlock` encodes its ABI string, a one-byte module-presence flag, and the optional module string. `WorldItem` encodes a one-byte import flag before its name. Components with no string or hash payload encode only their tag and disambiguator. These tag assignments are persistent format and MUST NOT be reused or renumbered.
 
+`Symbol::ERROR` is not a source string. In a symbol payload position, it is encoded as the length `u64::MAX` with no following bytes; no Rust string can have that byte length, so this cannot alias a real symbol. The sentinel is accepted only for an already-diagnosed or missing name.
+
 **`DefIndex` assignment.** `LocalDefId`s are interned from `DefPath`s by the query system, so a definition keeps its `LocalDefId` across revisions as long as its `DefPath` exists. Foreign `DefId`s are read from the dependency's metadata, where definitions are numbered in ascending `DefPathHash` order.
 
 In the reference implementation, each `LocalDefId` carries its package and the identity of the package's session-local definition table in addition to its `DefIndex`. This prevents an index from one table from resolving to an unrelated definition in another table. `to_def_id()` uses the package stored in the local ID.
@@ -1479,28 +1481,36 @@ The query `def_collector(FileId) -> ItemTree` produces a summary of a file's ite
 ```rust
 pub struct ItemTree {
     pub file: FileId,
-    pub module_attrs: Vec<RawAttr>,           // from the module header (`unsafe module`, inner docs)
+    pub module_docs: Option<AstPtr<ast::Docs>>, // inner docs from the module header
     pub is_unsafe_module: bool,
     pub uses: Vec<UseEntry>,                  // one per `use` declaration, in source order
     pub items: Vec<ItemTreeEntry>,            // top-level items, in source order
 }
 pub struct UseEntry { pub ast_id: ErasedAstId, pub is_pub: bool, pub pkg_path: SmolStr, pub alias: Option<Symbol>,
-                      pub items: Vec<(Symbol, Option<Symbol>, TextRange)> }
+                      pub items: Vec<(Symbol, Option<Symbol>, TextRange)>, pub raw_attrs: Vec<RawAttr> }
 pub struct ItemTreeEntry {
     pub ast_id: ErasedAstId,
-    pub kind: ItemTreeKind,                   // Fn, Struct, Alias, Refined, Enum, Distinct, Resource, Trait, Impl, Const, Invariant,
-                                              // Effect, Interface, World, ExternBlock, Test, Property, TypeParam, ConstParam
+    pub kind: ItemTreeKind,                   // Function, Struct, Alias, Refined, Enum, Distinct, Resource, Trait, Impl,
+                                              // Const, Invariant, Effect, Interface, World, ExternBlock, Test, Property,
+                                              // TypeParam, ConstParam, Field, Variant, VariantField, AssocType, AssocFn,
+                                              // InterfaceFn, ExternFn, WorldItem { import }, WorldInclude
     pub name: Symbol,                         // Symbol::ERROR if missing
     pub vis: Visibility,
     pub raw_attrs: Vec<RawAttr>,
-    pub children: Vec<ItemTreeEntry>,         // fields, variants, trait/impl/interface/world/extern items, generic params
+    pub children: Vec<ItemTreeEntry>,         // direct item-like children and generic parameters, in source order
     pub header_hash: Option<u64>,             // impls only (§2.8.2)
 }
 ```
 
-`TypeParam` and `ConstParam` are the `ItemTreeKind` variants for generic-parameter children. Each generic parameter is an `ItemTreeEntry` with its own `AstId`, name, kind, and nested position in its parent's `children`.
+`TypeParam` and `ConstParam` are the `ItemTreeKind` variants for generic-parameter children. Each generic parameter is an `ItemTreeEntry` with its own `AstId`, name, kind, and nested position in its parent's `children`. Named record fields, enum variants, and named fields of record-shaped variants are also entries. Tuple-shaped members are part of the item's type/signature syntax and are not separate entries because they are not item-like AST nodes.
 
-The item tree is equal (by value) across edits that do not touch item headers, so the module tree, import resolution, and item signatures in impl/03 are not recomputed for edits inside bodies.
+Children from mixed declaration categories are kept in source order. This includes generic parameters alongside fields, variants, and associated declarations. A world function is one `WorldItem` entry whose source `AstId` belongs to its enclosing `WorldImport` or `WorldExport`; its `FnDecl` remains reachable in the CST. Uses are kept in their own source-ordered list because they do not define items.
+
+The collector stores inner module documentation separately from attributes because the grammar gives it a `DOCS` node on `MODULE_HEADER`. `UseEntry` carries raw attributes because `@target` may apply to a use declaration. An attribute's `has_error` bit records parser recovery or lexical errors even when its argument list is absent.
+
+Item-tree equality is structural within one symbol-interner session. It excludes snapshot pointers and all absolute source ranges, including nested attribute-argument spans and selected-use ranges; it compares their semantic names and values instead. Module-document source text remains part of equality. This lets edits confined to bodies preserve item-tree equality when later declarations shift in the file, while the newly collected pointers and spans remain bound to the current snapshot. The query layer must retain the newly collected value when it backdates an equal result.
+
+**Current implementation slice.** `ItemTree::collect` requires a snapshot-bound `AstIdMap` matching the supplied file root and verifies that the supplied decoded source exactly matches the root's lossless token and trivia text. It collects all current top-level declarations and nested named item-like children, in source order, and records `@impl` header hashes independently of impl bodies. It interns identifiers in NFC after the lexer reports any required `IDENT_NOT_NFC`. Only names in the closed attribute table are retained in `RawAttr`.
 
 ---
 
@@ -1733,6 +1743,7 @@ pub struct RawAttr {
     pub args: Option<Vec<RawAttrArg>>,         // None: no parentheses; Some(vec![]): `()`
     pub span: Span,                            // from `@` to the closing `)` or the name
     pub ptr: AstPtr<ast::Attribute>,
+    pub has_error: bool,                       // parser recovery or lexical error in this attribute
 }
 pub enum RawAttrArg {
     Word { name: Symbol, raw: bool, args: Option<Vec<RawAttrArg>>, span: Span },   // Ident ( '(' … ')' )?

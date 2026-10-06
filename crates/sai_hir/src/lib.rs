@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod item_tree;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -127,6 +129,9 @@ impl DefPath {
         packages.resolve(package).map_err(DefPathError::Package)?;
         for component in &data {
             for symbol in component.data.symbols().into_iter().flatten() {
+                if symbol.is_error() {
+                    continue;
+                }
                 if symbol.session_id() != symbols.session_id() {
                     return Err(DefPathError::InternerSessionMismatch);
                 }
@@ -433,6 +438,12 @@ fn write_resolved_symbol(
     symbol: Symbol,
     symbols: &Interner,
 ) -> Result<(), DefPathError> {
+    if symbol.is_error() {
+        // No Rust string can have u64::MAX bytes, so this length is a
+        // collision-free marker in the same length-prefixed string encoding.
+        hasher.write_len(u64::MAX);
+        return Ok(());
+    }
     let value = symbols.resolve(symbol).map_err(DefPathError::Symbol)?;
     write_stable_string(hasher, &value);
     Ok(())
@@ -837,6 +848,40 @@ mod tests {
             Err(DefPathError::InternerSessionMismatch)
         );
         assert_ne!(first_path, matching_ids_in_other_session);
+    }
+
+    #[test]
+    fn error_symbol_has_a_collision_free_stable_hash_encoding() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let literal_marker = symbols.intern("\0SAI_ERROR_SYMBOL\0").unwrap();
+
+        let error_path = DefPath::new(
+            package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(Symbol::ERROR),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .unwrap();
+        let literal_path = DefPath::new(
+            package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(literal_marker),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .unwrap();
+
+        assert_ne!(
+            DefPathHash::compute(&error_path, &packages, &symbols),
+            DefPathHash::compute(&literal_path, &packages, &symbols)
+        );
     }
 
     #[test]

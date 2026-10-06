@@ -18,6 +18,26 @@ use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
+pub const ATTRIBUTE_NAMES: [&str; 17] = [
+    "derive",
+    "export_name",
+    "inline",
+    "import_name",
+    "cold",
+    "repr",
+    "must_use",
+    "flags",
+    "deprecated",
+    "target",
+    "allow",
+    "cases",
+    "warn",
+    "seed",
+    "deny",
+    "doc",
+    "panic_hook",
+];
+
 mod literal;
 mod parser;
 mod red;
@@ -709,6 +729,11 @@ pub fn lex(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<LexOutput, L
         };
         lexer.push_next_token(token)?;
     }
+}
+
+/// Returns the NFC form used for identifier identity after lexical validation.
+pub fn normalize_identifier(name: &str) -> String {
+    name.nfc().collect()
 }
 
 /// Lexes and parses one file, then binds its red root to the exact snapshot
