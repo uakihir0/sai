@@ -161,6 +161,175 @@ enum FnBodyPolicy {
     Required,
     Optional,
     Forbidden,
+    Extern,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExternAbi {
+    Wasm,
+    C,
+    Unknown,
+}
+
+fn decode_string_literal(literal: &str) -> Option<String> {
+    if literal.starts_with("r") {
+        let mut quote = 1;
+        while literal.as_bytes().get(quote) == Some(&b'#') {
+            quote += 1;
+        }
+        if literal.as_bytes().get(quote) != Some(&b'"') {
+            return None;
+        }
+        let hashes = quote - 1;
+        let suffix_len = hashes.checked_add(1)?;
+        let closing_quote = literal.len().checked_sub(suffix_len)?;
+        if literal.as_bytes().get(closing_quote) != Some(&b'"')
+            || !literal[closing_quote + 1..]
+                .bytes()
+                .all(|byte| byte == b'#')
+        {
+            return None;
+        }
+        return Some(literal[quote + 1..closing_quote].to_owned());
+    }
+
+    if literal.starts_with("\"\"\"") {
+        return decode_multiline_string_literal(literal);
+    }
+
+    let content = literal.strip_prefix('"')?.strip_suffix('"')?;
+    decode_escaped_string_content(content, true)
+}
+
+fn decode_multiline_string_literal(literal: &str) -> Option<String> {
+    let after_opener = 3;
+    let opening_break = line_break_len(literal, after_opener)?;
+    let content_start = after_opener + opening_break;
+    let mut line_start = content_start;
+    let (closing_line_start, indentation) = loop {
+        if line_start > literal.len() {
+            return None;
+        }
+        let line_end = literal[line_start..]
+            .find(['\r', '\n'])
+            .map_or(literal.len(), |offset| line_start + offset);
+        let line = &literal[line_start..line_end];
+        let quote_start = line
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        if &line[quote_start..] == "\"\"\"" && line_end == literal.len() {
+            break (line_start, &line[..quote_start]);
+        }
+        if line_end == literal.len() {
+            return None;
+        }
+        line_start = line_end + line_break_len(literal, line_end)?;
+    };
+
+    let mut content_end = closing_line_start;
+    if content_end > content_start {
+        let previous_break_start =
+            if literal.as_bytes().get(content_end - 2..content_end) == Some(b"\r\n") {
+                content_end - 2
+            } else if literal.as_bytes().get(content_end - 1) == Some(&b'\n') {
+                content_end - 1
+            } else {
+                return None;
+            };
+        content_end = previous_break_start;
+    }
+
+    let mut decoded = String::new();
+    let mut line_start = content_start;
+    while line_start < content_end {
+        let line_end = literal[line_start..content_end]
+            .find(['\r', '\n'])
+            .map_or(content_end, |offset| line_start + offset);
+        let line = &literal[line_start..line_end];
+        if !line.is_empty() && !line.starts_with(indentation) {
+            return None;
+        }
+        let content = line.strip_prefix(indentation).unwrap_or(line);
+        decoded.push_str(&decode_escaped_string_content(content, false)?);
+        if line_end < content_end {
+            let break_len = line_break_len(literal, line_end)?;
+            decoded.push('\n');
+            line_start = line_end + break_len;
+        } else {
+            line_start = content_end;
+        }
+    }
+    Some(decoded)
+}
+
+fn line_break_len(text: &str, position: usize) -> Option<usize> {
+    match text.as_bytes().get(position..position + 2) {
+        Some(b"\r\n") => Some(2),
+        _ if text.as_bytes().get(position) == Some(&b'\n') => Some(1),
+        _ => None,
+    }
+}
+
+fn decode_escaped_string_content(content: &str, allow_continuation: bool) -> Option<String> {
+    let mut decoded = String::new();
+    let mut position = 0;
+    while position < content.len() {
+        let ch = content[position..].chars().next()?;
+        position += ch.len_utf8();
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+
+        let escaped = content[position..].chars().next()?;
+        position += escaped.len_utf8();
+        let value = match escaped {
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            '0' => Some('\0'),
+            '\\' => Some('\\'),
+            '\'' => Some('\''),
+            '"' => Some('"'),
+            'u' => {
+                if content.as_bytes().get(position) != Some(&b'{') {
+                    return None;
+                }
+                position += 1;
+                let end = content[position..].find('}')? + position;
+                let digits = &content[position..end];
+                if !(1..=6).contains(&digits.len())
+                    || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return None;
+                }
+                position = end + 1;
+                Some(char::from_u32(u32::from_str_radix(digits, 16).ok()?)?)
+            }
+            '\n' | '\r' if allow_continuation => {
+                if escaped == '\r' {
+                    if content.as_bytes().get(position) != Some(&b'\n') {
+                        return None;
+                    }
+                    position += 1;
+                }
+                while content
+                    .as_bytes()
+                    .get(position)
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+                {
+                    position += 1;
+                }
+                None
+            }
+            _ => return None,
+        };
+        if let Some(value) = value {
+            decoded.push(value);
+        }
+    }
+    Some(decoded)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -332,14 +501,18 @@ impl Parser<'_, '_> {
         let public_impl = self.at(SyntaxKind::IMPL_KW)
             || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::IMPL_KW);
         let public_invariant = self.at_contextual("invariant") && self.nth(1) == SyntaxKind::UIDENT;
+        let public_extern = self.at(SyntaxKind::EXTERN_KW)
+            || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::EXTERN_KW);
         if let Some(range) = public_range
-            && (public_impl || public_invariant)
+            && (public_impl || public_invariant || public_extern)
         {
             self.emit_parser_diagnostic(
                 sai_diagnostics::Code::ExpectedToken,
                 range,
                 if public_impl {
                     "impl blocks do not have a visibility marker"
+                } else if public_extern {
+                    "extern blocks do not have a visibility marker"
                 } else {
                     "invariant declarations do not have a visibility marker"
                 },
@@ -392,6 +565,12 @@ impl Parser<'_, '_> {
 
         if self.at_contextual("world") && self.nth(1) == SyntaxKind::LIDENT {
             return self.world_decl(declaration);
+        }
+
+        if self.at(SyntaxKind::EXTERN_KW)
+            || (self.at(SyntaxKind::UNSAFE_KW) && self.nth(1) == SyntaxKind::EXTERN_KW)
+        {
+            return self.extern_block(declaration);
         }
 
         if !self.at(SyntaxKind::USE_KW) {
@@ -1150,6 +1329,353 @@ impl Parser<'_, '_> {
         }
         reference.complete(self, SyntaxKind::WORLD_REF)?;
         Ok(())
+    }
+
+    fn extern_block(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        let unsafe_block = self.eat(SyntaxKind::UNSAFE_KW);
+        let extern_range = self
+            .current_token()
+            .filter(|token| token.kind == SyntaxKind::EXTERN_KW)
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.expect(SyntaxKind::EXTERN_KW)?;
+
+        let abi_token = self
+            .current_token()
+            .filter(|token| token.kind == SyntaxKind::STRING);
+        let abi_range = abi_token.map(|token| token.range);
+        let abi = abi_token.and_then(|token| {
+            if token.flags.contains(crate::TokenFlags::HAS_ERROR) {
+                return None;
+            }
+            let value = self.string_token_value(token)?;
+            Some(match value.as_str() {
+                "wasm" => ExternAbi::Wasm,
+                "C" => ExternAbi::C,
+                _ => ExternAbi::Unknown,
+            })
+        });
+        self.expect(SyntaxKind::STRING)?;
+        if abi == Some(ExternAbi::Unknown)
+            && let Some(range) = abi_range
+        {
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::UnknownAbi,
+                range,
+                "extern ABI must be \"wasm\" or \"C\"",
+            )?;
+        }
+
+        let mut module_name_present = false;
+        if self.at_contextual("module") {
+            let module = self.start();
+            self.bump();
+            module_name_present = self
+                .current_token()
+                .and_then(|token| self.string_token_value(token))
+                .is_some();
+            self.expect(SyntaxKind::STRING)?;
+            module.complete(self, SyntaxKind::EXTERN_MODULE)?;
+        }
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::L_BRACE {
+            self.eat_nl();
+        }
+        self.extern_item_list()?;
+
+        let invalid_block = match abi {
+            Some(ExternAbi::Wasm) => !module_name_present,
+            Some(ExternAbi::C) => !unsafe_block,
+            Some(ExternAbi::Unknown) | None => false,
+        };
+        if invalid_block {
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::InvalidExternBlock,
+                extern_range,
+                "extern \"wasm\" requires `module \"name\"`; extern \"C\" requires `unsafe`",
+            )?;
+        }
+        if abi == Some(ExternAbi::C) && unsafe_block {
+            self.emit_staged_feature_diagnostic(
+                extern_range,
+                7,
+                "extern-c",
+                "native extern \"C\" blocks require Stage 7",
+            )?;
+        }
+
+        declaration.complete(self, SyntaxKind::EXTERN_BLOCK)
+    }
+
+    fn string_token_value(&self, token: &crate::Token) -> Option<String> {
+        if token.kind != SyntaxKind::STRING || token.flags.contains(crate::TokenFlags::HAS_ERROR) {
+            return None;
+        }
+        let literal = self
+            .source
+            .get(token.range.start().to_usize()..token.range.end().to_usize())?;
+        decode_string_literal(literal)
+    }
+
+    fn extern_item_list(&mut self) -> Result<(), ParserError> {
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.expect(SyntaxKind::L_BRACE)?;
+            return Ok(());
+        }
+        let items = self.start();
+        let open_position = self.position;
+        self.bump();
+        let closing_brace = self
+            .matching_r_braces
+            .get(open_position)
+            .copied()
+            .filter(|position| *position != usize::MAX);
+        while self.at(SyntaxKind::NEWLINE)
+            && !self.extern_item_list_boundary_after_newline(closing_brace)
+        {
+            self.eat_nl();
+        }
+        while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.at(SyntaxKind::NEWLINE)
+                && self.extern_item_list_boundary_after_newline(closing_brace)
+            {
+                break;
+            }
+            if self.at(SyntaxKind::DOC_INNER)
+                || (self.at(SyntaxKind::DOC_OUTER)
+                    && !self.extern_item_starts_at_after_attributes(self.position))
+            {
+                self.misplaced_doc_comment()?;
+                continue;
+            }
+            let position = self.position;
+            if self.extern_item(closing_brace)? {
+                break;
+            }
+            if self.at(SyntaxKind::NEWLINE)
+                && self.extern_item_list_boundary_after_newline(closing_brace)
+            {
+                break;
+            }
+            if self
+                .current_token()
+                .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+                && self.extern_item_starts_at_after_attributes(self.position)
+            {
+                continue;
+            }
+            if self.eat(SyntaxKind::NEWLINE) {
+                while self.at(SyntaxKind::NEWLINE)
+                    && !self.extern_item_list_boundary_after_newline(closing_brace)
+                {
+                    self.eat_nl();
+                }
+                continue;
+            }
+            if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+                break;
+            }
+            self.expect(SyntaxKind::NEWLINE)?;
+            if self.position == position {
+                self.recover_one()?;
+                if self.position == position {
+                    break;
+                }
+            }
+        }
+        if !self.extern_item_list_boundary_after_newline(closing_brace) {
+            self.eat_nl();
+        }
+        self.expect(SyntaxKind::R_BRACE)?;
+        items.complete(self, SyntaxKind::ITEM_LIST)?;
+        Ok(())
+    }
+
+    fn extern_item_list_boundary_after_newline(&self, closing_brace: Option<usize>) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        let Some(token) = self.tokens.get(position) else {
+            return false;
+        };
+        closing_brace.is_none()
+            && token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK)
+            && !self.extern_item_starts_at_after_attributes(position)
+            && self.item_starts_at_after_attributes(position)
+    }
+
+    fn extern_item_starts_at_after_attributes(&self, position: usize) -> bool {
+        let Some(mut position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| matches!(token.kind, SyntaxKind::PUB_KW | SyntaxKind::EXPORT_KW))
+        {
+            position += 1;
+        }
+        self.fn_decl_starts_at(position)
+    }
+
+    fn extern_fn_head_starts_at(&self, mut position: usize) -> bool {
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::UNSAFE_KW)
+        {
+            position += 1;
+        }
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::ASYNC_KW)
+        {
+            position += 1;
+        }
+        self.tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::FN_KW)
+            && self
+                .tokens
+                .get(position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::LIDENT)
+    }
+
+    fn extern_fn_head_starts_at_after_attributes(&self, position: usize) -> bool {
+        let Some(mut position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| matches!(token.kind, SyntaxKind::PUB_KW | SyntaxKind::EXPORT_KW))
+        {
+            position += 1;
+        }
+        self.extern_fn_head_starts_at(position)
+    }
+
+    fn fn_closure_starts_at_after_attributes(&self, position: usize) -> bool {
+        let Some(position) = self.position_after_attributes(position) else {
+            return false;
+        };
+        let fn_position = if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::ASYNC_KW)
+        {
+            position + 1
+        } else {
+            position
+        };
+        self.tokens
+            .get(fn_position)
+            .is_some_and(|token| token.kind == SyntaxKind::FN_KW)
+            && self
+                .tokens
+                .get(fn_position + 1)
+                .is_some_and(|token| token.kind == SyntaxKind::L_PAREN)
+    }
+
+    fn extern_item(&mut self, closing_brace: Option<usize>) -> Result<bool, ParserError> {
+        let declaration = self.start();
+        self.outer_docs()?;
+        self.attributes(true)?;
+        if self.at_any(&[SyntaxKind::PUB_KW, SyntaxKind::EXPORT_KW]) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "extern items do not have a visibility marker",
+            )?;
+            let visibility = self.start();
+            self.bump();
+            visibility.complete(self, SyntaxKind::ERROR)?;
+        }
+        if self.at_fn_decl_start() {
+            self.fn_decl(declaration, FnBodyPolicy::Extern)?;
+            return Ok(false);
+        }
+
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::ExpectedToken,
+            range,
+            "expected a function declaration in the extern block",
+        )?;
+        let preserve_top_level = self.recover_extern_item(closing_brace)?;
+        declaration.complete(self, SyntaxKind::ERROR)?;
+        Ok(preserve_top_level)
+    }
+
+    fn recover_extern_item(&mut self, closing_brace: Option<usize>) -> Result<bool, ParserError> {
+        let error = self.start();
+        let mut delimiters = Vec::new();
+        let mut consumed = false;
+        let mut preserve_top_level = false;
+        while !self.at(SyntaxKind::EOF) {
+            let kind = self.current();
+            if delimiters.is_empty() && kind == SyntaxKind::NEWLINE {
+                break;
+            }
+            if consumed
+                && delimiters.is_empty()
+                && self
+                    .current_token()
+                    .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+            {
+                if self.extern_fn_head_starts_at_after_attributes(self.position) {
+                    break;
+                }
+                if closing_brace.is_none()
+                    && self.item_starts_at_after_attributes(self.position)
+                    && !self.fn_closure_starts_at_after_attributes(self.position)
+                {
+                    preserve_top_level = true;
+                    break;
+                }
+            }
+            if kind == SyntaxKind::R_BRACE && delimiters.last() != Some(&SyntaxKind::L_BRACE) {
+                break;
+            }
+            match kind {
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACKET | SyntaxKind::L_BRACE => {
+                    delimiters.push(kind);
+                }
+                SyntaxKind::R_PAREN if delimiters.last() == Some(&SyntaxKind::L_PAREN) => {
+                    delimiters.pop();
+                }
+                SyntaxKind::R_BRACKET if delimiters.last() == Some(&SyntaxKind::L_BRACKET) => {
+                    delimiters.pop();
+                }
+                SyntaxKind::R_BRACE if delimiters.last() == Some(&SyntaxKind::L_BRACE) => {
+                    delimiters.pop();
+                }
+                _ => {}
+            }
+            self.bump();
+            consumed = true;
+        }
+        if consumed {
+            error.complete(self, SyntaxKind::ERROR)?;
+        } else {
+            error.abandon(self)?;
+        }
+        Ok(preserve_top_level)
     }
 
     fn trait_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
@@ -2660,14 +3186,14 @@ impl Parser<'_, '_> {
         self.eat(SyntaxKind::ASYNC_KW);
         self.expect(SyntaxKind::FN_KW)?;
         self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
-        if body_policy == FnBodyPolicy::Forbidden
+        if matches!(body_policy, FnBodyPolicy::Forbidden | FnBodyPolicy::Extern)
             && let Some(range) = async_range
         {
             self.emit_staged_feature_diagnostic(
                 range,
                 5,
                 "async-fn",
-                "async functions in interfaces and worlds require Stage 5",
+                "async functions in interfaces, worlds, and extern blocks require Stage 5",
             )?;
         }
         if body_policy == FnBodyPolicy::Forbidden
@@ -2719,6 +3245,16 @@ impl Parser<'_, '_> {
                     range,
                     "interface and world functions cannot have a body",
                 )?;
+            } else if body_policy == FnBodyPolicy::Extern {
+                let range = self
+                    .current_token()
+                    .map(|token| token.range)
+                    .ok_or(ParserError::InvalidDiagnosticSpan)?;
+                self.emit_parser_diagnostic(
+                    sai_diagnostics::Code::UnexpectedFnBody,
+                    range,
+                    "extern functions cannot have a body",
+                )?;
             }
             let body = match self.block() {
                 Ok(body) => body,
@@ -2727,7 +3263,7 @@ impl Parser<'_, '_> {
                     return Err(error);
                 }
             };
-            if body_policy == FnBodyPolicy::Forbidden {
+            if matches!(body_policy, FnBodyPolicy::Forbidden | FnBodyPolicy::Extern) {
                 body.precede(self).complete(self, SyntaxKind::ERROR)?;
             }
         } else if body_policy == FnBodyPolicy::Required {

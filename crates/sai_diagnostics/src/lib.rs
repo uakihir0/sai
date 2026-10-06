@@ -91,6 +91,9 @@ define_codes! {
     EffectsOnInterfaceFn => "EFFECTS_ON_INTERFACE_FN",
     InterfaceFnBody => "INTERFACE_FN_BODY",
     WorldImportNeedsInterface => "WORLD_IMPORT_NEEDS_INTERFACE",
+    UnknownAbi => "UNKNOWN_ABI",
+    InvalidExternBlock => "INVALID_EXTERN_BLOCK",
+    UnexpectedFnBody => "UNEXPECTED_FN_BODY",
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1652,6 +1655,15 @@ mod tests {
         assert_eq!(
             Code::from_name("WORLD_IMPORT_NEEDS_INTERFACE"),
             Some(Code::WorldImportNeedsInterface)
+        );
+        assert_eq!(Code::from_name("UNKNOWN_ABI"), Some(Code::UnknownAbi));
+        assert_eq!(
+            Code::from_name("INVALID_EXTERN_BLOCK"),
+            Some(Code::InvalidExternBlock)
+        );
+        assert_eq!(
+            Code::from_name("UNEXPECTED_FN_BODY"),
+            Some(Code::UnexpectedFnBody)
         );
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));

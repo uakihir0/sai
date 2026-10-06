@@ -1736,6 +1736,391 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_wasm_extern_blocks_and_decodes_abi_and_module_strings() {
+        let source = concat!(
+            "extern \"\\u{77}asm\" module r#\"host\"# {\n",
+            "/// Host logging function.\n",
+            "@import_name(\"host_log\")\n",
+            "fn log(message: Str)\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXTERN_MODULE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn extern_blocks_report_unknown_abi_and_invalid_abi_requirements() {
+        let source = concat!(
+            "extern \"native\" {\n}\n",
+            "extern \"wasm\" {\n}\n",
+            "extern \"C\" {\n}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                Code::UnknownAbi,
+                Code::InvalidExternBlock,
+                Code::InvalidExternBlock,
+            ],
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+                .count(),
+            3
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn unsafe_c_extern_blocks_report_the_unimplemented_stage() {
+        let source = "unsafe extern \"C\" {\nfn puts(value: Ptr<U8>)\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let diagnostic = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+            .expect("native C extern feature diagnostic");
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(
+            diagnostic.data.get("stage"),
+            Some(&sai_diagnostics::Value::Integer(7))
+        );
+        assert_eq!(
+            diagnostic.data.get("feature"),
+            Some(&sai_diagnostics::Value::String("extern-c".to_owned()))
+        );
+        let span = diagnostic
+            .primary()
+            .expect("extern feature diagnostic location")
+            .span
+            .range;
+        assert_eq!(
+            &source[span.start().to_usize()..span.end().to_usize()],
+            "extern"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn extern_function_bodies_are_reported_and_wrapped_as_errors() {
+        let source = "extern \"wasm\" module \"env\" {\nfn invalid() {}\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::UnexpectedFnBody);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn invalid_extern_item_recovers_through_nested_braces_without_cascading() {
+        let source = concat!(
+            "extern \"wasm\" module \"env\" {\n",
+            "const INVALID: Bool = { true }\n",
+            "fn after()\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let extern_block = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+            .expect("extern block");
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            extern_block
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            extern_block
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+
+        let source = concat!(
+            "extern \"wasm\" module \"env\" {\n",
+            "const INVALID: Bool =\n",
+            "fn() { true }\n",
+            "fn after()\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let extern_block = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+            .expect("extern block");
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            extern_block
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+
+        let source = concat!(
+            "extern \"wasm\" module \"env\" {\n",
+            "const INVALID: Bool =\n",
+            "fn after()\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let extern_block = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+            .expect("extern block");
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            extern_block
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn closed_extern_block_keeps_each_invalid_member_inside_the_block() {
+        let source = concat!(
+            "extern \"wasm\" module \"env\" {\n",
+            "const FIRST: Bool = true\n",
+            "const SECOND: Bool = false\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let extern_block = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+            .expect("extern block");
+
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::ExpectedToken),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            extern_block
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            0
+        );
+        assert_eq!(
+            extern_block
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ERROR)
+                .count(),
+            4
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn invalid_extern_item_recovery_preserves_a_top_level_item_after_a_missing_close() {
+        let source = concat!(
+            "extern \"wasm\" module \"env\" {\n",
+            "const INVALID: Bool =\n",
+            "const READY: Bool = true\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::ExpectedToken, Code::ExpectedToken],
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn async_extern_function_reports_its_stage_and_visibility_markers_are_rejected() {
+        let source = concat!(
+            "extern \"wasm\" module \"env\" {\n",
+            "async fn asynchronous()\n",
+            "pub fn visible()\n",
+            "}\n",
+            "pub extern \"wasm\" module \"outside\" {\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let diagnostics = output
+            .errors
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            diagnostics,
+            [
+                Code::FeatureNotImplemented,
+                Code::ExpectedToken,
+                Code::ExpectedToken,
+            ],
+            "{:?}",
+            output.errors
+        );
+        let async_diagnostic = output
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+            .expect("async extern diagnostic");
+        assert_eq!(
+            async_diagnostic.data.get("stage"),
+            Some(&sai_diagnostics::Value::Integer(5))
+        );
+        assert_eq!(
+            async_diagnostic.data.get("feature"),
+            Some(&sai_diagnostics::Value::String("async-fn".to_owned()))
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn extern_block_recovery_preserves_following_items_and_keeps_function_members() {
+        let missing_close =
+            "extern \"wasm\" module \"env\" {\nfn open()\nconst READY: Bool = true\n";
+        let output = parse_file(missing_close);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), missing_close.len());
+
+        let ambiguous = "extern \"wasm\" module \"env\" {\nfn first()\nfn second()\n}\n";
+        let output = parse_file(ambiguous);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let extern_block = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+            .expect("extern block");
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            extern_block
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), ambiguous.len());
+    }
+
+    #[test]
     fn source_file_parses_effect_declarations_and_covers_sets() {
         let source = concat!(
             "pub effect filesystem\n",
@@ -7778,18 +8163,20 @@ mod tests {
     }
 
     #[test]
-    fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
+    fn source_file_parses_extern_items_instead_of_treating_them_as_unsupported() {
         let source = "extern \"wasm\" {}\n";
-        let (snapshot_file, lexed) = lex_file(source);
-        let mut parser =
-            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::InvalidExternBlock);
         assert_eq!(
-            parser.parse_source_file(),
-            Err(ParserError::UnsupportedItem {
-                position: 0,
-                kind: SyntaxKind::EXTERN_KW
-            })
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+                .count(),
+            1
         );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
     }
 
     #[test]
