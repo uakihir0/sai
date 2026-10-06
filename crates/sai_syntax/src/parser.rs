@@ -2240,6 +2240,15 @@ mod tests {
     }
 
     #[test]
+    fn generated_ast_node_inventory_contains_unique_node_kinds() {
+        let mut kinds = std::collections::HashSet::new();
+        for &kind in crate::ast::AST_NODE_KINDS {
+            assert!(kind.is_node(), "{kind:?} is not a syntax node");
+            assert!(kinds.insert(kind), "duplicate generated node kind {kind:?}");
+        }
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,

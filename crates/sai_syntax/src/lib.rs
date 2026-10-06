@@ -4,6 +4,11 @@ use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 pub mod ast;
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build_support.rs"]
+mod ast_generator_build_support;
+
 use sai_diagnostics::{
     Applicability, Child, ChildKind, Code, Diagnostic, Fix, FixOperation, FixOperationName,
     FixOperationPlanner, Location, NodeGroup, NodeId, OperationPlanError, Severity, SourceRef,
