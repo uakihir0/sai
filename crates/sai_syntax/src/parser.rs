@@ -3019,6 +3019,127 @@ mod tests {
     }
 
     #[test]
+    fn generated_range_roles_select_both_operator_spellings_and_endpoint_kinds() {
+        use crate::ast::{AstNode, RangeExpr, RangePat, RangePatEndpoint};
+
+        let output = parse_file(concat!(
+            "fn ranges(value: I32, next: I32) {\n",
+            "let matched = match value {\n",
+            "1..=4 => 0,\n",
+            "..=8 => 1,\n",
+            "pkg.START..pkg.END => 2,\n",
+            "1.. => 3,\n",
+            "_ => 4\n",
+            "}\n",
+            "let inclusive = value..=next\n",
+            "let open_end = value..\n",
+            "let open_start = ..value\n",
+            "}\n",
+        ));
+        assert!(
+            output.errors.is_empty(),
+            "valid range expressions and patterns should parse cleanly: {:?}",
+            output.errors
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let range_patterns = root
+            .descendants()
+            .filter_map(RangePat::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(range_patterns.len(), 4);
+        assert!(matches!(
+            range_patterns[0].start(),
+            Some(RangePatEndpoint::Literal(_))
+        ));
+        assert!(matches!(
+            range_patterns[0].end(),
+            Some(RangePatEndpoint::Literal(_))
+        ));
+        assert!(range_patterns[1].start().is_none());
+        assert!(matches!(
+            range_patterns[1].end(),
+            Some(RangePatEndpoint::Literal(_))
+        ));
+        assert!(matches!(
+            range_patterns[2].start(),
+            Some(RangePatEndpoint::ConstantPath(_))
+        ));
+        assert!(matches!(
+            range_patterns[2].end(),
+            Some(RangePatEndpoint::ConstantPath(_))
+        ));
+        assert!(matches!(
+            range_patterns[3].start(),
+            Some(RangePatEndpoint::Literal(_))
+        ));
+        assert!(range_patterns[3].end().is_none());
+
+        let range_expressions = root
+            .descendants()
+            .filter_map(RangeExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(range_expressions.len(), 3);
+        assert_eq!(
+            range_expressions[0]
+                .start()
+                .expect("infix range start")
+                .syntax()
+                .kind(),
+            SyntaxKind::PATH_EXPR
+        );
+        assert_eq!(
+            range_expressions[0]
+                .end()
+                .expect("infix range end")
+                .syntax()
+                .kind(),
+            SyntaxKind::PATH_EXPR
+        );
+        assert_eq!(
+            range_expressions[1]
+                .start()
+                .expect("open-ended range start")
+                .syntax()
+                .kind(),
+            SyntaxKind::PATH_EXPR
+        );
+        assert!(range_expressions[1].end().is_none());
+        assert!(range_expressions[2].start().is_none());
+        assert_eq!(
+            range_expressions[2]
+                .end()
+                .expect("prefix range end")
+                .syntax()
+                .kind(),
+            SyntaxKind::PATH_EXPR
+        );
+
+        let malformed_pattern = parse_file("fn broken(value: I32) { let 1..= = value }\n");
+        assert!(!malformed_pattern.errors.is_empty());
+        let malformed_pattern_root = crate::SyntaxNode::new_root(malformed_pattern.root);
+        let malformed_pattern = malformed_pattern_root
+            .descendants()
+            .find_map(RangePat::cast)
+            .expect("recovered range pattern");
+        assert!(matches!(
+            malformed_pattern.start(),
+            Some(RangePatEndpoint::Literal(_))
+        ));
+        assert!(malformed_pattern.end().is_none());
+
+        let malformed_expression = parse_file("fn broken(value: I32) { let open = value..= }\n");
+        assert!(!malformed_expression.errors.is_empty());
+        let malformed_expression_root = crate::SyntaxNode::new_root(malformed_expression.root);
+        let malformed_expression = malformed_expression_root
+            .descendants()
+            .find_map(RangeExpr::cast)
+            .expect("recovered range expression");
+        assert!(malformed_expression.start().is_some());
+        assert!(malformed_expression.end().is_none());
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,

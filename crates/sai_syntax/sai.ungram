@@ -155,8 +155,8 @@ node InvariantExprList INVARIANT_EXPR_LIST
 node Error ERROR
 
 # Direct child roles: child selects by zero-based same-type position; child_before,
-# child_after, and children_before select relative to a direct token boundary; children
-# is repeated, and token names an AstToken.
+# child_after, children_before, child_before_any, and child_after_any select relative
+# to direct token boundaries; children is repeated, and token names an AstToken.
 children SourceFile items Item
 children SourceFile test_decls TestDecl
 children SourceFile property_decls PropertyDecl
@@ -284,6 +284,10 @@ child NamedPatArg pattern Pattern 0
 child ImplicitMemberPat name NameRef 0
 child ImplicitMemberPat args CtorPatArgs 0
 children ConstPath segments NameRef
+child_before_any RangeExpr start Expr DOT2|DOT2EQ 0
+child_after_any RangeExpr end Expr DOT2|DOT2EQ 0
+child_before_any RangePat start RangePatEndpoint DOT2|DOT2EQ 0
+child_after_any RangePat end RangePatEndpoint DOT2|DOT2EQ 0
 child CastExpr expression Expr 0
 child CastExpr ty Type 0
 child BinExpr lhs Expr 0

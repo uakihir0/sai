@@ -19,8 +19,22 @@ struct Accessor {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ChildSelector {
     Position(usize),
-    BeforeToken { syntax_kind: String, index: usize },
-    AfterToken { syntax_kind: String, index: usize },
+    BeforeToken {
+        syntax_kind: String,
+        index: usize,
+    },
+    AfterToken {
+        syntax_kind: String,
+        index: usize,
+    },
+    BeforeTokens {
+        syntax_kinds: Vec<String>,
+        index: usize,
+    },
+    AfterTokens {
+        syntax_kinds: Vec<String>,
+        index: usize,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -35,6 +49,7 @@ enum AccessorKind {
 pub(crate) struct ExistingAstTypes {
     names: BTreeSet<String>,
     unions: BTreeSet<String>,
+    union_members: BTreeMap<String, BTreeSet<String>>,
     tokens: BTreeSet<String>,
     methods: BTreeMap<String, BTreeSet<String>>,
 }
@@ -105,12 +120,12 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                 });
             }
             Some(
-                kind @ ("child" | "child_before" | "child_after" | "children" | "children_before"
-                | "token"),
+                kind @ ("child" | "child_before" | "child_after" | "child_before_any"
+                | "child_after_any" | "children" | "children_before" | "token"),
             ) => {
                 let expected_fields = match kind {
                     "child" => 5,
-                    "child_before" | "child_after" => 6,
+                    "child_before" | "child_after" | "child_before_any" | "child_after_any" => 6,
                     "children_before" => 5,
                     _ => 4,
                 };
@@ -121,6 +136,9 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                         match kind {
                             "child" => " <index>",
                             "child_before" | "child_after" => " <TOKEN_KIND> <index>",
+                            "child_before_any" | "child_after_any" => {
+                                " <TOKEN_KIND|TOKEN_KIND...> <index>"
+                            }
                             "children_before" => " <TOKEN_KIND>",
                             _ => "",
                         },
@@ -136,7 +154,8 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                     );
                 }
                 let accessor_kind = match kind {
-                    "child" | "child_before" | "child_after" => AccessorKind::Child,
+                    "child" | "child_before" | "child_after" | "child_before_any"
+                    | "child_after_any" => AccessorKind::Child,
                     "children" => AccessorKind::Children,
                     "children_before" => AccessorKind::ChildrenBefore,
                     "token" => AccessorKind::Token,
@@ -164,6 +183,21 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                         } else {
                             ChildSelector::AfterToken {
                                 syntax_kind: syntax_kind.to_owned(),
+                                index,
+                            }
+                        })
+                    }
+                    "child_before_any" | "child_after_any" => {
+                        let syntax_kinds = parse_boundary_token_kinds(fields[4], line_index + 1);
+                        let index = parse_child_index(fields[5], line_index + 1);
+                        Some(if kind == "child_before_any" {
+                            ChildSelector::BeforeTokens {
+                                syntax_kinds,
+                                index,
+                            }
+                        } else {
+                            ChildSelector::AfterTokens {
+                                syntax_kinds,
                                 index,
                             }
                         })
@@ -203,7 +237,7 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
 
     assert!(!nodes.is_empty(), "sai.ungram declares no syntax nodes");
     let mut declared_roles = BTreeSet::new();
-    let mut declared_child_selectors = BTreeSet::new();
+    let mut declared_child_selectors = Vec::<(String, String, ChildSelector)>::new();
     for (line, parent_name, accessor) in accessors {
         let Some(parent) = nodes.iter_mut().find(|node| node.ast_name == parent_name) else {
             panic!("sai.ungram:{line}: unknown AST node `{parent_name}`");
@@ -239,16 +273,28 @@ pub(crate) fn parse_nodes(grammar: &str, existing_types: &ExistingAstTypes) -> V
                         .selector
                         .as_ref()
                         .expect("child roles have a selector");
-                    if !declared_child_selectors.insert((
-                        parent_name.clone(),
-                        accessor.ty.clone(),
-                        selector.clone(),
-                    )) {
+                    if declared_child_selectors.iter().any(
+                        |(declared_parent, declared_ty, declared_selector)| {
+                            declared_parent == &parent_name
+                                && child_roles_overlap(
+                                    declared_ty,
+                                    &accessor.ty,
+                                    declared_selector,
+                                    selector,
+                                    existing_types,
+                                )
+                        },
+                    ) {
                         panic!(
                             "sai.ungram:{line}: two AST roles select {} child {:?}",
                             accessor.ty, selector
                         );
                     }
+                    declared_child_selectors.push((
+                        parent_name.clone(),
+                        accessor.ty.clone(),
+                        selector.clone(),
+                    ));
                 }
             }
             AccessorKind::Token => {
@@ -269,6 +315,160 @@ fn parse_child_index(value: &str, line: usize) -> usize {
     value.parse::<usize>().unwrap_or_else(|_| {
         panic!("sai.ungram:{line}: child position `{value}` is not a non-negative integer")
     })
+}
+
+fn parse_boundary_token_kinds(value: &str, line: usize) -> Vec<String> {
+    let mut syntax_kinds = Vec::new();
+    let mut unique_syntax_kinds = BTreeSet::new();
+    for syntax_kind in value.split('|') {
+        if !is_syntax_kind_name(syntax_kind) {
+            panic!("sai.ungram:{line}: invalid child boundary token kind `{syntax_kind}`");
+        }
+        if !unique_syntax_kinds.insert(syntax_kind) {
+            panic!("sai.ungram:{line}: duplicate child boundary token kind `{syntax_kind}`");
+        }
+        syntax_kinds.push(syntax_kind.to_owned());
+    }
+    syntax_kinds
+}
+
+fn child_roles_overlap(
+    left_ty: &str,
+    right_ty: &str,
+    left: &ChildSelector,
+    right: &ChildSelector,
+    existing_types: &ExistingAstTypes,
+) -> bool {
+    let left_members = ast_type_members(left_ty, existing_types);
+    let right_members = ast_type_members(right_ty, existing_types);
+    if !left_members
+        .iter()
+        .any(|member| right_members.contains(member))
+    {
+        return false;
+    }
+    child_selectors_overlap(left, right, &left_members, &right_members)
+}
+
+fn child_selectors_overlap(
+    left: &ChildSelector,
+    right: &ChildSelector,
+    left_members: &BTreeSet<String>,
+    right_members: &BTreeSet<String>,
+) -> bool {
+    match (left, right) {
+        (ChildSelector::Position(left_index), ChildSelector::Position(right_index)) => {
+            rank_indexes_overlap(*left_index, *right_index, left_members, right_members)
+        }
+        (ChildSelector::Position(position_index), selector) => {
+            let Some((is_before, _, boundary_index)) = boundary_selector(selector) else {
+                return false;
+            };
+            if is_before {
+                rank_indexes_overlap(*position_index, boundary_index, left_members, right_members)
+            } else {
+                *position_index >= boundary_index || has_type_only(right_members, left_members)
+            }
+        }
+        (selector, ChildSelector::Position(position_index)) => {
+            let Some((is_before, _, boundary_index)) = boundary_selector(selector) else {
+                return false;
+            };
+            if is_before {
+                rank_indexes_overlap(boundary_index, *position_index, left_members, right_members)
+            } else {
+                *position_index >= boundary_index || has_type_only(left_members, right_members)
+            }
+        }
+        _ => {
+            let Some((left_before, left_kinds, left_index)) = boundary_selector(left) else {
+                return false;
+            };
+            let Some((right_before, right_kinds, right_index)) = boundary_selector(right) else {
+                return false;
+            };
+            match (left_before, right_before) {
+                (true, true) => {
+                    rank_indexes_overlap(left_index, right_index, left_members, right_members)
+                }
+                (false, false) => {
+                    let shared_boundary = token_sets_intersect(&left_kinds, &right_kinds)
+                        && rank_indexes_overlap(
+                            left_index,
+                            right_index,
+                            left_members,
+                            right_members,
+                        );
+                    let left_boundary_first = has_token_only(&left_kinds, &right_kinds)
+                        && (left_index >= right_index
+                            || has_type_only(right_members, left_members));
+                    let right_boundary_first = has_token_only(&right_kinds, &left_kinds)
+                        && (right_index >= left_index
+                            || has_type_only(left_members, right_members));
+                    shared_boundary || left_boundary_first || right_boundary_first
+                }
+                (true, false) => {
+                    has_token_only(&right_kinds, &left_kinds)
+                        && (left_index >= right_index || has_type_only(right_members, left_members))
+                }
+                (false, true) => {
+                    has_token_only(&left_kinds, &right_kinds)
+                        && (right_index >= left_index || has_type_only(left_members, right_members))
+                }
+            }
+        }
+    }
+}
+
+fn rank_indexes_overlap(
+    left_index: usize,
+    right_index: usize,
+    left_members: &BTreeSet<String>,
+    right_members: &BTreeSet<String>,
+) -> bool {
+    left_index == right_index
+        || (left_index > right_index && has_type_only(left_members, right_members))
+        || (right_index > left_index && has_type_only(right_members, left_members))
+}
+
+fn has_type_only(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    left.iter().any(|member| !right.contains(member))
+}
+
+fn token_sets_intersect(left: &[&str], right: &[&str]) -> bool {
+    left.iter().any(|kind| right.contains(kind))
+}
+
+fn has_token_only(left: &[&str], right: &[&str]) -> bool {
+    left.iter().any(|kind| !right.contains(kind))
+}
+
+fn boundary_selector(selector: &ChildSelector) -> Option<(bool, Vec<&str>, usize)> {
+    match selector {
+        ChildSelector::BeforeToken { syntax_kind, index } => {
+            Some((true, vec![syntax_kind], *index))
+        }
+        ChildSelector::AfterToken { syntax_kind, index } => {
+            Some((false, vec![syntax_kind], *index))
+        }
+        ChildSelector::BeforeTokens {
+            syntax_kinds,
+            index,
+        } => Some((
+            true,
+            syntax_kinds.iter().map(String::as_str).collect(),
+            *index,
+        )),
+        ChildSelector::AfterTokens {
+            syntax_kinds,
+            index,
+        } => Some((
+            false,
+            syntax_kinds.iter().map(String::as_str).collect(),
+            *index,
+        )),
+        ChildSelector::Position(_) => None,
+    }
 }
 
 fn is_syntax_kind_name(name: &str) -> bool {
@@ -348,6 +548,7 @@ fn is_rust_value_name(name: &str) -> bool {
 }
 
 pub(crate) fn existing_ast_types(ast_source: &str) -> ExistingAstTypes {
+    let ast_source = strip_rust_comments_and_strings(ast_source);
     let mut types = ExistingAstTypes::default();
     let declaration_prefixes = [
         "pub(crate) struct ",
@@ -388,18 +589,29 @@ pub(crate) fn existing_ast_types(ast_source: &str) -> ExistingAstTypes {
         }
     }
 
-    for line in ast_source.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("pub enum ") {
-            if let Some(name) = first_identifier(rest) {
-                if ast_source.contains(&format!("impl AstNode for {name}")) {
-                    types.unions.insert(name.to_owned());
-                }
-            }
-        }
-    }
+    let enum_names = ast_source
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            ["pub(crate) enum ", "pub enum "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .filter_map(first_identifier)
+        .collect::<BTreeSet<_>>();
+    let ast_node_impls = ast_source
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("impl AstNode for "))
+        .filter_map(first_identifier)
+        .collect::<BTreeSet<_>>();
+    types.unions.extend(
+        enum_names
+            .intersection(&ast_node_impls)
+            .map(|name| (*name).to_owned()),
+    );
 
-    types.names.extend(imported_type_names(ast_source));
+    types.names.extend(imported_type_names(&ast_source));
     types.names.extend(
         [
             "Box",
@@ -428,8 +640,173 @@ pub(crate) fn existing_ast_types(ast_source: &str) -> ExistingAstTypes {
         .into_iter()
         .map(str::to_owned),
     );
-    types.methods = existing_ast_methods(ast_source);
+    types.union_members = existing_ast_union_members(&ast_source, &types.unions);
+    types.methods = existing_ast_methods(&ast_source);
     types
+}
+
+fn strip_rust_comments_and_strings(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"//") {
+            let start = index;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            append_masked_source(&source[start..index], &mut output);
+        } else if bytes[index..].starts_with(b"/*") {
+            let start = index;
+            skip_block_comment(source, &mut index);
+            append_masked_source(&source[start..index], &mut output);
+        } else if bytes[index] == b'r'
+            && let Some(end) = raw_string_end(source, index)
+        {
+            append_masked_source(&source[index..end], &mut output);
+            index = end;
+        } else if bytes[index] == b'"' {
+            let start = index;
+            skip_quoted_string(source, &mut index);
+            append_masked_source(&source[start..index], &mut output);
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(output).expect("masking Rust trivia preserves valid UTF-8")
+}
+
+fn append_masked_source(source: &str, output: &mut Vec<u8>) {
+    output.extend(source.bytes().map(|byte| {
+        if matches!(byte, b'\n' | b'\r') {
+            byte
+        } else {
+            b' '
+        }
+    }));
+}
+
+fn existing_ast_union_members(
+    ast_source: &str,
+    unions: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut members = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut active_union = None::<String>;
+    let mut active_body = String::new();
+
+    for line in ast_source.lines().map(str::trim) {
+        if active_union.is_some() {
+            let end = line.find('}').unwrap_or(line.len());
+            active_body.push_str(&line[..end]);
+            active_body.push('\n');
+            if end < line.len() {
+                let union_name = active_union.take().expect("active union name");
+                members
+                    .entry(union_name)
+                    .or_default()
+                    .extend(union_variant_ast_types(&active_body));
+                active_body.clear();
+            }
+            continue;
+        }
+
+        let union_name = line
+            .strip_prefix("ast_union!(")
+            .and_then(first_identifier)
+            .or_else(|| {
+                ["pub(crate) enum ", "pub enum "]
+                    .iter()
+                    .find_map(|prefix| line.strip_prefix(prefix))
+                    .and_then(first_identifier)
+                    .filter(|name| unions.contains(*name))
+            });
+        let Some(union_name) = union_name else {
+            continue;
+        };
+        let Some((_, body)) = line.split_once('{') else {
+            continue;
+        };
+        active_union = Some(union_name.to_owned());
+        let end = body.find('}').unwrap_or(body.len());
+        active_body.push_str(&body[..end]);
+        active_body.push('\n');
+        if end < body.len() {
+            members
+                .entry(union_name.to_owned())
+                .or_default()
+                .extend(union_variant_ast_types(&active_body));
+            active_union = None;
+            active_body.clear();
+        }
+    }
+
+    members
+}
+
+fn union_variant_ast_types(body: &str) -> BTreeSet<String> {
+    let mut members = BTreeSet::new();
+    let mut cursor = 0;
+    while let Some(open_relative) = body[cursor..].find('(') {
+        let open = cursor + open_relative;
+        let mut depth = 1usize;
+        let mut close = None;
+        for (relative, character) in body[open + 1..].char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + 1 + relative);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        if let Some(member) = first_identifier(
+            body[open + 1..close]
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .trim(),
+        ) {
+            members.insert(member.to_owned());
+        }
+        cursor = close + 1;
+    }
+    members
+}
+
+fn ast_type_members(ast_type: &str, existing_types: &ExistingAstTypes) -> BTreeSet<String> {
+    fn collect(
+        ast_type: &str,
+        existing_types: &ExistingAstTypes,
+        visiting: &mut BTreeSet<String>,
+        members: &mut BTreeSet<String>,
+    ) {
+        let Some(union_members) = existing_types.union_members.get(ast_type) else {
+            members.insert(ast_type.to_owned());
+            return;
+        };
+        if !visiting.insert(ast_type.to_owned()) {
+            members.insert(ast_type.to_owned());
+            return;
+        }
+        for member in union_members {
+            collect(member, existing_types, visiting, members);
+        }
+        visiting.remove(ast_type);
+    }
+
+    let mut members = BTreeSet::new();
+    collect(ast_type, existing_types, &mut BTreeSet::new(), &mut members);
+    members
 }
 
 fn existing_ast_methods(ast_source: &str) -> BTreeMap<String, BTreeSet<String>> {
@@ -530,23 +907,34 @@ pub(crate) fn validate_node_kinds(nodes: &[Node], syntax_source: &str) {
                 | Some(ChildSelector::AfterToken { syntax_kind, .. }) => Some(syntax_kind),
                 _ => None,
             };
-            if let Some(syntax_kind) = syntax_kind
-                && !variants.contains(syntax_kind)
-            {
-                panic!(
-                    "sai.ungram child role `{}::{}` uses unknown SyntaxKind `{syntax_kind}`",
-                    node.ast_name, accessor.name
-                );
+            let mut syntax_kinds = syntax_kind.into_iter().collect::<Vec<_>>();
+            match accessor.selector.as_ref() {
+                Some(ChildSelector::BeforeTokens {
+                    syntax_kinds: many, ..
+                })
+                | Some(ChildSelector::AfterTokens {
+                    syntax_kinds: many, ..
+                }) => {
+                    syntax_kinds.extend(many);
+                }
+                _ => {}
             }
-            if let Some(syntax_kind) = syntax_kind
-                && nodes
+            for syntax_kind in syntax_kinds {
+                if !variants.contains(syntax_kind) {
+                    panic!(
+                        "sai.ungram child role `{}::{}` uses unknown SyntaxKind `{syntax_kind}`",
+                        node.ast_name, accessor.name
+                    );
+                }
+                if nodes
                     .iter()
                     .any(|node| node.syntax_kind == syntax_kind.as_str())
-            {
-                panic!(
-                    "sai.ungram child role `{}::{}` uses node kind `{syntax_kind}` as a token boundary",
-                    node.ast_name, accessor.name
-                );
+                {
+                    panic!(
+                        "sai.ungram child role `{}::{}` uses node kind `{syntax_kind}` as a token boundary",
+                        node.ast_name, accessor.name
+                    );
+                }
             }
         }
     }
@@ -766,6 +1154,28 @@ pub(crate) fn generate_nodes(nodes: &[Node]) -> String {
                         ChildSelector::AfterToken { syntax_kind, index } => format!(
                             "direct_child_after(self.syntax(), SyntaxKind::{syntax_kind}, {index})"
                         ),
+                        ChildSelector::BeforeTokens {
+                            syntax_kinds,
+                            index,
+                        } => format!(
+                            "direct_child_before_any(self.syntax(), &[{}], {index})",
+                            syntax_kinds
+                                .iter()
+                                .map(|syntax_kind| format!("SyntaxKind::{syntax_kind}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        ChildSelector::AfterTokens {
+                            syntax_kinds,
+                            index,
+                        } => format!(
+                            "direct_child_after_any(self.syntax(), &[{}], {index})",
+                            syntax_kinds
+                                .iter()
+                                .map(|syntax_kind| format!("SyntaxKind::{syntax_kind}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
                     };
                     writeln!(
                         generated,
@@ -959,6 +1369,81 @@ mod tests {
     }
 
     #[test]
+    fn parse_nodes_rejects_overlapping_roles_through_ast_unions() {
+        let existing = existing_ast_types(concat!(
+            "pub enum Expr {\n",
+            "    /// A brace `}` and parenthesis ( in this comment are inert.\n",
+            "    #[doc = \"a string brace } and parenthesis ( are inert\"]\n",
+            "    #[doc = r#\"a raw string brace } and parenthesis ( are inert\"#]\n",
+            "    /* A block-comment brace } and parenthesis ( /* nested */ are inert. */\n",
+            "    Path(\n",
+            "        PathExpr,\n",
+            "    ),\n",
+            "    Literal(LiteralExpr),\n",
+            "}\n",
+            "impl AstNode for Expr {}\n",
+            "pub enum NestedExpr {\n",
+            "    Expr(Expr),\n",
+            "}\n",
+            "impl AstNode for NestedExpr {}\n",
+            "ast_union!(Pattern {\n",
+            "    Binding(BindingPat, BINDING_PAT),\n",
+            "});\n",
+        ));
+        assert!(existing.unions.contains("Expr"));
+        assert!(existing.unions.contains("NestedExpr"));
+        assert!(existing.union_members.get("Expr").is_some_and(|members| {
+            members.contains("PathExpr") && members.contains("LiteralExpr")
+        }));
+        assert!(
+            existing
+                .union_members
+                .get("NestedExpr")
+                .is_some_and(|members| members.contains("Expr"))
+        );
+        assert!(
+            existing
+                .union_members
+                .get("Pattern")
+                .is_some_and(|members| members.contains("BindingPat"))
+        );
+
+        let overlapping = concat!(
+            "node Parent PARENT\n",
+            "node PathExpr PATH_EXPR\n",
+            "node LiteralExpr LITERAL\n",
+            "child_before Parent expression NestedExpr DOT 1\n",
+            "child_before Parent path PathExpr DOT 0",
+        );
+        assert!(std::panic::catch_unwind(|| parse_nodes(overlapping, &existing)).is_err());
+
+        let non_overlapping = concat!(
+            "node Parent PARENT\n",
+            "node PathExpr PATH_EXPR\n",
+            "node LiteralExpr LITERAL\n",
+            "child_before Parent first_expression Expr DOT 0\n",
+            "child_before Parent second_path PathExpr DOT 1",
+        );
+        assert_eq!(parse_nodes(non_overlapping, &existing).len(), 3);
+    }
+
+    #[test]
+    fn existing_ast_types_require_an_exact_ast_node_impl_name() {
+        let existing = existing_ast_types(concat!(
+            "pub enum Expr {}\n",
+            "impl AstNode for ExprExtended {}\n",
+        ));
+        assert!(!existing.unions.contains("Expr"));
+        let result = std::panic::catch_unwind(|| {
+            parse_nodes(
+                "node Parent PARENT\nnode Child CHILD\nchild Parent value Expr 0",
+                &existing,
+            )
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn parse_nodes_validates_and_attaches_child_roles() {
         let existing = ExistingAstTypes {
             unions: BTreeSet::from(["Type".to_owned()]),
@@ -969,12 +1454,16 @@ mod tests {
             concat!(
                 "node Parent PARENT\n",
                 "node Child CHILD\n",
+                "node Other OTHER\n",
+                "node Extra EXTRA\n",
                 "children Parent children Child\n",
                 "child Parent first Child 0\n",
                 "child Parent second Child 1\n",
                 "child Parent child Type 0\n",
-                "child_before Parent before Child COMMA 0\n",
-                "child_after Parent after Child COMMA 0\n",
+                "child_before Parent before Extra COMMA 0\n",
+                "child_after Parent after Extra COMMA 0\n",
+                "child_before_any Parent before_any Other DOT2|DOT2EQ 0\n",
+                "child_after_any Parent after_any Other DOT2|DOT2EQ 0\n",
                 "children_before Parent preceding Child COMMA\n",
                 "token Parent token StringLit",
             ),
@@ -990,6 +1479,12 @@ mod tests {
         assert!(generated.contains("direct_child_at(self.syntax(), 1)"));
         assert!(generated.contains("direct_child_before(self.syntax(), SyntaxKind::COMMA, 0)"));
         assert!(generated.contains("direct_child_after(self.syntax(), SyntaxKind::COMMA, 0)"));
+        assert!(generated.contains(
+            "direct_child_before_any(self.syntax(), &[SyntaxKind::DOT2, SyntaxKind::DOT2EQ], 0)"
+        ));
+        assert!(generated.contains(
+            "direct_child_after_any(self.syntax(), &[SyntaxKind::DOT2, SyntaxKind::DOT2EQ], 0)"
+        ));
         assert!(generated.contains("direct_children_before(self.syntax(), SyntaxKind::COMMA)"));
         assert!(generated.contains("pub fn token(&self) -> Option<StringLit>"));
     }
@@ -1005,6 +1500,19 @@ mod tests {
             &ExistingAstTypes::default(),
         );
         validate_node_kinds(&nodes, "pub enum SyntaxKind { COMMA, EOF, PARENT, CHILD }");
+
+        let nodes = parse_nodes(
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child_before_any Parent before Child COMMA|DOT 0",
+            ),
+            &ExistingAstTypes::default(),
+        );
+        validate_node_kinds(
+            &nodes,
+            "pub enum SyntaxKind { COMMA, DOT, EOF, PARENT, CHILD }",
+        );
 
         let nodes = parse_nodes(
             concat!(
@@ -1030,6 +1538,21 @@ mod tests {
             })
             .is_err()
         );
+
+        for boundary in ["COMMA|MISSING_TOKEN", "COMMA|CHILD"] {
+            let nodes = parse_nodes(
+                &format!(
+                    "node Parent PARENT\nnode Child CHILD\nchild_after_any Parent after Child {boundary} 0"
+                ),
+                &ExistingAstTypes::default(),
+            );
+            assert!(
+                std::panic::catch_unwind(|| {
+                    validate_node_kinds(&nodes, "pub enum SyntaxKind { COMMA, EOF, PARENT, CHILD }")
+                })
+                .is_err()
+            );
+        }
 
         let nodes = parse_nodes(
             concat!(
@@ -1078,6 +1601,49 @@ mod tests {
 
         let unknown_type = "node Parent PARENT\nchild Parent item Missing 0";
         assert!(std::panic::catch_unwind(|| parse_nodes(unknown_type, &existing)).is_err());
+
+        for boundary in ["", "|COMMA", "COMMA|", "COMMA||DOT", "COMMA|COMMA"] {
+            let malformed = format!(
+                "node Parent PARENT\nnode Child CHILD\nchild_before_any Parent item Child {boundary} 0"
+            );
+            assert!(
+                std::panic::catch_unwind(|| parse_nodes(&malformed, &existing)).is_err(),
+                "invalid token-boundary list should be rejected: {boundary:?}"
+            );
+        }
+
+        let overlapping = [
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child_before_any Parent first Child COMMA 0\n",
+                "child_before_any Parent second Child DOT 0",
+            ),
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child_after_any Parent first Child COMMA 1\n",
+                "child_after_any Parent second Child DOT 0",
+            ),
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child Parent first Child 0\n",
+                "child_before Parent second Child COMMA 0",
+            ),
+            concat!(
+                "node Parent PARENT\n",
+                "node Child CHILD\n",
+                "child_before Parent first Child COMMA 0\n",
+                "child_after Parent second Child DOT 0",
+            ),
+        ];
+        for declarations in overlapping {
+            assert!(
+                std::panic::catch_unwind(|| parse_nodes(declarations, &existing)).is_err(),
+                "overlapping child roles should be rejected:\n{declarations}"
+            );
+        }
     }
 
     #[test]

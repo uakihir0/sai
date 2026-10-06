@@ -549,6 +549,11 @@ ast_union!(Pattern {
     ImplicitMember(ImplicitMemberPat, IMPLICIT_MEMBER_PAT),
 });
 
+ast_union!(RangePatEndpoint {
+    Literal(LiteralPat, LITERAL_PAT),
+    ConstantPath(ConstPath, CONST_PATH),
+});
+
 #[derive(Clone, Debug)]
 pub enum FStringPiece<'a> {
     Text(Cow<'a, str>),
@@ -857,10 +862,18 @@ fn direct_child_before<N: AstNode>(
     boundary: SyntaxKind,
     index: usize,
 ) -> Option<N> {
+    direct_child_before_any(node, &[boundary], index)
+}
+
+fn direct_child_before_any<N: AstNode>(
+    node: &SyntaxNode,
+    boundaries: &[SyntaxKind],
+    index: usize,
+) -> Option<N> {
     node.children_with_tokens()
-        .take_while(
-            |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == boundary),
-        )
+        .take_while(|element| {
+            !matches!(element, SyntaxElement::Token(token) if boundaries.contains(&token.kind()))
+        })
         .filter_map(|element| match element {
             SyntaxElement::Node(child) => N::cast(child),
             SyntaxElement::Token(_) => None,
@@ -873,10 +886,18 @@ fn direct_child_after<N: AstNode>(
     boundary: SyntaxKind,
     index: usize,
 ) -> Option<N> {
+    direct_child_after_any(node, &[boundary], index)
+}
+
+fn direct_child_after_any<N: AstNode>(
+    node: &SyntaxNode,
+    boundaries: &[SyntaxKind],
+    index: usize,
+) -> Option<N> {
     let mut found_boundary = false;
     node.children_with_tokens()
         .filter_map(|element| match element {
-            SyntaxElement::Token(token) if token.kind() == boundary => {
+            SyntaxElement::Token(token) if boundaries.contains(&token.kind()) => {
                 found_boundary = true;
                 None
             }
