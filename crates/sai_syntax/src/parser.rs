@@ -1626,6 +1626,10 @@ mod tests {
         assert!(output.errors.is_empty(), "{:?}", output.errors);
         let root = crate::SyntaxNode::new_root(output.root);
 
+        fn node_text<'a>(source: &'a str, node: &crate::SyntaxNode) -> &'a str {
+            &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+        }
+
         let interface = root
             .descendants()
             .find_map(InterfaceDecl::cast)
@@ -1680,7 +1684,10 @@ mod tests {
         assert_eq!(exports.len(), 2);
         let module_ref = exports[0].reference().expect("module reference on export");
         assert!(module_ref.package().is_none());
-        assert!(module_ref.mod_path().is_some());
+        let module_path = module_ref.mod_path().expect("module path on export");
+        let module_segments = module_path.segments().collect::<Vec<_>>();
+        assert_eq!(module_segments.len(), 1);
+        assert_eq!(node_text(source, module_segments[0].syntax()), "storage");
         assert!(exports[0].function().is_none());
         assert!(exports[1].reference().is_none());
         assert!(exports[1].function().is_some());
@@ -1693,6 +1700,14 @@ mod tests {
                 .and_then(|reference| reference.mod_path())
                 .is_some()
         );
+        let include_path = includes[0]
+            .reference()
+            .and_then(|reference| reference.mod_path())
+            .expect("included module path");
+        let include_segments = include_path.segments().collect::<Vec<_>>();
+        assert_eq!(include_segments.len(), 2);
+        assert_eq!(node_text(source, include_segments[0].syntax()), "common");
+        assert_eq!(node_text(source, include_segments[1].syntax()), "base");
 
         let extern_block = root
             .descendants()
@@ -6569,6 +6584,10 @@ let byte_non_ascii = b"€"
         assert!(output.errors.is_empty(), "{:?}", output.errors);
         let root = crate::SyntaxNode::new_root(output.root);
 
+        fn node_text<'a>(source: &'a str, node: &crate::SyntaxNode) -> &'a str {
+            &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+        }
+
         let traits = root
             .descendants()
             .filter_map(TraitDecl::cast)
@@ -6651,7 +6670,13 @@ let byte_non_ascii = b"€"
         assert!(interface_impl.trait_ref().is_none());
         assert!(interface_impl.for_type().is_none());
         assert!(interface_impl.inherent_type().is_none());
-        assert!(interface_impl.interface_path().is_some());
+        let interface_path = interface_impl
+            .interface_path()
+            .expect("interface implementation path");
+        let interface_segments = interface_path.segments().collect::<Vec<_>>();
+        assert_eq!(interface_segments.len(), 2);
+        assert_eq!(node_text(source, interface_segments[0].syntax()), "wasi");
+        assert_eq!(node_text(source, interface_segments[1].syntax()), "http");
         assert_eq!(
             interface_impl
                 .items()

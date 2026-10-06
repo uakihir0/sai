@@ -485,6 +485,7 @@ children WorldInclude attrs Attribute
 child WorldInclude reference WorldRef 0
 token WorldRef package PkgPath
 child WorldRef mod_path ModPath 0
+children ModPath segments NameRef
 child ExternBlock docs Docs 0
 children ExternBlock attrs Attribute
 token ExternBlock abi StringLit
