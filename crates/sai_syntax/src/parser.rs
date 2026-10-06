@@ -988,6 +988,213 @@ mod tests {
     }
 
     #[test]
+    fn declaration_metadata_accessors_expose_nested_attribute_arguments() {
+        use crate::ast::{AstNode, FnDecl, ImplDecl, TraitDecl, TypeDecl};
+
+        let source = concat!(
+            "/// Exported entry point.\n",
+            "@allow(check(name), option = \"value\", mode = FAST, 42)\n",
+            "export fn run() {}\n",
+            "/// Public record.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "pub type Count {\n",
+            "pub id: U32\n",
+            "name: U32\n",
+            "}\n",
+            "/// Trait declaration.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "pub trait Marker {\n",
+            "/// Associated output type.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "type Output\n",
+            "/// Trait method.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "fn render() {}\n",
+            "}\n",
+            "/// Trait implementation.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "impl Marker for Count {\n",
+            "/// Associated output implementation.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "type Output = U32\n",
+            "}\n",
+            "/// Inherent implementation.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "impl Count {\n",
+            "/// Public method.\n",
+            "@allow(UNUSED_IMPORTS)\n",
+            "pub fn size() {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        fn node_text<'a>(source: &'a str, node: &crate::SyntaxNode) -> &'a str {
+            &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+        }
+
+        let function = root.descendants().find_map(FnDecl::cast).expect("function");
+        assert_eq!(
+            node_text(source, function.docs().expect("function docs").syntax()),
+            "/// Exported entry point."
+        );
+        let attributes = function.attrs().collect::<Vec<_>>();
+        assert_eq!(attributes.len(), 1);
+        let attribute = &attributes[0];
+        assert_eq!(
+            node_text(source, attribute.name().expect("attribute name").syntax()),
+            "allow"
+        );
+        let args = attribute.args().expect("attribute arguments");
+        let args = args.items().collect::<Vec<_>>();
+        assert_eq!(args.len(), 4);
+        assert_eq!(
+            node_text(
+                source,
+                args[0].name().expect("nested argument name").syntax()
+            ),
+            "check"
+        );
+        let nested_args = args[0]
+            .args()
+            .expect("nested attribute arguments")
+            .items()
+            .collect::<Vec<_>>();
+        assert_eq!(nested_args.len(), 1);
+        assert_eq!(
+            node_text(source, nested_args[0].name().expect("nested name").syntax()),
+            "name"
+        );
+        assert_eq!(
+            node_text(source, args[1].name().expect("named argument").syntax()),
+            "option"
+        );
+        assert_eq!(
+            args[1].string().expect("string argument").value().as_ref(),
+            "value"
+        );
+        assert_eq!(
+            node_text(
+                source,
+                args[2].name().expect("assigned argument name").syntax()
+            ),
+            "mode"
+        );
+        assert_eq!(
+            node_text(source, args[2].value().expect("identifier value").syntax()),
+            "FAST"
+        );
+        assert_eq!(
+            args[3].integer().and_then(|integer| integer.value()),
+            Some(42)
+        );
+        let export = function.visibility().expect("export visibility");
+        assert!(export.export_token().is_some());
+        assert!(export.pub_token().is_none());
+
+        let type_decl = root
+            .descendants()
+            .find_map(TypeDecl::cast)
+            .expect("type declaration");
+        assert!(type_decl.docs().is_some());
+        assert_eq!(type_decl.attrs().count(), 1);
+        let public_type = type_decl.visibility().expect("pub visibility");
+        assert!(public_type.pub_token().is_some());
+        assert!(public_type.export_token().is_none());
+        let fields = type_decl
+            .struct_def()
+            .and_then(|definition| definition.fields())
+            .expect("record fields")
+            .fields()
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        assert!(fields[0].pub_token().is_some());
+        assert!(fields[1].pub_token().is_none());
+
+        let trait_decl = root
+            .descendants()
+            .find_map(TraitDecl::cast)
+            .expect("trait declaration");
+        assert!(trait_decl.docs().is_some());
+        assert_eq!(trait_decl.attrs().count(), 1);
+        assert!(trait_decl.visibility().is_some());
+
+        let trait_items = trait_decl.items().expect("trait items");
+        let assoc_type_decl = trait_items
+            .assoc_type_decls()
+            .next()
+            .expect("associated type declaration");
+        assert!(assoc_type_decl.docs().is_some());
+        assert_eq!(assoc_type_decl.attrs().count(), 1);
+        let trait_method = trait_items.functions().next().expect("trait method");
+        assert!(trait_method.docs().is_some());
+        assert_eq!(trait_method.attrs().count(), 1);
+        assert!(trait_method.visibility().is_none());
+
+        let impls = root
+            .descendants()
+            .filter_map(ImplDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(impls.len(), 2);
+        for impl_decl in &impls {
+            assert!(impl_decl.docs().is_some());
+            assert_eq!(impl_decl.attrs().count(), 1);
+        }
+        let trait_impl_items = impls[0].items().expect("trait implementation items");
+        let assoc_type_def = trait_impl_items
+            .assoc_type_defs()
+            .next()
+            .expect("associated type definition");
+        assert!(assoc_type_def.docs().is_some());
+        assert_eq!(assoc_type_def.attrs().count(), 1);
+        let inherent_items = impls[1].items().expect("inherent implementation items");
+        let public_method = inherent_items
+            .functions()
+            .next()
+            .expect("public inherent method");
+        assert!(public_method.docs().is_some());
+        assert_eq!(public_method.attrs().count(), 1);
+        assert!(public_method.visibility().unwrap().pub_token().is_some());
+    }
+
+    #[test]
+    fn invalid_parameter_attributes_remain_reachable_in_the_ast() {
+        use crate::ast::{AstNode, FnDecl};
+
+        let source = concat!(
+            "impl Value {\n",
+            "fn inspect(@allow(UNUSED_IMPORTS) self: Self, @allow(UNUSED_IMPORTS) value: I32) {}\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+                .count(),
+            2
+        );
+        let root = crate::SyntaxNode::new_root(output.root);
+        let function = root.descendants().find_map(FnDecl::cast).expect("method");
+        let params = function.params().expect("parameter list");
+        assert_eq!(
+            params.self_param().expect("self parameter").attrs().count(),
+            1
+        );
+        assert_eq!(
+            params
+                .params()
+                .next()
+                .expect("named parameter")
+                .attrs()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn source_file_parses_aliases_generic_aliases_and_refinements() {
         let source = concat!(
             "/// Public identifier type.\n",

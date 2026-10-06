@@ -163,6 +163,7 @@ children SourceFile property_decls PropertyDecl
 child SourceFile module_header ModuleHeader 0
 child ModuleHeader docs Docs 0
 child UseDecl docs Docs 0
+children UseDecl attrs Attribute
 child UseDecl visibility Visibility 0
 token UseDecl package PkgPath
 child UseDecl alias UseAlias 0
@@ -171,7 +172,18 @@ child UseAlias name Name 0
 children UseItems items UseItem
 child UseItem name NameRef 0
 child_after UseItem alias Name AS_KW 0
+child Attribute name NameRef 0
+child Attribute args AttrArgs 0
+children AttrArgs items AttrArg
+child_before AttrArg name NameRef EQ 0
+child AttrArg args AttrArgs 0
+child_after AttrArg value NameRef EQ 0
+token AttrArg string StringLit
+token AttrArg integer IntLit
 child FnDecl name Name 0
+child FnDecl docs Docs 0
+children FnDecl attrs Attribute
+child FnDecl visibility Visibility 0
 child FnDecl generic_params GenericParamList 0
 child FnDecl params ParamList 0
 child FnDecl ret_type RetType 0
@@ -181,15 +193,21 @@ child FnDecl borrows_clause BorrowsClause 0
 child FnDecl effects_clause EffectsClause 0
 children FnDecl requires_clauses RequiresClause
 children FnDecl ensures_clauses EnsuresClause
+child TestDecl docs Docs 0
+children TestDecl attrs Attribute
 token TestDecl name StringLit
 child TestDecl body Block 0
+child PropertyDecl docs Docs 0
+children PropertyDecl attrs Attribute
 token PropertyDecl name StringLit
 child PropertyDecl params ParamList 0
 child PropertyDecl body Block 0
 children ParamList params Param
 child ParamList self_param SelfParam 0
+children Param attrs Attribute
 child Param name Name 0
 child Param ty Type 0
+children SelfParam attrs Attribute
 child SelfParam ty Type 0
 child RetType ty Type 0
 children WhereClause predicates WherePred
@@ -335,6 +353,9 @@ child CastExpr expression Expr 0
 child CastExpr ty Type 0
 child BinExpr lhs Expr 0
 child BinExpr rhs Expr 1
+child TypeDecl docs Docs 0
+children TypeDecl attrs Attribute
+child TypeDecl visibility Visibility 0
 child TypeDecl generic_params GenericParamList 0
 child TypeDecl struct_def StructDef 0
 child TypeDecl alias_def AliasDef 0
@@ -348,6 +369,9 @@ child FieldDecl ty Type 0
 child AliasDef ty Type 0
 child AliasDef refinement RefinementClause 0
 child RefinementClause expression Expr 0
+child EnumDecl docs Docs 0
+children EnumDecl attrs Attribute
+child EnumDecl visibility Visibility 0
 child EnumDecl name Name 0
 child EnumDecl generic_params GenericParamList 0
 child EnumDecl where_clause WhereClause 0
@@ -365,31 +389,52 @@ children VariantField attrs Attribute
 child VariantField name Name 0
 child VariantField ty Type 0
 token Discriminant integer IntLit
+child DistinctDecl docs Docs 0
+children DistinctDecl attrs Attribute
+child DistinctDecl visibility Visibility 0
 child DistinctDecl name Name 0
 child DistinctDecl generic_params GenericParamList 0
 child DistinctDecl base_type Type 0
 child DistinctDecl refinement RefinementClause 0
+child ResourceDecl docs Docs 0
+children ResourceDecl attrs Attribute
+child ResourceDecl visibility Visibility 0
 child ResourceDecl name Name 0
 child ResourceDecl fields FieldList 0
+child ConstDecl docs Docs 0
+children ConstDecl attrs Attribute
+child ConstDecl visibility Visibility 0
 child ConstDecl name Name 0
 child ConstDecl ty Type 0
 child ConstDecl initializer Expr 0
+child InvariantDecl docs Docs 0
+children InvariantDecl attrs Attribute
 child InvariantDecl name Name 0
 child InvariantDecl predicates InvariantExprList 0
 children InvariantExprList expressions Expr
+child EffectDecl docs Docs 0
+children EffectDecl attrs Attribute
+child EffectDecl visibility Visibility 0
 child EffectDecl name Name 0
 child EffectDecl covers CoversClause 0
 child CoversClause set EffectSet 0
 child EffectsClause set EffectSet 0
 children EffectSet effects EffectRef
 children EffectRef segments NameRef
+child TraitDecl docs Docs 0
+children TraitDecl attrs Attribute
+child TraitDecl visibility Visibility 0
 child TraitDecl name Name 0
 child TraitDecl generic_params GenericParamList 0
 child TraitDecl bounds BoundList 0
 child TraitDecl where_clause WhereClause 0
 child TraitDecl items ItemList 0
+child AssocTypeDecl docs Docs 0
+children AssocTypeDecl attrs Attribute
 child AssocTypeDecl name Name 0
 child AssocTypeDecl bounds BoundList 0
+child ImplDecl docs Docs 0
+children ImplDecl attrs Attribute
 child ImplDecl generic_params GenericParamList 0
 child_after ImplDecl for_type Type FOR_KW 0
 child ImplDecl interface_path ModPath 0
@@ -398,12 +443,22 @@ child ImplDecl items ItemList 0
 children ItemList functions FnDecl
 children ItemList assoc_type_decls AssocTypeDecl
 children ItemList assoc_type_defs AssocTypeDef
+child AssocTypeDef docs Docs 0
+children AssocTypeDef attrs Attribute
 child AssocTypeDef name Name 0
 child AssocTypeDef ty Type 0
+child InterfaceDecl docs Docs 0
+children InterfaceDecl attrs Attribute
+child InterfaceDecl visibility Visibility 0
 child InterfaceDecl name Name 0
 child InterfaceDecl items ItemList 0
+child IfaceResource docs Docs 0
+children IfaceResource attrs Attribute
 child IfaceResource name Name 0
 child IfaceResource items ItemList 0
+child WorldDecl docs Docs 0
+children WorldDecl attrs Attribute
+child WorldDecl visibility Visibility 0
 child WorldDecl name Name 0
 child WorldDecl items ItemList 0
 children ItemList types TypeDecl
@@ -412,13 +467,21 @@ children ItemList iface_resources IfaceResource
 children ItemList world_imports WorldImport
 children ItemList world_exports WorldExport
 children ItemList world_includes WorldInclude
+child WorldImport docs Docs 0
+children WorldImport attrs Attribute
 child WorldImport function FnDecl 0
 child WorldImport reference WorldRef 0
+child WorldExport docs Docs 0
+children WorldExport attrs Attribute
 child WorldExport function FnDecl 0
 child WorldExport reference WorldRef 0
+child WorldInclude docs Docs 0
+children WorldInclude attrs Attribute
 child WorldInclude reference WorldRef 0
 token WorldRef package PkgPath
 child WorldRef mod_path ModPath 0
+child ExternBlock docs Docs 0
+children ExternBlock attrs Attribute
 token ExternBlock abi StringLit
 child ExternBlock module ExternModule 0
 child ExternBlock items ItemList 0

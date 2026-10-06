@@ -1804,6 +1804,7 @@ impl Parser<'_, '_> {
     }
 
     fn trait_item(&mut self) -> Result<(), ParserError> {
+        let declaration = self.start();
         self.outer_docs()?;
         self.attributes(true)?;
         if self.at_any(&[SyntaxKind::PUB_KW, SyntaxKind::EXPORT_KW]) {
@@ -1821,11 +1822,10 @@ impl Parser<'_, '_> {
             visibility.complete(self, SyntaxKind::ERROR)?;
         }
         if self.at(SyntaxKind::TYPE_KW) {
-            return self.assoc_type_decl();
+            return self.assoc_type_decl(declaration);
         }
         if self.at_fn_decl_start() {
-            let function = self.start();
-            self.fn_decl(function, FnBodyPolicy::Optional)?;
+            self.fn_decl(declaration, FnBodyPolicy::Optional)?;
             return Ok(());
         }
 
@@ -1838,14 +1838,12 @@ impl Parser<'_, '_> {
             range,
             "expected an associated type or function in the trait",
         )?;
-        let error = self.start();
         self.recover_one()?;
-        error.complete(self, SyntaxKind::ERROR)?;
+        declaration.complete(self, SyntaxKind::ERROR)?;
         Ok(())
     }
 
-    fn assoc_type_decl(&mut self) -> Result<(), ParserError> {
-        let declaration = self.start();
+    fn assoc_type_decl(&mut self, declaration: Marker) -> Result<(), ParserError> {
         self.expect(SyntaxKind::TYPE_KW)?;
         self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
         if self.eat(SyntaxKind::COLON) {
@@ -1982,8 +1980,7 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    fn assoc_type_def(&mut self) -> Result<bool, ParserError> {
-        let definition = self.start();
+    fn assoc_type_def(&mut self, definition: Marker) -> Result<bool, ParserError> {
         self.expect(SyntaxKind::TYPE_KW)?;
         self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
         self.expect(SyntaxKind::EQ)?;
@@ -2134,6 +2131,7 @@ impl Parser<'_, '_> {
     }
 
     fn impl_item(&mut self, target_kind: ImplTargetKind) -> Result<bool, ParserError> {
+        let declaration = self.start();
         self.outer_docs()?;
         self.attributes(true)?;
         if self.at(SyntaxKind::PUB_KW) {
@@ -2193,11 +2191,10 @@ impl Parser<'_, '_> {
         }
 
         if self.at(SyntaxKind::TYPE_KW) {
-            return self.assoc_type_def();
+            return self.assoc_type_def(declaration);
         }
         if self.at_fn_decl_start() {
-            let function = self.start();
-            self.fn_decl(function, FnBodyPolicy::Required)?;
+            self.fn_decl(declaration, FnBodyPolicy::Required)?;
             return Ok(false);
         }
 
@@ -2210,9 +2207,8 @@ impl Parser<'_, '_> {
             range,
             "expected an associated type definition or function in the impl",
         )?;
-        let error = self.start();
         self.recover_one()?;
-        error.complete(self, SyntaxKind::ERROR)?;
+        declaration.complete(self, SyntaxKind::ERROR)?;
         Ok(false)
     }
 

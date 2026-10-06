@@ -1024,6 +1024,12 @@ impl ModuleHeader {
     }
 }
 
+impl FieldDecl {
+    pub fn pub_token(&self) -> Option<SyntaxToken> {
+        direct_token_of_kind(self.syntax(), SyntaxKind::PUB_KW)
+    }
+}
+
 impl Visibility {
     pub fn pub_token(&self) -> Option<SyntaxToken> {
         direct_token_of_kind(self.syntax(), SyntaxKind::PUB_KW)
