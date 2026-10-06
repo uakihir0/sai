@@ -17,6 +17,7 @@ mod grammar;
 pub struct Parser<'src, 'tokens> {
     source: &'src str,
     tokens: &'tokens [Token],
+    matching_r_parens: Vec<usize>,
     position: usize,
     events: Vec<Event>,
     diagnostic_source: Option<DiagnosticSource<'src>>,
@@ -33,6 +34,23 @@ pub struct Parser<'src, 'tokens> {
     nesting_depth: usize,
     reported_nesting_limit: bool,
     spec_failures: HashSet<usize>,
+}
+
+fn compute_matching_r_parens(tokens: &[Token]) -> Vec<usize> {
+    let mut matching_r_parens = vec![usize::MAX; tokens.len()];
+    let mut open_parens = Vec::new();
+    for (position, token) in tokens.iter().enumerate() {
+        match token.kind {
+            SyntaxKind::L_PAREN => open_parens.push(position),
+            SyntaxKind::R_PAREN => {
+                if let Some(open_position) = open_parens.pop() {
+                    matching_r_parens[open_position] = position;
+                }
+            }
+            _ => {}
+        }
+    }
+    matching_r_parens
 }
 
 struct DiagnosticSource<'src> {
@@ -145,9 +163,11 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
             }
             previous_end = end;
         }
+        let matching_r_parens = compute_matching_r_parens(tokens);
         Ok(Parser {
             source,
             tokens,
+            matching_r_parens,
             position: 0,
             events: Vec::new(),
             diagnostic_source: None,
@@ -1174,6 +1194,173 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_distinct_types_and_refinements() {
+        let source = concat!(
+            "distinct UserId = U64\n",
+            "pub distinct Money = pub I64\n",
+            "distinct Meters<T> = T\n",
+            "distinct Age = U8\n",
+            "where self <= 150\n",
+            "distinct Refined<T> = T where self == self\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISTINCT_DECL)
+                .count(),
+            5
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::GENERIC_PARAM_LIST)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::REFINEMENT_CLAUSE)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn distinct_base_type_can_follow_a_suppressed_physical_newline() {
+        let source = concat!(
+            "distinct UserId =\n",
+            "U64\n",
+            "distinct Opaque =\n",
+            "pub\n",
+            "I64\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISTINCT_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn source_file_rejects_exported_distinct_and_keeps_public_visibility() {
+        let source = concat!(
+            "export distinct Hidden = U32\n",
+            "pub distinct Opaque = U32\n",
+            "pub distinct VisibleCtor = pub U64\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::InvalidExportTarget);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISTINCT_DECL)
+                .count(),
+            3
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            3
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn malformed_distinct_base_preserves_a_following_function() {
+        let source = "distinct Broken =\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISTINCT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn incomplete_distinct_borrow_base_preserves_a_following_function() {
+        let source = "distinct Broken = borrow\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISTINCT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn distinct_declaration_in_block_is_recovered_as_an_item() {
+        let source = "fn outer() {\ndistinct Local = U32\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISTINCT_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_enum_close_preserves_following_block_statements() {
         let source = concat!(
             "fn f() {\n",
@@ -1321,6 +1508,34 @@ mod tests {
         assert_eq!(
             root.descendants()
                 .filter(|node| node.kind() == SyntaxKind::BLOCK)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_enum_close_preserves_a_call_with_an_operator_after_a_type_path() {
+        let source = concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "Some(Foo + 1)\n",
+            "let later = 2\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
                 .count(),
             1
         );
@@ -1614,6 +1829,46 @@ mod tests {
     }
 
     #[test]
+    fn repeated_unclosed_tuple_variants_recover_at_following_statements() {
+        let mut source = String::from("fn f() {\nenum Broken {\nValue(I32)\n");
+        for index in 0..256 {
+            source.push_str(&format!("V{index}(1\n"));
+        }
+        source.push_str("let later = 2\n}\n}\n");
+
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn deeply_parenthesized_enum_payload_lookahead_obeys_the_nesting_limit() {
+        let mut source = String::from("enum Deep {\nValue(");
+        source.push_str(&"(".repeat(10_000));
+        source.push_str("I32");
+        source.push_str(&")".repeat(10_000));
+        source.push_str(")\n}\n");
+
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ImplementationLimitExceeded)
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn malformed_variant_list_keeps_later_variants_and_source_text() {
         let source = "enum E { , First, Second }\n";
         let output = parse_file(source);
@@ -1800,22 +2055,45 @@ mod tests {
 
     #[test]
     fn missing_use_items_close_stops_before_contextual_item_starters() {
-        for source in [
-            "use sai:http.{Request\ntest \"later\" {}\n",
-            "use sai:http.{Request\ndistinct Thing\n",
-        ] {
-            let (snapshot_file, lexed) = lex_file(source);
-            let mut parser = Parser::new_for_file(&snapshot_file, &lexed.tokens)
-                .expect("valid lexer token stream");
+        let source = "use sai:http.{Request\ntest \"later\" {}\n";
+        let (snapshot_file, lexed) = lex_file(source);
+        let mut parser =
+            Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
 
-            assert!(matches!(
-                parser.parse_source_file(),
-                Err(ParserError::UnsupportedItem {
-                    kind: SyntaxKind::LIDENT,
-                    ..
-                })
-            ));
-        }
+        assert!(matches!(
+            parser.parse_source_file(),
+            Err(ParserError::UnsupportedItem {
+                kind: SyntaxKind::LIDENT,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_use_items_close_preserves_a_following_distinct_declaration() {
+        let source = "use sai:http.{Request\ndistinct Thing = U32\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::USE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DISTINCT_DECL)
+                .count(),
+            1
+        );
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
     }
 
     #[test]
@@ -5796,7 +6074,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "distinct UserId = U32\n";
+        let source = "resource UserId\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");

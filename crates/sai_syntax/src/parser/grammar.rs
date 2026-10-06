@@ -321,6 +321,10 @@ impl Parser<'_, '_> {
             return self.enum_decl(declaration);
         }
 
+        if self.at_contextual("distinct") && self.nth(1) == SyntaxKind::UIDENT {
+            return self.distinct_decl(declaration);
+        }
+
         if !self.at(SyntaxKind::USE_KW) {
             let position = self.position;
             let kind = self.current();
@@ -395,6 +399,40 @@ impl Parser<'_, '_> {
             }
         }
         declaration.complete(self, SyntaxKind::ENUM_DECL)
+    }
+
+    fn distinct_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::LT) {
+            self.generic_param_list()?;
+        }
+        self.expect(SyntaxKind::EQ)?;
+        self.eat(SyntaxKind::PUB_KW);
+        if self.item_starts_at_after_attributes(self.position) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "expected a base type before the next item",
+            )?;
+            self.start().complete(self, SyntaxKind::ERROR)?;
+        } else {
+            self.type_(true)?;
+        }
+        if self.at(SyntaxKind::NEWLINE) && self.nth(1) == SyntaxKind::WHERE_KW {
+            self.eat_nl();
+        }
+        if self.at(SyntaxKind::WHERE_KW) {
+            let refinement = self.start();
+            self.bump();
+            self.expr_bp(0)?;
+            refinement.complete(self, SyntaxKind::REFINEMENT_CLAUSE)?;
+        }
+        declaration.complete(self, SyntaxKind::DISTINCT_DECL)
     }
 
     fn variant_list(
@@ -599,7 +637,12 @@ impl Parser<'_, '_> {
 
         match token.kind {
             SyntaxKind::LIDENT | SyntaxKind::UIDENT => {
-                self.generic_argument_path_type_starts_at(position)
+                let Some(after_type) = self.generic_argument_path_type_end_at(position) else {
+                    return false;
+                };
+                self.tokens.get(after_type).is_some_and(|next| {
+                    matches!(next.kind, SyntaxKind::COMMA | SyntaxKind::R_PAREN)
+                })
             }
             SyntaxKind::FN_KW => !self.closure_body_follows_fn_type(position),
             SyntaxKind::L_PAREN => self.variant_parenthesized_type_starts_at(position),
@@ -612,11 +655,17 @@ impl Parser<'_, '_> {
     }
 
     fn variant_parenthesized_type_starts_at(&self, position: usize) -> bool {
-        let inner_position = position + 1;
-        self.tokens
+        let mut inner_position = position + 1;
+        while self
+            .tokens
             .get(inner_position)
-            .is_some_and(|token| token.kind == SyntaxKind::R_PAREN)
-            || self.variant_payload_type_starts_at(inner_position)
+            .is_some_and(|token| token.kind == SyntaxKind::L_PAREN)
+        {
+            inner_position += 1;
+        }
+        self.tokens.get(inner_position).is_some_and(|token| {
+            token.kind == SyntaxKind::R_PAREN || self.variant_payload_type_starts_at(inner_position)
+        })
     }
 
     fn variant_field_list_boundary(&self) -> bool {
@@ -708,26 +757,13 @@ impl Parser<'_, '_> {
             return false;
         }
 
-        let mut depth = 0usize;
-        let mut after_call = None;
-        for (index, token) in self.tokens.iter().enumerate().skip(position + 1) {
-            match token.kind {
-                SyntaxKind::L_PAREN => depth += 1,
-                SyntaxKind::R_PAREN => {
-                    let Some(next_depth) = depth.checked_sub(1) else {
-                        return false;
-                    };
-                    depth = next_depth;
-                    if depth == 0 {
-                        after_call = Some(index + 1);
-                        break;
-                    }
-                }
-                SyntaxKind::EOF => return false,
-                _ => {}
-            }
-        }
-        let Some(mut next_position) = after_call else {
+        let Some(mut next_position) = self
+            .matching_r_parens
+            .get(position + 1)
+            .copied()
+            .filter(|close| *close != usize::MAX)
+            .map(|close| close + 1)
+        else {
             return false;
         };
         while self.tokens.get(next_position).is_some_and(|token| {
@@ -4793,13 +4829,13 @@ impl Parser<'_, '_> {
                 let ty = self.start();
                 self.bump();
                 self.eat(SyntaxKind::MUT_KW);
-                self.type_(true)?;
+                self.type_operand(true)?;
                 ty.complete(self, SyntaxKind::BORROW_TYPE)?;
             }
             SyntaxKind::OWNED_KW => {
                 let ty = self.start();
                 self.bump();
-                self.type_no_fx()?;
+                self.type_operand(false)?;
                 ty.complete(self, SyntaxKind::OWNED_TYPE)?;
             }
             SyntaxKind::SELF_TYPE_KW => self.self_type()?,
@@ -4816,6 +4852,22 @@ impl Parser<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    fn type_operand(&mut self, allow_fx: bool) -> Result<(), ParserError> {
+        if self.at_physical_line_start() && self.item_starts_at_after_attributes(self.position) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "expected a type before the next item",
+            )?;
+            return Ok(());
+        }
+        self.type_(allow_fx)
     }
 
     fn recover_overdeep_type(&mut self) -> Result<(), ParserError> {
@@ -5174,7 +5226,11 @@ impl Parser<'_, '_> {
         }
     }
 
-    fn generic_argument_path_type_starts_at(&self, mut position: usize) -> bool {
+    fn generic_argument_path_type_starts_at(&self, position: usize) -> bool {
+        self.generic_argument_path_type_end_at(position).is_some()
+    }
+
+    fn generic_argument_path_type_end_at(&self, mut position: usize) -> Option<usize> {
         while self
             .tokens
             .get(position)
@@ -5185,7 +5241,7 @@ impl Parser<'_, '_> {
                 .get(position + 1)
                 .is_some_and(|token| token.kind == SyntaxKind::DOT)
             {
-                return false;
+                return None;
             }
             position += 2;
         }
@@ -5194,7 +5250,7 @@ impl Parser<'_, '_> {
             .get(position)
             .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
         {
-            return false;
+            return None;
         }
 
         loop {
@@ -5204,10 +5260,7 @@ impl Parser<'_, '_> {
                 .get(position)
                 .is_some_and(|token| token.kind == SyntaxKind::LT)
             {
-                let Some(after_args) = self.skip_generic_argument_list_at(position) else {
-                    return false;
-                };
-                position = after_args;
+                position = self.skip_generic_argument_list_at(position)?;
             }
             if self
                 .tokens
@@ -5219,15 +5272,16 @@ impl Parser<'_, '_> {
                     .get(position + 1)
                     .is_some_and(|token| token.kind == SyntaxKind::UIDENT)
                 {
-                    return false;
+                    return None;
                 }
                 position += 1;
                 continue;
             }
-            return !self
+            return (!self
                 .tokens
                 .get(position)
-                .is_some_and(|token| token.kind == SyntaxKind::L_PAREN);
+                .is_some_and(|token| token.kind == SyntaxKind::L_PAREN))
+            .then_some(position);
         }
     }
 
