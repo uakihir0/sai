@@ -3140,6 +3140,48 @@ mod tests {
     }
 
     #[test]
+    fn binding_pattern_accessors_distinguish_binding_modes() {
+        use crate::ast::{AstNode, BindingModeKind, BindingPat};
+
+        let source = concat!(
+            "fn binding_modes(value: I32, items: I32) {\n",
+            "let plain = value\n",
+            "let var mutable = value\n",
+            "let borrow shared = value\n",
+            "let borrow mut exclusive = value\n",
+            "let [..borrow mut rest] = items\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let bindings = root
+            .descendants()
+            .filter_map(BindingPat::cast)
+            .map(|binding| {
+                let name = binding
+                    .name()
+                    .and_then(|name| name.token())
+                    .expect("binding name")
+                    .text()
+                    .to_owned();
+                let mode = binding.mode().and_then(|mode| mode.kind());
+                (name, mode)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bindings,
+            [
+                ("plain".to_owned(), None),
+                ("mutable".to_owned(), Some(BindingModeKind::Var)),
+                ("shared".to_owned(), Some(BindingModeKind::Borrow)),
+                ("exclusive".to_owned(), Some(BindingModeKind::BorrowMut)),
+                ("rest".to_owned(), Some(BindingModeKind::BorrowMut)),
+            ]
+        );
+    }
+
+    #[test]
     fn generated_function_and_statement_roles_follow_parsed_children() {
         use crate::ast::{AstNode, Item, Stmt};
 

@@ -733,6 +733,13 @@ pub enum PrefixOp {
     Not,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BindingModeKind {
+    Var,
+    Borrow,
+    BorrowMut,
+}
+
 impl IntLit {
     pub fn value(&self) -> Option<u128> {
         if self.syntax().has_error() {
@@ -1194,6 +1201,23 @@ impl PrefixExpr {
             _ => return None,
         };
         Some((token, op))
+    }
+}
+
+impl BindingMode {
+    pub fn kind(&self) -> Option<BindingModeKind> {
+        let token =
+            direct_token_of_kinds(self.syntax(), &[SyntaxKind::VAR_KW, SyntaxKind::BORROW_KW])?;
+        Some(match token.kind() {
+            SyntaxKind::VAR_KW => BindingModeKind::Var,
+            SyntaxKind::BORROW_KW
+                if direct_token_of_kind(self.syntax(), SyntaxKind::MUT_KW).is_some() =>
+            {
+                BindingModeKind::BorrowMut
+            }
+            SyntaxKind::BORROW_KW => BindingModeKind::Borrow,
+            _ => return None,
+        })
     }
 }
 
