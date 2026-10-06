@@ -186,5 +186,44 @@ child AssignStmt rhs Expr 1
 child_before AssertStmt condition Expr COMMA 0
 child_after AssertStmt message Expr COMMA 0
 child ExprStmt expression Expr 0
+child IfExpr condition Condition 0
+child IfExpr then_branch Block 0
+child IfExpr else_branch ElseBranch 0
+child ElseBranch block Block 0
+child ElseBranch else_if IfExpr 0
+child Condition expression Expr 0
+child Condition let_condition LetCondition 0
+child LetCondition pattern Pattern 0
+child LetCondition initializer Expr 0
+child MatchExpr scrutinee Expr 0
+child MatchExpr arms MatchArmList 0
+children MatchArmList arms MatchArm
+child MatchArm pattern Pattern 0
+child MatchArm guard MatchGuard 0
+child MatchArm expression Expr 0
+child MatchGuard expression Expr 0
+child LoopExpr label LoopLabel 0
+child LoopExpr body Block 0
+child WhileExpr label LoopLabel 0
+child WhileExpr condition Condition 0
+child WhileExpr body Block 0
+child ForExpr label LoopLabel 0
+child ForExpr pattern Pattern 0
+child ForExpr iterable Expr 0
+child ForExpr body Block 0
+child ClosureExpr params ClosureParamList 0
+child ClosureExpr ret_type RetType 0
+child ClosureExpr body Block 0
+children ClosureParamList params ClosureParam
+child ClosureParam name Name 0
+child ClosureParam ty Type 0
+child RegionExpr name Name 0
+child RegionExpr body Block 0
+child BlockExpr block Block 0
+child UnsafeBlockExpr body Block 0
+child AsyncBlockExpr body Block 0
+child ReturnExpr value Expr 0
+child BreakExpr value Expr 0
+child PrefixExpr operand Expr 0
 child BinExpr lhs Expr 0
 child BinExpr rhs Expr 1

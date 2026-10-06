@@ -2389,6 +2389,179 @@ mod tests {
     }
 
     #[test]
+    fn generated_control_flow_roles_follow_parsed_children() {
+        use crate::ast::{
+            AstNode, AsyncBlockExpr, BreakExpr, ClosureExpr, ForExpr, IfExpr, LoopExpr, MatchExpr,
+            PrefixExpr, RegionExpr, ReturnExpr, UnsafeBlockExpr, WhileExpr,
+        };
+
+        let source = concat!(
+            "fn controls(flag: Bool, values: I32) {\n",
+            "let plain = if flag { 1 } else { 2 }\n",
+            "let chain = if flag { 1 } else if flag { 2 } else { 3 }\n",
+            "let matched_if = if let Some(item) = values { item } else { 0 }\n",
+            "let matched = match values {\n",
+            "Some(item) if flag => item,\n",
+            "_ => 0,\n",
+            "}\n",
+            "'outer:\n",
+            "loop { break 'outer 1 }\n",
+            "while let Some(item) = values { break }\n",
+            "for item in values { continue }\n",
+            "let callback = fn(x: I32) -> I32 { x }\n",
+            "let plain_callback = fn(y) { y }\n",
+            "let task = async { values }\n",
+            "let guarded = unsafe { values }\n",
+            "let scoped = region arena { values }\n",
+            "let block = { values }\n",
+            "let negative = -values\n",
+            "return values\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let ifs = root
+            .descendants()
+            .filter_map(IfExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(ifs.len(), 4);
+        let plain_else = ifs[0].else_branch().expect("plain else branch");
+        assert!(
+            ifs[0]
+                .condition()
+                .and_then(|condition| condition.expression())
+                .is_some()
+        );
+        assert!(ifs[0].then_branch().is_some());
+        assert!(plain_else.block().is_some());
+        assert!(plain_else.else_if().is_none());
+
+        let chained_else = ifs[1].else_branch().expect("chained else branch");
+        assert!(chained_else.else_if().is_some());
+        let if_let_condition = ifs
+            .iter()
+            .find_map(|if_expr| if_expr.condition()?.let_condition())
+            .expect("if-let condition");
+        assert!(if_let_condition.pattern().is_some());
+        assert!(if_let_condition.initializer().is_some());
+
+        let matched = root
+            .descendants()
+            .find_map(MatchExpr::cast)
+            .expect("match expression");
+        assert!(matched.scrutinee().is_some());
+        let arms = matched
+            .arms()
+            .expect("match arm list")
+            .arms()
+            .collect::<Vec<_>>();
+        assert_eq!(arms.len(), 2);
+        assert!(arms[0].pattern().is_some());
+        let guard = arms[0].guard().expect("guarded arm");
+        assert!(guard.expression().is_some());
+        assert!(arms[0].expression().is_some());
+        assert!(arms[1].guard().is_none());
+
+        let loop_expr = root
+            .descendants()
+            .find_map(LoopExpr::cast)
+            .expect("loop expression");
+        assert!(loop_expr.label().is_some());
+        assert!(loop_expr.body().is_some());
+
+        let while_expr = root
+            .descendants()
+            .find_map(WhileExpr::cast)
+            .expect("while expression");
+        assert!(while_expr.label().is_none());
+        let while_condition = while_expr.condition().expect("while condition");
+        assert!(while_condition.let_condition().is_some());
+        assert!(while_expr.body().is_some());
+
+        let for_expr = root
+            .descendants()
+            .find_map(ForExpr::cast)
+            .expect("for expression");
+        assert!(for_expr.label().is_none());
+        assert!(for_expr.pattern().is_some());
+        assert!(for_expr.iterable().is_some());
+        assert!(for_expr.body().is_some());
+
+        let closures = root
+            .descendants()
+            .filter_map(ClosureExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(closures.len(), 2);
+        let closure = &closures[0];
+        let params = closure.params().expect("closure parameter list");
+        let param = params.params().next().expect("closure parameter");
+        assert!(param.name().is_some());
+        assert!(param.ty().is_some());
+        assert!(
+            closure
+                .ret_type()
+                .and_then(|ret_type| ret_type.ty())
+                .is_some()
+        );
+        assert!(closure.body().is_some());
+        assert!(closures[1].ret_type().is_none());
+
+        let async_block = root
+            .descendants()
+            .find_map(AsyncBlockExpr::cast)
+            .expect("async block");
+        assert!(async_block.body().is_some());
+        let unsafe_block = root
+            .descendants()
+            .find_map(UnsafeBlockExpr::cast)
+            .expect("unsafe block");
+        assert!(unsafe_block.body().is_some());
+        let region = root
+            .descendants()
+            .find_map(RegionExpr::cast)
+            .expect("region expression");
+        assert_eq!(
+            region
+                .name()
+                .and_then(|name| name.token())
+                .expect("region binder")
+                .text(),
+            "arena"
+        );
+        assert!(region.body().is_some());
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::BLOCK_EXPR)
+        );
+        assert!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BLOCK_EXPR)
+                .all(|node| crate::ast::BlockExpr::cast(node).unwrap().block().is_some())
+        );
+
+        assert!(
+            root.descendants()
+                .find_map(BreakExpr::cast)
+                .and_then(|expression| expression.value())
+                .is_some()
+        );
+        assert!(
+            root.descendants()
+                .find_map(ReturnExpr::cast)
+                .and_then(|expression| expression.value())
+                .is_some()
+        );
+        assert!(
+            root.descendants()
+                .find_map(PrefixExpr::cast)
+                .and_then(|expression| expression.operand())
+                .is_some()
+        );
+    }
+
+    #[test]
     fn typed_ast_views_cast_only_matching_nodes_and_tokens() {
         use crate::ast::{
             AstNode, AstToken, Block, BorrowType, FnPtrType, InferType, Name, OwnedType, Param,
@@ -7160,6 +7333,8 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
 
     #[test]
     fn match_arm_recovery_preserves_a_later_arm_after_a_missing_separator() {
+        use crate::ast::AstNode;
+
         let output =
             parse_file("fn f(value: Option<I32>) { match value { Some(1) => 1 None => 2 } }\n");
         let root = crate::SyntaxNode::new_root(output.root);
@@ -7177,6 +7352,21 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
             2,
             "separator recovery should continue at the next pattern"
         );
+        let match_expr = root
+            .descendants()
+            .find_map(crate::ast::MatchExpr::cast)
+            .expect("recovered match expression");
+        let arms = match_expr
+            .arms()
+            .expect("match arm list")
+            .arms()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arms.len(),
+            2,
+            "generated iteration should skip recovery nodes"
+        );
+        assert!(arms.iter().all(|arm| arm.expression().is_some()));
     }
 
     #[test]
