@@ -1346,7 +1346,7 @@ pub struct Body<'hir> {
     pub contracts: &'hir [Contract<'hir>],    // requires and ensures, in source order
     pub invariant_preds: &'hir [&'hir Expr<'hir>],  // only for invariant owners: one predicate per listed expression
 }
-pub struct BodyParam<'hir> { pub hir_id: HirId, pub binding: BindingId, pub name: Option<Name>, pub mutable: bool }
+pub struct BodyParam { pub hir_id: HirId, pub binding: BindingId, pub name: Option<Name>, pub mutable: bool }
 pub struct Contract<'hir> { pub hir_id: HirId, pub kind: ContractKind, pub expr: &'hir Expr<'hir> }
 pub enum ContractKind { Requires, Ensures }
 ```
@@ -1461,7 +1461,7 @@ pub enum GenericArg<'hir> { Type(&'hir Ty<'hir>), Const(ConstArg), Binding { nam
 pub enum ConstArg { Int { value: Option<u128>, negated: bool }, Char(char), Bool(bool) }
 ```
 
-**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `sai_hir::literals` and `sai_hir::patterns` define decoded HIR literals and the complete pattern node family. `sai_hir::expressions` defines expression, block, statement, match-arm, closure, and format-string nodes. Source-bearing records compare and hash their semantic contents while excluding spans, so moving syntax does not change their value equality. `Lit::ByteStr` borrows its bytes from the arena. The session-owned `sai_hir::arena::HirArena` provides typed storage for type, pattern, expression, statement, block, arm, closure, literal, and child-list data. Item/function declarations, body wrappers, and syntax-to-HIR lowering remain follow-up work.
+**Current implementation slice.** `sai_hir::types` defines `Name`, the complete `LangItem` list, type/path nodes, generic arguments and parameters, where predicates, bounds, effect references, and provenance. `sai_hir::literals` and `sai_hir::patterns` define decoded HIR literals and the complete pattern node family. `sai_hir::expressions` defines expression, block, statement, match-arm, closure, and format-string nodes; `sai_hir::body` defines function signatures, body parameters, contracts, and bodies. Source-bearing records compare and hash their semantic contents while excluding spans, so moving syntax does not change their value equality. `Lit::ByteStr` borrows its bytes from the arena. The session-owned `sai_hir::arena::HirArena` provides typed storage for type, pattern, expression, statement, block, arm, closure, body, literal, and child-list data. Item/function declarations and syntax-to-HIR lowering remain follow-up work.
 
 Notes on the shape:
 

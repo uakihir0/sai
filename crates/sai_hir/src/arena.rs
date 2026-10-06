@@ -1,3 +1,4 @@
+use crate::body::{Body, BodyParam, Contract, FnParam};
 use crate::expressions::{Arg, Arm, Block, Closure, ClosureParam, Expr, FmtPiece, Stmt};
 use crate::literals::Lit;
 use crate::patterns::{Pat, PatArg};
@@ -47,6 +48,15 @@ pub struct HirArena<'hir> {
     blocks: Arena<Block<'hir>>,
     stmts: Arena<Stmt<'hir>>,
     stmt_lists: Arena<Stmt<'hir>>,
+    fn_params: Arena<FnParam<'hir>>,
+    fn_param_lists: Arena<FnParam<'hir>>,
+    body: Arena<Body<'hir>>,
+    body_params: Arena<BodyParam>,
+    body_param_lists: Arena<BodyParam>,
+    contracts: Arena<Contract<'hir>>,
+    contract_lists: Arena<Contract<'hir>>,
+    hir_id_lists: Arena<crate::HirId>,
+    expr_ref_lists: Arena<&'hir Expr<'hir>>,
 }
 
 impl<'hir> HirArena<'hir> {
@@ -90,6 +100,15 @@ impl<'hir> HirArena<'hir> {
             blocks: Arena::new(),
             stmts: Arena::new(),
             stmt_lists: Arena::new(),
+            fn_params: Arena::new(),
+            fn_param_lists: Arena::new(),
+            body: Arena::new(),
+            body_params: Arena::new(),
+            body_param_lists: Arena::new(),
+            contracts: Arena::new(),
+            contract_lists: Arena::new(),
+            hir_id_lists: Arena::new(),
+            expr_ref_lists: Arena::new(),
         }
     }
 
@@ -259,6 +278,42 @@ impl<'hir> HirArena<'hir> {
     pub fn alloc_stmts(&'hir self, stmts: &[Stmt<'hir>]) -> &'hir [Stmt<'hir>] {
         self.stmt_lists.alloc_slice(stmts)
     }
+
+    pub fn alloc_fn_param(&'hir self, param: FnParam<'hir>) -> &'hir FnParam<'hir> {
+        self.fn_params.alloc(param)
+    }
+
+    pub fn alloc_fn_params(&'hir self, params: &[FnParam<'hir>]) -> &'hir [FnParam<'hir>] {
+        self.fn_param_lists.alloc_slice(params)
+    }
+
+    pub fn alloc_body(&'hir self, body: Body<'hir>) -> &'hir Body<'hir> {
+        self.body.alloc(body)
+    }
+
+    pub fn alloc_body_param(&'hir self, param: BodyParam) -> &'hir BodyParam {
+        self.body_params.alloc(param)
+    }
+
+    pub fn alloc_body_params(&'hir self, params: &[BodyParam]) -> &'hir [BodyParam] {
+        self.body_param_lists.alloc_slice(params)
+    }
+
+    pub fn alloc_contract(&'hir self, contract: Contract<'hir>) -> &'hir Contract<'hir> {
+        self.contracts.alloc(contract)
+    }
+
+    pub fn alloc_contracts(&'hir self, contracts: &[Contract<'hir>]) -> &'hir [Contract<'hir>] {
+        self.contract_lists.alloc_slice(contracts)
+    }
+
+    pub fn alloc_hir_ids(&'hir self, ids: &[crate::HirId]) -> &'hir [crate::HirId] {
+        self.hir_id_lists.alloc_slice(ids)
+    }
+
+    pub fn alloc_expr_refs(&'hir self, exprs: &[&'hir Expr<'hir>]) -> &'hir [&'hir Expr<'hir>] {
+        self.expr_ref_lists.alloc_slice(exprs)
+    }
 }
 
 impl Default for HirArena<'_> {
@@ -270,6 +325,7 @@ impl Default for HirArena<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::FnSig;
     use crate::expressions::{CaptureBy, ExprKind, FmtSpec, MatchSource, StmtKind};
     use crate::patterns::PatKind;
     use crate::types::{
@@ -549,5 +605,72 @@ mod tests {
         assert!(matches!(match_expr.kind, ExprKind::Match { .. }));
         assert!(matches!(closure_expr.kind, ExprKind::Closure(_)));
         assert!(matches!(fmt_expr.kind, ExprKind::FormatString(_)));
+    }
+
+    #[test]
+    fn arena_stores_function_signatures_and_body_contract_lists() {
+        let arena = HirArena::new();
+        let hir_id = test_hir_id();
+        let symbols = Interner::new();
+        let name = Name {
+            sym: symbols.intern("arg").expect("symbol interns"),
+            span: span(2),
+        };
+        let ty = arena.alloc_ty(Ty {
+            hir_id,
+            kind: TyKind::Infer,
+            span: span(3),
+        });
+        let fn_param = arena.alloc_fn_param(FnParam {
+            hir_id,
+            name: Some(name),
+            is_self: false,
+            mutable: true,
+            ty,
+        });
+        let fn_params = arena.alloc_fn_params(&[*fn_param]);
+        let required = arena.alloc_hir_ids(&[hir_id]);
+        let signature = FnSig {
+            safety: crate::Safety::Unsafe,
+            is_async: true,
+            params: fn_params,
+            ret: Some(ty),
+            borrows: None,
+            effects: None,
+            requires: required,
+            ensures: &[],
+        };
+        let expression = arena.alloc_expr(Expr {
+            hir_id,
+            kind: ExprKind::Lit(Lit::Bool(true)),
+            span: span(5),
+        });
+        let body_param = arena.alloc_body_param(BodyParam {
+            hir_id,
+            binding: crate::BindingId::default(),
+            name: Some(name),
+            mutable: true,
+        });
+        let body_params = arena.alloc_body_params(&[*body_param]);
+        let contract = arena.alloc_contract(Contract {
+            hir_id,
+            kind: crate::body::ContractKind::Ensures,
+            expr: expression,
+        });
+        let contracts = arena.alloc_contracts(&[*contract]);
+        let invariant_preds = arena.alloc_expr_refs(&[expression]);
+        let body = arena.alloc_body(Body {
+            owner: hir_id.owner,
+            params: body_params,
+            value: expression,
+            contracts,
+            invariant_preds,
+        });
+
+        assert_eq!(signature.params[0].name, Some(name));
+        assert_eq!(signature.requires, &[hir_id]);
+        assert_eq!(body.params[0].binding, crate::BindingId::default());
+        assert_eq!(body.contracts[0].kind, crate::body::ContractKind::Ensures);
+        assert_eq!(body.invariant_preds, &[expression]);
     }
 }
