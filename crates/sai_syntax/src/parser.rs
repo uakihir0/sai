@@ -1361,6 +1361,128 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_resources_with_optional_bodies_and_shared_fields() {
+        let source = concat!(
+            "resource UserId\n",
+            "pub resource File\n",
+            "{\n",
+            "pub name: Str\n",
+            "owner: U32\n",
+            "}\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::RESOURCE_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FIELD_LIST)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FIELD_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn exported_resources_are_diagnosed_and_missing_resource_close_preserves_next_item() {
+        let exported = "export resource Handle\npub resource Empty {}\n";
+        let output = parse_file(exported);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidExportTarget)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::RESOURCE_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            2
+        );
+
+        let source = "resource File {\nname: Str\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::RESOURCE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn resource_declaration_in_block_is_recovered_as_an_item() {
+        let source = "fn outer() {\nresource Local { id: U32 }\nlet later = 1\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ItemInBlock)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::RESOURCE_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_enum_close_preserves_following_block_statements() {
         let source = concat!(
             "fn f() {\n",
@@ -1533,6 +1655,42 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_enum_close_preserves_calls_with_type_prefix_expression_arguments() {
+        let mut source = String::from(concat!(
+            "fn f() {\n",
+            "enum Broken {\n",
+            "Value(I32)\n",
+            "Some(borrow value + 1)\n",
+            "Some(Self + 1)\n",
+        ));
+        for index in 0..128 {
+            source.push_str(&format!("Some(borrow value{index} + 1)\n"));
+        }
+        source.push_str("let later = 2\n}\n");
+
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        let expression_texts = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::EXPR_STMT)
+            .map(|node| {
+                &source[node.text_range().start().to_usize()..node.text_range().end().to_usize()]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expression_texts.len(), 130);
+        assert_eq!(expression_texts[0], "Some(borrow value + 1)");
+        assert_eq!(expression_texts[1], "Some(Self + 1)");
         assert_eq!(
             root.descendants()
                 .filter(|node| node.kind() == SyntaxKind::LET_STMT)
@@ -6074,7 +6232,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "resource UserId\n";
+        let source = "trait UserId\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -6082,7 +6240,7 @@ mod tests {
             parser.parse_source_file(),
             Err(ParserError::UnsupportedItem {
                 position: 0,
-                kind: SyntaxKind::LIDENT
+                kind: SyntaxKind::TRAIT_KW
             })
         );
     }
