@@ -929,6 +929,155 @@ mod tests {
     }
 
     #[test]
+    fn source_file_parses_constant_declarations_and_initializers() {
+        let source = concat!(
+            "/// The answer.\n",
+            "@const_attr\n",
+            "pub const ANSWER: I32 = 40 + 2\n",
+            "const MESSAGE: Str = \"ready\"\n",
+            "const MULTILINE: I32 =\n",
+            "40 + 2\n",
+            "const CLOSURE: fn() -> I32 =\n",
+            "fn() { 1 }\n",
+        );
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            4
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::BIN_EXPR)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::DOCS)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn exported_constants_are_diagnosed_but_kept_in_the_tree() {
+        let source = "export const VALUE: I32 = 1\npub const PUBLIC: I32 = 2\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::InvalidExportTarget);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            2
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::VISIBILITY)
+                .count(),
+            2
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_constant_type_preserves_a_following_function() {
+        let source = "const VALUE:\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            !output.errors.is_empty(),
+            "expected a missing type diagnostic"
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn missing_constant_initializer_preserves_a_following_function() {
+        let source = "const VALUE: I32 =\nfn later() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedExpression),
+            "{:?}",
+            output.errors
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn constant_declaration_in_block_is_recovered_as_an_item() {
+        let source = "fn outer() {\nconst LOCAL: I32 = 1\nlet later = LOCAL\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ItemInBlock);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::CONST_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::LET_STMT)
+                .count(),
+            1
+        );
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn source_file_parses_record_types_with_attributes_docs_and_where_clauses() {
         let source = concat!(
             "type User<T>\n",
@@ -6844,7 +6993,7 @@ mod tests {
 
     #[test]
     fn source_file_reports_unimplemented_item_kinds_without_misparsing_them() {
-        let source = "const VALUE: U32 = 1\n";
+        let source = "extern \"wasm\" {}\n";
         let (snapshot_file, lexed) = lex_file(source);
         let mut parser =
             Parser::new_for_file(&snapshot_file, &lexed.tokens).expect("valid lexer token stream");
@@ -6852,7 +7001,7 @@ mod tests {
             parser.parse_source_file(),
             Err(ParserError::UnsupportedItem {
                 position: 0,
-                kind: SyntaxKind::CONST_KW
+                kind: SyntaxKind::EXTERN_KW
             })
         );
     }

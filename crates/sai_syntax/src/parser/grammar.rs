@@ -362,6 +362,10 @@ impl Parser<'_, '_> {
             return self.impl_decl(declaration);
         }
 
+        if self.at(SyntaxKind::CONST_KW) {
+            return self.const_decl(declaration);
+        }
+
         if !self.at(SyntaxKind::USE_KW) {
             let position = self.position;
             let kind = self.current();
@@ -416,6 +420,34 @@ impl Parser<'_, '_> {
             self.struct_def()?;
         }
         declaration.complete(self, SyntaxKind::TYPE_DECL)
+    }
+
+    fn const_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.expect(SyntaxKind::CONST_KW)?;
+        self.name_node(&[SyntaxKind::UIDENT], SyntaxKind::NAME)?;
+        self.expect(SyntaxKind::COLON)?;
+        if self.item_starts_at_after_attributes(self.position) {
+            let range = self
+                .current_token()
+                .map(|token| token.range)
+                .ok_or(ParserError::InvalidDiagnosticSpan)?;
+            self.emit_parser_diagnostic(
+                sai_diagnostics::Code::ExpectedToken,
+                range,
+                "expected a type before the next item",
+            )?;
+            self.start().complete(self, SyntaxKind::ERROR)?;
+        } else {
+            self.type_(true)?;
+        }
+        self.expect(SyntaxKind::EQ)?;
+        self.eat_nl();
+        if self.at_physical_line_start() && self.item_starts_at_after_attributes(self.position) {
+            self.missing_expression()?;
+        } else {
+            self.expr_bp(0)?;
+        }
+        declaration.complete(self, SyntaxKind::CONST_DECL)
     }
 
     fn enum_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
