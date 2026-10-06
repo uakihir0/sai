@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 
 pub trait AstNode: Sized {
@@ -66,6 +68,7 @@ ast_node!(TupleIndexExpr, TUPLE_INDEX_EXPR);
 ast_token!(IntLit, INT);
 ast_token!(FloatLit, FLOAT);
 ast_token!(StringLit, STRING);
+ast_token!(ByteStringLit, BYTE_STRING);
 ast_token!(CharLit, CHAR);
 ast_token!(ByteLit, BYTE);
 
@@ -285,6 +288,16 @@ impl Name {
 impl StringLit {
     pub fn text(&self) -> &str {
         self.syntax().text()
+    }
+
+    pub fn value(&self) -> Cow<'_, str> {
+        crate::literal::decode_string_value(self.syntax().text())
+    }
+}
+
+impl ByteStringLit {
+    pub fn value(&self) -> Cow<'_, [u8]> {
+        crate::literal::decode_byte_string_value(self.syntax().text())
     }
 }
 

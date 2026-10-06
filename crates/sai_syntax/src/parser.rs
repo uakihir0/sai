@@ -2571,14 +2571,274 @@ let unclosed_byte = b'
     }
 
     #[test]
+    fn string_ast_values_decode_all_forms_and_replace_invalid_parts() {
+        use crate::ast::{AstToken, ByteStringLit, StringLit};
+        use std::borrow::Cow;
+
+        let source = r###"fn strings() {
+let plain = "plain"
+let escaped = "line\n\u{1f642}"
+let quoted = "say \"hi\""
+let slashed = "path\\name"
+let nul = "a\0b"
+let continued = "first\
+    second"
+let multiline = """
+    alpha
+    beta
+    """
+let raw = r#"path\n"#
+let invalid = "left\qright"
+let bad_indent = """
+    good
+  bad
+    """
+let byte_plain = b"plain"
+let byte_escaped = b"A\n\xFF"
+let byte_quoted = b"say \"hi\""
+let byte_slashed = b"path\\name"
+let byte_nul = b"a\0b"
+let byte_raw = br#"raw\n"#
+let byte_invalid = b"left\qright"
+let byte_unicode_invalid = b"bad\u{41}"
+let byte_non_ascii = b"€"
+}"###;
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut strings = Vec::new();
+        let mut byte_strings = Vec::new();
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                let crate::SyntaxElement::Token(token) = element else {
+                    continue;
+                };
+                if let Some(literal) = StringLit::cast(token.clone()) {
+                    strings.push(literal);
+                }
+                if let Some(literal) = ByteStringLit::cast(token) {
+                    byte_strings.push(literal);
+                }
+            }
+        }
+
+        let string_values = strings
+            .iter()
+            .map(|literal| literal.value().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            string_values,
+            [
+                "plain",
+                "line\n🙂",
+                "say \"hi\"",
+                "path\\name",
+                "a\0b",
+                "firstsecond",
+                "alpha\nbeta",
+                "path\\n",
+                "left\u{fffd}right",
+                "good\n\u{fffd}",
+            ]
+        );
+        assert!(matches!(strings[0].value(), Cow::Borrowed("plain")));
+        assert!(matches!(strings[7].value(), Cow::Borrowed("path\\n")));
+
+        let byte_values = byte_strings
+            .iter()
+            .map(|literal| literal.value().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            byte_values,
+            [
+                b"plain".to_vec(),
+                vec![b'A', b'\n', 0xff],
+                b"say \"hi\"".to_vec(),
+                b"path\\name".to_vec(),
+                b"a\0b".to_vec(),
+                b"raw\\n".to_vec(),
+                b"left"
+                    .iter()
+                    .copied()
+                    .chain("\u{fffd}".as_bytes().iter().copied())
+                    .chain(b"right".iter().copied())
+                    .collect(),
+                b"bad"
+                    .iter()
+                    .copied()
+                    .chain("\u{fffd}".as_bytes().iter().copied())
+                    .collect(),
+                "\u{fffd}".as_bytes().to_vec(),
+            ]
+        );
+        assert!(matches!(byte_strings[0].value(), Cow::Borrowed(b"plain")));
+        assert!(matches!(byte_strings[5].value(), Cow::Borrowed(b"raw\\n")));
+    }
+
+    #[test]
+    fn raw_and_multiline_string_values_preserve_lone_carriage_returns() {
+        use crate::ast::{AstToken, ByteStringLit, StringLit};
+
+        let source = "fn literals() {\nlet raw = r\"left\rright\"\nlet bytes = br\"left\rright\"\nlet multiline = \"\"\"\nleft\rright\n\"\"\"\n}\n";
+        let output = parse_file(source);
+        let (_, lexed) = lex_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut strings = Vec::new();
+        let mut byte_string = None;
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                let crate::SyntaxElement::Token(token) = element else {
+                    continue;
+                };
+                if let Some(literal) = StringLit::cast(token.clone()) {
+                    strings.push(literal);
+                }
+                if byte_string.is_none() {
+                    byte_string = ByteStringLit::cast(token);
+                }
+            }
+        }
+
+        assert_eq!(strings.len(), 2);
+        let byte_string = byte_string.expect("raw byte string token is retained");
+        assert!(strings.iter().all(|literal| literal.syntax().has_error()));
+        assert_eq!(strings[0].value(), "left\rright");
+        assert_eq!(strings[1].value(), "left\rright");
+        assert!(byte_string.syntax().has_error());
+        assert_eq!(byte_string.value().as_ref(), b"left\rright");
+        assert!(output.errors.is_empty());
+        assert_eq!(
+            lexed
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidLineEnding)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn string_values_preserve_allowed_controls_and_foreign_whitespace() {
+        use crate::ast::{AstToken, ByteStringLit, StringLit};
+
+        let control = "\u{0001}";
+        let foreign_whitespace = "\u{0085}";
+        let source = [
+            "fn literals() {\nlet simple = \"a",
+            control,
+            foreign_whitespace,
+            "b\"\nlet raw = r\"c",
+            control,
+            foreign_whitespace,
+            "d\"\nlet bytes = br\"x",
+            control,
+            "y\"\n}\n",
+        ]
+        .concat();
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut strings = Vec::new();
+        let mut byte_string = None;
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                let crate::SyntaxElement::Token(token) = element else {
+                    continue;
+                };
+                if let Some(literal) = StringLit::cast(token.clone()) {
+                    strings.push(literal);
+                }
+                if byte_string.is_none() {
+                    byte_string = ByteStringLit::cast(token);
+                }
+            }
+        }
+
+        assert_eq!(strings.len(), 2);
+        assert!(strings.iter().all(|literal| !literal.syntax().has_error()));
+        assert_eq!(
+            strings[0].value(),
+            format!("a{control}{foreign_whitespace}b")
+        );
+        assert_eq!(
+            strings[1].value(),
+            format!("c{control}{foreign_whitespace}d")
+        );
+
+        let byte_string = byte_string.expect("raw byte string token is retained");
+        assert!(!byte_string.syntax().has_error());
+        assert_eq!(byte_string.value().as_ref(), b"x\x01y");
+    }
+
+    #[test]
+    fn multiline_string_values_preserve_internal_crlf() {
+        use crate::ast::{AstToken, StringLit};
+
+        let source = "fn literals() {\r\nlet text = \"\"\"\r\n    first\r\n    second\r\n    \"\"\"\r\n}\r\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut string = None;
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                let crate::SyntaxElement::Token(token) = element else {
+                    continue;
+                };
+                if string.is_none() {
+                    string = StringLit::cast(token);
+                }
+            }
+        }
+        let string = string.expect("multiline string token is retained");
+
+        assert!(!string.syntax().has_error());
+        assert_eq!(string.value(), "first\r\nsecond");
+    }
+
+    #[test]
+    fn unterminated_strings_keep_escaped_terminal_quotes_in_value() {
+        use crate::ast::{AstToken, ByteStringLit, StringLit};
+
+        let source = [
+            "fn literals() {\nlet string = \"tail",
+            "\\",
+            "\"\nlet bytes = b\"tail",
+            "\\",
+            "\"\n}\n",
+        ]
+        .concat();
+        let output = parse_file(&source);
+        let root = crate::SyntaxNode::new_root(output.root);
+        let mut string = None;
+        let mut byte_string = None;
+        for node in root.descendants() {
+            for element in node.children_with_tokens() {
+                let crate::SyntaxElement::Token(token) = element else {
+                    continue;
+                };
+                if string.is_none() {
+                    string = StringLit::cast(token.clone());
+                }
+                if byte_string.is_none() {
+                    byte_string = ByteStringLit::cast(token);
+                }
+            }
+        }
+
+        let string = string.expect("unterminated string token is retained");
+        let byte_string = byte_string.expect("unterminated byte string token is retained");
+        assert!(string.syntax().has_error());
+        assert_eq!(string.value(), "tail\"");
+        assert!(byte_string.syntax().has_error());
+        assert_eq!(byte_string.value().as_ref(), b"tail\"");
+    }
+
+    #[test]
     fn malformed_utf8_character_literals_use_ast_fallback_values() {
-        use crate::ast::{AstToken, ByteLit, CharLit};
+        use crate::ast::{AstToken, ByteLit, ByteStringLit, CharLit, StringLit};
 
         let file_id = sai_vfs::FileId::new(2);
         let source_file = Arc::new(
             SourceFile::decode(
                 file_id,
-                b"fn literals() {\nlet invalid_utf8_char = '\xff'\nlet invalid_utf8_byte = b'\xff'\n}\n",
+                b"fn literals() {\nlet invalid_utf8_char = '\xff'\nlet invalid_utf8_byte = b'\xff'\nlet invalid_utf8_string = \"a\xffb\"\nlet invalid_utf8_byte_string = b\"a\xffb\"\n}\n",
             )
             .expect("decoded source"),
         );
@@ -2603,6 +2863,8 @@ let unclosed_byte = b'
         let root = crate::SyntaxNode::new_root(output.root);
         let mut char_literal = None;
         let mut byte_literal = None;
+        let mut string_literal = None;
+        let mut byte_string_literal = None;
         for node in root.descendants() {
             for element in node.children_with_tokens() {
                 let crate::SyntaxElement::Token(token) = element else {
@@ -2612,17 +2874,29 @@ let unclosed_byte = b'
                     char_literal = CharLit::cast(token.clone());
                 }
                 if byte_literal.is_none() {
-                    byte_literal = ByteLit::cast(token);
+                    byte_literal = ByteLit::cast(token.clone());
+                }
+                if string_literal.is_none() {
+                    string_literal = StringLit::cast(token.clone());
+                }
+                if byte_string_literal.is_none() {
+                    byte_string_literal = ByteStringLit::cast(token);
                 }
             }
         }
         let char_literal = char_literal.expect("character token is retained");
         let byte_literal = byte_literal.expect("byte token is retained");
+        let string_literal = string_literal.expect("string token is retained");
+        let byte_string_literal = byte_string_literal.expect("byte string token is retained");
 
         assert!(char_literal.syntax().has_error());
         assert_eq!(char_literal.value(), '\u{fffd}');
         assert!(byte_literal.syntax().has_error());
         assert_eq!(byte_literal.value(), 0);
+        assert!(string_literal.syntax().has_error());
+        assert_eq!(string_literal.value(), "a\u{fffd}b");
+        assert!(byte_string_literal.syntax().has_error());
+        assert_eq!(byte_string_literal.value().as_ref(), b"a\xEF\xBF\xBDb");
     }
 
     #[test]

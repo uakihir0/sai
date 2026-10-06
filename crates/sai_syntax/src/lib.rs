@@ -13,6 +13,7 @@ use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
+mod literal;
 mod parser;
 mod red;
 mod tree;
