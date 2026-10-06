@@ -10,12 +10,13 @@ use sai_syntax::{
     ast::{self, AstNode, AstToken},
 };
 
-/// Error returned when lowering cannot allocate a source mapping or intern a
-/// decoded string value.
+/// Error returned when lowering cannot allocate source data or encounters a
+/// syntax form whose HIR conversion has not been implemented yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HirLoweringError {
     SourceMap(HirSourceMapError),
     Interner(InternError),
+    UnsupportedSyntax(SyntaxKind),
 }
 
 impl From<HirSourceMapError> for HirLoweringError {
@@ -80,6 +81,53 @@ pub fn lower_literal_pat<'hir>(
             .unwrap_or(PatKind::Err)
     };
     Ok(arena.alloc_pat(Pat { hir_id, kind, span }))
+}
+
+/// Lower the pattern forms that do not require recursive child construction
+/// beyond parenthesis stripping.
+///
+/// Unsupported, otherwise-valid pattern kinds are returned explicitly so a
+/// caller cannot mistake an unfinished lowering case for a source error.
+pub fn lower_pattern<'hir>(
+    pattern: &ast::Pattern,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    if contains_error_node(pattern.syntax()) {
+        return lower_error_pattern(pattern.syntax(), arena, source_map);
+    }
+
+    match pattern {
+        ast::Pattern::Wildcard(wildcard) => {
+            let (hir_id, span) =
+                source_map.add_node_with_span(wildcard.syntax(), SpanCtxt::Root)?;
+            Ok(arena.alloc_pat(Pat {
+                hir_id,
+                kind: PatKind::Wild,
+                span,
+            }))
+        }
+        ast::Pattern::Literal(literal) => lower_literal_pat(literal, arena, symbols, source_map),
+        ast::Pattern::Parenthesized(paren) => match paren.pattern() {
+            Some(inner) => lower_pattern(&inner, arena, symbols, source_map),
+            None => lower_error_pattern(paren.syntax(), arena, source_map),
+        },
+        _ => Err(HirLoweringError::UnsupportedSyntax(pattern.syntax().kind())),
+    }
+}
+
+fn lower_error_pattern<'hir>(
+    syntax: &SyntaxNode,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::Err,
+        span,
+    }))
 }
 
 fn decode_literal<'hir>(
@@ -400,5 +448,65 @@ mod tests {
 
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), patterns.len() + 1);
+    }
+
+    #[test]
+    fn lowers_wildcard_and_strips_parenthesized_patterns() {
+        let file = crate::FileId::new(65);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() { match value { _ => (), (true) => (), ((_)) => (), (left, right) => () } }\n",
+        );
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .filter_map(|arm| arm.pattern())
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 4);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns[..3]
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("supported patterns lower");
+
+        assert_eq!(lowered[0].kind, PatKind::Wild);
+        assert_eq!(lowered[1].kind, PatKind::Lit(Lit::Bool(true)));
+        assert_eq!(lowered[2].kind, PatKind::Wild);
+        assert_eq!(lowered[0].span.range, patterns[0].syntax().text_range());
+        let ast::Pattern::Parenthesized(paren) = &patterns[1] else {
+            panic!("second pattern is parenthesized");
+        };
+        let inner = paren.pattern().expect("parenthesized literal");
+        assert_eq!(lowered[1].span.range, inner.syntax().text_range());
+        let ast::Pattern::Parenthesized(outer) = &patterns[2] else {
+            panic!("third pattern is parenthesized");
+        };
+        let ast::Pattern::Parenthesized(inner) = outer.pattern().expect("inner parentheses") else {
+            panic!("third pattern has nested parentheses");
+        };
+        let wildcard = inner.pattern().expect("nested wildcard");
+        assert_eq!(lowered[2].span.range, wildcard.syntax().text_range());
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|pattern| pattern.hir_id.local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::TUPLE_PAT)
+        );
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 4);
     }
 }
