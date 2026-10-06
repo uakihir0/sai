@@ -376,6 +376,10 @@ impl Parser<'_, '_> {
             return self.invariant_decl(declaration);
         }
 
+        if self.at_contextual("effect") && self.nth(1) == SyntaxKind::LIDENT {
+            return self.effect_decl(declaration);
+        }
+
         if !self.at(SyntaxKind::USE_KW) {
             let position = self.position;
             let kind = self.current();
@@ -548,6 +552,25 @@ impl Parser<'_, '_> {
             .get(position)
             .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
             && self.item_starts_at_after_attributes(position)
+    }
+
+    fn effect_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
+        self.bump();
+        self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
+        if self.at(SyntaxKind::NEWLINE)
+            && self.position.checked_add(1).is_some_and(|position| {
+                token_is_contextual(self.source, self.tokens, position, "covers")
+            })
+        {
+            self.eat_nl();
+        }
+        if self.at_contextual("covers") {
+            let covers = self.start();
+            self.bump();
+            self.effect_set()?;
+            covers.complete(self, SyntaxKind::COVERS_CLAUSE)?;
+        }
+        declaration.complete(self, SyntaxKind::EFFECT_DECL)
     }
 
     fn enum_decl(&mut self, declaration: Marker) -> Result<CompletedMarker, ParserError> {
@@ -2589,6 +2612,16 @@ impl Parser<'_, '_> {
         }
         self.eat_nl();
         while !self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
+            if self.effect_set_item_boundary() {
+                break;
+            }
+            if self.at(SyntaxKind::NEWLINE) {
+                if self.effect_set_boundary_after_newline() {
+                    break;
+                }
+                self.eat_nl();
+                continue;
+            }
             let position = self.position;
             if !self.at(SyntaxKind::LIDENT) {
                 self.expect(SyntaxKind::LIDENT)?;
@@ -2613,6 +2646,9 @@ impl Parser<'_, '_> {
             if self.at_any(&[SyntaxKind::R_BRACE, SyntaxKind::EOF]) {
                 break;
             }
+            if self.effect_set_item_boundary() {
+                break;
+            }
             self.expect_any(USE_ITEM_SEPARATOR_KINDS)?;
             if self.position == position {
                 self.recover_one()?;
@@ -2621,10 +2657,34 @@ impl Parser<'_, '_> {
                 }
             }
         }
-        self.eat_nl();
+        if !self.effect_set_boundary_after_newline() {
+            self.eat_nl();
+        }
         self.expect(SyntaxKind::R_BRACE)?;
         set.complete(self, SyntaxKind::EFFECT_SET)?;
         Ok(())
+    }
+
+    fn effect_set_item_boundary(&self) -> bool {
+        self.at_physical_line_start() && self.item_starts_at_after_attributes(self.position)
+    }
+
+    fn effect_set_boundary_after_newline(&self) -> bool {
+        if !self.at(SyntaxKind::NEWLINE) {
+            return false;
+        }
+        let mut position = self.position;
+        while self
+            .tokens
+            .get(position)
+            .is_some_and(|token| token.kind == SyntaxKind::NEWLINE)
+        {
+            position += 1;
+        }
+        self.tokens
+            .get(position)
+            .is_some_and(|token| token.flags.contains(crate::TokenFlags::AFTER_LINE_BREAK))
+            && self.item_starts_at_after_attributes(position)
     }
 
     fn effect_ref(&mut self) -> Result<(), ParserError> {
