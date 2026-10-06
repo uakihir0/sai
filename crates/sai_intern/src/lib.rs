@@ -21,6 +21,26 @@ impl Symbol {
     }
 }
 
+/// A session-local identity for an interned package key.
+///
+/// The numeric value is an implementation detail and must not be persisted;
+/// stable package identity is the canonical package key string.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageId(u32);
+
+impl PackageId {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageIdError {
+    TooManyPackages,
+    UnknownPackage,
+    LockPoisoned,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InternError {
     TooManySymbols,
@@ -173,6 +193,67 @@ impl Default for Interner {
     }
 }
 
+#[derive(Default)]
+struct PackageStorage {
+    keys: Vec<Arc<str>>,
+    by_key: HashMap<Arc<str>, PackageId>,
+}
+
+/// A session-local interner for canonical package identity keys.
+///
+/// Callers must validate and canonicalize keys before interning them.
+#[derive(Default)]
+pub struct PackageInterner {
+    storage: Mutex<PackageStorage>,
+}
+
+impl PackageInterner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&self, key: &str) -> Result<PackageId, PackageIdError> {
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|_| PackageIdError::LockPoisoned)?;
+        if let Some(id) = storage.by_key.get(key) {
+            return Ok(*id);
+        }
+
+        let raw = u32::try_from(storage.keys.len()).map_err(|_| PackageIdError::TooManyPackages)?;
+        let id = PackageId(raw);
+        let key: Arc<str> = Arc::from(key);
+        storage.keys.push(Arc::clone(&key));
+        storage.by_key.insert(key, id);
+        Ok(id)
+    }
+
+    pub fn resolve(&self, id: PackageId) -> Result<Arc<str>, PackageIdError> {
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| PackageIdError::LockPoisoned)?;
+        let index = usize::try_from(id.0).map_err(|_| PackageIdError::UnknownPackage)?;
+        storage
+            .keys
+            .get(index)
+            .cloned()
+            .ok_or(PackageIdError::UnknownPackage)
+    }
+
+    pub fn len(&self) -> Result<usize, PackageIdError> {
+        self.storage
+            .lock()
+            .map(|storage| storage.keys.len())
+            .map_err(|_| PackageIdError::LockPoisoned)
+    }
+
+    pub fn is_empty(&self) -> Result<bool, PackageIdError> {
+        self.len().map(|len| len == 0)
+    }
+}
+
 fn shard_for(value: &str) -> usize {
     (fingerprint(value).raw() as usize) & (SHARD_COUNT - 1)
 }
@@ -227,6 +308,35 @@ define_index_type!(ItemLocalId, 0x81);
 define_index_type!(BindingId, 0x82);
 define_index_type!(BasicBlock, 0x83);
 define_index_type!(Local, 0x84);
+
+macro_rules! define_session_index_type {
+    ($name:ident, $stable_tag:literal) => {
+        #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(u32);
+
+        impl index_sealed::Sealed for $name {}
+
+        impl $name {
+            pub const fn raw(self) -> u32 {
+                self.0
+            }
+        }
+
+        impl Idx for $name {
+            const STABLE_TAG: u8 = $stable_tag;
+
+            fn from_raw(raw: u32) -> Self {
+                Self(raw)
+            }
+
+            fn raw(self) -> u32 {
+                self.0
+            }
+        }
+    };
+}
+
+define_session_index_type!(DefIndex, 0x85);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndexVecError {
@@ -468,6 +578,29 @@ mod tests {
     }
 
     #[test]
+    fn package_interning_is_idempotent_and_resolves_canonical_keys() {
+        let packages = PackageInterner::new();
+        let app = packages
+            .intern("acme:app#1.0")
+            .expect("package key interns");
+        let core = packages.intern("sai:core").expect("core interns");
+
+        assert_eq!(packages.intern("acme:app#1.0"), Ok(app));
+        assert_ne!(app, core);
+        assert_eq!(
+            &*packages.resolve(app).expect("app package resolves"),
+            "acme:app#1.0"
+        );
+        assert_eq!(
+            packages.resolve(PackageId(9)),
+            Err(PackageIdError::UnknownPackage)
+        );
+        assert_eq!(packages.len(), Ok(2));
+        assert_eq!(packages.is_empty(), Ok(false));
+        assert_eq!(PackageInterner::new().is_empty(), Ok(true));
+    }
+
+    #[test]
     fn index_vectors_keep_indices_typed_and_stable() {
         let mut items = IndexVec::<ItemLocalId, &str>::new();
         let first = items.push("first").expect("index fits");
@@ -480,6 +613,14 @@ mod tests {
             [(first, &"first"), (second, &"second")]
         );
         assert_ne!(first.fingerprint(), BindingId::default().fingerprint());
+
+        let mut definitions = IndexVec::<DefIndex, &str>::new();
+        let definition = definitions.push("definition").expect("index fits");
+        assert_eq!(definition.raw(), 0);
+        assert_eq!(definitions.get(definition), Some(&"definition"));
+        let mut another_index_space = IndexVec::<ItemLocalId, &str>::new();
+        another_index_space.push("definition").expect("index fits");
+        assert_ne!(definitions.fingerprint(), another_index_space.fingerprint());
     }
 
     #[test]
