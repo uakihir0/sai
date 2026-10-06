@@ -569,3 +569,9 @@
 - **Decision:** Add `ModPath::segments()` as a generated iterator over direct `NameRef` children.
 - **Reason:** Interface implementation and world references already exposed a `ModPath` node, but consumers could not inspect the module names without raw descendant traversal. Direct-child iteration preserves source order and keeps package paths, represented by a separate token, distinct.
 - **Review:** Hostile review confirmed the parser builds each module segment as a direct `NameRef` in every use of `mod_path()`, including world and interface-impl contexts; incomplete paths retain any segments that were parsed. No actionable findings. Tests verify segment count and order for `wasi.http`, `storage`, and `common.base`. Both focused tests passed; `cargo test --workspace --quiet` passed all 464 tests; `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. Human review should confirm that package paths should remain separate from the `ModPath` segment API.
+
+### IR-095: Expose implicit-member expression names
+
+- **Decision:** Add `ImplicitMemberExpr::name()` as a generated role for its direct `NameRef` child.
+- **Reason:** `.Variant` expressions lower to `ExprKind::ImplicitMember(Name)`, but the syntax AST had no typed path to the variant name. The parser creates that name as the sole direct child, so an optional role is simple and remains safe for incomplete syntax.
+- **Review:** Hostile review confirmed the role matches parser construction and the HIR shape, including `.Some(` recovery; no actionable findings. The regression test obtains `Some` from `.Some(1)`. The focused test passed; `cargo test --workspace --quiet` passed all 464 tests; `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. Human review should confirm that `.Variant` names remain `NameRef` syntax nodes before HIR lowering interns them as `Name`.

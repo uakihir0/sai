@@ -10036,6 +10036,8 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
 
     #[test]
     fn function_parser_builds_postfix_and_array_expressions() {
+        use crate::ast::{AstNode, ImplicitMemberExpr};
+
         let source = concat!(
             "fn f() {\n",
             "let call = g<I32>(1, name: 2)\n",
@@ -10077,6 +10079,16 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
             );
         }
         assert!(output.errors.is_empty());
+        let implicit_member = root
+            .descendants()
+            .find_map(ImplicitMemberExpr::cast)
+            .expect("implicit-member expression");
+        let name = implicit_member.name().expect("implicit-member name");
+        let name_range = name.syntax().text_range();
+        assert_eq!(
+            &source[name_range.start().to_usize()..name_range.end().to_usize()],
+            "Some",
+        );
 
         for source in [
             "fn f() { g<I32> }\n",
