@@ -498,6 +498,9 @@ fn lower_expr_inner<'hir>(
             lower_continue_expr(continue_expr, arena, symbols, source_map)
         }
         ast::Expr::Block(block_expr) => lower_block_expr(block_expr, arena, symbols, source_map),
+        ast::Expr::UnsafeBlock(block_expr) => {
+            lower_unsafe_block_expr(block_expr, arena, symbols, source_map)
+        }
         ast::Expr::If(if_expr) => lower_if_expr(if_expr, arena, symbols, source_map),
         ast::Expr::Match(match_expr) => lower_match_expr(match_expr, arena, symbols, source_map),
         ast::Expr::Loop(loop_expr) => lower_loop_expr(loop_expr, arena, symbols, source_map),
@@ -1318,6 +1321,25 @@ fn lower_block_expr<'hir>(
     lower_block_as_expr(block_expr.syntax(), &block, arena, symbols, source_map)
 }
 
+fn lower_unsafe_block_expr<'hir>(
+    block_expr: &ast::UnsafeBlockExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(block) = block_expr.body() else {
+        return lower_error_expr(block_expr.syntax(), arena, source_map);
+    };
+    lower_block_as_expr_with_safety(
+        block_expr.syntax(),
+        &block,
+        Safety::Unsafe,
+        arena,
+        symbols,
+        source_map,
+    )
+}
+
 fn lower_block_as_expr<'hir>(
     syntax: &SyntaxNode,
     block: &ast::Block,
@@ -1325,8 +1347,19 @@ fn lower_block_as_expr<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    lower_block_as_expr_with_safety(syntax, block, Safety::Safe, arena, symbols, source_map)
+}
+
+fn lower_block_as_expr_with_safety<'hir>(
+    syntax: &SyntaxNode,
+    block: &ast::Block,
+    safety: Safety,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
-    let block = lower_block(block, arena, symbols, source_map)?;
+    let block = lower_block_with_safety(block, safety, arena, symbols, source_map)?;
     Ok(arena.alloc_expr(Expr {
         hir_id,
         kind: ExprKind::Block(block),
@@ -1813,6 +1846,16 @@ fn lower_block<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir HirBlock<'hir>, HirLoweringError> {
+    lower_block_with_safety(block, Safety::Safe, arena, symbols, source_map)
+}
+
+fn lower_block_with_safety<'hir>(
+    block: &ast::Block,
+    safety: Safety,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir HirBlock<'hir>, HirLoweringError> {
     let (hir_id, span) = source_map.add_node_with_span(block.syntax(), SpanCtxt::Root)?;
     let entries = collect_block_statements(block.syntax());
     let entry_count = entries.len();
@@ -1898,7 +1941,7 @@ fn lower_block<'hir>(
         hir_id,
         stmts: arena.alloc_stmts(&statements),
         tail,
-        safety: Safety::Safe,
+        safety,
         span,
     }))
 }
@@ -2427,6 +2470,10 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             Ok(())
         }
         ast::Expr::Block(block_expr) => match block_expr.block() {
+            Some(block) => ensure_supported_block(&block),
+            None => Ok(()),
+        },
+        ast::Expr::UnsafeBlock(block_expr) => match block_expr.body() {
             Some(block) => ensure_supported_block(&block),
             None => Ok(()),
         },
@@ -5163,6 +5210,78 @@ mod tests {
         assert_eq!(block.span.file, file);
         assert_eq!(block.span.ctxt, SpanCtxt::Root);
         assert_eq!(source_map.finish().node_to_syntax().len(), 9);
+    }
+
+    #[test]
+    fn lowers_unsafe_blocks_with_unsafe_block_safety() {
+        let file = crate::FileId::new(190);
+        let source = "fn f() { unsafe { 1 } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let unsafe_block = function
+            .descendants()
+            .find_map(ast::UnsafeBlockExpr::cast)
+            .expect("unsafe block expression");
+        let expression =
+            ast::Expr::cast(unsafe_block.syntax().clone()).expect("unsafe block is an expression");
+        let body = unsafe_block.body().expect("unsafe block body");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("unsafe block lowers");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("unsafe block expression maps to a block");
+        };
+        assert_eq!(block.safety, Safety::Unsafe);
+        assert_eq!(block.span.range, body.syntax().text_range());
+        assert_eq!(block.span.ctxt, SpanCtxt::Root);
+        assert_eq!(lowered.span.range, unsafe_block.syntax().text_range());
+        assert_eq!(lowered.span.ctxt, SpanCtxt::Root);
+        assert_eq!(lowered.hir_id.local_id.raw(), 1);
+        assert_eq!(block.hir_id.local_id.raw(), 2);
+        let tail = block.tail.expect("literal is the block tail");
+        assert!(matches!(
+            tail.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        ));
+        assert_eq!(tail.hir_id.local_id.raw(), 3);
+        assert_eq!(source_map.finish().node_to_syntax().len(), 4);
+    }
+
+    #[test]
+    fn unsafe_blocks_preflight_unsupported_descendants_before_allocation() {
+        let file = crate::FileId::new(191);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { unsafe { source.convert<U32> } }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let unsafe_block = function
+            .descendants()
+            .find_map(ast::UnsafeBlockExpr::cast)
+            .expect("unsafe block expression");
+        let expression =
+            ast::Expr::cast(unsafe_block.syntax().clone()).expect("unsafe block is an expression");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
     }
 
     #[test]
