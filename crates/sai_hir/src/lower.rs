@@ -180,6 +180,7 @@ pub fn lower_pattern<'hir>(
         ast::Pattern::Literal(literal) => lower_literal_pat(literal, arena, symbols, source_map),
         ast::Pattern::Range(range) => lower_range_pat(range, arena, symbols, source_map),
         ast::Pattern::Tuple(tuple) => lower_tuple_pattern(tuple, arena, symbols, source_map),
+        ast::Pattern::Slice(slice) => lower_slice_pattern(slice, arena, symbols, source_map),
         ast::Pattern::Binding(binding) => {
             lower_binding_pattern(binding, arena, symbols, source_map)
         }
@@ -231,6 +232,59 @@ fn lower_tuple_pattern<'hir>(
     }))
 }
 
+fn lower_slice_pattern<'hir>(
+    slice: &ast::SlicePat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    if contains_error_node(slice.syntax()) {
+        return lower_error_pattern(slice.syntax(), arena, source_map);
+    }
+
+    let rests = slice.rest_patterns().collect::<Vec<_>>();
+    if rests.len() > 1 {
+        return lower_error_pattern(slice.syntax(), arena, source_map);
+    }
+    let elements = slice.elements().collect::<Vec<_>>();
+    let split = rests.first().map_or(elements.len(), |rest| {
+        let rest_start = rest.syntax().text_range().start();
+        elements
+            .iter()
+            .position(|element| element.syntax().text_range().start() > rest_start)
+            .unwrap_or(elements.len())
+    });
+
+    let (hir_id, span) = source_map.add_node_with_span(slice.syntax(), SpanCtxt::Root)?;
+    let before = elements[..split]
+        .iter()
+        .map(|element| lower_pattern(element, arena, symbols, source_map).copied())
+        .collect::<Result<Vec<_>, _>>()?;
+    let rest = match rests.first() {
+        None => None,
+        Some(rest) => Some(
+            rest.binding()
+                .map(|binding| lower_binding_pattern(&binding, arena, symbols, source_map))
+                .transpose()?,
+        ),
+    };
+    let after = elements[split..]
+        .iter()
+        .map(|element| lower_pattern(element, arena, symbols, source_map).copied())
+        .collect::<Result<Vec<_>, _>>()?;
+    let before = arena.alloc_pats(&before);
+    let after = arena.alloc_pats(&after);
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::Slice {
+            before,
+            rest,
+            after,
+        },
+        span,
+    }))
+}
+
 fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringError> {
     if contains_error_node(pattern.syntax()) {
         return Ok(());
@@ -268,6 +322,13 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
         },
         ast::Pattern::Tuple(tuple) => {
             for element in tuple.elements() {
+                ensure_supported_pattern(&element)?;
+            }
+            Ok(())
+        }
+        ast::Pattern::Slice(slice) if slice.rest_patterns().count() > 1 => Ok(()),
+        ast::Pattern::Slice(slice) => {
+            for element in slice.elements() {
                 ensure_supported_pattern(&element)?;
             }
             Ok(())
@@ -749,7 +810,7 @@ mod tests {
         let file = crate::FileId::new(65);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
-            "fn f() { match value { _ => (), (true) => (), ((_)) => (), [left, right] => () } }\n",
+            "fn f() { match value { _ => (), (true) => (), ((_)) => (), [left, Some(value)] => () } }\n",
         );
         let function = function_node(&parsed.root);
         let patterns = function
@@ -797,7 +858,7 @@ mod tests {
         );
         assert_eq!(
             lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::SLICE_PAT)
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT)
         );
 
         let map = source_map.finish();
@@ -1233,5 +1294,170 @@ mod tests {
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 9);
         assert_eq!(map.binding_to_syntax().len(), 4);
+    }
+
+    #[test]
+    fn lowers_slice_patterns_and_recovers_duplicate_rest_patterns() {
+        let file = crate::FileId::new(69);
+        let source = concat!(
+            "fn f() { match value { ",
+            "[] => (), ",
+            "[first, .., last] => (), ",
+            "[..borrow mut rest, after] => (), ",
+            "[before, ..var tail] => (), ",
+            "[.., ..] => (), ",
+            "[before, Some(value)] => () ",
+            "} }",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::MultipleRestPatterns)
+        );
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .filter_map(|arm| arm.pattern())
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 6);
+        let ast::Pattern::Slice(duplicate_rest) = &patterns[4] else {
+            panic!("fifth pattern is a slice");
+        };
+        assert_eq!(duplicate_rest.rest_patterns().count(), 2);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns[..5]
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("slice patterns lower");
+
+        fn slice_parts<'hir>(
+            pattern: &Pat<'hir>,
+        ) -> (
+            &'hir [Pat<'hir>],
+            Option<Option<&'hir Pat<'hir>>>,
+            &'hir [Pat<'hir>],
+        ) {
+            match pattern.kind {
+                PatKind::Slice {
+                    before,
+                    rest,
+                    after,
+                } => (before, rest, after),
+                _ => panic!("slice pattern lowers to PatKind::Slice"),
+            }
+        }
+        fn binding_parts(pattern: &Pat<'_>) -> (Name, crate::BindingId, HirBindingMode) {
+            match pattern.kind {
+                PatKind::Binding {
+                    name,
+                    binding,
+                    mode,
+                    ..
+                } => (name, binding, mode),
+                _ => panic!("slice element lowers to PatKind::Binding"),
+            }
+        }
+
+        assert_eq!(slice_parts(lowered[0]), (&[][..], None, &[][..]));
+        let (before, rest, after) = slice_parts(lowered[1]);
+        assert_eq!(before.len(), 1);
+        assert_eq!(rest, Some(None));
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(binding_parts(&before[0]).0.sym)
+                .unwrap()
+                .as_ref(),
+            "first"
+        );
+        let (_, first_binding, _) = binding_parts(&before[0]);
+        assert_eq!(first_binding.raw(), 0);
+        let (_, last_binding, _) = binding_parts(&after[0]);
+        assert_eq!(last_binding.raw(), 1);
+        assert_eq!(
+            symbols
+                .resolve(binding_parts(&after[0]).0.sym)
+                .unwrap()
+                .as_ref(),
+            "last"
+        );
+        assert_eq!(before[0].hir_id.local_id.raw(), 3);
+        assert_eq!(after[0].hir_id.local_id.raw(), 4);
+
+        let (before, rest, after) = slice_parts(lowered[2]);
+        assert!(before.is_empty());
+        let rest = rest
+            .expect("bound rest is present")
+            .expect("rest binds a name");
+        let (rest_name, rest_binding, rest_mode) = binding_parts(rest);
+        assert_eq!(symbols.resolve(rest_name.sym).unwrap().as_ref(), "rest");
+        assert_eq!(rest_binding.raw(), 2);
+        assert_eq!(rest_mode, HirBindingMode::BorrowMut);
+        assert_eq!(after.len(), 1);
+        let (_, after_binding, _) = binding_parts(&after[0]);
+        assert_eq!(after_binding.raw(), 3);
+        assert_eq!(
+            symbols
+                .resolve(binding_parts(&after[0]).0.sym)
+                .unwrap()
+                .as_ref(),
+            "after"
+        );
+        assert_eq!(rest.hir_id.local_id.raw(), 6);
+        assert_eq!(after[0].hir_id.local_id.raw(), 7);
+
+        let (before, rest, after) = slice_parts(lowered[3]);
+        assert_eq!(before.len(), 1);
+        let tail = rest
+            .expect("bound rest is present")
+            .expect("rest binds a name");
+        let (tail_name, tail_binding, tail_mode) = binding_parts(tail);
+        assert_eq!(symbols.resolve(tail_name.sym).unwrap().as_ref(), "tail");
+        assert_eq!(tail_binding.raw(), 5);
+        assert_eq!(tail_mode, HirBindingMode::Var);
+        assert!(after.is_empty());
+        let (_, before_binding, _) = binding_parts(&before[0]);
+        assert_eq!(before_binding.raw(), 4);
+        assert_eq!(
+            symbols
+                .resolve(binding_parts(&before[0]).0.sym)
+                .unwrap()
+                .as_ref(),
+            "before"
+        );
+        assert_eq!(before[0].hir_id.local_id.raw(), 9);
+        assert_eq!(tail.hir_id.local_id.raw(), 10);
+
+        assert_eq!(lowered[4].kind, PatKind::Err);
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|pattern| pattern.hir_id.local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 5, 8, 11]
+        );
+        for (lowered, syntax) in lowered.iter().zip(&patterns) {
+            assert_eq!(lowered.span.range, syntax.syntax().text_range());
+            assert_eq!(lowered.span.ctxt, SpanCtxt::Root);
+        }
+        assert_eq!(lowered[1].span.range, patterns[1].syntax().text_range());
+        assert_eq!(
+            lower_pattern(&patterns[5], &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT)
+        );
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 12);
+        assert_eq!(map.binding_to_syntax().len(), 6);
     }
 }
