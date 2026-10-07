@@ -149,6 +149,20 @@ impl<'root> HirSourceMapBuilder<'root> {
         })
     }
 
+    /// Return exact decoded source text for syntax validated against this map's snapshot.
+    pub fn text_for_syntax(&self, syntax: &SyntaxNode) -> Result<&str, HirSourceMapError> {
+        syntax_pointer(self.file, self.root, syntax)?;
+        let file = self
+            .snapshot
+            .file(self.file)
+            .ok_or(HirSourceMapError::SourceTextNotValidForSnapshot)?;
+        let range = syntax.text_range();
+        file.source()
+            .text()
+            .get(range.start().to_usize()..range.end().to_usize())
+            .ok_or(HirSourceMapError::SourceTextNotValidForSnapshot)
+    }
+
     pub fn add_binding(&mut self, syntax: &SyntaxNode) -> Result<BindingId, HirSourceMapError> {
         let pointer = syntax_pointer(self.file, self.root, syntax)?;
         let binding = self
@@ -287,6 +301,7 @@ pub enum HirSourceMapError {
     AstIdMapMismatch,
     WorkspaceSnapshotMismatch,
     DiagnosticNotValidForSnapshot,
+    SourceTextNotValidForSnapshot,
     UnknownBindingAlias,
     SyntaxFileMismatch,
     SyntaxTreeMismatch,

@@ -467,7 +467,7 @@ pub fn lower_expr<'hir>(
     ensure_supported_expr(expression)?;
     if contains_error_node(expression.syntax())
         && !contains_call_arglist_error(expression.syntax())
-        && !errors_are_in_let_or_var_statements(expression.syntax())
+        && !errors_are_in_recoverable_block_statements(expression.syntax())
     {
         return lower_error_expr(expression.syntax(), arena, source_map);
     }
@@ -1634,10 +1634,18 @@ fn lower_block<'hir>(
                     source_map,
                 )?);
             }
-            BlockStatementSyntax::Statement(statement) => {
-                return Err(HirLoweringError::UnsupportedSyntax(
-                    statement.syntax().kind(),
-                ));
+            BlockStatementSyntax::Statement(ast::Stmt::Assign(assignment)) => {
+                statements.push(lower_assignment_statement(
+                    &assignment,
+                    arena,
+                    symbols,
+                    source_map,
+                )?);
+            }
+            BlockStatementSyntax::Statement(ast::Stmt::Assert(assertion)) => {
+                statements.push(lower_assert_statement(
+                    &assertion, arena, symbols, source_map,
+                )?);
             }
             BlockStatementSyntax::Error(error) => {
                 let (stmt_hir_id, stmt_span) =
@@ -1787,13 +1795,7 @@ fn lower_statement_initializer<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     match initializer {
-        Some(initializer)
-            if contains_error_node(initializer.syntax())
-                && !contains_call_arglist_error(initializer.syntax()) =>
-        {
-            lower_error_expr(initializer.syntax(), arena, source_map)
-        }
-        Some(initializer) => lower_expr_inner(&initializer, arena, symbols, source_map),
+        Some(initializer) => lower_recovered_expr(&initializer, arena, symbols, source_map),
         None => {
             let error = if has_direct_token(statement, SyntaxKind::EQ) {
                 direct_error_child_after_token(statement, SyntaxKind::EQ)
@@ -1803,6 +1805,166 @@ fn lower_statement_initializer<'hir>(
             .unwrap_or_else(|| statement.clone());
             lower_error_expr(&error, arena, source_map)
         }
+    }
+}
+
+fn lower_assignment_statement<'hir>(
+    statement: &ast::AssignStmt,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<HirStmt<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(statement.syntax(), SpanCtxt::Root)?;
+    let Some((operator_token, operator)) = statement.op() else {
+        let expression = lower_error_expr(statement.syntax(), arena, source_map)?;
+        return Ok(HirStmt {
+            hir_id,
+            kind: StmtKind::Expr(expression),
+            span,
+        });
+    };
+    let lhs = match statement.lhs() {
+        Some(lhs) => lower_recovered_expr(&lhs, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child_before_token(statement.syntax(), operator_token.kind())
+                .unwrap_or_else(|| statement.syntax().clone());
+            lower_error_expr(&error, arena, source_map)?
+        }
+    };
+    let rhs = match statement.rhs() {
+        Some(rhs) => lower_recovered_expr(&rhs, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child_after_token(statement.syntax(), operator_token.kind())
+                .unwrap_or_else(|| statement.syntax().clone());
+            lower_error_expr(&error, arena, source_map)?
+        }
+    };
+    let kind = match operator {
+        ast::AssignOp::Set => StmtKind::Assign { lhs, rhs },
+        ast::AssignOp::Add => StmtKind::AssignOp {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::Sub => StmtKind::AssignOp {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::Mul => StmtKind::AssignOp {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::Div => StmtKind::AssignOp {
+            op: BinOp::Div,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::Rem => StmtKind::AssignOp {
+            op: BinOp::Rem,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::WrappingAdd => StmtKind::AssignOp {
+            op: BinOp::WrapAdd,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::WrappingSub => StmtKind::AssignOp {
+            op: BinOp::WrapSub,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::WrappingMul => StmtKind::AssignOp {
+            op: BinOp::WrapMul,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::BitAnd => StmtKind::AssignOp {
+            op: BinOp::BitAnd,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::BitOr => StmtKind::AssignOp {
+            op: BinOp::BitOr,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::BitXor => StmtKind::AssignOp {
+            op: BinOp::BitXor,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::Shl => StmtKind::AssignOp {
+            op: BinOp::Shl,
+            lhs,
+            rhs,
+        },
+        ast::AssignOp::Shr => StmtKind::AssignOp {
+            op: BinOp::Shr,
+            lhs,
+            rhs,
+        },
+    };
+    Ok(HirStmt { hir_id, kind, span })
+}
+
+fn lower_assert_statement<'hir>(
+    statement: &ast::AssertStmt,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<HirStmt<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(statement.syntax(), SpanCtxt::Root)?;
+    let cond = match statement.condition() {
+        Some(condition) => lower_recovered_expr(&condition, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child_before_token(statement.syntax(), SyntaxKind::COMMA)
+                .unwrap_or_else(|| statement.syntax().clone());
+            lower_error_expr(&error, arena, source_map)?
+        }
+    };
+    let msg = match statement.message() {
+        Some(message) => Some(lower_recovered_expr(&message, arena, symbols, source_map)?),
+        None if has_direct_token(statement.syntax(), SyntaxKind::COMMA) => {
+            let error = direct_error_child_after_token(statement.syntax(), SyntaxKind::COMMA)
+                .unwrap_or_else(|| statement.syntax().clone());
+            Some(lower_error_expr(&error, arena, source_map)?)
+        }
+        None => None,
+    };
+    let cond_text = statement.condition().map_or_else(
+        || Ok(String::new()),
+        |condition| {
+            source_map
+                .text_for_syntax(condition.syntax())
+                .map(str::to_owned)
+        },
+    )?;
+    let cond_text = symbols.intern(cond_text.trim())?;
+    Ok(HirStmt {
+        hir_id,
+        kind: StmtKind::Assert {
+            cond,
+            msg,
+            cond_text,
+        },
+        span,
+    })
+}
+
+fn lower_recovered_expr<'hir>(
+    expression: &ast::Expr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    if contains_error_node(expression.syntax()) && !contains_call_arglist_error(expression.syntax())
+    {
+        lower_error_expr(expression.syntax(), arena, source_map)
+    } else {
+        lower_expr_inner(expression, arena, symbols, source_map)
     }
 }
 
@@ -2073,10 +2235,21 @@ fn ensure_supported_block(block: &ast::Block) -> Result<(), HirLoweringError> {
                     ensure_supported_expr(&initializer)?;
                 }
             }
-            BlockStatementSyntax::Statement(statement) => {
-                return Err(HirLoweringError::UnsupportedSyntax(
-                    statement.syntax().kind(),
-                ));
+            BlockStatementSyntax::Statement(ast::Stmt::Assign(statement)) => {
+                if let Some(lhs) = statement.lhs() {
+                    ensure_supported_expr(&lhs)?;
+                }
+                if let Some(rhs) = statement.rhs() {
+                    ensure_supported_expr(&rhs)?;
+                }
+            }
+            BlockStatementSyntax::Statement(ast::Stmt::Assert(statement)) => {
+                if let Some(condition) = statement.condition() {
+                    ensure_supported_expr(&condition)?;
+                }
+                if let Some(message) = statement.message() {
+                    ensure_supported_expr(&message)?;
+                }
             }
             BlockStatementSyntax::Error(_) => {}
         }
@@ -3212,7 +3385,7 @@ fn contains_error_node(syntax: &SyntaxNode) -> bool {
         .any(|node| node.kind() == SyntaxKind::ERROR)
 }
 
-fn errors_are_in_let_or_var_statements(syntax: &SyntaxNode) -> bool {
+fn errors_are_in_recoverable_block_statements(syntax: &SyntaxNode) -> bool {
     let errors = syntax
         .descendants()
         .filter(|node| node.kind() == SyntaxKind::ERROR)
@@ -3220,9 +3393,24 @@ fn errors_are_in_let_or_var_statements(syntax: &SyntaxNode) -> bool {
     !errors.is_empty()
         && errors.iter().all(|error| {
             error.ancestors().any(|ancestor| {
-                matches!(ancestor.kind(), SyntaxKind::LET_STMT | SyntaxKind::VAR_STMT)
-            })
+                matches!(
+                    ancestor.kind(),
+                    SyntaxKind::LET_STMT
+                        | SyntaxKind::VAR_STMT
+                        | SyntaxKind::ASSIGN_STMT
+                        | SyntaxKind::ASSERT_STMT
+                )
+            }) || is_direct_block_error(error)
         })
+}
+
+fn is_direct_block_error(error: &SyntaxNode) -> bool {
+    error.ancestors().any(|ancestor| {
+        ancestor.kind() == SyntaxKind::ERROR
+            && ancestor
+                .parent()
+                .is_some_and(|parent| parent.kind() == SyntaxKind::BLOCK)
+    })
 }
 
 #[cfg(test)]
@@ -4721,7 +4909,7 @@ mod tests {
         );
 
         let file = crate::FileId::new(98);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { assert true\n x } }\n");
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { loop {}\n x } }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let block_expr = function
@@ -4738,7 +4926,7 @@ mod tests {
                 .expect("source map builder");
         assert!(matches!(
             lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::ASSERT_STMT))
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::LOOP_EXPR))
         ));
         assert_eq!(source_map.finish().node_to_syntax().len(), 1);
 
@@ -5020,6 +5208,257 @@ mod tests {
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
             "fn f() { { let value = source.convert<U32>\n value } }\n",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn lowers_simple_compound_assignments_and_assertions() {
+        let file = crate::FileId::new(142);
+        let operators = [
+            ("=", None),
+            ("+=", Some(BinOp::Add)),
+            ("-=", Some(BinOp::Sub)),
+            ("*=", Some(BinOp::Mul)),
+            ("/=", Some(BinOp::Div)),
+            ("%=", Some(BinOp::Rem)),
+            ("+%=", Some(BinOp::WrapAdd)),
+            ("-%=", Some(BinOp::WrapSub)),
+            ("*%=", Some(BinOp::WrapMul)),
+            ("&=", Some(BinOp::BitAnd)),
+            ("|=", Some(BinOp::BitOr)),
+            ("^=", Some(BinOp::BitXor)),
+            ("<<=", Some(BinOp::Shl)),
+            (">>=", Some(BinOp::Shr)),
+        ];
+        let assignments = operators
+            .iter()
+            .map(|(operator, _)| format!("target {operator} value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!(
+            "fn f() {{ {{\n{assignments}\nassert   left /* condition */ == right   , \"failed\"\nassert ready\n}} }}\n"
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, &source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("assignment and assert statements lower");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the expression is a block");
+        };
+        assert_eq!(block.stmts.len(), operators.len() + 2);
+        assert!(block.tail.is_none());
+        for (statement, (_, expected_op)) in block.stmts.iter().zip(operators) {
+            assert_eq!(statement.span.ctxt, SpanCtxt::Root);
+            match (statement.kind, expected_op) {
+                (StmtKind::Assign { lhs, rhs }, None) => {
+                    assert!(statement.hir_id.local_id < lhs.hir_id.local_id);
+                    assert!(lhs.hir_id.local_id < rhs.hir_id.local_id);
+                    assert!(matches!(lhs.kind, ExprKind::Path(_)));
+                    assert!(matches!(rhs.kind, ExprKind::Path(_)));
+                }
+                (StmtKind::AssignOp { op, lhs, rhs }, Some(expected_op)) => {
+                    assert_eq!(op, expected_op);
+                    assert!(statement.hir_id.local_id < lhs.hir_id.local_id);
+                    assert!(lhs.hir_id.local_id < rhs.hir_id.local_id);
+                    assert!(matches!(lhs.kind, ExprKind::Path(_)));
+                    assert!(matches!(rhs.kind, ExprKind::Path(_)));
+                }
+                (kind, expected) => {
+                    panic!("unexpected assignment lowering {kind:?} for {expected:?}")
+                }
+            }
+        }
+        let StmtKind::Assert {
+            cond,
+            msg: Some(msg),
+            cond_text,
+        } = block.stmts[operators.len()].kind
+        else {
+            panic!("the first assert has a message");
+        };
+        assert!(block.stmts[operators.len()].hir_id.local_id < cond.hir_id.local_id);
+        assert!(cond.hir_id.local_id < msg.hir_id.local_id);
+        assert!(matches!(cond.kind, ExprKind::Binary { .. }));
+        assert_eq!(
+            symbols.resolve(cond_text).unwrap().as_ref(),
+            "left /* condition */ == right"
+        );
+        assert!(matches!(
+            msg.kind,
+            ExprKind::Lit(Lit::Str(text))
+                if symbols.resolve(text).unwrap().as_ref() == "failed"
+        ));
+        let StmtKind::Assert {
+            cond,
+            msg: None,
+            cond_text,
+        } = block.stmts[operators.len() + 1].kind
+        else {
+            panic!("the second assert uses its default message");
+        };
+        assert!(block.stmts[operators.len() + 1].hir_id.local_id < cond.hir_id.local_id);
+        assert!(matches!(cond.kind, ExprKind::Path(_)));
+        assert_eq!(symbols.resolve(cond_text).unwrap().as_ref(), "ready");
+    }
+
+    #[test]
+    fn malformed_assert_condition_is_retained_as_an_error_expression() {
+        let file = crate::FileId::new(143);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { { assert , \"message\"\n 1 } }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("assert recovery preserves the block");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the recovered expression is a block");
+        };
+        assert_eq!(block.stmts.len(), 1);
+        assert!(matches!(
+            block.tail.map(|tail| tail.kind),
+            Some(ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            }))
+        ));
+        let StmtKind::Assert {
+            cond,
+            msg: Some(msg),
+            cond_text,
+        } = block.stmts[0].kind
+        else {
+            panic!("the recovered assert keeps its message");
+        };
+        assert_eq!(cond.kind, ExprKind::Err);
+        assert!(matches!(
+            msg.kind,
+            ExprKind::Lit(Lit::Str(text))
+                if symbols.resolve(text).unwrap().as_ref() == "message"
+        ));
+        assert_eq!(symbols.resolve(cond_text).unwrap().as_ref(), "");
+        assert!(source_map.finish().diagnostics().is_empty());
+    }
+
+    #[test]
+    fn missing_assert_message_is_retained_as_an_error_expression() {
+        let file = crate::FileId::new(145);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { assert ready, } }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("assert recovery preserves the block");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the recovered expression is a block");
+        };
+        let StmtKind::Assert {
+            cond,
+            msg: Some(msg),
+            cond_text,
+        } = block.stmts[0].kind
+        else {
+            panic!("the missing message occupies its own error slot");
+        };
+        assert!(matches!(cond.kind, ExprKind::Path(_)));
+        assert_eq!(msg.kind, ExprKind::Err);
+        assert_eq!(symbols.resolve(cond_text).unwrap().as_ref(), "ready");
+        assert!(block.tail.is_none());
+    }
+
+    #[test]
+    fn direct_block_errors_preserve_otherwise_lowerable_blocks() {
+        let file = crate::FileId::new(146);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { { @allow(foo)\n fn inner() {} } }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("the block directly retains its recovery node");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the block expression is retained");
+        };
+        assert_eq!(block.stmts.len(), 1);
+        assert!(block.tail.is_none());
+        let StmtKind::Expr(error) = block.stmts[0].kind else {
+            panic!("a direct block error becomes an error statement");
+        };
+        assert_eq!(error.kind, ExprKind::Err);
+    }
+
+    #[test]
+    fn assignment_preflights_unsupported_operands_before_allocating() {
+        let file = crate::FileId::new(144);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() { { target = source.convert<U32>\n value } }\n",
         );
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
