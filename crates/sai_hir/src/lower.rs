@@ -96,6 +96,8 @@ fn lower_expr_inner<'hir>(
         ast::Expr::ImplicitMember(member) => {
             lower_implicit_member_expr(member, arena, symbols, source_map)
         }
+        ast::Expr::Field(field) => lower_field_expr(field, arena, symbols, source_map),
+        ast::Expr::TupleIndex(index) => lower_tuple_index_expr(index, arena, symbols, source_map),
         ast::Expr::Unit(unit) => {
             let (hir_id, span) = source_map.add_node_with_span(unit.syntax(), SpanCtxt::Root)?;
             Ok(arena.alloc_expr(Expr {
@@ -198,6 +200,53 @@ fn lower_implicit_member_expr<'hir>(
     }))
 }
 
+fn lower_field_expr<'hir>(
+    field: &ast::FieldExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    if has_direct_generic_args(field.syntax()) {
+        return Err(HirLoweringError::UnsupportedSyntax(field.syntax().kind()));
+    }
+    let (Some(base), Some(name)) = (field.base(), field.name()) else {
+        return lower_error_expr(field.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(field.syntax(), SpanCtxt::Root)?;
+    let base = lower_expr_inner(&base, arena, symbols, source_map)?;
+    let name = lower_name_ref(&name, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Field {
+            base,
+            name,
+            args: None,
+        },
+        span,
+    }))
+}
+
+fn lower_tuple_index_expr<'hir>(
+    index: &ast::TupleIndexExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(base) = index.base() else {
+        return lower_error_expr(index.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(index.syntax(), SpanCtxt::Root)?;
+    let base = lower_expr_inner(&base, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::TupleField {
+            base,
+            index: index.index(),
+        },
+        span,
+    }))
+}
+
 fn lower_error_expr<'hir>(
     syntax: &SyntaxNode,
     arena: &'hir HirArena<'hir>,
@@ -219,6 +268,14 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
     match expression {
         ast::Expr::Literal(_) | ast::Expr::SelfValue(_) | ast::Expr::SelfType(_) => Ok(()),
         ast::Expr::Path(path) if path.generic_args().is_none() => Ok(()),
+        ast::Expr::Field(field) if !has_direct_generic_args(field.syntax()) => match field.base() {
+            Some(base) => ensure_supported_expr(&base),
+            None => Ok(()),
+        },
+        ast::Expr::TupleIndex(index) => match index.base() {
+            Some(base) => ensure_supported_expr(&base),
+            None => Ok(()),
+        },
         ast::Expr::ImplicitMember(_) | ast::Expr::Unit(_) => Ok(()),
         ast::Expr::Paren(paren) => match paren.expression() {
             Some(inner) => ensure_supported_expr(&inner),
@@ -234,6 +291,12 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             expression.syntax().kind(),
         )),
     }
+}
+
+fn has_direct_generic_args(syntax: &SyntaxNode) -> bool {
+    syntax
+        .children()
+        .any(|child| child.kind() == SyntaxKind::GENERIC_ARG_LIST)
 }
 
 /// Lower a literal pattern, preserving its direct minus sign for integer
@@ -1470,7 +1533,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_tuple_children_before_allocating_hir_nodes() {
         let file = crate::FileId::new(73);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value.field) }\n");
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value.convert<U32>) }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let tuple = function
@@ -1493,7 +1556,7 @@ mod tests {
         assert_eq!(
             source_map.finish().node_to_syntax().len(),
             1,
-            "preflight rejects a valid unsupported child before allocating the tuple"
+            "preflight rejects generic field arguments before allocating the tuple"
         );
     }
 
@@ -1621,6 +1684,114 @@ mod tests {
         assert_eq!(path_span, elements[0].span.range);
         assert_eq!(segment_span, value_path.segments[0].name.span.range);
         assert_eq!(map.node_to_syntax().len(), 10);
+    }
+
+    #[test]
+    fn lowers_nested_field_and_tuple_index_expressions() {
+        let file = crate::FileId::new(76);
+        let source = "fn f() { (value.field.other, value.0, value.00, value.999999999999) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidTupleIndex)
+                .count(),
+            1
+        );
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("field and tuple-index expressions lower");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), 4);
+
+        let ExprKind::Field {
+            base: outer_base,
+            name: outer_name,
+            args: None,
+        } = elements[0].kind
+        else {
+            panic!("outer field expression is lowered");
+        };
+        assert_eq!(symbols.resolve(outer_name.sym).unwrap().as_ref(), "other");
+        let ExprKind::Field {
+            base: inner_base,
+            name: inner_name,
+            args: None,
+        } = outer_base.kind
+        else {
+            panic!("field chain is represented as nested field expressions");
+        };
+        assert_eq!(symbols.resolve(inner_name.sym).unwrap().as_ref(), "field");
+        let ExprKind::Path(path) = inner_base.kind else {
+            panic!("field chain starts with a plain path");
+        };
+        assert_eq!(path.root, PathRoot::Plain);
+        assert_eq!(path.segments.len(), 1);
+
+        let ExprKind::TupleField {
+            base: tuple_base,
+            index: Some(0),
+        } = elements[1].kind
+        else {
+            panic!("valid tuple index is retained");
+        };
+        assert!(matches!(tuple_base.kind, ExprKind::Path(_)));
+        let ExprKind::TupleField {
+            base: invalid_index_base,
+            index: None,
+        } = elements[2].kind
+        else {
+            panic!("parser-diagnosed invalid index keeps its recovery value");
+        };
+        assert!(matches!(invalid_index_base.kind, ExprKind::Path(_)));
+        let ExprKind::TupleField {
+            base: overflowing_index_base,
+            index: None,
+        } = elements[3].kind
+        else {
+            panic!("an index outside u32 has no decoded HIR index");
+        };
+        assert!(matches!(overflowing_index_base.kind, ExprKind::Path(_)));
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                elements[0].hir_id.local_id.raw(),
+                outer_base.hir_id.local_id.raw(),
+                inner_base.hir_id.local_id.raw(),
+                path.hir_id.local_id.raw(),
+                path.segments[0].hir_id.local_id.raw(),
+                elements[1].hir_id.local_id.raw(),
+                tuple_base.hir_id.local_id.raw(),
+                elements[2].hir_id.local_id.raw(),
+                invalid_index_base.hir_id.local_id.raw(),
+                elements[3].hir_id.local_id.raw(),
+                overflowing_index_base.hir_id.local_id.raw(),
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 15, 16]
+        );
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 19);
+        assert!(
+            map.diagnostics().is_empty(),
+            "the parser's INVALID_TUPLE_INDEX diagnostic remains authoritative"
+        );
     }
 
     #[test]
