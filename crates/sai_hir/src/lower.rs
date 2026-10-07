@@ -2,7 +2,7 @@ use crate::Symbol;
 use crate::arena::HirArena;
 use crate::expressions::{
     Arg, Arm as HirArm, BinOp, Block as HirBlock, Expr, ExprKind, Label as HirLabel,
-    MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
+    LoopSource as HirLoopSource, MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
 };
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
@@ -499,6 +499,8 @@ fn lower_expr_inner<'hir>(
         ast::Expr::Block(block_expr) => lower_block_expr(block_expr, arena, symbols, source_map),
         ast::Expr::If(if_expr) => lower_if_expr(if_expr, arena, symbols, source_map),
         ast::Expr::Match(match_expr) => lower_match_expr(match_expr, arena, symbols, source_map),
+        ast::Expr::Loop(loop_expr) => lower_loop_expr(loop_expr, arena, symbols, source_map),
+        ast::Expr::While(while_expr) => lower_while_expr(while_expr, arena, symbols, source_map),
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -1394,6 +1396,207 @@ fn lower_if_expr<'hir>(
     }))
 }
 
+fn lower_loop_expr<'hir>(
+    loop_expr: &ast::LoopExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(body) = loop_expr.body() else {
+        return lower_error_expr(loop_expr.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(loop_expr.syntax(), SpanCtxt::Root)?;
+    let label = lower_label(
+        loop_expr.label().and_then(|label| label.label()),
+        symbols,
+        source_map,
+    )?;
+    let body = lower_block(&body, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Loop {
+            body,
+            label,
+            source: HirLoopSource::Loop,
+        },
+        span,
+    }))
+}
+
+fn lower_while_expr<'hir>(
+    while_expr: &ast::WhileExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(body) = while_expr.body() else {
+        return lower_error_expr(while_expr.syntax(), arena, source_map);
+    };
+    let Some(condition) = while_expr.condition() else {
+        return lower_error_expr(while_expr.syntax(), arena, source_map);
+    };
+
+    let let_condition = condition.let_condition();
+    let desugaring = if let_condition.is_some() {
+        DesugaringKind::WhileLet
+    } else {
+        DesugaringKind::WhileLoop
+    };
+    let ctxt = SpanCtxt::Desugared(desugaring);
+    let (hir_id, span) = source_map.add_node_with_span(while_expr.syntax(), ctxt)?;
+    let label = lower_label(
+        while_expr.label().and_then(|label| label.label()),
+        symbols,
+        source_map,
+    )?;
+    let (loop_body_hir_id, loop_body_span) =
+        source_map.add_node_with_span(while_expr.syntax(), ctxt)?;
+
+    let tail = if let Some(let_condition) = let_condition {
+        let (match_hir_id, match_span) =
+            source_map.add_node_with_span(while_expr.syntax(), ctxt)?;
+        let scrutinee = match let_condition.initializer() {
+            Some(expression) => lower_expr_inner(&expression, arena, symbols, source_map)?,
+            None => {
+                let error = direct_error_child_from_end(let_condition.syntax())
+                    .unwrap_or_else(|| let_condition.syntax().clone());
+                lower_error_expr(&error, arena, source_map)?
+            }
+        };
+
+        let (user_arm_hir_id, user_arm_span) =
+            source_map.add_node_with_span(while_expr.syntax(), ctxt)?;
+        let pattern = match let_condition.pattern() {
+            Some(pattern) => lower_pattern(&pattern, arena, symbols, source_map)?,
+            None => {
+                let error = direct_error_child(let_condition.syntax())
+                    .unwrap_or_else(|| let_condition.syntax().clone());
+                lower_error_pattern(&error, arena, source_map)?
+            }
+        };
+        let user_body = lower_block_as_expr(body.syntax(), &body, arena, symbols, source_map)?;
+        let user_arm = HirArm {
+            hir_id: user_arm_hir_id,
+            pat: pattern,
+            guard: None,
+            body: user_body,
+            span: user_arm_span,
+            synthesized: false,
+        };
+
+        let (fallback_arm_hir_id, fallback_arm_span) =
+            source_map.add_node_with_span(while_expr.syntax(), ctxt)?;
+        let (wildcard_hir_id, wildcard_span) =
+            source_map.add_node_with_span(while_expr.syntax(), ctxt)?;
+        let wildcard = arena.alloc_pat(Pat {
+            hir_id: wildcard_hir_id,
+            kind: PatKind::Wild,
+            span: wildcard_span,
+        });
+        let fallback_body = lower_synthetic_break(while_expr.syntax(), ctxt, arena, source_map)?;
+        let fallback_arm = HirArm {
+            hir_id: fallback_arm_hir_id,
+            pat: wildcard,
+            guard: None,
+            body: fallback_body,
+            span: fallback_arm_span,
+            synthesized: true,
+        };
+        arena.alloc_expr(Expr {
+            hir_id: match_hir_id,
+            kind: ExprKind::Match {
+                scrutinee,
+                arms: arena.alloc_arms(&[user_arm, fallback_arm]),
+                source: HirMatchSource::WhileLet,
+            },
+            span: match_span,
+        })
+    } else {
+        let (if_hir_id, if_span) = source_map.add_node_with_span(while_expr.syntax(), ctxt)?;
+        let cond = match condition.expression() {
+            Some(expression) => lower_expr_inner(&expression, arena, symbols, source_map)?,
+            None => {
+                let error = direct_error_child(condition.syntax())
+                    .unwrap_or_else(|| condition.syntax().clone());
+                lower_error_expr(&error, arena, source_map)?
+            }
+        };
+        let then_branch = lower_block(&body, arena, symbols, source_map)?;
+        let else_branch =
+            lower_synthetic_break_block_expr(while_expr.syntax(), ctxt, arena, source_map)?;
+        arena.alloc_expr(Expr {
+            hir_id: if_hir_id,
+            kind: ExprKind::If {
+                cond,
+                then: then_branch,
+                els: Some(else_branch),
+            },
+            span: if_span,
+        })
+    };
+
+    let loop_body = arena.alloc_block(HirBlock {
+        hir_id: loop_body_hir_id,
+        stmts: arena.alloc_stmts(&[]),
+        tail: Some(tail),
+        safety: Safety::Safe,
+        span: loop_body_span,
+    });
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Loop {
+            body: loop_body,
+            label,
+            source: if desugaring == DesugaringKind::WhileLet {
+                HirLoopSource::WhileLet
+            } else {
+                HirLoopSource::While
+            },
+        },
+        span,
+    }))
+}
+
+fn lower_synthetic_break<'hir>(
+    syntax: &SyntaxNode,
+    ctxt: SpanCtxt,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(syntax, ctxt)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Break {
+            label: None,
+            value: None,
+        },
+        span,
+    }))
+}
+
+fn lower_synthetic_break_block_expr<'hir>(
+    syntax: &SyntaxNode,
+    ctxt: SpanCtxt,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (expr_hir_id, expr_span) = source_map.add_node_with_span(syntax, ctxt)?;
+    let (block_hir_id, block_span) = source_map.add_node_with_span(syntax, ctxt)?;
+    let break_expr = lower_synthetic_break(syntax, ctxt, arena, source_map)?;
+    let block = arena.alloc_block(HirBlock {
+        hir_id: block_hir_id,
+        stmts: arena.alloc_stmts(&[]),
+        tail: Some(break_expr),
+        safety: Safety::Safe,
+        span: block_span,
+    });
+    Ok(arena.alloc_expr(Expr {
+        hir_id: expr_hir_id,
+        kind: ExprKind::Block(block),
+        span: expr_span,
+    }))
+}
+
 fn lower_if_let_expr<'hir>(
     if_expr: &ast::IfExpr,
     condition: &ast::LetCondition,
@@ -2198,6 +2401,13 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
         },
         ast::Expr::If(if_expr) => ensure_supported_if_expr(if_expr),
         ast::Expr::Match(match_expr) => ensure_supported_match_expr(match_expr),
+        ast::Expr::Loop(loop_expr) => {
+            if let Some(body) = loop_expr.body() {
+                ensure_supported_block(&body)?;
+            }
+            Ok(())
+        }
+        ast::Expr::While(while_expr) => ensure_supported_while_expr(while_expr),
         _ if contains_error_node(expression.syntax()) => Ok(()),
         _ => Err(HirLoweringError::UnsupportedSyntax(
             expression.syntax().kind(),
@@ -2279,6 +2489,25 @@ fn ensure_supported_if_expr(if_expr: &ast::IfExpr) -> Result<(), HirLoweringErro
         } else if let Some(else_if) = else_branch.else_if() {
             ensure_supported_if_expr(&else_if)?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_supported_while_expr(while_expr: &ast::WhileExpr) -> Result<(), HirLoweringError> {
+    if let Some(condition) = while_expr.condition() {
+        if let Some(let_condition) = condition.let_condition() {
+            if let Some(pattern) = let_condition.pattern() {
+                ensure_supported_pattern(&pattern)?;
+            }
+            if let Some(expression) = let_condition.initializer() {
+                ensure_supported_expr(&expression)?;
+            }
+        } else if let Some(expression) = condition.expression() {
+            ensure_supported_expr(&expression)?;
+        }
+    }
+    if let Some(body) = while_expr.body() {
+        ensure_supported_block(&body)?;
     }
     Ok(())
 }
@@ -4909,7 +5138,7 @@ mod tests {
         );
 
         let file = crate::FileId::new(98);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { loop {}\n x } }\n");
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { for item in x {}\n x } }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let block_expr = function
@@ -4926,7 +5155,7 @@ mod tests {
                 .expect("source map builder");
         assert!(matches!(
             lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::LOOP_EXPR))
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FOR_EXPR))
         ));
         assert_eq!(source_map.finish().node_to_syntax().len(), 1);
 
@@ -5624,6 +5853,245 @@ mod tests {
             std::array::from_fn::<_, 23, _>(|index| index as u32 + 1)
         );
         assert_eq!(source_map.finish().node_to_syntax().len(), 24);
+    }
+
+    #[test]
+    fn lowers_loop_and_while_with_specified_hir_shapes() {
+        let file = crate::FileId::new(100);
+        let source = concat!(
+            "fn f(value: I32) {\n",
+            "'outer:\n",
+            "loop { break 'outer }\n",
+            "'again:\n",
+            "while true { value }\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+
+        let loop_syntax = function
+            .descendants()
+            .find_map(ast::LoopExpr::cast)
+            .expect("loop expression");
+        let loop_expression =
+            ast::Expr::cast(loop_syntax.syntax().clone()).expect("loop expression variant");
+        let mut loop_source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("loop source map");
+        let lowered_loop = lower_expr(&loop_expression, &arena, &symbols, &mut loop_source_map)
+            .expect("loop lowers");
+        let ExprKind::Loop {
+            body,
+            label: Some(label),
+            source: HirLoopSource::Loop,
+        } = lowered_loop.kind
+        else {
+            panic!("the source loop retains its label and loop kind");
+        };
+        assert_eq!(symbols.resolve(label.name).unwrap().as_ref(), "outer");
+        let ExprKind::Break {
+            label: Some(break_label),
+            value: None,
+        } = body.tail.expect("loop body tail").kind
+        else {
+            panic!("the loop body contains its labeled break");
+        };
+        assert_eq!(symbols.resolve(break_label.name).unwrap().as_ref(), "outer");
+        let loop_source_map = loop_source_map.finish();
+        assert_eq!(loop_source_map.node_to_syntax().len(), 4);
+        let loop_pointer =
+            sai_syntax::SyntaxNodePtr::new(file, loop_syntax.syntax()).expect("loop pointer");
+        assert_eq!(
+            loop_source_map
+                .nodes_for_syntax(&loop_pointer)
+                .iter()
+                .map(|local_id| local_id.raw())
+                .collect::<Vec<_>>(),
+            [1]
+        );
+
+        let while_syntax = function
+            .descendants()
+            .find_map(ast::WhileExpr::cast)
+            .expect("while expression");
+        let while_expression =
+            ast::Expr::cast(while_syntax.syntax().clone()).expect("while expression variant");
+        let mut while_source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("while source map");
+        let lowered_while = lower_expr(&while_expression, &arena, &symbols, &mut while_source_map)
+            .expect("while lowers");
+        let ExprKind::Loop {
+            body: while_body,
+            label: Some(while_label),
+            source: HirLoopSource::While,
+        } = lowered_while.kind
+        else {
+            panic!("labeled while lowers to a labeled loop with While source");
+        };
+        let ctxt = SpanCtxt::Desugared(DesugaringKind::WhileLoop);
+        assert_eq!(symbols.resolve(while_label.name).unwrap().as_ref(), "again");
+        assert_eq!(lowered_while.span.ctxt, ctxt);
+        assert_eq!(while_body.span, lowered_while.span);
+        let ExprKind::If {
+            cond,
+            then,
+            els: Some(else_expr),
+        } = while_body.tail.expect("synthetic loop body tail").kind
+        else {
+            panic!("while lowers to an if in the loop body");
+        };
+        assert_eq!(cond.kind, ExprKind::Lit(Lit::Bool(true)));
+        assert_eq!(cond.span.ctxt, SpanCtxt::Root);
+        assert_eq!(then.span.ctxt, SpanCtxt::Root);
+        assert_eq!(while_body.tail.unwrap().span.ctxt, ctxt);
+        let then_tail = then.tail.expect("user while body tail");
+        assert!(matches!(then_tail.kind, ExprKind::Path(_)));
+        let ExprKind::Path(path) = then_tail.kind else {
+            unreachable!();
+        };
+        assert_eq!(
+            symbols.resolve(path.segments[0].name.sym).unwrap().as_ref(),
+            "value"
+        );
+        let ExprKind::Block(else_block) = else_expr.kind else {
+            panic!("the false branch is a synthesized block");
+        };
+        assert_eq!(else_expr.span.ctxt, ctxt);
+        assert_eq!(else_block.span.ctxt, ctxt);
+        let synthesized_break = else_block.tail.expect("synthesized break");
+        assert_eq!(synthesized_break.span.ctxt, ctxt);
+        assert_eq!(
+            synthesized_break.kind,
+            ExprKind::Break {
+                label: None,
+                value: None,
+            }
+        );
+        assert_eq!(
+            [
+                lowered_while.hir_id.local_id.raw(),
+                while_body.hir_id.local_id.raw(),
+                while_body.tail.unwrap().hir_id.local_id.raw(),
+                cond.hir_id.local_id.raw(),
+            ],
+            [1, 2, 3, 4]
+        );
+        let source_map = while_source_map.finish();
+        assert_eq!(source_map.node_to_syntax().len(), 12);
+        let while_pointer =
+            sai_syntax::SyntaxNodePtr::new(file, while_syntax.syntax()).expect("while pointer");
+        assert_eq!(
+            source_map
+                .nodes_for_syntax(&while_pointer)
+                .iter()
+                .map(|local_id| local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn lowers_while_let_to_match_with_synthesized_break_arm() {
+        let file = crate::FileId::new(100);
+        let source = "fn f(value: Option<I32>) { while let Some(item) = value { item } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let while_syntax = function
+            .descendants()
+            .find_map(ast::WhileExpr::cast)
+            .expect("while-let expression");
+        let expression =
+            ast::Expr::cast(while_syntax.syntax().clone()).expect("while expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("while-let lowers");
+        let ctxt = SpanCtxt::Desugared(DesugaringKind::WhileLet);
+        assert_eq!(lowered.span.ctxt, ctxt);
+        let ExprKind::Loop {
+            body,
+            source: HirLoopSource::WhileLet,
+            ..
+        } = lowered.kind
+        else {
+            panic!("while-let lowers to a loop");
+        };
+        assert_eq!(body.span.ctxt, ctxt);
+        let ExprKind::Match {
+            scrutinee,
+            arms,
+            source: HirMatchSource::WhileLet,
+        } = body.tail.expect("loop body match").kind
+        else {
+            panic!("while-let loop body is a match");
+        };
+        assert!(matches!(scrutinee.kind, ExprKind::Path(_)));
+        assert_eq!(arms.len(), 2);
+        assert!(!arms[0].synthesized);
+        assert!(matches!(arms[0].pat.kind, PatKind::Ctor { .. }));
+        assert_eq!(arms[0].pat.span.ctxt, SpanCtxt::Root);
+        assert_eq!(arms[0].body.span.ctxt, SpanCtxt::Root);
+        assert!(arms[1].synthesized);
+        assert_eq!(arms[1].span.ctxt, ctxt);
+        assert_eq!(arms[1].pat.kind, PatKind::Wild);
+        assert_eq!(arms[1].pat.span.ctxt, ctxt);
+        assert_eq!(
+            arms[1].body.kind,
+            ExprKind::Break {
+                label: None,
+                value: None,
+            }
+        );
+        assert_eq!(arms[1].body.span.ctxt, ctxt);
+        let source_map = source_map.finish();
+        let while_pointer =
+            sai_syntax::SyntaxNodePtr::new(file, while_syntax.syntax()).expect("while pointer");
+        assert_eq!(
+            source_map
+                .nodes_for_syntax(&while_pointer)
+                .iter()
+                .map(|local_id| local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 7, 17, 18, 19]
+        );
+    }
+
+    #[test]
+    fn loop_preflight_rejects_unsupported_nested_syntax_atomically() {
+        let file = crate::FileId::new(100);
+        let source = "fn f(value: I32) { while true { for item in value { item } } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let while_syntax = function
+            .descendants()
+            .find_map(ast::WhileExpr::cast)
+            .expect("while expression");
+        let expression =
+            ast::Expr::cast(while_syntax.syntax().clone()).expect("while expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FOR_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
     }
 
     #[test]
