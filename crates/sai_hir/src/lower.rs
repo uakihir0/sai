@@ -39,11 +39,12 @@ pub enum HirLoweringError {
 
 /// Lower a function declaration's signature and body within its HIR owner.
 ///
-/// The source-map builder must be rooted at `declaration`. If its contracts or
-/// body contain closures or async blocks, the builder must also receive the
-/// same definition-path interner that interned the owner. Function bodies and
-/// contract expressions share the owner's HIR and binding-ID spaces. Async
-/// function desugaring is handled by a later lowering slice.
+/// The source-map builder must be rooted at `declaration`. An async function
+/// with a body, or any function whose contracts or body contain closures or
+/// async blocks, requires the same definition-path interner that interned the
+/// owner. Function bodies and contract expressions share the owner's HIR and
+/// binding-ID spaces. Async functions with bodies use the Stage 5 synthetic
+/// async-block wrapper.
 pub fn lower_function<'hir>(
     declaration: &ast::FnDecl,
     arena: &'hir HirArena<'hir>,
@@ -57,12 +58,6 @@ pub fn lower_function<'hir>(
             declaration.syntax().kind(),
         ));
     }
-    if declaration.async_token().is_some() {
-        return Err(HirLoweringError::UnsupportedSyntax(
-            declaration.syntax().kind(),
-        ));
-    }
-
     let params = declaration
         .params()
         .map(|list| {
@@ -109,7 +104,16 @@ pub fn lower_function<'hir>(
     // Assign closure and async-block identities across the complete owner
     // before lowering any child. This also makes contracts and body expressions
     // agree on the same owner-wide preorder.
-    prepare_nested_definition_ids(declaration.syntax(), source_map)?;
+    let async_fn_body_syntax = if declaration.async_token().is_some() {
+        body.as_ref().map(|body| body.syntax().clone())
+    } else {
+        None
+    };
+    let async_fn_def_id = prepare_nested_definition_ids_with_async_fn_body(
+        declaration.syntax(),
+        async_fn_body_syntax.as_ref(),
+        source_map,
+    )?;
 
     let mut lowered_params = Vec::with_capacity(params.len());
     let mut pending_body_params = Vec::with_capacity(params.len());
@@ -165,7 +169,9 @@ pub fn lower_function<'hir>(
         };
         let (hir_id, _) = source_map.add_node_with_span(&syntax, SpanCtxt::Root)?;
         let expression = match expression {
-            Some(expression) => lower_expr(&expression, arena, symbols, source_map)?,
+            Some(expression) => {
+                lower_expr_in_prepared_owner(&expression, arena, symbols, source_map)?
+            }
             None => {
                 let error = direct_error_child(&syntax).unwrap_or_else(|| syntax.clone());
                 lower_error_expr(&error, arena, source_map)?
@@ -183,6 +189,16 @@ pub fn lower_function<'hir>(
     }
 
     let body_value = match body {
+        Some(body) if let Some(async_fn_def_id) = async_fn_def_id => {
+            Some(lower_async_function_body(
+                declaration,
+                &body,
+                async_fn_def_id,
+                arena,
+                symbols,
+                source_map,
+            )?)
+        }
         Some(body) => Some(lower_block_as_expr(
             body.syntax(),
             &body,
@@ -208,7 +224,7 @@ pub fn lower_function<'hir>(
         } else {
             Safety::Safe
         },
-        is_async: false,
+        is_async: declaration.async_token().is_some(),
         params: arena.alloc_fn_params(&lowered_params),
         ret,
         borrows,
@@ -228,6 +244,45 @@ pub fn lower_function<'hir>(
         invariant_preds: arena.alloc_expr_refs(&[]),
     });
     Ok((signature, Some(body)))
+}
+
+fn lower_async_function_body<'hir>(
+    declaration: &ast::FnDecl,
+    source_body: &ast::Block,
+    def_id: LocalDefId,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let span_context = SpanCtxt::Desugared(DesugaringKind::AsyncFn);
+    let (value_hir_id, value_span) =
+        source_map.add_node_with_span(declaration.syntax(), span_context)?;
+    let (outer_block_hir_id, outer_block_span) =
+        source_map.add_node_with_span(declaration.syntax(), span_context)?;
+    let (async_expr_hir_id, async_expr_span) =
+        source_map.add_node_with_span(declaration.syntax(), span_context)?;
+    let block = lower_block(source_body, arena, symbols, source_map)?;
+    let async_expr = arena.alloc_expr(Expr {
+        hir_id: async_expr_hir_id,
+        kind: ExprKind::AsyncBlock {
+            def_id,
+            capture: CaptureBy::Move,
+            block,
+        },
+        span: async_expr_span,
+    });
+    let outer_block = arena.alloc_block(HirBlock {
+        hir_id: outer_block_hir_id,
+        stmts: arena.alloc_stmts(&[]),
+        tail: Some(async_expr),
+        safety: Safety::Safe,
+        span: outer_block_span,
+    });
+    Ok(arena.alloc_expr(Expr {
+        hir_id: value_hir_id,
+        kind: ExprKind::Block(outer_block),
+        span: value_span,
+    }))
 }
 
 enum FunctionParamSyntax {
@@ -1030,24 +1085,52 @@ pub fn lower_expr<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     ensure_supported_expr(expression)?;
-    if contains_error_node(expression.syntax())
-        && !contains_call_arglist_error(expression.syntax())
-        && !errors_are_in_recoverable_block_statements(expression.syntax())
-        && !errors_are_recoverable_closure_contexts(expression.syntax())
-        && !errors_are_in_recoverable_format_interpolations(expression.syntax())
-        && !errors_are_in_casts(expression.syntax())
-    {
+    if should_lower_expression_as_error(expression) {
         return lower_error_expr(expression.syntax(), arena, source_map);
     }
     prepare_nested_definition_ids(expression.syntax(), source_map)?;
     lower_expr_inner(expression, arena, symbols, source_map)
 }
 
+fn lower_expr_in_prepared_owner<'hir>(
+    expression: &ast::Expr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    ensure_supported_expr(expression)?;
+    if should_lower_expression_as_error(expression) {
+        return lower_error_expr(expression.syntax(), arena, source_map);
+    }
+    lower_expr_inner(expression, arena, symbols, source_map)
+}
+
+fn should_lower_expression_as_error(expression: &ast::Expr) -> bool {
+    contains_error_node(expression.syntax())
+        && !contains_call_arglist_error(expression.syntax())
+        && !errors_are_in_recoverable_block_statements(expression.syntax())
+        && !errors_are_recoverable_closure_contexts(expression.syntax())
+        && !errors_are_in_recoverable_format_interpolations(expression.syntax())
+        && !errors_are_in_casts(expression.syntax())
+}
+
 fn prepare_nested_definition_ids(
     expression_syntax: &SyntaxNode,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(), HirLoweringError> {
+    prepare_nested_definition_ids_with_async_fn_body(expression_syntax, None, source_map)?;
+    Ok(())
+}
+
+fn prepare_nested_definition_ids_with_async_fn_body(
+    expression_syntax: &SyntaxNode,
+    async_fn_body_syntax: Option<&SyntaxNode>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Option<LocalDefId>, HirLoweringError> {
     let owner_pointer = source_map.pointer_for(source_map.owner_syntax())?;
+    let async_fn_body_pointer = async_fn_body_syntax
+        .map(|syntax| source_map.pointer_for(syntax))
+        .transpose()?;
     let mut nested_definitions = Vec::new();
     for node in source_map.owner_syntax().descendants() {
         if is_nested_definition_kind(node.kind())
@@ -1078,17 +1161,29 @@ fn prepare_nested_definition_ids(
             return Err(HirLoweringError::UnsupportedSyntax(node.kind()));
         }
     }
-    let Some(first_owned_definition_kind) = first_owned_definition_kind else {
-        return Ok(());
+    if first_owned_definition_kind.is_none() && async_fn_body_pointer.is_none() {
+        return Ok(None);
     };
     let Some(def_paths) = source_map.def_path_interner() else {
         return Err(HirLoweringError::UnsupportedSyntax(
-            first_owned_definition_kind,
+            first_owned_definition_kind.unwrap_or(SyntaxKind::FN_DECL),
         ));
     };
+    let async_fn_def_id = async_fn_body_pointer
+        .as_ref()
+        .map(|_| {
+            def_paths
+                .intern_nested(source_map.owner().def_id, DefPathData::AsyncBlock, 0)
+                .map_err(HirLoweringError::from)
+        })
+        .transpose()?;
+    let disambiguator_offset = usize::from(async_fn_def_id.is_some());
     let mut ids_by_syntax = HashMap::<SyntaxNodePtr, LocalDefId>::new();
 
     for (ordinal, (node, pointer)) in nested_definitions.iter().enumerate() {
+        let ordinal = ordinal
+            .checked_add(disambiguator_offset)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
         let disambiguator =
             u32::try_from(ordinal).map_err(|_| DefPathInternerError::TooManyDefinitions)?;
         let component = match node.kind() {
@@ -1105,11 +1200,14 @@ fn prepare_nested_definition_ids(
                 let Some(candidate) = ancestor else {
                     break source_map.owner().def_id;
                 };
+                let candidate_pointer = source_map.pointer_for(&candidate)?;
+                if async_fn_body_pointer.as_ref() == Some(&candidate_pointer) {
+                    break async_fn_def_id.ok_or(HirSourceMapError::NestedDefinitionIdMismatch)?;
+                }
                 if matches!(
                     candidate.kind(),
                     SyntaxKind::CLOSURE_EXPR | SyntaxKind::ASYNC_BLOCK_EXPR
                 ) {
-                    let candidate_pointer = source_map.pointer_for(&candidate)?;
                     if candidate_pointer == owner_pointer {
                         break source_map.owner().def_id;
                     }
@@ -1118,7 +1216,7 @@ fn prepare_nested_definition_ids(
                         .copied()
                         .ok_or(HirSourceMapError::NestedDefinitionIdMismatch)?;
                 }
-                if source_map.pointer_for(&candidate)? == owner_pointer {
+                if candidate_pointer == owner_pointer {
                     break source_map.owner().def_id;
                 }
                 ancestor = candidate.parent();
@@ -1129,7 +1227,7 @@ fn prepare_nested_definition_ids(
         source_map.record_nested_definition(node, id)?;
         ids_by_syntax.insert(pointer.clone(), id);
     }
-    Ok(())
+    Ok(async_fn_def_id)
 }
 
 fn is_nested_definition_kind(kind: SyntaxKind) -> bool {
@@ -13054,5 +13152,189 @@ mod tests {
                 disambiguator: 1,
             })
         );
+    }
+
+    #[test]
+    fn lowers_async_function_with_move_wrapper_and_lexical_nested_paths() {
+        let file = crate::FileId::new(216);
+        let source = "async fn f(x: I32) -> U8 requires fn() { true } { fn() {} }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let source_body = declaration.body().expect("async function body");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (signature, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("async function lowers");
+        assert!(signature.is_async);
+        assert_eq!(signature.params.len(), 1);
+        assert!(matches!(
+            signature.ret.map(|ty| ty.kind),
+            Some(HirTyKind::Path(_))
+        ));
+        let body = body.expect("async function has a body");
+        assert_eq!(body.params.len(), 1);
+        assert_eq!(paths.len().unwrap(), 4, "owner, wrapper, and two closures");
+
+        let ExprKind::Block(outer_block) = body.value.kind else {
+            panic!("async function returns a synthetic outer block");
+        };
+        assert!(outer_block.stmts.is_empty());
+        let async_expr = outer_block.tail.expect("async block is the outer tail");
+        let ExprKind::AsyncBlock {
+            def_id,
+            capture,
+            block: source_block,
+        } = async_expr.kind
+        else {
+            panic!("async function body is wrapped in an async block");
+        };
+        assert_eq!(capture, CaptureBy::Move);
+        assert_eq!(
+            body.value.span.ctxt,
+            SpanCtxt::Desugared(DesugaringKind::AsyncFn)
+        );
+        assert_eq!(
+            outer_block.span.ctxt,
+            SpanCtxt::Desugared(DesugaringKind::AsyncFn)
+        );
+        assert_eq!(
+            async_expr.span.ctxt,
+            SpanCtxt::Desugared(DesugaringKind::AsyncFn)
+        );
+        assert_eq!(body.value.span.range, function.text_range());
+        assert_eq!(outer_block.span.range, function.text_range());
+        assert_eq!(async_expr.span.range, function.text_range());
+        assert_eq!(source_block.span.ctxt, SpanCtxt::Root);
+        assert_eq!(source_block.span.range, source_body.syntax().text_range());
+
+        let wrapper_path = paths.resolve(def_id).unwrap().expect("wrapper path");
+        assert_eq!(
+            wrapper_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::AsyncBlock,
+                disambiguator: 0,
+            })
+        );
+        let owner_path = paths.resolve(owner.def_id).unwrap().expect("owner path");
+        let ExprKind::Closure(contract_closure) = body.contracts[0].expr.kind else {
+            panic!("closure in requires stays outside the generated async block");
+        };
+        let contract_path = paths
+            .resolve(contract_closure.def_id)
+            .unwrap()
+            .expect("contract closure path");
+        assert_eq!(
+            contract_path.data().len(),
+            owner_path.data().len() + 1,
+            "contract closures remain direct children of their function"
+        );
+        assert_eq!(
+            contract_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 1,
+            })
+        );
+        assert_eq!(
+            &contract_path.data()[..owner_path.data().len()],
+            owner_path.data()
+        );
+
+        let Some(body_tail) = source_block.tail else {
+            panic!("body closure is the async block tail");
+        };
+        let ExprKind::Closure(body_closure) = body_tail.kind else {
+            panic!("body tail remains a closure expression");
+        };
+        let body_closure_path = paths
+            .resolve(body_closure.def_id)
+            .unwrap()
+            .expect("body closure path");
+        assert_eq!(
+            body_closure_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 2,
+            })
+        );
+        assert_eq!(
+            body_closure_path.data()[owner_path.data().len()],
+            DisambiguatedDefPathData {
+                data: DefPathData::AsyncBlock,
+                disambiguator: 0,
+            }
+        );
+
+        let function_pointer =
+            SyntaxNodePtr::new(file, &function).expect("function syntax pointer");
+        let body_pointer =
+            SyntaxNodePtr::new(file, source_body.syntax()).expect("body syntax pointer");
+        let map = source_map.finish();
+        for hir_id in [body.value.hir_id, outer_block.hir_id, async_expr.hir_id] {
+            assert_eq!(map.syntax_for_node(hir_id), Some(&function_pointer));
+        }
+        assert_eq!(
+            map.syntax_for_node(source_block.hir_id),
+            Some(&body_pointer)
+        );
+    }
+
+    #[test]
+    fn async_function_requires_nested_path_interner_before_allocating_hir() {
+        let file = crate::FileId::new(217);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "async fn f(x: I32) { x }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert_eq!(
+            lower_function(&declaration, &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::FN_DECL)
+        );
+        assert_eq!(paths.len().unwrap(), 1);
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 1);
+        assert!(map.binding_to_syntax().is_empty());
+    }
+
+    #[test]
+    fn bodyless_async_function_has_no_synthetic_async_block() {
+        let file = crate::FileId::new(218);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "async fn f(x: I32)\n");
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::MissingFnBody),
+            "the parser owns the missing-body diagnostic"
+        );
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let (signature, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("bodyless async function lowers");
+        assert!(signature.is_async);
+        assert!(body.is_none());
+        assert!(source_map.finish().binding_to_syntax().is_empty());
     }
 }
