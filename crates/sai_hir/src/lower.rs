@@ -100,6 +100,9 @@ fn lower_expr_inner<'hir>(
         ast::Expr::Binary(binary) => lower_binary_expr(binary, arena, symbols, source_map),
         ast::Expr::Prefix(prefix) => lower_prefix_expr(prefix, arena, symbols, source_map),
         ast::Expr::Range(range) => lower_range_expr(range, arena, symbols, source_map),
+        ast::Expr::Index(index) => lower_index_expr(index, arena, symbols, source_map),
+        ast::Expr::Try(try_expr) => lower_try_expr(try_expr, arena, symbols, source_map),
+        ast::Expr::Await(await_expr) => lower_await_expr(await_expr, arena, symbols, source_map),
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -351,6 +354,61 @@ fn range_inclusive(syntax: &SyntaxNode) -> Option<bool> {
         })
 }
 
+fn lower_index_expr<'hir>(
+    index: &ast::IndexExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (Some(base), Some(index_expr)) = (index.base(), index.index()) else {
+        return lower_error_expr(index.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(index.syntax(), SpanCtxt::Root)?;
+    let base = lower_expr_inner(&base, arena, symbols, source_map)?;
+    let index_expr = lower_expr_inner(&index_expr, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Index(base, index_expr),
+        span,
+    }))
+}
+
+fn lower_try_expr<'hir>(
+    try_expr: &ast::TryExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(operand) = try_expr.operand() else {
+        return lower_error_expr(try_expr.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(try_expr.syntax(), SpanCtxt::Root)?;
+    let operand = lower_expr_inner(&operand, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Try(operand),
+        span,
+    }))
+}
+
+fn lower_await_expr<'hir>(
+    await_expr: &ast::AwaitExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(operand) = await_expr.operand() else {
+        return lower_error_expr(await_expr.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(await_expr.syntax(), SpanCtxt::Root)?;
+    let operand = lower_expr_inner(&operand, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Await(operand),
+        span,
+    }))
+}
+
 fn lower_bin_op(op: ast::BinOp) -> BinOp {
     match op {
         ast::BinOp::Or => BinOp::Or,
@@ -420,6 +478,21 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             }
             Ok(())
         }
+        ast::Expr::Index(index) => {
+            let (Some(base), Some(index_expr)) = (index.base(), index.index()) else {
+                return Ok(());
+            };
+            ensure_supported_expr(&base)?;
+            ensure_supported_expr(&index_expr)
+        }
+        ast::Expr::Try(try_expr) => match try_expr.operand() {
+            Some(operand) => ensure_supported_expr(&operand),
+            None => Ok(()),
+        },
+        ast::Expr::Await(await_expr) => match await_expr.operand() {
+            Some(operand) => ensure_supported_expr(&operand),
+            None => Ok(()),
+        },
         ast::Expr::Path(path) if path.generic_args().is_none() => Ok(()),
         ast::Expr::Field(field) if !has_direct_generic_args(field.syntax()) => match field.base() {
             Some(base) => ensure_supported_expr(&base),
@@ -2299,6 +2372,128 @@ mod tests {
         ));
         assert!(matches!(end.kind, ExprKind::Path(_)));
         assert!(source_map.finish().diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_index_try_and_await_postfix_expressions() {
+        let file = crate::FileId::new(84);
+        let source = "fn f() { (array[index], optional?, future.await, nested[a][b]?) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("postfix lowers");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), 4);
+        assert!(matches!(
+            elements[0].kind,
+            ExprKind::Index(base, index)
+                if matches!(base.kind, ExprKind::Path(_))
+                    && matches!(index.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[1].kind,
+            ExprKind::Try(operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[2].kind,
+            ExprKind::Await(operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        let ExprKind::Try(outer_operand) = elements[3].kind else {
+            panic!("postfix question mark wraps the indexed expression");
+        };
+        let ExprKind::Index(outer_base, outer_index) = outer_operand.kind else {
+            panic!("outer index is preserved");
+        };
+        let ExprKind::Index(inner_base, inner_index) = outer_base.kind else {
+            panic!("nested index remains left-associated");
+        };
+        assert!(matches!(inner_base.kind, ExprKind::Path(_)));
+        assert!(matches!(inner_index.kind, ExprKind::Path(_)));
+        assert!(matches!(outer_index.kind, ExprKind::Path(_)));
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                elements[0].hir_id.local_id.raw(),
+                elements[1].hir_id.local_id.raw(),
+                elements[2].hir_id.local_id.raw(),
+                elements[3].hir_id.local_id.raw(),
+                outer_operand.hir_id.local_id.raw(),
+                outer_base.hir_id.local_id.raw(),
+                inner_base.hir_id.local_id.raw(),
+                inner_index.hir_id.local_id.raw(),
+                outer_index.hir_id.local_id.raw(),
+            ],
+            [1, 2, 9, 13, 17, 18, 19, 20, 23, 26]
+        );
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 29);
+        assert!(map.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn postfix_recovery_and_preflight_avoid_partial_lowering() {
+        let file = crate::FileId::new(85);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { array[value<I32>] }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let index = function
+            .descendants()
+            .find_map(ast::IndexExpr::cast)
+            .expect("index expression");
+        let expression =
+            ast::Expr::cast(index.syntax().clone()).expect("index is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+
+        let file = crate::FileId::new(86);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { array[] }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let index = function
+            .descendants()
+            .find_map(ast::IndexExpr::cast)
+            .expect("recovered index expression");
+        assert!(contains_error_node(index.syntax()));
+        let expression =
+            ast::Expr::cast(index.syntax().clone()).expect("index is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("index recovers");
+        assert_eq!(lowered.kind, ExprKind::Err);
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 2);
+        assert!(map.diagnostics().is_empty());
     }
 
     #[test]
