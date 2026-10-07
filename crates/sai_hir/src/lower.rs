@@ -2026,48 +2026,59 @@ fn lower_for_expr<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
-    if has_direct_token(for_expr.syntax(), SyntaxKind::AWAIT_KW) {
-        return Err(HirLoweringError::UnsupportedSyntax(
-            for_expr.syntax().kind(),
-        ));
-    }
     let (Some(pattern), Some(iterable), Some(body)) =
         (for_expr.pattern(), for_expr.iterable(), for_expr.body())
     else {
         return lower_error_expr(for_expr.syntax(), arena, source_map);
     };
 
-    let ctxt = SpanCtxt::Desugared(DesugaringKind::ForLoop);
+    let await_token = for_expr
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::AWAIT_KW => Some(token),
+            _ => None,
+        });
+    let for_await = await_token.is_some();
+    let ctxt = SpanCtxt::Desugared(if for_await {
+        DesugaringKind::ForAwait
+    } else {
+        DesugaringKind::ForLoop
+    });
     let (match_hir_id, match_span) = source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
     let iterable_syntax = iterable.syntax();
-    let (iter_call_hir_id, iter_call_span) =
-        source_map.add_node_with_span(iterable_syntax, ctxt)?;
-    let iter_callee = lower_synthetic_lang_path_expr(
-        iterable_syntax,
-        ctxt,
-        LangItem::IntoIteratorIntoIter,
-        arena,
-        source_map,
-    )?;
-    let iterable = lower_expr_inner(&iterable, arena, symbols, source_map)?;
-    let iter_call = arena.alloc_expr(Expr {
-        hir_id: iter_call_hir_id,
-        kind: ExprKind::Call {
-            callee: iter_callee,
-            args: arena.alloc_args(&[Arg {
-                name: None,
-                expr: iterable,
-            }]),
-            base: None,
-        },
-        span: iter_call_span,
-    });
+    let outer_scrutinee = if for_await {
+        lower_expr_inner(&iterable, arena, symbols, source_map)?
+    } else {
+        let (iter_call_hir_id, iter_call_span) =
+            source_map.add_node_with_span(iterable_syntax, ctxt)?;
+        let iter_callee = lower_synthetic_lang_path_expr(
+            iterable_syntax,
+            ctxt,
+            LangItem::IntoIteratorIntoIter,
+            arena,
+            source_map,
+        )?;
+        let iterable = lower_expr_inner(&iterable, arena, symbols, source_map)?;
+        arena.alloc_expr(Expr {
+            hir_id: iter_call_hir_id,
+            kind: ExprKind::Call {
+                callee: iter_callee,
+                args: arena.alloc_args(&[Arg {
+                    name: None,
+                    expr: iterable,
+                }]),
+                base: None,
+            },
+            span: iter_call_span,
+        })
+    };
 
     let (outer_arm_hir_id, outer_arm_span) =
         source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
     let (iter_pat_hir_id, iter_pat_span) =
         source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
-    let iter_symbol = symbols.intern("%iter")?;
+    let iter_symbol = symbols.intern(if for_await { "%stream" } else { "%iter" })?;
     let iter_name_span = source_map.span_for(for_expr.syntax(), ctxt)?;
     let iter_name = Name {
         sym: iter_symbol,
@@ -2095,35 +2106,90 @@ fn lower_for_expr<'hir>(
         source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
     let (next_match_hir_id, next_match_span) =
         source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
-    let (next_call_hir_id, next_call_span) =
-        source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
-    let next_callee = lower_synthetic_lang_path_expr(
-        for_expr.syntax(),
-        ctxt,
-        LangItem::IteratorNext,
-        arena,
-        source_map,
-    )?;
-    let (borrow_hir_id, borrow_span) = source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
-    let iter_ref =
-        lower_synthetic_local_path_expr(for_expr.syntax(), ctxt, iter_symbol, arena, source_map)?;
-    let iter_borrow = arena.alloc_expr(Expr {
-        hir_id: borrow_hir_id,
-        kind: ExprKind::Borrow(Mutability::Mut, iter_ref),
-        span: borrow_span,
-    });
-    let next_call = arena.alloc_expr(Expr {
-        hir_id: next_call_hir_id,
-        kind: ExprKind::Call {
-            callee: next_callee,
-            args: arena.alloc_args(&[Arg {
-                name: None,
-                expr: iter_borrow,
-            }]),
-            base: None,
-        },
-        span: next_call_span,
-    });
+    let next_value = if for_await {
+        let (await_hir_id, mut await_span) =
+            source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
+        await_span.range = await_token
+            .as_ref()
+            .expect("for-await syntax has its await token")
+            .text_range();
+        let (next_call_hir_id, next_call_span) =
+            source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
+        let next_callee = lower_synthetic_lang_path_expr(
+            for_expr.syntax(),
+            ctxt,
+            LangItem::StreamNext,
+            arena,
+            source_map,
+        )?;
+        let (borrow_hir_id, borrow_span) =
+            source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
+        let stream_ref = lower_synthetic_local_path_expr(
+            for_expr.syntax(),
+            ctxt,
+            iter_symbol,
+            arena,
+            source_map,
+        )?;
+        let stream_borrow = arena.alloc_expr(Expr {
+            hir_id: borrow_hir_id,
+            kind: ExprKind::Borrow(Mutability::Mut, stream_ref),
+            span: borrow_span,
+        });
+        let next_call = arena.alloc_expr(Expr {
+            hir_id: next_call_hir_id,
+            kind: ExprKind::Call {
+                callee: next_callee,
+                args: arena.alloc_args(&[Arg {
+                    name: None,
+                    expr: stream_borrow,
+                }]),
+                base: None,
+            },
+            span: next_call_span,
+        });
+        arena.alloc_expr(Expr {
+            hir_id: await_hir_id,
+            kind: ExprKind::Await(next_call),
+            span: await_span,
+        })
+    } else {
+        let (next_call_hir_id, next_call_span) =
+            source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
+        let next_callee = lower_synthetic_lang_path_expr(
+            for_expr.syntax(),
+            ctxt,
+            LangItem::IteratorNext,
+            arena,
+            source_map,
+        )?;
+        let (borrow_hir_id, borrow_span) =
+            source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
+        let iter_ref = lower_synthetic_local_path_expr(
+            for_expr.syntax(),
+            ctxt,
+            iter_symbol,
+            arena,
+            source_map,
+        )?;
+        let iter_borrow = arena.alloc_expr(Expr {
+            hir_id: borrow_hir_id,
+            kind: ExprKind::Borrow(Mutability::Mut, iter_ref),
+            span: borrow_span,
+        });
+        arena.alloc_expr(Expr {
+            hir_id: next_call_hir_id,
+            kind: ExprKind::Call {
+                callee: next_callee,
+                args: arena.alloc_args(&[Arg {
+                    name: None,
+                    expr: iter_borrow,
+                }]),
+                base: None,
+            },
+            span: next_call_span,
+        })
+    };
 
     let (some_arm_hir_id, some_arm_span) =
         source_map.add_node_with_span(for_expr.syntax(), ctxt)?;
@@ -2170,9 +2236,13 @@ fn lower_for_expr<'hir>(
     let next_match = arena.alloc_expr(Expr {
         hir_id: next_match_hir_id,
         kind: ExprKind::Match {
-            scrutinee: next_call,
+            scrutinee: next_value,
             arms: arena.alloc_arms(&[some_arm, none_arm]),
-            source: HirMatchSource::ForLoop,
+            source: if for_await {
+                HirMatchSource::ForAwait
+            } else {
+                HirMatchSource::ForLoop
+            },
         },
         span: next_match_span,
     });
@@ -2188,7 +2258,11 @@ fn lower_for_expr<'hir>(
         kind: ExprKind::Loop {
             body: loop_body,
             label,
-            source: HirLoopSource::ForLoop,
+            source: if for_await {
+                HirLoopSource::ForAwait
+            } else {
+                HirLoopSource::ForLoop
+            },
         },
         span: loop_span,
     });
@@ -2203,9 +2277,13 @@ fn lower_for_expr<'hir>(
     Ok(arena.alloc_expr(Expr {
         hir_id: match_hir_id,
         kind: ExprKind::Match {
-            scrutinee: iter_call,
+            scrutinee: outer_scrutinee,
             arms: arena.alloc_arms(&[outer_arm]),
-            source: HirMatchSource::ForLoop,
+            source: if for_await {
+                HirMatchSource::ForAwait
+            } else {
+                HirMatchSource::ForLoop
+            },
         },
         span: match_span,
     }))
@@ -3187,11 +3265,6 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
         }
         ast::Expr::While(while_expr) => ensure_supported_while_expr(while_expr),
         ast::Expr::For(for_expr) => {
-            if has_direct_token(for_expr.syntax(), SyntaxKind::AWAIT_KW) {
-                return Err(HirLoweringError::UnsupportedSyntax(
-                    for_expr.syntax().kind(),
-                ));
-            }
             if let Some(pattern) = for_expr.pattern() {
                 ensure_supported_pattern(&pattern)?;
             }
@@ -6627,6 +6700,257 @@ mod tests {
     }
 
     #[test]
+    fn lowers_for_await_loops_with_stream_protocol_and_synthetic_spans() {
+        let file = crate::FileId::new(211);
+        let source = "fn f() { 'outer: for await item in stream { item } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let for_expr = function
+            .descendants()
+            .find_map(ast::ForExpr::cast)
+            .expect("for-await expression");
+        let expression = ast::Expr::cast(for_expr.syntax().clone()).unwrap();
+        let pattern = for_expr.pattern().expect("loop pattern");
+        let iterable = for_expr.iterable().expect("stream expression");
+        let body = for_expr.body().expect("loop body");
+        let await_token_range = for_expr
+            .syntax()
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::AWAIT_KW => {
+                    Some(token.text_range())
+                }
+                _ => None,
+            })
+            .expect("for-await keyword");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("for await lowers");
+        let ctxt = SpanCtxt::Desugared(DesugaringKind::ForAwait);
+        let ExprKind::Match {
+            scrutinee: outer_scrutinee,
+            arms: outer_arms,
+            source: HirMatchSource::ForAwait,
+        } = lowered.kind
+        else {
+            panic!("for await lowers to the outer stream match");
+        };
+        assert_eq!(lowered.span.ctxt, ctxt);
+        let ExprKind::Path(stream_path) = outer_scrutinee.kind else {
+            panic!("the source stream is matched directly");
+        };
+        assert_eq!(outer_scrutinee.span.ctxt, SpanCtxt::Root);
+        assert_eq!(stream_path.root, PathRoot::Plain);
+        assert_eq!(stream_path.segments.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(stream_path.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "stream"
+        );
+        assert_eq!(outer_arms.len(), 1);
+        let outer_arm = outer_arms[0];
+        assert!(!outer_arm.synthesized);
+        let PatKind::Binding {
+            mode: HirBindingMode::Var,
+            name: stream_name,
+            binding: stream_binding,
+            sub: None,
+        } = outer_arm.pat.kind
+        else {
+            panic!("the outer arm binds the hidden mutable stream");
+        };
+        assert_eq!(
+            symbols.resolve(stream_name.sym).unwrap().as_ref(),
+            "%stream"
+        );
+        assert_eq!(stream_name.span.ctxt, ctxt);
+        assert_eq!(outer_arm.span.ctxt, ctxt);
+        assert_eq!(outer_arm.pat.span.ctxt, ctxt);
+        let ExprKind::Loop {
+            body: loop_body,
+            label: Some(label),
+            source: HirLoopSource::ForAwait,
+        } = outer_arm.body.kind
+        else {
+            panic!("the outer arm evaluates the labeled stream loop");
+        };
+        assert_eq!(symbols.resolve(label.name).unwrap().as_ref(), "outer");
+        assert_eq!(label.span.ctxt, SpanCtxt::Root);
+        assert_eq!(outer_arm.body.span.ctxt, ctxt);
+        assert_eq!(loop_body.span.ctxt, ctxt);
+        let next_match = loop_body.tail.expect("loop tail is the stream-next match");
+        let ExprKind::Match {
+            scrutinee: awaited_next,
+            arms: next_arms,
+            source: HirMatchSource::ForAwait,
+        } = next_match.kind
+        else {
+            panic!("the loop tail matches the awaited stream result");
+        };
+        assert_eq!(next_match.span.ctxt, ctxt);
+        let ExprKind::Await(next_call) = awaited_next.kind else {
+            panic!("StreamNext is awaited");
+        };
+        assert_eq!(awaited_next.span.ctxt, ctxt);
+        assert_eq!(awaited_next.span.range, await_token_range);
+        let ExprKind::Call {
+            callee: next_callee,
+            args: next_args,
+            base: None,
+        } = next_call.kind
+        else {
+            panic!("the await operand calls StreamNext");
+        };
+        assert_eq!(next_call.span.ctxt, ctxt);
+        let ExprKind::Path(next_path) = next_callee.kind else {
+            panic!("StreamNext is a lang-item path");
+        };
+        assert_eq!(next_path.root, PathRoot::Lang(LangItem::StreamNext));
+        assert_eq!(next_callee.span.ctxt, ctxt);
+        assert_eq!(next_path.span.ctxt, ctxt);
+        assert_eq!(next_args.len(), 1);
+        let ExprKind::Borrow(Mutability::Mut, stream_ref) = next_args[0].expr.kind else {
+            panic!("StreamNext receives a mutable borrow");
+        };
+        assert_eq!(next_args[0].expr.span.ctxt, ctxt);
+        let ExprKind::Path(stream_ref_path) = stream_ref.kind else {
+            panic!("the mutable borrow refers to the hidden stream");
+        };
+        assert_eq!(stream_ref_path.root, PathRoot::Plain);
+        assert_eq!(stream_ref.span.ctxt, ctxt);
+        assert_eq!(stream_ref_path.span.ctxt, ctxt);
+        assert_eq!(stream_ref_path.segments.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(stream_ref_path.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "%stream"
+        );
+
+        assert_eq!(next_arms.len(), 2);
+        let some_arm = next_arms[0];
+        assert!(!some_arm.synthesized);
+        let PatKind::Ctor {
+            path: some_path,
+            args: Some(some_args),
+            has_rest: false,
+        } = some_arm.pat.kind
+        else {
+            panic!("the first stream-next arm matches Option.Some");
+        };
+        assert_eq!(some_path.root, PathRoot::Lang(LangItem::OptionSome));
+        assert_eq!(some_arm.span.ctxt, ctxt);
+        assert_eq!(some_arm.pat.span.ctxt, ctxt);
+        assert_eq!(some_path.span.ctxt, ctxt);
+        assert_eq!(some_args.len(), 1);
+        assert_eq!(
+            some_args[0].pat.span,
+            Span {
+                file,
+                range: pattern.syntax().text_range(),
+                ctxt: SpanCtxt::Root,
+            }
+        );
+        let PatKind::Binding {
+            binding: item_binding,
+            ..
+        } = some_args[0].pat.kind
+        else {
+            panic!("the source loop pattern is nested under Option.Some");
+        };
+        let ExprKind::Block(user_block) = some_arm.body.kind else {
+            panic!("the source block remains the Some arm body");
+        };
+        assert_eq!(some_arm.body.span.range, body.syntax().text_range());
+        assert_eq!(some_arm.body.span.ctxt, SpanCtxt::Root);
+        assert_eq!(user_block.safety, Safety::Safe);
+
+        let none_arm = next_arms[1];
+        assert!(none_arm.synthesized);
+        let PatKind::Ctor {
+            path: none_path,
+            args: None,
+            has_rest: false,
+        } = none_arm.pat.kind
+        else {
+            panic!("the fallback matches Option.None without arguments");
+        };
+        assert_eq!(none_path.root, PathRoot::Lang(LangItem::OptionNone));
+        assert_eq!(none_arm.span.ctxt, ctxt);
+        assert_eq!(none_arm.pat.span.ctxt, ctxt);
+        assert_eq!(none_path.span.ctxt, ctxt);
+        assert!(matches!(
+            none_arm.body.kind,
+            ExprKind::Break {
+                label: None,
+                value: None,
+            }
+        ));
+
+        let for_ptr = SyntaxNodePtr::new(file, for_expr.syntax()).expect("for syntax pointer");
+        let iterable_ptr =
+            SyntaxNodePtr::new(file, iterable.syntax()).expect("stream expression pointer");
+        let source_map = source_map.finish();
+        assert_eq!(
+            source_map.syntax_for_binding(stream_binding),
+            Some(&for_ptr)
+        );
+        assert_eq!(
+            source_map.syntax_for_node(awaited_next.hir_id),
+            Some(&for_ptr)
+        );
+        assert_eq!(
+            source_map.syntax_for_binding(item_binding).unwrap().kind(),
+            SyntaxKind::BINDING_PAT
+        );
+        assert_eq!(
+            source_map.syntax_for_node(outer_scrutinee.hir_id),
+            Some(&iterable_ptr)
+        );
+        assert_eq!(source_map.diagnostics().len(), 0);
+    }
+
+    #[test]
+    fn for_await_preflights_unsupported_descendants_before_allocation() {
+        let file = crate::FileId::new(212);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() { for await item in stream { item.convert<U32> } }\n",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let for_expr = function
+            .descendants()
+            .find_map(ast::ForExpr::cast)
+            .expect("for-await expression");
+        let expression = ast::Expr::cast(for_expr.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        let source_map = source_map.finish();
+        assert_eq!(source_map.node_to_syntax().len(), 1);
+        assert!(source_map.binding_to_syntax().is_empty());
+    }
+
+    #[test]
     fn for_loops_preflight_unsupported_descendants_before_allocation() {
         let file = crate::FileId::new(195);
         let (snapshot, parsed, ast_ids) = parse_file(
@@ -6655,33 +6979,6 @@ mod tests {
         let source_map = source_map.finish();
         assert_eq!(source_map.node_to_syntax().len(), 1);
         assert!(source_map.binding_to_syntax().is_empty());
-    }
-
-    #[test]
-    fn for_await_remains_unsupported_until_async_lowering() {
-        let file = crate::FileId::new(196);
-        let (snapshot, parsed, ast_ids) =
-            parse_file(file, "fn f() { for await item in streams {} }\n");
-        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        let function = function_node(&parsed.root);
-        let for_expr = function
-            .descendants()
-            .find_map(ast::ForExpr::cast)
-            .expect("for-await expression");
-        let expression =
-            ast::Expr::cast(for_expr.syntax().clone()).expect("for expression variant");
-        let arena = HirArena::new();
-        let symbols = Interner::new();
-        let owner = owner_id(&symbols);
-        let mut source_map =
-            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
-                .expect("source map builder");
-
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FOR_EXPR))
-        ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
     }
 
     #[test]
