@@ -5,7 +5,7 @@ use crate::expressions::{Expr, ExprKind};
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
-use crate::types::Name;
+use crate::types::{Name, Path, PathRoot, PathSegment};
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
     SyntaxElement, SyntaxKind, SyntaxNode,
@@ -192,6 +192,9 @@ pub fn lower_pattern<'hir>(
         {
             lower_error_pattern(constructor.syntax(), arena, source_map)
         }
+        ast::Pattern::Constructor(constructor) => {
+            lower_constructor_pattern(constructor, arena, symbols, source_map)
+        }
         ast::Pattern::ImplicitMember(member) => {
             lower_implicit_member_pattern(member, arena, symbols, source_map)
         }
@@ -328,6 +331,73 @@ fn lower_implicit_member_pattern<'hir>(
     }))
 }
 
+fn lower_constructor_pattern<'hir>(
+    constructor: &ast::CtorPat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    if contains_error_node(constructor.syntax()) {
+        return lower_error_pattern(constructor.syntax(), arena, source_map);
+    }
+    let Some(path) = constructor.path() else {
+        return lower_error_pattern(constructor.syntax(), arena, source_map);
+    };
+    if path.segments().next().is_none() {
+        return lower_error_pattern(constructor.syntax(), arena, source_map);
+    }
+    let args = match constructor.args() {
+        Some(args) => match collect_ctor_pat_args(&args) {
+            Some((args, has_rest)) => Some((args, has_rest)),
+            None => return lower_error_pattern(constructor.syntax(), arena, source_map),
+        },
+        None => None,
+    };
+
+    let (hir_id, span) = source_map.add_node_with_span(constructor.syntax(), SpanCtxt::Root)?;
+    let path = lower_const_path(&path, arena, symbols, source_map)?;
+    let (args, has_rest) = match args {
+        Some((args, has_rest)) => (
+            Some(lower_ctor_pat_args(&args, arena, symbols, source_map)?),
+            has_rest,
+        ),
+        None => (None, false),
+    };
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::Ctor {
+            path,
+            args,
+            has_rest,
+        },
+        span,
+    }))
+}
+
+fn lower_const_path<'hir>(
+    syntax: &ast::ConstPath,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Path<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(syntax.syntax(), SpanCtxt::Root)?;
+    let mut segments = Vec::new();
+    for segment in syntax.segments() {
+        let (hir_id, _) = source_map.add_node_with_span(segment.syntax(), SpanCtxt::Root)?;
+        segments.push(PathSegment {
+            hir_id,
+            name: lower_name_ref(&segment, symbols, source_map)?,
+            args: None,
+        });
+    }
+    Ok(Path {
+        hir_id,
+        root: PathRoot::Plain,
+        segments: arena.alloc_path_segments(&segments),
+        span,
+    })
+}
+
 fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringError> {
     if contains_error_node(pattern.syntax()) {
         return Ok(());
@@ -397,6 +467,22 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
                 .path()
                 .is_some_and(const_path_has_invalid_raw_identifier) =>
         {
+            Ok(())
+        }
+        ast::Pattern::Constructor(constructor) => {
+            let Some(args) = constructor.args() else {
+                return Ok(());
+            };
+            let Some((args, _)) = collect_ctor_pat_args(&args) else {
+                return Ok(());
+            };
+            for arg in args {
+                let pattern = match arg {
+                    CtorPatArgSyntax::Positional(pattern)
+                    | CtorPatArgSyntax::Named { pattern, .. } => pattern,
+                };
+                ensure_supported_pattern(&pattern)?;
+            }
             Ok(())
         }
         _ => Err(HirLoweringError::UnsupportedSyntax(pattern.syntax().kind())),
@@ -944,7 +1030,7 @@ mod tests {
         let file = crate::FileId::new(65);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
-            "fn f() { match value { _ => (), (true) => (), ((_)) => (), [left, Some(value)] => () } }\n",
+            "fn f() { match value { _ => (), (true) => (), ((_)) => (), [left, first | second] => () } }\n",
         );
         let function = function_node(&parsed.root);
         let patterns = function
@@ -992,7 +1078,7 @@ mod tests {
         );
         assert_eq!(
             lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT)
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
         );
 
         let map = source_map.finish();
@@ -1338,7 +1424,7 @@ mod tests {
     #[test]
     fn lowers_tuple_patterns_and_preflights_unsupported_children() {
         let file = crate::FileId::new(68);
-        let source = "fn f() { match value { () => (), (only,) => (), (first, (second,), var third,) => (), (before, Some(value)) => () } }";
+        let source = "fn f() { match value { () => (), (only,) => (), (first, (second,), var third,) => (), (before, left | right) => () } }";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
@@ -1423,7 +1509,7 @@ mod tests {
 
         assert_eq!(
             lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT)
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
         );
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 9);
@@ -1440,7 +1526,7 @@ mod tests {
             "[..borrow mut rest, after] => (), ",
             "[before, ..var tail] => (), ",
             "[.., ..] => (), ",
-            "[before, Some(value)] => () ",
+            "[before, left | right] => () ",
             "} }",
         );
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -1587,7 +1673,7 @@ mod tests {
         assert_eq!(lowered[1].span.range, patterns[1].syntax().text_range());
         assert_eq!(
             lower_pattern(&patterns[5], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT)
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
         );
 
         let map = source_map.finish();
@@ -1604,7 +1690,7 @@ mod tests {
             ".Some() => (), ",
             ".Some(..) => (), ",
             ".Some(field: var named, positional, ..) => (), ",
-            ".Some(before, Some(value)) => () ",
+            ".Some(before, left | right) => () ",
             "} }",
         );
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -1715,13 +1801,192 @@ mod tests {
         assert!(
             matches!(
                 lower_pattern(&patterns[4], &arena, &symbols, &mut source_map),
-                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT))
+                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT))
             ),
-            "unsupported nested constructors are rejected before allocation"
+            "unsupported nested or-patterns are rejected before allocation"
         );
 
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 7);
         assert_eq!(map.binding_to_syntax().len(), 2);
+    }
+
+    #[test]
+    fn lowers_constructor_paths_arguments_and_source_mappings() {
+        let file = crate::FileId::new(71);
+        let source = concat!(
+            "fn f() { match value { ",
+            "Some => (), ",
+            "Some() => (), ",
+            "http.Status.Ok(code: var named, payload, ..) => (), ",
+            "app.Result.Left(.Ready) => (), ",
+            "app.Result.Left(first | second) => (), ",
+            "r#Self() => () ",
+            "} }",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidRawIdent)
+        );
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .filter_map(|arm| arm.pattern())
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 6);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns[..4]
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("constructor patterns lower");
+        assert_eq!(
+            lower_pattern(&patterns[4], &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
+        );
+        let invalid_raw = lower_pattern(&patterns[5], &arena, &symbols, &mut source_map)
+            .expect("invalid raw constructor lowers to an error pattern");
+
+        fn ctor_parts<'hir>(
+            pattern: &Pat<'hir>,
+        ) -> (Path<'hir>, Option<&'hir [PatArg<'hir>]>, bool) {
+            match pattern.kind {
+                PatKind::Ctor {
+                    path,
+                    args,
+                    has_rest,
+                } => (path, args, has_rest),
+                _ => panic!("constructor pattern lowers to PatKind::Ctor"),
+            }
+        }
+        fn binding_parts(pattern: &Pat<'_>) -> (Name, crate::BindingId, HirBindingMode) {
+            match pattern.kind {
+                PatKind::Binding {
+                    name,
+                    binding,
+                    mode,
+                    ..
+                } => (name, binding, mode),
+                _ => panic!("constructor argument lowers to PatKind::Binding"),
+            }
+        }
+        fn path_names<'hir>(path: &Path<'hir>, symbols: &Interner) -> Vec<String> {
+            path.segments
+                .iter()
+                .map(|segment| {
+                    symbols
+                        .resolve(segment.name.sym)
+                        .expect("path segment symbol resolves")
+                        .to_string()
+                })
+                .collect()
+        }
+
+        let (first_path, args, has_rest) = ctor_parts(lowered[0]);
+        assert_eq!(first_path.root, PathRoot::Plain);
+        assert_eq!(path_names(&first_path, &symbols).join("."), "Some");
+        assert!(args.is_none());
+        assert!(!has_rest);
+
+        let (path, args, has_rest) = ctor_parts(lowered[1]);
+        assert_eq!(path_names(&path, &symbols).join("."), "Some");
+        assert_eq!(args.expect("explicit empty args"), &[]);
+        assert!(!has_rest);
+
+        let (qualified_path, args, has_rest) = ctor_parts(lowered[2]);
+        assert_eq!(
+            path_names(&qualified_path, &symbols).join("."),
+            "http.Status.Ok"
+        );
+        let args = args.expect("explicit constructor arguments");
+        assert_eq!(args.len(), 2);
+        assert!(has_rest);
+        assert_eq!(
+            symbols
+                .resolve(args[0].name.expect("named argument").sym)
+                .unwrap()
+                .as_ref(),
+            "code"
+        );
+        assert_eq!(args[1].name, None);
+        let (named, named_binding, named_mode) = binding_parts(args[0].pat);
+        assert_eq!(symbols.resolve(named.sym).unwrap().as_ref(), "named");
+        assert_eq!(named_binding.raw(), 0);
+        assert_eq!(named_mode, HirBindingMode::Var);
+        let (positional, positional_binding, positional_mode) = binding_parts(args[1].pat);
+        assert_eq!(symbols.resolve(positional.sym).unwrap().as_ref(), "payload");
+        assert_eq!(positional_binding.raw(), 1);
+        assert_eq!(positional_mode, HirBindingMode::Value);
+
+        let (nested_path, args, has_rest) = ctor_parts(lowered[3]);
+        assert_eq!(
+            path_names(&nested_path, &symbols).join("."),
+            "app.Result.Left"
+        );
+        let args = args.expect("nested implicit-member argument");
+        assert_eq!(args.len(), 1);
+        assert!(!has_rest);
+        assert!(matches!(
+            args[0].pat.kind,
+            PatKind::ImplicitMember { name, .. }
+                if symbols.resolve(name.sym).unwrap().as_ref() == "Ready"
+        ));
+        assert_eq!(invalid_raw.kind, PatKind::Err);
+        assert_eq!(
+            invalid_raw.hir_id.local_id.raw(),
+            20,
+            "unsupported nested patterns are rejected before allocating the constructor"
+        );
+
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|pattern| pattern.hir_id.local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 4, 7, 14]
+        );
+        for (lowered, syntax) in lowered.iter().zip(&patterns[..4]) {
+            assert_eq!(lowered.span.range, syntax.syntax().text_range());
+            assert_eq!(lowered.span.ctxt, SpanCtxt::Root);
+        }
+        let ast::Pattern::Constructor(qualified_syntax) = &patterns[2] else {
+            panic!("third arm is a constructor");
+        };
+        let syntax_path = qualified_syntax.path().expect("qualified constructor path");
+        assert_eq!(qualified_path.span.range, syntax_path.syntax().text_range());
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 21);
+        assert_eq!(map.binding_to_syntax().len(), 2);
+        assert_eq!(
+            map.syntax_for_node(qualified_path.hir_id)
+                .expect("path source mapping")
+                .resolve(file, &parsed.root)
+                .expect("path syntax resolves")
+                .text_range(),
+            syntax_path.syntax().text_range()
+        );
+        assert_eq!(
+            map.syntax_for_node(qualified_path.segments[0].hir_id)
+                .expect("path segment source mapping")
+                .resolve(file, &parsed.root)
+                .expect("segment syntax resolves")
+                .text_range(),
+            syntax_path
+                .segments()
+                .next()
+                .expect("first path segment")
+                .syntax()
+                .text_range()
+        );
     }
 }
