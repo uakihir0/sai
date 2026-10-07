@@ -61,6 +61,97 @@ pub fn lower_literal<'hir>(
     Ok(arena.alloc_expr(Expr { hir_id, kind, span }))
 }
 
+/// Lower the currently supported expression forms and record their source spans.
+///
+/// Valid but not-yet-supported expressions are rejected before any HIR nodes
+/// or source-map entries are allocated.
+pub fn lower_expr<'hir>(
+    expression: &ast::Expr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    ensure_supported_expr(expression)?;
+    if contains_error_node(expression.syntax()) {
+        return lower_error_expr(expression.syntax(), arena, source_map);
+    }
+    lower_expr_inner(expression, arena, symbols, source_map)
+}
+
+fn lower_expr_inner<'hir>(
+    expression: &ast::Expr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    match expression {
+        ast::Expr::Literal(literal) => lower_literal(literal, arena, symbols, source_map),
+        ast::Expr::Unit(unit) => {
+            let (hir_id, span) = source_map.add_node_with_span(unit.syntax(), SpanCtxt::Root)?;
+            Ok(arena.alloc_expr(Expr {
+                hir_id,
+                kind: ExprKind::Tuple(arena.alloc_exprs(&[])),
+                span,
+            }))
+        }
+        ast::Expr::Paren(paren) => match paren.expression() {
+            Some(inner) => lower_expr_inner(&inner, arena, symbols, source_map),
+            None => lower_error_expr(paren.syntax(), arena, source_map),
+        },
+        ast::Expr::Tuple(tuple) => {
+            let (hir_id, span) = source_map.add_node_with_span(tuple.syntax(), SpanCtxt::Root)?;
+            let elements = tuple
+                .elements()
+                .map(|element| lower_expr_inner(&element, arena, symbols, source_map).copied())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(arena.alloc_expr(Expr {
+                hir_id,
+                kind: ExprKind::Tuple(arena.alloc_exprs(&elements)),
+                span,
+            }))
+        }
+        _ => Err(HirLoweringError::UnsupportedSyntax(
+            expression.syntax().kind(),
+        )),
+    }
+}
+
+fn lower_error_expr<'hir>(
+    syntax: &SyntaxNode,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Err,
+        span,
+    }))
+}
+
+fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError> {
+    if contains_error_node(expression.syntax()) {
+        return Ok(());
+    }
+
+    match expression {
+        ast::Expr::Literal(_) | ast::Expr::Unit(_) => Ok(()),
+        ast::Expr::Paren(paren) => match paren.expression() {
+            Some(inner) => ensure_supported_expr(&inner),
+            None => Ok(()),
+        },
+        ast::Expr::Tuple(tuple) => {
+            for element in tuple.elements() {
+                ensure_supported_expr(&element)?;
+            }
+            Ok(())
+        }
+        _ => Err(HirLoweringError::UnsupportedSyntax(
+            expression.syntax().kind(),
+        )),
+    }
+}
+
 /// Lower a literal pattern, preserving its direct minus sign for integer
 /// patterns and mapping parser-rejected float patterns to `PatKind::Err`.
 pub fn lower_literal_pat<'hir>(
@@ -1206,6 +1297,120 @@ mod tests {
 
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), literals.len() + 1);
+    }
+
+    #[test]
+    fn lowers_unit_parenthesized_and_tuple_expressions() {
+        let file = crate::FileId::new(72);
+        let source = "fn f() { ((), (1, ((true,)))) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("outer tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("supported tuple expression lowers");
+
+        fn tuple_elements<'hir>(expression: &Expr<'hir>) -> &'hir [Expr<'hir>] {
+            match expression.kind {
+                ExprKind::Tuple(elements) => elements,
+                _ => panic!("unit and tuple expressions lower to ExprKind::Tuple"),
+            }
+        }
+        let outer = tuple_elements(lowered);
+        assert_eq!(outer.len(), 2);
+        assert!(tuple_elements(&outer[0]).is_empty());
+        assert_eq!(
+            outer[0].span.range,
+            function
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::UNIT_EXPR)
+                .expect("unit expression syntax")
+                .text_range()
+        );
+
+        let inner = tuple_elements(&outer[1]);
+        assert_eq!(inner.len(), 2);
+        assert_eq!(
+            inner[0].kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+        let singleton = tuple_elements(&inner[1]);
+        assert_eq!(singleton.len(), 1);
+        assert_eq!(singleton[0].kind, ExprKind::Lit(Lit::Bool(true)));
+        assert_eq!(
+            lowered.hir_id.local_id.raw(),
+            1,
+            "the outer tuple receives its ID before its children"
+        );
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                outer[0].hir_id.local_id.raw(),
+                outer[1].hir_id.local_id.raw(),
+                inner[0].hir_id.local_id.raw(),
+                inner[1].hir_id.local_id.raw(),
+                singleton[0].hir_id.local_id.raw(),
+            ],
+            [1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(lowered.span.range, tuple.syntax().text_range());
+        let paren = function
+            .descendants()
+            .find_map(ast::ParenExpr::cast)
+            .expect("parenthesized expression syntax");
+        let paren_pointer =
+            sai_syntax::SyntaxNodePtr::new(file, paren.syntax()).expect("parenthesis pointer");
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 7);
+        assert!(
+            map.nodes_for_syntax(&paren_pointer).is_empty(),
+            "parentheses reuse their contents without a separate HIR node"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_tuple_children_before_allocating_hir_nodes() {
+        let file = crate::FileId::new(73);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value) }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+        ));
+        assert_eq!(
+            source_map.finish().node_to_syntax().len(),
+            1,
+            "preflight rejects a valid unsupported child before allocating the tuple"
+        );
     }
 
     #[test]
