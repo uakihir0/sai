@@ -1,11 +1,11 @@
 use crate::Symbol;
 use crate::arena::HirArena;
-use crate::expressions::{Arg, BinOp, Expr, ExprKind, UnOp};
+use crate::expressions::{Arg, BinOp, Expr, ExprKind, Label as HirLabel, UnOp};
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use crate::types::{Name, Path, PathRoot, PathSegment};
-use crate::{BindingId, Mutability, SpanCtxt};
+use crate::{BindingId, Mutability, Span, SpanCtxt};
 use sai_diagnostics::Code;
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
@@ -105,6 +105,13 @@ fn lower_expr_inner<'hir>(
         ast::Expr::Try(try_expr) => lower_try_expr(try_expr, arena, symbols, source_map),
         ast::Expr::Await(await_expr) => lower_await_expr(await_expr, arena, symbols, source_map),
         ast::Expr::Call(call) => lower_call_expr(call, arena, symbols, source_map),
+        ast::Expr::Return(return_expr) => {
+            lower_return_expr(return_expr, arena, symbols, source_map)
+        }
+        ast::Expr::Break(break_expr) => lower_break_expr(break_expr, arena, symbols, source_map),
+        ast::Expr::Continue(continue_expr) => {
+            lower_continue_expr(continue_expr, arena, symbols, source_map)
+        }
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -622,6 +629,102 @@ fn lower_call_expr<'hir>(
     }))
 }
 
+fn lower_return_expr<'hir>(
+    return_expr: &ast::ReturnExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(return_expr.syntax(), SpanCtxt::Root)?;
+    let value = lower_optional_expr_value(
+        return_expr.syntax(),
+        return_expr.value(),
+        arena,
+        symbols,
+        source_map,
+    )?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Return(value),
+        span,
+    }))
+}
+
+fn lower_break_expr<'hir>(
+    break_expr: &ast::BreakExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(break_expr.syntax(), SpanCtxt::Root)?;
+    let label = lower_label(break_expr.label(), symbols, source_map)?;
+    let value = lower_optional_expr_value(
+        break_expr.syntax(),
+        break_expr.value(),
+        arena,
+        symbols,
+        source_map,
+    )?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Break { label, value },
+        span,
+    }))
+}
+
+fn lower_optional_expr_value<'hir>(
+    syntax: &SyntaxNode,
+    value: Option<ast::Expr>,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Option<&'hir Expr<'hir>>, HirLoweringError> {
+    if let Some(value) = value {
+        Ok(Some(lower_expr_inner(&value, arena, symbols, source_map)?))
+    } else if let Some(error) = direct_error_child(syntax) {
+        Ok(Some(lower_error_expr(&error, arena, source_map)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn lower_continue_expr<'hir>(
+    continue_expr: &ast::ContinueExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(continue_expr.syntax(), SpanCtxt::Root)?;
+    let label = lower_label(continue_expr.label(), symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Continue { label },
+        span,
+    }))
+}
+
+fn lower_label(
+    label: Option<ast::Label>,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Option<HirLabel>, HirLoweringError> {
+    label
+        .map(|label| {
+            let token = label.syntax();
+            let parent_span = source_map.span_for(token.parent(), SpanCtxt::Root)?;
+            let text = token.text().strip_prefix('\'').unwrap_or(token.text());
+            let normalized = sai_syntax::normalize_identifier(text);
+            Ok(HirLabel {
+                name: symbols.intern(&normalized)?,
+                span: Span {
+                    range: token.text_range(),
+                    ..parent_span
+                },
+            })
+        })
+        .transpose()
+}
+
 fn lower_bin_op(op: ast::BinOp) -> BinOp {
     match op {
         ast::BinOp::Or => BinOp::Or,
@@ -702,6 +805,15 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             Some(operand) => ensure_supported_expr(&operand),
             None => Ok(()),
         },
+        ast::Expr::Return(return_expr) => match return_expr.value() {
+            Some(value) => ensure_supported_expr(&value),
+            None => Ok(()),
+        },
+        ast::Expr::Break(break_expr) => match break_expr.value() {
+            Some(value) => ensure_supported_expr(&value),
+            None => Ok(()),
+        },
+        ast::Expr::Continue(_) => Ok(()),
         ast::Expr::Call(call) => {
             if let Some(callee) = call.callee() {
                 ensure_supported_expr(&callee)?;
@@ -2189,6 +2301,181 @@ mod tests {
             1,
             "parenthesized recovery wrappers do not hide unsupported children"
         );
+    }
+
+    #[test]
+    fn lowers_return_break_continue_and_label_spans() {
+        let file = crate::FileId::new(93);
+        let source = "fn f() { (return, return 1, break, break 'outer 2, continue 'outer) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("control-transfer expressions lower");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("the outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), 5);
+        assert_eq!(elements[0].kind, ExprKind::Return(None));
+        let ExprKind::Return(Some(return_value)) = elements[1].kind else {
+            panic!("return keeps its optional value");
+        };
+        assert_eq!(
+            return_value.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+        assert_eq!(
+            elements[2].kind,
+            ExprKind::Break {
+                label: None,
+                value: None,
+            }
+        );
+        let ExprKind::Break {
+            label: Some(break_label),
+            value: Some(break_value),
+        } = elements[3].kind
+        else {
+            panic!("labeled break retains its label and value");
+        };
+        assert_eq!(
+            symbols
+                .resolve(break_label.name)
+                .expect("label name resolves")
+                .as_ref(),
+            "outer"
+        );
+        assert_eq!(
+            break_value.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(2),
+                negated: false,
+            })
+        );
+        let ExprKind::Continue {
+            label: Some(continue_label),
+        } = elements[4].kind
+        else {
+            panic!("labeled continue retains its label");
+        };
+        assert_eq!(continue_label.name, break_label.name);
+
+        let label_tokens = function
+            .descendants()
+            .filter_map(ast::BreakExpr::cast)
+            .filter_map(|break_expr| break_expr.label())
+            .chain(
+                function
+                    .descendants()
+                    .filter_map(ast::ContinueExpr::cast)
+                    .filter_map(|continue_expr| continue_expr.label()),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(label_tokens.len(), 2);
+        for (label, hir_label) in label_tokens.iter().zip([break_label, continue_label]) {
+            assert_eq!(hir_label.span.file, file);
+            assert_eq!(hir_label.span.range, label.syntax().text_range());
+            assert_eq!(hir_label.span.ctxt, SpanCtxt::Root);
+        }
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                elements[0].hir_id.local_id.raw(),
+                elements[1].hir_id.local_id.raw(),
+                return_value.hir_id.local_id.raw(),
+                elements[2].hir_id.local_id.raw(),
+                elements[3].hir_id.local_id.raw(),
+                break_value.hir_id.local_id.raw(),
+                elements[4].hir_id.local_id.raw(),
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(source_map.finish().node_to_syntax().len(), 9);
+
+        let file = crate::FileId::new(94);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { return value.convert<U32> }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let return_expr = function
+            .descendants()
+            .find_map(ast::ReturnExpr::cast)
+            .expect("return expression");
+        let expression =
+            ast::Expr::cast(return_expr.syntax().clone()).expect("return is an expression");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        assert_eq!(
+            source_map.finish().node_to_syntax().len(),
+            1,
+            "unsupported return values are rejected before the return node is allocated"
+        );
+
+        let file = crate::FileId::new(95);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() { (return 'oops:, break 'oops:, call(, 2)) }\n",
+        );
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("recovery tuple");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("the outer tuple preserves local recovery");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("the recovery parent remains a tuple");
+        };
+        assert_eq!(elements.len(), 3);
+        assert!(matches!(
+            elements[0].kind,
+            ExprKind::Return(Some(value)) if value.kind == ExprKind::Err
+        ));
+        assert!(matches!(
+            elements[1].kind,
+            ExprKind::Break {
+                label: _,
+                value: Some(value),
+            } if value.kind == ExprKind::Err
+        ));
+        assert!(matches!(
+            elements[2].kind,
+            ExprKind::Call { args, .. }
+                if args.first().is_some_and(|arg| arg.expr.kind == ExprKind::Err)
+        ));
+        assert!(source_map.finish().diagnostics().is_empty());
     }
 
     #[test]

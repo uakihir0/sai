@@ -1488,6 +1488,8 @@ Call-argument recovery preserves an enclosing call when an individual expression
 
 Array expressions lower to `ExprKind::Array` with elements in source order and the array's HIR ID allocated before its children. Direct `ERROR` children are retained as `ExprKind::Err` elements when enclosing recovery preserves the array, while attribute-only error wrappers are skipped. Valid unsupported descendants are rejected before the array or its elements receive HIR IDs.
 
+`return`, `break`, and `continue` lower to their corresponding HIR expressions. Return and break values and break/continue labels remain optional; label names are normalized after removing the leading apostrophe, and the label span covers the full `LABEL` token. Transfer expressions receive their HIR ID before any value expression; label target lookup remains semantic work.
+
 ### 2.8.7 Item tree
 
 The query `def_collector(FileId) -> ItemTree` produces a summary of a file's item-like nodes without bodies:
