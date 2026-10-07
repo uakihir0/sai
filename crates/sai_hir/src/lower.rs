@@ -3809,9 +3809,6 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
         }
         ast::Expr::Field(field) => {
             if let Some(args) = direct_generic_args(field.syntax()) {
-                if !is_direct_call_callee(field.syntax()) {
-                    return Err(HirLoweringError::UnsupportedSyntax(field.syntax().kind()));
-                }
                 ensure_supported_generic_args(&args)?;
             }
             match field.base() {
@@ -4087,20 +4084,6 @@ fn ensure_supported_match_expr(match_expr: &ast::MatchExpr) -> Result<(), HirLow
 
 fn direct_generic_args(syntax: &SyntaxNode) -> Option<ast::GenericArgList> {
     syntax.children().find_map(ast::GenericArgList::cast)
-}
-
-fn is_direct_call_callee(syntax: &SyntaxNode) -> bool {
-    let mut candidate = syntax.clone();
-    loop {
-        let Some(parent) = candidate.parent() else {
-            return false;
-        };
-        if parent.kind() == SyntaxKind::PAREN_EXPR {
-            candidate = parent;
-        } else {
-            return parent.kind() == SyntaxKind::CALL_EXPR;
-        }
-    }
 }
 
 /// Lower a literal pattern, preserving its direct minus sign for integer
@@ -6539,7 +6522,7 @@ mod tests {
     }
 
     #[test]
-    fn array_recovery_keeps_missing_elements_and_preflights_supported_children() {
+    fn array_recovery_keeps_missing_elements_and_lowers_generic_fields() {
         let file = crate::FileId::new(89);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { [, call(, 2)] }\n");
         assert!(!parsed.errors.is_empty());
@@ -6605,19 +6588,14 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        let result = lower_expr(&expression, &arena, &symbols, &mut source_map);
-        assert!(
-            matches!(
-                result,
-                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-            ),
-            "unexpected lowering result: {result:?}"
-        );
-        assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "a valid unsupported child is rejected before the array is allocated"
-        );
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("a malformed call remains local to its array element");
+        let ExprKind::Array(elements) = lowered.kind else {
+            panic!("the array is retained around the malformed call");
+        };
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].kind, ExprKind::Err);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(91);
         let (snapshot, parsed, ast_ids) =
@@ -6636,15 +6614,15 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-        ));
-        assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "all nested array elements are preflighted before any array is allocated"
-        );
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("nested generic fields and missing elements recover");
+        let ExprKind::Array(elements) = lowered.kind else {
+            panic!("the outer array is retained");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(elements[0].kind, ExprKind::Array(_)));
+        assert!(matches!(elements[1].kind, ExprKind::Call { .. }));
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(92);
         let (snapshot, parsed, ast_ids) = parse_file(
@@ -6665,19 +6643,19 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-        ));
-        assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "parenthesized recovery wrappers do not hide unsupported children"
-        );
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("the parenthesized field value and recovered call lower");
+        let ExprKind::Array(elements) = lowered.kind else {
+            panic!("the array is retained");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(elements[0].kind, ExprKind::Field { .. }));
+        assert!(matches!(elements[1].kind, ExprKind::Call { .. }));
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
-    fn lowers_return_break_continue_and_label_spans() {
+    fn lowers_return_break_continue_and_generic_field_values() {
         let file = crate::FileId::new(93);
         let source = "fn f() { (return, return 1, break, break 'outer 2, continue 'outer) }\n";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -6797,15 +6775,16 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("return lowers");
+        let ExprKind::Return(Some(value)) = lowered.kind else {
+            panic!("the return value remains in HIR");
+        };
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            value.kind,
+            ExprKind::Field { args: Some(args), .. } if args.args.len() == 1
         ));
-        assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "unsupported return values are rejected before the return node is allocated"
-        );
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(95);
         let (snapshot, parsed, ast_ids) = parse_file(
@@ -6970,7 +6949,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_blocks_preflight_unsupported_descendants_before_allocation() {
+    fn unsafe_blocks_lower_generic_field_values() {
         let file = crate::FileId::new(191);
         let (snapshot, parsed, ast_ids) =
             parse_file(file, "fn f() { unsafe { source.convert<U32> } }\n");
@@ -6989,11 +6968,17 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
 
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("unsafe block lowers");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("unsafe block lowers to a HIR block expression");
+        };
+        assert_eq!(block.safety, Safety::Unsafe);
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            block.tail.map(|tail| tail.kind),
+            Some(ExprKind::Field { args: Some(args), .. }) if args.args.len() == 1
         ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -7063,7 +7048,7 @@ mod tests {
     }
 
     #[test]
-    fn region_blocks_preflight_unsupported_descendants_before_allocation() {
+    fn region_blocks_lower_generic_field_values() {
         let file = crate::FileId::new(193);
         let (snapshot, parsed, ast_ids) =
             parse_file(file, "fn f() { region arena { source.convert<U32> } }\n");
@@ -7082,13 +7067,18 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
 
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("region lowers");
+        let ExprKind::Region { block, .. } = lowered.kind else {
+            panic!("the region expression is retained");
+        };
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            block.tail.map(|tail| tail.kind),
+            Some(ExprKind::Field { args: Some(args), .. }) if args.args.len() == 1
         ));
-        let source_map = source_map.finish();
-        assert_eq!(source_map.node_to_syntax().len(), 1);
-        assert!(source_map.binding_to_syntax().is_empty());
+        let map = source_map.finish();
+        assert!(map.node_to_syntax().len() > 1);
+        assert_eq!(map.binding_to_syntax().len(), 1);
     }
 
     #[test]
@@ -7542,7 +7532,7 @@ mod tests {
     }
 
     #[test]
-    fn for_await_preflights_unsupported_descendants_before_allocation() {
+    fn for_await_lowers_generic_field_values_in_the_body() {
         let file = crate::FileId::new(212);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
@@ -7562,17 +7552,22 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
 
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("for await lowers");
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            lowered.kind,
+            ExprKind::Match {
+                source: HirMatchSource::ForAwait,
+                ..
+            }
         ));
         let source_map = source_map.finish();
-        assert_eq!(source_map.node_to_syntax().len(), 1);
-        assert!(source_map.binding_to_syntax().is_empty());
+        assert!(source_map.node_to_syntax().len() > 1);
+        assert_eq!(source_map.binding_to_syntax().len(), 2);
     }
 
     #[test]
-    fn for_loops_preflight_unsupported_descendants_before_allocation() {
+    fn for_loops_lower_generic_field_values_in_the_body() {
         let file = crate::FileId::new(195);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
@@ -7593,17 +7588,22 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
 
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("for loop lowers");
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            lowered.kind,
+            ExprKind::Match {
+                source: HirMatchSource::ForLoop,
+                ..
+            }
         ));
         let source_map = source_map.finish();
-        assert_eq!(source_map.node_to_syntax().len(), 1);
-        assert!(source_map.binding_to_syntax().is_empty());
+        assert!(source_map.node_to_syntax().len() > 1);
+        assert_eq!(source_map.binding_to_syntax().len(), 2);
     }
 
     #[test]
-    fn block_recovery_keeps_call_argument_errors_and_preflights_statements() {
+    fn block_recovery_keeps_call_errors_and_lowers_generic_fields_in_loops() {
         let file = crate::FileId::new(97);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { call(, 2) } }\n");
         assert!(!parsed.errors.is_empty());
@@ -7658,11 +7658,10 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-        ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("nested block lowers");
+        assert!(matches!(lowered.kind, ExprKind::Block(_)));
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(99);
         let (snapshot, parsed, ast_ids) = parse_file(
@@ -7937,7 +7936,7 @@ mod tests {
     }
 
     #[test]
-    fn let_statement_preflights_nested_unsupported_expressions_before_allocating() {
+    fn let_statement_lowers_generic_field_initializers() {
         let file = crate::FileId::new(140);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
@@ -7958,11 +7957,19 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
 
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("block lowers");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the enclosing block is retained");
+        };
+        let StmtKind::Let { init, .. } = block.stmts[0].kind else {
+            panic!("the let initializer is retained");
+        };
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            init.kind,
+            ExprKind::Field { args: Some(args), .. } if args.args.len() == 1
         ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -8188,7 +8195,7 @@ mod tests {
     }
 
     #[test]
-    fn assignment_preflights_unsupported_operands_before_allocating() {
+    fn assignment_lowers_generic_field_operands() {
         let file = crate::FileId::new(144);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
@@ -8209,11 +8216,19 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
 
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("block lowers");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the enclosing block is retained");
+        };
+        let StmtKind::Assign { rhs, .. } = block.stmts[0].kind else {
+            panic!("the assignment is retained");
+        };
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            rhs.kind,
+            ExprKind::Field { args: Some(args), .. } if args.args.len() == 1
         ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -8573,7 +8588,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_preflight_rejects_unsupported_nested_syntax_atomically() {
+    fn while_loop_lowers_generic_field_values_in_the_body() {
         let file = crate::FileId::new(100);
         let source = "fn f(value: I32) { while true { value.convert<U32> } }\n";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -8592,11 +8607,16 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map");
 
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("while lowers");
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            lowered.kind,
+            ExprKind::Loop {
+                source: HirLoopSource::While,
+                ..
+            }
         ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -8964,7 +8984,7 @@ mod tests {
     }
 
     #[test]
-    fn if_recovery_is_preserved_and_unsupported_branches_are_atomic() {
+    fn if_recovery_is_preserved_with_generic_field_else_values() {
         let file = crate::FileId::new(101);
         let (snapshot, parsed, ast_ids) =
             parse_file(file, "fn f() { if call(, true) { 1 } else { 2 } }\n");
@@ -9057,15 +9077,29 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        let result = lower_expr(&expression, &arena, &symbols, &mut source_map);
-        assert!(
-            matches!(
-                result,
-                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-            ),
-            "unexpected lowering result: {result:?}"
-        );
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("if recovery preserves its generic field else branch");
+        let ExprKind::If {
+            cond,
+            els: Some(els),
+            ..
+        } = lowered.kind
+        else {
+            panic!("the recovered if expression retains its else branch");
+        };
+        let ExprKind::Call { args, .. } = cond.kind else {
+            panic!("the recovered condition remains a call");
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].expr.kind, ExprKind::Err);
+        let ExprKind::Block(else_block) = els.kind else {
+            panic!("the else block is retained");
+        };
+        assert!(matches!(
+            else_block.tail.map(|tail| tail.kind),
+            Some(ExprKind::Field { args: Some(args), .. }) if args.args.len() == 1
+        ));
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(104);
         let (snapshot, parsed, ast_ids) = parse_file(
@@ -9285,7 +9319,7 @@ mod tests {
     }
 
     #[test]
-    fn match_recovery_keeps_arms_and_preflights_nested_expressions() {
+    fn match_recovery_keeps_arms_and_lowers_generic_field_values() {
         let file = crate::FileId::new(107);
         let (snapshot, parsed, ast_ids) =
             parse_file(file, "fn f() { match call(, true) { _ =>, 1 => 2 } }\n");
@@ -9347,11 +9381,17 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("match recovery retains its generic field arm");
+        let ExprKind::Match { arms, .. } = lowered.kind else {
+            panic!("the match expression is retained");
+        };
+        assert_eq!(arms.len(), 1);
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            arms[0].body.kind,
+            ExprKind::Field { args: Some(args), .. } if args.args.len() == 1
         ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -9461,11 +9501,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_tuple_children_before_allocating_hir_nodes() {
+    fn lowers_generic_field_arguments_in_value_position() {
         let file = crate::FileId::new(73);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value.convert<U32>) }\n");
+        let source = "fn f() { (1, value.convert<U32, 5>) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
+        let field = function
+            .descendants()
+            .find_map(ast::FieldExpr::cast)
+            .expect("generic field expression");
+        let generic_args_syntax =
+            direct_generic_args(field.syntax()).expect("field has explicit generic arguments");
         let tuple = function
             .descendants()
             .find_map(ast::TupleExpr::cast)
@@ -9479,15 +9526,43 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("tuple lowers");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        let ExprKind::Field {
+            args: Some(args), ..
+        } = elements[1].kind
+        else {
+            panic!("generic field arguments remain on the field expression");
+        };
+        assert_eq!(args.args.len(), 2);
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            args.args[0],
+            HirGenericArg::Type(ty) if matches!(ty.kind, HirTyKind::Path(_))
         ));
         assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "preflight rejects generic field arguments before allocating the tuple"
+            args.args[1],
+            HirGenericArg::Const(HirConstArg::Int {
+                value: Some(5),
+                negated: false,
+            })
         );
+        assert_eq!(args.span.range, generic_args_syntax.syntax().text_range());
+        let source_ty = generic_args_syntax
+            .syntax()
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::PATH_TYPE)
+            .expect("generic type argument syntax");
+        let source_ty_ptr =
+            SyntaxNodePtr::new(file, &source_ty).expect("generic type syntax pointer");
+        let HirGenericArg::Type(lowered_ty) = args.args[0] else {
+            panic!("first generic argument is a type");
+        };
+        let map = source_map.finish();
+        assert!(map.node_to_syntax().len() > 1);
+        assert_eq!(map.syntax_for_node(lowered_ty.hir_id), Some(&source_ty_ptr));
     }
 
     #[test]
@@ -12505,7 +12580,7 @@ mod tests {
     }
 
     #[test]
-    fn async_block_preflight_rejects_unsupported_body_before_allocating_any_nodes() {
+    fn async_block_lowers_generic_field_values_in_the_body() {
         let file = crate::FileId::new(210);
         let (snapshot, parsed, ast_ids) =
             parse_file(file, "fn f() { async { value.convert<U32> } }\n");
@@ -12523,12 +12598,17 @@ mod tests {
                 .expect("source map builder")
                 .with_def_path_interner(&paths);
 
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("async block with a generic field lowers");
+        let ExprKind::AsyncBlock { block, .. } = lowered.kind else {
+            panic!("async block retains its HIR form");
+        };
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            block.tail.map(|tail| tail.kind),
+            Some(ExprKind::Field { args: Some(args), .. }) if args.args.len() == 1
         ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
-        assert_eq!(paths.len().unwrap(), 1, "preflight adds no nested paths");
+        assert!(source_map.finish().node_to_syntax().len() > 1);
+        assert_eq!(paths.len().unwrap(), 2, "the async block path is interned");
     }
 
     #[test]
@@ -12559,7 +12639,7 @@ mod tests {
     }
 
     #[test]
-    fn closure_preflight_rejects_unsupported_body_before_allocating_any_nodes() {
+    fn closure_lowers_generic_field_values_in_the_body() {
         let file = crate::FileId::new(203);
         let (snapshot, parsed, ast_ids) =
             parse_file(file, "fn f() { fn() { value.convert<U32> } }\n");
@@ -12577,14 +12657,19 @@ mod tests {
                 .expect("source map builder")
                 .with_def_path_interner(&paths);
 
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("closure lowers");
+        let ExprKind::Closure(closure) = lowered.kind else {
+            panic!("the closure retains its HIR form");
+        };
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+            closure.body.tail.map(|tail| tail.kind),
+            Some(ExprKind::Field { args: Some(args), .. }) if args.args.len() == 1
         ));
         let map = source_map.finish();
-        assert_eq!(map.node_to_syntax().len(), 1);
+        assert!(map.node_to_syntax().len() > 1);
         assert!(map.binding_to_syntax().is_empty());
-        assert_eq!(paths.len().unwrap(), 1, "preflight adds no nested paths");
+        assert_eq!(paths.len().unwrap(), 2, "the closure path is interned");
     }
 
     #[test]
@@ -13159,7 +13244,7 @@ mod tests {
     }
 
     #[test]
-    fn function_preflight_rejects_unsupported_generic_field_before_allocating_parameters() {
+    fn function_lowering_preserves_generic_field_values_in_the_body() {
         let file = crate::FileId::new(211);
         let (snapshot, parsed, ast_ids) =
             parse_file(file, "fn f(x: I32) { (0, target.field<I32>) }\n");
@@ -13174,22 +13259,29 @@ mod tests {
                 .expect("source map builder")
                 .with_def_path_interner(&paths);
 
-        assert_eq!(
-            lower_function(&declaration, &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR)
-        );
+        let (signature, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("generic field body lowers");
+        assert_eq!(signature.params.len(), 1);
+        let body = body.expect("function body is present");
+        let ExprKind::Block(block) = body.value.kind else {
+            panic!("function body is a block");
+        };
+        let tail = block.tail.expect("tuple is the function body tail");
+        let ExprKind::Tuple(elements) = tail.kind else {
+            panic!("tuple body remains a tuple");
+        };
+        assert!(matches!(
+            elements[1].kind,
+            ExprKind::Field { args: Some(args), .. } if args.args.len() == 1
+        ));
         assert_eq!(
             paths.len().unwrap(),
             1,
-            "preflight does not intern closure paths"
+            "generic field lowering does not intern nested definitions"
         );
         let map = source_map.finish();
-        assert_eq!(
-            map.node_to_syntax().len(),
-            1,
-            "only the owner node is mapped"
-        );
-        assert!(map.binding_to_syntax().is_empty());
+        assert!(map.node_to_syntax().len() > 1);
+        assert_eq!(map.binding_to_syntax().len(), 1);
     }
 
     #[test]
