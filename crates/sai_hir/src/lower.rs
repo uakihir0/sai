@@ -468,6 +468,7 @@ pub fn lower_expr<'hir>(
     if contains_error_node(expression.syntax())
         && !contains_call_arglist_error(expression.syntax())
         && !errors_are_in_recoverable_block_statements(expression.syntax())
+        && !errors_are_in_casts(expression.syntax())
     {
         return lower_error_expr(expression.syntax(), arena, source_map);
     }
@@ -501,6 +502,7 @@ fn lower_expr_inner<'hir>(
         ast::Expr::Match(match_expr) => lower_match_expr(match_expr, arena, symbols, source_map),
         ast::Expr::Loop(loop_expr) => lower_loop_expr(loop_expr, arena, symbols, source_map),
         ast::Expr::While(while_expr) => lower_while_expr(while_expr, arena, symbols, source_map),
+        ast::Expr::Cast(cast) => lower_cast_expr(cast, arena, symbols, source_map),
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -1597,6 +1599,35 @@ fn lower_synthetic_break_block_expr<'hir>(
     }))
 }
 
+fn lower_cast_expr<'hir>(
+    cast: &ast::CastExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(cast.syntax(), SpanCtxt::Root)?;
+    let operand = match cast.expression() {
+        Some(expression) => lower_expr_inner(&expression, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child(cast.syntax()).unwrap_or_else(|| cast.syntax().clone());
+            lower_error_expr(&error, arena, source_map)?
+        }
+    };
+    let ty = match cast.ty() {
+        Some(ty) => lower_type(&ty, arena, symbols, source_map)?,
+        None => {
+            let error =
+                direct_error_child_from_end(cast.syntax()).unwrap_or_else(|| cast.syntax().clone());
+            lower_error_type(&error, arena, source_map)?
+        }
+    };
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::AsCast { operand, ty },
+        span,
+    }))
+}
+
 fn lower_if_let_expr<'hir>(
     if_expr: &ast::IfExpr,
     condition: &ast::LetCondition,
@@ -2408,6 +2439,15 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             Ok(())
         }
         ast::Expr::While(while_expr) => ensure_supported_while_expr(while_expr),
+        ast::Expr::Cast(cast) => {
+            if let Some(operand) = cast.expression() {
+                ensure_supported_expr(&operand)?;
+            }
+            if let Some(ty) = cast.ty() {
+                ensure_supported_type(&ty)?;
+            }
+            Ok(())
+        }
         _ if contains_error_node(expression.syntax()) => Ok(()),
         _ => Err(HirLoweringError::UnsupportedSyntax(
             expression.syntax().kind(),
@@ -3631,6 +3671,31 @@ fn errors_are_in_recoverable_block_statements(syntax: &SyntaxNode) -> bool {
                 )
             }) || is_direct_block_error(error)
         })
+}
+
+fn errors_are_in_casts(syntax: &SyntaxNode) -> bool {
+    let errors = syntax
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::ERROR)
+        .collect::<Vec<_>>();
+    !errors.is_empty()
+        && errors
+            .iter()
+            .all(|error| error_belongs_to_cast(error, syntax))
+}
+
+fn error_belongs_to_cast(error: &SyntaxNode, root: &SyntaxNode) -> bool {
+    let mut ancestor = Some(error.clone());
+    while let Some(node) = ancestor {
+        if node.kind() == root.kind() && node.text_range() == root.text_range() {
+            return node.kind() == SyntaxKind::CAST_EXPR;
+        }
+        if node.kind() == SyntaxKind::CAST_EXPR {
+            return true;
+        }
+        ancestor = node.parent();
+    }
+    false
 }
 
 fn is_direct_block_error(error: &SyntaxNode) -> bool {
@@ -6092,6 +6157,172 @@ mod tests {
             Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FOR_EXPR))
         ));
         assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn lowers_cast_recovery_and_retains_a_missing_target_type() {
+        let file = crate::FileId::new(100);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(value: I32) { value as U8 }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let cast = function
+            .descendants()
+            .find_map(ast::CastExpr::cast)
+            .expect("cast expression");
+        let expression = ast::Expr::cast(cast.syntax().clone()).expect("cast expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map");
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("cast recovery lowers");
+        let ExprKind::AsCast { operand, ty } = lowered.kind else {
+            panic!("a cast remains in HIR for type checking");
+        };
+        assert!(matches!(operand.kind, ExprKind::Path(_)));
+        assert!(matches!(ty.kind, HirTyKind::Path(_)));
+        assert_eq!(lowered.hir_id.local_id.raw(), 1);
+        assert_eq!(operand.hir_id.local_id.raw(), 2);
+        assert_eq!(ty.hir_id.local_id.raw(), 5);
+        assert_eq!(source_map.finish().node_to_syntax().len(), 8);
+
+        let file = crate::FileId::new(101);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(value: I32) { value as }\n");
+        assert!(
+            !parsed.errors.is_empty(),
+            "the parser owns the missing-type diagnostic"
+        );
+        let function = function_node(&parsed.root);
+        let cast = function
+            .descendants()
+            .find_map(ast::CastExpr::cast)
+            .expect("recovered cast expression");
+        assert!(cast.ty().is_none());
+        let expression = ast::Expr::cast(cast.syntax().clone()).expect("cast expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map");
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("the cast survives parser recovery");
+        let ExprKind::AsCast { operand, ty } = lowered.kind else {
+            panic!("the outer cast is preserved");
+        };
+        assert!(matches!(operand.kind, ExprKind::Path(_)));
+        assert_eq!(ty.kind, HirTyKind::Err);
+        assert_eq!(
+            ty.span.range,
+            direct_error_child_from_end(cast.syntax())
+                .expect("the parser's missing-type error")
+                .text_range()
+        );
+        let source_map = source_map.finish();
+        assert!(source_map.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn cast_preflight_rejects_unsupported_operands_before_allocation() {
+        let file = crate::FileId::new(100);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { value<I32>() as U8 }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let cast = function
+            .descendants()
+            .find_map(ast::CastExpr::cast)
+            .expect("cast expression");
+        let expression = ast::Expr::cast(cast.syntax().clone()).expect("cast expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn cast_recovery_does_not_discard_its_parent_expression() {
+        let file = crate::FileId::new(100);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(value: I32) { value as + 1 }\n");
+        assert!(
+            !parsed.errors.is_empty(),
+            "the parser diagnoses the missing type"
+        );
+        let function = function_node(&parsed.root);
+        let binary = function
+            .descendants()
+            .find_map(ast::BinExpr::cast)
+            .expect("binary expression");
+        let expression = ast::Expr::cast(binary.syntax().clone()).expect("binary expression");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map");
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("the enclosing expression retains cast recovery");
+        let ExprKind::Binary(BinOp::Add, left, right) = lowered.kind else {
+            panic!("the binary expression is preserved");
+        };
+        let ExprKind::AsCast { operand, ty } = left.kind else {
+            panic!("the recovered cast remains the left operand");
+        };
+        assert!(matches!(operand.kind, ExprKind::Path(_)));
+        assert_eq!(ty.kind, HirTyKind::Err);
+        assert_eq!(
+            right.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn cast_recovery_does_not_escape_the_lowered_syntax_subtree() {
+        let file = crate::FileId::new(100);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f(value: I32) { (value +) as U8 }\n");
+        assert!(
+            !parsed.errors.is_empty(),
+            "the parser diagnoses the missing operand"
+        );
+        let function = function_node(&parsed.root);
+        let cast = function
+            .descendants()
+            .find_map(ast::CastExpr::cast)
+            .expect("outer cast expression");
+        let binary = function
+            .descendants()
+            .find_map(ast::BinExpr::cast)
+            .expect("malformed binary operand");
+        assert!(contains_error_node(binary.syntax()));
+        assert!(!errors_are_in_casts(binary.syntax()));
+        let expression = ast::Expr::cast(binary.syntax().clone()).expect("binary expression");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map");
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("the malformed binary is recoverable on its own");
+        assert_eq!(lowered.kind, ExprKind::Err);
+        assert!(cast.ty().is_some());
     }
 
     #[test]
