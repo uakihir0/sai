@@ -1196,6 +1196,8 @@ In the reference implementation, each `LocalDefId` carries its package and the i
 
 A local `DefId` retains that definition-table identity so two accidentally distinct tables for the same package cannot compare as the same definition. A foreign `DefId` is created from its metadata package and `DefIndex` and has no local-table identity.
 
+`DefPathInterner::intern_nested` appends a `Closure` or `AsyncBlock` component to its lexical parent's path, using the preorder disambiguator assigned within the owner. It rejects other component kinds so callers cannot bypass symbol-session validation for named path components.
+
 **`HirId` assignment.** Within an owner, `ItemLocalId`s are assigned in pre-order of HIR node creation during lowering, starting with 0 for the owner node. Desugared nodes are numbered at the position of the construct they replace, in the order in which §2.9 lists their children. The numbering depends only on the owner's own source, so an edit inside one owner never changes another owner's `HirId`s.
 
 **`BindingId`.** Every `PatKind::Binding`, every body parameter, every closure parameter, and every synthetic binding of a desugaring gets a `BindingId`, numbered in pre-order within the owner. The resolver maps each path use of a local to a `BindingId` (impl/03).

@@ -469,6 +469,8 @@ pub enum DefPathInternerError {
     Package(PackageIdError),
     InternerSessionMismatch,
     ForeignDefinitionId,
+    ParentDefinitionNotFound,
+    InvalidNestedComponent,
     WrongPackage,
     TooManyInternerInstances,
     TooManyDefinitions,
@@ -543,6 +545,30 @@ impl DefPathInterner {
         };
         storage.by_path.insert(path, id);
         Ok(id)
+    }
+
+    /// Intern a closure or async-block definition below its lexical parent.
+    ///
+    /// The caller supplies the preorder disambiguator assigned within the
+    /// enclosing owner. Named and otherwise symbol-bearing components must
+    /// use `DefPath::new` and `intern` so their interner sessions are checked.
+    pub fn intern_nested(
+        &self,
+        parent: LocalDefId,
+        component: DefPathData,
+        disambiguator: u32,
+    ) -> Result<LocalDefId, DefPathInternerError> {
+        if !matches!(&component, DefPathData::Closure | DefPathData::AsyncBlock) {
+            return Err(DefPathInternerError::InvalidNestedComponent);
+        }
+        let mut path = self
+            .resolve(parent)?
+            .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+        path.data.push(DisambiguatedDefPathData {
+            data: component,
+            disambiguator,
+        });
+        self.intern(path)
     }
 
     pub fn resolve(&self, id: LocalDefId) -> Result<Option<DefPath>, DefPathInternerError> {
@@ -963,6 +989,68 @@ mod tests {
         assert_eq!(paths.resolve(later_id), Ok(Some(later_path)));
         assert_eq!(paths.len(), Ok(2));
         assert_eq!(paths.is_empty(), Ok(false));
+    }
+
+    #[test]
+    fn nested_closure_and_async_paths_keep_lexical_parents_and_ordinals() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let owner = paths
+            .intern(def_path(package, &packages, &symbols, "f"))
+            .unwrap();
+
+        let closure = paths.intern_nested(owner, DefPathData::Closure, 0).unwrap();
+        let nested_closure = paths
+            .intern_nested(closure, DefPathData::Closure, 1)
+            .unwrap();
+        let async_block = paths
+            .intern_nested(owner, DefPathData::AsyncBlock, 2)
+            .unwrap();
+
+        assert_eq!(
+            paths.resolve(closure).unwrap().unwrap().data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 0,
+            })
+        );
+        let nested_path = paths.resolve(nested_closure).unwrap().unwrap();
+        assert_eq!(nested_path.data().len(), 3);
+        assert_eq!(
+            nested_path.data()[1],
+            DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 0,
+            }
+        );
+        assert_eq!(
+            nested_path.data()[2],
+            DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 1,
+            }
+        );
+        assert_eq!(
+            paths.resolve(async_block).unwrap().unwrap().data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::AsyncBlock,
+                disambiguator: 2,
+            })
+        );
+        assert_eq!(
+            paths.intern_nested(owner, DefPathData::Closure, 0),
+            Ok(closure)
+        );
+        assert_eq!(
+            paths.intern_nested(
+                owner,
+                DefPathData::TypeNs(symbols.intern("Bad").unwrap()),
+                3
+            ),
+            Err(DefPathInternerError::InvalidNestedComponent)
+        );
     }
 
     #[test]
