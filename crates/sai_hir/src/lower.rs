@@ -129,63 +129,12 @@ pub fn lower_function_owner<'hir>(
     item_id: ast::ErasedAstId,
     context: &HirLoweringContext<'_, 'hir>,
 ) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
-    if !item_tree.matches_ast_ids(context.ast_ids) {
-        return Err(HirLoweringError::ItemTreeEntryMismatch);
-    }
-    if item_tree.file != context.ast_ids.file()
-        || !context.ast_ids.matches_root(item_tree.file, context.root)
-    {
-        return Err(HirSourceMapError::AstIdMapMismatch.into());
-    }
-    if !context.ast_ids.matches_snapshot(context.snapshot) {
-        return Err(HirSourceMapError::WorkspaceSnapshotMismatch.into());
-    }
-    let entry = item_tree
-        .items
-        .iter()
-        .find(|entry| entry.ast_id == item_id)
-        .filter(|entry| entry.kind == ItemTreeKind::Function)
-        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
-    let owner_path = context
-        .def_paths
-        .resolve(owner.def_id)?
-        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
-    if !matches!(
-        owner_path.data().last(),
-        Some(component) if component.data == DefPathData::ValueNs(entry.name)
-    ) {
-        return Err(HirLoweringError::ItemTreeEntryMismatch);
-    }
-    let function = context
-        .ast_ids
-        .pointer(entry.ast_id)
-        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
-        .and_then(ast::FnDecl::cast)
-        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
-    let source = context
-        .snapshot
-        .file(item_tree.file)
-        .ok_or(HirSourceMapError::WorkspaceSnapshotMismatch)?
-        .source()
-        .text();
-    let current_raw_attrs =
-        crate::item_tree::raw_attrs(item_tree.file, source, function.attrs(), context.symbols)?;
-    let visibility = function
-        .syntax()
-        .children()
-        .find_map(ast::Visibility::cast)
-        .map_or(crate::Visibility::Private, |visibility| {
-            if visibility.export_token().is_some() {
-                crate::Visibility::Export
-            } else if visibility.pub_token().is_some() {
-                crate::Visibility::Pub
-            } else {
-                crate::Visibility::Private
-            }
-        });
-    if !raw_attrs_match(&current_raw_attrs, &entry.raw_attrs) || visibility != entry.vis {
-        return Err(HirLoweringError::ItemTreeEntryMismatch);
-    }
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Function, context)?;
+    let function = ast::FnDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(function.syntax());
+    validate_current_item_metadata(entry, function.attrs(), visibility, context)?;
+    validate_owner_def_path(owner, entry, context)?;
 
     let mut source_map = HirSourceMapBuilder::new(
         owner,
@@ -230,6 +179,186 @@ pub fn lower_function_owner<'hir>(
         },
         source_map,
     ))
+}
+
+/// Lower one top-level constant entry from the current item tree.
+///
+/// A diagnosed missing type or initializer is retained as an error HIR node so
+/// the owner remains available to later stages. As with function owners, the
+/// caller must supply the exact already-interned definition path for this
+/// declaration, including its parent and sibling disambiguator.
+pub fn lower_const_owner<'hir>(
+    owner: OwnerId,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Const, context)?;
+    let declaration =
+        ast::ConstDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(owner, entry, context)?;
+
+    if let Some(ty) = declaration.ty() {
+        ensure_supported_type(&ty)?;
+    }
+    if let Some(initializer) = declaration.initializer() {
+        ensure_supported_expr(&initializer)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let ty = match declaration.ty() {
+        Some(ty) => lower_type(&ty, context.arena, context.symbols, &mut source_map)?,
+        None => lower_error_type(
+            &direct_error_child(declaration.syntax())
+                .unwrap_or_else(|| declaration.syntax().clone()),
+            context.arena,
+            &mut source_map,
+        )?,
+    };
+    let value = match declaration.initializer() {
+        Some(initializer) => lower_expr(
+            &initializer,
+            context.arena,
+            context.symbols,
+            &mut source_map,
+        )?,
+        None => lower_error_expr(
+            &direct_error_child_from_end(declaration.syntax())
+                .unwrap_or_else(|| declaration.syntax().clone()),
+            context.arena,
+            &mut source_map,
+        )?,
+    };
+    let body = context.arena.alloc_body(Body {
+        owner,
+        params: &[],
+        value,
+        contracts: &[],
+        invariant_preds: &[],
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Const { ty },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: Some(body),
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
+fn resolve_item_tree_entry<'tree, 'hir>(
+    item_tree: &'tree ItemTree,
+    item_id: ast::ErasedAstId,
+    kind: ItemTreeKind,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(&'tree crate::item_tree::ItemTreeEntry, SyntaxNode), HirLoweringError> {
+    if !item_tree.matches_ast_ids(context.ast_ids) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    if item_tree.file != context.ast_ids.file()
+        || !context.ast_ids.matches_root(item_tree.file, context.root)
+    {
+        return Err(HirSourceMapError::AstIdMapMismatch.into());
+    }
+    if !context.ast_ids.matches_snapshot(context.snapshot) {
+        return Err(HirSourceMapError::WorkspaceSnapshotMismatch.into());
+    }
+    let entry = item_tree
+        .items
+        .iter()
+        .find(|entry| entry.ast_id == item_id)
+        .filter(|entry| entry.kind == kind)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let syntax = context
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    Ok((entry, syntax))
+}
+
+fn item_visibility(syntax: &SyntaxNode) -> crate::Visibility {
+    syntax.children().find_map(ast::Visibility::cast).map_or(
+        crate::Visibility::Private,
+        |visibility| {
+            if visibility.export_token().is_some() {
+                crate::Visibility::Export
+            } else if visibility.pub_token().is_some() {
+                crate::Visibility::Pub
+            } else {
+                crate::Visibility::Private
+            }
+        },
+    )
+}
+
+fn validate_current_item_metadata<'hir>(
+    entry: &crate::item_tree::ItemTreeEntry,
+    attrs: impl Iterator<Item = ast::Attribute>,
+    visibility: crate::Visibility,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(), HirLoweringError> {
+    let source = context
+        .snapshot
+        .file(context.ast_ids.file())
+        .ok_or(HirSourceMapError::WorkspaceSnapshotMismatch)?
+        .source()
+        .text();
+    let current_raw_attrs =
+        crate::item_tree::raw_attrs(context.ast_ids.file(), source, attrs, context.symbols)?;
+    if !raw_attrs_match(&current_raw_attrs, &entry.raw_attrs) || visibility != entry.vis {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    Ok(())
+}
+
+fn validate_owner_def_path<'hir>(
+    owner: OwnerId,
+    entry: &crate::item_tree::ItemTreeEntry,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(), HirLoweringError> {
+    let owner_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    if !matches!(
+        owner_path.data().last(),
+        Some(component) if component.data == DefPathData::ValueNs(entry.name)
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    Ok(())
 }
 
 fn raw_attrs_match(current: &[RawAttr], item_tree: &[RawAttr]) -> bool {
@@ -14440,6 +14569,144 @@ mod tests {
         assert!(matches!(
             lower_function_owner(other_owner, &item_tree, entry_id, &other_context),
             Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+    }
+
+    #[test]
+    fn lowers_item_tree_const_into_complete_hir_owner() {
+        let file = crate::FileId::new(234);
+        let source = "@deprecated(\"keep\")\npub const ANSWER: I32 = 42\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("const item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Const);
+        let entry_id = entry.ast_id;
+        let name = symbols.intern("ANSWER").expect("symbol interns");
+        let (_packages, paths, owner) = owner_context_with_symbol(&symbols, name);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) = lower_const_owner(owner, &item_tree, entry_id, &context)
+            .expect("const item lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(
+            hir_owner.body.expect("const has an initializer").owner,
+            owner
+        );
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level const is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        assert_eq!(item.name.sym, name);
+        let ItemKind::Const { ty } = item.kind else {
+            panic!("constant item retains its const kind");
+        };
+        assert!(matches!(ty.kind, HirTyKind::Path(_)));
+        let body = hir_owner.body.expect("const initializer body");
+        assert!(matches!(
+            body.value.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(42),
+                negated: false
+            })
+        ));
+        let const_node = parsed
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::CONST_DECL)
+            .expect("const declaration");
+        assert_eq!(item.span.range, const_node.text_range());
+        assert_eq!(
+            source_map
+                .syntax_for_node(crate::HirId {
+                    owner,
+                    local_id: crate::ItemLocalId::default(),
+                })
+                .expect("owner has a source-map entry")
+                .text_range(),
+            const_node.text_range()
+        );
+        assert_eq!(paths.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn const_owner_recovers_a_missing_initializer() {
+        let file = crate::FileId::new(235);
+        let source = "const ANSWER: I32 =\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ExpectedExpression)
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects a diagnosed const");
+        let entry = item_tree.items.first().expect("const item entry");
+        let name = symbols.intern("ANSWER").expect("symbol interns");
+        let (_packages, paths, owner) = owner_context_with_symbol(&symbols, name);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) = lower_const_owner(owner, &item_tree, entry.ast_id, &context)
+            .expect("missing initializer recovers as an error body");
+        let body = hir_owner.body.expect("const still has an owner body");
+        assert!(matches!(body.value.kind, ExprKind::Err));
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("constant is represented by an item owner");
+        };
+        assert!(matches!(item.kind, ItemKind::Const { .. }));
+    }
+
+    #[test]
+    fn const_owner_recovers_a_missing_type() {
+        let file = crate::FileId::new(236);
+        let source = "const ANSWER: = 42\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the parser diagnoses the missing type"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects a diagnosed const");
+        let entry = item_tree.items.first().expect("const item entry");
+        let name = symbols.intern("ANSWER").expect("symbol interns");
+        let (_packages, paths, owner) = owner_context_with_symbol(&symbols, name);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) = lower_const_owner(owner, &item_tree, entry.ast_id, &context)
+            .expect("missing type recovers as an error HIR type");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("constant is represented by an item owner");
+        };
+        let ItemKind::Const { ty } = item.kind else {
+            panic!("constant item retains its const kind");
+        };
+        assert!(matches!(ty.kind, HirTyKind::Err));
+        assert!(matches!(
+            hir_owner.body.expect("initializer body").value.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(42),
+                negated: false
+            })
         ));
     }
 
