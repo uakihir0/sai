@@ -99,6 +99,7 @@ fn lower_expr_inner<'hir>(
         ast::Expr::Literal(literal) => lower_literal(literal, arena, symbols, source_map),
         ast::Expr::Binary(binary) => lower_binary_expr(binary, arena, symbols, source_map),
         ast::Expr::Prefix(prefix) => lower_prefix_expr(prefix, arena, symbols, source_map),
+        ast::Expr::Range(range) => lower_range_expr(range, arena, symbols, source_map),
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -311,6 +312,45 @@ fn lower_prefix_expr<'hir>(
     Ok(arena.alloc_expr(Expr { hir_id, kind, span }))
 }
 
+fn lower_range_expr<'hir>(
+    range: &ast::RangeExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(inclusive) = range_inclusive(range.syntax()) else {
+        return lower_error_expr(range.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(range.syntax(), SpanCtxt::Root)?;
+    let start = range
+        .start()
+        .map(|start| lower_expr_inner(&start, arena, symbols, source_map))
+        .transpose()?;
+    let end = range
+        .end()
+        .map(|end| lower_expr_inner(&end, arena, symbols, source_map))
+        .transpose()?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Range {
+            start,
+            end,
+            inclusive,
+        },
+        span,
+    }))
+}
+
+fn range_inclusive(syntax: &SyntaxNode) -> Option<bool> {
+    syntax
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::DOT2 => Some(false),
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::DOT2EQ => Some(true),
+            SyntaxElement::Node(_) | SyntaxElement::Token(_) => None,
+        })
+}
+
 fn lower_bin_op(op: ast::BinOp) -> BinOp {
     match op {
         ast::BinOp::Or => BinOp::Or,
@@ -368,6 +408,18 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             (Some(_), Some(operand)) => ensure_supported_expr(&operand),
             _ => Ok(()),
         },
+        ast::Expr::Range(range) => {
+            if range_inclusive(range.syntax()).is_none() {
+                return Ok(());
+            }
+            if let Some(start) = range.start() {
+                ensure_supported_expr(&start)?;
+            }
+            if let Some(end) = range.end() {
+                ensure_supported_expr(&end)?;
+            }
+            Ok(())
+        }
         ast::Expr::Path(path) if path.generic_args().is_none() => Ok(()),
         ast::Expr::Field(field) if !has_direct_generic_args(field.syntax()) => match field.base() {
             Some(base) => ensure_supported_expr(&base),
@@ -2061,6 +2113,192 @@ mod tests {
             "-1.25",
             "a folded negative literal maps to the whole prefix expression"
         );
+    }
+
+    #[test]
+    fn lowers_all_six_range_expression_forms() {
+        let file = crate::FileId::new(80);
+        let source = "fn f() { (start..end, start..=end, start.., ..end, ..=end, ..) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("all range expression forms lower");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), 6);
+        let expected = [
+            (true, true, false),
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+            (false, false, false),
+        ];
+        for (index, (range, (has_start, has_end, inclusive))) in
+            elements.iter().zip(expected).enumerate()
+        {
+            let ExprKind::Range {
+                start,
+                end,
+                inclusive: actual_inclusive,
+            } = range.kind
+            else {
+                panic!("tuple element {index} is a range");
+            };
+            assert_eq!(start.is_some(), has_start, "range {index} start");
+            assert_eq!(end.is_some(), has_end, "range {index} end");
+            assert_eq!(actual_inclusive, inclusive, "range {index} inclusivity");
+            for endpoint in start.into_iter().chain(end) {
+                assert!(matches!(endpoint.kind, ExprKind::Path(_)));
+            }
+        }
+        let ExprKind::Range {
+            start: Some(first_start),
+            end: Some(first_end),
+            inclusive: false,
+        } = elements[0].kind
+        else {
+            panic!("first range has two exclusive endpoints");
+        };
+        assert_eq!(elements[0].hir_id.local_id.raw(), 2);
+        assert_eq!(first_start.hir_id.local_id.raw(), 3);
+        assert_eq!(first_end.hir_id.local_id.raw(), 6);
+        assert_eq!(elements[1].hir_id.local_id.raw(), 9);
+        assert_eq!(elements[2].hir_id.local_id.raw(), 16);
+        assert_eq!(elements[3].hir_id.local_id.raw(), 20);
+        assert_eq!(elements[4].hir_id.local_id.raw(), 24);
+        assert_eq!(elements[5].hir_id.local_id.raw(), 28);
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 29);
+        let first_range_syntax = map
+            .syntax_for_node(elements[0].hir_id)
+            .expect("range has a source mapping")
+            .resolve(file, &parsed.root)
+            .expect("range syntax resolves");
+        assert_eq!(first_range_syntax.text_range(), elements[0].span.range);
+        assert_eq!(
+            &source[first_range_syntax.text_range().start().to_usize()
+                ..first_range_syntax.text_range().end().to_usize()],
+            "start..end"
+        );
+    }
+
+    #[test]
+    fn range_recovery_preserves_diagnostics_and_rejects_unsupported_endpoints() {
+        let file = crate::FileId::new(81);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { left..value<I32> }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let range = function
+            .descendants()
+            .find_map(ast::RangeExpr::cast)
+            .expect("range expression");
+        let expression =
+            ast::Expr::cast(range.syntax().clone()).expect("range is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+        ));
+        assert_eq!(
+            source_map.finish().node_to_syntax().len(),
+            1,
+            "an unsupported endpoint is rejected before allocating the range"
+        );
+
+        let file = crate::FileId::new(82);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { value..= }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let range = function
+            .descendants()
+            .find_map(ast::RangeExpr::cast)
+            .expect("recovered range expression");
+        assert!(contains_error_node(range.syntax()));
+        let expression =
+            ast::Expr::cast(range.syntax().clone()).expect("range is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("parser-recovered range lowers");
+        assert_eq!(lowered.kind, ExprKind::Err);
+        let map = source_map.finish();
+        assert!(map.diagnostics().is_empty());
+        assert_eq!(map.node_to_syntax().len(), 2);
+    }
+
+    #[test]
+    fn chained_range_diagnostic_does_not_prevent_hir_recovery() {
+        let file = crate::FileId::new(83);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { left..middle..right }\n");
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::ChainedRange]
+        );
+        let function = function_node(&parsed.root);
+        let range = function
+            .descendants()
+            .find_map(ast::RangeExpr::cast)
+            .expect("outer range expression");
+        let expression =
+            ast::Expr::cast(range.syntax().clone()).expect("range is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("range lowers");
+        let ExprKind::Range {
+            start: Some(start),
+            end: Some(end),
+            inclusive: false,
+        } = lowered.kind
+        else {
+            panic!("outer range retains both endpoints");
+        };
+        assert!(matches!(
+            start.kind,
+            ExprKind::Range {
+                start: Some(_),
+                end: Some(_),
+                inclusive: false,
+            }
+        ));
+        assert!(matches!(end.kind, ExprKind::Path(_)));
+        assert!(source_map.finish().diagnostics().is_empty());
     }
 
     #[test]
