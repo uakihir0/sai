@@ -95,7 +95,10 @@ pub enum ExprKind<'hir> {
     },
     FormatString(&'hir [FmtPiece<'hir>]),
     ContractResult,
-    ContractOld(&'hir Expr<'hir>),
+    ContractOld {
+        args: &'hir [Arg<'hir>],
+        base: Option<&'hir Expr<'hir>>,
+    },
     AsCast {
         operand: &'hir Expr<'hir>,
         ty: &'hir Ty<'hir>,

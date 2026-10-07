@@ -1,5 +1,6 @@
 use crate::Symbol;
 use crate::arena::HirArena;
+use crate::body::{Body, BodyParam, Contract, ContractKind, FnParam, FnSig};
 use crate::expressions::{
     Arg, Arm as HirArm, BinOp, Block as HirBlock, CaptureBy, Closure, ClosureParam, Expr, ExprKind,
     FmtPiece, FmtSpec as HirFmtSpec, Label as HirLabel, LoopSource as HirLoopSource,
@@ -10,8 +11,8 @@ use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRa
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use crate::types::{
     ConstArg as HirConstArg, EffectRef as HirEffectRef, GenericArg as HirGenericArg,
-    GenericArgs as HirGenericArgs, LangItem, Name, Path, PathRoot, PathSegment, Ty as HirTy,
-    TyKind as HirTyKind,
+    GenericArgs as HirGenericArgs, LangItem, Name, Path, PathRoot, PathSegment, Provenance,
+    Ty as HirTy, TyKind as HirTyKind,
 };
 use crate::{
     BindingId, DefPathData, DefPathInternerError, DesugaringKind, LocalDefId, Mutability, Safety,
@@ -34,6 +35,378 @@ pub enum HirLoweringError {
     Interner(InternError),
     DefPath(DefPathInternerError),
     UnsupportedSyntax(SyntaxKind),
+}
+
+/// Lower a function declaration's signature and body within its HIR owner.
+///
+/// The source-map builder must be rooted at `declaration`. If its contracts or
+/// body contain closures or async blocks, the builder must also receive the
+/// same definition-path interner that interned the owner. Function bodies and
+/// contract expressions share the owner's HIR and binding-ID spaces. Async
+/// function desugaring is handled by a later lowering slice.
+pub fn lower_function<'hir>(
+    declaration: &ast::FnDecl,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<(FnSig<'hir>, Option<&'hir Body<'hir>>), HirLoweringError> {
+    if source_map.pointer_for(declaration.syntax())?
+        != source_map.pointer_for(source_map.owner_syntax())?
+    {
+        return Err(HirLoweringError::UnsupportedSyntax(
+            declaration.syntax().kind(),
+        ));
+    }
+    if declaration.async_token().is_some() {
+        return Err(HirLoweringError::UnsupportedSyntax(
+            declaration.syntax().kind(),
+        ));
+    }
+
+    let params = declaration
+        .params()
+        .map(|list| {
+            list.syntax()
+                .children()
+                .filter_map(|child| {
+                    ast::Param::cast(child.clone())
+                        .map(FunctionParamSyntax::Param)
+                        .or_else(|| ast::SelfParam::cast(child).map(FunctionParamSyntax::SelfParam))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let ret_type = declaration.ret_type().and_then(|ret| ret.ty());
+    let contracts = declaration
+        .syntax()
+        .children()
+        .filter_map(|child| {
+            ast::RequiresClause::cast(child.clone())
+                .map(FunctionContractSyntax::Requires)
+                .or_else(|| ast::EnsuresClause::cast(child).map(FunctionContractSyntax::Ensures))
+        })
+        .collect::<Vec<_>>();
+    let body = declaration.body();
+    let has_body_owner = body.is_some() || !contracts.is_empty();
+
+    for param in &params {
+        if let Some(ty) = param.ty() {
+            ensure_supported_type(&ty)?;
+        }
+    }
+    if let Some(ret_type) = &ret_type {
+        ensure_supported_type(ret_type)?;
+    }
+    for contract in &contracts {
+        if let Some(expression) = contract.expression() {
+            ensure_supported_expr(&expression)?;
+        }
+    }
+    if let Some(body) = &body {
+        ensure_supported_block(body)?;
+    }
+
+    // Assign closure and async-block identities across the complete owner
+    // before lowering any child. This also makes contracts and body expressions
+    // agree on the same owner-wide preorder.
+    prepare_nested_definition_ids(declaration.syntax(), source_map)?;
+
+    let mut lowered_params = Vec::with_capacity(params.len());
+    let mut pending_body_params = Vec::with_capacity(params.len());
+    for param in params {
+        let (lowered, body_param) = lower_function_param(param, arena, symbols, source_map)?;
+        lowered_params.push(lowered);
+        pending_body_params.push(body_param);
+    }
+
+    let ret = match declaration.ret_type() {
+        Some(ret) => match ret.ty() {
+            Some(ty) => Some(lower_type_inner(&ty, arena, symbols, source_map)?),
+            None => Some(lower_error_type(ret.syntax(), arena, source_map)?),
+        },
+        None => None,
+    };
+
+    let borrows = declaration
+        .borrows_clause()
+        .filter(borrows_clause_is_well_formed)
+        .map(|clause| lower_provenances(&clause, arena, symbols, source_map))
+        .transpose()?;
+    let effects = declaration
+        .effects_clause()
+        .map(|clause| lower_function_effects(&clause, arena, symbols, source_map))
+        .transpose()?;
+    let effects = effects.flatten();
+
+    let body_params = if has_body_owner {
+        pending_body_params
+            .into_iter()
+            .map(|pending| lower_body_param(pending, source_map))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    let mut lowered_contracts = Vec::with_capacity(contracts.len());
+    let mut requires = Vec::new();
+    let mut ensures = Vec::new();
+    for contract in contracts {
+        let (syntax, kind, expression) = match contract {
+            FunctionContractSyntax::Requires(clause) => (
+                clause.syntax().clone(),
+                ContractKind::Requires,
+                clause.expression(),
+            ),
+            FunctionContractSyntax::Ensures(clause) => (
+                clause.syntax().clone(),
+                ContractKind::Ensures,
+                clause.expression(),
+            ),
+        };
+        let (hir_id, _) = source_map.add_node_with_span(&syntax, SpanCtxt::Root)?;
+        let expression = match expression {
+            Some(expression) => lower_expr(&expression, arena, symbols, source_map)?,
+            None => {
+                let error = direct_error_child(&syntax).unwrap_or_else(|| syntax.clone());
+                lower_error_expr(&error, arena, source_map)?
+            }
+        };
+        match kind {
+            ContractKind::Requires => requires.push(expression.hir_id),
+            ContractKind::Ensures => ensures.push(expression.hir_id),
+        }
+        lowered_contracts.push(Contract {
+            hir_id,
+            kind,
+            expr: expression,
+        });
+    }
+
+    let body_value = match body {
+        Some(body) => Some(lower_block_as_expr(
+            body.syntax(),
+            &body,
+            arena,
+            symbols,
+            source_map,
+        )?),
+        None if !lowered_contracts.is_empty() => {
+            let (hir_id, span) =
+                source_map.add_node_with_span(declaration.syntax(), SpanCtxt::Root)?;
+            Some(arena.alloc_expr(Expr {
+                hir_id,
+                kind: ExprKind::Tuple(arena.alloc_exprs(&[])),
+                span,
+            }))
+        }
+        None => None,
+    };
+
+    let signature = FnSig {
+        safety: if declaration.unsafe_token().is_some() {
+            Safety::Unsafe
+        } else {
+            Safety::Safe
+        },
+        is_async: false,
+        params: arena.alloc_fn_params(&lowered_params),
+        ret,
+        borrows,
+        effects,
+        requires: arena.alloc_hir_ids(&requires),
+        ensures: arena.alloc_hir_ids(&ensures),
+    };
+
+    let Some(body_value) = body_value else {
+        return Ok((signature, None));
+    };
+    let body = arena.alloc_body(Body {
+        owner: source_map.owner(),
+        params: arena.alloc_body_params(&body_params),
+        value: body_value,
+        contracts: arena.alloc_contracts(&lowered_contracts),
+        invariant_preds: arena.alloc_expr_refs(&[]),
+    });
+    Ok((signature, Some(body)))
+}
+
+enum FunctionParamSyntax {
+    Param(ast::Param),
+    SelfParam(ast::SelfParam),
+}
+
+struct PendingBodyParam {
+    syntax: SyntaxNode,
+    binding_syntax: SyntaxNode,
+    name: Option<Name>,
+    mutable: bool,
+}
+
+impl FunctionParamSyntax {
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            Self::Param(param) => param.syntax(),
+            Self::SelfParam(param) => param.syntax(),
+        }
+    }
+
+    fn ty(&self) -> Option<ast::Type> {
+        match self {
+            Self::Param(param) => param.ty(),
+            Self::SelfParam(param) => param.ty(),
+        }
+    }
+}
+
+enum FunctionContractSyntax {
+    Requires(ast::RequiresClause),
+    Ensures(ast::EnsuresClause),
+}
+
+impl FunctionContractSyntax {
+    fn expression(&self) -> Option<ast::Expr> {
+        match self {
+            Self::Requires(clause) => clause.expression(),
+            Self::Ensures(clause) => clause.expression(),
+        }
+    }
+}
+
+fn lower_function_param<'hir>(
+    param: FunctionParamSyntax,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<(FnParam<'hir>, PendingBodyParam), HirLoweringError> {
+    let (hir_id, _) = source_map.add_node_with_span(param.syntax(), SpanCtxt::Root)?;
+    let (name, binding_syntax, is_self, mutable) = match &param {
+        FunctionParamSyntax::Param(param) => {
+            let source_name = param.name();
+            let name_token = source_name.as_ref().and_then(ast::Name::token);
+            let binding_syntax = source_name
+                .as_ref()
+                .map(|name| name.syntax().clone())
+                .or_else(|| direct_error_child(param.syntax()))
+                .unwrap_or_else(|| param.syntax().clone());
+            let name = match (source_name, name_token) {
+                (Some(_), Some(token)) if token.kind() == SyntaxKind::UNDERSCORE => None,
+                (Some(name), token) => Some(lower_name_spelling(
+                    name.syntax(),
+                    token.as_ref().map(|token| token.text()),
+                    symbols,
+                    source_map,
+                )?),
+                (None, _) => Some(Name {
+                    sym: Symbol::ERROR,
+                    span: source_map.span_for(&binding_syntax, SpanCtxt::Root)?,
+                }),
+            };
+            (name, binding_syntax, false, param.is_mutable())
+        }
+        FunctionParamSyntax::SelfParam(param) => {
+            let binding_syntax = param.syntax().clone();
+            let mut span = source_map.span_for(param.syntax(), SpanCtxt::Root)?;
+            if let Some(token) = direct_token(param.syntax(), SyntaxKind::SELF_KW) {
+                span.range = token.text_range();
+            }
+            (
+                Some(Name {
+                    sym: symbols.intern("self")?,
+                    span,
+                }),
+                binding_syntax,
+                true,
+                param.is_mutable(),
+            )
+        }
+    };
+    let ty = match param.ty() {
+        Some(ty) => lower_type_inner(&ty, arena, symbols, source_map)?,
+        None => lower_error_type(param.syntax(), arena, source_map)?,
+    };
+    let lowered = FnParam {
+        hir_id,
+        name,
+        is_self,
+        mutable,
+        ty,
+    };
+    let body_param = PendingBodyParam {
+        syntax: param.syntax().clone(),
+        binding_syntax,
+        name,
+        mutable,
+    };
+    Ok((lowered, body_param))
+}
+
+fn lower_body_param(
+    pending: PendingBodyParam,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<BodyParam, HirLoweringError> {
+    let hir_id = source_map.add_node(&pending.syntax)?;
+    let binding = source_map.add_binding(&pending.binding_syntax)?;
+    Ok(BodyParam {
+        hir_id,
+        binding,
+        name: pending.name,
+        mutable: pending.mutable,
+    })
+}
+
+fn lower_provenances<'hir>(
+    clause: &ast::BorrowsClause,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<&'hir [Provenance<'hir>], HirLoweringError> {
+    let mut lowered = Vec::new();
+    for provenance in clause.provenances() {
+        let segments = provenance
+            .segments()
+            .map(|segment| {
+                if segment
+                    .syntax()
+                    .first_token()
+                    .is_some_and(|token| token.kind() == SyntaxKind::SELF_KW)
+                {
+                    Ok(Name {
+                        sym: symbols.intern("self")?,
+                        span: source_map.span_for(segment.syntax(), SpanCtxt::Root)?,
+                    })
+                } else {
+                    lower_name_ref(&segment, symbols, source_map)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (root, fields) = match segments.split_first() {
+            Some((root, fields)) => (*root, fields),
+            None => (
+                Name {
+                    sym: Symbol::ERROR,
+                    span: source_map.span_for(provenance.syntax(), SpanCtxt::Root)?,
+                },
+                &[] as &[Name],
+            ),
+        };
+        lowered.push(Provenance {
+            root,
+            fields: arena.alloc_names(fields),
+        });
+    }
+    Ok(arena.alloc_provenances(&lowered))
+}
+
+fn lower_function_effects<'hir>(
+    clause: &ast::EffectsClause,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Option<&'hir [HirEffectRef<'hir>]>, HirLoweringError> {
+    let Some(set) = clause.set().filter(effect_set_is_well_formed) else {
+        return Ok(None);
+    };
+    lower_effect_set(&set, arena, symbols, source_map).map(Some)
 }
 
 impl From<HirSourceMapError> for HirLoweringError {
@@ -630,8 +1003,19 @@ fn lower_effect_set<'hir>(
 
 fn effect_set_is_well_formed(set: &ast::EffectSet) -> bool {
     !contains_error_node(set.syntax())
+        && has_direct_token(set.syntax(), SyntaxKind::L_BRACE)
+        && has_direct_token(set.syntax(), SyntaxKind::R_BRACE)
         && set.effects().all(|effect| {
             !contains_error_node(effect.syntax()) && effect.segments().next().is_some()
+        })
+}
+
+fn borrows_clause_is_well_formed(clause: &ast::BorrowsClause) -> bool {
+    !contains_error_node(clause.syntax())
+        && has_direct_token(clause.syntax(), SyntaxKind::L_BRACE)
+        && has_direct_token(clause.syntax(), SyntaxKind::R_BRACE)
+        && clause.provenances().all(|provenance| {
+            !contains_error_node(provenance.syntax()) && provenance.segments().next().is_some()
         })
 }
 
@@ -655,12 +1039,12 @@ pub fn lower_expr<'hir>(
     {
         return lower_error_expr(expression.syntax(), arena, source_map);
     }
-    prepare_nested_definition_ids(expression, source_map)?;
+    prepare_nested_definition_ids(expression.syntax(), source_map)?;
     lower_expr_inner(expression, arena, symbols, source_map)
 }
 
 fn prepare_nested_definition_ids(
-    expression: &ast::Expr,
+    expression_syntax: &SyntaxNode,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(), HirLoweringError> {
     let owner_pointer = source_map.pointer_for(source_map.owner_syntax())?;
@@ -677,10 +1061,9 @@ fn prepare_nested_definition_ids(
         .iter()
         .map(|(_, pointer)| pointer.clone())
         .collect::<HashSet<_>>();
-    let expression_pointer = source_map.pointer_for(expression.syntax())?;
+    let expression_pointer = source_map.pointer_for(expression_syntax)?;
     let mut first_owned_definition_kind = None;
-    for node in expression
-        .syntax()
+    for node in expression_syntax
         .descendants()
         .filter(|node| is_nested_definition_kind(node.kind()))
     {
@@ -827,6 +1210,14 @@ fn lower_expr_inner<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     match expression {
+        ast::Expr::Path(path) if is_contract_result(path) => {
+            lower_contract_result(path, arena, source_map)
+        }
+        ast::Expr::Call(call)
+            if is_inside_ensures(call.syntax()) && is_contract_old_callee(call) =>
+        {
+            lower_contract_old(call, arena, symbols, source_map)
+        }
         ast::Expr::Literal(literal) => lower_literal(literal, arena, symbols, source_map),
         ast::Expr::FormatString(format_string) => {
             lower_format_string_expr(format_string, arena, symbols, source_map)
@@ -933,6 +1324,117 @@ fn lower_expr_inner<'hir>(
             expression.syntax().kind(),
         )),
     }
+}
+
+fn lower_contract_result<'hir>(
+    path: &ast::PathExpr,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(path.syntax(), SpanCtxt::Root)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::ContractResult,
+        span,
+    }))
+}
+
+fn lower_contract_old<'hir>(
+    call: &ast::CallExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(args) = collect_call_args(call) else {
+        return lower_error_expr(call.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(call.syntax(), SpanCtxt::Root)?;
+    let mut lowered_args = Vec::with_capacity(args.len());
+    let mut base = None;
+    for arg in args {
+        match arg {
+            CallArgSyntax::Positional(expression) => {
+                let expression = lower_expr_inner(&expression, arena, symbols, source_map)?;
+                lowered_args.push(Arg {
+                    name: None,
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::PositionalError(syntax) => {
+                let expression = lower_error_expr(&syntax, arena, source_map)?;
+                lowered_args.push(Arg {
+                    name: None,
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::Named { name, expression } => {
+                let name = lower_name_ref(&name, symbols, source_map)?;
+                let expression = lower_expr_inner(&expression, arena, symbols, source_map)?;
+                lowered_args.push(Arg {
+                    name: Some(name),
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::NamedError { name, syntax } => {
+                let name = lower_name_ref(&name, symbols, source_map)?;
+                let expression = lower_error_expr(&syntax, arena, source_map)?;
+                lowered_args.push(Arg {
+                    name: Some(name),
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::Base(expression) => {
+                base = Some(lower_expr_inner(&expression, arena, symbols, source_map)?);
+            }
+            CallArgSyntax::BaseError(syntax) => {
+                base = Some(lower_error_expr(&syntax, arena, source_map)?);
+            }
+        }
+    }
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::ContractOld {
+            args: arena.alloc_args(&lowered_args),
+            base,
+        },
+        span,
+    }))
+}
+
+fn is_contract_result(path: &ast::PathExpr) -> bool {
+    is_inside_ensures(path.syntax())
+        && path.generic_args().is_none()
+        && path.name().is_some_and(|name| {
+            name.syntax()
+                .first_token()
+                .is_some_and(|token| !token.has_error() && token.text() == "result")
+        })
+}
+
+fn is_contract_old_callee(call: &ast::CallExpr) -> bool {
+    let Some(ast::Expr::Path(path)) = call.callee() else {
+        return false;
+    };
+    path.generic_args().is_none()
+        && path.name().is_some_and(|name| {
+            name.syntax()
+                .first_token()
+                .is_some_and(|token| !token.has_error() && token.text() == "old")
+        })
+}
+
+fn is_inside_ensures(syntax: &SyntaxNode) -> bool {
+    let mut ancestor = syntax.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == SyntaxKind::ENSURES_CLAUSE {
+            return true;
+        }
+        if is_hir_owner_syntax(node.kind()) || is_nested_definition_kind(node.kind()) {
+            return false;
+        }
+        ancestor = node.parent();
+    }
+    false
 }
 
 fn lower_path_expr<'hir>(
@@ -3008,6 +3510,15 @@ fn has_direct_token(syntax: &SyntaxNode, kind: SyntaxKind) -> bool {
     syntax
         .children_with_tokens()
         .any(|element| matches!(element, SyntaxElement::Token(token) if token.kind() == kind))
+}
+
+fn direct_token(syntax: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
+    syntax
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == kind => Some(token),
+            _ => None,
+        })
 }
 
 fn direct_error_child_before_token(syntax: &SyntaxNode, before: SyntaxKind) -> Option<SyntaxNode> {
@@ -12139,5 +12650,409 @@ mod tests {
             "the local item's closure is outside the enclosing owner's paths"
         );
         assert_eq!(paths.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn lowers_function_signature_parameters_and_body() {
+        let file = crate::FileId::new(208);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "unsafe fn f(var x: I32, _: U8, var self: Self) -> (I32, U8) borrows {x.field, self.field} effects {io, net.http} { x }\n",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (signature, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("function lowers");
+        assert_eq!(signature.safety, Safety::Unsafe);
+        assert!(!signature.is_async);
+        assert_eq!(signature.params.len(), 3);
+        assert_eq!(
+            signature.params[0].name.map(|name| {
+                symbols
+                    .resolve(name.sym)
+                    .expect("first parameter name")
+                    .to_string()
+            }),
+            Some("x".to_owned())
+        );
+        assert!(signature.params[0].mutable);
+        assert_eq!(signature.params[1].name, None);
+        assert!(signature.params[2].is_self);
+        assert!(signature.params[2].mutable);
+        assert_eq!(
+            signature.params[2]
+                .name
+                .map(|name| symbols.resolve(name.sym).unwrap().to_string()),
+            Some("self".to_owned())
+        );
+        assert!(matches!(signature.params[0].ty.kind, HirTyKind::Path(_)));
+        assert!(matches!(
+            signature.ret.map(|ty| ty.kind),
+            Some(HirTyKind::Tuple(_))
+        ));
+        let borrows = signature.borrows.expect("borrows clause");
+        assert_eq!(borrows.len(), 2);
+        assert_eq!(borrows[0].fields.len(), 1);
+        assert_eq!(borrows[1].fields.len(), 1);
+        assert_eq!(symbols.resolve(borrows[0].root.sym).unwrap().as_ref(), "x");
+        assert_eq!(
+            symbols.resolve(borrows[1].root.sym).unwrap().as_ref(),
+            "self"
+        );
+        let effects = signature.effects.expect("effects clause");
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[1].segments.len(), 2);
+        assert_eq!(
+            symbols
+                .resolve(effects[1].segments[1].sym)
+                .unwrap()
+                .as_ref(),
+            "http"
+        );
+
+        let body = body.expect("function has a body");
+        assert_eq!(body.owner, owner);
+        assert_eq!(body.params.len(), 3);
+        assert_ne!(body.params[0].hir_id, signature.params[0].hir_id);
+        assert!(body.params[0].mutable);
+        assert_eq!(body.params[1].name, None);
+        assert!(body.params[2].binding.raw() > body.params[1].binding.raw());
+        let ExprKind::Block(block) = body.value.kind else {
+            panic!("function body is represented by a block expression");
+        };
+        assert!(matches!(
+            block.tail.map(|expr| expr.kind),
+            Some(ExprKind::Path(_))
+        ));
+        assert!(body.contracts.is_empty());
+        assert!(body.invariant_preds.is_empty());
+        assert_eq!(source_map.finish().binding_to_syntax().len(), 3);
+    }
+
+    #[test]
+    fn lowers_contracts_in_source_order_and_synthesizes_bodiless_body() {
+        let file = crate::FileId::new(209);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f(x: I32) requires result > 0 ensures result > x\n",
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::MissingFnBody),
+            "the parser owns the missing-body diagnostic"
+        );
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (signature, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("contract-only declaration lowers");
+        let body = body.expect("contracts need an owning body");
+        assert_eq!(body.params.len(), 1);
+        assert_eq!(body.contracts.len(), 2);
+        assert_eq!(body.contracts[0].kind, ContractKind::Requires);
+        assert_eq!(body.contracts[1].kind, ContractKind::Ensures);
+        let ExprKind::Binary(_, requires_lhs, _) = body.contracts[0].expr.kind else {
+            panic!("requires expression is binary");
+        };
+        assert!(matches!(requires_lhs.kind, ExprKind::Path(_)));
+        let ExprKind::Binary(_, ensures_lhs, _) = body.contracts[1].expr.kind else {
+            panic!("ensures expression is binary");
+        };
+        assert!(matches!(ensures_lhs.kind, ExprKind::ContractResult));
+        assert_eq!(signature.requires, &[body.contracts[0].expr.hir_id]);
+        assert_eq!(signature.ensures, &[body.contracts[1].expr.hir_id]);
+        assert!(matches!(body.value.kind, ExprKind::Tuple(elements) if elements.is_empty()));
+        assert_eq!(body.owner, owner);
+    }
+
+    #[test]
+    fn lowers_result_and_old_only_inside_ensures_clauses() {
+        let file = crate::FileId::new(213);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f(x: I32) ensures result > old(old(x)) { old(x) }\n",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (_, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("contract builtins lower");
+        let body = body.expect("function body exists");
+        let ExprKind::Binary(_, result, old) = body.contracts[0].expr.kind else {
+            panic!("ensures expression is a binary expression");
+        };
+        assert!(matches!(result.kind, ExprKind::ContractResult));
+        let ExprKind::ContractOld {
+            args: old_args,
+            base: None,
+        } = old.kind
+        else {
+            panic!("old call in ensures lowers to ContractOld");
+        };
+        assert_eq!(old_args.len(), 1);
+        assert_eq!(old_args[0].name, None);
+        let ExprKind::ContractOld {
+            args: inner_args, ..
+        } = old_args[0].expr.kind
+        else {
+            panic!("nested old call also lowers to ContractOld");
+        };
+        assert_eq!(inner_args.len(), 1);
+        let ExprKind::Block(block) = body.value.kind else {
+            panic!("function body is a block");
+        };
+        assert!(matches!(
+            block.tail.map(|expression| expression.kind),
+            Some(ExprKind::Call { .. })
+        ));
+    }
+
+    #[test]
+    fn contract_old_preserves_malformed_argument_shapes_for_later_diagnostics() {
+        let file = crate::FileId::new(214);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f(x: I32) ensures (old(), old(x, x), old(value: x), old(..x)) {}\n",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (_, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("contract old calls lower");
+        let body = body.expect("function body exists");
+        let ExprKind::Tuple(calls) = body.contracts[0].expr.kind else {
+            panic!("ensures expression is a tuple");
+        };
+        assert_eq!(calls.len(), 4);
+        let [
+            Expr {
+                kind:
+                    ExprKind::ContractOld {
+                        args: no_args,
+                        base: None,
+                    },
+                ..
+            },
+            Expr {
+                kind:
+                    ExprKind::ContractOld {
+                        args: two_args,
+                        base: None,
+                    },
+                ..
+            },
+            Expr {
+                kind:
+                    ExprKind::ContractOld {
+                        args: named_args,
+                        base: None,
+                    },
+                ..
+            },
+            Expr {
+                kind:
+                    ExprKind::ContractOld {
+                        args: base_args,
+                        base: Some(_),
+                    },
+                ..
+            },
+        ] = calls
+        else {
+            panic!("every unqualified non-raw old call keeps its contract meaning");
+        };
+        assert!(no_args.is_empty());
+        assert_eq!(two_args.len(), 2);
+        assert_eq!(named_args.len(), 1);
+        assert!(named_args[0].name.is_some());
+        assert!(base_args.is_empty());
+    }
+
+    #[test]
+    fn malformed_borrows_and_effects_sets_do_not_lower_as_empty_sets() {
+        let file = crate::FileId::new(215);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn missing_borrows() borrows effects {}\n\
+             fn missing_effects() effects borrows {}\n\
+             fn unclosed_effects() effects {\n",
+        );
+        assert!(
+            !parsed.errors.is_empty(),
+            "the parser owns the syntax errors"
+        );
+        let declarations = parsed
+            .root
+            .descendants()
+            .filter_map(ast::FnDecl::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), 3);
+
+        for (index, declaration) in declarations.iter().enumerate() {
+            let function = declaration.syntax().clone();
+            let arena = HirArena::new();
+            let symbols = Interner::new();
+            let (_packages, paths, owner) = owner_context(&symbols);
+            let mut source_map =
+                HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                    .expect("source map builder")
+                    .with_def_path_interner(&paths);
+
+            let (signature, _) = lower_function(declaration, &arena, &symbols, &mut source_map)
+                .expect("malformed declarations still lower with recovery");
+            match index {
+                0 => {
+                    assert!(signature.borrows.is_none());
+                    assert_eq!(signature.effects.map(|effects| effects.len()), Some(0));
+                }
+                1 => {
+                    assert_eq!(signature.borrows.map(|borrows| borrows.len()), Some(0));
+                    assert!(signature.effects.is_none());
+                }
+                2 => {
+                    assert!(signature.effects.is_none());
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn bodiless_function_without_contracts_has_no_body_parameters() {
+        let file = crate::FileId::new(210);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(x: I32)\n");
+        assert!(!parsed.errors.is_empty(), "the missing body is diagnosed");
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let (signature, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("bodyless function lowers");
+        assert_eq!(signature.params.len(), 1);
+        assert!(body.is_none());
+        let map = source_map.finish();
+        assert!(map.binding_to_syntax().is_empty());
+    }
+
+    #[test]
+    fn function_preflight_rejects_unsupported_body_before_allocating_parameters() {
+        let file = crate::FileId::new(211);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(x: I32) { (0, target<I32>) }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        assert_eq!(
+            lower_function(&declaration, &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR)
+        );
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "preflight does not intern closure paths"
+        );
+        let map = source_map.finish();
+        assert_eq!(
+            map.node_to_syntax().len(),
+            1,
+            "only the owner node is mapped"
+        );
+        assert!(map.binding_to_syntax().is_empty());
+    }
+
+    #[test]
+    fn lower_function_prepares_owner_wide_nested_definition_paths() {
+        let file = crate::FileId::new(212);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() requires fn() { true } { fn() {} }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (_, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("function with nested closures lowers");
+        let body = body.expect("body exists");
+        let ExprKind::Block(block) = body.value.kind else {
+            panic!("function body is a block");
+        };
+        let Some(closure_expr) = block.tail else {
+            panic!("closure is the body tail");
+        };
+        let ExprKind::Closure(closure) = closure_expr.kind else {
+            panic!("body tail is a closure");
+        };
+        assert_eq!(paths.len().unwrap(), 3, "owner plus two closures");
+        assert!(
+            source_map
+                .nested_definition_for_syntax(
+                    &function
+                        .descendants()
+                        .find(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+                        .expect("first closure"),
+                )
+                .unwrap()
+                .is_some()
+        );
+        let path = paths.resolve(closure.def_id).unwrap().unwrap();
+        assert_eq!(
+            path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 1,
+            })
+        );
     }
 }
