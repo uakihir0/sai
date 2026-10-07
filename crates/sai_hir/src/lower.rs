@@ -179,6 +179,7 @@ pub fn lower_pattern<'hir>(
         }
         ast::Pattern::Literal(literal) => lower_literal_pat(literal, arena, symbols, source_map),
         ast::Pattern::Range(range) => lower_range_pat(range, arena, symbols, source_map),
+        ast::Pattern::Tuple(tuple) => lower_tuple_pattern(tuple, arena, symbols, source_map),
         ast::Pattern::Binding(binding) => {
             lower_binding_pattern(binding, arena, symbols, source_map)
         }
@@ -207,6 +208,25 @@ fn lower_error_pattern<'hir>(
     Ok(arena.alloc_pat(Pat {
         hir_id,
         kind: PatKind::Err,
+        span,
+    }))
+}
+
+fn lower_tuple_pattern<'hir>(
+    tuple: &ast::TuplePat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(tuple.syntax(), SpanCtxt::Root)?;
+    let elements = tuple
+        .elements()
+        .map(|element| lower_pattern(&element, arena, symbols, source_map).copied())
+        .collect::<Result<Vec<_>, _>>()?;
+    let elements = arena.alloc_pats(&elements);
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::Tuple(elements),
         span,
     }))
 }
@@ -246,6 +266,12 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
             }
             _ => Ok(()),
         },
+        ast::Pattern::Tuple(tuple) => {
+            for element in tuple.elements() {
+                ensure_supported_pattern(&element)?;
+            }
+            Ok(())
+        }
         ast::Pattern::Constructor(constructor)
             if constructor
                 .path()
@@ -723,7 +749,7 @@ mod tests {
         let file = crate::FileId::new(65);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
-            "fn f() { match value { _ => (), (true) => (), ((_)) => (), (left, right) => () } }\n",
+            "fn f() { match value { _ => (), (true) => (), ((_)) => (), [left, right] => () } }\n",
         );
         let function = function_node(&parsed.root);
         let patterns = function
@@ -771,7 +797,7 @@ mod tests {
         );
         assert_eq!(
             lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::TUPLE_PAT)
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::SLICE_PAT)
         );
 
         let map = source_map.finish();
@@ -1112,5 +1138,100 @@ mod tests {
                 expected.syntax().text_range()
             );
         }
+    }
+
+    #[test]
+    fn lowers_tuple_patterns_and_preflights_unsupported_children() {
+        let file = crate::FileId::new(68);
+        let source = "fn f() { match value { () => (), (only,) => (), (first, (second,), var third,) => (), (before, Some(value)) => () } }";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .filter_map(|arm| arm.pattern())
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 4);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns[..3]
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("tuple patterns lower");
+
+        fn tuple_elements<'hir>(pattern: &Pat<'hir>) -> &'hir [Pat<'hir>] {
+            match pattern.kind {
+                PatKind::Tuple(elements) => elements,
+                _ => panic!("tuple pattern lowers to PatKind::Tuple"),
+            }
+        }
+        assert!(tuple_elements(lowered[0]).is_empty());
+        let singleton = tuple_elements(lowered[1]);
+        assert_eq!(singleton.len(), 1);
+        let binding_parts = |pattern: &Pat<'_>| match pattern.kind {
+            PatKind::Binding {
+                name,
+                binding,
+                mode,
+                ..
+            } => (name, binding, mode),
+            _ => panic!("tuple element lowers to PatKind::Binding"),
+        };
+        let (only_name, only_binding, _) = binding_parts(&singleton[0]);
+        assert_eq!(symbols.resolve(only_name.sym).unwrap().as_ref(), "only");
+        assert_eq!(only_binding.raw(), 0);
+
+        let nested = tuple_elements(lowered[2]);
+        assert_eq!(nested.len(), 3);
+        let (first_name, first_binding, _) = binding_parts(&nested[0]);
+        assert_eq!(symbols.resolve(first_name.sym).unwrap().as_ref(), "first");
+        assert_eq!(first_binding.raw(), 1);
+        let second = tuple_elements(&nested[1]);
+        assert_eq!(second.len(), 1);
+        let (second_name, second_binding, _) = binding_parts(&second[0]);
+        assert_eq!(symbols.resolve(second_name.sym).unwrap().as_ref(), "second");
+        assert_eq!(second_binding.raw(), 2);
+        let (third_name, third_binding, third_mode) = binding_parts(&nested[2]);
+        assert_eq!(symbols.resolve(third_name.sym).unwrap().as_ref(), "third");
+        assert_eq!(third_binding.raw(), 3);
+        assert_eq!(third_mode, HirBindingMode::Var);
+
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|pattern| pattern.hir_id.local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 4]
+        );
+        assert_eq!(lowered[0].span.range, patterns[0].syntax().text_range());
+        assert_eq!(
+            singleton[0].span.range,
+            patterns[1]
+                .syntax()
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::BINDING_PAT)
+                .expect("singleton binding syntax")
+                .text_range()
+        );
+        assert_eq!(
+            second[0].hir_id.local_id.raw(),
+            7,
+            "nested tuple children receive owner-local IDs in source pre-order"
+        );
+
+        assert_eq!(
+            lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT)
+        );
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 9);
+        assert_eq!(map.binding_to_syntax().len(), 4);
     }
 }
