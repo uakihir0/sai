@@ -208,6 +208,35 @@ fn lower_closure_expr<'hir>(
     }))
 }
 
+fn lower_async_block_expr<'hir>(
+    async_block: &ast::AsyncBlockExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(body) = async_block.body() else {
+        return lower_error_expr(async_block.syntax(), arena, source_map);
+    };
+    let def_id = source_map
+        .nested_definition_for_syntax(async_block.syntax())?
+        .ok_or(HirSourceMapError::NestedDefinitionIdMismatch)?;
+    let (hir_id, span) = source_map.add_node_with_span(async_block.syntax(), SpanCtxt::Root)?;
+    let block = lower_block(&body, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::AsyncBlock {
+            def_id,
+            capture: if has_direct_token(async_block.syntax(), SyntaxKind::MOVE_KW) {
+                CaptureBy::Move
+            } else {
+                CaptureBy::Infer
+            },
+            block,
+        },
+        span,
+    }))
+}
+
 fn lower_literal_with_sign<'hir>(
     literal: &ast::LiteralExpr,
     expression_syntax: &SyntaxNode,
@@ -634,27 +663,11 @@ fn prepare_nested_definition_ids(
     expression: &ast::Expr,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(), HirLoweringError> {
-    let contains_closure = expression
-        .syntax()
-        .descendants()
-        .any(|node| node.kind() == SyntaxKind::CLOSURE_EXPR);
-    if !contains_closure {
-        return Ok(());
-    }
-
-    let Some(def_paths) = source_map.def_path_interner() else {
-        return Err(HirLoweringError::UnsupportedSyntax(
-            SyntaxKind::CLOSURE_EXPR,
-        ));
-    };
-
     let owner_pointer = source_map.pointer_for(source_map.owner_syntax())?;
     let mut nested_definitions = Vec::new();
     for node in source_map.owner_syntax().descendants() {
-        if matches!(
-            node.kind(),
-            SyntaxKind::CLOSURE_EXPR | SyntaxKind::ASYNC_BLOCK_EXPR
-        ) && nested_definition_belongs_to_owner(&node, &owner_pointer, source_map)?
+        if is_nested_definition_kind(node.kind())
+            && nested_definition_belongs_to_owner(&node, &owner_pointer, source_map)?
         {
             let pointer = source_map.pointer_for(&node)?;
             nested_definitions.push((node, pointer));
@@ -665,24 +678,31 @@ fn prepare_nested_definition_ids(
         .map(|(_, pointer)| pointer.clone())
         .collect::<HashSet<_>>();
     let expression_pointer = source_map.pointer_for(expression.syntax())?;
-    let expression_is_closure = expression.syntax().kind() == SyntaxKind::CLOSURE_EXPR;
+    let mut first_owned_definition_kind = None;
     for node in expression
         .syntax()
         .descendants()
-        .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+        .filter(|node| is_nested_definition_kind(node.kind()))
     {
         let pointer = source_map.pointer_for(&node)?;
         if nested_definition_pointers.contains(&pointer) {
+            first_owned_definition_kind.get_or_insert(node.kind());
             continue;
         }
-        if (expression_is_closure && pointer == expression_pointer)
+        if pointer == expression_pointer
             || !nested_definition_is_in_foreign_owner(&node, &owner_pointer, source_map)?
         {
-            return Err(HirLoweringError::UnsupportedSyntax(
-                SyntaxKind::CLOSURE_EXPR,
-            ));
+            return Err(HirLoweringError::UnsupportedSyntax(node.kind()));
         }
     }
+    let Some(first_owned_definition_kind) = first_owned_definition_kind else {
+        return Ok(());
+    };
+    let Some(def_paths) = source_map.def_path_interner() else {
+        return Err(HirLoweringError::UnsupportedSyntax(
+            first_owned_definition_kind,
+        ));
+    };
     let mut ids_by_syntax = HashMap::<SyntaxNodePtr, LocalDefId>::new();
 
     for (ordinal, (node, pointer)) in nested_definitions.iter().enumerate() {
@@ -727,6 +747,13 @@ fn prepare_nested_definition_ids(
         ids_by_syntax.insert(pointer.clone(), id);
     }
     Ok(())
+}
+
+fn is_nested_definition_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::CLOSURE_EXPR | SyntaxKind::ASYNC_BLOCK_EXPR
+    )
 }
 
 fn nested_definition_belongs_to_owner(
@@ -805,6 +832,9 @@ fn lower_expr_inner<'hir>(
             lower_format_string_expr(format_string, arena, symbols, source_map)
         }
         ast::Expr::Closure(closure) => lower_closure_expr(closure, arena, symbols, source_map),
+        ast::Expr::AsyncBlock(async_block) => {
+            lower_async_block_expr(async_block, arena, symbols, source_map)
+        }
         ast::Expr::Binary(binary) => lower_binary_expr(binary, arena, symbols, source_map),
         ast::Expr::Prefix(prefix) => lower_prefix_expr(prefix, arena, symbols, source_map),
         ast::Expr::Range(range) => lower_range_expr(range, arena, symbols, source_map),
@@ -3025,6 +3055,10 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             }
             Ok(())
         }
+        ast::Expr::AsyncBlock(async_block) => match async_block.body() {
+            Some(body) => ensure_supported_block(&body),
+            None => Ok(()),
+        },
         ast::Expr::Binary(binary) => {
             if let Some(lhs) = binary.lhs() {
                 ensure_supported_expr(&lhs)?;
@@ -11331,6 +11365,177 @@ mod tests {
             outer_ast_params[0].name().unwrap().syntax().text_range()
         );
         assert_eq!(outer.params[0].name.unwrap().span.ctxt, SpanCtxt::Root);
+    }
+
+    #[test]
+    fn lowers_async_blocks_with_capture_paths_and_source_mappings() {
+        let file = crate::FileId::new(208);
+        let source =
+            "fn f() {\n    async { 1 }\n    async move { 2 }\n    fn() { async { 3 } }\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let async_blocks = function
+            .descendants()
+            .filter_map(ast::AsyncBlockExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(async_blocks.len(), 3);
+        let closure = function
+            .descendants()
+            .find_map(ast::ClosureExpr::cast)
+            .expect("closure with a nested async block");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+        let mut lowered = Vec::new();
+        for async_block in &async_blocks {
+            let expression = ast::Expr::cast(async_block.syntax().clone()).unwrap();
+            lowered.push(
+                lower_expr(&expression, &arena, &symbols, &mut source_map)
+                    .expect("async block lowers"),
+            );
+        }
+        let closure_expression = ast::Expr::cast(closure.syntax().clone()).unwrap();
+        let lowered_closure = lower_expr(&closure_expression, &arena, &symbols, &mut source_map)
+            .expect("closure containing an async block lowers");
+        let ExprKind::Closure(lowered_closure) = lowered_closure.kind else {
+            panic!("the closure remains a closure");
+        };
+        let nested_async = lowered_closure.body.tail.expect("nested async block");
+
+        let ExprKind::AsyncBlock {
+            def_id: first_def_id,
+            capture: CaptureBy::Infer,
+            block: first_body,
+        } = lowered[0].kind
+        else {
+            panic!("plain async block infers its capture mode");
+        };
+        let ExprKind::AsyncBlock {
+            def_id: second_def_id,
+            capture: CaptureBy::Move,
+            block: second_body,
+        } = lowered[1].kind
+        else {
+            panic!("move async block captures by move");
+        };
+        assert!(matches!(
+            first_body.tail.map(|tail| tail.kind),
+            Some(ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            }))
+        ));
+        assert!(matches!(
+            second_body.tail.map(|tail| tail.kind),
+            Some(ExprKind::Lit(Lit::Int {
+                value: Some(2),
+                negated: false,
+            }))
+        ));
+        assert_eq!(first_body.safety, Safety::Safe);
+        assert_eq!(second_body.safety, Safety::Safe);
+
+        for (ordinal, def_id) in [(0, first_def_id), (1, second_def_id)] {
+            let path = paths.resolve(def_id).unwrap().unwrap();
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::AsyncBlock,
+                    disambiguator: ordinal,
+                })
+            );
+        }
+        let ExprKind::AsyncBlock {
+            def_id: nested_def_id,
+            capture: CaptureBy::Infer,
+            ..
+        } = nested_async.kind
+        else {
+            panic!("nested async block uses inferred capture");
+        };
+        let nested_path = paths.resolve(nested_def_id).unwrap().unwrap();
+        assert_eq!(
+            nested_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::AsyncBlock,
+                disambiguator: 3,
+            })
+        );
+        assert_eq!(
+            nested_path.data()[nested_path.data().len() - 2],
+            DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 2,
+            }
+        );
+        let first_ptr =
+            SyntaxNodePtr::new(file, async_blocks[0].syntax()).expect("first async pointer");
+        let first_body_ptr = SyntaxNodePtr::new(file, async_blocks[0].body().unwrap().syntax())
+            .expect("first async body pointer");
+        let map = source_map.finish();
+        assert_eq!(map.syntax_for_node(lowered[0].hir_id), Some(&first_ptr));
+        assert_eq!(
+            map.syntax_for_node(first_body.hir_id),
+            Some(&first_body_ptr)
+        );
+    }
+
+    #[test]
+    fn async_block_lowering_requires_definition_paths_before_allocating_hir() {
+        let file = crate::FileId::new(209);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { async {} }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let async_block = function
+            .descendants()
+            .find_map(ast::AsyncBlockExpr::cast)
+            .expect("async block");
+        let expression = ast::Expr::cast(async_block.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert_eq!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::ASYNC_BLOCK_EXPR)
+        );
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn async_block_preflight_rejects_unsupported_body_before_allocating_any_nodes() {
+        let file = crate::FileId::new(210);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { async { value.convert<U32> } }\n");
+        let function = function_node(&parsed.root);
+        let async_block = function
+            .descendants()
+            .find_map(ast::AsyncBlockExpr::cast)
+            .expect("async block");
+        let expression = ast::Expr::cast(async_block.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        assert_eq!(paths.len().unwrap(), 1, "preflight adds no nested paths");
     }
 
     #[test]
