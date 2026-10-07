@@ -86,6 +86,16 @@ fn lower_expr_inner<'hir>(
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     match expression {
         ast::Expr::Literal(literal) => lower_literal(literal, arena, symbols, source_map),
+        ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
+        ast::Expr::SelfValue(self_value) => {
+            lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
+        }
+        ast::Expr::SelfType(self_type) => {
+            lower_root_path_expr(self_type.syntax(), PathRoot::SelfType, arena, source_map)
+        }
+        ast::Expr::ImplicitMember(member) => {
+            lower_implicit_member_expr(member, arena, symbols, source_map)
+        }
         ast::Expr::Unit(unit) => {
             let (hir_id, span) = source_map.add_node_with_span(unit.syntax(), SpanCtxt::Root)?;
             Ok(arena.alloc_expr(Expr {
@@ -116,6 +126,78 @@ fn lower_expr_inner<'hir>(
     }
 }
 
+fn lower_path_expr<'hir>(
+    path: &ast::PathExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    if path.generic_args().is_some() {
+        return Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()));
+    }
+    let Some(name) = path.name() else {
+        return lower_error_expr(path.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(path.syntax(), SpanCtxt::Root)?;
+    let (path_hir_id, path_span) = source_map.add_node_with_span(path.syntax(), SpanCtxt::Root)?;
+    let (segment_hir_id, _) = source_map.add_node_with_span(name.syntax(), SpanCtxt::Root)?;
+    let segment = PathSegment {
+        hir_id: segment_hir_id,
+        name: lower_name_ref(&name, symbols, source_map)?,
+        args: None,
+    };
+    let path = Path {
+        hir_id: path_hir_id,
+        root: PathRoot::Plain,
+        segments: arena.alloc_path_segments(&[segment]),
+        span: path_span,
+    };
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Path(path),
+        span,
+    }))
+}
+
+fn lower_root_path_expr<'hir>(
+    syntax: &SyntaxNode,
+    root: PathRoot,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    let (path_hir_id, path_span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    let path = Path {
+        hir_id: path_hir_id,
+        root,
+        segments: arena.alloc_path_segments(&[]),
+        span: path_span,
+    };
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Path(path),
+        span,
+    }))
+}
+
+fn lower_implicit_member_expr<'hir>(
+    member: &ast::ImplicitMemberExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let Some(name) = member.name() else {
+        return lower_error_expr(member.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(member.syntax(), SpanCtxt::Root)?;
+    let name = lower_name_ref(&name, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::ImplicitMember(name),
+        span,
+    }))
+}
+
 fn lower_error_expr<'hir>(
     syntax: &SyntaxNode,
     arena: &'hir HirArena<'hir>,
@@ -135,7 +217,9 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
     }
 
     match expression {
-        ast::Expr::Literal(_) | ast::Expr::Unit(_) => Ok(()),
+        ast::Expr::Literal(_) | ast::Expr::SelfValue(_) | ast::Expr::SelfType(_) => Ok(()),
+        ast::Expr::Path(path) if path.generic_args().is_none() => Ok(()),
+        ast::Expr::ImplicitMember(_) | ast::Expr::Unit(_) => Ok(()),
         ast::Expr::Paren(paren) => match paren.expression() {
             Some(inner) => ensure_supported_expr(&inner),
             None => Ok(()),
@@ -1386,7 +1470,37 @@ mod tests {
     #[test]
     fn rejects_unsupported_tuple_children_before_allocating_hir_nodes() {
         let file = crate::FileId::new(73);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value) }\n");
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value.field) }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        assert_eq!(
+            source_map.finish().node_to_syntax().len(),
+            1,
+            "preflight rejects a valid unsupported child before allocating the tuple"
+        );
+    }
+
+    #[test]
+    fn rejects_generic_path_arguments_before_allocating_hir_nodes() {
+        let file = crate::FileId::new(75);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value<I32>) }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let tuple = function
@@ -1409,8 +1523,104 @@ mod tests {
         assert_eq!(
             source_map.finish().node_to_syntax().len(),
             1,
-            "preflight rejects a valid unsupported child before allocating the tuple"
+            "generic paths are rejected before allocating the tuple or its children"
         );
+    }
+
+    #[test]
+    fn lowers_plain_self_and_implicit_member_expression_paths() {
+        let file = crate::FileId::new(74);
+        let source = "fn f() { (value, self, Self, .Variant) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("path expressions lower");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), 4);
+
+        let ExprKind::Path(value_path) = elements[0].kind else {
+            panic!("plain name lowers to a path");
+        };
+        assert_eq!(value_path.root, PathRoot::Plain);
+        assert_eq!(value_path.segments.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(value_path.segments[0].name.sym)
+                .expect("path name resolves")
+                .as_ref(),
+            "value"
+        );
+        assert_eq!(value_path.segments[0].args, None);
+
+        let ExprKind::Path(self_path) = elements[1].kind else {
+            panic!("self lowers to a path");
+        };
+        assert_eq!(self_path.root, PathRoot::SelfValue);
+        assert!(self_path.segments.is_empty());
+
+        let ExprKind::Path(self_type_path) = elements[2].kind else {
+            panic!("Self lowers to a path");
+        };
+        assert_eq!(self_type_path.root, PathRoot::SelfType);
+        assert!(self_type_path.segments.is_empty());
+
+        let ExprKind::ImplicitMember(variant) = elements[3].kind else {
+            panic!("implicit member lowers to its dedicated expression");
+        };
+        assert_eq!(
+            symbols
+                .resolve(variant.sym)
+                .expect("implicit member name resolves")
+                .as_ref(),
+            "Variant"
+        );
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                elements[0].hir_id.local_id.raw(),
+                value_path.hir_id.local_id.raw(),
+                value_path.segments[0].hir_id.local_id.raw(),
+                elements[1].hir_id.local_id.raw(),
+                self_path.hir_id.local_id.raw(),
+                elements[2].hir_id.local_id.raw(),
+                self_type_path.hir_id.local_id.raw(),
+                elements[3].hir_id.local_id.raw(),
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+
+        let map = source_map.finish();
+        let path_span = map
+            .syntax_for_node(value_path.hir_id)
+            .expect("path has a source mapping")
+            .resolve(file, &parsed.root)
+            .expect("path syntax resolves")
+            .text_range();
+        let segment_span = map
+            .syntax_for_node(value_path.segments[0].hir_id)
+            .expect("segment has a source mapping")
+            .resolve(file, &parsed.root)
+            .expect("segment syntax resolves")
+            .text_range();
+        assert_eq!(path_span, elements[0].span.range);
+        assert_eq!(segment_span, value_path.segments[0].name.span.range);
+        assert_eq!(map.node_to_syntax().len(), 10);
     }
 
     #[test]
