@@ -85,10 +85,9 @@ pub fn lower_literal_pat<'hir>(
     Ok(arena.alloc_pat(Pat { hir_id, kind, span }))
 }
 
-/// Lower a range pattern with literal endpoints.
+/// Lower a range pattern with literal or constant-path endpoints.
 ///
-/// Constant-path endpoints are rejected explicitly until path lowering is
-/// available. Invalid endpoint syntax becomes `PatKind::Err`.
+/// Invalid endpoint syntax becomes `PatKind::Err`.
 pub fn lower_range_pat<'hir>(
     range: &ast::RangePat,
     arena: &'hir HirArena<'hir>,
@@ -101,55 +100,51 @@ pub fn lower_range_pat<'hir>(
 
     let start_syntax = range.start();
     let end_syntax = range.end();
-    let has_invalid_raw_path = [start_syntax.as_ref(), end_syntax.as_ref()]
+    let has_invalid_path = [start_syntax.as_ref(), end_syntax.as_ref()]
         .into_iter()
         .flatten()
         .any(|endpoint| match endpoint {
-            ast::RangePatEndpoint::ConstantPath(path) => {
-                const_path_has_invalid_raw_identifier(path.clone())
-            }
+            ast::RangePatEndpoint::ConstantPath(path) => const_path_is_invalid(path.clone()),
             ast::RangePatEndpoint::Literal(_) => false,
         });
-    if has_invalid_raw_path {
+    if has_invalid_path {
         return lower_error_pattern(range.syntax(), arena, source_map);
     }
-    if start_syntax
-        .as_ref()
-        .is_some_and(|endpoint| matches!(endpoint, ast::RangePatEndpoint::ConstantPath(_)))
-        || end_syntax
-            .as_ref()
-            .is_some_and(|endpoint| matches!(endpoint, ast::RangePatEndpoint::ConstantPath(_)))
-    {
-        return Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::CONST_PATH));
-    }
-
-    let start = start_syntax
-        .map(|endpoint| lower_range_endpoint(endpoint, arena, symbols))
-        .transpose()?;
-    let end = end_syntax
-        .map(|endpoint| lower_range_endpoint(endpoint, arena, symbols))
-        .transpose()?;
     let inclusive = range.syntax().children_with_tokens().any(|element| {
         matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::DOT2EQ)
     });
-    let invalid_shape = if inclusive {
-        end.is_none()
-    } else {
-        start.is_none()
-    };
-    let invalid_endpoint = start.is_some_and(|endpoint| endpoint.is_none())
-        || end.is_some_and(|endpoint| endpoint.is_none());
+    let has_start = start_syntax.is_some();
+    let has_end = end_syntax.is_some();
+    let start = start_syntax
+        .map(|endpoint| prepare_range_endpoint(endpoint, arena, symbols))
+        .transpose()?
+        .flatten();
+    let end = end_syntax
+        .map(|endpoint| prepare_range_endpoint(endpoint, arena, symbols))
+        .transpose()?
+        .flatten();
+    let invalid_shape = if inclusive { !has_end } else { !has_start };
+    let invalid_endpoint = (has_start && start.is_none()) || (has_end && end.is_none());
+    if invalid_shape || invalid_endpoint {
+        return lower_error_pattern(range.syntax(), arena, source_map);
+    }
+
     let (hir_id, span) = source_map.add_node_with_span(range.syntax(), SpanCtxt::Root)?;
-    let kind = if invalid_shape || invalid_endpoint {
-        PatKind::Err
-    } else {
-        PatKind::Range {
-            start: start.flatten(),
-            end: end.flatten(),
+    let start = start
+        .map(|endpoint| lower_prepared_range_endpoint(endpoint, arena, symbols, source_map))
+        .transpose()?;
+    let end = end
+        .map(|endpoint| lower_prepared_range_endpoint(endpoint, arena, symbols, source_map))
+        .transpose()?;
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::Range {
+            start,
+            end,
             inclusive,
-        }
-    };
-    Ok(arena.alloc_pat(Pat { hir_id, kind, span }))
+        },
+        span,
+    }))
 }
 
 /// Lower the currently supported simple and recursive pattern forms.
@@ -186,9 +181,7 @@ pub fn lower_pattern<'hir>(
         }
         ast::Pattern::At(at) => lower_at_pattern(at, arena, symbols, source_map),
         ast::Pattern::Constructor(constructor)
-            if constructor
-                .path()
-                .is_some_and(const_path_has_invalid_raw_identifier) =>
+            if constructor.path().is_some_and(const_path_is_invalid) =>
         {
             lower_error_pattern(constructor.syntax(), arena, source_map)
         }
@@ -405,24 +398,7 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
 
     match pattern {
         ast::Pattern::Wildcard(_) | ast::Pattern::Literal(_) | ast::Pattern::Binding(_) => Ok(()),
-        ast::Pattern::Range(range) => {
-            let endpoints = [range.start(), range.end()];
-            let has_invalid_raw_path = endpoints.iter().flatten().any(|endpoint| match endpoint {
-                ast::RangePatEndpoint::ConstantPath(path) => {
-                    const_path_has_invalid_raw_identifier(path.clone())
-                }
-                ast::RangePatEndpoint::Literal(_) => false,
-            });
-            if has_invalid_raw_path {
-                return Ok(());
-            }
-            for endpoint in endpoints.into_iter().flatten() {
-                if let ast::RangePatEndpoint::ConstantPath(path) = endpoint {
-                    return Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()));
-                }
-            }
-            Ok(())
-        }
+        ast::Pattern::Range(_) => Ok(()),
         ast::Pattern::Parenthesized(paren) => match paren.pattern() {
             Some(inner) => ensure_supported_pattern(&inner),
             None => Ok(()),
@@ -463,9 +439,7 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
             Ok(())
         }
         ast::Pattern::Constructor(constructor)
-            if constructor
-                .path()
-                .is_some_and(const_path_has_invalid_raw_identifier) =>
+            if constructor.path().is_some_and(const_path_is_invalid) =>
         {
             Ok(())
         }
@@ -680,11 +654,20 @@ fn const_path_has_invalid_raw_identifier(path: ast::ConstPath) -> bool {
     })
 }
 
-fn lower_range_endpoint<'hir>(
+fn const_path_is_invalid(path: ast::ConstPath) -> bool {
+    path.segments().next().is_none() || const_path_has_invalid_raw_identifier(path)
+}
+
+enum PreparedRangeEndpoint<'hir> {
+    Literal(Lit<'hir>),
+    Path(ast::ConstPath),
+}
+
+fn prepare_range_endpoint<'hir>(
     endpoint: ast::RangePatEndpoint,
     arena: &'hir HirArena<'hir>,
     symbols: &Interner,
-) -> Result<Option<PatRangeEnd<'hir>>, HirLoweringError> {
+) -> Result<Option<PreparedRangeEndpoint<'hir>>, HirLoweringError> {
     match endpoint {
         ast::RangePatEndpoint::Literal(literal) => {
             if contains_error_node(literal.syntax()) {
@@ -697,11 +680,23 @@ fn lower_range_endpoint<'hir>(
                 .map(|token| decode_literal(token, arena, symbols, false, negative))
                 .transpose()?
                 .flatten();
-            Ok(decoded.map(PatRangeEnd::Lit))
+            Ok(decoded.map(PreparedRangeEndpoint::Literal))
         }
-        ast::RangePatEndpoint::ConstantPath(path) => {
-            Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()))
-        }
+        ast::RangePatEndpoint::ConstantPath(path) => Ok(Some(PreparedRangeEndpoint::Path(path))),
+    }
+}
+
+fn lower_prepared_range_endpoint<'hir>(
+    endpoint: PreparedRangeEndpoint<'hir>,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<PatRangeEnd<'hir>, HirLoweringError> {
+    match endpoint {
+        PreparedRangeEndpoint::Literal(literal) => Ok(PatRangeEnd::Lit(literal)),
+        PreparedRangeEndpoint::Path(path) => Ok(PatRangeEnd::Path(lower_const_path(
+            &path, arena, symbols, source_map,
+        )?)),
     }
 }
 
@@ -1086,11 +1081,11 @@ mod tests {
     }
 
     #[test]
-    fn lowers_open_inclusive_and_literal_range_patterns() {
+    fn lowers_open_inclusive_literal_and_constant_path_range_patterns() {
         let file = crate::FileId::new(66);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
-            "fn f() { match value { 1..=4 => (), ..=8 => (), 9.. => (), 'a'..'z' => (), b'A'..=b'Z' => (), 1..2 => (), -2..=-1 => (), 1..=2.5 => (), Low..=High => () } }\n",
+            "fn f() { match value { 1..=4 => (), ..=8 => (), 9.. => (), 'a'..'z' => (), b'A'..=b'Z' => (), 1..2 => (), -2..=-1 => (), 1.5..=pkg.Status.High => (), pkg.Status.Low..=pkg.Status.High => () } }\n",
         );
         let function = function_node(&parsed.root);
         let ranges = function
@@ -1113,7 +1108,7 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        let patterns = ranges[..8]
+        let patterns = ranges
             .iter()
             .map(|range| ast::Pattern::cast(range.syntax().clone()).expect("range pattern variant"))
             .collect::<Vec<_>>();
@@ -1209,26 +1204,75 @@ mod tests {
                 .iter()
                 .map(|pattern| pattern.hir_id.local_id.raw())
                 .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5, 6, 7, 8]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
         for (pattern, syntax) in lowered.iter().zip(&patterns) {
             assert_eq!(pattern.span.range, syntax.syntax().text_range());
             assert_eq!(pattern.span.file, file);
             assert_eq!(pattern.span.ctxt, SpanCtxt::Root);
         }
-        assert_eq!(
-            lower_pattern(
-                &ast::Pattern::cast(ranges[8].syntax().clone()).expect("const range pattern"),
-                &arena,
-                &symbols,
-                &mut source_map,
-            )
-            .unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::CONST_PATH)
-        );
+        let (start_path, end_path) = match lowered[8].kind {
+            PatKind::Range {
+                start: Some(PatRangeEnd::Path(start_path)),
+                end: Some(PatRangeEnd::Path(end_path)),
+                inclusive: true,
+            } => (start_path, end_path),
+            _ => panic!("constant-path range lowers to two HIR paths"),
+        };
+        let path_names = |path: Path<'_>| {
+            path.segments
+                .iter()
+                .map(|segment| {
+                    symbols
+                        .resolve(segment.name.sym)
+                        .expect("path segment symbol resolves")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(path_names(start_path).join("."), "pkg.Status.Low");
+        assert_eq!(path_names(end_path).join("."), "pkg.Status.High");
+        assert_eq!(start_path.root, PathRoot::Plain);
+        assert_eq!(end_path.root, PathRoot::Plain);
+        assert_eq!(start_path.hir_id.local_id.raw(), 10);
+        assert_eq!(start_path.segments[0].hir_id.local_id.raw(), 11);
+        assert_eq!(end_path.hir_id.local_id.raw(), 14);
+        assert_eq!(end_path.segments[0].hir_id.local_id.raw(), 15);
+
+        let ast::RangePatEndpoint::ConstantPath(start_syntax) =
+            ranges[8].start().expect("start path syntax")
+        else {
+            panic!("range starts with a constant path");
+        };
+        let ast::RangePatEndpoint::ConstantPath(end_syntax) =
+            ranges[8].end().expect("end path syntax")
+        else {
+            panic!("range ends with a constant path");
+        };
 
         let map = source_map.finish();
-        assert_eq!(map.node_to_syntax().len(), 9);
+        assert_eq!(map.node_to_syntax().len(), 18);
+        assert_eq!(
+            map.syntax_for_node(start_path.hir_id)
+                .expect("start path source mapping")
+                .resolve(file, &parsed.root)
+                .expect("start path syntax resolves")
+                .text_range(),
+            start_syntax.syntax().text_range()
+        );
+        assert_eq!(
+            map.syntax_for_node(end_path.segments[0].hir_id)
+                .expect("end path segment source mapping")
+                .resolve(file, &parsed.root)
+                .expect("end path segment syntax resolves")
+                .text_range(),
+            end_syntax
+                .segments()
+                .next()
+                .expect("first end path segment")
+                .syntax()
+                .text_range()
+        );
     }
 
     #[test]
