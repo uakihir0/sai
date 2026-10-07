@@ -1486,6 +1486,8 @@ Notes on the shape:
 
 Call-argument recovery preserves an enclosing call when an individual expression is missing. The parser may omit an empty positional `Arg` node but retain a zero-width `ERROR`; lowering stores an `Err` expression at that argument's position so following valid arguments remain ordered and available. Error wrappers containing only invalid argument attributes do not become arguments.
 
+Array expressions lower to `ExprKind::Array` with elements in source order and the array's HIR ID allocated before its children. Direct `ERROR` children are retained as `ExprKind::Err` elements when enclosing recovery preserves the array, while attribute-only error wrappers are skipped. Valid unsupported descendants are rejected before the array or its elements receive HIR IDs.
+
 ### 2.8.7 Item tree
 
 The query `def_collector(FileId) -> ItemTree` produces a summary of a file's item-like nodes without bodies:
