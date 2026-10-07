@@ -12,7 +12,7 @@ pub mod patterns;
 pub mod source_map;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -569,6 +569,99 @@ impl DefPathInterner {
             disambiguator,
         });
         self.intern(path)
+    }
+
+    /// Intern a type or const generic parameter below its declaring definition.
+    ///
+    /// The disambiguator is the ordinal among siblings with the same parameter
+    /// kind and symbol, in source order.
+    pub fn intern_generic_param(
+        &self,
+        parent: LocalDefId,
+        name: Symbol,
+        is_const: bool,
+        disambiguator: u32,
+    ) -> Result<LocalDefId, DefPathInternerError> {
+        self.intern_generic_params(parent, &[(name, is_const, disambiguator)])?
+            .into_iter()
+            .next()
+            .ok_or(DefPathInternerError::ParentDefinitionNotFound)
+    }
+
+    /// Intern a batch of type and const generic parameters below one parent.
+    ///
+    /// All symbol sessions and definition-path capacity are validated before
+    /// any path is added, so a failed batch leaves the interner unchanged.
+    pub fn intern_generic_params(
+        &self,
+        parent: LocalDefId,
+        parameters: &[(Symbol, bool, u32)],
+    ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        if parameters
+            .iter()
+            .any(|(name, _, _)| !name.is_error() && name.session_id() != self.symbol_interner)
+        {
+            return Err(DefPathInternerError::InternerSessionMismatch);
+        }
+
+        let parent_path = self
+            .resolve(parent)?
+            .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+        let paths = parameters
+            .iter()
+            .map(|(name, is_const, disambiguator)| {
+                let mut path = parent_path.clone();
+                path.data.push(DisambiguatedDefPathData {
+                    data: if *is_const {
+                        DefPathData::ConstParam(*name)
+                    } else {
+                        DefPathData::TypeParam(*name)
+                    },
+                    disambiguator: *disambiguator,
+                });
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|_| DefPathInternerError::LockPoisoned)?;
+        let mut paths_to_add = HashSet::new();
+        for path in &paths {
+            if !storage.by_path.contains_key(path) {
+                paths_to_add.insert(path.clone());
+            }
+        }
+        let final_len = storage
+            .paths
+            .len()
+            .checked_add(paths_to_add.len())
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+        let maximum_len = usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX);
+        if final_len > maximum_len {
+            return Err(DefPathInternerError::TooManyDefinitions);
+        }
+
+        let mut ids = Vec::with_capacity(paths.len());
+        for path in paths {
+            let id = if let Some(id) = storage.by_path.get(&path) {
+                *id
+            } else {
+                let index = storage.paths.push(path.clone()).map_err(
+                    |IndexVecError::TooManyElements| DefPathInternerError::TooManyDefinitions,
+                )?;
+                let id = LocalDefId {
+                    package: self.package,
+                    index,
+                    interner: self.id,
+                };
+                storage.by_path.insert(path, id);
+                id
+            };
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     pub fn resolve(&self, id: LocalDefId) -> Result<Option<DefPath>, DefPathInternerError> {

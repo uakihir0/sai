@@ -7334,6 +7334,9 @@ impl Parser<'_, '_> {
             let position = self.position;
             if !self.at_any(TYPE_START_KINDS) {
                 self.expect_any(TYPE_START_KINDS)?;
+                if self.eat(SyntaxKind::COMMA) {
+                    continue;
+                }
                 self.recover_one()?;
                 if self.position == position {
                     break;

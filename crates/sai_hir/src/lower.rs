@@ -10,9 +10,11 @@ use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use crate::types::{
-    ConstArg as HirConstArg, EffectRef as HirEffectRef, GenericArg as HirGenericArg,
-    GenericArgs as HirGenericArgs, LangItem, Name, Path, PathRoot, PathSegment, Provenance,
-    Ty as HirTy, TyKind as HirTyKind,
+    Bound as HirBound, BoundKind as HirBoundKind, ConstArg as HirConstArg,
+    EffectRef as HirEffectRef, FnTraitKind, GenericArg as HirGenericArg,
+    GenericArgs as HirGenericArgs, GenericParam as HirGenericParam,
+    GenericParamKind as HirGenericParamKind, Generics as HirGenerics, LangItem, Name, Path,
+    PathRoot, PathSegment, Provenance, Ty as HirTy, TyKind as HirTyKind, WherePred as HirWherePred,
 };
 use crate::{
     BindingId, DefPathData, DefPathInternerError, DesugaringKind, LocalDefId, Mutability, Safety,
@@ -34,6 +36,7 @@ pub enum HirLoweringError {
     SourceMap(HirSourceMapError),
     Interner(InternError),
     DefPath(DefPathInternerError),
+    DefPathInternerRequired,
     UnsupportedSyntax(SyntaxKind),
 }
 
@@ -43,20 +46,65 @@ pub enum HirLoweringError {
 /// with a body, or any function whose contracts or body contain closures or
 /// async blocks, requires the same definition-path interner that interned the
 /// owner. Function bodies and contract expressions share the owner's HIR and
-/// binding-ID spaces. Async functions with bodies use the Stage 5 synthetic
-/// async-block wrapper.
+/// binding-ID spaces. This compatibility entry point preserves its historical
+/// behavior and does not lower generic bounds or `where` predicates; use
+/// `lower_function_with_generics` when the owning item needs generic HIR.
 pub fn lower_function<'hir>(
     declaration: &ast::FnDecl,
     arena: &'hir HirArena<'hir>,
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(FnSig<'hir>, Option<&'hir Body<'hir>>), HirLoweringError> {
+    let (signature, _, body) =
+        lower_function_inner(declaration, arena, symbols, source_map, false)?;
+    Ok((signature, body))
+}
+
+/// Lower a function declaration's signature, generics, and body in one owner.
+///
+/// Generic parameter bounds are lowered before the signature, `where`
+/// predicates after the return type, and the remaining clauses in written
+/// order, so HIR IDs follow source order. Async functions with bodies use the
+/// Stage 5 synthetic async-block wrapper.
+pub fn lower_function_with_generics<'hir>(
+    declaration: &ast::FnDecl,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<
+    (
+        FnSig<'hir>,
+        &'hir HirGenerics<'hir>,
+        Option<&'hir Body<'hir>>,
+    ),
+    HirLoweringError,
+> {
+    lower_function_inner(declaration, arena, symbols, source_map, true)
+}
+
+fn lower_function_inner<'hir>(
+    declaration: &ast::FnDecl,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+    lower_generics: bool,
+) -> Result<
+    (
+        FnSig<'hir>,
+        &'hir HirGenerics<'hir>,
+        Option<&'hir Body<'hir>>,
+    ),
+    HirLoweringError,
+> {
     if source_map.pointer_for(declaration.syntax())?
         != source_map.pointer_for(source_map.owner_syntax())?
     {
         return Err(HirLoweringError::UnsupportedSyntax(
             declaration.syntax().kind(),
         ));
+    }
+    if lower_generics {
+        ensure_supported_generics(declaration)?;
     }
     let params = declaration
         .params()
@@ -101,6 +149,12 @@ pub fn lower_function<'hir>(
         ensure_supported_block(body)?;
     }
 
+    let pending_generic_params = if lower_generics {
+        prepare_generic_params(declaration, symbols, source_map)?
+    } else {
+        Vec::new()
+    };
+
     // Assign closure and async-block identities across the complete owner
     // before lowering any child. This also makes contracts and body expressions
     // agree on the same owner-wide preorder.
@@ -113,7 +167,11 @@ pub fn lower_function<'hir>(
         declaration.syntax(),
         async_fn_body_syntax.as_ref(),
         source_map,
+        true,
     )?;
+
+    let lowered_generic_params =
+        lower_generic_params(pending_generic_params, arena, symbols, source_map)?;
 
     let mut lowered_params = Vec::with_capacity(params.len());
     let mut pending_body_params = Vec::with_capacity(params.len());
@@ -131,16 +189,53 @@ pub fn lower_function<'hir>(
         None => None,
     };
 
-    let borrows = declaration
-        .borrows_clause()
-        .filter(borrows_clause_is_well_formed)
-        .map(|clause| lower_provenances(&clause, arena, symbols, source_map))
-        .transpose()?;
-    let effects = declaration
-        .effects_clause()
-        .map(|clause| lower_function_effects(&clause, arena, symbols, source_map))
-        .transpose()?;
-    let effects = effects.flatten();
+    let mut lowered_where_preds = Vec::new();
+    let mut borrows = None;
+    let mut effects = None;
+    let mut borrows_seen = false;
+    let mut effects_seen = false;
+    let mut lowered_contracts = Vec::with_capacity(contracts.len());
+    let mut requires = Vec::new();
+    let mut ensures = Vec::new();
+    for child in declaration.syntax().children() {
+        if lower_generics && let Some(clause) = ast::WhereClause::cast(child.clone()) {
+            lowered_where_preds.extend(lower_where_clause(&clause, arena, symbols, source_map)?);
+        } else if let Some(clause) = ast::BorrowsClause::cast(child.clone()) {
+            if !borrows_seen {
+                borrows_seen = true;
+                if borrows_clause_is_well_formed(&clause) {
+                    borrows = Some(lower_provenances(&clause, arena, symbols, source_map)?);
+                }
+            }
+        } else if let Some(clause) = ast::EffectsClause::cast(child.clone()) {
+            if !effects_seen {
+                effects_seen = true;
+                effects = lower_function_effects(&clause, arena, symbols, source_map)?;
+            }
+        } else if let Some(clause) = ast::RequiresClause::cast(child.clone()) {
+            let (contract, expression_hir_id) = lower_function_contract(
+                FunctionContractSyntax::Requires(clause),
+                arena,
+                symbols,
+                source_map,
+            )?;
+            requires.push(expression_hir_id);
+            lowered_contracts.push(contract);
+        } else if let Some(clause) = ast::EnsuresClause::cast(child) {
+            let (contract, expression_hir_id) = lower_function_contract(
+                FunctionContractSyntax::Ensures(clause),
+                arena,
+                symbols,
+                source_map,
+            )?;
+            ensures.push(expression_hir_id);
+            lowered_contracts.push(contract);
+        }
+    }
+    let generics = arena.alloc_generics(HirGenerics {
+        params: arena.alloc_generic_params(&lowered_generic_params),
+        where_preds: arena.alloc_where_preds(&lowered_where_preds),
+    });
 
     let body_params = if has_body_owner {
         pending_body_params
@@ -150,43 +245,6 @@ pub fn lower_function<'hir>(
     } else {
         Vec::new()
     };
-
-    let mut lowered_contracts = Vec::with_capacity(contracts.len());
-    let mut requires = Vec::new();
-    let mut ensures = Vec::new();
-    for contract in contracts {
-        let (syntax, kind, expression) = match contract {
-            FunctionContractSyntax::Requires(clause) => (
-                clause.syntax().clone(),
-                ContractKind::Requires,
-                clause.expression(),
-            ),
-            FunctionContractSyntax::Ensures(clause) => (
-                clause.syntax().clone(),
-                ContractKind::Ensures,
-                clause.expression(),
-            ),
-        };
-        let (hir_id, _) = source_map.add_node_with_span(&syntax, SpanCtxt::Root)?;
-        let expression = match expression {
-            Some(expression) => {
-                lower_expr_in_prepared_owner(&expression, arena, symbols, source_map)?
-            }
-            None => {
-                let error = direct_error_child(&syntax).unwrap_or_else(|| syntax.clone());
-                lower_error_expr(&error, arena, source_map)?
-            }
-        };
-        match kind {
-            ContractKind::Requires => requires.push(expression.hir_id),
-            ContractKind::Ensures => ensures.push(expression.hir_id),
-        }
-        lowered_contracts.push(Contract {
-            hir_id,
-            kind,
-            expr: expression,
-        });
-    }
 
     let body_value = match body {
         Some(body) if let Some(async_fn_def_id) = async_fn_def_id => {
@@ -234,7 +292,7 @@ pub fn lower_function<'hir>(
     };
 
     let Some(body_value) = body_value else {
-        return Ok((signature, None));
+        return Ok((signature, generics, None));
     };
     let body = arena.alloc_body(Body {
         owner: source_map.owner(),
@@ -243,7 +301,7 @@ pub fn lower_function<'hir>(
         contracts: arena.alloc_contracts(&lowered_contracts),
         invariant_preds: arena.alloc_expr_refs(&[]),
     });
-    Ok((signature, Some(body)))
+    Ok((signature, generics, Some(body)))
 }
 
 fn lower_async_function_body<'hir>(
@@ -450,6 +508,344 @@ fn lower_provenances<'hir>(
         });
     }
     Ok(arena.alloc_provenances(&lowered))
+}
+
+fn lower_item_name(
+    name: Option<ast::Name>,
+    fallback_syntax: &SyntaxNode,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Name, HirLoweringError> {
+    let Some(name) = name else {
+        return lower_name_spelling(fallback_syntax, None, symbols, source_map);
+    };
+    let written = name.token().map(|token| token.text().to_owned());
+    lower_name_spelling(name.syntax(), written.as_deref(), symbols, source_map)
+}
+
+struct PendingGenericParam {
+    param: ast::GenericParam,
+    name: Name,
+    def_id: LocalDefId,
+}
+
+fn prepare_generic_params(
+    declaration: &ast::FnDecl,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Vec<PendingGenericParam>, HirLoweringError> {
+    let params = declaration
+        .generic_params()
+        .map(|params| params.params().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if params.is_empty() {
+        return Ok(Vec::new());
+    }
+    let def_paths = source_map
+        .def_path_interner()
+        .ok_or(HirLoweringError::DefPathInternerRequired)?;
+
+    let mut pending = Vec::with_capacity(params.len());
+    let mut disambiguators = HashMap::<DefPathData, u32>::new();
+    for param in params {
+        let (name, is_const) = match &param {
+            ast::GenericParam::Type(param) => (
+                lower_item_name(param.name(), param.syntax(), symbols, source_map)?,
+                false,
+            ),
+            ast::GenericParam::Const(param) => (
+                lower_item_name(param.name(), param.syntax(), symbols, source_map)?,
+                true,
+            ),
+        };
+        let component = if is_const {
+            DefPathData::ConstParam(name.sym)
+        } else {
+            DefPathData::TypeParam(name.sym)
+        };
+        let disambiguator = disambiguators.entry(component).or_default();
+        let ordinal = *disambiguator;
+        *disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+        pending.push((param, name, is_const, ordinal));
+    }
+
+    let path_parameters = pending
+        .iter()
+        .map(|(_, name, is_const, disambiguator)| (name.sym, *is_const, *disambiguator))
+        .collect::<Vec<_>>();
+    let def_ids = def_paths.intern_generic_params(source_map.owner().def_id, &path_parameters)?;
+    Ok(pending
+        .into_iter()
+        .zip(def_ids)
+        .map(|((param, name, _, _), def_id)| PendingGenericParam {
+            param,
+            name,
+            def_id,
+        })
+        .collect())
+}
+
+fn lower_generic_params<'hir>(
+    pending_params: Vec<PendingGenericParam>,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Vec<HirGenericParam<'hir>>, HirLoweringError> {
+    pending_params
+        .into_iter()
+        .map(
+            |PendingGenericParam {
+                 param,
+                 name,
+                 def_id,
+             }| {
+                let kind = match param {
+                    ast::GenericParam::Type(param) => {
+                        let bounds = param
+                            .bounds()
+                            .map(|bounds| lower_bounds(&bounds, arena, symbols, source_map))
+                            .transpose()?
+                            .unwrap_or_default();
+                        HirGenericParamKind::Type {
+                            bounds: arena.alloc_bounds(&bounds),
+                        }
+                    }
+                    ast::GenericParam::Const(param) => {
+                        let ty = match param.ty() {
+                            Some(ty) => lower_type_inner(&ty, arena, symbols, source_map)?,
+                            None => lower_error_type(param.syntax(), arena, source_map)?,
+                        };
+                        HirGenericParamKind::Const { ty }
+                    }
+                };
+                Ok(HirGenericParam { def_id, name, kind })
+            },
+        )
+        .collect()
+}
+
+fn lower_where_clause<'hir>(
+    where_clause: &ast::WhereClause,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Vec<HirWherePred<'hir>>, HirLoweringError> {
+    let mut lowered = Vec::new();
+    for predicate in where_clause.predicates() {
+        let hir_id = source_map.add_node(predicate.syntax())?;
+        let ty = match predicate.ty() {
+            Some(ty) => lower_type_inner(&ty, arena, symbols, source_map)?,
+            None => lower_error_type(predicate.syntax(), arena, source_map)?,
+        };
+        let bounds = predicate
+            .bounds()
+            .map(|bound| lower_bound(bound, arena, symbols, source_map))
+            .collect::<Result<Vec<_>, _>>()?;
+        lowered.push(HirWherePred {
+            hir_id,
+            ty,
+            bounds: arena.alloc_bounds(&bounds),
+        });
+    }
+    Ok(lowered)
+}
+
+fn lower_function_contract<'hir>(
+    contract: FunctionContractSyntax,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<(Contract<'hir>, crate::HirId), HirLoweringError> {
+    let (syntax, kind, expression) = match contract {
+        FunctionContractSyntax::Requires(clause) => (
+            clause.syntax().clone(),
+            ContractKind::Requires,
+            clause.expression(),
+        ),
+        FunctionContractSyntax::Ensures(clause) => (
+            clause.syntax().clone(),
+            ContractKind::Ensures,
+            clause.expression(),
+        ),
+    };
+    let (hir_id, _) = source_map.add_node_with_span(&syntax, SpanCtxt::Root)?;
+    let expression = match expression {
+        Some(expression) => lower_expr_in_prepared_owner(&expression, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child(&syntax).unwrap_or_else(|| syntax.clone());
+            lower_error_expr(&error, arena, source_map)?
+        }
+    };
+    let expression_hir_id = expression.hir_id;
+    Ok((
+        Contract {
+            hir_id,
+            kind,
+            expr: expression,
+        },
+        expression_hir_id,
+    ))
+}
+
+fn lower_bounds<'hir>(
+    bounds: &ast::BoundList,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Vec<HirBound<'hir>>, HirLoweringError> {
+    bounds
+        .bounds()
+        .map(|bound| lower_bound(bound, arena, symbols, source_map))
+        .collect()
+}
+
+fn lower_bound<'hir>(
+    bound: ast::Bound,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<HirBound<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(bound.syntax(), SpanCtxt::Root)?;
+    let (kind, effects_clause) = match bound {
+        ast::Bound::Trait(bound) => {
+            let path = match bound.path() {
+                Some(path) if contains_error_node(path.syntax()) => lower_path(
+                    path.syntax(),
+                    Vec::new(),
+                    PathRoot::Plain,
+                    arena,
+                    symbols,
+                    source_map,
+                )?,
+                Some(path) => lower_path(
+                    path.syntax(),
+                    path.segments().collect(),
+                    PathRoot::Plain,
+                    arena,
+                    symbols,
+                    source_map,
+                )?,
+                None => lower_path(
+                    bound.syntax(),
+                    Vec::new(),
+                    PathRoot::Plain,
+                    arena,
+                    symbols,
+                    source_map,
+                )?,
+            };
+            (HirBoundKind::Trait(*path), bound.effects())
+        }
+        ast::Bound::FnSugar(bound) => {
+            let kind = lower_fn_trait_kind(&bound);
+            let params = lower_fn_type_params(bound.syntax(), arena, symbols, source_map)?;
+            let ret = match bound.ret_type() {
+                Some(ty) => Some(lower_type_inner(&ty, arena, symbols, source_map)?),
+                None if direct_token(bound.syntax(), SyntaxKind::THIN_ARROW).is_some() => {
+                    let error =
+                        direct_error_child_after_token(bound.syntax(), SyntaxKind::THIN_ARROW)
+                            .unwrap_or_else(|| bound.syntax().clone());
+                    Some(lower_error_type(&error, arena, source_map)?)
+                }
+                None => None,
+            };
+            (
+                HirBoundKind::FnSugar {
+                    kind,
+                    params: arena.alloc_tys(&params),
+                    ret,
+                },
+                bound.effects(),
+            )
+        }
+    };
+    let effects = effects_clause
+        .as_ref()
+        .map(|clause| lower_function_effects(clause, arena, symbols, source_map))
+        .transpose()?
+        .flatten();
+    Ok(HirBound {
+        hir_id,
+        kind,
+        effects,
+        span,
+    })
+}
+
+fn lower_fn_type_params<'hir>(
+    syntax: &SyntaxNode,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Vec<HirTy<'hir>>, HirLoweringError> {
+    let mut lowered = Vec::new();
+    let mut in_params = false;
+    let mut has_parameter = false;
+    for element in syntax.children_with_tokens() {
+        match element {
+            SyntaxElement::Node(node) if in_params => {
+                if node.kind() == SyntaxKind::ERROR {
+                    if !is_missing_close_delimiter_error(syntax, &node, SyntaxKind::R_PAREN)
+                        || error_is_before_comma(syntax, &node)
+                    {
+                        lowered.push(*lower_error_type(&node, arena, source_map)?);
+                        has_parameter = true;
+                    }
+                } else if let Some(ty) = ast::Type::cast(node) {
+                    lowered.push(*lower_type_inner(&ty, arena, symbols, source_map)?);
+                    has_parameter = true;
+                }
+            }
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_PAREN && !in_params => {
+                in_params = true;
+            }
+            SyntaxElement::Token(token) if in_params && token.kind() == SyntaxKind::R_PAREN => {
+                break;
+            }
+            SyntaxElement::Token(token) if in_params && token.kind() == SyntaxKind::THIN_ARROW => {
+                break;
+            }
+            SyntaxElement::Token(token) if in_params && token.kind() == SyntaxKind::COMMA => {
+                if !has_parameter {
+                    lowered.push(*lower_error_type(syntax, arena, source_map)?);
+                }
+                has_parameter = false;
+            }
+            SyntaxElement::Token(_) | SyntaxElement::Node(_) => {}
+        }
+    }
+    Ok(lowered)
+}
+
+fn error_is_before_comma(syntax: &SyntaxNode, error: &SyntaxNode) -> bool {
+    for ancestor in syntax.ancestors() {
+        match ancestor.token_at_offset(error.text_range().start()) {
+            TokenAtOffset::Single(token) if token.kind() == SyntaxKind::COMMA => return true,
+            TokenAtOffset::Between(left, right)
+                if left.kind() == SyntaxKind::COMMA || right.kind() == SyntaxKind::COMMA =>
+            {
+                return true;
+            }
+            TokenAtOffset::None | TokenAtOffset::Single(_) | TokenAtOffset::Between(_, _) => {}
+        }
+    }
+    false
+}
+
+fn lower_fn_trait_kind(bound: &ast::FnSugarBound) -> FnTraitKind {
+    let written = bound
+        .name()
+        .and_then(|name| name.syntax().first_token())
+        .map(|token| token.text().to_owned());
+    match written.as_deref() {
+        Some("Fn") => FnTraitKind::Fn,
+        Some("FnMut") => FnTraitKind::FnMut,
+        // `FnOnce` is also the deterministic recovery for a malformed
+        // function-sugar name: it promises the least callability.
+        Some("FnOnce") | None | Some(_) => FnTraitKind::FnOnce,
+    }
 }
 
 fn lower_function_effects<'hir>(
@@ -815,10 +1211,7 @@ fn lower_type_inner<'hir>(
             };
             let (hir_id, span) =
                 source_map.add_node_with_span(function.syntax(), SpanCtxt::Root)?;
-            let params = function
-                .params()
-                .map(|param| lower_type_inner(&param, arena, symbols, source_map).copied())
-                .collect::<Result<Vec<_>, _>>()?;
+            let params = lower_fn_type_params(function.syntax(), arena, symbols, source_map)?;
             let ret = function
                 .ret_type()
                 .map(|ret| lower_type_inner(&ret, arena, symbols, source_map))
@@ -870,6 +1263,22 @@ fn lower_path_type<'hir>(
         return lower_error_type(syntax, arena, source_map);
     }
     let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    let path = lower_path(syntax, path_segments, root, arena, symbols, source_map)?;
+    Ok(arena.alloc_ty(HirTy {
+        hir_id,
+        kind: HirTyKind::Path(*path),
+        span,
+    }))
+}
+
+fn lower_path<'hir>(
+    syntax: &SyntaxNode,
+    path_segments: Vec<ast::PathSegment>,
+    root: PathRoot,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Path<'hir>, HirLoweringError> {
     let (path_hir_id, path_span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
     let mut segments = Vec::new();
     for segment in path_segments {
@@ -889,16 +1298,11 @@ fn lower_path_type<'hir>(
             args,
         });
     }
-    let path = arena.alloc_path(Path {
+    Ok(arena.alloc_path(Path {
         hir_id: path_hir_id,
         root,
         segments: arena.alloc_path_segments(&segments),
         span: path_span,
-    });
-    Ok(arena.alloc_ty(HirTy {
-        hir_id,
-        kind: HirTyKind::Path(*path),
-        span,
     }))
 }
 
@@ -1118,7 +1522,7 @@ fn prepare_nested_definition_ids(
     expression_syntax: &SyntaxNode,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(), HirLoweringError> {
-    prepare_nested_definition_ids_with_async_fn_body(expression_syntax, None, source_map)?;
+    prepare_nested_definition_ids_with_async_fn_body(expression_syntax, None, source_map, false)?;
     Ok(())
 }
 
@@ -1126,6 +1530,7 @@ fn prepare_nested_definition_ids_with_async_fn_body(
     expression_syntax: &SyntaxNode,
     async_fn_body_syntax: Option<&SyntaxNode>,
     source_map: &mut HirSourceMapBuilder<'_>,
+    require_interner: bool,
 ) -> Result<Option<LocalDefId>, HirLoweringError> {
     let owner_pointer = source_map.pointer_for(source_map.owner_syntax())?;
     let async_fn_body_pointer = async_fn_body_syntax
@@ -1165,9 +1570,13 @@ fn prepare_nested_definition_ids_with_async_fn_body(
         return Ok(None);
     };
     let Some(def_paths) = source_map.def_path_interner() else {
-        return Err(HirLoweringError::UnsupportedSyntax(
-            first_owned_definition_kind.unwrap_or(SyntaxKind::FN_DECL),
-        ));
+        return Err(if require_interner {
+            HirLoweringError::DefPathInternerRequired
+        } else {
+            HirLoweringError::UnsupportedSyntax(
+                first_owned_definition_kind.unwrap_or(SyntaxKind::FN_DECL),
+            )
+        });
     };
     let async_fn_def_id = async_fn_body_pointer
         .as_ref()
@@ -4038,6 +4447,61 @@ fn ensure_supported_type(ty: &ast::Type) -> Result<(), HirLoweringError> {
             }
             if let Some(ret) = function.ret_type() {
                 ensure_supported_type(&ret)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_generics(declaration: &ast::FnDecl) -> Result<(), HirLoweringError> {
+    if let Some(params) = declaration.generic_params() {
+        for param in params.params() {
+            match param {
+                ast::GenericParam::Type(param) => {
+                    if let Some(bounds) = param.bounds() {
+                        for bound in bounds.bounds() {
+                            ensure_supported_bound(bound)?;
+                        }
+                    }
+                }
+                ast::GenericParam::Const(param) => {
+                    if let Some(ty) = param.ty() {
+                        ensure_supported_type(&ty)?;
+                    }
+                }
+            }
+        }
+    }
+    for where_clause in declaration
+        .syntax()
+        .children()
+        .filter_map(ast::WhereClause::cast)
+    {
+        for predicate in where_clause.predicates() {
+            if let Some(ty) = predicate.ty() {
+                ensure_supported_type(&ty)?;
+            }
+            for bound in predicate.bounds() {
+                ensure_supported_bound(bound)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_bound(bound: ast::Bound) -> Result<(), HirLoweringError> {
+    match bound {
+        ast::Bound::Trait(bound) => {
+            if let Some(path) = bound.path() {
+                ensure_supported_type(&ast::Type::PathType(path))?;
+            }
+        }
+        ast::Bound::FnSugar(bound) => {
+            for ty in bound.params() {
+                ensure_supported_type(&ty)?;
+            }
+            if let Some(ty) = bound.ret_type() {
+                ensure_supported_type(&ty)?;
             }
         }
     }
@@ -12923,6 +13387,558 @@ mod tests {
     }
 
     #[test]
+    fn lowers_function_generic_parameters_bounds_and_where_predicates() {
+        let file = crate::FileId::new(219);
+        let source = concat!(
+            "fn inspect<U: Clone + Fn(I32) -> I32 + Send, const N: U32, U>(value: U) -> Bool\n",
+            "where U: Clone + (FnMut() -> Bool effects { io }) + Send, ",
+            "I32: (Copy effects {}), Bool: Fn()\n{}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (signature, generics, _) =
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .expect("function generics, signature, and body lower");
+        assert_eq!(generics.params.len(), 3);
+        assert_eq!(generics.where_preds.len(), 3);
+        let return_type = signature.ret.expect("written return type");
+        assert!(
+            signature.params[0].hir_id.local_id.raw() < return_type.hir_id.local_id.raw()
+                && return_type.hir_id.local_id.raw()
+                    < generics.where_preds[0].hir_id.local_id.raw(),
+            "parameter, return, then where nodes follow source order"
+        );
+
+        let first = generics.params[0];
+        assert_eq!(symbols.resolve(first.name.sym).unwrap().as_ref(), "U");
+        let HirGenericParamKind::Type { bounds } = first.kind else {
+            panic!("the first parameter is a type parameter");
+        };
+        assert!(
+            bounds[0].hir_id.local_id.raw() < signature.params[0].hir_id.local_id.raw(),
+            "generic bounds precede function signature nodes"
+        );
+        assert_eq!(bounds.len(), 3);
+        assert!(matches!(bounds[0].kind, HirBoundKind::Trait(_)));
+        let HirBoundKind::FnSugar {
+            kind: FnTraitKind::Fn,
+            params,
+            ret: Some(ret),
+        } = bounds[1].kind
+        else {
+            panic!("the second bound is an Fn bound with a return type");
+        };
+        assert_eq!(params.len(), 1);
+        assert!(bounds[1].effects.is_none());
+        let HirTyKind::Path(param_path) = params[0].kind else {
+            panic!("Fn parameter lowers to a path type");
+        };
+        assert_eq!(
+            symbols
+                .resolve(param_path.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "I32"
+        );
+        let HirTyKind::Path(ret_path) = ret.kind else {
+            panic!("Fn return lowers to a path type");
+        };
+        assert_eq!(
+            symbols
+                .resolve(ret_path.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "I32"
+        );
+        assert!(matches!(bounds[2].kind, HirBoundKind::Trait(_)));
+
+        let second = generics.params[1];
+        assert_eq!(symbols.resolve(second.name.sym).unwrap().as_ref(), "N");
+        let HirGenericParamKind::Const { ty } = second.kind else {
+            panic!("the second parameter is a const parameter");
+        };
+        assert!(matches!(ty.kind, HirTyKind::Path(_)));
+        let third = generics.params[2];
+        assert!(matches!(
+            third.kind,
+            HirGenericParamKind::Type { bounds } if bounds.is_empty()
+        ));
+
+        let first_predicate = generics.where_preds[0];
+        let HirTyKind::Path(subject_path) = first_predicate.ty.kind else {
+            panic!("the first where subject is a path type");
+        };
+        assert_eq!(
+            symbols
+                .resolve(subject_path.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "U"
+        );
+        assert_eq!(first_predicate.bounds.len(), 3);
+        assert!(matches!(
+            first_predicate.bounds[0].kind,
+            HirBoundKind::Trait(_)
+        ));
+        let HirBoundKind::FnSugar {
+            kind: FnTraitKind::FnMut,
+            params,
+            ret: Some(ret),
+        } = first_predicate.bounds[1].kind
+        else {
+            panic!("the middle where bound is FnMut");
+        };
+        assert!(params.is_empty());
+        assert!(matches!(ret.kind, HirTyKind::Path(_)));
+        let effects = first_predicate.bounds[1].effects.expect("FnMut effect cap");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(effects[0].segments[0].sym)
+                .unwrap()
+                .as_ref(),
+            "io"
+        );
+        assert!(matches!(
+            first_predicate.bounds[2].kind,
+            HirBoundKind::Trait(_)
+        ));
+
+        let empty_cap = generics.where_preds[1].bounds[0]
+            .effects
+            .expect("explicit empty cap is retained");
+        assert!(empty_cap.is_empty());
+        assert!(matches!(
+            generics.where_preds[2].bounds[0].kind,
+            HirBoundKind::FnSugar {
+                kind: FnTraitKind::Fn,
+                params,
+                ret: None,
+            } if params.is_empty()
+        ));
+
+        let first_path = paths.resolve(first.def_id).unwrap().unwrap();
+        assert!(matches!(
+            first_path.data().last().map(|component| &component.data),
+            Some(DefPathData::TypeParam(_))
+        ));
+        assert_eq!(
+            first_path.data().last().unwrap().disambiguator,
+            0,
+            "the first same-named type parameter has disambiguator zero"
+        );
+        let const_path = paths.resolve(second.def_id).unwrap().unwrap();
+        assert!(matches!(
+            const_path.data().last().map(|component| &component.data),
+            Some(DefPathData::ConstParam(_))
+        ));
+        let duplicate_path = paths.resolve(third.def_id).unwrap().unwrap();
+        assert_eq!(
+            duplicate_path.data().last().unwrap().disambiguator,
+            1,
+            "same-named parameters of the same kind remain distinct"
+        );
+        assert_ne!(first.def_id, third.def_id);
+
+        let lowered_map = source_map.finish();
+        assert_eq!(
+            lowered_map
+                .syntax_for_node(first_predicate.bounds[1].hir_id)
+                .unwrap()
+                .text_range(),
+            first_predicate.bounds[1].span.range
+        );
+        assert!(
+            lowered_map.node_to_syntax().len() > generics.params.len(),
+            "the source map includes bound and type nodes as well as the owner"
+        );
+    }
+
+    #[test]
+    fn generic_lowering_rejects_a_foreign_owner_before_allocating_hir() {
+        let file = crate::FileId::new(220);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f<T: Clone>() {}\nfn g<U: Copy>() {}\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let functions = parsed
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+            .collect::<Vec<_>>();
+        let first = functions[0].clone();
+        let second = ast::FnDecl::cast(functions[1].clone()).expect("second function");
+        let declaration = ast::FnDecl::cast(first.clone()).expect("first function");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &first)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        assert_eq!(
+            lower_function_with_generics(&second, &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::FN_DECL)
+        );
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        assert_eq!(paths.len().unwrap(), 1);
+
+        let other_packages = PackageInterner::new();
+        let other_package = other_packages
+            .intern("acme:other#1.0")
+            .expect("package interns");
+        let other_paths = DefPathInterner::new(other_package, &other_packages, &symbols)
+            .expect("other path interner");
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &first)
+                .expect("source map builder");
+        assert_eq!(
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .unwrap_err(),
+            HirLoweringError::DefPathInternerRequired
+        );
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &first)
+                .expect("source map builder")
+                .with_def_path_interner(&other_paths);
+        assert_eq!(
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .unwrap_err(),
+            HirLoweringError::DefPath(DefPathInternerError::ForeignDefinitionId)
+        );
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn malformed_generic_parameter_types_recover_as_error_types() {
+        let file = crate::FileId::new(221);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f<const N:>() {}\n");
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing const type is diagnosed"
+        );
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (_, generics, _) =
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .expect("diagnosed syntax still lowers");
+        assert_eq!(generics.params.len(), 1);
+        let HirGenericParamKind::Const { ty } = generics.params[0].kind else {
+            panic!("the malformed declaration remains a const parameter");
+        };
+        assert!(matches!(ty.kind, HirTyKind::Err));
+    }
+
+    #[test]
+    fn function_clause_hir_ids_follow_written_order_after_parser_recovery() {
+        let file = crate::FileId::new(225);
+        let source = concat!(
+            "fn f<T>(x: I32) -> Bool ",
+            "ensures result > x borrows { x } requires x > 0 ",
+            "effects { io } where T: Clone {}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ClauseOrder),
+            "the parser diagnoses the deliberately reordered clauses"
+        );
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (signature, generics, body) =
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .expect("recovered function still lowers");
+        let body = body.expect("function body exists");
+        assert_eq!(body.contracts.len(), 2);
+        assert_eq!(body.contracts[0].kind, ContractKind::Ensures);
+        assert_eq!(body.contracts[1].kind, ContractKind::Requires);
+        let effects = signature.effects.expect("the effect clause is retained");
+        let borrows = signature.borrows.expect("the borrow clause is retained");
+        assert_eq!(borrows.len(), 1);
+        assert_eq!(symbols.resolve(borrows[0].root.sym).unwrap().as_ref(), "x");
+        let ensures_id = body.contracts[0].hir_id.local_id.raw();
+        let requires_id = body.contracts[1].hir_id.local_id.raw();
+        assert!(
+            ensures_id < requires_id
+                && requires_id < effects[0].hir_id.local_id.raw()
+                && effects[0].hir_id.local_id.raw() < generics.where_preds[0].hir_id.local_id.raw(),
+            "contract, effect, and where nodes follow their written order"
+        );
+    }
+
+    #[test]
+    fn duplicate_function_borrows_and_effects_keep_the_first_clause() {
+        let file = crate::FileId::new(227);
+        let source =
+            "fn f(x: I32) borrows { x } borrows { x.field } effects { io } effects {} {}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::DuplicateClause),
+            "duplicate clauses are diagnosed"
+        );
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (signature, _) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("diagnosed duplicate clauses still lower");
+        let borrows = signature
+            .borrows
+            .expect("the first borrow clause is retained");
+        assert_eq!(borrows.len(), 1);
+        assert!(borrows[0].fields.is_empty());
+        let effects = signature
+            .effects
+            .expect("the first effects clause is retained");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(effects[0].segments[0].sym)
+                .unwrap()
+                .as_ref(),
+            "io"
+        );
+    }
+
+    #[test]
+    fn malformed_fn_bound_return_type_recovers_as_error_type() {
+        let file = crate::FileId::new(222);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f<T: Fn(, I32) ->>() {}\n");
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing return type is diagnosed"
+        );
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (_, generics, _) =
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .expect("diagnosed function still lowers");
+        let HirGenericParamKind::Type { bounds } = generics.params[0].kind else {
+            panic!("the parameter remains a type parameter");
+        };
+        let HirBoundKind::FnSugar {
+            params,
+            ret: Some(ret),
+            ..
+        } = bounds[0].kind
+        else {
+            panic!("the malformed return remains an Fn-family bound");
+        };
+        assert_eq!(params.len(), 2, "parameter recovery preserves I32");
+        assert!(matches!(params[0].kind, HirTyKind::Err));
+        assert!(matches!(params[1].kind, HirTyKind::Path(_)));
+        assert!(matches!(ret.kind, HirTyKind::Err));
+        let bound_syntax = declaration
+            .generic_params()
+            .expect("generic parameters")
+            .params()
+            .next()
+            .and_then(|param| match param {
+                ast::GenericParam::Type(param) => param.bounds(),
+                ast::GenericParam::Const(_) => None,
+            })
+            .and_then(|bounds| bounds.bounds().next())
+            .and_then(|bound| match bound {
+                ast::Bound::FnSugar(bound) => Some(bound.syntax().clone()),
+                ast::Bound::Trait(_) => None,
+            })
+            .expect("function-sugar syntax");
+        let return_error = direct_error_child_after_token(&bound_syntax, SyntaxKind::THIN_ARROW)
+            .expect("missing return type error follows the arrow");
+        let source_map = source_map.finish();
+        assert_eq!(
+            source_map
+                .syntax_for_node(ret.hir_id)
+                .expect("return error has a source map entry")
+                .text_range(),
+            return_error.text_range(),
+            "return error maps to its own missing type, not the parameter slot"
+        );
+    }
+
+    #[test]
+    fn malformed_fn_bound_parameter_keeps_its_slot_and_following_type() {
+        let file = crate::FileId::new(226);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f<T: Fn(, I32)>() {}\n");
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing parameter is diagnosed"
+        );
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (_, generics, _) =
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .expect("diagnosed function still lowers");
+        let HirGenericParamKind::Type { bounds } = generics.params[0].kind else {
+            panic!("the parameter remains a type parameter");
+        };
+        let HirBoundKind::FnSugar { params, .. } = bounds[0].kind else {
+            panic!("the bound remains an Fn-family bound");
+        };
+        assert_eq!(params.len(), 2, "both parameter entries survive recovery");
+        assert!(
+            matches!(params[0].kind, HirTyKind::Err),
+            "the malformed slot recovers as an error type"
+        );
+        let HirTyKind::Path(path) = params[1].kind else {
+            panic!("the valid type after the missing slot remains a path");
+        };
+        assert_eq!(
+            symbols
+                .resolve(path.segments[0].name.sym)
+                .expect("the path segment symbol is valid")
+                .as_ref(),
+            "I32"
+        );
+    }
+
+    #[test]
+    fn malformed_trait_path_does_not_lower_as_its_valid_prefix() {
+        let file = crate::FileId::new(223);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f<T: Clone.>() {}\n");
+        assert!(!parsed.errors.is_empty(), "the malformed path is diagnosed");
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let ast::GenericParam::Type(type_param) = declaration
+            .generic_params()
+            .expect("generic parameter list")
+            .params()
+            .next()
+            .expect("type parameter")
+        else {
+            panic!("parameter is a type parameter");
+        };
+        let ast::Bound::Trait(trait_bound) = type_param
+            .bounds()
+            .expect("type parameter bounds")
+            .bounds()
+            .next()
+            .expect("trait bound")
+        else {
+            panic!("bound is a trait bound");
+        };
+        let syntax_path = trait_bound
+            .path()
+            .expect("malformed path node remains")
+            .syntax()
+            .clone();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let (_, generics, _) =
+            lower_function_with_generics(&declaration, &arena, &symbols, &mut source_map)
+                .expect("diagnosed function still lowers");
+        let HirGenericParamKind::Type { bounds } = generics.params[0].kind else {
+            panic!("the parameter remains a type parameter");
+        };
+        let HirBoundKind::Trait(path) = bounds[0].kind else {
+            panic!("the declaration remains a trait bound");
+        };
+        assert!(
+            path.segments.is_empty(),
+            "an invalid path must not expose the valid Clone prefix"
+        );
+        let source_map = source_map.finish();
+        assert_eq!(
+            source_map
+                .syntax_for_node(path.hir_id)
+                .expect("malformed path has a source map entry")
+                .text_range(),
+            syntax_path.text_range(),
+            "the empty fallback path maps to the malformed path syntax"
+        );
+    }
+
+    #[test]
+    fn failed_generic_path_batch_does_not_leave_partial_definitions() {
+        let file = crate::FileId::new(224);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f<const : U32, T>() {}\n");
+        assert!(!parsed.errors.is_empty(), "the missing name is diagnosed");
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let path_symbols = Interner::new();
+        let lower_symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&path_symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        assert_eq!(
+            lower_function_with_generics(&declaration, &arena, &lower_symbols, &mut source_map)
+                .unwrap_err(),
+            HirLoweringError::DefPath(DefPathInternerError::InternerSessionMismatch)
+        );
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "failed generic interning keeps only the preexisting owner path"
+        );
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
     fn lowers_function_signature_parameters_and_body() {
         let file = crate::FileId::new(208);
         let (snapshot, parsed, ast_ids) = parse_file(
@@ -13006,6 +14022,39 @@ mod tests {
         assert!(body.contracts.is_empty());
         assert!(body.invariant_preds.is_empty());
         assert_eq!(source_map.finish().binding_to_syntax().len(), 3);
+    }
+
+    #[test]
+    fn compatibility_function_lowering_does_not_require_generic_def_paths() {
+        let file = crate::FileId::new(228);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f<T: Clone>(value: T) -> T where T: Copy { value }\n",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let (signature, body) = lower_function(&declaration, &arena, &symbols, &mut source_map)
+            .expect("legacy lowering accepts a generic declaration");
+        assert_eq!(signature.params.len(), 1);
+        assert!(matches!(signature.params[0].ty.kind, HirTyKind::Path(_)));
+        assert!(matches!(
+            signature.ret.map(|ty| ty.kind),
+            Some(HirTyKind::Path(_))
+        ));
+        assert!(body.is_some());
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "legacy lowering does not intern generic parameter definitions"
+        );
     }
 
     #[test]
@@ -13483,7 +14532,7 @@ mod tests {
 
         assert_eq!(
             lower_function(&declaration, &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::FN_DECL)
+            HirLoweringError::DefPathInternerRequired
         );
         assert_eq!(paths.len().unwrap(), 1);
         let map = source_map.finish();

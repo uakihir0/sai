@@ -8055,6 +8055,32 @@ let byte_non_ascii = b"€"
     }
 
     #[test]
+    fn missing_fn_sugar_parameter_preserves_following_types() {
+        let output = parse_file("fn f<T: Fn(, I32)>() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root);
+        let bound = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::FN_SUGAR_BOUND)
+            .expect("Fn-sugar bound is retained");
+
+        assert!(!output.errors.is_empty(), "the missing type is diagnosed");
+        assert!(
+            bound
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ERROR),
+            "the missing parameter slot remains in the bound"
+        );
+        assert_eq!(
+            bound
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::PATH_TYPE)
+                .count(),
+            1,
+            "the type after the missing slot remains in the bound"
+        );
+    }
+
+    #[test]
     fn source_file_recovers_redundant_pub_before_exported_function() {
         let source = "pub export fn f() {}\nfn next() {}\n";
         let output = parse_file(source);
