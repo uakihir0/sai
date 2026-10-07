@@ -3803,9 +3803,6 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
         }
         ast::Expr::Path(path) => {
             if let Some(args) = path.generic_args() {
-                if !is_direct_call_callee(path.syntax()) {
-                    return Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()));
-                }
                 ensure_supported_generic_args(&args)?;
             }
             Ok(())
@@ -9494,9 +9491,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_standalone_generic_path_arguments_before_allocating_hir_nodes() {
+    fn lowers_standalone_generic_path_arguments_in_value_position() {
         let file = crate::FileId::new(75);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value<I32>) }\n");
+        let source = "fn f() { (1, value<I32, 5>) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let tuple = function
@@ -9512,15 +9510,40 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("tuple lowers");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        let ExprKind::Path(path) = elements[1].kind else {
+            panic!("generic function item remains a path value");
+        };
+        let args = path.segments[0].args.expect("explicit generic arguments");
+        assert_eq!(args.args.len(), 2);
         assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+            args.args[0],
+            HirGenericArg::Type(ty) if matches!(ty.kind, HirTyKind::Path(_))
         ));
         assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "standalone generic paths are rejected before allocating the tuple or its children"
+            args.args[1],
+            HirGenericArg::Const(HirConstArg::Int {
+                value: Some(5),
+                negated: false,
+            })
         );
+        let map = source_map.finish();
+        assert!(map.node_to_syntax().len() > 1);
+        let source_ty = tuple
+            .syntax()
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::PATH_TYPE)
+            .expect("generic type argument syntax");
+        let source_ty_ptr =
+            SyntaxNodePtr::new(file, &source_ty).expect("generic type syntax pointer");
+        let HirGenericArg::Type(lowered_ty) = args.args[0] else {
+            panic!("first generic argument is a type");
+        };
+        assert_eq!(map.syntax_for_node(lowered_ty.hir_id), Some(&source_ty_ptr));
     }
 
     #[test]
@@ -9982,7 +10005,7 @@ mod tests {
     }
 
     #[test]
-    fn range_recovery_preserves_diagnostics_and_rejects_unsupported_endpoints() {
+    fn range_recovery_preserves_diagnostics_and_lowers_generic_endpoints() {
         let file = crate::FileId::new(81);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { left..value<I32> }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
@@ -10000,15 +10023,21 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
-        ));
-        assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "an unsupported endpoint is rejected before allocating the range"
-        );
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("range lowers");
+        let ExprKind::Range {
+            start: Some(_),
+            end: Some(end),
+            inclusive: false,
+        } = lowered.kind
+        else {
+            panic!("the range retains both endpoints");
+        };
+        let ExprKind::Path(path) = end.kind else {
+            panic!("the generic endpoint remains a path");
+        };
+        assert!(path.segments[0].args.is_some());
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(82);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { value..= }\n");
@@ -10156,7 +10185,7 @@ mod tests {
     }
 
     #[test]
-    fn postfix_recovery_and_preflight_avoid_partial_lowering() {
+    fn postfix_recovery_lowers_generic_index_expressions() {
         let file = crate::FileId::new(85);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { array[value<I32>] }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
@@ -10174,11 +10203,16 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
-        ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("index lowers");
+        let ExprKind::Index(_, index) = lowered.kind else {
+            panic!("the postfix expression remains an index");
+        };
+        let ExprKind::Path(path) = index.kind else {
+            panic!("the generic index remains a path");
+        };
+        assert!(path.segments[0].args.is_some());
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(86);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { array[] }\n");
@@ -10399,7 +10433,7 @@ mod tests {
     }
 
     #[test]
-    fn call_argument_recovery_keeps_valid_arguments_and_preflights_them() {
+    fn call_argument_recovery_lowers_generic_paths_and_keeps_valid_arguments() {
         let file = crate::FileId::new(90);
         let source = "fn f() { (call(, 1), 2) }\n";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -10645,19 +10679,22 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
-        ));
-        assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "the malformed sibling must not bypass preflight of valid arguments"
-        );
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("call recovers");
+        let ExprKind::Call { args, .. } = lowered.kind else {
+            panic!("the recovered expression remains a call");
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].expr.kind, ExprKind::Err);
+        let ExprKind::Path(path) = args[1].expr.kind else {
+            panic!("the valid generic call argument remains a path");
+        };
+        assert!(path.segments[0].args.is_some());
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
-    fn rejects_unsupported_binary_children_before_allocating_nodes() {
+    fn lowers_generic_paths_as_binary_operands() {
         let file = crate::FileId::new(79);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (left + value<I32>) }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
@@ -10675,15 +10712,16 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
-        ));
-        assert_eq!(
-            source_map.finish().node_to_syntax().len(),
-            1,
-            "preflight rejects the generic path before allocating its binary or tuple parents"
-        );
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("binary lowers");
+        let ExprKind::Binary(_, _, rhs) = lowered.kind else {
+            panic!("outer expression is binary");
+        };
+        let ExprKind::Path(path) = rhs.kind else {
+            panic!("generic operand remains a path");
+        };
+        assert!(path.segments[0].args.is_some());
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -13121,9 +13159,10 @@ mod tests {
     }
 
     #[test]
-    fn function_preflight_rejects_unsupported_body_before_allocating_parameters() {
+    fn function_preflight_rejects_unsupported_generic_field_before_allocating_parameters() {
         let file = crate::FileId::new(211);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(x: I32) { (0, target<I32>) }\n");
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f(x: I32) { (0, target.field<I32>) }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
@@ -13137,7 +13176,7 @@ mod tests {
 
         assert_eq!(
             lower_function(&declaration, &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR)
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR)
         );
         assert_eq!(
             paths.len().unwrap(),
