@@ -1,9 +1,9 @@
 use crate::Symbol;
 use crate::arena::HirArena;
 use crate::expressions::{
-    Arg, Arm as HirArm, BinOp, Block as HirBlock, Expr, ExprKind, FmtPiece, FmtSpec as HirFmtSpec,
-    Label as HirLabel, LoopSource as HirLoopSource, MatchSource as HirMatchSource, Stmt as HirStmt,
-    StmtKind, UnOp,
+    Arg, Arm as HirArm, BinOp, Block as HirBlock, CaptureBy, Closure, ClosureParam, Expr, ExprKind,
+    FmtPiece, FmtSpec as HirFmtSpec, Label as HirLabel, LoopSource as HirLoopSource,
+    MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
 };
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
@@ -13,20 +13,26 @@ use crate::types::{
     GenericArgs as HirGenericArgs, LangItem, Name, Path, PathRoot, PathSegment, Ty as HirTy,
     TyKind as HirTyKind,
 };
-use crate::{BindingId, DesugaringKind, Mutability, Safety, Span, SpanCtxt};
+use crate::{
+    BindingId, DefPathData, DefPathInternerError, DesugaringKind, LocalDefId, Mutability, Safety,
+    Span, SpanCtxt,
+};
 use sai_diagnostics::Code;
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
-    SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TokenAtOffset,
+    SyntaxElement, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TokenAtOffset,
     ast::{self, AstNode, AstToken},
 };
+use std::collections::{HashMap, HashSet};
 
 /// Error returned when lowering cannot allocate source data or encounters a
 /// syntax form whose HIR conversion has not been implemented yet.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HirLoweringError {
     SourceMap(HirSourceMapError),
     Interner(InternError),
+    DefPath(DefPathInternerError),
     UnsupportedSyntax(SyntaxKind),
 }
 
@@ -39,6 +45,12 @@ impl From<HirSourceMapError> for HirLoweringError {
 impl From<InternError> for HirLoweringError {
     fn from(error: InternError) -> Self {
         Self::Interner(error)
+    }
+}
+
+impl From<DefPathInternerError> for HirLoweringError {
+    fn from(error: DefPathInternerError) -> Self {
+        Self::DefPath(error)
     }
 }
 
@@ -107,6 +119,91 @@ fn lower_format_string_expr<'hir>(
     Ok(arena.alloc_expr(Expr {
         hir_id,
         kind: ExprKind::FormatString(arena.alloc_fmt_pieces(&pieces)),
+        span,
+    }))
+}
+
+fn lower_closure_expr<'hir>(
+    closure: &ast::ClosureExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (Some(params), Some(body)) = (closure.params(), closure.body()) else {
+        return lower_error_expr(closure.syntax(), arena, source_map);
+    };
+    let params = params.params().collect::<Vec<_>>();
+
+    let (hir_id, span) = source_map.add_node_with_span(closure.syntax(), SpanCtxt::Root)?;
+    let def_id = source_map
+        .nested_definition_for_syntax(closure.syntax())?
+        .ok_or(HirSourceMapError::NestedDefinitionIdMismatch)?;
+    let mut lowered_params = Vec::with_capacity(params.len());
+    for param in params {
+        let (param_hir_id, _) = source_map.add_node_with_span(param.syntax(), SpanCtxt::Root)?;
+        let source_name = param.name();
+        let name_token = source_name.as_ref().and_then(ast::Name::token);
+        let binding_syntax = source_name
+            .as_ref()
+            .map(|name| name.syntax().clone())
+            .or_else(|| direct_error_child(param.syntax()))
+            .unwrap_or_else(|| param.syntax().clone());
+        let (binding, name_span) =
+            source_map.add_binding_with_span(&binding_syntax, SpanCtxt::Root)?;
+        let name = match (source_name, name_token) {
+            (Some(_), Some(token)) if token.kind() == SyntaxKind::UNDERSCORE => None,
+            (Some(name), token) => {
+                let hir_name = lower_name_spelling(
+                    name.syntax(),
+                    token.as_ref().map(|token| token.text()),
+                    symbols,
+                    source_map,
+                )?;
+                Some(hir_name)
+            }
+            (None, _) => Some(Name {
+                sym: Symbol::ERROR,
+                span: name_span,
+            }),
+        };
+        let ty = match param.ty() {
+            Some(ty) => Some(lower_type_inner(&ty, arena, symbols, source_map)?),
+            None if has_direct_token(param.syntax(), SyntaxKind::COLON) => {
+                Some(lower_error_type(param.syntax(), arena, source_map)?)
+            }
+            None => None,
+        };
+        lowered_params.push(ClosureParam {
+            hir_id: param_hir_id,
+            binding,
+            name,
+            mutable: has_direct_token(param.syntax(), SyntaxKind::VAR_KW),
+            ty,
+        });
+    }
+
+    let ret = closure
+        .ret_type()
+        .map(|ret| match ret.ty() {
+            Some(ty) => lower_type_inner(&ty, arena, symbols, source_map),
+            None => lower_error_type(ret.syntax(), arena, source_map),
+        })
+        .transpose()?;
+    let body = lower_block(&body, arena, symbols, source_map)?;
+    let closure = arena.alloc_closure(Closure {
+        def_id,
+        capture: if has_direct_token(closure.syntax(), SyntaxKind::MOVE_KW) {
+            CaptureBy::Move
+        } else {
+            CaptureBy::Infer
+        },
+        params: arena.alloc_closure_params(&lowered_params),
+        ret,
+        body,
+    });
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Closure(closure),
         span,
     }))
 }
@@ -523,12 +620,177 @@ pub fn lower_expr<'hir>(
     if contains_error_node(expression.syntax())
         && !contains_call_arglist_error(expression.syntax())
         && !errors_are_in_recoverable_block_statements(expression.syntax())
+        && !errors_are_recoverable_closure_contexts(expression.syntax())
         && !errors_are_in_recoverable_format_interpolations(expression.syntax())
         && !errors_are_in_casts(expression.syntax())
     {
         return lower_error_expr(expression.syntax(), arena, source_map);
     }
+    prepare_nested_definition_ids(expression, source_map)?;
     lower_expr_inner(expression, arena, symbols, source_map)
+}
+
+fn prepare_nested_definition_ids(
+    expression: &ast::Expr,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<(), HirLoweringError> {
+    let contains_closure = expression
+        .syntax()
+        .descendants()
+        .any(|node| node.kind() == SyntaxKind::CLOSURE_EXPR);
+    if !contains_closure {
+        return Ok(());
+    }
+
+    let Some(def_paths) = source_map.def_path_interner() else {
+        return Err(HirLoweringError::UnsupportedSyntax(
+            SyntaxKind::CLOSURE_EXPR,
+        ));
+    };
+
+    let owner_pointer = source_map.pointer_for(source_map.owner_syntax())?;
+    let mut nested_definitions = Vec::new();
+    for node in source_map.owner_syntax().descendants() {
+        if matches!(
+            node.kind(),
+            SyntaxKind::CLOSURE_EXPR | SyntaxKind::ASYNC_BLOCK_EXPR
+        ) && nested_definition_belongs_to_owner(&node, &owner_pointer, source_map)?
+        {
+            let pointer = source_map.pointer_for(&node)?;
+            nested_definitions.push((node, pointer));
+        }
+    }
+    let nested_definition_pointers = nested_definitions
+        .iter()
+        .map(|(_, pointer)| pointer.clone())
+        .collect::<HashSet<_>>();
+    let expression_pointer = source_map.pointer_for(expression.syntax())?;
+    let expression_is_closure = expression.syntax().kind() == SyntaxKind::CLOSURE_EXPR;
+    for node in expression
+        .syntax()
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+    {
+        let pointer = source_map.pointer_for(&node)?;
+        if nested_definition_pointers.contains(&pointer) {
+            continue;
+        }
+        if (expression_is_closure && pointer == expression_pointer)
+            || !nested_definition_is_in_foreign_owner(&node, &owner_pointer, source_map)?
+        {
+            return Err(HirLoweringError::UnsupportedSyntax(
+                SyntaxKind::CLOSURE_EXPR,
+            ));
+        }
+    }
+    let mut ids_by_syntax = HashMap::<SyntaxNodePtr, LocalDefId>::new();
+
+    for (ordinal, (node, pointer)) in nested_definitions.iter().enumerate() {
+        let disambiguator =
+            u32::try_from(ordinal).map_err(|_| DefPathInternerError::TooManyDefinitions)?;
+        let component = match node.kind() {
+            SyntaxKind::CLOSURE_EXPR => DefPathData::Closure,
+            SyntaxKind::ASYNC_BLOCK_EXPR => DefPathData::AsyncBlock,
+            _ => unreachable!("only nested definition nodes are collected"),
+        };
+
+        let mut ancestor = node.parent();
+        let parent = if pointer == &owner_pointer {
+            source_map.owner().def_id
+        } else {
+            loop {
+                let Some(candidate) = ancestor else {
+                    break source_map.owner().def_id;
+                };
+                if matches!(
+                    candidate.kind(),
+                    SyntaxKind::CLOSURE_EXPR | SyntaxKind::ASYNC_BLOCK_EXPR
+                ) {
+                    let candidate_pointer = source_map.pointer_for(&candidate)?;
+                    if candidate_pointer == owner_pointer {
+                        break source_map.owner().def_id;
+                    }
+                    break ids_by_syntax
+                        .get(&candidate_pointer)
+                        .copied()
+                        .ok_or(HirSourceMapError::NestedDefinitionIdMismatch)?;
+                }
+                if source_map.pointer_for(&candidate)? == owner_pointer {
+                    break source_map.owner().def_id;
+                }
+                ancestor = candidate.parent();
+            }
+        };
+
+        let id = def_paths.intern_nested(parent, component, disambiguator)?;
+        source_map.record_nested_definition(node, id)?;
+        ids_by_syntax.insert(pointer.clone(), id);
+    }
+    Ok(())
+}
+
+fn nested_definition_belongs_to_owner(
+    node: &SyntaxNode,
+    owner_pointer: &SyntaxNodePtr,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<bool, HirLoweringError> {
+    let mut ancestor = Some(node.clone());
+    while let Some(candidate) = ancestor {
+        let pointer = source_map.pointer_for(&candidate)?;
+        if &pointer == owner_pointer {
+            return Ok(true);
+        }
+        if is_hir_owner_syntax(candidate.kind()) {
+            return Ok(false);
+        }
+        ancestor = candidate.parent();
+    }
+    Ok(false)
+}
+
+fn nested_definition_is_in_foreign_owner(
+    node: &SyntaxNode,
+    owner_pointer: &SyntaxNodePtr,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<bool, HirLoweringError> {
+    let mut ancestor = Some(node.clone());
+    while let Some(candidate) = ancestor {
+        let pointer = source_map.pointer_for(&candidate)?;
+        if &pointer == owner_pointer {
+            return Ok(false);
+        }
+        if is_hir_owner_syntax(candidate.kind()) {
+            return Ok(true);
+        }
+        ancestor = candidate.parent();
+    }
+    Ok(false)
+}
+
+fn is_hir_owner_syntax(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::FN_DECL
+            | SyntaxKind::TYPE_DECL
+            | SyntaxKind::ENUM_DECL
+            | SyntaxKind::DISTINCT_DECL
+            | SyntaxKind::RESOURCE_DECL
+            | SyntaxKind::TRAIT_DECL
+            | SyntaxKind::ASSOC_TYPE_DECL
+            | SyntaxKind::IMPL_DECL
+            | SyntaxKind::ASSOC_TYPE_DEF
+            | SyntaxKind::CONST_DECL
+            | SyntaxKind::INVARIANT_DECL
+            | SyntaxKind::EFFECT_DECL
+            | SyntaxKind::INTERFACE_DECL
+            | SyntaxKind::IFACE_RESOURCE
+            | SyntaxKind::WORLD_DECL
+            | SyntaxKind::WORLD_IMPORT
+            | SyntaxKind::WORLD_EXPORT
+            | SyntaxKind::EXTERN_MODULE
+            | SyntaxKind::TEST_DECL
+            | SyntaxKind::PROPERTY_DECL
+    )
 }
 
 fn lower_expr_inner<'hir>(
@@ -542,6 +804,7 @@ fn lower_expr_inner<'hir>(
         ast::Expr::FormatString(format_string) => {
             lower_format_string_expr(format_string, arena, symbols, source_map)
         }
+        ast::Expr::Closure(closure) => lower_closure_expr(closure, arena, symbols, source_map),
         ast::Expr::Binary(binary) => lower_binary_expr(binary, arena, symbols, source_map),
         ast::Expr::Prefix(prefix) => lower_prefix_expr(prefix, arena, symbols, source_map),
         ast::Expr::Range(range) => lower_range_expr(range, arena, symbols, source_map),
@@ -2746,6 +3009,22 @@ fn lower_error_expr<'hir>(
 fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError> {
     match expression {
         ast::Expr::Literal(_) | ast::Expr::SelfValue(_) | ast::Expr::SelfType(_) => Ok(()),
+        ast::Expr::Closure(closure) => {
+            if let Some(params) = closure.params() {
+                for param in params.params() {
+                    if let Some(ty) = param.ty() {
+                        ensure_supported_type(&ty)?;
+                    }
+                }
+            }
+            if let Some(ret) = closure.ret_type().and_then(|ret| ret.ty()) {
+                ensure_supported_type(&ret)?;
+            }
+            if let Some(body) = closure.body() {
+                ensure_supported_block(&body)?;
+            }
+            Ok(())
+        }
         ast::Expr::Binary(binary) => {
             if let Some(lhs) = binary.lhs() {
                 ensure_supported_expr(&lhs)?;
@@ -4110,18 +4389,50 @@ fn errors_are_in_recoverable_block_statements(syntax: &SyntaxNode) -> bool {
         .descendants()
         .filter(|node| node.kind() == SyntaxKind::ERROR)
         .collect::<Vec<_>>();
+    !errors.is_empty() && errors.iter().all(error_is_in_recoverable_block_statement)
+}
+
+fn errors_are_recoverable_closure_contexts(syntax: &SyntaxNode) -> bool {
+    let errors = syntax
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::ERROR)
+        .collect::<Vec<_>>();
     !errors.is_empty()
+        && errors.iter().any(error_is_in_closure_params)
         && errors.iter().all(|error| {
-            error.ancestors().any(|ancestor| {
-                matches!(
-                    ancestor.kind(),
-                    SyntaxKind::LET_STMT
-                        | SyntaxKind::VAR_STMT
-                        | SyntaxKind::ASSIGN_STMT
-                        | SyntaxKind::ASSERT_STMT
-                )
-            }) || is_direct_block_error(error)
+            error_is_in_closure_params(error)
+                || error_is_in_recoverable_block_statement(error)
+                || error_is_in_call_arglist(error)
+                || error_is_in_recoverable_format_interpolation(error, syntax)
+                || error_belongs_to_cast(error, syntax)
         })
+}
+
+fn error_is_in_closure_params(error: &SyntaxNode) -> bool {
+    error.ancestors().any(|ancestor| {
+        matches!(
+            ancestor.kind(),
+            SyntaxKind::CLOSURE_PARAM | SyntaxKind::CLOSURE_PARAM_LIST
+        )
+    })
+}
+
+fn error_is_in_recoverable_block_statement(error: &SyntaxNode) -> bool {
+    error.ancestors().any(|ancestor| {
+        matches!(
+            ancestor.kind(),
+            SyntaxKind::LET_STMT
+                | SyntaxKind::VAR_STMT
+                | SyntaxKind::ASSIGN_STMT
+                | SyntaxKind::ASSERT_STMT
+        )
+    }) || is_direct_block_error(error)
+}
+
+fn error_is_in_call_arglist(error: &SyntaxNode) -> bool {
+    error
+        .ancestors()
+        .any(|ancestor| ancestor.kind() == SyntaxKind::ARG_LIST)
 }
 
 fn errors_are_in_casts(syntax: &SyntaxNode) -> bool {
@@ -4141,20 +4452,24 @@ fn errors_are_in_recoverable_format_interpolations(syntax: &SyntaxNode) -> bool 
         .filter(|node| node.kind() == SyntaxKind::ERROR)
         .collect::<Vec<_>>();
     !errors.is_empty()
-        && errors.iter().all(|error| {
-            let mut ancestor = Some(error.clone());
-            let mut in_interpolation = false;
-            let mut in_format_string = false;
-            while let Some(node) = ancestor {
-                in_interpolation |= node.kind() == SyntaxKind::FSTRING_INTERP;
-                in_format_string |= node.kind() == SyntaxKind::FSTRING_EXPR;
-                if node.kind() == syntax.kind() && node.text_range() == syntax.text_range() {
-                    return in_interpolation && in_format_string;
-                }
-                ancestor = node.parent();
-            }
-            false
-        })
+        && errors
+            .iter()
+            .all(|error| error_is_in_recoverable_format_interpolation(error, syntax))
+}
+
+fn error_is_in_recoverable_format_interpolation(error: &SyntaxNode, syntax: &SyntaxNode) -> bool {
+    let mut ancestor = Some(error.clone());
+    let mut in_interpolation = false;
+    let mut in_format_string = false;
+    while let Some(node) = ancestor {
+        in_interpolation |= node.kind() == SyntaxKind::FSTRING_INTERP;
+        in_format_string |= node.kind() == SyntaxKind::FSTRING_EXPR;
+        if node.kind() == syntax.kind() && node.text_range() == syntax.text_range() {
+            return in_interpolation && in_format_string;
+        }
+        ancestor = node.parent();
+    }
+    false
 }
 
 fn error_belongs_to_cast(error: &SyntaxNode, root: &SyntaxNode) -> bool {
@@ -4226,6 +4541,29 @@ mod tests {
         OwnerId {
             def_id: paths.intern(path).expect("definition interns"),
         }
+    }
+
+    fn owner_context(symbols: &Interner) -> (PackageInterner, DefPathInterner, OwnerId) {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:closure-lowering#1.0")
+            .expect("package interns");
+        let paths = DefPathInterner::new(package, &packages, symbols).expect("path interner");
+        let name = symbols.intern("f").expect("symbol interns");
+        let path = DefPath::new(
+            package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::ValueNs(name),
+                disambiguator: 0,
+            }],
+            &packages,
+            symbols,
+        )
+        .expect("definition path");
+        let owner = OwnerId {
+            def_id: paths.intern(path).expect("definition interns"),
+        };
+        (packages, paths, owner)
     }
 
     fn function_node(root: &sai_syntax::SyntaxNode) -> sai_syntax::SyntaxNode {
@@ -10819,5 +11157,485 @@ mod tests {
                 .syntax()
                 .text_range()
         );
+    }
+
+    #[test]
+    fn lowers_closures_with_lexical_paths_parameters_and_source_mappings() {
+        let file = crate::FileId::new(201);
+        let source = "fn f() {\n    move fn(var x: I32, _: U8) -> I32 { fn(y) { x } }\n    async {}\n    fn() {}\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let closures = function
+            .descendants()
+            .filter_map(ast::ClosureExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(closures.len(), 3);
+        let async_block = function
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ASYNC_BLOCK_EXPR)
+            .expect("async block contributes to nested-definition preorder");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let outer_expr = ast::Expr::cast(closures[0].syntax().clone()).unwrap();
+        let outer = lower_expr(&outer_expr, &arena, &symbols, &mut source_map)
+            .expect("outer closure lowers");
+        let outer_hir_id = outer.hir_id;
+        let outer_span = outer.span;
+        let ExprKind::Closure(outer) = outer.kind else {
+            panic!("closure expression is preserved");
+        };
+        assert_eq!(outer.capture, CaptureBy::Move);
+        assert_eq!(outer.params.len(), 2);
+        assert!(outer.params[0].mutable);
+        assert_eq!(
+            symbols
+                .resolve(outer.params[0].name.expect("named parameter").sym)
+                .unwrap()
+                .as_ref(),
+            "x"
+        );
+        assert!(!outer.params[1].mutable);
+        assert!(outer.params[1].name.is_none(), "underscore is a wildcard");
+        assert!(outer.params[0].ty.is_some());
+        assert!(outer.params[1].ty.is_some());
+        assert!(outer.ret.is_some());
+        assert_eq!(outer.body.safety, Safety::Safe);
+
+        let nested = outer
+            .body
+            .tail
+            .expect("nested closure is the outer closure's tail");
+        let nested_hir_id = nested.hir_id;
+        let ExprKind::Closure(nested) = nested.kind else {
+            panic!("nested closure is preserved");
+        };
+        assert_eq!(nested.capture, CaptureBy::Infer);
+        assert_eq!(nested.params.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(nested.params[0].name.expect("nested parameter").sym)
+                .unwrap()
+                .as_ref(),
+            "y"
+        );
+
+        let sibling_expr = ast::Expr::cast(closures[2].syntax().clone()).unwrap();
+        let sibling = lower_expr(&sibling_expr, &arena, &symbols, &mut source_map)
+            .expect("sibling closure lowers");
+        let ExprKind::Closure(sibling) = sibling.kind else {
+            panic!("sibling closure is preserved");
+        };
+        assert_eq!(sibling.capture, CaptureBy::Infer);
+        assert!(sibling.params.is_empty());
+
+        let outer_path = paths.resolve(outer.def_id).unwrap().unwrap();
+        assert_eq!(
+            outer_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 0,
+            })
+        );
+        let nested_path = paths.resolve(nested.def_id).unwrap().unwrap();
+        assert_eq!(
+            nested_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 1,
+            })
+        );
+        assert_eq!(
+            nested_path.data()[nested_path.data().len() - 2],
+            DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 0,
+            }
+        );
+        let sibling_path = paths.resolve(sibling.def_id).unwrap().unwrap();
+        assert_eq!(
+            sibling_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 3,
+            })
+        );
+        let async_id = source_map
+            .nested_definition_for_syntax(&async_block)
+            .unwrap()
+            .expect("async block path was assigned");
+        assert_eq!(
+            paths.resolve(async_id).unwrap().unwrap().data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::AsyncBlock,
+                disambiguator: 2,
+            })
+        );
+
+        let outer_ptr =
+            SyntaxNodePtr::new(file, closures[0].syntax()).expect("outer closure pointer");
+        let outer_ast_params = closures[0].params().unwrap().params().collect::<Vec<_>>();
+        let first_param_ptr =
+            SyntaxNodePtr::new(file, outer_ast_params[0].name().unwrap().syntax())
+                .expect("first parameter name pointer");
+        let wildcard_ptr = SyntaxNodePtr::new(file, outer_ast_params[1].name().unwrap().syntax())
+            .expect("wildcard parameter name pointer");
+        let first_param_node_ptr =
+            SyntaxNodePtr::new(file, outer_ast_params[0].syntax()).expect("parameter pointer");
+        let first_param_type_ptr =
+            SyntaxNodePtr::new(file, outer_ast_params[0].ty().unwrap().syntax())
+                .expect("parameter type pointer");
+        let ret_type_ptr =
+            SyntaxNodePtr::new(file, closures[0].ret_type().unwrap().ty().unwrap().syntax())
+                .expect("closure return type pointer");
+        let body_ptr =
+            SyntaxNodePtr::new(file, closures[0].body().unwrap().syntax()).expect("body pointer");
+        let nested_ptr =
+            SyntaxNodePtr::new(file, closures[1].syntax()).expect("nested closure pointer");
+        let map = source_map.finish();
+        assert_eq!(map.syntax_for_node(outer_hir_id), Some(&outer_ptr));
+        assert_eq!(
+            map.syntax_for_node(outer.params[0].hir_id)
+                .expect("first parameter HIR source"),
+            &first_param_node_ptr
+        );
+        assert_eq!(
+            map.syntax_for_node(outer.params[0].ty.unwrap().hir_id),
+            Some(&first_param_type_ptr)
+        );
+        assert_eq!(
+            map.syntax_for_node(outer.ret.unwrap().hir_id),
+            Some(&ret_type_ptr)
+        );
+        assert_eq!(map.syntax_for_node(outer.body.hir_id), Some(&body_ptr));
+        assert_eq!(
+            map.syntax_for_binding(outer.params[0].binding),
+            Some(&first_param_ptr)
+        );
+        assert_eq!(
+            map.syntax_for_binding(outer.params[1].binding),
+            Some(&wildcard_ptr)
+        );
+        assert_eq!(map.syntax_for_node(nested_hir_id), Some(&nested_ptr));
+        assert_eq!(outer_span.range, closures[0].syntax().text_range());
+        assert_eq!(outer_span.ctxt, SpanCtxt::Root);
+        assert_eq!(
+            outer.params[0].name.unwrap().span.range,
+            outer_ast_params[0].name().unwrap().syntax().text_range()
+        );
+        assert_eq!(outer.params[0].name.unwrap().span.ctxt, SpanCtxt::Root);
+    }
+
+    #[test]
+    fn closure_lowering_requires_definition_paths_before_allocating_hir() {
+        let file = crate::FileId::new(202);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { fn() {} }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let closure = function
+            .descendants()
+            .find_map(ast::ClosureExpr::cast)
+            .expect("closure expression");
+        let expression = ast::Expr::cast(closure.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert_eq!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::CLOSURE_EXPR)
+        );
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 1);
+        assert!(map.binding_to_syntax().is_empty());
+    }
+
+    #[test]
+    fn closure_preflight_rejects_unsupported_body_before_allocating_any_nodes() {
+        let file = crate::FileId::new(203);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { fn() { value.convert<U32> } }\n");
+        let function = function_node(&parsed.root);
+        let closure = function
+            .descendants()
+            .find_map(ast::ClosureExpr::cast)
+            .expect("closure expression");
+        let expression = ast::Expr::cast(closure.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 1);
+        assert!(map.binding_to_syntax().is_empty());
+        assert_eq!(paths.len().unwrap(), 1, "preflight adds no nested paths");
+    }
+
+    #[test]
+    fn closure_parameter_name_recovery_keeps_the_closure_body() {
+        let file = crate::FileId::new(204);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { fn(var) { 7 } }\n");
+        assert!(!parsed.errors.is_empty(), "the missing name is diagnosed");
+        let function = function_node(&parsed.root);
+        let closure = function
+            .descendants()
+            .find_map(ast::ClosureExpr::cast)
+            .expect("closure expression");
+        let param = closure
+            .params()
+            .unwrap()
+            .params()
+            .next()
+            .expect("recovered closure parameter");
+        let expression = ast::Expr::cast(closure.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("closure recovers its diagnosed parameter name");
+        let ExprKind::Closure(closure) = lowered.kind else {
+            panic!("the valid closure body is retained");
+        };
+        assert_eq!(closure.params.len(), 1);
+        assert!(closure.params[0].mutable);
+        assert_eq!(
+            closure.params[0].name.map(|name| name.sym),
+            Some(Symbol::ERROR)
+        );
+        assert!(matches!(
+            closure.body.tail.map(|tail| tail.kind),
+            Some(ExprKind::Lit(Lit::Int {
+                value: Some(7),
+                negated: false,
+            }))
+        ));
+
+        let binding_syntax = param
+            .name()
+            .map(|name| name.syntax().clone())
+            .or_else(|| direct_error_child(param.syntax()))
+            .unwrap_or_else(|| param.syntax().clone());
+        let binding_ptr =
+            SyntaxNodePtr::new(file, &binding_syntax).expect("recovered binding pointer");
+        let map = source_map.finish();
+        assert_eq!(
+            map.syntax_for_binding(closure.params[0].binding),
+            Some(&binding_ptr)
+        );
+    }
+
+    #[test]
+    fn closure_parameter_separator_recovery_keeps_later_parameters_and_body() {
+        let file = crate::FileId::new(206);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { fn(x y: I32) { x } }\n");
+        assert!(!parsed.errors.is_empty(), "the missing comma is diagnosed");
+        let function = function_node(&parsed.root);
+        let closure_syntax = function
+            .descendants()
+            .find_map(ast::ClosureExpr::cast)
+            .expect("closure expression");
+        let params = closure_syntax
+            .params()
+            .unwrap()
+            .params()
+            .collect::<Vec<_>>();
+        assert_eq!(params.len(), 2);
+        let expression = ast::Expr::cast(closure_syntax.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("closure recovers its missing parameter separator");
+        let ExprKind::Closure(closure) = lowered.kind else {
+            panic!("the closure is preserved");
+        };
+        assert_eq!(closure.params.len(), 2);
+        assert_eq!(
+            symbols
+                .resolve(closure.params[1].name.expect("second parameter").sym)
+                .unwrap()
+                .as_ref(),
+            "y"
+        );
+        assert!(matches!(
+            closure.body.tail.map(|tail| tail.kind),
+            Some(ExprKind::Path(_))
+        ));
+        assert_eq!(source_map.finish().binding_to_syntax().len(), 2);
+    }
+
+    #[test]
+    fn closure_parameter_and_body_recovery_compose() {
+        let file = crate::FileId::new(207);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { fn(x y: I32) { let value: = 1\n value } }\n");
+        assert!(
+            parsed.errors.len() >= 2,
+            "the missing parameter separator and type annotation are diagnosed"
+        );
+        let function = function_node(&parsed.root);
+        let closure_syntax = function
+            .descendants()
+            .find_map(ast::ClosureExpr::cast)
+            .expect("closure expression");
+        let expression = ast::Expr::cast(closure_syntax.syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("recoverable parameter and body errors compose");
+        let ExprKind::Closure(closure) = lowered.kind else {
+            panic!("the closure is preserved");
+        };
+        assert_eq!(closure.params.len(), 2);
+        assert_eq!(closure.body.stmts.len(), 1);
+        let StmtKind::Let { ty, init, .. } = closure.body.stmts[0].kind else {
+            panic!("the closure body keeps its recoverable let statement");
+        };
+        assert!(matches!(ty.map(|ty| ty.kind), Some(HirTyKind::Err)));
+        assert!(matches!(
+            init.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        ));
+        assert!(matches!(
+            closure.body.tail.map(|tail| tail.kind),
+            Some(ExprKind::Path(_))
+        ));
+    }
+
+    #[test]
+    fn closure_paths_ignore_nested_item_syntax_outside_the_owner() {
+        let file = crate::FileId::new(205);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() {\n    fn hidden() { fn() {} }\n    fn() {}\n}\n",
+        );
+        assert!(!parsed.errors.is_empty(), "local items are diagnosed");
+        let function = function_node(&parsed.root);
+        let closures = function
+            .descendants()
+            .filter_map(ast::ClosureExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(closures.len(), 2);
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let hidden_expr = ast::Expr::cast(closures[0].syntax().clone()).unwrap();
+        assert_eq!(
+            lower_expr(&hidden_expr, &arena, &symbols, &mut source_map).unwrap_err(),
+            HirLoweringError::UnsupportedSyntax(SyntaxKind::CLOSURE_EXPR)
+        );
+        assert_eq!(paths.len().unwrap(), 1);
+        assert_eq!(
+            source_map
+                .nested_definition_for_syntax(closures[0].syntax())
+                .unwrap(),
+            None
+        );
+
+        let source_expr = ast::Expr::cast(closures[1].syntax().clone()).unwrap();
+        let lowered = lower_expr(&source_expr, &arena, &symbols, &mut source_map)
+            .expect("closure in the current owner lowers");
+        let ExprKind::Closure(closure) = lowered.kind else {
+            panic!("source closure is preserved");
+        };
+        assert_eq!(
+            paths
+                .resolve(closure.def_id)
+                .unwrap()
+                .unwrap()
+                .data()
+                .last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn nested_item_errors_do_not_block_the_enclosing_closure_body() {
+        let file = crate::FileId::new(207);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() {\n    fn() {\n        fn hidden() { fn() {} }\n        1\n    }\n}\n",
+        );
+        assert!(!parsed.errors.is_empty(), "the local item is diagnosed");
+        let function = function_node(&parsed.root);
+        let closures = function
+            .descendants()
+            .filter_map(ast::ClosureExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(closures.len(), 2);
+        let expression = ast::Expr::cast(closures[0].syntax().clone()).unwrap();
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("outer closure lowers around the diagnosed local item");
+        let ExprKind::Closure(closure) = lowered.kind else {
+            panic!("outer closure is preserved");
+        };
+        assert!(matches!(
+            closure.body.tail.map(|tail| tail.kind),
+            Some(ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            }))
+        ));
+        assert_eq!(
+            source_map
+                .nested_definition_for_syntax(closures[1].syntax())
+                .unwrap(),
+            None,
+            "the local item's closure is outside the enclosing owner's paths"
+        );
+        assert_eq!(paths.len().unwrap(), 2);
     }
 }

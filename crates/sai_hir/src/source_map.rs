@@ -1,4 +1,7 @@
-use crate::{BindingId, HirId, IndexVec, IndexVecError, ItemLocalId, OwnerId, Span, SpanCtxt};
+use crate::{
+    BindingId, DefPathInterner, HirId, IndexVec, IndexVecError, ItemLocalId, LocalDefId, OwnerId,
+    Span, SpanCtxt,
+};
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Span as DiagnosticSpan};
 use sai_syntax::{SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, ast::AstIdMap};
 use std::collections::HashMap;
@@ -59,6 +62,9 @@ pub struct HirSourceMapBuilder<'root> {
     snapshot: sai_vfs::WorkspaceSnapshot,
     file: crate::FileId,
     root: &'root SyntaxNode,
+    owner_syntax: SyntaxNode,
+    def_path_interner: Option<&'root DefPathInterner>,
+    nested_definition_ids: HashMap<SyntaxNodePtr, LocalDefId>,
     node_to_syntax: IndexVec<ItemLocalId, SyntaxNodePtr>,
     syntax_to_nodes: HashMap<SyntaxNodePtr, Vec<ItemLocalId>>,
     binding_to_syntax: IndexVec<BindingId, SyntaxNodePtr>,
@@ -88,6 +94,9 @@ impl<'root> HirSourceMapBuilder<'root> {
             snapshot: snapshot.clone(),
             file,
             root,
+            owner_syntax: owner_syntax.clone(),
+            def_path_interner: None,
+            nested_definition_ids: HashMap::new(),
             node_to_syntax: IndexVec::new(),
             syntax_to_nodes: HashMap::new(),
             binding_to_syntax: IndexVec::new(),
@@ -97,6 +106,57 @@ impl<'root> HirSourceMapBuilder<'root> {
         let owner_local_id = builder.push_node_pointer(owner_pointer)?;
         debug_assert_eq!(owner_local_id, ItemLocalId::default());
         Ok(builder)
+    }
+
+    /// Enable lowering of lexical closure and async-block definitions.
+    pub fn with_def_path_interner(mut self, interner: &'root DefPathInterner) -> Self {
+        self.def_path_interner = Some(interner);
+        self
+    }
+
+    pub(crate) const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub(crate) fn owner_syntax(&self) -> &SyntaxNode {
+        &self.owner_syntax
+    }
+
+    pub(crate) fn def_path_interner(&self) -> Option<&'root DefPathInterner> {
+        self.def_path_interner
+    }
+
+    pub(crate) fn pointer_for(
+        &self,
+        syntax: &SyntaxNode,
+    ) -> Result<SyntaxNodePtr, HirSourceMapError> {
+        syntax_pointer(self.file, self.root, syntax)
+    }
+
+    pub(crate) fn record_nested_definition(
+        &mut self,
+        syntax: &SyntaxNode,
+        id: LocalDefId,
+    ) -> Result<(), HirSourceMapError> {
+        let pointer = self.pointer_for(syntax)?;
+        match self.nested_definition_ids.entry(pointer) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == id => {}
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(HirSourceMapError::NestedDefinitionIdMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn nested_definition_for_syntax(
+        &self,
+        syntax: &SyntaxNode,
+    ) -> Result<Option<LocalDefId>, HirSourceMapError> {
+        let pointer = self.pointer_for(syntax)?;
+        Ok(self.nested_definition_ids.get(&pointer).copied())
     }
 
     /// The HIR node for the owner itself always has local ID zero.
@@ -296,6 +356,7 @@ fn syntax_pointer(
     Ok(pointer)
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HirSourceMapError {
     AstIdMapMismatch,
@@ -303,6 +364,7 @@ pub enum HirSourceMapError {
     DiagnosticNotValidForSnapshot,
     SourceTextNotValidForSnapshot,
     UnknownBindingAlias,
+    NestedDefinitionIdMismatch,
     SyntaxFileMismatch,
     SyntaxTreeMismatch,
     TooManyNodes,
