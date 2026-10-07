@@ -1,8 +1,8 @@
 use crate::Symbol;
 use crate::arena::HirArena;
 use crate::expressions::{
-    Arg, BinOp, Block as HirBlock, Expr, ExprKind, Label as HirLabel, Stmt as HirStmt, StmtKind,
-    UnOp,
+    Arg, Arm as HirArm, BinOp, Block as HirBlock, Expr, ExprKind, Label as HirLabel,
+    MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
 };
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
@@ -117,6 +117,7 @@ fn lower_expr_inner<'hir>(
         }
         ast::Expr::Block(block_expr) => lower_block_expr(block_expr, arena, symbols, source_map),
         ast::Expr::If(if_expr) => lower_if_expr(if_expr, arena, symbols, source_map),
+        ast::Expr::Match(match_expr) => lower_match_expr(match_expr, arena, symbols, source_map),
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -482,6 +483,11 @@ enum BlockStatementSyntax {
     Error(SyntaxNode),
 }
 
+enum MatchArmSyntax {
+    Arm(ast::MatchArm),
+    Error(SyntaxNode),
+}
+
 fn collect_expr_list_elements(syntax: &SyntaxNode) -> Vec<ExprListElementSyntax> {
     let mut elements = Vec::new();
     for child in syntax.children() {
@@ -504,6 +510,42 @@ fn collect_block_statements(syntax: &SyntaxNode) -> Vec<BlockStatementSyntax> {
         }
     }
     statements
+}
+
+fn collect_match_arms(match_expr: &ast::MatchExpr) -> Vec<MatchArmSyntax> {
+    match match_expr.arms() {
+        Some(arms) => arms
+            .syntax()
+            .children()
+            .filter_map(|child| {
+                ast::MatchArm::cast(child.clone())
+                    .map(MatchArmSyntax::Arm)
+                    .or_else(|| {
+                        (child.kind() == SyntaxKind::ERROR)
+                            .then_some(child)
+                            .map(MatchArmSyntax::Error)
+                    })
+            })
+            .collect(),
+        None => {
+            let mut errors = match_expr
+                .syntax()
+                .children()
+                .filter(|child| child.kind() == SyntaxKind::ERROR)
+                .collect::<Vec<_>>();
+            if match_expr.scrutinee().is_none()
+                && let Some(scrutinee_error) =
+                    errors.iter().position(|error| !contains_attribute(error))
+            {
+                errors.remove(scrutinee_error);
+            }
+            if errors.is_empty() {
+                vec![MatchArmSyntax::Error(match_expr.syntax().clone())]
+            } else {
+                errors.into_iter().map(MatchArmSyntax::Error).collect()
+            }
+        }
+    }
 }
 
 fn collect_call_args(call: &ast::CallExpr) -> Option<Vec<CallArgSyntax>> {
@@ -568,6 +610,15 @@ fn direct_error_child(syntax: &SyntaxNode) -> Option<SyntaxNode> {
     syntax
         .children()
         .find(|child| child.kind() == SyntaxKind::ERROR && !contains_attribute(child))
+}
+
+fn direct_error_child_from_end(syntax: &SyntaxNode) -> Option<SyntaxNode> {
+    syntax
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::ERROR && !contains_attribute(child))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .next_back()
 }
 
 fn contains_attribute(syntax: &SyntaxNode) -> bool {
@@ -802,6 +853,95 @@ fn lower_if_expr<'hir>(
         },
         span,
     }))
+}
+
+fn lower_match_expr<'hir>(
+    match_expr: &ast::MatchExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(match_expr.syntax(), SpanCtxt::Root)?;
+    let scrutinee = match match_expr.scrutinee() {
+        Some(expression) => lower_expr_inner(&expression, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child(match_expr.syntax())
+                .unwrap_or_else(|| match_expr.syntax().clone());
+            lower_error_expr(&error, arena, source_map)?
+        }
+    };
+    let mut arms = Vec::new();
+    for arm in collect_match_arms(match_expr) {
+        arms.push(match arm {
+            MatchArmSyntax::Arm(arm) => lower_match_arm(&arm, arena, symbols, source_map)?,
+            MatchArmSyntax::Error(error) => {
+                let (arm_hir_id, arm_span) =
+                    source_map.add_node_with_span(&error, SpanCtxt::Root)?;
+                let pattern = lower_error_pattern(&error, arena, source_map)?;
+                let body = lower_error_expr(&error, arena, source_map)?;
+                HirArm {
+                    hir_id: arm_hir_id,
+                    pat: pattern,
+                    guard: None,
+                    body,
+                    span: arm_span,
+                    synthesized: false,
+                }
+            }
+        });
+    }
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Match {
+            scrutinee,
+            arms: arena.alloc_arms(&arms),
+            source: HirMatchSource::Normal,
+        },
+        span,
+    }))
+}
+
+fn lower_match_arm<'hir>(
+    arm: &ast::MatchArm,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<HirArm<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(arm.syntax(), SpanCtxt::Root)?;
+    let pattern = match arm.pattern() {
+        Some(pattern) => lower_pattern(&pattern, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child(arm.syntax()).unwrap_or_else(|| arm.syntax().clone());
+            lower_error_pattern(&error, arena, source_map)?
+        }
+    };
+    let guard = arm
+        .guard()
+        .map(|guard| match guard.expression() {
+            Some(expression) => lower_expr_inner(&expression, arena, symbols, source_map),
+            None => {
+                let error =
+                    direct_error_child(guard.syntax()).unwrap_or_else(|| guard.syntax().clone());
+                lower_error_expr(&error, arena, source_map)
+            }
+        })
+        .transpose()?;
+    let body = match arm.expression() {
+        Some(expression) => lower_expr_inner(&expression, arena, symbols, source_map)?,
+        None => {
+            let error =
+                direct_error_child_from_end(arm.syntax()).unwrap_or_else(|| arm.syntax().clone());
+            lower_error_expr(&error, arena, source_map)?
+        }
+    };
+    Ok(HirArm {
+        hir_id,
+        pat: pattern,
+        guard,
+        body,
+        span,
+        synthesized: false,
+    })
 }
 
 fn lower_block<'hir>(
@@ -1039,6 +1179,7 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             None => Ok(()),
         },
         ast::Expr::If(if_expr) => ensure_supported_if_expr(if_expr),
+        ast::Expr::Match(match_expr) => ensure_supported_match_expr(match_expr),
         _ if contains_error_node(expression.syntax()) => Ok(()),
         _ => Err(HirLoweringError::UnsupportedSyntax(
             expression.syntax().kind(),
@@ -1084,6 +1225,29 @@ fn ensure_supported_if_expr(if_expr: &ast::IfExpr) -> Result<(), HirLoweringErro
             ensure_supported_block(&block)?;
         } else if let Some(else_if) = else_branch.else_if() {
             ensure_supported_if_expr(&else_if)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_match_expr(match_expr: &ast::MatchExpr) -> Result<(), HirLoweringError> {
+    if let Some(scrutinee) = match_expr.scrutinee() {
+        ensure_supported_expr(&scrutinee)?;
+    }
+    for arm in collect_match_arms(match_expr) {
+        let MatchArmSyntax::Arm(arm) = arm else {
+            continue;
+        };
+        if let Some(pattern) = arm.pattern() {
+            ensure_supported_pattern(&pattern)?;
+        }
+        if let Some(guard) = arm.guard()
+            && let Some(expression) = guard.expression()
+        {
+            ensure_supported_expr(&expression)?;
+        }
+        if let Some(expression) = arm.expression() {
+            ensure_supported_expr(&expression)?;
         }
     }
     Ok(())
@@ -3214,6 +3378,291 @@ mod tests {
             "unexpected lowering result: {result:?}"
         );
         assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn lowers_match_arms_with_patterns_guards_and_source_ordered_ids() {
+        let file = crate::FileId::new(106);
+        let source = "fn f() { match value { 0 => 1, 1 if test => 2, _ => 3 } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let match_expr = function
+            .descendants()
+            .find_map(ast::MatchExpr::cast)
+            .expect("match expression");
+        let expression =
+            ast::Expr::cast(match_expr.syntax().clone()).expect("match is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("match lowers");
+        let ExprKind::Match {
+            scrutinee,
+            arms,
+            source: HirMatchSource::Normal,
+        } = lowered.kind
+        else {
+            panic!("the expression lowers to a normal match");
+        };
+        assert_eq!(arms.len(), 3);
+        assert!(matches!(scrutinee.kind, ExprKind::Path(_)));
+        assert_eq!(
+            arms[0].pat.kind,
+            PatKind::Lit(Lit::Int {
+                value: Some(0),
+                negated: false,
+            })
+        );
+        assert!(arms[0].guard.is_none());
+        assert_eq!(
+            arms[0].body.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+        assert_eq!(
+            arms[1].pat.kind,
+            PatKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+        assert!(matches!(
+            arms[1].guard.map(|guard| guard.kind),
+            Some(ExprKind::Path(_))
+        ));
+        assert_eq!(
+            arms[1].body.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(2),
+                negated: false,
+            })
+        );
+        assert_eq!(arms[2].pat.kind, PatKind::Wild);
+        assert_eq!(
+            arms[2].body.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(3),
+                negated: false,
+            })
+        );
+        assert!(arms.iter().all(|arm| !arm.synthesized));
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                scrutinee.hir_id.local_id.raw(),
+                match scrutinee.kind {
+                    ExprKind::Path(path) => path.hir_id.local_id.raw(),
+                    _ => unreachable!(),
+                },
+                match scrutinee.kind {
+                    ExprKind::Path(path) => path.segments[0].hir_id.local_id.raw(),
+                    _ => unreachable!(),
+                },
+                arms[0].hir_id.local_id.raw(),
+                arms[0].pat.hir_id.local_id.raw(),
+                arms[0].body.hir_id.local_id.raw(),
+                arms[1].hir_id.local_id.raw(),
+                arms[1].pat.hir_id.local_id.raw(),
+                arms[1].guard.unwrap().hir_id.local_id.raw(),
+                match arms[1].guard.unwrap().kind {
+                    ExprKind::Path(path) => path.hir_id.local_id.raw(),
+                    _ => unreachable!(),
+                },
+                match arms[1].guard.unwrap().kind {
+                    ExprKind::Path(path) => path.segments[0].hir_id.local_id.raw(),
+                    _ => unreachable!(),
+                },
+                arms[1].body.hir_id.local_id.raw(),
+                arms[2].hir_id.local_id.raw(),
+                arms[2].pat.hir_id.local_id.raw(),
+                arms[2].body.hir_id.local_id.raw(),
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(source_map.finish().node_to_syntax().len(), 17);
+    }
+
+    #[test]
+    fn match_recovery_keeps_arms_and_preflights_nested_expressions() {
+        let file = crate::FileId::new(107);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { match call(, true) { _ =>, 1 => 2 } }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let match_expr = function
+            .descendants()
+            .find_map(ast::MatchExpr::cast)
+            .expect("match expression");
+        let expression =
+            ast::Expr::cast(match_expr.syntax().clone()).expect("match is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("scrutinee call errors preserve the match");
+        let ExprKind::Match {
+            scrutinee,
+            arms,
+            source: HirMatchSource::Normal,
+        } = lowered.kind
+        else {
+            panic!("the match is preserved");
+        };
+        let ExprKind::Call { args, .. } = scrutinee.kind else {
+            panic!("the scrutinee call is preserved");
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].expr.kind, ExprKind::Err);
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0].body.kind, ExprKind::Err);
+        assert_eq!(
+            arms[1].pat.kind,
+            PatKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+
+        let file = crate::FileId::new(108);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() { match call(, true) { _ => value.convert<U32> } }\n",
+        );
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let match_expr = function
+            .descendants()
+            .find_map(ast::MatchExpr::cast)
+            .expect("match expression");
+        let expression =
+            ast::Expr::cast(match_expr.syntax().clone()).expect("match is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn missing_match_scrutinee_and_arm_list_keep_distinct_error_nodes() {
+        let file = crate::FileId::new(109);
+        let source = "fn f() { (match, call(, 2)) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let match_expr = function
+            .descendants()
+            .find_map(ast::MatchExpr::cast)
+            .expect("match expression");
+        assert!(match_expr.scrutinee().is_none());
+        assert!(match_expr.arms().is_none());
+        let errors = match_expr
+            .syntax()
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::ERROR)
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let tuple_expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&tuple_expression, &arena, &symbols, &mut source_map)
+            .expect("the sibling call keeps the tuple recoverable");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("the outer tuple is preserved");
+        };
+        let ExprKind::Match {
+            scrutinee,
+            arms,
+            source: HirMatchSource::Normal,
+        } = elements[0].kind
+        else {
+            panic!("the malformed match is preserved");
+        };
+        assert_eq!(scrutinee.kind, ExprKind::Err);
+        assert_eq!(arms.len(), 1);
+        assert_eq!(arms[0].pat.kind, PatKind::Err);
+        assert_eq!(arms[0].body.kind, ExprKind::Err);
+        assert_eq!(scrutinee.span.range, errors[0].text_range());
+        assert_eq!(arms[0].span.range, errors[1].text_range());
+        let first_error =
+            sai_syntax::SyntaxNodePtr::new(file, &errors[0]).expect("scrutinee error pointer");
+        let second_error =
+            sai_syntax::SyntaxNodePtr::new(file, &errors[1]).expect("arm error pointer");
+        let map = source_map.finish();
+        assert_eq!(map.nodes_for_syntax(&first_error).len(), 1);
+        assert_eq!(map.nodes_for_syntax(&second_error).len(), 3);
+    }
+
+    #[test]
+    fn missing_match_body_uses_its_own_recovery_node() {
+        let file = crate::FileId::new(110);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { match call(, true) { _ } }\n");
+        let function = function_node(&parsed.root);
+        assert!(!parsed.errors.is_empty());
+        let match_expr = function
+            .descendants()
+            .find_map(ast::MatchExpr::cast)
+            .expect("match expression");
+        let arm = function
+            .descendants()
+            .find_map(ast::MatchArm::cast)
+            .expect("match arm");
+        let errors = arm
+            .syntax()
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::ERROR)
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].text_range(), errors[1].text_range());
+        let expression =
+            ast::Expr::cast(match_expr.syntax().clone()).expect("match is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("a missing body is represented as an error expression");
+        let ExprKind::Match { arms, .. } = lowered.kind else {
+            panic!("the match is preserved: {lowered:?}");
+        };
+        assert_eq!(arms.len(), 1);
+        assert_eq!(arms[0].pat.kind, PatKind::Wild);
+        assert_eq!(arms[0].body.kind, ExprKind::Err);
+        assert_eq!(arms[0].body.span.range, errors[1].text_range());
+        let arrow_error =
+            sai_syntax::SyntaxNodePtr::new(file, &errors[0]).expect("arrow error pointer");
+        let body_error =
+            sai_syntax::SyntaxNodePtr::new(file, &errors[1]).expect("body error pointer");
+        let map = source_map.finish();
+        assert!(map.nodes_for_syntax(&arrow_error).is_empty());
+        assert_eq!(map.nodes_for_syntax(&body_error).len(), 1);
     }
 
     #[test]
