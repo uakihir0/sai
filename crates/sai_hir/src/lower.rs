@@ -1,6 +1,6 @@
 use crate::Symbol;
 use crate::arena::HirArena;
-use crate::expressions::{BinOp, Expr, ExprKind, UnOp};
+use crate::expressions::{Arg, BinOp, Expr, ExprKind, UnOp};
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
@@ -83,7 +83,8 @@ pub fn lower_expr<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     ensure_supported_expr(expression)?;
-    if contains_error_node(expression.syntax()) {
+    if contains_error_node(expression.syntax()) && !contains_call_arglist_error(expression.syntax())
+    {
         return lower_error_expr(expression.syntax(), arena, source_map);
     }
     lower_expr_inner(expression, arena, symbols, source_map)
@@ -103,6 +104,7 @@ fn lower_expr_inner<'hir>(
         ast::Expr::Index(index) => lower_index_expr(index, arena, symbols, source_map),
         ast::Expr::Try(try_expr) => lower_try_expr(try_expr, arena, symbols, source_map),
         ast::Expr::Await(await_expr) => lower_await_expr(await_expr, arena, symbols, source_map),
+        ast::Expr::Call(call) => lower_call_expr(call, arena, symbols, source_map),
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -129,15 +131,26 @@ fn lower_expr_inner<'hir>(
         },
         ast::Expr::Tuple(tuple) => {
             let (hir_id, span) = source_map.add_node_with_span(tuple.syntax(), SpanCtxt::Root)?;
-            let elements = tuple
-                .elements()
-                .map(|element| lower_expr_inner(&element, arena, symbols, source_map).copied())
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut elements = Vec::new();
+            for element in collect_tuple_elements(tuple) {
+                let lowered = match element {
+                    TupleElementSyntax::Expression(expression) => {
+                        lower_expr_inner(&expression, arena, symbols, source_map)?
+                    }
+                    TupleElementSyntax::Error(syntax) => {
+                        lower_error_expr(&syntax, arena, source_map)?
+                    }
+                };
+                elements.push(*lowered);
+            }
             Ok(arena.alloc_expr(Expr {
                 hir_id,
                 kind: ExprKind::Tuple(arena.alloc_exprs(&elements)),
                 span,
             }))
+        }
+        _ if contains_error_node(expression.syntax()) => {
+            lower_error_expr(expression.syntax(), arena, source_map)
         }
         _ => Err(HirLoweringError::UnsupportedSyntax(
             expression.syntax().kind(),
@@ -324,6 +337,9 @@ fn lower_range_expr<'hir>(
     let Some(inclusive) = range_inclusive(range.syntax()) else {
         return lower_error_expr(range.syntax(), arena, source_map);
     };
+    if inclusive && range.end().is_none() {
+        return lower_error_expr(range.syntax(), arena, source_map);
+    }
     let (hir_id, span) = source_map.add_node_with_span(range.syntax(), SpanCtxt::Root)?;
     let start = range
         .start()
@@ -409,6 +425,168 @@ fn lower_await_expr<'hir>(
     }))
 }
 
+enum CallArgSyntax {
+    Positional(ast::Expr),
+    PositionalError(SyntaxNode),
+    Named {
+        name: ast::NameRef,
+        expression: ast::Expr,
+    },
+    NamedError {
+        name: ast::NameRef,
+        syntax: SyntaxNode,
+    },
+    Base(ast::Expr),
+    BaseError(SyntaxNode),
+}
+
+enum TupleElementSyntax {
+    Expression(ast::Expr),
+    Error(SyntaxNode),
+}
+
+fn collect_tuple_elements(tuple: &ast::TupleExpr) -> Vec<TupleElementSyntax> {
+    let mut elements = Vec::new();
+    for child in tuple.syntax().children() {
+        if let Some(expression) = ast::Expr::cast(child.clone()) {
+            elements.push(TupleElementSyntax::Expression(expression));
+        } else if child.kind() == SyntaxKind::ERROR && !contains_attribute(&child) {
+            elements.push(TupleElementSyntax::Error(child));
+        }
+    }
+    elements
+}
+
+fn collect_call_args(call: &ast::CallExpr) -> Option<Vec<CallArgSyntax>> {
+    let args = call.args()?;
+    let mut collected = Vec::new();
+    let mut has_base = false;
+    for child in args.syntax().children() {
+        if let Some(arg) = ast::Arg::cast(child.clone()) {
+            if let Some(expression) = arg.expression() {
+                collected.push(CallArgSyntax::Positional(expression));
+            } else {
+                collected.push(CallArgSyntax::PositionalError(direct_error_child(
+                    arg.syntax(),
+                )?));
+            }
+        } else if let Some(arg) = ast::NamedArg::cast(child.clone()) {
+            let name = arg.name()?;
+            if let Some(expression) = arg.expression() {
+                collected.push(CallArgSyntax::Named { name, expression });
+            } else {
+                collected.push(CallArgSyntax::NamedError {
+                    name,
+                    syntax: direct_error_child(arg.syntax())?,
+                });
+            }
+        } else if let Some(arg) = ast::BaseArg::cast(child.clone()) {
+            if has_base {
+                return None;
+            }
+            has_base = true;
+            if let Some(expression) = arg.expression() {
+                collected.push(CallArgSyntax::Base(expression));
+            } else {
+                collected.push(CallArgSyntax::BaseError(direct_error_child(arg.syntax())?));
+            }
+        } else if child.kind() == SyntaxKind::ERROR && !contains_attribute(&child) {
+            // Recovery creates no Arg node for an empty expression such as
+            // `call(, value)`. Keep its position so later stages see an Err
+            // argument instead of a call with a silently shortened list.
+            collected.push(CallArgSyntax::PositionalError(child));
+        }
+    }
+    Some(collected)
+}
+
+fn direct_error_child(syntax: &SyntaxNode) -> Option<SyntaxNode> {
+    syntax
+        .children()
+        .find(|child| child.kind() == SyntaxKind::ERROR && !contains_attribute(child))
+}
+
+fn contains_attribute(syntax: &SyntaxNode) -> bool {
+    syntax
+        .descendants()
+        .any(|node| node.kind() == SyntaxKind::ATTRIBUTE)
+}
+
+fn contains_call_arglist_error(syntax: &SyntaxNode) -> bool {
+    let root_call = ast::CallExpr::cast(syntax.clone());
+    root_call
+        .into_iter()
+        .chain(syntax.descendants().filter_map(ast::CallExpr::cast))
+        .any(|call| {
+            call.args()
+                .is_some_and(|args| contains_error_node(args.syntax()))
+        })
+}
+
+fn lower_call_expr<'hir>(
+    call: &ast::CallExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (Some(callee), Some(args)) = (call.callee(), collect_call_args(call)) else {
+        return lower_error_expr(call.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(call.syntax(), SpanCtxt::Root)?;
+    let callee = lower_expr_inner(&callee, arena, symbols, source_map)?;
+    let mut lowered_args = Vec::with_capacity(args.len());
+    let mut base = None;
+    for arg in args {
+        match arg {
+            CallArgSyntax::Positional(expression) => {
+                let expression = lower_expr_inner(&expression, arena, symbols, source_map)?;
+                lowered_args.push(Arg {
+                    name: None,
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::PositionalError(syntax) => {
+                let expression = lower_error_expr(&syntax, arena, source_map)?;
+                lowered_args.push(Arg {
+                    name: None,
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::Named { name, expression } => {
+                let name = lower_name_ref(&name, symbols, source_map)?;
+                let expression = lower_expr_inner(&expression, arena, symbols, source_map)?;
+                lowered_args.push(Arg {
+                    name: Some(name),
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::NamedError { name, syntax } => {
+                let name = lower_name_ref(&name, symbols, source_map)?;
+                let expression = lower_error_expr(&syntax, arena, source_map)?;
+                lowered_args.push(Arg {
+                    name: Some(name),
+                    expr: expression,
+                });
+            }
+            CallArgSyntax::Base(expression) => {
+                base = Some(lower_expr_inner(&expression, arena, symbols, source_map)?);
+            }
+            CallArgSyntax::BaseError(syntax) => {
+                base = Some(lower_error_expr(&syntax, arena, source_map)?);
+            }
+        }
+    }
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Call {
+            callee,
+            args: arena.alloc_args(&lowered_args),
+            base,
+        },
+        span,
+    }))
+}
+
 fn lower_bin_op(op: ast::BinOp) -> BinOp {
     match op {
         ast::BinOp::Or => BinOp::Or,
@@ -449,7 +627,8 @@ fn lower_error_expr<'hir>(
 }
 
 fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError> {
-    if contains_error_node(expression.syntax()) {
+    if contains_error_node(expression.syntax()) && !contains_call_arglist_error(expression.syntax())
+    {
         return Ok(());
     }
 
@@ -493,6 +672,24 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             Some(operand) => ensure_supported_expr(&operand),
             None => Ok(()),
         },
+        ast::Expr::Call(call) => {
+            let (Some(callee), Some(args)) = (call.callee(), collect_call_args(call)) else {
+                return Ok(());
+            };
+            ensure_supported_expr(&callee)?;
+            for arg in args {
+                let expression = match arg {
+                    CallArgSyntax::Positional(expression)
+                    | CallArgSyntax::Named { expression, .. }
+                    | CallArgSyntax::Base(expression) => expression,
+                    CallArgSyntax::PositionalError(_)
+                    | CallArgSyntax::NamedError { .. }
+                    | CallArgSyntax::BaseError(_) => continue,
+                };
+                ensure_supported_expr(&expression)?;
+            }
+            Ok(())
+        }
         ast::Expr::Path(path) if path.generic_args().is_none() => Ok(()),
         ast::Expr::Field(field) if !has_direct_generic_args(field.syntax()) => match field.base() {
             Some(base) => ensure_supported_expr(&base),
@@ -513,6 +710,7 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             }
             Ok(())
         }
+        _ if contains_error_node(expression.syntax()) => Ok(()),
         _ => Err(HirLoweringError::UnsupportedSyntax(
             expression.syntax().kind(),
         )),
@@ -2494,6 +2692,452 @@ mod tests {
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 2);
         assert!(map.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn lowers_calls_with_source_ordered_positional_named_and_base_arguments() {
+        let file = crate::FileId::new(87);
+        let source = "fn f() { (factory(1, named: value, ..base), object.method(first: 2, value), .Variant(3)) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("calls lower");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), 3);
+
+        let ExprKind::Call {
+            callee: first_callee,
+            args: first_args,
+            base: Some(base),
+        } = elements[0].kind
+        else {
+            panic!("the first call retains its record-update base");
+        };
+        assert!(matches!(first_callee.kind, ExprKind::Path(_)));
+        assert_eq!(first_args.len(), 2);
+        assert_eq!(first_args[0].name, None);
+        assert_eq!(
+            first_args[0].expr.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+        assert_eq!(
+            symbols
+                .resolve(first_args[1].name.expect("named argument").sym)
+                .expect("argument name resolves")
+                .as_ref(),
+            "named"
+        );
+        assert!(matches!(first_args[1].expr.kind, ExprKind::Path(_)));
+        assert!(matches!(base.kind, ExprKind::Path(_)));
+
+        let ExprKind::Call {
+            callee: method,
+            args: method_args,
+            base: None,
+        } = elements[1].kind
+        else {
+            panic!("the method call has no base argument");
+        };
+        assert!(matches!(method.kind, ExprKind::Field { .. }));
+        assert_eq!(method_args.len(), 2);
+        assert_eq!(
+            symbols
+                .resolve(method_args[0].name.expect("first named argument").sym)
+                .expect("argument name resolves")
+                .as_ref(),
+            "first"
+        );
+        assert_eq!(
+            method_args[0].expr.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(2),
+                negated: false,
+            })
+        );
+        assert_eq!(method_args[1].name, None);
+        assert!(matches!(method_args[1].expr.kind, ExprKind::Path(_)));
+
+        let ExprKind::Call {
+            callee: variant,
+            args: variant_args,
+            base: None,
+        } = elements[2].kind
+        else {
+            panic!("implicit variant construction is represented as a call");
+        };
+        let ExprKind::ImplicitMember(variant_name) = variant.kind else {
+            panic!("call callee is the implicit member");
+        };
+        assert_eq!(
+            symbols
+                .resolve(variant_name.sym)
+                .expect("variant name resolves")
+                .as_ref(),
+            "Variant"
+        );
+        assert_eq!(variant_args.len(), 1);
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                elements[0].hir_id.local_id.raw(),
+                first_callee.hir_id.local_id.raw(),
+                first_args[0].expr.hir_id.local_id.raw(),
+                first_args[1].expr.hir_id.local_id.raw(),
+                base.hir_id.local_id.raw(),
+                elements[1].hir_id.local_id.raw(),
+                method.hir_id.local_id.raw(),
+                elements[2].hir_id.local_id.raw(),
+                variant.hir_id.local_id.raw(),
+                variant_args[0].expr.hir_id.local_id.raw(),
+            ],
+            [1, 2, 3, 6, 7, 10, 13, 14, 22, 23, 24]
+        );
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 25);
+        let call_syntax = map
+            .syntax_for_node(elements[0].hir_id)
+            .expect("call has a source mapping")
+            .resolve(file, &parsed.root)
+            .expect("call syntax resolves");
+        assert_eq!(call_syntax.text_range(), elements[0].span.range);
+        assert_eq!(
+            &source[call_syntax.text_range().start().to_usize()
+                ..call_syntax.text_range().end().to_usize()],
+            "factory(1, named: value, ..base)"
+        );
+    }
+
+    #[test]
+    fn call_preflight_and_multiple_base_recovery_are_atomic() {
+        let file = crate::FileId::new(88);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { factory<I32>(value) }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let call = function
+            .descendants()
+            .find_map(ast::CallExpr::cast)
+            .expect("call expression");
+        let expression =
+            ast::Expr::cast(call.syntax().clone()).expect("call is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+
+        let file = crate::FileId::new(89);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { factory(..first, ..second) }\n");
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::BaseArgNotLast]
+        );
+        let function = function_node(&parsed.root);
+        let call = function
+            .descendants()
+            .find_map(ast::CallExpr::cast)
+            .expect("recovered call expression");
+        let expression =
+            ast::Expr::cast(call.syntax().clone()).expect("call is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("call recovers");
+        assert_eq!(lowered.kind, ExprKind::Err);
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 2);
+        assert!(map.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn call_argument_recovery_keeps_valid_arguments_and_preflights_them() {
+        let file = crate::FileId::new(90);
+        let source = "fn f() { (call(, 1), 2) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::ExpectedExpression]
+        );
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple containing the recovered call");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("call recovers");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("a malformed argument does not discard its enclosing tuple");
+        };
+        assert_eq!(elements.len(), 2);
+        let ExprKind::Call {
+            args, base: None, ..
+        } = elements[0].kind
+        else {
+            panic!("the call retains its HIR node");
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].expr.kind, ExprKind::Err);
+        assert_eq!(
+            args[1].expr.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+        assert_eq!(
+            elements[1].kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(2),
+                negated: false,
+            })
+        );
+
+        let map = source_map.finish();
+        let error_syntax = map
+            .syntax_for_node(args[0].expr.hir_id)
+            .expect("recovered argument has a source mapping")
+            .resolve(file, &parsed.root)
+            .expect("recovered argument syntax resolves");
+        assert_eq!(error_syntax.kind(), SyntaxKind::ERROR);
+        assert!(error_syntax.text_range().is_empty());
+        assert!(map.diagnostics().is_empty());
+
+        let file = crate::FileId::new(92);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { call(@inline 1) }\n");
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidAttributeTarget]
+        );
+        let function = function_node(&parsed.root);
+        let call = function
+            .descendants()
+            .find_map(ast::CallExpr::cast)
+            .expect("call with an invalid argument attribute");
+        let expression =
+            ast::Expr::cast(call.syntax().clone()).expect("call is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("call survives an invalid argument attribute");
+        let ExprKind::Call { args, .. } = lowered.kind else {
+            panic!("an attribute error is not an argument");
+        };
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            args[0].expr.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+
+        let file = crate::FileId::new(93);
+        let source = "fn f() { (call(named: @inline), call(..@inline)) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+                .count(),
+            2
+        );
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+                .count(),
+            2
+        );
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple containing incomplete named and base arguments");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("incomplete named and base arguments recover");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("incomplete arguments stay local to their calls");
+        };
+        let ExprKind::Call {
+            args: named_args,
+            base: None,
+            ..
+        } = elements[0].kind
+        else {
+            panic!("first expression is the named-argument call");
+        };
+        assert_eq!(named_args.len(), 1);
+        assert!(named_args[0].name.is_some());
+        assert_eq!(named_args[0].expr.kind, ExprKind::Err);
+
+        let ExprKind::Call {
+            args: base_args,
+            base: Some(base),
+            ..
+        } = elements[1].kind
+        else {
+            panic!("second expression is the base-argument call");
+        };
+        assert!(base_args.is_empty());
+        assert_eq!(base.kind, ExprKind::Err);
+
+        let map = source_map.finish();
+        for error_expr in [named_args[0].expr, base] {
+            let syntax = map
+                .syntax_for_node(error_expr.hir_id)
+                .expect("missing argument expression has a source mapping")
+                .resolve(file, &parsed.root)
+                .expect("missing argument syntax resolves");
+            assert_eq!(syntax.kind(), SyntaxKind::ERROR);
+            assert!(
+                syntax.text_range().is_empty(),
+                "attribute recovery must not steal the missing-expression source map"
+            );
+        }
+
+        let file = crate::FileId::new(94);
+        let source = "fn f() { (, call(@inline 1)) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ExpectedExpression)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+        );
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple with a missing element and an attributed call");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("tuple and nested call recover independently");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("the enclosing tuple remains available");
+        };
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0].kind, ExprKind::Err);
+        let ExprKind::Call { args, .. } = elements[1].kind else {
+            panic!("the valid call remains available");
+        };
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            args[0].expr.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        );
+        let map = source_map.finish();
+        let missing_element = map
+            .syntax_for_node(elements[0].hir_id)
+            .expect("missing tuple element has a source mapping")
+            .resolve(file, &parsed.root)
+            .expect("missing tuple element syntax resolves");
+        assert_eq!(missing_element.kind(), SyntaxKind::ERROR);
+        assert!(missing_element.text_range().is_empty());
+
+        let file = crate::FileId::new(91);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { call(, value<I32>) }\n");
+        let function = function_node(&parsed.root);
+        let call = function
+            .descendants()
+            .find_map(ast::CallExpr::cast)
+            .expect("call with a valid unsupported sibling argument");
+        let expression =
+            ast::Expr::cast(call.syntax().clone()).expect("call is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+        ));
+        assert_eq!(
+            source_map.finish().node_to_syntax().len(),
+            1,
+            "the malformed sibling must not bypass preflight of valid arguments"
+        );
     }
 
     #[test]
