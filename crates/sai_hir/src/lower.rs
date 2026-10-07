@@ -6,9 +6,11 @@ use crate::expressions::{
     FmtPiece, FmtSpec as HirFmtSpec, Label as HirLabel, LoopSource as HirLoopSource,
     MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
 };
+use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
+use crate::items::{HirOwner, Item, ItemKind, OwnerNode};
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
-use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
+use crate::source_map::{HirSourceMap, HirSourceMapBuilder, HirSourceMapError};
 use crate::types::{
     Bound as HirBound, BoundKind as HirBoundKind, ConstArg as HirConstArg,
     EffectRef as HirEffectRef, FnTraitKind, GenericArg as HirGenericArg,
@@ -17,8 +19,8 @@ use crate::types::{
     PathRoot, PathSegment, Provenance, Ty as HirTy, TyKind as HirTyKind, WherePred as HirWherePred,
 };
 use crate::{
-    BindingId, DefPathData, DefPathInternerError, DesugaringKind, LocalDefId, Mutability, Safety,
-    Span, SpanCtxt,
+    BindingId, DefPathData, DefPathInterner, DefPathInternerError, DesugaringKind, LocalDefId,
+    Mutability, OwnerId, Safety, Span, SpanCtxt,
 };
 use sai_diagnostics::Code;
 use sai_intern::{InternError, Interner};
@@ -37,7 +39,39 @@ pub enum HirLoweringError {
     Interner(InternError),
     DefPath(DefPathInternerError),
     DefPathInternerRequired,
+    ItemTree(ItemTreeError),
+    ItemTreeEntryMismatch,
     UnsupportedSyntax(SyntaxKind),
+}
+
+/// Inputs shared by owner-level lowering for one parsed workspace snapshot.
+pub struct HirLoweringContext<'source, 'hir> {
+    ast_ids: &'source ast::AstIdMap,
+    snapshot: &'source sai_vfs::WorkspaceSnapshot,
+    root: &'source SyntaxNode,
+    arena: &'hir HirArena<'hir>,
+    symbols: &'source Interner,
+    def_paths: &'source DefPathInterner,
+}
+
+impl<'source, 'hir> HirLoweringContext<'source, 'hir> {
+    pub fn new(
+        ast_ids: &'source ast::AstIdMap,
+        snapshot: &'source sai_vfs::WorkspaceSnapshot,
+        root: &'source SyntaxNode,
+        arena: &'hir HirArena<'hir>,
+        symbols: &'source Interner,
+        def_paths: &'source DefPathInterner,
+    ) -> Self {
+        Self {
+            ast_ids,
+            snapshot,
+            root,
+            arena,
+            symbols,
+            def_paths,
+        }
+    }
 }
 
 /// Lower a function declaration's signature and body within its HIR owner.
@@ -80,6 +114,216 @@ pub fn lower_function_with_generics<'hir>(
     HirLoweringError,
 > {
     lower_function_inner(declaration, arena, symbols, source_map, true)
+}
+
+/// Lower one top-level function entry from the current item tree into a
+/// complete HIR owner and its source map.
+///
+/// The item's `DefPath` must already be interned in the lowering context, and
+/// the caller must supply the definition allocated for this exact item,
+/// including its enclosing path and sibling disambiguator. The item tree,
+/// AST ID map, snapshot, and root must all describe the same file and snapshot.
+pub fn lower_function_owner<'hir>(
+    owner: OwnerId,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    if !item_tree.matches_ast_ids(context.ast_ids) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    if item_tree.file != context.ast_ids.file()
+        || !context.ast_ids.matches_root(item_tree.file, context.root)
+    {
+        return Err(HirSourceMapError::AstIdMapMismatch.into());
+    }
+    if !context.ast_ids.matches_snapshot(context.snapshot) {
+        return Err(HirSourceMapError::WorkspaceSnapshotMismatch.into());
+    }
+    let entry = item_tree
+        .items
+        .iter()
+        .find(|entry| entry.ast_id == item_id)
+        .filter(|entry| entry.kind == ItemTreeKind::Function)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let owner_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    if !matches!(
+        owner_path.data().last(),
+        Some(component) if component.data == DefPathData::ValueNs(entry.name)
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let function = context
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .and_then(ast::FnDecl::cast)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let source = context
+        .snapshot
+        .file(item_tree.file)
+        .ok_or(HirSourceMapError::WorkspaceSnapshotMismatch)?
+        .source()
+        .text();
+    let current_raw_attrs =
+        crate::item_tree::raw_attrs(item_tree.file, source, function.attrs(), context.symbols)?;
+    let visibility = function
+        .syntax()
+        .children()
+        .find_map(ast::Visibility::cast)
+        .map_or(crate::Visibility::Private, |visibility| {
+            if visibility.export_token().is_some() {
+                crate::Visibility::Export
+            } else if visibility.pub_token().is_some() {
+                crate::Visibility::Pub
+            } else {
+                crate::Visibility::Private
+            }
+        });
+    if !raw_attrs_match(&current_raw_attrs, &entry.raw_attrs) || visibility != entry.vis {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        function.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        function.name(),
+        function.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let (sig, generics, body) =
+        lower_function_with_generics(&function, context.arena, context.symbols, &mut source_map)?;
+    let span = source_map.span_for(function.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Fn {
+            sig,
+            generics: *generics,
+            has_body: function.body().is_some(),
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
+fn raw_attrs_match(current: &[RawAttr], item_tree: &[RawAttr]) -> bool {
+    current.len() == item_tree.len()
+        && current.iter().zip(item_tree).all(|(current, item_tree)| {
+            current == item_tree
+                && current.span == item_tree.span
+                && current.ptr.syntax_node_ptr() == item_tree.ptr.syntax_node_ptr()
+                && raw_attr_args_match(&current.args, &item_tree.args)
+        })
+}
+
+fn raw_attr_args_match(
+    current: &Option<Vec<RawAttrArg>>,
+    item_tree: &Option<Vec<RawAttrArg>>,
+) -> bool {
+    match (current, item_tree) {
+        (None, None) => true,
+        (Some(current), Some(item_tree)) => {
+            current.len() == item_tree.len()
+                && current
+                    .iter()
+                    .zip(item_tree)
+                    .all(|(current, item_tree)| raw_attr_arg_match(current, item_tree))
+        }
+        _ => false,
+    }
+}
+
+fn raw_attr_arg_match(current: &RawAttrArg, item_tree: &RawAttrArg) -> bool {
+    match (current, item_tree) {
+        (
+            RawAttrArg::Word {
+                name: current_name,
+                raw: current_raw,
+                args: current_args,
+                span: current_span,
+            },
+            RawAttrArg::Word {
+                name: item_tree_name,
+                raw: item_tree_raw,
+                args: item_tree_args,
+                span: item_tree_span,
+            },
+        ) => {
+            current_name == item_tree_name
+                && current_raw == item_tree_raw
+                && current_span == item_tree_span
+                && raw_attr_args_match(current_args, item_tree_args)
+        }
+        (
+            RawAttrArg::Str {
+                value: current_value,
+                span: current_span,
+            },
+            RawAttrArg::Str {
+                value: item_tree_value,
+                span: item_tree_span,
+            },
+        ) => current_value == item_tree_value && current_span == item_tree_span,
+        (
+            RawAttrArg::Int {
+                value: current_value,
+                span: current_span,
+            },
+            RawAttrArg::Int {
+                value: item_tree_value,
+                span: item_tree_span,
+            },
+        ) => current_value == item_tree_value && current_span == item_tree_span,
+        (
+            RawAttrArg::KeyValue {
+                key: current_key,
+                raw: current_raw,
+                value: current_value,
+                value_span: current_value_span,
+                span: current_span,
+            },
+            RawAttrArg::KeyValue {
+                key: item_tree_key,
+                raw: item_tree_raw,
+                value: item_tree_value,
+                value_span: item_tree_value_span,
+                span: item_tree_span,
+            },
+        ) => {
+            current_key == item_tree_key
+                && current_raw == item_tree_raw
+                && current_value == item_tree_value
+                && current_value_span == item_tree_value_span
+                && current_span == item_tree_span
+        }
+        _ => false,
+    }
 }
 
 fn lower_function_inner<'hir>(
@@ -863,6 +1107,12 @@ fn lower_function_effects<'hir>(
 impl From<HirSourceMapError> for HirLoweringError {
     fn from(error: HirSourceMapError) -> Self {
         Self::SourceMap(error)
+    }
+}
+
+impl From<ItemTreeError> for HirLoweringError {
+    fn from(error: ItemTreeError) -> Self {
+        Self::ItemTree(error)
     }
 }
 
@@ -5719,12 +5969,19 @@ mod tests {
     }
 
     fn owner_context(symbols: &Interner) -> (PackageInterner, DefPathInterner, OwnerId) {
+        let name = symbols.intern("f").expect("symbol interns");
+        owner_context_with_symbol(symbols, name)
+    }
+
+    fn owner_context_with_symbol(
+        symbols: &Interner,
+        name: Symbol,
+    ) -> (PackageInterner, DefPathInterner, OwnerId) {
         let packages = PackageInterner::new();
         let package = packages
             .intern("acme:closure-lowering#1.0")
             .expect("package interns");
         let paths = DefPathInterner::new(package, &packages, symbols).expect("path interner");
-        let name = symbols.intern("f").expect("symbol interns");
         let path = DefPath::new(
             package,
             vec![DisambiguatedDefPathData {
@@ -14054,6 +14311,257 @@ mod tests {
             paths.len().unwrap(),
             1,
             "legacy lowering does not intern generic parameter definitions"
+        );
+    }
+
+    #[test]
+    fn lowers_item_tree_function_into_complete_hir_owner() {
+        let file = crate::FileId::new(229);
+        let source = "@inline\n@deprecated(\"reason\")\npub fn f<T: Clone>(value: T) -> T where T: Copy { value }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("function item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Function);
+        let entry_id = entry.ast_id;
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) = lower_function_owner(owner, &item_tree, entry_id, &context)
+            .expect("function item lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.body.expect("function has a body").owner, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 2);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Inline
+        );
+        assert_eq!(
+            hir_owner.raw_attrs[1].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level function is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        assert_eq!(symbols.resolve(item.name.sym).unwrap().as_ref(), "f");
+        let ItemKind::Fn {
+            sig,
+            generics,
+            has_body,
+        } = item.kind
+        else {
+            panic!("function item retains its function kind");
+        };
+        assert_eq!(sig.params.len(), 1);
+        assert_eq!(generics.params.len(), 1);
+        assert_eq!(generics.where_preds.len(), 1);
+        assert!(has_body);
+        let owner_node = crate::HirId {
+            owner,
+            local_id: crate::ItemLocalId::default(),
+        };
+        assert_eq!(
+            source_map
+                .syntax_for_node(owner_node)
+                .expect("owner has a source-map entry")
+                .text_range(),
+            function_node(&parsed.root).text_range()
+        );
+        assert_eq!(
+            item.span.range,
+            function_node(&parsed.root).text_range(),
+            "the HIR item span covers the function declaration"
+        );
+        assert_eq!(paths.len().unwrap(), 2);
+
+        let mut stale_item_tree = item_tree.clone();
+        stale_item_tree.items[0].vis = crate::Visibility::Private;
+        assert!(matches!(
+            lower_function_owner(owner, &stale_item_tree, entry_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            2,
+            "a stale visibility snapshot is rejected before lowering generic paths"
+        );
+
+        let mut stale_attributes = item_tree.clone();
+        stale_attributes.items[0].raw_attrs.clear();
+        assert!(matches!(
+            lower_function_owner(owner, &stale_attributes, entry_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            2,
+            "stale attributes are rejected before lowering generic paths"
+        );
+
+        let mut changed_attributes = item_tree.clone();
+        changed_attributes.items[0].raw_attrs[0].args = Some(Vec::new());
+        assert!(matches!(
+            lower_function_owner(owner, &changed_attributes, entry_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+
+        let mut stale_argument_span = item_tree.clone();
+        let attr = &mut stale_argument_span.items[0].raw_attrs[1];
+        let argument = &mut attr.args.as_mut().expect("attribute has args")[0];
+        let RawAttrArg::Str { span, .. } = argument else {
+            panic!("deprecated attribute has a string argument");
+        };
+        *span = attr.span;
+        assert!(matches!(
+            lower_function_owner(owner, &stale_argument_span, entry_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+
+        let wrong_name = symbols.intern("other").expect("symbol interns");
+        let (_other_packages, other_paths, other_owner) =
+            owner_context_with_symbol(&symbols, wrong_name);
+        let other_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &other_paths,
+        );
+        assert!(matches!(
+            lower_function_owner(other_owner, &item_tree, entry_id, &other_context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+    }
+
+    #[test]
+    fn function_owner_recovers_invalid_raw_function_names() {
+        let file = crate::FileId::new(231);
+        let source = "fn r#self() {}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InvalidRawIdent)
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects a diagnosed function");
+        let entry = item_tree.items.first().expect("function item entry");
+        assert!(entry.name.is_error());
+        let (_packages, paths, owner) = owner_context_with_symbol(&symbols, crate::Symbol::ERROR);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) = lower_function_owner(owner, &item_tree, entry.ast_id, &context)
+            .expect("a parser-diagnosed name still lowers the function body");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("function is represented by an item owner");
+        };
+        assert!(item.name.sym.is_error());
+        assert!(hir_owner.body.is_some());
+    }
+
+    #[test]
+    fn function_owner_recovers_reserved_function_names() {
+        let file = crate::FileId::new(232);
+        let source = "fn null() {}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.iter().any(|error| error.code == Code::NoNull));
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects a diagnosed function");
+        let entry = item_tree.items.first().expect("function item entry");
+        assert!(entry.name.is_error());
+        let (_packages, paths, owner) = owner_context_with_symbol(&symbols, crate::Symbol::ERROR);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) = lower_function_owner(owner, &item_tree, entry.ast_id, &context)
+            .expect("a parser-diagnosed reserved name still lowers the function body");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("function is represented by an item owner");
+        };
+        assert!(item.name.sym.is_error());
+        assert!(hir_owner.body.is_some());
+    }
+
+    #[test]
+    fn function_owner_lowering_rejects_non_function_item_entries() {
+        let file = crate::FileId::new(230);
+        let source = "const VALUE: I32 = 1\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry_id = item_tree.items[0].ast_id;
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        assert!(matches!(
+            lower_function_owner(owner, &item_tree, entry_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "rejecting an unrelated owner does not intern extra definitions"
+        );
+    }
+
+    #[test]
+    fn function_owner_rejects_item_tree_from_an_older_snapshot() {
+        let file = crate::FileId::new(233);
+        let old_source = "fn f() {}\n";
+        let (_old_snapshot, old_parsed, old_ast_ids) = parse_file(file, old_source);
+        let symbols = Interner::new();
+        let old_item_tree =
+            ItemTree::collect(file, old_source, &old_parsed.root, &old_ast_ids, &symbols)
+                .expect("old item tree collects");
+        let stale_item_id = old_item_tree.items[0].ast_id;
+
+        let current_source = "fn f() { 1 }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, current_source);
+        let current_item_tree =
+            ItemTree::collect(file, current_source, &parsed.root, &ast_ids, &symbols)
+                .expect("current item tree collects");
+        assert_eq!(
+            old_item_tree, current_item_tree,
+            "snapshot binding does not affect structural incremental equality"
+        );
+        assert!(
+            !old_item_tree.matches_ast_ids(&ast_ids),
+            "a same-file AST map from another snapshot does not match"
+        );
+        assert!(current_item_tree.matches_ast_ids(&ast_ids));
+
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        assert!(matches!(
+            lower_function_owner(owner, &old_item_tree, stale_item_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "stale item trees are rejected before generic definition paths are interned"
         );
     }
 

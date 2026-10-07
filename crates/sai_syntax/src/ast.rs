@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, marker::PhantomData};
 
-use sai_vfs::{FileId, WorkspaceSnapshot};
+use sai_vfs::{FileId, WorkspaceSnapshot, WorkspaceSnapshotId};
 
 use crate::red::RootIdentity;
 use crate::{
@@ -205,6 +205,17 @@ impl AstIdMap {
 
     pub const fn file(&self) -> FileId {
         self.file
+    }
+
+    /// Return the workspace snapshot identity for this map's root.
+    ///
+    /// `None` is reserved for maps built from unbound trees; `AstIdMap::new`
+    /// currently rejects those roots.
+    pub fn snapshot_id(&self) -> Option<WorkspaceSnapshotId> {
+        match self.identity {
+            RootIdentity::Snapshot { id, .. } => Some(id),
+            RootIdentity::Tree(_) => None,
+        }
     }
 
     pub fn len(&self) -> usize {

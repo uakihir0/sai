@@ -4,7 +4,7 @@ use sai_syntax::{
     GreenElement, SyntaxElement, SyntaxKind, SyntaxNode,
     ast::{self, AstNode, AstToken},
 };
-use sai_vfs::{FileId, Span, TextRange};
+use sai_vfs::{FileId, Span, TextRange, WorkspaceSnapshotId};
 
 pub use sai_syntax::ast::ErasedAstId;
 
@@ -252,6 +252,8 @@ pub struct ItemTreeEntry {
 #[derive(Clone, Debug)]
 pub struct ItemTree {
     pub file: FileId,
+    /// Snapshot that supplied the AST pointers; ignored by structural equality.
+    snapshot_id: WorkspaceSnapshotId,
     /// Inner module documentation has a separate syntax role from attributes.
     pub module_docs: Option<ast::AstPtr<ast::Docs>>,
     /// Source text used to compare module documentation across snapshots.
@@ -285,6 +287,11 @@ pub enum ItemTreeError {
 }
 
 impl ItemTree {
+    /// Whether this item tree was collected from the AST map's exact snapshot.
+    pub fn matches_ast_ids(&self, ast_ids: &ast::AstIdMap) -> bool {
+        self.file == ast_ids.file() && ast_ids.snapshot_id() == Some(self.snapshot_id)
+    }
+
     pub fn collect(
         file: FileId,
         source: &str,
@@ -298,9 +305,11 @@ impl ItemTree {
         if !green_text_matches_source(root, source) {
             return Err(ItemTreeError::SourceMismatch);
         }
+        let snapshot_id = ast_ids.snapshot_id().ok_or(ItemTreeError::FileMismatch)?;
         let source_file = ast::SourceFile::cast(root.clone()).ok_or(ItemTreeError::FileMismatch)?;
         let mut tree = Self {
             file,
+            snapshot_id,
             module_docs: None,
             module_docs_text: None,
             is_unsafe_module: false,
@@ -1200,7 +1209,13 @@ fn name_symbol<N: AstNode>(
     symbols: &Interner,
 ) -> Result<Symbol, ItemTreeError> {
     let text = node_text(source, name.syntax())?;
-    let text = text.strip_prefix("r#").unwrap_or(text);
+    let raw_name = text.strip_prefix("r#");
+    if matches!(raw_name, Some("self" | "Self" | "_"))
+        || (raw_name.is_none() && sai_syntax::is_reserved_identifier(text))
+    {
+        return Ok(Symbol::ERROR);
+    }
+    let text = raw_name.unwrap_or(text);
     let text = sai_syntax::normalize_identifier(text);
     symbols.intern(&text).map_err(ItemTreeError::Interner)
 }
@@ -1219,7 +1234,7 @@ fn direct_visibility(node: &SyntaxNode, default: crate::Visibility) -> crate::Vi
         })
 }
 
-fn raw_attrs(
+pub(crate) fn raw_attrs(
     file: FileId,
     source: &str,
     attrs: impl Iterator<Item = ast::Attribute>,
@@ -1520,6 +1535,28 @@ mod tests {
             assert!(AttrName::from_source_name(name).is_some(), "{name}");
         }
         assert!(AttrName::from_source_name("r#derive").is_none());
+    }
+
+    #[test]
+    fn invalid_and_reserved_item_names_use_the_error_symbol() {
+        for (index, (source, diagnostic)) in [
+            ("fn r#self() {}\n", sai_diagnostics::Code::InvalidRawIdent),
+            ("fn null() {}\n", sai_diagnostics::Code::NoNull),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (parsed, _symbols, tree) = collect(source, FileId::new(700 + index as u32));
+
+            assert!(
+                parsed.errors.iter().any(|error| error.code == diagnostic),
+                "the parser reports the invalid name in {source:?}"
+            );
+            assert!(
+                tree.items[0].name.is_error(),
+                "ItemTree agrees with HIR name recovery for {source:?}"
+            );
+        }
     }
 
     #[test]

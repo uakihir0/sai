@@ -8913,6 +8913,7 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
         let root = crate::SyntaxNode::new_root_in_snapshot(output.root, file, &snapshot)
             .expect("green tree matches the file in this snapshot");
         let map = AstIdMap::new(file, &root).expect("item count fits ErasedAstId");
+        assert_eq!(map.snapshot_id(), Some(snapshot.id()));
         assert!(matches!(
             AstIdMap::new(FileId::new(8), &root),
             Err(AstIdMapError::FileMismatch)
@@ -8948,6 +8949,11 @@ let large = f"{value:pad(340282366920938463463374607431768211456)}"
             .root;
         let same_source_map =
             AstIdMap::new(file, &same_source_root).expect("same-source snapshot map");
+        assert_eq!(
+            same_source_map.snapshot_id(),
+            Some(same_source_snapshot.id())
+        );
+        assert_ne!(map.snapshot_id(), same_source_map.snapshot_id());
         let same_source_test = same_source_root
             .descendants()
             .find_map(TestDecl::cast)
