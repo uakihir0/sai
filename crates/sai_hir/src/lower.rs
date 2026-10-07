@@ -1,11 +1,11 @@
 use crate::Symbol;
 use crate::arena::HirArena;
-use crate::expressions::{Expr, ExprKind};
+use crate::expressions::{BinOp, Expr, ExprKind, UnOp};
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use crate::types::{Name, Path, PathRoot, PathSegment};
-use crate::{BindingId, SpanCtxt};
+use crate::{BindingId, Mutability, SpanCtxt};
 use sai_diagnostics::Code;
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
@@ -46,13 +46,24 @@ pub fn lower_literal<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
-    let (hir_id, span) = source_map.add_node_with_span(literal.syntax(), SpanCtxt::Root)?;
-    let kind = if contains_error_node(literal.syntax()) {
+    lower_literal_with_sign(literal, literal.syntax(), false, arena, symbols, source_map)
+}
+
+fn lower_literal_with_sign<'hir>(
+    literal: &ast::LiteralExpr,
+    expression_syntax: &SyntaxNode,
+    negated: bool,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(expression_syntax, SpanCtxt::Root)?;
+    let kind = if contains_error_node(expression_syntax) {
         ExprKind::Err
     } else {
         literal
             .token()
-            .map(|token| decode_literal(token, arena, symbols, true, false))
+            .map(|token| decode_literal(token, arena, symbols, true, negated))
             .transpose()?
             .flatten()
             .map(ExprKind::Lit)
@@ -86,6 +97,8 @@ fn lower_expr_inner<'hir>(
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     match expression {
         ast::Expr::Literal(literal) => lower_literal(literal, arena, symbols, source_map),
+        ast::Expr::Binary(binary) => lower_binary_expr(binary, arena, symbols, source_map),
+        ast::Expr::Prefix(prefix) => lower_prefix_expr(prefix, arena, symbols, source_map),
         ast::Expr::Path(path) => lower_path_expr(path, arena, symbols, source_map),
         ast::Expr::SelfValue(self_value) => {
             lower_root_path_expr(self_value.syntax(), PathRoot::SelfValue, arena, source_map)
@@ -247,6 +260,83 @@ fn lower_tuple_index_expr<'hir>(
     }))
 }
 
+fn lower_binary_expr<'hir>(
+    binary: &ast::BinExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (Some(lhs), Some(rhs), Some((_, op))) = (binary.lhs(), binary.rhs(), binary.op()) else {
+        return lower_error_expr(binary.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(binary.syntax(), SpanCtxt::Root)?;
+    let lhs = lower_expr_inner(&lhs, arena, symbols, source_map)?;
+    let rhs = lower_expr_inner(&rhs, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Binary(lower_bin_op(op), lhs, rhs),
+        span,
+    }))
+}
+
+fn lower_prefix_expr<'hir>(
+    prefix: &ast::PrefixExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (Some((_, op)), Some(operand)) = (prefix.op(), prefix.operand()) else {
+        return lower_error_expr(prefix.syntax(), arena, source_map);
+    };
+    if op == ast::PrefixOp::Neg
+        && let ast::Expr::Literal(ref literal) = operand
+        && matches!(
+            literal.token(),
+            Some(ast::LiteralToken::Int(_) | ast::LiteralToken::Float(_))
+        )
+    {
+        return lower_literal_with_sign(literal, prefix.syntax(), true, arena, symbols, source_map);
+    }
+
+    let (hir_id, span) = source_map.add_node_with_span(prefix.syntax(), SpanCtxt::Root)?;
+    let operand = lower_expr_inner(&operand, arena, symbols, source_map)?;
+    let kind = match op {
+        ast::PrefixOp::Neg => ExprKind::Unary(UnOp::Neg, operand),
+        ast::PrefixOp::BitNot => ExprKind::Unary(UnOp::BitNot, operand),
+        ast::PrefixOp::Deref => ExprKind::Unary(UnOp::Deref, operand),
+        ast::PrefixOp::Not => ExprKind::Unary(UnOp::Not, operand),
+        ast::PrefixOp::Borrow => ExprKind::Borrow(Mutability::Not, operand),
+        ast::PrefixOp::BorrowMut => ExprKind::Borrow(Mutability::Mut, operand),
+    };
+    Ok(arena.alloc_expr(Expr { hir_id, kind, span }))
+}
+
+fn lower_bin_op(op: ast::BinOp) -> BinOp {
+    match op {
+        ast::BinOp::Or => BinOp::Or,
+        ast::BinOp::And => BinOp::And,
+        ast::BinOp::Eq => BinOp::Eq,
+        ast::BinOp::Ne => BinOp::Ne,
+        ast::BinOp::Lt => BinOp::Lt,
+        ast::BinOp::Le => BinOp::Le,
+        ast::BinOp::Gt => BinOp::Gt,
+        ast::BinOp::Ge => BinOp::Ge,
+        ast::BinOp::BitOr => BinOp::BitOr,
+        ast::BinOp::BitXor => BinOp::BitXor,
+        ast::BinOp::BitAnd => BinOp::BitAnd,
+        ast::BinOp::Shl => BinOp::Shl,
+        ast::BinOp::Shr => BinOp::Shr,
+        ast::BinOp::Add => BinOp::Add,
+        ast::BinOp::Sub => BinOp::Sub,
+        ast::BinOp::WrappingAdd => BinOp::WrapAdd,
+        ast::BinOp::WrappingSub => BinOp::WrapSub,
+        ast::BinOp::Mul => BinOp::Mul,
+        ast::BinOp::Div => BinOp::Div,
+        ast::BinOp::Rem => BinOp::Rem,
+        ast::BinOp::WrappingMul => BinOp::WrapMul,
+    }
+}
+
 fn lower_error_expr<'hir>(
     syntax: &SyntaxNode,
     arena: &'hir HirArena<'hir>,
@@ -267,6 +357,17 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
 
     match expression {
         ast::Expr::Literal(_) | ast::Expr::SelfValue(_) | ast::Expr::SelfType(_) => Ok(()),
+        ast::Expr::Binary(binary) => {
+            let (Some(lhs), Some(rhs), Some(_)) = (binary.lhs(), binary.rhs(), binary.op()) else {
+                return Ok(());
+            };
+            ensure_supported_expr(&lhs)?;
+            ensure_supported_expr(&rhs)
+        }
+        ast::Expr::Prefix(prefix) => match (prefix.op(), prefix.operand()) {
+            (Some(_), Some(operand)) => ensure_supported_expr(&operand),
+            _ => Ok(()),
+        },
         ast::Expr::Path(path) if path.generic_args().is_none() => Ok(()),
         ast::Expr::Field(field) if !has_direct_generic_args(field.syntax()) => match field.base() {
             Some(base) => ensure_supported_expr(&base),
@@ -1280,13 +1381,11 @@ fn decode_literal<'hir>(
             value: token.value(),
             negated,
         }),
-        ast::LiteralToken::Float(token)
-            if allow_float && !negated && !token.syntax().has_error() =>
-        {
+        ast::LiteralToken::Float(token) if allow_float && !token.syntax().has_error() => {
             let text = token.syntax().text().replace('_', "");
             Some(Lit::Float {
                 text: symbols.intern(&text)?,
-                negated: false,
+                negated,
             })
         }
         ast::LiteralToken::String(token) if !negated => {
@@ -1791,6 +1890,206 @@ mod tests {
         assert!(
             map.diagnostics().is_empty(),
             "the parser's INVALID_TUPLE_INDEX diagnostic remains authoritative"
+        );
+    }
+
+    #[test]
+    fn lowers_all_binary_operators_with_parent_first_ids() {
+        let cases = [
+            ("or", BinOp::Or),
+            ("and", BinOp::And),
+            ("==", BinOp::Eq),
+            ("!=", BinOp::Ne),
+            ("<", BinOp::Lt),
+            ("<=", BinOp::Le),
+            (">", BinOp::Gt),
+            (">=", BinOp::Ge),
+            ("|", BinOp::BitOr),
+            ("^", BinOp::BitXor),
+            ("&", BinOp::BitAnd),
+            ("<<", BinOp::Shl),
+            (">>", BinOp::Shr),
+            ("+", BinOp::Add),
+            ("-", BinOp::Sub),
+            ("+%", BinOp::WrapAdd),
+            ("-%", BinOp::WrapSub),
+            ("*", BinOp::Mul),
+            ("/", BinOp::Div),
+            ("%", BinOp::Rem),
+            ("*%", BinOp::WrapMul),
+            ("||", BinOp::Or),
+            ("&&", BinOp::And),
+        ];
+        let source = format!(
+            "fn f() {{ ({}) }}\n",
+            cases
+                .iter()
+                .map(|(operator, _)| format!("left {operator} right"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let file = crate::FileId::new(77);
+        let (snapshot, parsed, ast_ids) = parse_file(file, &source);
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::UseAndOr, Code::UseAndOr]
+        );
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("binary lowers");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), cases.len());
+        assert_eq!(lowered.hir_id.local_id.raw(), 1);
+        for (index, (element, (_, expected_op))) in elements.iter().zip(cases).enumerate() {
+            let ExprKind::Binary(op, lhs, rhs) = element.kind else {
+                panic!("tuple element {index} is binary");
+            };
+            assert_eq!(op, expected_op, "operator at tuple element {index}");
+            assert!(matches!(lhs.kind, ExprKind::Path(_)));
+            assert!(matches!(rhs.kind, ExprKind::Path(_)));
+            assert_eq!(element.hir_id.local_id.raw(), 2 + index as u32 * 7);
+            assert_eq!(lhs.hir_id.local_id.raw(), element.hir_id.local_id.raw() + 1);
+            assert_eq!(rhs.hir_id.local_id.raw(), element.hir_id.local_id.raw() + 4);
+        }
+        assert_eq!(
+            source_map.finish().node_to_syntax().len(),
+            2 + cases.len() * 7,
+            "the source map also contains the owner node"
+        );
+    }
+
+    #[test]
+    fn lowers_prefix_operators_and_folds_negative_numeric_literals() {
+        let file = crate::FileId::new(78);
+        let source = "fn f() { (-12, -1.25, -value, ~mask, *pointer, not condition, borrow value, borrow mut value, -true) }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let tuple = function
+            .descendants()
+            .find_map(ast::TupleExpr::cast)
+            .expect("tuple expression");
+        let expression =
+            ast::Expr::cast(tuple.syntax().clone()).expect("tuple is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("prefixes lower");
+        let ExprKind::Tuple(elements) = lowered.kind else {
+            panic!("outer expression is a tuple");
+        };
+        assert_eq!(elements.len(), 9);
+        assert_eq!(
+            elements[0].kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(12),
+                negated: true,
+            })
+        );
+        assert_eq!(
+            elements[1].kind,
+            ExprKind::Lit(Lit::Float {
+                text: symbols.intern("1.25").expect("float spelling interns"),
+                negated: true,
+            })
+        );
+        assert!(matches!(
+            elements[2].kind,
+            ExprKind::Unary(UnOp::Neg, operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[3].kind,
+            ExprKind::Unary(UnOp::BitNot, operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[4].kind,
+            ExprKind::Unary(UnOp::Deref, operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[5].kind,
+            ExprKind::Unary(UnOp::Not, operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[6].kind,
+            ExprKind::Borrow(Mutability::Not, operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[7].kind,
+            ExprKind::Borrow(Mutability::Mut, operand) if matches!(operand.kind, ExprKind::Path(_))
+        ));
+        assert!(matches!(
+            elements[8].kind,
+            ExprKind::Unary(UnOp::Neg, operand)
+                if operand.kind == ExprKind::Lit(Lit::Bool(true))
+        ));
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 30);
+        let negative_float = map
+            .syntax_for_node(elements[1].hir_id)
+            .expect("folded float has a source mapping")
+            .resolve(file, &parsed.root)
+            .expect("negative float syntax resolves");
+        assert_eq!(negative_float.text_range(), elements[1].span.range);
+        assert_eq!(
+            &source[negative_float.text_range().start().to_usize()
+                ..negative_float.text_range().end().to_usize()],
+            "-1.25",
+            "a folded negative literal maps to the whole prefix expression"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_binary_children_before_allocating_nodes() {
+        let file = crate::FileId::new(79);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (left + value<I32>) }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let binary = function
+            .descendants()
+            .find_map(ast::BinExpr::cast)
+            .expect("binary expression");
+        let expression = ast::Expr::cast(binary.syntax().clone())
+            .expect("binary expression is an expression variant");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
+        ));
+        assert_eq!(
+            source_map.finish().node_to_syntax().len(),
+            1,
+            "preflight rejects the generic path before allocating its binary or tuple parents"
         );
     }
 
