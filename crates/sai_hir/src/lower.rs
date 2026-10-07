@@ -1,8 +1,9 @@
 use crate::Symbol;
 use crate::arena::HirArena;
 use crate::expressions::{
-    Arg, Arm as HirArm, BinOp, Block as HirBlock, Expr, ExprKind, Label as HirLabel,
-    LoopSource as HirLoopSource, MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
+    Arg, Arm as HirArm, BinOp, Block as HirBlock, Expr, ExprKind, FmtPiece, FmtSpec as HirFmtSpec,
+    Label as HirLabel, LoopSource as HirLoopSource, MatchSource as HirMatchSource, Stmt as HirStmt,
+    StmtKind, UnOp,
 };
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
@@ -54,6 +55,60 @@ pub fn lower_literal<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     lower_literal_with_sign(literal, literal.syntax(), false, arena, symbols, source_map)
+}
+
+fn lower_format_string_expr<'hir>(
+    format_string: &ast::FStringExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(format_string.syntax(), SpanCtxt::Root)?;
+    let mut interpolation_nodes = format_string
+        .syntax()
+        .children()
+        .filter_map(ast::FStringInterp::cast);
+    let mut pieces = Vec::new();
+    for piece in format_string.pieces() {
+        match piece {
+            ast::FStringPiece::Text(text) => {
+                pieces.push(FmtPiece::Text(symbols.intern(text.as_ref())?));
+            }
+            ast::FStringPiece::Interp { expr, spec } => {
+                let interpolation = interpolation_nodes
+                    .next()
+                    .expect("each typed f-string interpolation has a syntax node");
+                let interpolation_error = interpolation
+                    .syntax()
+                    .descendants()
+                    .find(|node| node.kind() == SyntaxKind::ERROR);
+                let expr = match (expr, interpolation_error) {
+                    (_, Some(error)) => lower_error_expr(&error, arena, source_map)?,
+                    (Some(expr), None) => lower_expr_inner(&expr, arena, symbols, source_map)?,
+                    (None, None) => lower_error_expr(interpolation.syntax(), arena, source_map)?,
+                };
+                let spec = spec
+                    .map(|spec| -> Result<HirFmtSpec, HirLoweringError> {
+                        Ok(HirFmtSpec {
+                            name: symbols.intern(&sai_syntax::normalize_identifier(spec.name()))?,
+                            arg: spec.arg(),
+                            span: Span {
+                                file: span.file,
+                                range: spec.syntax().text_range(),
+                                ctxt: SpanCtxt::Root,
+                            },
+                        })
+                    })
+                    .transpose()?;
+                pieces.push(FmtPiece::Arg { expr, spec });
+            }
+        }
+    }
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::FormatString(arena.alloc_fmt_pieces(&pieces)),
+        span,
+    }))
 }
 
 fn lower_literal_with_sign<'hir>(
@@ -468,6 +523,7 @@ pub fn lower_expr<'hir>(
     if contains_error_node(expression.syntax())
         && !contains_call_arglist_error(expression.syntax())
         && !errors_are_in_recoverable_block_statements(expression.syntax())
+        && !errors_are_in_recoverable_format_interpolations(expression.syntax())
         && !errors_are_in_casts(expression.syntax())
     {
         return lower_error_expr(expression.syntax(), arena, source_map);
@@ -483,6 +539,9 @@ fn lower_expr_inner<'hir>(
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     match expression {
         ast::Expr::Literal(literal) => lower_literal(literal, arena, symbols, source_map),
+        ast::Expr::FormatString(format_string) => {
+            lower_format_string_expr(format_string, arena, symbols, source_map)
+        }
         ast::Expr::Binary(binary) => lower_binary_expr(binary, arena, symbols, source_map),
         ast::Expr::Prefix(prefix) => lower_prefix_expr(prefix, arena, symbols, source_map),
         ast::Expr::Range(range) => lower_range_expr(range, arena, symbols, source_map),
@@ -2781,6 +2840,18 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             }
             Ok(())
         }
+        ast::Expr::FormatString(format_string) => {
+            for piece in format_string.pieces() {
+                if let ast::FStringPiece::Interp {
+                    expr: Some(expression),
+                    ..
+                } = piece
+                {
+                    ensure_supported_expr(&expression)?;
+                }
+            }
+            Ok(())
+        }
         ast::Expr::Block(block_expr) => match block_expr.block() {
             Some(block) => ensure_supported_block(&block),
             None => Ok(()),
@@ -4064,6 +4135,28 @@ fn errors_are_in_casts(syntax: &SyntaxNode) -> bool {
             .all(|error| error_belongs_to_cast(error, syntax))
 }
 
+fn errors_are_in_recoverable_format_interpolations(syntax: &SyntaxNode) -> bool {
+    let errors = syntax
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::ERROR)
+        .collect::<Vec<_>>();
+    !errors.is_empty()
+        && errors.iter().all(|error| {
+            let mut ancestor = Some(error.clone());
+            let mut in_interpolation = false;
+            let mut in_format_string = false;
+            while let Some(node) = ancestor {
+                in_interpolation |= node.kind() == SyntaxKind::FSTRING_INTERP;
+                in_format_string |= node.kind() == SyntaxKind::FSTRING_EXPR;
+                if node.kind() == syntax.kind() && node.text_range() == syntax.text_range() {
+                    return in_interpolation && in_format_string;
+                }
+                ancestor = node.parent();
+            }
+            false
+        })
+}
+
 fn error_belongs_to_cast(error: &SyntaxNode, root: &SyntaxNode) -> bool {
     let mut ancestor = Some(error.clone());
     while let Some(node) = ancestor {
@@ -5006,6 +5099,226 @@ mod tests {
 
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), literals.len() + 1);
+    }
+
+    #[test]
+    fn lowers_format_strings_with_decoded_text_specs_and_source_spans() {
+        let file = crate::FileId::new(197);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            r###"fn f(name: Str, age: I32) { f"Hello {{name}} {name}, age {age:pad(3)}!" }
+"###,
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let format_string = function
+            .descendants()
+            .find_map(ast::FStringExpr::cast)
+            .expect("format string expression");
+        let expression =
+            ast::Expr::cast(format_string.syntax().clone()).expect("format string expression AST");
+        let source_interpolations = format_string
+            .syntax()
+            .children()
+            .filter_map(ast::FStringInterp::cast)
+            .collect::<Vec<_>>();
+        let source_spec = format_string
+            .syntax()
+            .descendants()
+            .find_map(|node| {
+                node.children_with_tokens()
+                    .find_map(|element| match element {
+                        SyntaxElement::Token(token) => ast::FormatSpec::cast(token),
+                        SyntaxElement::Node(_) => None,
+                    })
+            })
+            .expect("format spec token");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("format lowers");
+        let ExprKind::FormatString(pieces) = lowered.kind else {
+            panic!("format string remains an ExprKind::FormatString");
+        };
+
+        assert_eq!(lowered.hir_id.local_id.raw(), 1);
+        assert_eq!(lowered.span.range, format_string.syntax().text_range());
+        assert_eq!(lowered.span.ctxt, SpanCtxt::Root);
+        assert_eq!(pieces.len(), 5);
+        let FmtPiece::Text(text) = pieces[0] else {
+            panic!("the first piece is decoded text");
+        };
+        assert_eq!(symbols.resolve(text).unwrap().as_ref(), "Hello {name} ");
+        let FmtPiece::Arg {
+            expr: first_arg,
+            spec: None,
+        } = pieces[1]
+        else {
+            panic!("the first interpolation has no format spec");
+        };
+        assert_eq!(first_arg.span.ctxt, SpanCtxt::Root);
+        assert_eq!(
+            first_arg.span.range,
+            source_interpolations[0]
+                .syntax()
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::PATH_EXPR)
+                .expect("first interpolation expression")
+                .text_range()
+        );
+        let FmtPiece::Text(text) = pieces[2] else {
+            panic!("the middle piece is text");
+        };
+        assert_eq!(symbols.resolve(text).unwrap().as_ref(), ", age ");
+        let FmtPiece::Arg {
+            expr: second_arg,
+            spec: Some(spec),
+        } = pieces[3]
+        else {
+            panic!("the second interpolation carries its format spec");
+        };
+        assert_eq!(spec.name, symbols.intern("pad").unwrap());
+        assert_eq!(spec.arg, Some(3));
+        assert_eq!(spec.span.file, file);
+        assert_eq!(spec.span.range, source_spec.syntax().text_range());
+        assert_eq!(spec.span.ctxt, SpanCtxt::Root);
+        assert_eq!(second_arg.span.ctxt, SpanCtxt::Root);
+        let FmtPiece::Text(text) = pieces[4] else {
+            panic!("the final piece is text");
+        };
+        assert_eq!(symbols.resolve(text).unwrap().as_ref(), "!");
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 8);
+    }
+
+    #[test]
+    fn format_string_preflight_rejects_unsupported_interpolations_before_allocation() {
+        let file = crate::FileId::new(198);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { f\"{fn() {}}\" }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let format_string = function
+            .descendants()
+            .find_map(ast::FStringExpr::cast)
+            .expect("format string expression");
+        let expression =
+            ast::Expr::cast(format_string.syntax().clone()).expect("format string expression AST");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(
+                SyntaxKind::CLOSURE_EXPR
+            ))
+        ));
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 1);
+        assert!(map.binding_to_syntax().is_empty());
+    }
+
+    #[test]
+    fn malformed_format_string_text_keeps_the_ast_decoder_recovery_value() {
+        let file = crate::FileId::new(199);
+        let (snapshot, parsed, ast_ids) = parse_file(file, r#"fn f() { f"bad\q" }"#);
+        let function = function_node(&parsed.root);
+        let format_string = function
+            .descendants()
+            .find_map(ast::FStringExpr::cast)
+            .expect("format string expression");
+        let expression =
+            ast::Expr::cast(format_string.syntax().clone()).expect("format string expression AST");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("format lowers");
+        let ExprKind::FormatString(pieces) = lowered.kind else {
+            panic!("lexical text errors do not discard the format string");
+        };
+        assert!(matches!(
+            pieces,
+            [FmtPiece::Text(text)] if symbols.resolve(*text).unwrap().as_ref() == "bad\u{fffd}"
+        ));
+    }
+
+    #[test]
+    fn malformed_format_interpolation_keeps_its_sibling_pieces() {
+        let file = crate::FileId::new(200);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            r#"fn f(value: I32) { f"before {1 + } after {value} end" }"#,
+        );
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let format_string = function
+            .descendants()
+            .find_map(ast::FStringExpr::cast)
+            .expect("format string expression");
+        let interpolation_errors = format_string
+            .syntax()
+            .descendants()
+            .filter(|node| {
+                node.kind() == SyntaxKind::ERROR
+                    && node
+                        .ancestors()
+                        .any(|ancestor| ancestor.kind() == SyntaxKind::FSTRING_INTERP)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(interpolation_errors.len(), 1);
+        let expression =
+            ast::Expr::cast(format_string.syntax().clone()).expect("format string expression AST");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("format recovers");
+        let ExprKind::FormatString(pieces) = lowered.kind else {
+            panic!("the outer format string is preserved after an interpolation error");
+        };
+        assert_eq!(pieces.len(), 5);
+        let FmtPiece::Text(text) = pieces[0] else {
+            panic!("the leading text is retained");
+        };
+        assert_eq!(symbols.resolve(text).unwrap().as_ref(), "before ");
+        let FmtPiece::Arg { expr, .. } = pieces[1] else {
+            panic!("the malformed interpolation remains an argument");
+        };
+        assert_eq!(expr.kind, ExprKind::Err);
+        assert_eq!(expr.span.range, interpolation_errors[0].text_range());
+        let FmtPiece::Text(text) = pieces[2] else {
+            panic!("text after the malformed interpolation is retained");
+        };
+        assert_eq!(symbols.resolve(text).unwrap().as_ref(), " after ");
+        let FmtPiece::Arg { expr, .. } = pieces[3] else {
+            panic!("the later valid interpolation remains an argument");
+        };
+        assert!(matches!(expr.kind, ExprKind::Path(_)));
+        let FmtPiece::Text(text) = pieces[4] else {
+            panic!("the trailing text is retained");
+        };
+        assert_eq!(symbols.resolve(text).unwrap().as_ref(), " end");
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 6);
     }
 
     #[test]
