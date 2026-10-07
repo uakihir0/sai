@@ -1,9 +1,11 @@
 use crate::SpanCtxt;
+use crate::Symbol;
 use crate::arena::HirArena;
 use crate::expressions::{Expr, ExprKind};
 use crate::literals::Lit;
-use crate::patterns::{Pat, PatKind, PatRangeEnd};
+use crate::patterns::{BindingMode as HirBindingMode, Pat, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
+use crate::types::Name;
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
     SyntaxElement, SyntaxKind, SyntaxNode,
@@ -99,6 +101,18 @@ pub fn lower_range_pat<'hir>(
 
     let start_syntax = range.start();
     let end_syntax = range.end();
+    let has_invalid_raw_path = [start_syntax.as_ref(), end_syntax.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|endpoint| match endpoint {
+            ast::RangePatEndpoint::ConstantPath(path) => {
+                const_path_has_invalid_raw_identifier(path.clone())
+            }
+            ast::RangePatEndpoint::Literal(_) => false,
+        });
+    if has_invalid_raw_path {
+        return lower_error_pattern(range.syntax(), arena, source_map);
+    }
     if start_syntax
         .as_ref()
         .is_some_and(|endpoint| matches!(endpoint, ast::RangePatEndpoint::ConstantPath(_)))
@@ -138,8 +152,7 @@ pub fn lower_range_pat<'hir>(
     Ok(arena.alloc_pat(Pat { hir_id, kind, span }))
 }
 
-/// Lower the pattern forms that do not require recursive child construction
-/// beyond parenthesis stripping.
+/// Lower the currently supported simple and recursive pattern forms.
 ///
 /// Unsupported, otherwise-valid pattern kinds are returned explicitly so a
 /// caller cannot mistake an unfinished lowering case for a source error.
@@ -149,6 +162,7 @@ pub fn lower_pattern<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    ensure_supported_pattern(pattern)?;
     if contains_error_node(pattern.syntax()) {
         return lower_error_pattern(pattern.syntax(), arena, source_map);
     }
@@ -165,6 +179,17 @@ pub fn lower_pattern<'hir>(
         }
         ast::Pattern::Literal(literal) => lower_literal_pat(literal, arena, symbols, source_map),
         ast::Pattern::Range(range) => lower_range_pat(range, arena, symbols, source_map),
+        ast::Pattern::Binding(binding) => {
+            lower_binding_pattern(binding, arena, symbols, source_map)
+        }
+        ast::Pattern::At(at) => lower_at_pattern(at, arena, symbols, source_map),
+        ast::Pattern::Constructor(constructor)
+            if constructor
+                .path()
+                .is_some_and(const_path_has_invalid_raw_identifier) =>
+        {
+            lower_error_pattern(constructor.syntax(), arena, source_map)
+        }
         ast::Pattern::Parenthesized(paren) => match paren.pattern() {
             Some(inner) => lower_pattern(&inner, arena, symbols, source_map),
             None => lower_error_pattern(paren.syntax(), arena, source_map),
@@ -184,6 +209,168 @@ fn lower_error_pattern<'hir>(
         kind: PatKind::Err,
         span,
     }))
+}
+
+fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringError> {
+    if contains_error_node(pattern.syntax()) {
+        return Ok(());
+    }
+
+    match pattern {
+        ast::Pattern::Wildcard(_) | ast::Pattern::Literal(_) | ast::Pattern::Binding(_) => Ok(()),
+        ast::Pattern::Range(range) => {
+            let endpoints = [range.start(), range.end()];
+            let has_invalid_raw_path = endpoints.iter().flatten().any(|endpoint| match endpoint {
+                ast::RangePatEndpoint::ConstantPath(path) => {
+                    const_path_has_invalid_raw_identifier(path.clone())
+                }
+                ast::RangePatEndpoint::Literal(_) => false,
+            });
+            if has_invalid_raw_path {
+                return Ok(());
+            }
+            for endpoint in endpoints.into_iter().flatten() {
+                if let ast::RangePatEndpoint::ConstantPath(path) = endpoint {
+                    return Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()));
+                }
+            }
+            Ok(())
+        }
+        ast::Pattern::Parenthesized(paren) => match paren.pattern() {
+            Some(inner) => ensure_supported_pattern(&inner),
+            None => Ok(()),
+        },
+        ast::Pattern::At(at) => match (at.binding(), at.pattern()) {
+            (Some(binding), Some(inner)) if lower_binding_mode(&binding).is_some() => {
+                ensure_supported_pattern(&inner)
+            }
+            _ => Ok(()),
+        },
+        ast::Pattern::Constructor(constructor)
+            if constructor
+                .path()
+                .is_some_and(const_path_has_invalid_raw_identifier) =>
+        {
+            Ok(())
+        }
+        _ => Err(HirLoweringError::UnsupportedSyntax(pattern.syntax().kind())),
+    }
+}
+
+fn lower_binding_pattern<'hir>(
+    binding_pat: &ast::BindingPat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    if contains_error_node(binding_pat.syntax()) {
+        return lower_error_pattern(binding_pat.syntax(), arena, source_map);
+    }
+    let Some(mode) = lower_binding_mode(binding_pat) else {
+        return lower_error_pattern(binding_pat.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(binding_pat.syntax(), SpanCtxt::Root)?;
+    let name = lower_binding_name(binding_pat, symbols, source_map)?;
+    let (binding, _) = source_map.add_binding_with_span(binding_pat.syntax(), SpanCtxt::Root)?;
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::Binding {
+            mode,
+            name,
+            binding,
+            sub: None,
+        },
+        span,
+    }))
+}
+
+fn lower_at_pattern<'hir>(
+    at: &ast::AtPat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    if contains_error_node(at.syntax()) {
+        return lower_error_pattern(at.syntax(), arena, source_map);
+    }
+    let (Some(binding_pat), Some(inner)) = (at.binding(), at.pattern()) else {
+        return lower_error_pattern(at.syntax(), arena, source_map);
+    };
+    let Some(mode) = lower_binding_mode(&binding_pat) else {
+        return lower_error_pattern(at.syntax(), arena, source_map);
+    };
+
+    let (hir_id, span) = source_map.add_node_with_span(at.syntax(), SpanCtxt::Root)?;
+    let name = lower_binding_name(&binding_pat, symbols, source_map)?;
+    let (binding, _) = source_map.add_binding_with_span(binding_pat.syntax(), SpanCtxt::Root)?;
+    let sub = lower_pattern(&inner, arena, symbols, source_map)?;
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::Binding {
+            mode,
+            name,
+            binding,
+            sub: Some(sub),
+        },
+        span,
+    }))
+}
+
+fn lower_binding_mode(binding_pat: &ast::BindingPat) -> Option<HirBindingMode> {
+    let Some(mode) = binding_pat.mode() else {
+        return Some(HirBindingMode::Value);
+    };
+    match mode.kind()? {
+        ast::BindingModeKind::Var => Some(HirBindingMode::Var),
+        ast::BindingModeKind::Borrow => Some(HirBindingMode::Borrow),
+        ast::BindingModeKind::BorrowMut => Some(HirBindingMode::BorrowMut),
+    }
+}
+
+fn lower_binding_name(
+    binding_pat: &ast::BindingPat,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Name, HirLoweringError> {
+    let Some(name) = binding_pat.name() else {
+        return Ok(Name {
+            sym: Symbol::ERROR,
+            span: source_map.span_for(binding_pat.syntax(), SpanCtxt::Root)?,
+        });
+    };
+    let span = source_map.span_for(name.syntax(), SpanCtxt::Root)?;
+    let Some(token) = name.token() else {
+        return Ok(Name {
+            sym: Symbol::ERROR,
+            span,
+        });
+    };
+
+    let written = token.text();
+    let raw_name = written.strip_prefix("r#");
+    let identifier = raw_name.unwrap_or(written);
+    let invalid_raw = invalid_raw_identifier(written);
+    let reserved = raw_name.is_none() && sai_syntax::is_reserved_identifier(identifier);
+    let sym = if invalid_raw || reserved {
+        Symbol::ERROR
+    } else {
+        let normalized = sai_syntax::normalize_identifier(identifier);
+        symbols.intern(&normalized)?
+    };
+    Ok(Name { sym, span })
+}
+
+fn invalid_raw_identifier(written: &str) -> bool {
+    matches!(written.strip_prefix("r#"), Some("self" | "Self" | "_"))
+}
+
+fn const_path_has_invalid_raw_identifier(path: ast::ConstPath) -> bool {
+    path.segments().any(|segment| {
+        segment
+            .syntax()
+            .first_token()
+            .is_some_and(|token| invalid_raw_identifier(token.text()))
+    })
 }
 
 fn lower_range_endpoint<'hir>(
@@ -735,5 +922,195 @@ mod tests {
 
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 9);
+    }
+
+    #[test]
+    fn lowers_binding_modes_at_patterns_and_normalized_names() {
+        let file = crate::FileId::new(67);
+        let source = "fn f() { match value { item => (), var mutable => (), borrow borrowed => (), borrow mut mutable_ref => (), named @ _ => (), outer @ (inner) => (), null => (), r#null => (), r#self => (), cafe\u{301} => (), r#Self => (), r#Self..=4 => () } }";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::NoNull)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidRawIdent)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::IdentNotNfc)
+        );
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .filter_map(|arm| arm.pattern())
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 12);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("binding patterns lower");
+
+        let modes = lowered[..4]
+            .iter()
+            .map(|pattern| match pattern.kind {
+                PatKind::Binding { mode, .. } => mode,
+                _ => panic!("simple binding pattern lowers to PatKind::Binding"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modes,
+            [
+                HirBindingMode::Value,
+                HirBindingMode::Var,
+                HirBindingMode::Borrow,
+                HirBindingMode::BorrowMut,
+            ]
+        );
+        fn binding_parts<'hir>(
+            pattern: &Pat<'hir>,
+        ) -> (Name, crate::BindingId, Option<&'hir Pat<'hir>>) {
+            match pattern.kind {
+                PatKind::Binding {
+                    name, binding, sub, ..
+                } => (name, binding, sub),
+                _ => panic!("binding pattern lowers to PatKind::Binding"),
+            }
+        }
+        assert_eq!(
+            ["item", "mutable", "borrowed", "mutable_ref"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, expected)| {
+                    symbols
+                        .resolve(binding_parts(lowered[index]).0.sym)
+                        .expect("binding symbol resolves")
+                        .to_string()
+                        == expected
+                })
+                .collect::<Vec<_>>(),
+            [true, true, true, true]
+        );
+        let (named, named_binding, named_sub) = binding_parts(lowered[4]);
+        assert_eq!(symbols.resolve(named.sym).unwrap().as_ref(), "named");
+        assert_eq!(named_binding.raw(), 4);
+        assert_eq!(
+            named_sub.expect("at pattern has subpattern").kind,
+            PatKind::Wild
+        );
+        let (outer, outer_binding, outer_sub) = binding_parts(lowered[5]);
+        assert_eq!(symbols.resolve(outer.sym).unwrap().as_ref(), "outer");
+        assert_eq!(outer_binding.raw(), 5);
+        let inner = outer_sub.expect("at pattern has subpattern");
+        let (inner_name, inner_binding, inner_sub) = binding_parts(inner);
+        assert_eq!(symbols.resolve(inner_name.sym).unwrap().as_ref(), "inner");
+        assert_eq!(inner_binding.raw(), 6);
+        assert_eq!(inner_sub, None);
+        assert_eq!(
+            named_sub
+                .expect("at pattern has subpattern")
+                .hir_id
+                .local_id
+                .raw(),
+            6
+        );
+        assert_eq!(inner.hir_id.local_id.raw(), 8);
+        assert!(binding_parts(lowered[6]).0.sym.is_error());
+        assert_eq!(
+            symbols
+                .resolve(binding_parts(lowered[7]).0.sym)
+                .unwrap()
+                .as_ref(),
+            "null"
+        );
+        assert!(binding_parts(lowered[8]).0.sym.is_error());
+        assert_eq!(
+            symbols
+                .resolve(binding_parts(lowered[9]).0.sym)
+                .unwrap()
+                .as_ref(),
+            "café"
+        );
+        assert_eq!(lowered[10].kind, PatKind::Err);
+        assert_eq!(lowered[11].kind, PatKind::Err);
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|pattern| pattern.hir_id.local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14]
+        );
+        let ast::Pattern::At(outer_at) = &patterns[5] else {
+            panic!("sixth pattern is an at pattern");
+        };
+        let name_syntax = outer_at
+            .binding()
+            .and_then(|binding| binding.name())
+            .expect("at pattern name");
+        assert_eq!(lowered[5].span.range, outer_at.syntax().text_range());
+        assert_eq!(
+            binding_parts(lowered[5]).0.span.range,
+            name_syntax.syntax().text_range()
+        );
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 15);
+        assert_eq!(map.binding_to_syntax().len(), 11);
+
+        fn collect_bindings(pattern: &ast::Pattern, bindings: &mut Vec<ast::BindingPat>) {
+            match pattern {
+                ast::Pattern::Binding(binding) => bindings.push(binding.clone()),
+                ast::Pattern::At(at) => {
+                    if let Some(binding) = at.binding() {
+                        bindings.push(binding);
+                    }
+                    if let Some(inner) = at.pattern() {
+                        collect_bindings(&inner, bindings);
+                    }
+                }
+                ast::Pattern::Parenthesized(paren) => {
+                    if let Some(inner) = paren.pattern() {
+                        collect_bindings(&inner, bindings);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut expected_bindings = Vec::new();
+        for pattern in &patterns {
+            collect_bindings(pattern, &mut expected_bindings);
+        }
+        assert_eq!(expected_bindings.len(), map.binding_to_syntax().len());
+        for (expected_id, ((binding_id, pointer), expected)) in map
+            .binding_to_syntax()
+            .iter_enumerated()
+            .zip(expected_bindings)
+            .enumerate()
+        {
+            assert_eq!(binding_id.raw() as usize, expected_id);
+            assert_eq!(
+                pointer
+                    .resolve(file, &parsed.root)
+                    .expect("binding pointer resolves")
+                    .text_range(),
+                expected.syntax().text_range()
+            );
+        }
     }
 }

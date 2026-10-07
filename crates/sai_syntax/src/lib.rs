@@ -736,6 +736,14 @@ pub fn normalize_identifier(name: &str) -> String {
     name.nfc().collect()
 }
 
+/// Returns whether a bare, non-raw identifier is a reserved word.
+///
+/// The lexer records this classification separately from the token's error
+/// bit so parser recovery can still treat the spelling as an identifier.
+pub fn is_reserved_identifier(name: &str) -> bool {
+    matches!(keyword_class(name), Some(KeywordClass::Reserved(_)))
+}
+
 /// Lexes and parses one file, then binds its red root to the exact snapshot
 /// source used by the parser. Returned diagnostics are ordered by source range.
 pub fn parse(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<Parse, ParseError> {
@@ -4101,6 +4109,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Code::NoNull, Code::NoExceptions]
         );
+    }
+
+    #[test]
+    fn exposes_reserved_identifier_classification_for_lowering() {
+        assert!(is_reserved_identifier("null"));
+        assert!(is_reserved_identifier("nil"));
+        assert!(is_reserved_identifier("undefined"));
+        assert!(is_reserved_identifier("try"));
+        assert!(is_reserved_identifier("catch"));
+        assert!(is_reserved_identifier("throw"));
+        assert!(is_reserved_identifier("class"));
+        assert!(!is_reserved_identifier("name"));
+        assert!(!is_reserved_identifier("result"));
+        assert!(!is_reserved_identifier("and"));
     }
 
     #[test]
