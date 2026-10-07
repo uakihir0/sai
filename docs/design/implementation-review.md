@@ -894,3 +894,10 @@
 - **Reason:** The HIR already represents unsafe context on `Block`, so no new node or desugaring is needed. Keeping ordinary blocks on the safe lowering path makes the lexical unsafe boundary explicit for later analyses, which identify the unsafe context from the marked block.
 - **Review:** Focused tests cover the unsafe marker, source spans, parent-first HIR IDs, and rejection of an unsupported generic field before allocation. The hostile review found no actionable findings. All 127 HIR tests and all 601 workspace tests passed; workspace Clippy with warnings denied, formatting, and `git diff --check` passed.
 - **Human review:** Confirm that `UnsafeBlockExpr` should reuse `ExprKind::Block` and mark only its body `Block` unsafe, while nested source blocks retain their own syntax-derived safety.
+
+### IR-142: Lower region expressions
+
+- **Decision:** Lower `RegionExpr` to `ExprKind::Region`, normalize its source name, register a `BindingId` at the name syntax, and lower the source body as an ordinary safe `Block`. A missing required name or body recovers as `ExprKind::Err`. Preflight body expressions before allocating HIR nodes or bindings.
+- **Reason:** HIR has a dedicated region node and binding identity, preserving the source boundary for type checking and MIR construction without introducing the hidden arena operations during syntax lowering. Shared name lowering keeps Unicode normalization and raw-identifier rules consistent with other bindings.
+- **Review:** Focused tests cover the HIR node, normalized name and source span, exact binding-to-name syntax mapping, block span and safety, parent-first HIR IDs, and rejection of an unsupported generic field before allocation. The hostile review found no actionable findings. All 129 HIR tests and all 603 workspace tests passed; workspace Clippy with warnings denied, formatting, and `git diff --check` passed.
+- **Human review:** Confirm that the binder's `BindingId` should point to the `Name` syntax and that arena construction/lifetime behavior should remain downstream of source-level HIR lowering.

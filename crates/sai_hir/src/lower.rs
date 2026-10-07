@@ -501,6 +501,9 @@ fn lower_expr_inner<'hir>(
         ast::Expr::UnsafeBlock(block_expr) => {
             lower_unsafe_block_expr(block_expr, arena, symbols, source_map)
         }
+        ast::Expr::Region(region_expr) => {
+            lower_region_expr(region_expr, arena, symbols, source_map)
+        }
         ast::Expr::If(if_expr) => lower_if_expr(if_expr, arena, symbols, source_map),
         ast::Expr::Match(match_expr) => lower_match_expr(match_expr, arena, symbols, source_map),
         ast::Expr::Loop(loop_expr) => lower_loop_expr(loop_expr, arena, symbols, source_map),
@@ -1338,6 +1341,38 @@ fn lower_unsafe_block_expr<'hir>(
         symbols,
         source_map,
     )
+}
+
+fn lower_region_expr<'hir>(
+    region_expr: &ast::RegionExpr,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    let (Some(region_name), Some(body)) = (region_expr.name(), region_expr.body()) else {
+        return lower_error_expr(region_expr.syntax(), arena, source_map);
+    };
+    let (hir_id, span) = source_map.add_node_with_span(region_expr.syntax(), SpanCtxt::Root)?;
+    let name = match region_name.token() {
+        Some(token) => lower_name_spelling(
+            region_name.syntax(),
+            Some(token.text()),
+            symbols,
+            source_map,
+        )?,
+        None => lower_name_spelling(region_name.syntax(), None, symbols, source_map)?,
+    };
+    let binding = lower_binding_id(region_name.syntax(), source_map)?;
+    let block = lower_block(&body, arena, symbols, source_map)?;
+    Ok(arena.alloc_expr(Expr {
+        hir_id,
+        kind: ExprKind::Region {
+            name,
+            binding,
+            block,
+        },
+        span,
+    }))
 }
 
 fn lower_block_as_expr<'hir>(
@@ -2474,6 +2509,10 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             None => Ok(()),
         },
         ast::Expr::UnsafeBlock(block_expr) => match block_expr.body() {
+            Some(block) => ensure_supported_block(&block),
+            None => Ok(()),
+        },
+        ast::Expr::Region(region_expr) => match region_expr.body() {
             Some(block) => ensure_supported_block(&block),
             None => Ok(()),
         },
@@ -5282,6 +5321,101 @@ mod tests {
             Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
         ));
         assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn lowers_region_blocks_with_a_source_mapped_binding() {
+        let file = crate::FileId::new(192);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { region arena { 1 } }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let region_expr = function
+            .descendants()
+            .find_map(ast::RegionExpr::cast)
+            .expect("region expression");
+        let expression =
+            ast::Expr::cast(region_expr.syntax().clone()).expect("region is an expression");
+        let region_name = region_expr.name().expect("region binding name");
+        let body = region_expr.body().expect("region body");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("region lowers");
+        let ExprKind::Region {
+            name,
+            binding,
+            block,
+        } = lowered.kind
+        else {
+            panic!("region syntax maps to a region expression");
+        };
+        assert_eq!(
+            symbols
+                .resolve(name.sym)
+                .expect("interned region name")
+                .as_ref(),
+            "arena"
+        );
+        assert_eq!(name.span.range, region_name.syntax().text_range());
+        assert_eq!(name.span.ctxt, SpanCtxt::Root);
+        assert_eq!(binding.raw(), 0);
+        assert_eq!(block.safety, Safety::Safe);
+        assert_eq!(block.span.range, body.syntax().text_range());
+        assert_eq!(lowered.span.range, region_expr.syntax().text_range());
+        assert_eq!(lowered.hir_id.local_id.raw(), 1);
+        assert_eq!(block.hir_id.local_id.raw(), 2);
+        let tail = block.tail.expect("literal is the region tail");
+        assert!(matches!(
+            tail.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        ));
+        assert_eq!(tail.hir_id.local_id.raw(), 3);
+        let region_name_ptr =
+            sai_syntax::SyntaxNodePtr::new(file, region_name.syntax()).expect("region name ptr");
+        let source_map = source_map.finish();
+        assert_eq!(source_map.node_to_syntax().len(), 4);
+        assert_eq!(source_map.binding_to_syntax().len(), 1);
+        assert_eq!(
+            source_map.syntax_for_binding(binding),
+            Some(&region_name_ptr)
+        );
+    }
+
+    #[test]
+    fn region_blocks_preflight_unsupported_descendants_before_allocation() {
+        let file = crate::FileId::new(193);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { region arena { source.convert<U32> } }\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let region_expr = function
+            .descendants()
+            .find_map(ast::RegionExpr::cast)
+            .expect("region expression");
+        let expression =
+            ast::Expr::cast(region_expr.syntax().clone()).expect("region is an expression");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        let source_map = source_map.finish();
+        assert_eq!(source_map.node_to_syntax().len(), 1);
+        assert!(source_map.binding_to_syntax().is_empty());
     }
 
     #[test]
