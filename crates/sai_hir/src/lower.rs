@@ -465,7 +465,9 @@ pub fn lower_expr<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
     ensure_supported_expr(expression)?;
-    if contains_error_node(expression.syntax()) && !contains_call_arglist_error(expression.syntax())
+    if contains_error_node(expression.syntax())
+        && !contains_call_arglist_error(expression.syntax())
+        && !errors_are_in_let_or_var_statements(expression.syntax())
     {
         return lower_error_expr(expression.syntax(), arena, source_map);
     }
@@ -1616,6 +1618,22 @@ fn lower_block<'hir>(
                     span: stmt_span,
                 });
             }
+            BlockStatementSyntax::Statement(ast::Stmt::Let(let_statement)) => {
+                statements.push(lower_let_statement(
+                    &let_statement,
+                    arena,
+                    symbols,
+                    source_map,
+                )?);
+            }
+            BlockStatementSyntax::Statement(ast::Stmt::Var(var_statement)) => {
+                statements.push(lower_var_statement(
+                    &var_statement,
+                    arena,
+                    symbols,
+                    source_map,
+                )?);
+            }
             BlockStatementSyntax::Statement(statement) => {
                 return Err(HirLoweringError::UnsupportedSyntax(
                     statement.syntax().kind(),
@@ -1641,6 +1659,217 @@ fn lower_block<'hir>(
         safety: Safety::Safe,
         span,
     }))
+}
+
+fn lower_let_statement<'hir>(
+    statement: &ast::LetStmt,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<HirStmt<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(statement.syntax(), SpanCtxt::Root)?;
+    let pat = match statement.pattern() {
+        Some(pattern) => lower_pattern(&pattern, arena, symbols, source_map)?,
+        None => {
+            let error = direct_error_child_before_token(statement.syntax(), SyntaxKind::EQ)
+                .unwrap_or_else(|| statement.syntax().clone());
+            lower_error_pattern(&error, arena, source_map)?
+        }
+    };
+    let ty = if let Some(ty) = statement.ty() {
+        Some(lower_type_inner(&ty, arena, symbols, source_map)?)
+    } else if has_direct_token(statement.syntax(), SyntaxKind::COLON) {
+        let error = direct_error_child_between_tokens(
+            statement.syntax(),
+            SyntaxKind::COLON,
+            SyntaxKind::EQ,
+        )
+        .unwrap_or_else(|| statement.syntax().clone());
+        Some(lower_error_type(&error, arena, source_map)?)
+    } else {
+        None
+    };
+    let init = lower_statement_initializer(
+        statement.syntax(),
+        statement.initializer(),
+        arena,
+        symbols,
+        source_map,
+    )?;
+    let els = statement
+        .else_clause()
+        .map(|else_clause| {
+            if let Some(block) = else_clause.block() {
+                lower_block(&block, arena, symbols, source_map)
+            } else {
+                lower_error_block(else_clause.syntax(), arena, source_map)
+            }
+        })
+        .transpose()?;
+    Ok(HirStmt {
+        hir_id,
+        kind: StmtKind::Let { pat, ty, init, els },
+        span,
+    })
+}
+
+fn lower_var_statement<'hir>(
+    statement: &ast::VarStmt,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<HirStmt<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(statement.syntax(), SpanCtxt::Root)?;
+    let pat = if let Some(name) = statement.name() {
+        let ctxt = SpanCtxt::Desugared(DesugaringKind::VarStmt);
+        let (pat_hir_id, pat_span) = source_map.add_node_with_span(statement.syntax(), ctxt)?;
+        let (binding, name_span) = source_map.add_binding_with_span(name.syntax(), ctxt)?;
+        let token = name.token();
+        let mut hir_name = lower_name_spelling(
+            name.syntax(),
+            token.as_ref().map(|token| token.text()),
+            symbols,
+            source_map,
+        )?;
+        hir_name.span = name_span;
+        arena.alloc_pat(Pat {
+            hir_id: pat_hir_id,
+            kind: PatKind::Binding {
+                mode: HirBindingMode::Var,
+                name: hir_name,
+                binding,
+                sub: None,
+            },
+            span: pat_span,
+        })
+    } else {
+        let error = direct_error_child_before_token(statement.syntax(), SyntaxKind::EQ)
+            .unwrap_or_else(|| statement.syntax().clone());
+        lower_error_pattern(&error, arena, source_map)?
+    };
+    let ty = if let Some(ty) = statement.ty() {
+        Some(lower_type_inner(&ty, arena, symbols, source_map)?)
+    } else if has_direct_token(statement.syntax(), SyntaxKind::COLON) {
+        let error = direct_error_child_between_tokens(
+            statement.syntax(),
+            SyntaxKind::COLON,
+            SyntaxKind::EQ,
+        )
+        .unwrap_or_else(|| statement.syntax().clone());
+        Some(lower_error_type(&error, arena, source_map)?)
+    } else {
+        None
+    };
+    let init = lower_statement_initializer(
+        statement.syntax(),
+        statement.initializer(),
+        arena,
+        symbols,
+        source_map,
+    )?;
+    Ok(HirStmt {
+        hir_id,
+        kind: StmtKind::Let {
+            pat,
+            ty,
+            init,
+            els: None,
+        },
+        span,
+    })
+}
+
+fn lower_statement_initializer<'hir>(
+    statement: &SyntaxNode,
+    initializer: Option<ast::Expr>,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Expr<'hir>, HirLoweringError> {
+    match initializer {
+        Some(initializer)
+            if contains_error_node(initializer.syntax())
+                && !contains_call_arglist_error(initializer.syntax()) =>
+        {
+            lower_error_expr(initializer.syntax(), arena, source_map)
+        }
+        Some(initializer) => lower_expr_inner(&initializer, arena, symbols, source_map),
+        None => {
+            let error = if has_direct_token(statement, SyntaxKind::EQ) {
+                direct_error_child_after_token(statement, SyntaxKind::EQ)
+            } else {
+                direct_error_child_from_end(statement)
+            }
+            .unwrap_or_else(|| statement.clone());
+            lower_error_expr(&error, arena, source_map)
+        }
+    }
+}
+
+fn lower_error_block<'hir>(
+    syntax: &SyntaxNode,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir HirBlock<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    let error = direct_error_child(syntax).unwrap_or_else(|| syntax.clone());
+    let tail = lower_error_expr(&error, arena, source_map)?;
+    Ok(arena.alloc_block(HirBlock {
+        hir_id,
+        stmts: arena.alloc_stmts(&[]),
+        tail: Some(tail),
+        safety: Safety::Safe,
+        span,
+    }))
+}
+
+fn has_direct_token(syntax: &SyntaxNode, kind: SyntaxKind) -> bool {
+    syntax
+        .children_with_tokens()
+        .any(|element| matches!(element, SyntaxElement::Token(token) if token.kind() == kind))
+}
+
+fn direct_error_child_before_token(syntax: &SyntaxNode, before: SyntaxKind) -> Option<SyntaxNode> {
+    let mut errors = syntax.children_with_tokens().take_while(
+        |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == before),
+    );
+    errors.find_map(|element| match element {
+        SyntaxElement::Node(node) if node.kind() == SyntaxKind::ERROR => Some(node),
+        _ => None,
+    })
+}
+
+fn direct_error_child_after_token(syntax: &SyntaxNode, after: SyntaxKind) -> Option<SyntaxNode> {
+    let mut after_token = false;
+    for element in syntax.children_with_tokens() {
+        match element {
+            SyntaxElement::Token(token) if token.kind() == after => after_token = true,
+            SyntaxElement::Node(node) if after_token && node.kind() == SyntaxKind::ERROR => {
+                return Some(node);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn direct_error_child_between_tokens(
+    syntax: &SyntaxNode,
+    after: SyntaxKind,
+    before: SyntaxKind,
+) -> Option<SyntaxNode> {
+    let mut after_token = false;
+    for element in syntax.children_with_tokens() {
+        match element {
+            SyntaxElement::Token(token) if after_token && token.kind() == before => return None,
+            SyntaxElement::Token(token) if token.kind() == after => after_token = true,
+            SyntaxElement::Node(node) if after_token && node.kind() == SyntaxKind::ERROR => {
+                return Some(node);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn lower_label(
@@ -1820,6 +2049,28 @@ fn ensure_supported_block(block: &ast::Block) -> Result<(), HirLoweringError> {
             BlockStatementSyntax::Statement(ast::Stmt::Expr(expression_statement)) => {
                 if let Some(expression) = expression_statement.expression() {
                     ensure_supported_expr(&expression)?;
+                }
+            }
+            BlockStatementSyntax::Statement(ast::Stmt::Let(statement)) => {
+                if let Some(pattern) = statement.pattern() {
+                    ensure_supported_pattern(&pattern)?;
+                }
+                if let Some(ty) = statement.ty() {
+                    ensure_supported_type(&ty)?;
+                }
+                if let Some(initializer) = statement.initializer() {
+                    ensure_supported_expr(&initializer)?;
+                }
+                if let Some(block) = statement.else_clause().and_then(|clause| clause.block()) {
+                    ensure_supported_block(&block)?;
+                }
+            }
+            BlockStatementSyntax::Statement(ast::Stmt::Var(statement)) => {
+                if let Some(ty) = statement.ty() {
+                    ensure_supported_type(&ty)?;
+                }
+                if let Some(initializer) = statement.initializer() {
+                    ensure_supported_expr(&initializer)?;
                 }
             }
             BlockStatementSyntax::Statement(statement) => {
@@ -2959,6 +3210,19 @@ fn contains_error_node(syntax: &SyntaxNode) -> bool {
     syntax
         .descendants()
         .any(|node| node.kind() == SyntaxKind::ERROR)
+}
+
+fn errors_are_in_let_or_var_statements(syntax: &SyntaxNode) -> bool {
+    let errors = syntax
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::ERROR)
+        .collect::<Vec<_>>();
+    !errors.is_empty()
+        && errors.iter().all(|error| {
+            error.ancestors().any(|ancestor| {
+                matches!(ancestor.kind(), SyntaxKind::LET_STMT | SyntaxKind::VAR_STMT)
+            })
+        })
 }
 
 #[cfg(test)]
@@ -4457,7 +4721,7 @@ mod tests {
         );
 
         let file = crate::FileId::new(98);
-        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { let x = 1\n x } }\n");
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { { assert true\n x } }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let block_expr = function
@@ -4474,7 +4738,7 @@ mod tests {
                 .expect("source map builder");
         assert!(matches!(
             lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::LET_STMT))
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::ASSERT_STMT))
         ));
         assert_eq!(source_map.finish().node_to_syntax().len(), 1);
 
@@ -4525,6 +4789,258 @@ mod tests {
             sai_syntax::SyntaxNodePtr::new(file, &recovered_error).expect("error pointer");
         let map = source_map.finish();
         assert_eq!(map.nodes_for_syntax(&error_ptr).len(), 2);
+    }
+
+    #[test]
+    fn lowers_let_and_var_statements_with_bindings_and_source_context() {
+        let file = crate::FileId::new(137);
+        let source = "fn f() { { let (left, right): (I32, I32) = pair\n var cursor: I32 = left\n cursor } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("statements lower");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the expression is a block");
+        };
+        assert_eq!(block.stmts.len(), 2);
+        assert!(block.tail.is_some());
+        let StmtKind::Let {
+            pat,
+            ty: Some(ty),
+            init,
+            els: None,
+        } = block.stmts[0].kind
+        else {
+            panic!("the first statement is an annotated let");
+        };
+        let PatKind::Tuple(elements) = pat.kind else {
+            panic!("the let retains its tuple pattern");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(elements.iter().all(|element| matches!(
+            element.kind,
+            PatKind::Binding {
+                mode: HirBindingMode::Value,
+                sub: None,
+                ..
+            }
+        )));
+        assert!(matches!(ty.kind, HirTyKind::Tuple(types) if types.len() == 2));
+        assert!(matches!(init.kind, ExprKind::Path(_)));
+        assert_eq!(block.stmts[0].span.ctxt, SpanCtxt::Root);
+        assert_eq!(pat.span.ctxt, SpanCtxt::Root);
+
+        let StmtKind::Let {
+            pat: var_pat,
+            ty: Some(var_ty),
+            init: var_init,
+            els: None,
+        } = block.stmts[1].kind
+        else {
+            panic!("var lowers to a let-shaped HIR statement");
+        };
+        let PatKind::Binding {
+            mode: HirBindingMode::Var,
+            name,
+            binding,
+            sub: None,
+        } = var_pat.kind
+        else {
+            panic!("var creates a mutable binding pattern");
+        };
+        assert_eq!(symbols.resolve(name.sym).unwrap().as_ref(), "cursor");
+        assert!(matches!(var_ty.kind, HirTyKind::Path(_)));
+        assert!(matches!(var_init.kind, ExprKind::Path(_)));
+        assert_eq!(
+            var_pat.span.ctxt,
+            SpanCtxt::Desugared(DesugaringKind::VarStmt)
+        );
+        assert_eq!(name.span.ctxt, SpanCtxt::Desugared(DesugaringKind::VarStmt));
+        assert_eq!(block.stmts[1].span.ctxt, SpanCtxt::Root);
+        let var_statement = function
+            .descendants()
+            .find_map(ast::VarStmt::cast)
+            .expect("var statement syntax");
+        let var_name = var_statement.name().expect("var binding name");
+        let var_statement_ptr =
+            sai_syntax::SyntaxNodePtr::new(file, var_statement.syntax()).expect("statement ptr");
+        let var_name_ptr =
+            sai_syntax::SyntaxNodePtr::new(file, var_name.syntax()).expect("name ptr");
+        let map = source_map.finish();
+        assert_eq!(map.binding_to_syntax().len(), 3);
+        assert_eq!(
+            map.syntax_for_node(var_pat.hir_id),
+            Some(&var_statement_ptr)
+        );
+        assert_eq!(map.syntax_for_binding(binding), Some(&var_name_ptr));
+    }
+
+    #[test]
+    fn lowers_let_else_and_preserves_missing_annotation_and_initializer_errors() {
+        let file = crate::FileId::new(138);
+        let source = "fn f() { { let value = input else { fallback() }\n value } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("let-else lowers");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the expression is a block");
+        };
+        let StmtKind::Let {
+            els: Some(else_block),
+            init,
+            ..
+        } = block.stmts[0].kind
+        else {
+            panic!("the let-else clause remains present");
+        };
+        assert!(matches!(init.kind, ExprKind::Path(_)));
+        assert!(matches!(
+            else_block.tail.map(|tail| tail.kind),
+            Some(ExprKind::Call { .. })
+        ));
+        assert!(block.tail.is_some());
+
+        let file = crate::FileId::new(139);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { { let x: = 1\n let y\n y } }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("recovery lowers");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the recovered expression is a block");
+        };
+        assert_eq!(block.stmts.len(), 2);
+        let StmtKind::Let {
+            ty: Some(ty), init, ..
+        } = block.stmts[0].kind
+        else {
+            panic!("the first statement remains a let with an explicit annotation");
+        };
+        assert_eq!(ty.kind, HirTyKind::Err);
+        assert!(matches!(
+            init.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(1),
+                negated: false,
+            })
+        ));
+        let StmtKind::Let { init, ty: None, .. } = block.stmts[1].kind else {
+            panic!("the second statement is an unannotated let");
+        };
+        assert_eq!(init.kind, ExprKind::Err);
+        assert!(source_map.finish().diagnostics().is_empty());
+    }
+
+    #[test]
+    fn let_initializer_keeps_recoverable_call_arguments() {
+        let file = crate::FileId::new(141);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f() { { let value = call(, 2)\n value } }\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered =
+            lower_expr(&expression, &arena, &symbols, &mut source_map).expect("let recovers");
+        let ExprKind::Block(block) = lowered.kind else {
+            panic!("the containing block survives initializer recovery");
+        };
+        let StmtKind::Let { init, .. } = block.stmts[0].kind else {
+            panic!("the first statement is a let");
+        };
+        let ExprKind::Call { args, .. } = init.kind else {
+            panic!("the initializer call is preserved");
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].expr.kind, ExprKind::Err);
+        assert!(matches!(
+            args[1].expr.kind,
+            ExprKind::Lit(Lit::Int {
+                value: Some(2),
+                negated: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn let_statement_preflights_nested_unsupported_expressions_before_allocating() {
+        let file = crate::FileId::new(140);
+        let (snapshot, parsed, ast_ids) = parse_file(
+            file,
+            "fn f() { { let value = source.convert<U32>\n value } }\n",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let block_expr = function
+            .descendants()
+            .find_map(ast::BlockExpr::cast)
+            .expect("block expression");
+        let expression =
+            ast::Expr::cast(block_expr.syntax().clone()).expect("block is an expression variant");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        assert!(matches!(
+            lower_expr(&expression, &arena, &symbols, &mut source_map),
+            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
+        ));
+        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
     }
 
     #[test]
