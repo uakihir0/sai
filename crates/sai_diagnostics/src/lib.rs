@@ -76,6 +76,8 @@ define_codes! {
     InvalidTupleIndex => "INVALID_TUPLE_INDEX",
     FloatPattern => "FLOAT_PATTERN",
     MultipleRestPatterns => "MULTIPLE_REST_PATTERNS",
+    DuplicateBinding => "DUPLICATE_BINDING",
+    OrPatternBindingMismatch => "OR_PATTERN_BINDING_MISMATCH",
     MissingFnBody => "MISSING_FN_BODY",
     ImplementationLimitExceeded => "IMPLEMENTATION_LIMIT_EXCEEDED",
     ClauseOrder => "CLAUSE_ORDER",
@@ -1673,6 +1675,14 @@ mod tests {
         assert_eq!(
             Code::from_name("UNEXPECTED_FN_BODY"),
             Some(Code::UnexpectedFnBody)
+        );
+        assert_eq!(
+            Code::from_name("DUPLICATE_BINDING"),
+            Some(Code::DuplicateBinding)
+        );
+        assert_eq!(
+            Code::from_name("OR_PATTERN_BINDING_MISMATCH"),
+            Some(Code::OrPatternBindingMismatch)
         );
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));

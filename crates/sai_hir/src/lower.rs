@@ -1,4 +1,3 @@
-use crate::SpanCtxt;
 use crate::Symbol;
 use crate::arena::HirArena;
 use crate::expressions::{Expr, ExprKind};
@@ -6,6 +5,8 @@ use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use crate::types::{Name, Path, PathRoot, PathSegment};
+use crate::{BindingId, SpanCtxt};
+use sai_diagnostics::Code;
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
     SyntaxElement, SyntaxKind, SyntaxNode,
@@ -161,7 +162,16 @@ pub fn lower_pattern<'hir>(
     if contains_error_node(pattern.syntax()) {
         return lower_error_pattern(pattern.syntax(), arena, source_map);
     }
+    plan_pattern_bindings(pattern, symbols, source_map, None)?;
+    lower_pattern_inner(pattern, arena, symbols, source_map)
+}
 
+fn lower_pattern_inner<'hir>(
+    pattern: &ast::Pattern,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
     match pattern {
         ast::Pattern::Wildcard(wildcard) => {
             let (hir_id, span) =
@@ -188,14 +198,14 @@ pub fn lower_pattern<'hir>(
         ast::Pattern::Constructor(constructor) => {
             lower_constructor_pattern(constructor, arena, symbols, source_map)
         }
+        ast::Pattern::Or(or) => lower_or_pattern(or, arena, symbols, source_map),
         ast::Pattern::ImplicitMember(member) => {
             lower_implicit_member_pattern(member, arena, symbols, source_map)
         }
         ast::Pattern::Parenthesized(paren) => match paren.pattern() {
-            Some(inner) => lower_pattern(&inner, arena, symbols, source_map),
+            Some(inner) => lower_pattern_inner(&inner, arena, symbols, source_map),
             None => lower_error_pattern(paren.syntax(), arena, source_map),
         },
-        _ => Err(HirLoweringError::UnsupportedSyntax(pattern.syntax().kind())),
     }
 }
 
@@ -212,6 +222,33 @@ fn lower_error_pattern<'hir>(
     }))
 }
 
+fn lower_or_pattern<'hir>(
+    or: &ast::OrPat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    let alternatives = flattened_or_alternatives(or);
+    match alternatives.as_slice() {
+        [] => lower_error_pattern(or.syntax(), arena, source_map),
+        [only] => lower_pattern_inner(only, arena, symbols, source_map),
+        _ => {
+            let (hir_id, span) = source_map.add_node_with_span(or.syntax(), SpanCtxt::Root)?;
+            let alternatives = alternatives
+                .iter()
+                .map(|alternative| {
+                    lower_pattern_inner(alternative, arena, symbols, source_map).copied()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(arena.alloc_pat(Pat {
+                hir_id,
+                kind: PatKind::Or(arena.alloc_pats(&alternatives)),
+                span,
+            }))
+        }
+    }
+}
+
 fn lower_tuple_pattern<'hir>(
     tuple: &ast::TuplePat,
     arena: &'hir HirArena<'hir>,
@@ -221,7 +258,7 @@ fn lower_tuple_pattern<'hir>(
     let (hir_id, span) = source_map.add_node_with_span(tuple.syntax(), SpanCtxt::Root)?;
     let elements = tuple
         .elements()
-        .map(|element| lower_pattern(&element, arena, symbols, source_map).copied())
+        .map(|element| lower_pattern_inner(&element, arena, symbols, source_map).copied())
         .collect::<Result<Vec<_>, _>>()?;
     let elements = arena.alloc_pats(&elements);
     Ok(arena.alloc_pat(Pat {
@@ -257,7 +294,7 @@ fn lower_slice_pattern<'hir>(
     let (hir_id, span) = source_map.add_node_with_span(slice.syntax(), SpanCtxt::Root)?;
     let before = elements[..split]
         .iter()
-        .map(|element| lower_pattern(element, arena, symbols, source_map).copied())
+        .map(|element| lower_pattern_inner(element, arena, symbols, source_map).copied())
         .collect::<Result<Vec<_>, _>>()?;
     let rest = match rests.first() {
         None => None,
@@ -269,7 +306,7 @@ fn lower_slice_pattern<'hir>(
     };
     let after = elements[split..]
         .iter()
-        .map(|element| lower_pattern(element, arena, symbols, source_map).copied())
+        .map(|element| lower_pattern_inner(element, arena, symbols, source_map).copied())
         .collect::<Result<Vec<_>, _>>()?;
     let before = arena.alloc_pats(&before);
     let after = arena.alloc_pats(&after);
@@ -391,6 +428,284 @@ fn lower_const_path<'hir>(
     })
 }
 
+#[derive(Clone)]
+struct PlannedBinding {
+    symbol: Symbol,
+    mode: HirBindingMode,
+    binding: BindingId,
+    occurrences: Vec<ast::BindingPat>,
+}
+
+fn plan_pattern_bindings(
+    pattern: &ast::Pattern,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+    shared: Option<&[PlannedBinding]>,
+) -> Result<Vec<PlannedBinding>, HirLoweringError> {
+    match pattern {
+        ast::Pattern::Binding(binding) => plan_binding(binding, symbols, source_map, shared),
+        ast::Pattern::At(at) => {
+            let (Some(binding), Some(inner)) = (at.binding(), at.pattern()) else {
+                return Ok(Vec::new());
+            };
+            if lower_binding_mode(&binding).is_none() {
+                return Ok(Vec::new());
+            }
+            let mut planned = plan_binding(&binding, symbols, source_map, shared)?;
+            let inner = plan_pattern_bindings(&inner, symbols, source_map, shared)?;
+            merge_planned_bindings(&mut planned, inner, symbols, source_map)?;
+            Ok(planned)
+        }
+        ast::Pattern::Parenthesized(paren) => match paren.pattern() {
+            Some(inner) => plan_pattern_bindings(&inner, symbols, source_map, shared),
+            None => Ok(Vec::new()),
+        },
+        ast::Pattern::Tuple(tuple) => {
+            let mut planned = Vec::new();
+            for element in tuple.elements() {
+                let element = plan_pattern_bindings(&element, symbols, source_map, shared)?;
+                merge_planned_bindings(&mut planned, element, symbols, source_map)?;
+            }
+            Ok(planned)
+        }
+        ast::Pattern::Slice(slice) if slice.rest_patterns().count() > 1 => Ok(Vec::new()),
+        ast::Pattern::Slice(slice) => {
+            let mut planned = Vec::new();
+            for child in slice.syntax().children() {
+                let child_bindings = if let Some(pattern) = ast::Pattern::cast(child.clone()) {
+                    plan_pattern_bindings(&pattern, symbols, source_map, shared)?
+                } else if let Some(rest) = ast::RestPat::cast(child) {
+                    match rest.binding() {
+                        Some(binding) => plan_binding(&binding, symbols, source_map, shared)?,
+                        None => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                merge_planned_bindings(&mut planned, child_bindings, symbols, source_map)?;
+            }
+            Ok(planned)
+        }
+        ast::Pattern::Constructor(constructor)
+            if constructor.path().is_none_or(const_path_is_invalid) =>
+        {
+            Ok(Vec::new())
+        }
+        ast::Pattern::Constructor(constructor) => {
+            let Some(args) = constructor.args() else {
+                return Ok(Vec::new());
+            };
+            let Some((args, _)) = collect_ctor_pat_args(&args) else {
+                return Ok(Vec::new());
+            };
+            plan_ctor_args(&args, symbols, source_map, shared)
+        }
+        ast::Pattern::ImplicitMember(member) => {
+            if member.name().is_none() {
+                return Ok(Vec::new());
+            }
+            let Some(args) = member.args() else {
+                return Ok(Vec::new());
+            };
+            let Some((args, _)) = collect_ctor_pat_args(&args) else {
+                return Ok(Vec::new());
+            };
+            plan_ctor_args(&args, symbols, source_map, shared)
+        }
+        ast::Pattern::Or(or) => plan_or_bindings(or, symbols, source_map, shared),
+        ast::Pattern::Wildcard(_) | ast::Pattern::Literal(_) | ast::Pattern::Range(_) => {
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn plan_binding(
+    binding_pat: &ast::BindingPat,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+    shared: Option<&[PlannedBinding]>,
+) -> Result<Vec<PlannedBinding>, HirLoweringError> {
+    let Some(mode) = lower_binding_mode(binding_pat) else {
+        return Ok(Vec::new());
+    };
+    let name = lower_binding_name(binding_pat, symbols, source_map)?;
+    if name.sym.is_error() {
+        return Ok(Vec::new());
+    }
+    let binding = match shared
+        .and_then(|bindings| bindings.iter().find(|planned| planned.symbol == name.sym))
+    {
+        Some(planned) => {
+            source_map.add_binding_alias(binding_pat.syntax(), planned.binding)?;
+            planned.binding
+        }
+        None => {
+            source_map
+                .add_binding_with_span(binding_pat.syntax(), SpanCtxt::Root)?
+                .0
+        }
+    };
+    Ok(vec![PlannedBinding {
+        symbol: name.sym,
+        mode,
+        binding,
+        occurrences: vec![binding_pat.clone()],
+    }])
+}
+
+fn plan_ctor_args(
+    args: &[CtorPatArgSyntax],
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+    shared: Option<&[PlannedBinding]>,
+) -> Result<Vec<PlannedBinding>, HirLoweringError> {
+    let mut planned = Vec::new();
+    for arg in args {
+        let pattern = match arg {
+            CtorPatArgSyntax::Positional(pattern) | CtorPatArgSyntax::Named { pattern, .. } => {
+                pattern
+            }
+        };
+        let bindings = plan_pattern_bindings(pattern, symbols, source_map, shared)?;
+        merge_planned_bindings(&mut planned, bindings, symbols, source_map)?;
+    }
+    Ok(planned)
+}
+
+fn merge_planned_bindings(
+    planned: &mut Vec<PlannedBinding>,
+    incoming: Vec<PlannedBinding>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<(), HirLoweringError> {
+    for mut binding in incoming {
+        let duplicate = planned
+            .iter()
+            .find(|existing| existing.symbol == binding.symbol);
+        if let Some(existing) = duplicate {
+            if existing.binding == binding.binding {
+                let mut occurrences = binding.occurrences.iter();
+                let first = occurrences
+                    .next()
+                    .expect("a planned binding has at least one syntax occurrence");
+                binding.binding = source_map
+                    .add_binding_with_span(first.syntax(), SpanCtxt::Root)?
+                    .0;
+                for occurrence in occurrences {
+                    source_map.add_binding_alias(occurrence.syntax(), binding.binding)?;
+                }
+            }
+            let duplicate_syntax = binding
+                .occurrences
+                .first()
+                .expect("a planned binding has at least one syntax occurrence");
+            let name = symbols
+                .resolve(binding.symbol)
+                .map(|name| name.to_string())
+                .unwrap_or_else(|_| "<error>".to_owned());
+            source_map.push_error_diagnostic_for_node(
+                Code::DuplicateBinding,
+                format!("`{name}` is bound more than once in this pattern"),
+                duplicate_syntax.syntax(),
+            )?;
+        } else {
+            planned.push(binding);
+        }
+    }
+    Ok(())
+}
+
+fn plan_or_bindings(
+    or: &ast::OrPat,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+    shared: Option<&[PlannedBinding]>,
+) -> Result<Vec<PlannedBinding>, HirLoweringError> {
+    let alternatives = flattened_or_alternatives(or);
+    let Some(first) = alternatives.first() else {
+        return Ok(Vec::new());
+    };
+    let first_bindings = plan_pattern_bindings(first, symbols, source_map, shared)?;
+    let mut planned = first_bindings.clone();
+    let mut mismatch = None;
+    for alternative in alternatives.iter().skip(1) {
+        let bindings = plan_pattern_bindings(alternative, symbols, source_map, Some(&planned))?;
+        if mismatch.is_none() {
+            mismatch = first_binding_mismatch(&first_bindings, &bindings);
+        }
+        for alternative_binding in bindings {
+            if let Some(planned_binding) = planned
+                .iter_mut()
+                .find(|binding| binding.symbol == alternative_binding.symbol)
+            {
+                planned_binding
+                    .occurrences
+                    .extend(alternative_binding.occurrences.iter().cloned());
+            } else {
+                planned.push(alternative_binding);
+            }
+        }
+    }
+    if let Some(symbol) = mismatch {
+        let name = symbols
+            .resolve(symbol)
+            .map(|name| name.to_string())
+            .unwrap_or_else(|_| "<error>".to_owned());
+        source_map.push_error_diagnostic_for_node(
+            Code::OrPatternBindingMismatch,
+            format!("or-pattern alternatives do not bind `{name}` consistently"),
+            or.syntax(),
+        )?;
+    }
+    Ok(planned)
+}
+
+fn first_binding_mismatch(
+    expected: &[PlannedBinding],
+    actual: &[PlannedBinding],
+) -> Option<Symbol> {
+    for binding in expected {
+        match actual
+            .iter()
+            .find(|candidate| candidate.symbol == binding.symbol)
+        {
+            Some(candidate) if candidate.mode == binding.mode => {}
+            _ => return Some(binding.symbol),
+        }
+    }
+    actual
+        .iter()
+        .find(|binding| {
+            !expected
+                .iter()
+                .any(|candidate| candidate.symbol == binding.symbol)
+        })
+        .map(|binding| binding.symbol)
+}
+
+fn flattened_or_alternatives(or: &ast::OrPat) -> Vec<ast::Pattern> {
+    fn flatten(pattern: &ast::Pattern, alternatives: &mut Vec<ast::Pattern>) {
+        match pattern {
+            ast::Pattern::Or(or) => {
+                for alternative in or.alternatives() {
+                    flatten(&alternative, alternatives);
+                }
+            }
+            ast::Pattern::Parenthesized(paren) => match paren.pattern() {
+                Some(inner) => flatten(&inner, alternatives),
+                None => alternatives.push(pattern.clone()),
+            },
+            _ => alternatives.push(pattern.clone()),
+        }
+    }
+
+    let mut alternatives = Vec::new();
+    for alternative in or.alternatives() {
+        flatten(&alternative, &mut alternatives);
+    }
+    alternatives
+}
+
 fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringError> {
     if contains_error_node(pattern.syntax()) {
         return Ok(());
@@ -419,6 +734,12 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
         ast::Pattern::Slice(slice) => {
             for element in slice.elements() {
                 ensure_supported_pattern(&element)?;
+            }
+            Ok(())
+        }
+        ast::Pattern::Or(or) => {
+            for alternative in flattened_or_alternatives(or) {
+                ensure_supported_pattern(&alternative)?;
             }
             Ok(())
         }
@@ -459,7 +780,6 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
             }
             Ok(())
         }
-        _ => Err(HirLoweringError::UnsupportedSyntax(pattern.syntax().kind())),
     }
 }
 
@@ -500,7 +820,7 @@ fn lower_ctor_pat_args<'hir>(
     for arg in args {
         match arg {
             CtorPatArgSyntax::Positional(pattern) => {
-                let pattern = lower_pattern(pattern, arena, symbols, source_map)?;
+                let pattern = lower_pattern_inner(pattern, arena, symbols, source_map)?;
                 lowered.push(PatArg {
                     name: None,
                     pat: pattern,
@@ -508,7 +828,7 @@ fn lower_ctor_pat_args<'hir>(
             }
             CtorPatArgSyntax::Named { name, pattern } => {
                 let name = lower_name_ref(name, symbols, source_map)?;
-                let pattern = lower_pattern(pattern, arena, symbols, source_map)?;
+                let pattern = lower_pattern_inner(pattern, arena, symbols, source_map)?;
                 lowered.push(PatArg {
                     name: Some(name),
                     pat: pattern,
@@ -533,7 +853,7 @@ fn lower_binding_pattern<'hir>(
     };
     let (hir_id, span) = source_map.add_node_with_span(binding_pat.syntax(), SpanCtxt::Root)?;
     let name = lower_binding_name(binding_pat, symbols, source_map)?;
-    let (binding, _) = source_map.add_binding_with_span(binding_pat.syntax(), SpanCtxt::Root)?;
+    let binding = lower_binding_id(binding_pat.syntax(), source_map)?;
     Ok(arena.alloc_pat(Pat {
         hir_id,
         kind: PatKind::Binding {
@@ -564,8 +884,8 @@ fn lower_at_pattern<'hir>(
 
     let (hir_id, span) = source_map.add_node_with_span(at.syntax(), SpanCtxt::Root)?;
     let name = lower_binding_name(&binding_pat, symbols, source_map)?;
-    let (binding, _) = source_map.add_binding_with_span(binding_pat.syntax(), SpanCtxt::Root)?;
-    let sub = lower_pattern(&inner, arena, symbols, source_map)?;
+    let binding = lower_binding_id(binding_pat.syntax(), source_map)?;
+    let sub = lower_pattern_inner(&inner, arena, symbols, source_map)?;
     Ok(arena.alloc_pat(Pat {
         hir_id,
         kind: PatKind::Binding {
@@ -576,6 +896,16 @@ fn lower_at_pattern<'hir>(
         },
         span,
     }))
+}
+
+fn lower_binding_id(
+    syntax: &SyntaxNode,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<BindingId, HirLoweringError> {
+    match source_map.binding_for_syntax(syntax)? {
+        Some(binding) => Ok(binding),
+        None => Ok(source_map.add_binding(syntax)?),
+    }
 }
 
 fn lower_binding_mode(binding_pat: &ast::BindingPat) -> Option<HirBindingMode> {
@@ -1025,7 +1355,7 @@ mod tests {
         let file = crate::FileId::new(65);
         let (snapshot, parsed, ast_ids) = parse_file(
             file,
-            "fn f() { match value { _ => (), (true) => (), ((_)) => (), [left, first | second] => () } }\n",
+            "fn f() { match value { _ => (), (true) => (), ((_)) => () } }\n",
         );
         let function = function_node(&parsed.root);
         let patterns = function
@@ -1033,7 +1363,7 @@ mod tests {
             .filter_map(ast::MatchArm::cast)
             .filter_map(|arm| arm.pattern())
             .collect::<Vec<_>>();
-        assert_eq!(patterns.len(), 4);
+        assert_eq!(patterns.len(), 3);
 
         let arena = HirArena::new();
         let symbols = Interner::new();
@@ -1071,11 +1401,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        assert_eq!(
-            lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
-        );
-
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 4);
     }
@@ -1466,9 +1791,9 @@ mod tests {
     }
 
     #[test]
-    fn lowers_tuple_patterns_and_preflights_unsupported_children() {
-        let file = crate::FileId::new(68);
-        let source = "fn f() { match value { () => (), (only,) => (), (first, (second,), var third,) => (), (before, left | right) => () } }";
+    fn lowers_or_patterns_shares_bindings_and_reports_mismatches_and_duplicates() {
+        let file = crate::FileId::new(69);
+        let source = "fn f() { match value { Pair(first, second) | Pair(second, first) => (), Pair(var mode) | Pair(mode) => (), Pair(left) | Pair(right) => (), Pair(duplicate, duplicate) => (), ((nested | nested) | nested) => (), | leading | leading => () } }";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
@@ -1477,7 +1802,342 @@ mod tests {
             .filter_map(ast::MatchArm::cast)
             .filter_map(|arm| arm.pattern())
             .collect::<Vec<_>>();
-        assert_eq!(patterns.len(), 4);
+        assert_eq!(patterns.len(), 6);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("or-patterns lower");
+
+        fn alternatives<'hir>(pattern: &Pat<'hir>) -> &'hir [Pat<'hir>] {
+            match pattern.kind {
+                PatKind::Or(alternatives) => alternatives,
+                _ => panic!("or-pattern lowers to PatKind::Or"),
+            }
+        }
+        fn binding(pattern: &Pat<'_>) -> (Symbol, crate::BindingId, HirBindingMode) {
+            match pattern.kind {
+                PatKind::Binding {
+                    name,
+                    binding,
+                    mode,
+                    ..
+                } => (name.sym, binding, mode),
+                _ => panic!("binding pattern lowers to PatKind::Binding"),
+            }
+        }
+        fn constructor_args<'hir>(pattern: &Pat<'hir>) -> &'hir [PatArg<'hir>] {
+            match pattern.kind {
+                PatKind::Ctor {
+                    args: Some(args), ..
+                } => args,
+                _ => panic!("constructor pattern has arguments"),
+            }
+        }
+
+        let valid_alternatives = alternatives(lowered[0]);
+        assert_eq!(valid_alternatives.len(), 2);
+        let first_args = constructor_args(&valid_alternatives[0]);
+        let second_args = constructor_args(&valid_alternatives[1]);
+        assert_eq!(binding(first_args[0].pat).1.raw(), 0);
+        assert_eq!(binding(first_args[1].pat).1.raw(), 1);
+        assert_eq!(binding(second_args[0].pat).1.raw(), 1);
+        assert_eq!(binding(second_args[1].pat).1.raw(), 0);
+
+        let mode_alternatives = alternatives(lowered[1]);
+        assert_eq!(
+            binding(constructor_args(&mode_alternatives[0])[0].pat)
+                .1
+                .raw(),
+            2
+        );
+        assert_eq!(
+            binding(constructor_args(&mode_alternatives[1])[0].pat)
+                .1
+                .raw(),
+            2
+        );
+        assert_eq!(
+            binding(constructor_args(&mode_alternatives[0])[0].pat).2,
+            HirBindingMode::Var
+        );
+        assert_eq!(
+            binding(constructor_args(&mode_alternatives[1])[0].pat).2,
+            HirBindingMode::Value
+        );
+
+        let name_alternatives = alternatives(lowered[2]);
+        assert_eq!(
+            binding(constructor_args(&name_alternatives[0])[0].pat)
+                .1
+                .raw(),
+            3
+        );
+        assert_eq!(
+            binding(constructor_args(&name_alternatives[1])[0].pat)
+                .1
+                .raw(),
+            4
+        );
+
+        let duplicate_args = constructor_args(lowered[3]);
+        assert_eq!(binding(duplicate_args[0].pat).1.raw(), 5);
+        assert_eq!(binding(duplicate_args[1].pat).1.raw(), 6);
+
+        let nested_alternatives = alternatives(lowered[4]);
+        assert_eq!(nested_alternatives.len(), 3);
+        assert_eq!(
+            nested_alternatives
+                .iter()
+                .map(|pattern| binding(pattern).1.raw())
+                .collect::<Vec<_>>(),
+            [7, 7, 7]
+        );
+
+        let leading_alternatives = alternatives(lowered[5]);
+        assert_eq!(leading_alternatives.len(), 2);
+        assert_eq!(
+            leading_alternatives
+                .iter()
+                .map(|pattern| binding(pattern).1.raw())
+                .collect::<Vec<_>>(),
+            [8, 8]
+        );
+
+        let map = source_map.finish();
+        assert_eq!(map.binding_to_syntax().len(), 9);
+        let duplicate_diagnostics = map
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_diagnostics.len(), 1);
+        let duplicate_binding = ast::BindingPat::cast(
+            patterns[3]
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::BINDING_PAT)
+                .nth(1)
+                .expect("second duplicate binding")
+                .clone(),
+        )
+        .expect("binding syntax");
+        assert_eq!(
+            duplicate_diagnostics[0]
+                .primary()
+                .expect("duplicate diagnostic location")
+                .span
+                .range,
+            duplicate_binding.syntax().text_range()
+        );
+
+        let mismatch_diagnostics = map
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::OrPatternBindingMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(mismatch_diagnostics.len(), 2);
+        for ((diagnostic, pattern), expected_name) in mismatch_diagnostics
+            .into_iter()
+            .zip([&patterns[1], &patterns[2]])
+            .zip(["mode", "left"])
+        {
+            assert_eq!(diagnostic.severity, sai_diagnostics::Severity::Error);
+            assert!(diagnostic.message.contains(&format!("`{expected_name}`")));
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("mismatch diagnostic location")
+                    .span
+                    .range,
+                pattern.syntax().text_range()
+            );
+        }
+
+        let all_binding_syntax = function
+            .descendants()
+            .filter_map(ast::BindingPat::cast)
+            .collect::<Vec<_>>();
+        let canonical_binding_indexes = [0, 1, 4, 6, 7, 8, 9, 10, 13];
+        for ((_, pointer), expected_index) in map
+            .binding_to_syntax()
+            .iter_enumerated()
+            .zip(canonical_binding_indexes)
+        {
+            let expected =
+                sai_syntax::SyntaxNodePtr::new(file, all_binding_syntax[expected_index].syntax())
+                    .expect("expected binding pointer");
+            assert_eq!(pointer, &expected);
+        }
+    }
+
+    #[test]
+    fn keeps_nested_or_aliases_together_when_reporting_duplicate_bindings() {
+        let file = crate::FileId::new(70);
+        let source = "fn f() { match value { Pair(existing, Pair(existing | existing)) | Pair(existing, Pair(existing | existing)) => () } }";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let pattern = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .find_map(|arm| arm.pattern())
+            .expect("match arm pattern");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_pattern(&pattern, &arena, &symbols, &mut source_map)
+            .expect("nested or-pattern lowers");
+        let PatKind::Or(outer_alternatives) = lowered.kind else {
+            panic!("outer pattern lowers to an or-pattern");
+        };
+        assert_eq!(outer_alternatives.len(), 2);
+        let nested_binding_ids = outer_alternatives
+            .iter()
+            .map(|alternative| {
+                let PatKind::Ctor {
+                    args: Some(args), ..
+                } = alternative.kind
+                else {
+                    panic!("outer alternative is a constructor");
+                };
+                let PatKind::Ctor {
+                    args: Some(nested_args),
+                    ..
+                } = args[1].pat.kind
+                else {
+                    panic!("second constructor is nested");
+                };
+                let PatKind::Or(inner_alternatives) = nested_args[0].pat.kind else {
+                    panic!("nested constructor argument is an or-pattern");
+                };
+                inner_alternatives
+                    .iter()
+                    .map(|pattern| match pattern.kind {
+                        PatKind::Binding { binding, .. } => binding.raw(),
+                        _ => panic!("nested or alternative is a binding"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nested_binding_ids[0][0], nested_binding_ids[0][1]);
+        assert_eq!(nested_binding_ids[1][0], nested_binding_ids[1][1]);
+
+        let map = source_map.finish();
+        assert_eq!(
+            map.diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn checks_bindings_from_later_or_alternatives_against_sibling_patterns() {
+        let file = crate::FileId::new(71);
+        let source = "fn f() { match value { (left | right | right, right) => () } }";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let pattern = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .find_map(|arm| arm.pattern())
+            .expect("match arm pattern");
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = lower_pattern(&pattern, &arena, &symbols, &mut source_map)
+            .expect("tuple with an or-pattern lowers");
+        let PatKind::Tuple(elements) = lowered.kind else {
+            panic!("parenthesized comma pattern lowers to a tuple");
+        };
+        let PatKind::Or(alternatives) = elements[0].kind else {
+            panic!("first tuple element is an or-pattern");
+        };
+        let alternative_bindings = alternatives
+            .iter()
+            .map(|pattern| match pattern.kind {
+                PatKind::Binding { binding, .. } => binding.raw(),
+                _ => panic!("or alternative is a binding"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(alternative_bindings, [0, 1, 1]);
+        let PatKind::Binding {
+            binding: trailing_binding,
+            ..
+        } = elements[1].kind
+        else {
+            panic!("second tuple element is a binding");
+        };
+        assert_eq!(trailing_binding.raw(), 2);
+
+        let map = source_map.finish();
+        let duplicate_diagnostics = map
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_diagnostics.len(), 1);
+        assert_eq!(map.binding_to_syntax().len(), 3);
+        assert_eq!(
+            duplicate_diagnostics[0]
+                .primary()
+                .expect("duplicate diagnostic location")
+                .span
+                .range,
+            elements[1].span.range
+        );
+        let binding_syntaxes = function
+            .descendants()
+            .filter_map(ast::BindingPat::cast)
+            .collect::<Vec<_>>();
+        for ((_, pointer), expected_index) in
+            map.binding_to_syntax().iter_enumerated().zip([0, 1, 3])
+        {
+            let expected =
+                sai_syntax::SyntaxNodePtr::new(file, binding_syntaxes[expected_index].syntax())
+                    .expect("expected binding pointer");
+            assert_eq!(pointer, &expected);
+        }
+        assert_eq!(
+            map.diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::OrPatternBindingMismatch)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lowers_tuple_patterns_and_preserves_nested_bindings() {
+        let file = crate::FileId::new(68);
+        let source = "fn f() { match value { () => (), (only,) => (), (first, (second,), var third,) => () } }";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .filter_map(|arm| arm.pattern())
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 3);
 
         let arena = HirArena::new();
         let symbols = Interner::new();
@@ -1551,10 +2211,6 @@ mod tests {
             "nested tuple children receive owner-local IDs in source pre-order"
         );
 
-        assert_eq!(
-            lower_pattern(&patterns[3], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
-        );
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 9);
         assert_eq!(map.binding_to_syntax().len(), 4);
@@ -1570,7 +2226,6 @@ mod tests {
             "[..borrow mut rest, after] => (), ",
             "[before, ..var tail] => (), ",
             "[.., ..] => (), ",
-            "[before, left | right] => () ",
             "} }",
         );
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -1586,7 +2241,7 @@ mod tests {
             .filter_map(ast::MatchArm::cast)
             .filter_map(|arm| arm.pattern())
             .collect::<Vec<_>>();
-        assert_eq!(patterns.len(), 6);
+        assert_eq!(patterns.len(), 5);
         let ast::Pattern::Slice(duplicate_rest) = &patterns[4] else {
             panic!("fifth pattern is a slice");
         };
@@ -1715,11 +2370,6 @@ mod tests {
             assert_eq!(lowered.span.ctxt, SpanCtxt::Root);
         }
         assert_eq!(lowered[1].span.range, patterns[1].syntax().text_range());
-        assert_eq!(
-            lower_pattern(&patterns[5], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
-        );
-
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 12);
         assert_eq!(map.binding_to_syntax().len(), 6);
@@ -1734,7 +2384,6 @@ mod tests {
             ".Some() => (), ",
             ".Some(..) => (), ",
             ".Some(field: var named, positional, ..) => (), ",
-            ".Some(before, left | right) => () ",
             "} }",
         );
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -1745,7 +2394,7 @@ mod tests {
             .filter_map(ast::MatchArm::cast)
             .filter_map(|arm| arm.pattern())
             .collect::<Vec<_>>();
-        assert_eq!(patterns.len(), 5);
+        assert_eq!(patterns.len(), 4);
 
         let arena = HirArena::new();
         let symbols = Interner::new();
@@ -1842,14 +2491,6 @@ mod tests {
         }
         assert_eq!(args[0].pat.hir_id.local_id.raw(), 5);
         assert_eq!(args[1].pat.hir_id.local_id.raw(), 6);
-        assert!(
-            matches!(
-                lower_pattern(&patterns[4], &arena, &symbols, &mut source_map),
-                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT))
-            ),
-            "unsupported nested or-patterns are rejected before allocation"
-        );
-
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 7);
         assert_eq!(map.binding_to_syntax().len(), 2);
@@ -1864,7 +2505,6 @@ mod tests {
             "Some() => (), ",
             "http.Status.Ok(code: var named, payload, ..) => (), ",
             "app.Result.Left(.Ready) => (), ",
-            "app.Result.Left(first | second) => (), ",
             "r#Self() => () ",
             "} }",
         );
@@ -1881,7 +2521,7 @@ mod tests {
             .filter_map(ast::MatchArm::cast)
             .filter_map(|arm| arm.pattern())
             .collect::<Vec<_>>();
-        assert_eq!(patterns.len(), 6);
+        assert_eq!(patterns.len(), 5);
 
         let arena = HirArena::new();
         let symbols = Interner::new();
@@ -1894,11 +2534,7 @@ mod tests {
             .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
             .collect::<Result<Vec<_>, _>>()
             .expect("constructor patterns lower");
-        assert_eq!(
-            lower_pattern(&patterns[4], &arena, &symbols, &mut source_map).unwrap_err(),
-            HirLoweringError::UnsupportedSyntax(SyntaxKind::OR_PAT)
-        );
-        let invalid_raw = lower_pattern(&patterns[5], &arena, &symbols, &mut source_map)
+        let invalid_raw = lower_pattern(&patterns[4], &arena, &symbols, &mut source_map)
             .expect("invalid raw constructor lowers to an error pattern");
 
         fn ctor_parts<'hir>(

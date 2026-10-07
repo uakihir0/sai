@@ -1,5 +1,5 @@
 use crate::{BindingId, HirId, IndexVec, IndexVecError, ItemLocalId, OwnerId, Span, SpanCtxt};
-use sai_diagnostics::Diagnostic;
+use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Span as DiagnosticSpan};
 use sai_syntax::{SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, ast::AstIdMap};
 use std::collections::HashMap;
 
@@ -62,6 +62,7 @@ pub struct HirSourceMapBuilder<'root> {
     node_to_syntax: IndexVec<ItemLocalId, SyntaxNodePtr>,
     syntax_to_nodes: HashMap<SyntaxNodePtr, Vec<ItemLocalId>>,
     binding_to_syntax: IndexVec<BindingId, SyntaxNodePtr>,
+    binding_ids_by_syntax: HashMap<SyntaxNodePtr, BindingId>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -90,6 +91,7 @@ impl<'root> HirSourceMapBuilder<'root> {
             node_to_syntax: IndexVec::new(),
             syntax_to_nodes: HashMap::new(),
             binding_to_syntax: IndexVec::new(),
+            binding_ids_by_syntax: HashMap::new(),
             diagnostics: Vec::new(),
         };
         let owner_local_id = builder.push_node_pointer(owner_pointer)?;
@@ -149,9 +151,12 @@ impl<'root> HirSourceMapBuilder<'root> {
 
     pub fn add_binding(&mut self, syntax: &SyntaxNode) -> Result<BindingId, HirSourceMapError> {
         let pointer = syntax_pointer(self.file, self.root, syntax)?;
-        self.binding_to_syntax
-            .push(pointer)
-            .map_err(|IndexVecError::TooManyElements| HirSourceMapError::TooManyBindings)
+        let binding = self
+            .binding_to_syntax
+            .push(pointer.clone())
+            .map_err(|IndexVecError::TooManyElements| HirSourceMapError::TooManyBindings)?;
+        self.binding_ids_by_syntax.insert(pointer, binding);
+        Ok(binding)
     }
 
     /// Record a binding and return its validated source span.
@@ -168,9 +173,65 @@ impl<'root> HirSourceMapBuilder<'root> {
         };
         let binding = self
             .binding_to_syntax
-            .push(pointer)
+            .push(pointer.clone())
             .map_err(|IndexVecError::TooManyElements| HirSourceMapError::TooManyBindings)?;
+        self.binding_ids_by_syntax.insert(pointer, binding);
         Ok((binding, span))
+    }
+
+    /// Associate another syntax binding occurrence with an existing logical binding.
+    ///
+    /// Or-pattern alternatives use this to share one `BindingId` while keeping
+    /// `binding_to_syntax` pointed at the first occurrence in source order.
+    pub fn add_binding_alias(
+        &mut self,
+        syntax: &SyntaxNode,
+        binding: BindingId,
+    ) -> Result<(), HirSourceMapError> {
+        let pointer = syntax_pointer(self.file, self.root, syntax)?;
+        if self.binding_to_syntax.get(binding).is_none() {
+            return Err(HirSourceMapError::UnknownBindingAlias);
+        }
+        self.binding_ids_by_syntax.insert(pointer, binding);
+        Ok(())
+    }
+
+    /// Find a planned logical binding for one syntax occurrence, if present.
+    pub fn binding_for_syntax(
+        &self,
+        syntax: &SyntaxNode,
+    ) -> Result<Option<BindingId>, HirSourceMapError> {
+        let pointer = syntax_pointer(self.file, self.root, syntax)?;
+        Ok(self.binding_ids_by_syntax.get(&pointer).copied())
+    }
+
+    /// Create and record an error diagnostic at a validated syntax node.
+    pub fn push_error_diagnostic_for_node(
+        &mut self,
+        code: Code,
+        message: impl Into<String>,
+        syntax: &SyntaxNode,
+    ) -> Result<(), HirSourceMapError> {
+        syntax_pointer(self.file, self.root, syntax)?;
+        let file = self
+            .snapshot
+            .file(self.file)
+            .ok_or(HirSourceMapError::DiagnosticNotValidForSnapshot)?;
+        let location = Location::from_decoded_source(
+            SourceRef {
+                path: file.path().to_owned(),
+                package: file.package().map(str::to_owned),
+                snapshot: file.document_version(),
+            },
+            DiagnosticSpan::new(self.file, syntax.text_range()),
+            file.source(),
+        )
+        .ok_or(HirSourceMapError::DiagnosticNotValidForSnapshot)?;
+        let message = message.into();
+        let mut diagnostic =
+            Diagnostic::new(code, Severity::Error, message.clone(), Some(location));
+        diagnostic.primary_label = message;
+        self.push_diagnostic(diagnostic)
     }
 
     pub fn push_diagnostic(&mut self, diagnostic: Diagnostic) -> Result<(), HirSourceMapError> {
@@ -226,6 +287,7 @@ pub enum HirSourceMapError {
     AstIdMapMismatch,
     WorkspaceSnapshotMismatch,
     DiagnosticNotValidForSnapshot,
+    UnknownBindingAlias,
     SyntaxFileMismatch,
     SyntaxTreeMismatch,
     TooManyNodes,
