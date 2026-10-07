@@ -1541,19 +1541,21 @@ fn lower_path_expr<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
-    if path.generic_args().is_some() {
-        return Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()));
-    }
     let Some(name) = path.name() else {
         return lower_error_expr(path.syntax(), arena, source_map);
     };
     let (hir_id, span) = source_map.add_node_with_span(path.syntax(), SpanCtxt::Root)?;
     let (path_hir_id, path_span) = source_map.add_node_with_span(path.syntax(), SpanCtxt::Root)?;
     let (segment_hir_id, _) = source_map.add_node_with_span(name.syntax(), SpanCtxt::Root)?;
+    let name = lower_name_ref(&name, symbols, source_map)?;
+    let args = path
+        .generic_args()
+        .map(|args| lower_generic_args(&args, arena, symbols, source_map))
+        .transpose()?;
     let segment = PathSegment {
         hir_id: segment_hir_id,
-        name: lower_name_ref(&name, symbols, source_map)?,
-        args: None,
+        name,
+        args,
     };
     let path = Path {
         hir_id: path_hir_id,
@@ -1613,22 +1615,18 @@ fn lower_field_expr<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<&'hir Expr<'hir>, HirLoweringError> {
-    if has_direct_generic_args(field.syntax()) {
-        return Err(HirLoweringError::UnsupportedSyntax(field.syntax().kind()));
-    }
     let (Some(base), Some(name)) = (field.base(), field.name()) else {
         return lower_error_expr(field.syntax(), arena, source_map);
     };
     let (hir_id, span) = source_map.add_node_with_span(field.syntax(), SpanCtxt::Root)?;
     let base = lower_expr_inner(&base, arena, symbols, source_map)?;
     let name = lower_name_ref(&name, symbols, source_map)?;
+    let args = direct_generic_args(field.syntax())
+        .map(|args| lower_generic_args(&args, arena, symbols, source_map))
+        .transpose()?;
     Ok(arena.alloc_expr(Expr {
         hir_id,
-        kind: ExprKind::Field {
-            base,
-            name,
-            args: None,
-        },
+        kind: ExprKind::Field { base, name, args },
         span,
     }))
 }
@@ -3804,15 +3802,20 @@ fn ensure_supported_expr(expression: &ast::Expr) -> Result<(), HirLoweringError>
             Ok(())
         }
         ast::Expr::Path(path) => {
-            if path.generic_args().is_none() {
-                Ok(())
-            } else {
-                Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()))
+            if let Some(args) = path.generic_args() {
+                if !is_direct_call_callee(path.syntax()) {
+                    return Err(HirLoweringError::UnsupportedSyntax(path.syntax().kind()));
+                }
+                ensure_supported_generic_args(&args)?;
             }
+            Ok(())
         }
         ast::Expr::Field(field) => {
-            if has_direct_generic_args(field.syntax()) {
-                return Err(HirLoweringError::UnsupportedSyntax(field.syntax().kind()));
+            if let Some(args) = direct_generic_args(field.syntax()) {
+                if !is_direct_call_callee(field.syntax()) {
+                    return Err(HirLoweringError::UnsupportedSyntax(field.syntax().kind()));
+                }
+                ensure_supported_generic_args(&args)?;
             }
             match field.base() {
                 Some(base) => ensure_supported_expr(&base),
@@ -4085,10 +4088,22 @@ fn ensure_supported_match_expr(match_expr: &ast::MatchExpr) -> Result<(), HirLow
     Ok(())
 }
 
-fn has_direct_generic_args(syntax: &SyntaxNode) -> bool {
-    syntax
-        .children()
-        .any(|child| child.kind() == SyntaxKind::GENERIC_ARG_LIST)
+fn direct_generic_args(syntax: &SyntaxNode) -> Option<ast::GenericArgList> {
+    syntax.children().find_map(ast::GenericArgList::cast)
+}
+
+fn is_direct_call_callee(syntax: &SyntaxNode) -> bool {
+    let mut candidate = syntax.clone();
+    loop {
+        let Some(parent) = candidate.parent() else {
+            return false;
+        };
+        if parent.kind() == SyntaxKind::PAREN_EXPR {
+            candidate = parent;
+        } else {
+            return parent.kind() == SyntaxKind::CALL_EXPR;
+        }
+    }
 }
 
 /// Lower a literal pattern, preserving its direct minus sign for integer
@@ -8655,7 +8670,7 @@ mod tests {
     }
 
     #[test]
-    fn cast_preflight_rejects_unsupported_operands_before_allocation() {
+    fn cast_preflight_lowers_explicit_generic_call_operands() {
         let file = crate::FileId::new(100);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { value<I32>() as U8 }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
@@ -8672,11 +8687,19 @@ mod tests {
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map");
 
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
-        ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("generic call operand lowers through a cast");
+        let ExprKind::AsCast { operand, .. } = lowered.kind else {
+            panic!("the expression remains a cast");
+        };
+        let ExprKind::Call { callee, .. } = operand.kind else {
+            panic!("the cast operand remains a call");
+        };
+        let ExprKind::Path(path) = callee.kind else {
+            panic!("the generic function callee remains a path");
+        };
+        assert!(path.segments[0].args.is_some());
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -8902,7 +8925,7 @@ mod tests {
     }
 
     #[test]
-    fn if_let_preflights_unsupported_scrutinees_before_allocating_nodes() {
+    fn if_let_lowers_explicit_generic_method_call_scrutinees() {
         let file = crate::FileId::new(113);
         let source = "fn f() { if let _ = value.convert<U32>() {} }\n";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -8920,11 +8943,27 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-        ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("generic method call scrutinee lowers");
+        let ExprKind::Match {
+            scrutinee,
+            source: HirMatchSource::IfLet,
+            ..
+        } = lowered.kind
+        else {
+            panic!("if-let retains its dedicated match source");
+        };
+        let ExprKind::Call { callee, .. } = scrutinee.kind else {
+            panic!("if-let scrutinee is a call");
+        };
+        let ExprKind::Field {
+            args: Some(args), ..
+        } = callee.kind
+        else {
+            panic!("the method callee retains generic arguments");
+        };
+        assert_eq!(args.args.len(), 1);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -9064,7 +9103,7 @@ mod tests {
         let ast::Expr::Field(callee) = call.callee().expect("call callee") else {
             panic!("the call callee is a field expression");
         };
-        assert!(has_direct_generic_args(callee.syntax()));
+        assert!(direct_generic_args(callee.syntax()).is_some());
         let expression =
             ast::Expr::cast(if_expr.syntax().clone()).expect("if is an expression variant");
         let arena = HirArena::new();
@@ -9073,15 +9112,17 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        let result = lower_expr(&expression, &arena, &symbols, &mut source_map);
-        assert!(
-            matches!(
-                result,
-                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-            ),
-            "unexpected lowering result: {result:?}"
-        );
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("generic method calls lower inside recoverable if branches");
+        let ExprKind::If { cond, then, .. } = lowered.kind else {
+            panic!("the if is retained around the recovered block");
+        };
+        let ExprKind::Call { args, .. } = cond.kind else {
+            panic!("the if condition call is preserved");
+        };
+        assert_eq!(args[0].expr.kind, ExprKind::Err);
+        assert_eq!(then.tail.expect("then tail").kind, ExprKind::Err);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(105);
         let (snapshot, parsed, ast_ids) = parse_file(
@@ -9113,7 +9154,8 @@ mod tests {
                 .base()
                 .is_some_and(|base| matches!(base, ast::Expr::Call(ref call)
                     if call.callee().is_some_and(|callee| matches!(callee,
-                        ast::Expr::Field(ref field) if has_direct_generic_args(field.syntax())))))
+                        ast::Expr::Field(ref field)
+                            if direct_generic_args(field.syntax()).is_some()))))
         );
         let expression =
             ast::Expr::cast(if_expr.syntax().clone()).expect("if is an expression variant");
@@ -9123,15 +9165,17 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        let result = lower_expr(&expression, &arena, &symbols, &mut source_map);
-        assert!(
-            matches!(
-                result,
-                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::FIELD_EXPR))
-            ),
-            "unexpected lowering result: {result:?}"
-        );
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("generic method callee lowers through recovered index syntax");
+        let ExprKind::If { cond, then, .. } = lowered.kind else {
+            panic!("the if remains around the recovered index");
+        };
+        let ExprKind::Call { args, .. } = cond.kind else {
+            panic!("the condition call remains available");
+        };
+        assert_eq!(args[0].expr.kind, ExprKind::Err);
+        assert_eq!(then.tail.expect("then tail").kind, ExprKind::Err);
+        assert!(source_map.finish().node_to_syntax().len() > 1);
     }
 
     #[test]
@@ -9450,7 +9494,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_generic_path_arguments_before_allocating_hir_nodes() {
+    fn rejects_standalone_generic_path_arguments_before_allocating_hir_nodes() {
         let file = crate::FileId::new(75);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { (1, value<I32>) }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
@@ -9475,7 +9519,7 @@ mod tests {
         assert_eq!(
             source_map.finish().node_to_syntax().len(),
             1,
-            "generic paths are rejected before allocating the tuple or its children"
+            "standalone generic paths are rejected before allocating the tuple or its children"
         );
     }
 
@@ -10294,7 +10338,7 @@ mod tests {
     }
 
     #[test]
-    fn call_preflight_and_multiple_base_recovery_are_atomic() {
+    fn explicit_generic_call_arguments_and_multiple_base_recovery() {
         let file = crate::FileId::new(88);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { factory<I32>(value) }\n");
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
@@ -10311,11 +10355,16 @@ mod tests {
         let mut source_map =
             HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
                 .expect("source map builder");
-        assert!(matches!(
-            lower_expr(&expression, &arena, &symbols, &mut source_map),
-            Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::PATH_EXPR))
-        ));
-        assert_eq!(source_map.finish().node_to_syntax().len(), 1);
+        let lowered = lower_expr(&expression, &arena, &symbols, &mut source_map)
+            .expect("explicit generic call arguments lower");
+        let ExprKind::Call { callee, .. } = lowered.kind else {
+            panic!("generic function invocation remains a call");
+        };
+        let ExprKind::Path(path) = callee.kind else {
+            panic!("generic function callee remains a path");
+        };
+        assert!(path.segments[0].args.is_some());
+        assert!(source_map.finish().node_to_syntax().len() > 1);
 
         let file = crate::FileId::new(89);
         let (snapshot, parsed, ast_ids) =
@@ -13336,5 +13385,118 @@ mod tests {
         assert!(signature.is_async);
         assert!(body.is_none());
         assert!(source_map.finish().binding_to_syntax().is_empty());
+    }
+
+    #[test]
+    fn lowers_explicit_generic_arguments_on_paths_and_method_calls() {
+        let file = crate::FileId::new(219);
+        let source = "fn f() {\n    parse<I32, 8>(x)\n    receiver.map<U8, 5>(x)\n    (convert<U16>)(x)\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let calls = function
+            .descendants()
+            .filter_map(ast::CallExpr::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 3);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let (_packages, paths, owner) = owner_context(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder")
+                .with_def_path_interner(&paths);
+
+        let path_callee = calls[0].callee().expect("generic path callee");
+        let ast::Expr::Path(path_syntax) = &path_callee else {
+            panic!("the first generic callee is a path");
+        };
+        let path_generic_args_syntax = path_syntax
+            .generic_args()
+            .expect("path has explicit generic arguments");
+        let lowered_path = lower_expr(&path_callee, &arena, &symbols, &mut source_map)
+            .expect("generic path lowers");
+        let ExprKind::Path(path) = lowered_path.kind else {
+            panic!("the generic path remains a path expression");
+        };
+        let path_args = path.segments[0].args.expect("path generic arguments");
+        assert_eq!(path_args.args.len(), 2);
+        assert!(matches!(
+            path_args.args[0],
+            HirGenericArg::Type(ty) if matches!(ty.kind, HirTyKind::Path(_))
+        ));
+        assert_eq!(
+            path_args.args[1],
+            HirGenericArg::Const(HirConstArg::Int {
+                value: Some(8),
+                negated: false,
+            })
+        );
+        assert_eq!(
+            path_args.span.range,
+            path_generic_args_syntax.syntax().text_range()
+        );
+
+        let method_callee = calls[1].callee().expect("generic method callee");
+        let ast::Expr::Field(field_syntax) = &method_callee else {
+            panic!("the second generic callee is a field expression");
+        };
+        let method_generic_args_syntax = direct_generic_args(field_syntax.syntax())
+            .expect("method has explicit generic arguments");
+        let lowered_method = lower_expr(&method_callee, &arena, &symbols, &mut source_map)
+            .expect("generic method lowers");
+        let ExprKind::Field {
+            args: Some(method_args),
+            ..
+        } = lowered_method.kind
+        else {
+            panic!("method field retains its generic arguments");
+        };
+        assert_eq!(method_args.args.len(), 2);
+        assert!(matches!(
+            method_args.args[0],
+            HirGenericArg::Type(ty) if matches!(ty.kind, HirTyKind::Path(_))
+        ));
+        assert_eq!(
+            method_args.args[1],
+            HirGenericArg::Const(HirConstArg::Int {
+                value: Some(5),
+                negated: false,
+            })
+        );
+        assert_eq!(
+            method_args.span.range,
+            method_generic_args_syntax.syntax().text_range()
+        );
+
+        let parenthesized_callee = calls[2].callee().expect("parenthesized generic callee");
+        assert!(
+            matches!(parenthesized_callee, ast::Expr::Paren(_)),
+            "source retains the callee parentheses"
+        );
+        let lowered_parenthesized =
+            lower_expr(&parenthesized_callee, &arena, &symbols, &mut source_map)
+                .expect("a parenthesized generic callee lowers");
+        let ExprKind::Path(parenthesized_path) = lowered_parenthesized.kind else {
+            panic!("HIR erases callee parentheses");
+        };
+        assert!(
+            parenthesized_path.segments[0].args.is_some(),
+            "the generic arguments survive the parentheses"
+        );
+
+        let map = source_map.finish();
+        let source_ty = path_generic_args_syntax
+            .syntax()
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::PATH_TYPE)
+            .expect("generic type argument syntax");
+        let source_ty_ptr =
+            SyntaxNodePtr::new(file, &source_ty).expect("generic type syntax pointer");
+        let HirGenericArg::Type(lowered_ty) = path_args.args[0] else {
+            panic!("first path argument is a type");
+        };
+        assert_eq!(map.syntax_for_node(lowered_ty.hir_id), Some(&source_ty_ptr));
     }
 }
