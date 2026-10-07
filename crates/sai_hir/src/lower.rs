@@ -3,7 +3,7 @@ use crate::Symbol;
 use crate::arena::HirArena;
 use crate::expressions::{Expr, ExprKind};
 use crate::literals::Lit;
-use crate::patterns::{BindingMode as HirBindingMode, Pat, PatKind, PatRangeEnd};
+use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
 use crate::types::Name;
 use sai_intern::{InternError, Interner};
@@ -192,6 +192,9 @@ pub fn lower_pattern<'hir>(
         {
             lower_error_pattern(constructor.syntax(), arena, source_map)
         }
+        ast::Pattern::ImplicitMember(member) => {
+            lower_implicit_member_pattern(member, arena, symbols, source_map)
+        }
         ast::Pattern::Parenthesized(paren) => match paren.pattern() {
             Some(inner) => lower_pattern(&inner, arena, symbols, source_map),
             None => lower_error_pattern(paren.syntax(), arena, source_map),
@@ -285,6 +288,46 @@ fn lower_slice_pattern<'hir>(
     }))
 }
 
+fn lower_implicit_member_pattern<'hir>(
+    member: &ast::ImplicitMemberPat,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir Pat<'hir>, HirLoweringError> {
+    if contains_error_node(member.syntax()) {
+        return lower_error_pattern(member.syntax(), arena, source_map);
+    }
+    let Some(name) = member.name() else {
+        return lower_error_pattern(member.syntax(), arena, source_map);
+    };
+    let args = match member.args() {
+        Some(args) => match collect_ctor_pat_args(&args) {
+            Some((args, has_rest)) => Some((args, has_rest)),
+            None => return lower_error_pattern(member.syntax(), arena, source_map),
+        },
+        None => None,
+    };
+
+    let (hir_id, span) = source_map.add_node_with_span(member.syntax(), SpanCtxt::Root)?;
+    let name = lower_name_ref(&name, symbols, source_map)?;
+    let (args, has_rest) = match args {
+        Some((args, has_rest)) => (
+            Some(lower_ctor_pat_args(&args, arena, symbols, source_map)?),
+            has_rest,
+        ),
+        None => (None, false),
+    };
+    Ok(arena.alloc_pat(Pat {
+        hir_id,
+        kind: PatKind::ImplicitMember {
+            name,
+            args,
+            has_rest,
+        },
+        span,
+    }))
+}
+
 fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringError> {
     if contains_error_node(pattern.syntax()) {
         return Ok(());
@@ -333,6 +376,22 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
             }
             Ok(())
         }
+        ast::Pattern::ImplicitMember(member) => {
+            let Some(args) = member.args() else {
+                return Ok(());
+            };
+            let Some((args, _)) = collect_ctor_pat_args(&args) else {
+                return Ok(());
+            };
+            for arg in args {
+                let pattern = match arg {
+                    CtorPatArgSyntax::Positional(pattern)
+                    | CtorPatArgSyntax::Named { pattern, .. } => pattern,
+                };
+                ensure_supported_pattern(&pattern)?;
+            }
+            Ok(())
+        }
         ast::Pattern::Constructor(constructor)
             if constructor
                 .path()
@@ -342,6 +401,62 @@ fn ensure_supported_pattern(pattern: &ast::Pattern) -> Result<(), HirLoweringErr
         }
         _ => Err(HirLoweringError::UnsupportedSyntax(pattern.syntax().kind())),
     }
+}
+
+enum CtorPatArgSyntax {
+    Positional(ast::Pattern),
+    Named {
+        name: ast::NameRef,
+        pattern: ast::Pattern,
+    },
+}
+
+fn collect_ctor_pat_args(args: &ast::CtorPatArgs) -> Option<(Vec<CtorPatArgSyntax>, bool)> {
+    let rests = args.rest_patterns().count();
+    if rests > 1 {
+        return None;
+    }
+    let mut lowered = Vec::new();
+    for child in args.syntax().children() {
+        if let Some(pattern) = ast::Pattern::cast(child.clone()) {
+            lowered.push(CtorPatArgSyntax::Positional(pattern));
+        } else if let Some(named) = ast::NamedPatArg::cast(child) {
+            let (Some(name), Some(pattern)) = (named.name(), named.pattern()) else {
+                return None;
+            };
+            lowered.push(CtorPatArgSyntax::Named { name, pattern });
+        }
+    }
+    Some((lowered, rests == 1))
+}
+
+fn lower_ctor_pat_args<'hir>(
+    args: &[CtorPatArgSyntax],
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir [PatArg<'hir>], HirLoweringError> {
+    let mut lowered = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            CtorPatArgSyntax::Positional(pattern) => {
+                let pattern = lower_pattern(pattern, arena, symbols, source_map)?;
+                lowered.push(PatArg {
+                    name: None,
+                    pat: pattern,
+                });
+            }
+            CtorPatArgSyntax::Named { name, pattern } => {
+                let name = lower_name_ref(name, symbols, source_map)?;
+                let pattern = lower_pattern(pattern, arena, symbols, source_map)?;
+                lowered.push(PatArg {
+                    name: Some(name),
+                    pat: pattern,
+                });
+            }
+        }
+    }
+    Ok(arena.alloc_pat_args(&lowered))
 }
 
 fn lower_binding_pattern<'hir>(
@@ -420,20 +535,39 @@ fn lower_binding_name(
     source_map: &HirSourceMapBuilder<'_>,
 ) -> Result<Name, HirLoweringError> {
     let Some(name) = binding_pat.name() else {
-        return Ok(Name {
-            sym: Symbol::ERROR,
-            span: source_map.span_for(binding_pat.syntax(), SpanCtxt::Root)?,
-        });
+        return lower_name_spelling(binding_pat.syntax(), None, symbols, source_map);
     };
-    let span = source_map.span_for(name.syntax(), SpanCtxt::Root)?;
     let Some(token) = name.token() else {
+        return lower_name_spelling(name.syntax(), None, symbols, source_map);
+    };
+
+    lower_name_spelling(name.syntax(), Some(token.text()), symbols, source_map)
+}
+
+fn lower_name_ref(
+    name: &ast::NameRef,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Name, HirLoweringError> {
+    match name.syntax().first_token() {
+        Some(token) => lower_name_spelling(name.syntax(), Some(token.text()), symbols, source_map),
+        None => lower_name_spelling(name.syntax(), None, symbols, source_map),
+    }
+}
+
+fn lower_name_spelling(
+    syntax: &SyntaxNode,
+    written: Option<&str>,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Name, HirLoweringError> {
+    let span = source_map.span_for(syntax, SpanCtxt::Root)?;
+    let Some(written) = written else {
         return Ok(Name {
             sym: Symbol::ERROR,
             span,
         });
     };
-
-    let written = token.text();
     let raw_name = written.strip_prefix("r#");
     let identifier = raw_name.unwrap_or(written);
     let invalid_raw = invalid_raw_identifier(written);
@@ -1459,5 +1593,135 @@ mod tests {
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 12);
         assert_eq!(map.binding_to_syntax().len(), 6);
+    }
+
+    #[test]
+    fn lowers_implicit_member_patterns_and_preserves_argument_order() {
+        let file = crate::FileId::new(70);
+        let source = concat!(
+            "fn f() { match value { ",
+            ".Some => (), ",
+            ".Some() => (), ",
+            ".Some(..) => (), ",
+            ".Some(field: var named, positional, ..) => (), ",
+            ".Some(before, Some(value)) => () ",
+            "} }",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let patterns = function
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+            .filter_map(|arm| arm.pattern())
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 5);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered = patterns[..4]
+            .iter()
+            .map(|pattern| lower_pattern(pattern, &arena, &symbols, &mut source_map))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("implicit member patterns lower");
+
+        fn implicit_parts<'hir>(pattern: &Pat<'hir>) -> (Name, Option<&'hir [PatArg<'hir>]>, bool) {
+            match pattern.kind {
+                PatKind::ImplicitMember {
+                    name,
+                    args,
+                    has_rest,
+                } => (name, args, has_rest),
+                _ => panic!("implicit member lowers to PatKind::ImplicitMember"),
+            }
+        }
+        fn binding_parts(pattern: &Pat<'_>) -> (Name, crate::BindingId, HirBindingMode) {
+            match pattern.kind {
+                PatKind::Binding {
+                    name,
+                    binding,
+                    mode,
+                    ..
+                } => (name, binding, mode),
+                _ => panic!("argument pattern lowers to PatKind::Binding"),
+            }
+        }
+
+        let (name, args, has_rest) = implicit_parts(lowered[0]);
+        assert_eq!(symbols.resolve(name.sym).unwrap().as_ref(), "Some");
+        assert!(args.is_none());
+        assert!(!has_rest);
+        let (_, args, has_rest) = implicit_parts(lowered[1]);
+        assert_eq!(args.expect("explicit empty args"), &[]);
+        assert!(!has_rest);
+        let (_, args, has_rest) = implicit_parts(lowered[2]);
+        assert_eq!(args.expect("explicit rest args"), &[]);
+        assert!(has_rest);
+        let (_, args, has_rest) = implicit_parts(lowered[3]);
+        let args = args.expect("explicit arguments");
+        assert_eq!(args.len(), 2);
+        assert!(has_rest);
+        assert_eq!(
+            symbols
+                .resolve(args[0].name.expect("named argument").sym)
+                .unwrap()
+                .as_ref(),
+            "field"
+        );
+        assert_eq!(args[1].name, None);
+        let (named, named_binding, named_mode) = binding_parts(args[0].pat);
+        assert_eq!(symbols.resolve(named.sym).unwrap().as_ref(), "named");
+        assert_eq!(named_binding.raw(), 0);
+        assert_eq!(named_mode, HirBindingMode::Var);
+        let (positional, positional_binding, positional_mode) = binding_parts(args[1].pat);
+        assert_eq!(
+            symbols.resolve(positional.sym).unwrap().as_ref(),
+            "positional"
+        );
+        assert_eq!(positional_binding.raw(), 1);
+        assert_eq!(positional_mode, HirBindingMode::Value);
+        let ast::Pattern::ImplicitMember(mixed) = &patterns[3] else {
+            panic!("fourth pattern is an implicit member");
+        };
+        let named_arg_syntax = mixed
+            .args()
+            .and_then(|args| args.named_args().next())
+            .expect("named argument syntax");
+        assert_eq!(
+            args[0].name.expect("named argument").span.range,
+            named_arg_syntax
+                .name()
+                .expect("named argument name")
+                .syntax()
+                .text_range()
+        );
+        assert_eq!(
+            lowered
+                .iter()
+                .map(|pattern| pattern.hir_id.local_id.raw())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        for (lowered, syntax) in lowered.iter().zip(&patterns) {
+            assert_eq!(lowered.span.range, syntax.syntax().text_range());
+            assert_eq!(lowered.span.ctxt, SpanCtxt::Root);
+        }
+        assert_eq!(args[0].pat.hir_id.local_id.raw(), 5);
+        assert_eq!(args[1].pat.hir_id.local_id.raw(), 6);
+        assert!(
+            matches!(
+                lower_pattern(&patterns[4], &arena, &symbols, &mut source_map),
+                Err(HirLoweringError::UnsupportedSyntax(SyntaxKind::CTOR_PAT))
+            ),
+            "unsupported nested constructors are rejected before allocation"
+        );
+
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 7);
+        assert_eq!(map.binding_to_syntax().len(), 2);
     }
 }
