@@ -7,12 +7,16 @@ use crate::expressions::{
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMapBuilder, HirSourceMapError};
-use crate::types::{Name, Path, PathRoot, PathSegment};
+use crate::types::{
+    ConstArg as HirConstArg, EffectRef as HirEffectRef, GenericArg as HirGenericArg,
+    GenericArgs as HirGenericArgs, Name, Path, PathRoot, PathSegment, Ty as HirTy,
+    TyKind as HirTyKind,
+};
 use crate::{BindingId, DesugaringKind, Mutability, Safety, Span, SpanCtxt};
 use sai_diagnostics::Code;
 use sai_intern::{InternError, Interner};
 use sai_syntax::{
-    SyntaxElement, SyntaxKind, SyntaxNode,
+    SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TokenAtOffset,
     ast::{self, AstNode, AstToken},
 };
 
@@ -73,6 +77,381 @@ fn lower_literal_with_sign<'hir>(
             .unwrap_or(ExprKind::Err)
     };
     Ok(arena.alloc_expr(Expr { hir_id, kind, span }))
+}
+
+/// Lower one syntax type and record its source spans.
+///
+/// Parentheses and `owned` are transparent in HIR. Missing or error-marked
+/// types become `TyKind::Err`, leaving parser diagnostics authoritative.
+pub fn lower_type<'hir>(
+    ty: &ast::Type,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir HirTy<'hir>, HirLoweringError> {
+    ensure_supported_type(ty)?;
+    lower_type_inner(ty, arena, symbols, source_map)
+}
+
+fn lower_type_inner<'hir>(
+    ty: &ast::Type,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir HirTy<'hir>, HirLoweringError> {
+    if !matches!(ty, ast::Type::TupleType(_)) && direct_error_child(ty.syntax()).is_some() {
+        return lower_error_type(ty.syntax(), arena, source_map);
+    }
+    match ty {
+        ast::Type::PathType(path) => lower_path_type(
+            path.syntax(),
+            path.segments().collect(),
+            PathRoot::Plain,
+            arena,
+            symbols,
+            source_map,
+        ),
+        ast::Type::SelfType(path) => lower_path_type(
+            path.syntax(),
+            path.segments().collect(),
+            PathRoot::SelfType,
+            arena,
+            symbols,
+            source_map,
+        ),
+        ast::Type::BorrowType(borrow) => {
+            let Some(inner) = borrow.ty() else {
+                return lower_error_type(borrow.syntax(), arena, source_map);
+            };
+            let (hir_id, span) = source_map.add_node_with_span(borrow.syntax(), SpanCtxt::Root)?;
+            let mutability = if borrow.mut_token().is_some() {
+                Mutability::Mut
+            } else {
+                Mutability::Not
+            };
+            let inner = lower_type_inner(&inner, arena, symbols, source_map)?;
+            Ok(arena.alloc_ty(HirTy {
+                hir_id,
+                kind: HirTyKind::Borrow(mutability, inner),
+                span,
+            }))
+        }
+        ast::Type::OwnedType(owned) => match owned.ty() {
+            Some(inner) => lower_type_inner(&inner, arena, symbols, source_map),
+            None => lower_error_type(owned.syntax(), arena, source_map),
+        },
+        ast::Type::TupleType(tuple) => {
+            let (hir_id, span) = source_map.add_node_with_span(tuple.syntax(), SpanCtxt::Root)?;
+            let mut elements = Vec::new();
+            for child in tuple.syntax().children() {
+                if child.kind() == SyntaxKind::ERROR {
+                    if is_missing_tuple_close_error(tuple, &child) {
+                        continue;
+                    }
+                    elements.push(*lower_error_type(&child, arena, source_map)?);
+                } else if let Some(element) = ast::Type::cast(child) {
+                    elements.push(*lower_type_inner(&element, arena, symbols, source_map)?);
+                }
+            }
+            let comma_error = boundary_comma_error(tuple.syntax());
+            let unconsumed_commas = comma_error.as_ref().map_or(0, |error| {
+                unconsumed_commas_at_error_boundary(tuple.syntax(), error)
+            });
+            let represented_error_slots = tuple
+                .syntax()
+                .children()
+                .filter(|child| {
+                    child.kind() == SyntaxKind::ERROR
+                        && child.text_range().is_empty()
+                        && comma_error.as_ref().is_some_and(|error| {
+                            child.text_range().start() == error.text_range().start()
+                        })
+                        && !is_missing_tuple_close_error(tuple, child)
+                })
+                .count();
+            if let Some(error) = comma_error.as_ref() {
+                for _ in represented_error_slots..unconsumed_commas {
+                    elements.push(*lower_error_type(error, arena, source_map)?);
+                }
+            }
+            Ok(arena.alloc_ty(HirTy {
+                hir_id,
+                kind: HirTyKind::Tuple(arena.alloc_tys(&elements)),
+                span,
+            }))
+        }
+        ast::Type::ParenType(paren) => match paren.ty() {
+            Some(inner) => lower_type_inner(&inner, arena, symbols, source_map),
+            None => lower_error_type(paren.syntax(), arena, source_map),
+        },
+        ast::Type::InferType(infer) => {
+            let (hir_id, span) = source_map.add_node_with_span(infer.syntax(), SpanCtxt::Root)?;
+            Ok(arena.alloc_ty(HirTy {
+                hir_id,
+                kind: HirTyKind::Infer,
+                span,
+            }))
+        }
+        ast::Type::FnPtrType(function) => {
+            let effects_set = match function
+                .syntax()
+                .children()
+                .find_map(ast::EffectsClause::cast)
+            {
+                Some(clause) => match clause.set() {
+                    Some(set) if effect_set_is_well_formed(&set) => Some(set),
+                    _ => return lower_error_type(function.syntax(), arena, source_map),
+                },
+                None => None,
+            };
+            let (hir_id, span) =
+                source_map.add_node_with_span(function.syntax(), SpanCtxt::Root)?;
+            let params = function
+                .params()
+                .map(|param| lower_type_inner(&param, arena, symbols, source_map).copied())
+                .collect::<Result<Vec<_>, _>>()?;
+            let ret = function
+                .ret_type()
+                .map(|ret| lower_type_inner(&ret, arena, symbols, source_map))
+                .transpose()?;
+            let effects = effects_set
+                .as_ref()
+                .map(|effects| lower_effect_set(effects, arena, symbols, source_map))
+                .transpose()?;
+            Ok(arena.alloc_ty(HirTy {
+                hir_id,
+                kind: HirTyKind::FnPtr {
+                    safety: if function.unsafe_token().is_some() {
+                        Safety::Unsafe
+                    } else {
+                        Safety::Safe
+                    },
+                    params: arena.alloc_tys(&params),
+                    ret,
+                    effects,
+                },
+                span,
+            }))
+        }
+    }
+}
+
+fn lower_error_type<'hir>(
+    syntax: &SyntaxNode,
+    arena: &'hir HirArena<'hir>,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir HirTy<'hir>, HirLoweringError> {
+    let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    Ok(arena.alloc_ty(HirTy {
+        hir_id,
+        kind: HirTyKind::Err,
+        span,
+    }))
+}
+
+fn lower_path_type<'hir>(
+    syntax: &SyntaxNode,
+    path_segments: Vec<ast::PathSegment>,
+    root: PathRoot,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir HirTy<'hir>, HirLoweringError> {
+    if root == PathRoot::Plain && path_segments.is_empty() {
+        return lower_error_type(syntax, arena, source_map);
+    }
+    let (hir_id, span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    let (path_hir_id, path_span) = source_map.add_node_with_span(syntax, SpanCtxt::Root)?;
+    let mut segments = Vec::new();
+    for segment in path_segments {
+        let (segment_hir_id, _) =
+            source_map.add_node_with_span(segment.syntax(), SpanCtxt::Root)?;
+        let name = match segment.name() {
+            Some(name) => lower_name_ref(&name, symbols, source_map)?,
+            None => lower_name_spelling(segment.syntax(), None, symbols, source_map)?,
+        };
+        let args = segment
+            .generic_args()
+            .map(|args| lower_generic_args(&args, arena, symbols, source_map))
+            .transpose()?;
+        segments.push(PathSegment {
+            hir_id: segment_hir_id,
+            name,
+            args,
+        });
+    }
+    let path = arena.alloc_path(Path {
+        hir_id: path_hir_id,
+        root,
+        segments: arena.alloc_path_segments(&segments),
+        span: path_span,
+    });
+    Ok(arena.alloc_ty(HirTy {
+        hir_id,
+        kind: HirTyKind::Path(*path),
+        span,
+    }))
+}
+
+fn lower_generic_args<'hir>(
+    args: &ast::GenericArgList,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir HirGenericArgs<'hir>, HirLoweringError> {
+    let mut lowered = Vec::new();
+    let mut has_argument_in_slot = false;
+    let mut has_any_argument = false;
+    let mut trailing_comma = false;
+    for element in args.syntax().children_with_tokens() {
+        match element {
+            SyntaxElement::Node(child) => {
+                if let Some(type_arg) = ast::TypeArg::cast(child.clone()) {
+                    let ty = match type_arg.ty() {
+                        Some(ty) => lower_type_inner(&ty, arena, symbols, source_map)?,
+                        None => lower_error_type(type_arg.syntax(), arena, source_map)?,
+                    };
+                    lowered.push(HirGenericArg::Type(ty));
+                    has_argument_in_slot = true;
+                    has_any_argument = true;
+                    trailing_comma = false;
+                } else if let Some(const_arg) = ast::ConstArg::cast(child.clone()) {
+                    match lower_const_arg(&const_arg) {
+                        Some(const_arg) => lowered.push(HirGenericArg::Const(const_arg)),
+                        None => lowered.push(HirGenericArg::Type(lower_error_type(
+                            const_arg.syntax(),
+                            arena,
+                            source_map,
+                        )?)),
+                    }
+                    has_argument_in_slot = true;
+                    has_any_argument = true;
+                    trailing_comma = false;
+                } else if let Some(binding) = ast::AssocTypeBinding::cast(child.clone()) {
+                    let name = match binding.name() {
+                        Some(name) => lower_name_ref(&name, symbols, source_map)?,
+                        None => lower_name_spelling(binding.syntax(), None, symbols, source_map)?,
+                    };
+                    let ty = match binding.ty() {
+                        Some(ty) => lower_type_inner(&ty, arena, symbols, source_map)?,
+                        None => lower_error_type(binding.syntax(), arena, source_map)?,
+                    };
+                    lowered.push(HirGenericArg::Binding { name, ty });
+                    has_argument_in_slot = true;
+                    has_any_argument = true;
+                    trailing_comma = false;
+                } else if child.kind() == SyntaxKind::ERROR {
+                    if is_missing_generic_close_error(args, &child) {
+                        continue;
+                    }
+                    lowered.push(HirGenericArg::Type(lower_error_type(
+                        &child, arena, source_map,
+                    )?));
+                    has_argument_in_slot = true;
+                    has_any_argument = true;
+                    trailing_comma = false;
+                }
+            }
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA => {
+                if !has_argument_in_slot {
+                    // Some parser recovery paths report a missing argument but
+                    // do not keep an ERROR node at that source position.
+                    lowered.push(HirGenericArg::Type(lower_error_type(
+                        args.syntax(),
+                        arena,
+                        source_map,
+                    )?));
+                    has_any_argument = true;
+                }
+                has_argument_in_slot = false;
+                trailing_comma = true;
+            }
+            SyntaxElement::Token(_) => {}
+        }
+    }
+    let comma_error = boundary_comma_error(args.syntax());
+    let unconsumed_commas = comma_error.as_ref().map_or(0, |error| {
+        unconsumed_commas_at_error_boundary(args.syntax(), error)
+    });
+    let represented_error_slots = args
+        .syntax()
+        .children()
+        .filter(|child| {
+            child.kind() == SyntaxKind::ERROR
+                && child.text_range().is_empty()
+                && comma_error
+                    .as_ref()
+                    .is_some_and(|error| child.text_range().start() == error.text_range().start())
+                && !is_missing_generic_close_error(args, child)
+        })
+        .count();
+    if let Some(error) = comma_error.as_ref() {
+        for _ in represented_error_slots..unconsumed_commas {
+            lowered.push(HirGenericArg::Type(lower_error_type(
+                error, arena, source_map,
+            )?));
+        }
+    }
+    if !has_any_argument && !trailing_comma {
+        lowered.push(HirGenericArg::Type(lower_error_type(
+            args.syntax(),
+            arena,
+            source_map,
+        )?));
+    }
+    let span = source_map.span_for(args.syntax(), SpanCtxt::Root)?;
+    Ok(arena.alloc_generic_args(HirGenericArgs {
+        args: arena.alloc_generic_args_list(&lowered),
+        span,
+    }))
+}
+
+fn lower_const_arg(arg: &ast::ConstArg) -> Option<HirConstArg> {
+    let negated = arg.minus_token().is_some();
+    let token = arg.value_token()?;
+    if token.has_error() {
+        return None;
+    }
+    Some(match token.kind() {
+        SyntaxKind::INT => HirConstArg::Int {
+            value: ast::IntLit::cast(token).and_then(|literal| literal.value()),
+            negated,
+        },
+        SyntaxKind::CHAR => HirConstArg::Char(ast::CharLit::cast(token)?.value()),
+        SyntaxKind::TRUE_KW => HirConstArg::Bool(true),
+        SyntaxKind::FALSE_KW => HirConstArg::Bool(false),
+        _ => {
+            return None;
+        }
+    })
+}
+
+fn lower_effect_set<'hir>(
+    set: &ast::EffectSet,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<&'hir [HirEffectRef<'hir>], HirLoweringError> {
+    let mut effects = Vec::new();
+    for effect in set.effects() {
+        let (hir_id, _) = source_map.add_node_with_span(effect.syntax(), SpanCtxt::Root)?;
+        let segments = effect
+            .segments()
+            .map(|segment| lower_name_ref(&segment, symbols, source_map))
+            .collect::<Result<Vec<_>, _>>()?;
+        effects.push(HirEffectRef {
+            hir_id,
+            segments: arena.alloc_names(&segments),
+        });
+    }
+    Ok(arena.alloc_effect_refs(&effects))
+}
+
+fn effect_set_is_well_formed(set: &ast::EffectSet) -> bool {
+    !contains_error_node(set.syntax())
+        && set.effects().all(|effect| {
+            !contains_error_node(effect.syntax()) && effect.segments().next().is_some()
+        })
 }
 
 /// Lower the currently supported expression forms and record their source spans.
@@ -610,6 +989,151 @@ fn direct_error_child(syntax: &SyntaxNode) -> Option<SyntaxNode> {
     syntax
         .children()
         .find(|child| child.kind() == SyntaxKind::ERROR && !contains_attribute(child))
+}
+
+fn is_missing_tuple_close_error(tuple: &ast::TupleType, error: &SyntaxNode) -> bool {
+    if !is_missing_close_delimiter_error(tuple.syntax(), error, SyntaxKind::R_PAREN) {
+        return false;
+    }
+    let item_count = tuple.elements().count()
+        + tuple
+            .syntax()
+            .children()
+            .filter(|child| child.kind() == SyntaxKind::ERROR)
+            .count()
+            .saturating_sub(1);
+    let comma_count = tuple
+        .syntax()
+        .children_with_tokens()
+        .filter(|element| matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA))
+        .count()
+        + unconsumed_commas_at_error_boundary(tuple.syntax(), error);
+    comma_count <= item_count
+}
+
+fn is_missing_generic_close_error(args: &ast::GenericArgList, error: &SyntaxNode) -> bool {
+    if !is_missing_close_delimiter_error(args.syntax(), error, SyntaxKind::GT) {
+        return false;
+    }
+    let children = args.syntax().children().collect::<Vec<_>>();
+    let item_count = children
+        .iter()
+        .filter(|child| {
+            ast::TypeArg::can_cast(child.kind())
+                || ast::ConstArg::can_cast(child.kind())
+                || ast::AssocTypeBinding::can_cast(child.kind())
+                || child.kind() == SyntaxKind::ERROR
+        })
+        .count()
+        .saturating_sub(1);
+    let comma_count = args
+        .syntax()
+        .children_with_tokens()
+        .filter(|element| matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA))
+        .count()
+        + unconsumed_commas_at_error_boundary(args.syntax(), error);
+    comma_count <= item_count
+}
+
+fn unconsumed_commas_at_error_boundary(syntax: &SyntaxNode, error: &SyntaxNode) -> usize {
+    let Some(mut token) = token_at_error_boundary(syntax, error) else {
+        return 0;
+    };
+    if comma_belongs_to_enclosing_list(&token, syntax) {
+        return 0;
+    }
+    let mut commas = 0;
+    loop {
+        if token.kind() != SyntaxKind::COMMA {
+            break;
+        }
+        commas += 1;
+        let Some(next) = next_syntax_token(&token) else {
+            break;
+        };
+        if comma_belongs_to_enclosing_list(&next, syntax) {
+            break;
+        }
+        token = next;
+    }
+    commas
+}
+
+fn comma_belongs_to_enclosing_list(token: &SyntaxToken, syntax: &SyntaxNode) -> bool {
+    // Commas consumed as list separators are direct children of the owning
+    // syntax node; recovery-wrapped commas still describe an inner empty slot.
+    let owner = token.parent();
+    token.kind() == SyntaxKind::COMMA
+        && owner.kind() != SyntaxKind::ERROR
+        && (owner.kind() != syntax.kind() || owner.text_range() != syntax.text_range())
+}
+
+fn boundary_comma_error(syntax: &SyntaxNode) -> Option<SyntaxNode> {
+    syntax.children().find(|child| {
+        child.kind() == SyntaxKind::ERROR
+            && child.text_range().is_empty()
+            && child.text_range().start() >= syntax.text_range().end()
+            && token_at_error_boundary(syntax, child)
+                .is_some_and(|token| token.kind() == SyntaxKind::COMMA)
+    })
+}
+
+fn token_at_error_boundary(syntax: &SyntaxNode, error: &SyntaxNode) -> Option<SyntaxToken> {
+    let boundary = error.text_range().start();
+    let root = syntax.ancestors().last()?;
+    match root.token_at_offset(boundary) {
+        TokenAtOffset::Single(token) if token.text_range().start() == boundary => Some(token),
+        TokenAtOffset::Between(_, right) if right.text_range().start() == boundary => Some(right),
+        TokenAtOffset::Between(left, _) if left.text_range().start() == boundary => Some(left),
+        _ => None,
+    }
+}
+
+fn next_syntax_token(token: &SyntaxToken) -> Option<SyntaxToken> {
+    let mut parent = token.parent().clone();
+    let mut index = token.index_in_parent();
+    loop {
+        if let Some(next) = parent
+            .children_with_tokens()
+            .skip(index as usize + 1)
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) => Some(token),
+                SyntaxElement::Node(node) => node.first_token(),
+            })
+        {
+            return Some(next);
+        }
+        index = parent.index_in_parent()?;
+        parent = parent.parent()?;
+    }
+}
+
+fn is_missing_close_delimiter_error(
+    syntax: &SyntaxNode,
+    error: &SyntaxNode,
+    close_kind: SyntaxKind,
+) -> bool {
+    if !error.text_range().is_empty()
+        || error.text_range().start() < syntax.text_range().end()
+        || syntax.children_with_tokens().any(
+            |element| matches!(element, SyntaxElement::Token(token) if token.kind() == close_kind),
+        )
+    {
+        return false;
+    }
+    error.text_range().start() == syntax.text_range().end()
+        || token_at_error_boundary(syntax, error).is_some_and(|token| {
+            matches!(
+                token.kind(),
+                SyntaxKind::COMMA
+                    | SyntaxKind::EOF
+                    | SyntaxKind::GT
+                    | SyntaxKind::NEWLINE
+                    | SyntaxKind::R_BRACE
+                    | SyntaxKind::R_BRACKET
+                    | SyntaxKind::R_PAREN
+            )
+        })
 }
 
 fn direct_error_child_from_end(syntax: &SyntaxNode) -> Option<SyntaxNode> {
@@ -1330,6 +1854,70 @@ fn ensure_supported_if_expr(if_expr: &ast::IfExpr) -> Result<(), HirLoweringErro
             ensure_supported_block(&block)?;
         } else if let Some(else_if) = else_branch.else_if() {
             ensure_supported_if_expr(&else_if)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_type(ty: &ast::Type) -> Result<(), HirLoweringError> {
+    match ty {
+        ast::Type::PathType(path) => {
+            for segment in path.segments() {
+                if let Some(args) = segment.generic_args() {
+                    ensure_supported_generic_args(&args)?;
+                }
+            }
+        }
+        ast::Type::SelfType(path) => {
+            for segment in path.segments() {
+                if let Some(args) = segment.generic_args() {
+                    ensure_supported_generic_args(&args)?;
+                }
+            }
+        }
+        ast::Type::BorrowType(borrow) => {
+            if let Some(inner) = borrow.ty() {
+                ensure_supported_type(&inner)?;
+            }
+        }
+        ast::Type::OwnedType(owned) => {
+            if let Some(inner) = owned.ty() {
+                ensure_supported_type(&inner)?;
+            }
+        }
+        ast::Type::TupleType(tuple) => {
+            for element in tuple.elements() {
+                ensure_supported_type(&element)?;
+            }
+        }
+        ast::Type::ParenType(paren) => {
+            if let Some(inner) = paren.ty() {
+                ensure_supported_type(&inner)?;
+            }
+        }
+        ast::Type::InferType(_) => {}
+        ast::Type::FnPtrType(function) => {
+            for param in function.params() {
+                ensure_supported_type(&param)?;
+            }
+            if let Some(ret) = function.ret_type() {
+                ensure_supported_type(&ret)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_generic_args(args: &ast::GenericArgList) -> Result<(), HirLoweringError> {
+    for child in args.syntax().children() {
+        if let Some(type_arg) = ast::TypeArg::cast(child.clone()) {
+            if let Some(ty) = type_arg.ty() {
+                ensure_supported_type(&ty)?;
+            }
+        } else if let Some(binding) = ast::AssocTypeBinding::cast(child)
+            && let Some(ty) = binding.ty()
+        {
+            ensure_supported_type(&ty)?;
         }
     }
     Ok(())
@@ -2425,6 +3013,791 @@ mod tests {
         root.descendants()
             .find(|node| node.kind() == SyntaxKind::FN_DECL)
             .expect("function declaration")
+    }
+
+    #[test]
+    fn lowers_nested_borrow_tuple_owned_and_self_types() {
+        let file = crate::FileId::new(114);
+        let source = "fn f(a: borrow mut (I32, owned U8), b: Self.Nested) {}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration AST");
+        let params = declaration
+            .params()
+            .expect("parameter list")
+            .params()
+            .collect::<Vec<_>>();
+        let first_type = params[0].ty().expect("borrow tuple type");
+        let second_type = params[1].ty().expect("Self-qualified type");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered = lower_type(&first_type, &arena, &symbols, &mut source_map)
+            .expect("nested borrow type lowers");
+        let HirTyKind::Borrow(Mutability::Mut, tuple) = lowered.kind else {
+            panic!("the outer type is a mutable borrow");
+        };
+        let HirTyKind::Tuple(elements) = tuple.kind else {
+            panic!("the borrowed type is a tuple");
+        };
+        assert_eq!(elements.len(), 2);
+        let HirTyKind::Path(first_path) = elements[0].kind else {
+            panic!("the first tuple element is a path type");
+        };
+        let HirTyKind::Path(owned_path) = elements[1].kind else {
+            panic!("owned is erased to its inner path type");
+        };
+        assert_eq!(
+            symbols
+                .resolve(owned_path.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "U8"
+        );
+        assert_eq!(
+            elements[1].span.range,
+            params[0]
+                .ty()
+                .unwrap()
+                .syntax()
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::PATH_TYPE
+                    && node.text_range().start() > elements[0].span.range.start())
+                .expect("the owned inner path syntax")
+                .text_range()
+        );
+
+        let self_type = lower_type(&second_type, &arena, &symbols, &mut source_map)
+            .expect("Self path type lowers");
+        let HirTyKind::Path(self_path) = self_type.kind else {
+            panic!("Self type lowers to a path");
+        };
+        assert_eq!(self_path.root, PathRoot::SelfType);
+        assert_eq!(self_path.segments.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(self_path.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "Nested"
+        );
+        assert_eq!(
+            [
+                lowered.hir_id.local_id.raw(),
+                tuple.hir_id.local_id.raw(),
+                elements[0].hir_id.local_id.raw(),
+                first_path.hir_id.local_id.raw(),
+                first_path.segments[0].hir_id.local_id.raw(),
+                elements[1].hir_id.local_id.raw(),
+                owned_path.hir_id.local_id.raw(),
+                owned_path.segments[0].hir_id.local_id.raw(),
+                self_type.hir_id.local_id.raw(),
+                self_path.hir_id.local_id.raw(),
+                self_path.segments[0].hir_id.local_id.raw(),
+            ],
+            std::array::from_fn::<_, 11, _>(|index| index as u32 + 1)
+        );
+        let map = source_map.finish();
+        assert_eq!(map.node_to_syntax().len(), 12);
+    }
+
+    #[test]
+    fn lowers_mixed_generic_arguments_and_function_pointer_effects() {
+        let file = crate::FileId::new(115);
+        let source = concat!(
+            "fn f<T: pkg.Trait<I32, U8, -3, 4, 'c', true, false, Item = U8, Other = I32>>(",
+            "a: pkg.Foo<I32, -3, 4, 'c', true, false>, ",
+            "callback: unsafe fn(I32, U8) -> Bool effects { io }, ",
+            "pure: fn(), ",
+            "empty: fn() effects {}) {}\n"
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration AST");
+        let params = declaration
+            .params()
+            .expect("parameter list")
+            .params()
+            .collect::<Vec<_>>();
+        let path_type = params[0].ty().expect("generic path type");
+        let function_type = params[1].ty().expect("function pointer type");
+        let pure_function_type = params[2].ty().expect("pure function pointer type");
+        let empty_effects_type = params[3].ty().expect("explicit empty effect set");
+        let trait_path = function
+            .descendants()
+            .filter_map(ast::PathType::cast)
+            .find(|path| {
+                path.segments().any(|segment| {
+                    segment
+                        .generic_args()
+                        .is_some_and(|args| args.assoc_type_bindings().count() == 2)
+                })
+            })
+            .expect("trait bound path with associated type arguments");
+        let trait_type =
+            ast::Type::cast(trait_path.syntax().clone()).expect("trait bound path type");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered_path = lower_type(&path_type, &arena, &symbols, &mut source_map)
+            .expect("generic path type lowers");
+        let HirTyKind::Path(path) = lowered_path.kind else {
+            panic!("generic path lowers to a path type");
+        };
+        assert_eq!(path.root, PathRoot::Plain);
+        assert_eq!(path.segments.len(), 2);
+        let args = path.segments[1].args.expect("generic arguments");
+        assert_eq!(args.args.len(), 6);
+        assert!(matches!(args.args[0], HirGenericArg::Type(_)));
+        assert_eq!(
+            args.args[1],
+            HirGenericArg::Const(HirConstArg::Int {
+                value: Some(3),
+                negated: true,
+            })
+        );
+        assert_eq!(
+            args.args[2],
+            HirGenericArg::Const(HirConstArg::Int {
+                value: Some(4),
+                negated: false,
+            })
+        );
+        assert_eq!(args.args[3], HirGenericArg::Const(HirConstArg::Char('c')));
+        assert_eq!(args.args[4], HirGenericArg::Const(HirConstArg::Bool(true)));
+        assert_eq!(args.args[5], HirGenericArg::Const(HirConstArg::Bool(false)));
+        assert_eq!(
+            args.span.range,
+            path_type
+                .syntax()
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::GENERIC_ARG_LIST)
+                .expect("generic argument list")
+                .text_range()
+        );
+
+        let lowered_trait = lower_type(&trait_type, &arena, &symbols, &mut source_map)
+            .expect("trait bound type lowers");
+        let HirTyKind::Path(trait_path) = lowered_trait.kind else {
+            panic!("trait bound lowers to a path type");
+        };
+        let trait_args = trait_path.segments[1].args.expect("trait arguments");
+        assert_eq!(trait_args.args.len(), 9);
+        assert!(matches!(
+            trait_args.args[7],
+            HirGenericArg::Binding { name, .. }
+                if symbols.resolve(name.sym).unwrap().as_ref() == "Item"
+        ));
+        assert!(matches!(
+            trait_args.args[8],
+            HirGenericArg::Binding { name, .. }
+                if symbols.resolve(name.sym).unwrap().as_ref() == "Other"
+        ));
+
+        let lowered_function = lower_type(&function_type, &arena, &symbols, &mut source_map)
+            .expect("function pointer type lowers");
+        let HirTyKind::FnPtr {
+            safety,
+            params,
+            ret,
+            effects,
+        } = lowered_function.kind
+        else {
+            panic!("function pointer lowers to TyKind::FnPtr");
+        };
+        assert_eq!(safety, Safety::Unsafe);
+        assert_eq!(params.len(), 2);
+        assert!(matches!(ret.map(|ty| ty.kind), Some(HirTyKind::Path(_))));
+        let effects = effects.expect("effect set");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].segments.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(effects[0].segments[0].sym)
+                .unwrap()
+                .as_ref(),
+            "io"
+        );
+        assert_eq!(lowered_function.span.ctxt, SpanCtxt::Root);
+        let lowered_pure_function =
+            lower_type(&pure_function_type, &arena, &symbols, &mut source_map)
+                .expect("pure function pointer type lowers");
+        assert!(matches!(
+            lowered_pure_function.kind,
+            HirTyKind::FnPtr {
+                safety: Safety::Safe,
+                params,
+                ret: None,
+                effects: None,
+            } if params.is_empty()
+        ));
+        let lowered_empty_effects =
+            lower_type(&empty_effects_type, &arena, &symbols, &mut source_map)
+                .expect("explicit empty effect set lowers");
+        assert!(matches!(
+            lowered_empty_effects.kind,
+            HirTyKind::FnPtr {
+                effects: Some(effects),
+                ..
+            } if effects.is_empty()
+        ));
+        assert!(source_map.finish().node_to_syntax().len() > 2);
+    }
+
+    #[test]
+    fn lowers_unit_grouped_and_inference_types() {
+        let file = crate::FileId::new(118);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f(unit: (), grouped: (U8), inferred: _) {}\n");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration AST");
+        let params = declaration
+            .params()
+            .expect("parameter list")
+            .params()
+            .collect::<Vec<_>>();
+        let unit_type = params[0].ty().expect("unit type");
+        let grouped_type = params[1].ty().expect("grouped type");
+        let inferred_type = params[2].ty().expect("inference type");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let unit =
+            lower_type(&unit_type, &arena, &symbols, &mut source_map).expect("unit type lowers");
+        assert!(matches!(unit.kind, HirTyKind::Tuple(elements) if elements.is_empty()));
+        let grouped = lower_type(&grouped_type, &arena, &symbols, &mut source_map)
+            .expect("grouped type lowers");
+        let HirTyKind::Path(path) = grouped.kind else {
+            panic!("parentheses are transparent in type HIR");
+        };
+        assert_eq!(
+            symbols.resolve(path.segments[0].name.sym).unwrap().as_ref(),
+            "U8"
+        );
+        assert_eq!(
+            grouped.span.range,
+            grouped_type
+                .syntax()
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::PATH_TYPE)
+                .expect("inner path type")
+                .text_range()
+        );
+        let inferred = lower_type(&inferred_type, &arena, &symbols, &mut source_map)
+            .expect("inference type lowers");
+        assert_eq!(inferred.kind, HirTyKind::Infer);
+        assert!(source_map.finish().node_to_syntax().len() > 2);
+    }
+
+    #[test]
+    fn malformed_function_pointer_effects_make_the_type_err() {
+        for (index, source) in [
+            "fn f(callback: fn() effects) {}\n",
+            "fn f(callback: fn() effects { io, 123, net }) {}\n",
+            "fn f(callback: fn() effects { io. }) {}\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = crate::FileId::new(119 + index as u32);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert!(!parsed.errors.is_empty(), "{source}");
+            let function = function_node(&parsed.root);
+            let function_type = function
+                .descendants()
+                .find_map(ast::FnPtrType::cast)
+                .expect("function pointer type");
+            let ty = ast::Type::cast(function_type.syntax().clone()).expect("type union member");
+            let arena = HirArena::new();
+            let symbols = Interner::new();
+            let owner = owner_id(&symbols);
+            let mut source_map =
+                HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                    .expect("source map builder");
+
+            let lowered = lower_type(&ty, &arena, &symbols, &mut source_map)
+                .expect("malformed effect syntax lowers to an error type");
+            assert_eq!(lowered.kind, HirTyKind::Err, "{source}");
+            assert_eq!(source_map.finish().node_to_syntax().len(), 2, "{source}");
+        }
+    }
+
+    #[test]
+    fn malformed_generic_argument_preserves_valid_siblings() {
+        let file = crate::FileId::new(116);
+        let (snapshot, parsed, ast_ids) =
+            parse_file(file, "fn f(value: Foo<I32, borrow, U8>) {}\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration AST");
+        let ty = declaration
+            .params()
+            .and_then(|params| params.params().next())
+            .and_then(|param| param.ty())
+            .expect("recovered type");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+        let lowered =
+            lower_type(&ty, &arena, &symbols, &mut source_map).expect("recovered type lowers");
+        let HirTyKind::Path(path) = lowered.kind else {
+            panic!("a malformed generic argument preserves the path type");
+        };
+        let args = path.segments[0].args.expect("generic argument list").args;
+        assert_eq!(args.len(), 3);
+        assert!(matches!(
+            args[0],
+            HirGenericArg::Type(ty)
+                if matches!(ty.kind, HirTyKind::Path(path)
+                    if symbols.resolve(path.segments[0].name.sym).unwrap().as_ref() == "I32")
+        ));
+        assert!(matches!(args[1], HirGenericArg::Type(ty) if ty.kind == HirTyKind::Err));
+        assert!(matches!(
+            args[2],
+            HirGenericArg::Type(ty)
+                if matches!(ty.kind, HirTyKind::Path(path)
+                    if symbols.resolve(path.segments[0].name.sym).unwrap().as_ref() == "U8")
+        ));
+        assert_eq!(lowered.span.range, ty.syntax().text_range());
+        assert!(source_map.finish().node_to_syntax().len() > 2);
+    }
+
+    #[test]
+    fn empty_generic_argument_list_retains_an_error_placeholder() {
+        for (index, source) in ["fn f(value: Foo<>) {}\n", "fn f(value: Foo<,>) {}\n"]
+            .into_iter()
+            .enumerate()
+        {
+            let file = crate::FileId::new(122 + index as u32);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert!(!parsed.errors.is_empty(), "{source}");
+            let function = function_node(&parsed.root);
+            let declaration =
+                ast::FnDecl::cast(function.clone()).expect("function declaration AST");
+            let ty = declaration
+                .params()
+                .and_then(|params| params.params().next())
+                .and_then(|param| param.ty())
+                .expect("recovered type");
+            let arena = HirArena::new();
+            let symbols = Interner::new();
+            let owner = owner_id(&symbols);
+            let mut source_map =
+                HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                    .expect("source map builder");
+
+            let lowered =
+                lower_type(&ty, &arena, &symbols, &mut source_map).expect("recovered type lowers");
+            let HirTyKind::Path(path) = lowered.kind else {
+                panic!("a recovered empty generic list preserves its path type");
+            };
+            let args = path.segments[0].args.expect("generic arguments").args;
+            assert_eq!(args.len(), 1, "{source}");
+            assert!(matches!(
+                args[0],
+                HirGenericArg::Type(ty) if ty.kind == HirTyKind::Err
+            ));
+            assert!(source_map.finish().node_to_syntax().len() > 2, "{source}");
+        }
+    }
+
+    #[test]
+    fn malformed_const_argument_is_err_but_overflow_remains_decodable() {
+        for (index, (source, expect_parse_error)) in [
+            ("fn f(value: Foo<1__2>) {}\n", true),
+            (
+                "fn f(value: Foo<340282366920938463463374607431768211456>) {}\n",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = crate::FileId::new(126 + index as u32);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert_eq!(!parsed.errors.is_empty(), expect_parse_error, "{source}");
+            let function = function_node(&parsed.root);
+            let declaration =
+                ast::FnDecl::cast(function.clone()).expect("function declaration AST");
+            let ty = declaration
+                .params()
+                .and_then(|params| params.params().next())
+                .and_then(|param| param.ty())
+                .expect("path type");
+            let arena = HirArena::new();
+            let symbols = Interner::new();
+            let owner = owner_id(&symbols);
+            let mut source_map =
+                HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                    .expect("source map builder");
+
+            let lowered =
+                lower_type(&ty, &arena, &symbols, &mut source_map).expect("path type lowers");
+            let HirTyKind::Path(path) = lowered.kind else {
+                panic!("constant argument recovery preserves the generic path");
+            };
+            let args = path.segments[0].args.expect("generic arguments").args;
+            assert_eq!(args.len(), 1);
+            if expect_parse_error {
+                assert!(matches!(
+                    args[0],
+                    HirGenericArg::Type(ty) if ty.kind == HirTyKind::Err
+                ));
+            } else {
+                assert_eq!(
+                    args[0],
+                    HirGenericArg::Const(HirConstArg::Int {
+                        value: None,
+                        negated: false,
+                    })
+                );
+            }
+            assert!(source_map.finish().node_to_syntax().len() > 2);
+        }
+    }
+
+    #[test]
+    fn malformed_tuple_element_does_not_discard_valid_siblings() {
+        let file = crate::FileId::new(117);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f(value: (I32, , U8)) {}\n");
+        assert!(!parsed.errors.is_empty());
+        let function = function_node(&parsed.root);
+        let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration AST");
+        let ty = declaration
+            .params()
+            .and_then(|params| params.params().next())
+            .and_then(|param| param.ty())
+            .expect("recovered tuple type");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("source map builder");
+
+        let lowered = lower_type(&ty, &arena, &symbols, &mut source_map)
+            .expect("recovered tuple type lowers");
+        let HirTyKind::Tuple(elements) = lowered.kind else {
+            panic!("the malformed syntax still has a tuple type");
+        };
+        assert_eq!(elements.len(), 3);
+        assert!(matches!(elements[0].kind, HirTyKind::Path(_)));
+        assert_eq!(elements[1].kind, HirTyKind::Err);
+        let HirTyKind::Path(last) = elements[2].kind else {
+            panic!("the final tuple element remains a path type");
+        };
+        assert_eq!(
+            symbols.resolve(last.segments[0].name.sym).unwrap().as_ref(),
+            "U8"
+        );
+        assert!(source_map.finish().node_to_syntax().len() > 2);
+    }
+
+    #[test]
+    fn missing_type_delimiters_do_not_create_phantom_children() {
+        for (index, (source, expect_tuple, expected_count)) in [
+            ("type Pair = (I32, U8", true, 2),
+            ("type Pair = (U8,,,", true, 3),
+            ("type Pair = (U8, , ,", true, 3),
+            ("type Boxed = Foo<U8", false, 1),
+            ("type Boxed = Foo<U8,,", false, 2),
+            ("type Boxed = Foo<U8,,,", false, 3),
+            ("type Boxed = Foo<U8, , ,", false, 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = crate::FileId::new(124 + index as u32);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert!(!parsed.errors.is_empty(), "{source}");
+            let type_decl = parsed
+                .root
+                .descendants()
+                .find_map(ast::TypeDecl::cast)
+                .expect("type declaration");
+            let ty = type_decl
+                .alias_def()
+                .and_then(|alias| alias.ty())
+                .expect("aliased type");
+            let arena = HirArena::new();
+            let symbols = Interner::new();
+            let owner = owner_id(&symbols);
+            let mut source_map = HirSourceMapBuilder::new(
+                owner,
+                &ast_ids,
+                &snapshot,
+                &parsed.root,
+                type_decl.syntax(),
+            )
+            .expect("source map builder");
+
+            let lowered = lower_type(&ty, &arena, &symbols, &mut source_map)
+                .expect("type with a missing closing delimiter lowers");
+            if expect_tuple {
+                let HirTyKind::Tuple(elements) = lowered.kind else {
+                    panic!("the missing tuple delimiter retains its tuple type");
+                };
+                assert_eq!(elements.len(), expected_count, "{source}");
+                if expected_count > 2 {
+                    assert!(
+                        elements[1..]
+                            .iter()
+                            .all(|ty| ty.kind == HirTyKind::Err && ty.span.range.is_empty())
+                    );
+                }
+            } else {
+                let HirTyKind::Path(path) = lowered.kind else {
+                    panic!("the missing generic delimiter retains its path type");
+                };
+                let args = path.segments[0].args.expect("generic args").args;
+                assert_eq!(args.len(), expected_count, "{source}");
+                if expected_count > 1 {
+                    assert!(
+                        args[1..].iter().all(
+                            |arg| matches!(arg, HirGenericArg::Type(ty) if ty.kind == HirTyKind::Err)
+                        ),
+                        "{source}"
+                    );
+                    assert!(
+                        args[1..]
+                            .iter()
+                            .all(|arg| matches!(arg, HirGenericArg::Type(ty)
+                            if ty.kind == HirTyKind::Err && ty.span.range.is_empty())),
+                        "{source}"
+                    );
+                }
+            }
+            assert!(source_map.finish().node_to_syntax().len() > 2);
+        }
+    }
+
+    #[test]
+    fn missing_inner_generic_delimiter_does_not_consume_outer_separator() {
+        let file = crate::FileId::new(130);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "type X = Outer<Inner<U8,, T>\n");
+        assert!(!parsed.errors.is_empty());
+        let type_decl = parsed
+            .root
+            .descendants()
+            .find_map(ast::TypeDecl::cast)
+            .expect("type declaration");
+        let ty = type_decl
+            .alias_def()
+            .and_then(|alias| alias.ty())
+            .expect("aliased type");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, type_decl.syntax())
+                .expect("source map builder");
+
+        let lowered = lower_type(&ty, &arena, &symbols, &mut source_map)
+            .expect("nested type with a missing delimiter lowers");
+        let HirTyKind::Path(outer) = lowered.kind else {
+            panic!("the outer generic path is retained");
+        };
+        let outer_args = outer.segments[0].args.expect("outer generic arguments");
+        assert_eq!(outer_args.args.len(), 2);
+        let HirGenericArg::Type(inner_ty) = outer_args.args[0] else {
+            panic!("the first outer argument is the inner type");
+        };
+        let HirTyKind::Path(inner) = inner_ty.kind else {
+            panic!("the inner generic path is retained");
+        };
+        let inner_args = inner.segments[0].args.expect("inner generic arguments");
+        assert_eq!(inner_args.args.len(), 1);
+        assert!(matches!(
+            inner_args.args[0],
+            HirGenericArg::Type(ty) if matches!(ty.kind, HirTyKind::Path(_))
+        ));
+        assert!(matches!(outer_args.args[1], HirGenericArg::Type(_)));
+        assert!(source_map.finish().node_to_syntax().len() > 2);
+    }
+
+    #[test]
+    fn missing_generic_delimiter_does_not_consume_function_pointer_parameter_separator() {
+        let file = crate::FileId::new(131);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "type F = fn(Foo<U8, , Bar)\n");
+        assert!(!parsed.errors.is_empty());
+        let type_decl = parsed
+            .root
+            .descendants()
+            .find_map(ast::TypeDecl::cast)
+            .expect("type declaration");
+        let ty = type_decl
+            .alias_def()
+            .and_then(|alias| alias.ty())
+            .expect("aliased type");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, type_decl.syntax())
+                .expect("source map builder");
+
+        let lowered = lower_type(&ty, &arena, &symbols, &mut source_map)
+            .expect("function pointer with a recovered generic type lowers");
+        let HirTyKind::FnPtr { params, .. } = lowered.kind else {
+            panic!("the type remains a function pointer");
+        };
+        assert_eq!(params.len(), 2);
+        let HirTyKind::Path(first) = params[0].kind else {
+            panic!("the first parameter remains the generic path");
+        };
+        assert_eq!(first.segments[0].args.expect("generic args").args.len(), 1);
+        let HirTyKind::Path(second) = params[1].kind else {
+            panic!("the second parameter remains a path");
+        };
+        assert_eq!(
+            symbols
+                .resolve(second.segments[0].name.sym)
+                .unwrap()
+                .as_ref(),
+            "Bar"
+        );
+        assert!(source_map.finish().node_to_syntax().len() > 2);
+    }
+
+    #[test]
+    fn missing_generic_delimiter_does_not_consume_variant_payload_separator() {
+        for (index, source) in [
+            "enum E { V(Foo<U8, , Bar) }\n",
+            "enum E { V(first: Foo<U8, , second: Bar) }\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = crate::FileId::new(132 + index as u32);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert!(!parsed.errors.is_empty(), "{source}");
+            let enum_decl = parsed
+                .root
+                .descendants()
+                .find_map(ast::EnumDecl::cast)
+                .expect("enum declaration");
+            let foo = enum_decl
+                .syntax()
+                .descendants()
+                .filter_map(ast::PathType::cast)
+                .find(|path| {
+                    path.segments()
+                        .next()
+                        .and_then(|segment| segment.name())
+                        .and_then(|name| name.syntax().first_token())
+                        .is_some_and(|token| token.text() == "Foo")
+                })
+                .expect("Foo type in variant payload");
+            assert!(
+                enum_decl
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::PathType::cast)
+                    .any(|path| {
+                        path.segments()
+                            .next()
+                            .and_then(|segment| segment.name())
+                            .and_then(|name| name.syntax().first_token())
+                            .is_some_and(|token| token.text() == "Bar")
+                    }),
+                "the following payload type survives: {source}"
+            );
+            let ty = ast::Type::cast(foo.syntax().clone()).expect("type union member");
+            let arena = HirArena::new();
+            let symbols = Interner::new();
+            let owner = owner_id(&symbols);
+            let mut source_map = HirSourceMapBuilder::new(
+                owner,
+                &ast_ids,
+                &snapshot,
+                &parsed.root,
+                enum_decl.syntax(),
+            )
+            .expect("source map builder");
+
+            let lowered = lower_type(&ty, &arena, &symbols, &mut source_map)
+                .expect("recovered generic path lowers");
+            let HirTyKind::Path(path) = lowered.kind else {
+                panic!("Foo remains a path type");
+            };
+            assert_eq!(
+                path.segments[0].args.expect("generic arguments").args.len(),
+                1,
+                "{source}"
+            );
+            assert!(source_map.finish().node_to_syntax().len() > 2);
+        }
+    }
+
+    #[test]
+    fn missing_generic_delimiter_does_not_consume_where_predicate_separator() {
+        let file = crate::FileId::new(134);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() where Foo<U8, , T: Trait {}\n");
+        assert!(!parsed.errors.is_empty());
+        let function = parsed
+            .root
+            .descendants()
+            .find_map(ast::FnDecl::cast)
+            .expect("function declaration");
+        let foo = function
+            .syntax()
+            .descendants()
+            .filter_map(ast::PathType::cast)
+            .find(|path| {
+                path.segments()
+                    .next()
+                    .and_then(|segment| segment.name())
+                    .and_then(|name| name.syntax().first_token())
+                    .is_some_and(|token| token.text() == "Foo")
+            })
+            .expect("Foo type in where predicate");
+        assert!(
+            function
+                .syntax()
+                .descendants()
+                .filter_map(ast::PathType::cast)
+                .any(|path| {
+                    path.segments()
+                        .next()
+                        .and_then(|segment| segment.name())
+                        .and_then(|name| name.syntax().first_token())
+                        .is_some_and(|token| token.text() == "T")
+                }),
+            "the next where predicate's type survives"
+        );
+        let ty = ast::Type::cast(foo.syntax().clone()).expect("type union member");
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let owner = owner_id(&symbols);
+        let mut source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, function.syntax())
+                .expect("source map builder");
+
+        let lowered =
+            lower_type(&ty, &arena, &symbols, &mut source_map).expect("recovered type lowers");
+        let HirTyKind::Path(path) = lowered.kind else {
+            panic!("Foo remains a path type");
+        };
+        assert_eq!(path.segments[0].args.expect("generic args").args.len(), 1);
+        assert!(source_map.finish().node_to_syntax().len() > 2);
     }
 
     #[test]

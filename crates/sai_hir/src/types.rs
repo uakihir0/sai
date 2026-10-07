@@ -102,7 +102,9 @@ pub enum TyKind<'hir> {
     FnPtr {
         safety: Safety,
         params: &'hir [Ty<'hir>],
+        // `None` preserves an omitted `->`; it denotes the unit return type.
         ret: Option<&'hir Ty<'hir>>,
+        // `None` is an omitted clause; `Some([])` is an explicit empty set.
         effects: Option<&'hir [EffectRef<'hir>]>,
     },
     Infer,
