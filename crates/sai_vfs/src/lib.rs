@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use sai_query::{Durability, InputQuery, QueryDatabase, QueryError};
+use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_stable_hash::{StableHash, StableHasher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -577,6 +577,110 @@ impl SourceDecodeError {
     }
 }
 
+/// The source-decoding outcome recorded alongside a decoded source file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceTextStatus {
+    Ready,
+    Missing,
+    ReadError { io_error_kind: String },
+    TooLarge { byte_len: usize },
+}
+
+impl StableHash for SourceTextStatus {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xA9);
+        match self {
+            Self::Ready => hasher.write_tag(0),
+            Self::Missing => hasher.write_tag(1),
+            Self::ReadError { io_error_kind } => {
+                hasher.write_tag(2);
+                io_error_kind.stable_hash(hasher);
+            }
+            Self::TooLarge { byte_len } => {
+                hasher.write_tag(3);
+                (*byte_len as u64).stable_hash(hasher);
+            }
+        }
+    }
+}
+
+/// Decoded text plus the input condition needed by diagnostics and the driver.
+///
+/// The cached value's `FileId` is deliberately excluded from equality and
+/// stable hashing. `VfsInputs::source_text` attaches the requesting session ID
+/// after reading the memoized result.
+#[derive(Clone, Debug)]
+pub struct SourceText {
+    source: SourceFile,
+    status: SourceTextStatus,
+}
+
+impl SourceText {
+    pub const fn source(&self) -> &SourceFile {
+        &self.source
+    }
+
+    pub const fn status(&self) -> &SourceTextStatus {
+        &self.status
+    }
+
+    fn for_file_id(&self, file_id: FileId) -> Self {
+        Self {
+            source: self.source.with_file_id(file_id),
+            status: self.status.clone(),
+        }
+    }
+}
+
+impl PartialEq for SourceText {
+    fn eq(&self, other: &Self) -> bool {
+        self.status == other.status && self.source.raw_bytes == other.source.raw_bytes
+    }
+}
+
+impl Eq for SourceText {}
+
+impl StableHash for SourceText {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xAA);
+        self.status.stable_hash(hasher);
+        self.source.raw_bytes.stable_hash(hasher);
+    }
+}
+
+fn decode_source_text(contents: Option<FileContents>) -> SourceText {
+    let (bytes, status) = match contents {
+        None => (Arc::<[u8]>::from([]), SourceTextStatus::Missing),
+        Some(FileContents::ReadError { io_error_kind }) => (
+            Arc::<[u8]>::from([]),
+            SourceTextStatus::ReadError { io_error_kind },
+        ),
+        Some(FileContents::Bytes(bytes)) if bytes.len() > MAX_SOURCE_BYTES => (
+            Arc::<[u8]>::from([]),
+            SourceTextStatus::TooLarge {
+                byte_len: bytes.len(),
+            },
+        ),
+        Some(FileContents::Bytes(bytes)) => (bytes, SourceTextStatus::Ready),
+    };
+    let source = match SourceFile::decode(FileId::new(0), &bytes) {
+        Ok(source) => source,
+        Err(SourceDecodeError::SourceTooLarge) => {
+            return SourceText {
+                source: SourceFile::new(FileId::new(0), "", false)
+                    .expect("empty source always fits the source size limit"),
+                status: SourceTextStatus::TooLarge {
+                    byte_len: bytes.len(),
+                },
+            };
+        }
+        Err(SourceDecodeError::UnremovedLeadingBom) => {
+            unreachable!("byte decoding always records and removes a leading BOM")
+        }
+    };
+    SourceText { source, status }
+}
+
 /// Opaque identity for one consistent VFS snapshot of a workspace's file set.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct WorkspaceSnapshotId(u64);
@@ -733,17 +837,30 @@ pub enum VfsInputUpdate {
 
 /// Query-backed raw source inputs for the virtual file system.
 ///
-/// This is the input layer only; decoding and syntax queries consume these
-/// bytes in higher compiler layers.
+/// This layer owns tracked raw inputs and memoized source decoding; syntax
+/// queries consume the decoded source values above it.
 #[derive(Clone)]
 pub struct VfsInputs {
     file_contents: InputQuery<FileKey, FileContents>,
+    source_text_query: DerivedQuery<FileKey, SourceText>,
 }
 
 impl VfsInputs {
     pub fn new() -> Result<Self, QueryError> {
+        let file_contents = InputQuery::new("file_contents", Durability::Low)?;
+        let source_text_inputs = file_contents.clone();
+        let source_text_query = DerivedQuery::<FileKey, SourceText>::new(
+            "source_text",
+            move |database: &mut QueryDatabase, key| {
+                let contents = source_text_inputs
+                    .get_opt(database, key.clone())?
+                    .map(|contents: Arc<FileContents>| contents.as_ref().clone());
+                Ok(decode_source_text(contents))
+            },
+        )?;
         Ok(Self {
-            file_contents: InputQuery::new("file_contents", Durability::Low)?,
+            file_contents,
+            source_text_query,
         })
     }
 
@@ -805,6 +922,21 @@ impl VfsInputs {
         self.file_contents
             .get_opt(database, key)
             .map(|contents| contents.map(|contents| contents.as_ref().clone()))
+    }
+
+    /// Decodes a file as a tracked query and binds it to the requested session ID.
+    ///
+    /// Missing files and read failures carry an empty source file so syntax
+    /// recovery can continue; their status remains available for diagnostics.
+    pub fn source_text(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        file_id: FileId,
+    ) -> Result<SourceText, QueryError> {
+        self.source_text_query
+            .get(database, key)
+            .map(|source| source.for_file_id(file_id))
     }
 
     /// Applies a group of file changes in one query revision.
@@ -961,6 +1093,17 @@ impl WorkspaceSnapshot {
 }
 
 impl SourceFile {
+    fn with_file_id(&self, id: FileId) -> Self {
+        Self {
+            id,
+            text: Arc::clone(&self.text),
+            had_bom: self.had_bom,
+            line_index: Arc::clone(&self.line_index),
+            raw_bytes: Arc::clone(&self.raw_bytes),
+            invalid_utf8: Arc::clone(&self.invalid_utf8),
+        }
+    }
+
     pub fn new(
         id: FileId,
         text: impl Into<Arc<str>>,
@@ -1975,6 +2118,132 @@ mod tests {
             0
         );
         assert_eq!(runs.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn source_text_decoding_is_memoized_by_file_key_and_rebound_to_file_id() {
+        let inputs = VfsInputs::new().expect("input queries are available");
+        let mut database = QueryDatabase::new();
+        let key = FileKey::new("acme:app#0.1", "src/main.sai").expect("file key is valid");
+        let raw = b"\xEF\xBB\xBFA\xFF";
+        assert!(
+            inputs
+                .set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::from(&raw[..]),
+                    Durability::Low,
+                )
+                .expect("raw bytes are set")
+        );
+
+        let first = inputs
+            .source_text(&mut database, key.clone(), FileId::new(17))
+            .expect("source text is decoded");
+        assert_eq!(first.status(), &SourceTextStatus::Ready);
+        assert_eq!(first.source().id(), FileId::new(17));
+        assert_eq!(first.source().text(), "A\u{FFFD}");
+        assert_eq!(first.source().raw_bytes(), raw);
+        assert!(first.source().had_bom());
+        assert_eq!(first.source().invalid_utf8_sequences().len(), 1);
+
+        let second = inputs
+            .source_text(&mut database, key.clone(), FileId::new(29))
+            .expect("memoized text can be rebound");
+        assert_eq!(second.source().id(), FileId::new(29));
+        assert_eq!(
+            first, second,
+            "session-local IDs do not affect query values"
+        );
+
+        assert!(
+            inputs
+                .set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::from(&raw[..]),
+                    Durability::High,
+                )
+                .expect("durability can change without changing bytes")
+        );
+        let rebound = inputs
+            .source_text(&mut database, key.clone(), FileId::new(17))
+            .expect("source text remains available after a durability change");
+        assert_eq!(rebound.source().text(), "A\u{FFFD}");
+
+        assert!(
+            inputs
+                .set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::from(&b"changed"[..]),
+                    Durability::Low,
+                )
+                .expect("updated raw bytes are set")
+        );
+        let changed = inputs
+            .source_text(&mut database, key, FileId::new(17))
+            .expect("changed bytes invalidate source text");
+        assert_eq!(changed.source().text(), "changed");
+        assert_eq!(changed.status(), &SourceTextStatus::Ready);
+    }
+
+    #[test]
+    fn source_text_turns_missing_read_errors_and_oversized_files_into_values() {
+        let inputs = VfsInputs::new().expect("input queries are available");
+        let mut database = QueryDatabase::new();
+        let missing_key =
+            FileKey::new("acme:app#0.1", "src/missing.sai").expect("file key is valid");
+        let missing = inputs
+            .source_text(&mut database, missing_key.clone(), FileId::new(1))
+            .expect("missing input is a source-text value");
+        assert_eq!(missing.status(), &SourceTextStatus::Missing);
+        assert_eq!(missing.source().text(), "");
+
+        assert!(
+            inputs
+                .set_file_read_error(
+                    &mut database,
+                    missing_key.clone(),
+                    "permission denied",
+                    Durability::Low,
+                )
+                .expect("read error is set")
+        );
+        let failed = inputs
+            .source_text(&mut database, missing_key, FileId::new(1))
+            .expect("read error is a source-text value");
+        assert_eq!(
+            failed.status(),
+            &SourceTextStatus::ReadError {
+                io_error_kind: "permission denied".to_owned()
+            }
+        );
+        assert_eq!(failed.source().text(), "");
+
+        let oversized_key =
+            FileKey::new("acme:app#0.1", "src/large.sai").expect("file key is valid");
+        let oversized_bytes = vec![b'x'; MAX_SOURCE_BYTES + 1];
+        assert!(
+            inputs
+                .set_file_contents(
+                    &mut database,
+                    oversized_key.clone(),
+                    Arc::from(oversized_bytes),
+                    Durability::Low,
+                )
+                .expect("oversized raw input is retained")
+        );
+        let oversized = inputs
+            .source_text(&mut database, oversized_key, FileId::new(2))
+            .expect("size limit is a source-text value");
+        assert_eq!(
+            oversized.status(),
+            &SourceTextStatus::TooLarge {
+                byte_len: MAX_SOURCE_BYTES + 1
+            }
+        );
+        assert_eq!(oversized.source().text(), "");
     }
 
     #[test]

@@ -416,7 +416,9 @@ where
     ///
     /// The input query's configured durability remains the default for `set`.
     /// Changing an existing key's durability advances all stamps through the
-    /// more durable of its old and new levels.
+    /// more durable of its old and new levels. If the value is equal, its
+    /// `changed_at` revision stays unchanged, so dependent queries refresh
+    /// durability metadata without rerunning their query functions.
     pub fn set_at_durability(
         &self,
         database: &mut QueryDatabase,
@@ -436,27 +438,36 @@ where
             }
             None => None,
         };
-        if previous.as_ref().is_some_and(|input| {
-            input.durability == durability
-                && input
-                    .value
-                    .as_deref()
-                    .is_some_and(|old_value| old_value == &value)
-        }) {
+        let value_is_unchanged = previous.as_ref().is_some_and(|input| {
+            input
+                .value
+                .as_deref()
+                .is_some_and(|old_value| old_value == &value)
+        });
+        if value_is_unchanged
+            && previous
+                .as_ref()
+                .is_some_and(|input| input.durability == durability)
+        {
             return Ok(false);
         }
-        let changed_durability =
-            previous.map_or(durability, |input| input.durability.max(durability));
+        let changed_durability = previous
+            .as_ref()
+            .map_or(durability, |input| input.durability.max(durability));
         let revision = match database.record_input_change(changed_durability) {
             Ok(revision) => revision,
             Err(error) => return Err(database.record_query_error(&error)),
+        };
+        let (value, changed_at) = match previous {
+            Some(input) if value_is_unchanged => (input.value, input.changed_at),
+            _ => (Some(Arc::new(value)), revision),
         };
         database.store_state(
             node,
             key,
             MemoState::Input(InputMemo {
-                value: Some(Arc::new(value)),
-                changed_at: revision,
+                value,
+                changed_at,
                 durability,
             }),
         );
@@ -1406,6 +1417,14 @@ mod tests {
         });
 
         assert_eq!(*query.get(&mut database, 1).expect("query computes"), 7);
+        let node = NodeKey::new(query.id, &1_u32);
+        assert!(matches!(
+            database.memo_state::<u32, u32>(node, &1),
+            Ok(Some(MemoState::Derived(DerivedMemo {
+                durability: Durability::High,
+                ..
+            })))
+        ));
         assert!(
             source
                 .set_at_durability(&mut database, 2, 8, Durability::Low)
@@ -1427,8 +1446,31 @@ mod tests {
         assert_eq!(
             *query
                 .get(&mut database, 1)
-                .expect("durability change invalidates"),
+                .expect("durability change refreshes metadata"),
             7
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "changing only the input durability must not rerun the query body"
+        );
+        assert!(matches!(
+            database.memo_state::<u32, u32>(node, &1),
+            Ok(Some(MemoState::Derived(DerivedMemo {
+                durability: Durability::Low,
+                ..
+            })))
+        ));
+        assert!(
+            source
+                .set_at_durability(&mut database, 1, 8, Durability::Low)
+                .expect("changed value invalidates")
+        );
+        assert_eq!(
+            *query
+                .get(&mut database, 1)
+                .expect("changed value recomputes"),
+            8
         );
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
