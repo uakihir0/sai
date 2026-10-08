@@ -1079,7 +1079,10 @@ impl WorldItemAccessor for ast::WorldExport {
     }
 }
 
-fn world_ref_text(source: &str, reference: &ast::WorldRef) -> Result<String, ItemTreeError> {
+pub(crate) fn world_ref_text(
+    source: &str,
+    reference: &ast::WorldRef,
+) -> Result<String, ItemTreeError> {
     if let Some(package) = reference.package() {
         return Ok(package.syntax().text().to_owned());
     }
@@ -1193,7 +1196,7 @@ where
     })
 }
 
-fn named_symbol<N: AstNode>(
+pub(crate) fn named_symbol<N: AstNode>(
     source: &str,
     name: Option<N>,
     symbols: &Interner,
