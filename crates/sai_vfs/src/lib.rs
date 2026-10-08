@@ -210,6 +210,36 @@ impl FileInterner {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        self.intern_keys(keys)
+    }
+
+    /// Interns source-directory-relative paths as one all-or-nothing batch.
+    ///
+    /// All paths and the available `FileId` range are validated before any
+    /// IDs are assigned, so a failed batch does not partially mutate the
+    /// interner.
+    pub fn intern_source_files(
+        &mut self,
+        packages: &PackageInterner,
+        package_id: PackageId,
+        source_directory: PackageSourceDirectory,
+        source_relative_paths: impl IntoIterator<Item = PackageSourcePath>,
+    ) -> Result<Vec<FileId>, FileInternerError> {
+        let package_key = packages
+            .resolve(package_id)
+            .map_err(FileInternerError::Package)?;
+        let keys = source_relative_paths
+            .into_iter()
+            .map(|path| {
+                FileKey::from_source_path(package_key.as_ref(), source_directory.clone(), path)
+                    .map_err(FileInternerError::FileKey)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.intern_keys(keys)
+    }
+
+    fn intern_keys(&mut self, keys: Vec<FileKey>) -> Result<Vec<FileId>, FileInternerError> {
         let new_keys = keys
             .iter()
             .filter(|key| !self.by_key.contains_key(*key))

@@ -203,6 +203,8 @@ A query that, directly or through other queries, reads itself is a **query cycle
 
 **Implementation update (IR-210, partial).** `RootDatabase::intern_wit_files(PackageId)` reads the tracked WIT inventory, interns each package-relative WIT path as a session-local `FileId`, and preserves the differences between a missing inventory, `NotApplicable`, an empty `Listed` set, and listed files. The rest of package discovery and WIT loading remains outside this driver slice.
 
+**Implementation update (IR-211, partial).** `RootDatabase::intern_package_files(PackageId, PackageSourceDirectory)` reads the tracked source inventory and maps each file's source-relative path through the configured source directory to a session-local `FileId`. Directory and symlink entries remain in the result without file IDs, and a missing inventory, missing source directory, and existing empty directory remain distinct.
+
 ## 1.5 Identifiers, interning, and arenas
 
 ### 1.5.1 Session identifiers

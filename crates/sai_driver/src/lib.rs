@@ -6,7 +6,7 @@ use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageIntern
 use sai_query::{Durability, QueryDatabase, QueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
-    FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex,
+    FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
     PackageSourcePath, SourceText, VfsInputSnapshot, VfsInputUpdate, VfsInputs, WitFilesSnapshot,
     WorkspaceSnapshot,
@@ -41,6 +41,59 @@ pub enum RootDatabaseError {
 pub enum InternedWitFiles {
     NotApplicable,
     Listed(Vec<FileId>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InternedPackageFiles {
+    source_directory_exists: bool,
+    entries: Vec<InternedPackageFileEntry>,
+}
+
+impl InternedPackageFiles {
+    pub const fn source_directory_exists(&self) -> bool {
+        self.source_directory_exists
+    }
+
+    pub fn entries(&self) -> &[InternedPackageFileEntry] {
+        &self.entries
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InternedPackageFileEntry {
+    File {
+        path: PackageSourcePath,
+        file_id: FileId,
+    },
+    Directory {
+        path: PackageSourcePath,
+    },
+    Symlink {
+        path: PackageSourcePath,
+    },
+}
+
+impl InternedPackageFileEntry {
+    pub fn path(&self) -> &PackageSourcePath {
+        match self {
+            Self::File { path, .. } | Self::Directory { path } | Self::Symlink { path } => path,
+        }
+    }
+
+    pub const fn kind(&self) -> PackageFileKind {
+        match self {
+            Self::File { .. } => PackageFileKind::File,
+            Self::Directory { .. } => PackageFileKind::Directory,
+            Self::Symlink { .. } => PackageFileKind::Symlink,
+        }
+    }
+
+    pub const fn file_id(&self) -> Option<FileId> {
+        match self {
+            Self::File { file_id, .. } => Some(*file_id),
+            Self::Directory { .. } | Self::Symlink { .. } => None,
+        }
+    }
 }
 
 impl From<QueryError> for RootDatabaseError {
@@ -226,6 +279,62 @@ impl RootDatabase {
     /// Reads the memoized line index for a stable file identity.
     pub fn line_index(&mut self, key: FileKey) -> Result<Arc<LineIndex>, QueryError> {
         self.vfs.line_index(&mut self.query_database, key)
+    }
+
+    /// Reads a package's source inventory and interns file entries.
+    ///
+    /// `None` means no inventory input exists. A returned value preserves
+    /// whether the configured source directory exists; directories and
+    /// symlinks remain listed but receive no `FileId`.
+    pub fn intern_package_files(
+        &mut self,
+        package_id: PackageId,
+        source_directory: PackageSourceDirectory,
+    ) -> Result<Option<InternedPackageFiles>, RootDatabaseError> {
+        let package_name = self.packages.resolve(package_id)?;
+        let package_key = PackageKey::new(package_name.as_ref())?;
+        let Some(snapshot) = self
+            .vfs
+            .package_files(&mut self.query_database, package_key)?
+        else {
+            return Ok(None);
+        };
+        let source_paths = snapshot
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind() == PackageFileKind::File)
+            .map(|entry| entry.path().clone())
+            .collect::<Vec<_>>();
+        let file_ids = self.files.intern_source_files(
+            &self.packages,
+            package_id,
+            source_directory,
+            source_paths,
+        )?;
+        let mut file_ids = file_ids.into_iter();
+        let entries = snapshot
+            .entries()
+            .iter()
+            .map(|entry| match entry.kind() {
+                PackageFileKind::File => InternedPackageFileEntry::File {
+                    path: entry.path().clone(),
+                    file_id: file_ids
+                        .next()
+                        .expect("every inventoried source file has an interned file ID"),
+                },
+                PackageFileKind::Directory => InternedPackageFileEntry::Directory {
+                    path: entry.path().clone(),
+                },
+                PackageFileKind::Symlink => InternedPackageFileEntry::Symlink {
+                    path: entry.path().clone(),
+                },
+            })
+            .collect();
+        debug_assert!(file_ids.next().is_none());
+        Ok(Some(InternedPackageFiles {
+            source_directory_exists: snapshot.source_directory_exists(),
+            entries,
+        }))
     }
 
     /// Reads WIT paths and interns them as session-local file IDs.
@@ -468,5 +577,113 @@ mod tests {
                 .package_key(),
             "acme:app#0.1"
         );
+    }
+
+    #[test]
+    fn root_database_interns_package_source_files_and_preserves_inventory_entries() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let package_id = database
+            .intern_package("acme:app#0.1")
+            .expect("package is interned");
+        let package_key = PackageKey::new("acme:app#0.1").expect("package key is valid");
+        let source_directory =
+            PackageSourceDirectory::new("src").expect("source directory is valid");
+
+        assert_eq!(
+            database.intern_package_files(package_id, source_directory.clone()),
+            Ok(None)
+        );
+
+        let foreign_packages = PackageInterner::new();
+        let foreign_package_id = foreign_packages
+            .intern("acme:app#0.1")
+            .expect("foreign package is interned");
+        assert_eq!(
+            database.intern_package_files(foreign_package_id, source_directory.clone()),
+            Err(RootDatabaseError::Package(PackageIdError::UnknownPackage))
+        );
+
+        assert!(
+            database
+                .set_package_files(
+                    package_key.clone(),
+                    PackageFilesSnapshot::new(false, []).expect("missing source dir is valid"),
+                    Durability::Low,
+                )
+                .expect("missing source inventory is set")
+        );
+        let absent = database
+            .intern_package_files(package_id, source_directory.clone())
+            .expect("missing source inventory is read")
+            .expect("inventory input exists");
+        assert!(!absent.source_directory_exists());
+        assert!(absent.entries().is_empty());
+
+        assert!(
+            database
+                .set_package_files(
+                    package_key.clone(),
+                    PackageFilesSnapshot::new(true, []).expect("empty source dir is valid"),
+                    Durability::Low,
+                )
+                .expect("empty source inventory is set")
+        );
+        let empty = database
+            .intern_package_files(package_id, source_directory.clone())
+            .expect("empty source inventory is read")
+            .expect("inventory input exists");
+        assert!(empty.source_directory_exists());
+        assert!(empty.entries().is_empty());
+
+        assert!(
+            database
+                .set_package_files(
+                    package_key,
+                    PackageFilesSnapshot::new(
+                        true,
+                        [
+                            sai_vfs::PackageFileEntry::new(
+                                "nested",
+                                PackageFileKind::Directory,
+                            )
+                            .expect("directory entry is valid"),
+                            sai_vfs::PackageFileEntry::new(
+                                "nested/lib.sai",
+                                PackageFileKind::File,
+                            )
+                            .expect("source file entry is valid"),
+                            sai_vfs::PackageFileEntry::new(
+                                "link",
+                                PackageFileKind::Symlink,
+                            )
+                            .expect("symlink entry is valid"),
+                        ],
+                    )
+                    .expect("source inventory is valid"),
+                    Durability::Low,
+                )
+                .expect("source inventory is set")
+        );
+        let listed = database
+            .intern_package_files(package_id, source_directory)
+            .expect("source inventory is read")
+            .expect("inventory input exists");
+        assert!(listed.source_directory_exists());
+        assert_eq!(listed.entries().len(), 3);
+        assert_eq!(listed.entries()[0].path().as_str(), "link");
+        assert_eq!(listed.entries()[0].kind(), PackageFileKind::Symlink);
+        assert_eq!(listed.entries()[0].file_id(), None);
+        assert_eq!(listed.entries()[1].path().as_str(), "nested");
+        assert_eq!(listed.entries()[1].kind(), PackageFileKind::Directory);
+        assert_eq!(listed.entries()[1].file_id(), None);
+        let source_file = &listed.entries()[2];
+        assert_eq!(source_file.path().as_str(), "nested/lib.sai");
+        assert_eq!(source_file.kind(), PackageFileKind::File);
+        let file_id = source_file.file_id().expect("source files have IDs");
+        let stable_key = database
+            .file_key(file_id)
+            .expect("source file ID resolves in this session");
+        assert_eq!(stable_key.package_key(), "acme:app#0.1");
+        assert_eq!(stable_key.path(), "src/nested/lib.sai");
     }
 }
