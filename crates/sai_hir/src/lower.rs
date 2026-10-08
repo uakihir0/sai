@@ -291,6 +291,116 @@ pub fn lower_const_owner<'hir>(
     ))
 }
 
+/// Lower one top-level invariant declaration from the current item tree.
+///
+/// Invariant expressions belong to one owner, so nested closure and async
+/// definition IDs are prepared over the entire declaration before any
+/// predicate is lowered.
+pub fn lower_invariant_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Invariant, context)?;
+    let declaration =
+        ast::InvariantDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::Invariant(entry.name),
+        context,
+    )?;
+
+    let predicates = declaration
+        .predicates()
+        .map(|list| list.expressions().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for predicate in &predicates {
+        ensure_supported_expr(predicate)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    prepare_nested_definition_ids(declaration.syntax(), &mut source_map)?;
+
+    let target_syntax = declaration
+        .name()
+        .map(|name| name.syntax().clone())
+        .unwrap_or_else(|| declaration.syntax().clone());
+    let (path_hir_id, path_span) = source_map.add_node_with_span(&target_syntax, SpanCtxt::Root)?;
+    let (segment_hir_id, _) = source_map.add_node_with_span(&target_syntax, SpanCtxt::Root)?;
+    let target = Path {
+        hir_id: path_hir_id,
+        root: PathRoot::Plain,
+        segments: context.arena.alloc_path_segments(&[PathSegment {
+            hir_id: segment_hir_id,
+            name,
+            args: None,
+        }]),
+        span: path_span,
+    };
+    let lowered_predicates = predicates
+        .iter()
+        .map(|predicate| {
+            lower_expr_in_prepared_owner(predicate, context.arena, context.symbols, &mut source_map)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (value_hir_id, value_span) =
+        source_map.add_node_with_span(declaration.syntax(), SpanCtxt::Root)?;
+    let value = context.arena.alloc_expr(Expr {
+        hir_id: value_hir_id,
+        kind: ExprKind::Tuple(context.arena.alloc_exprs(&[])),
+        span: value_span,
+    });
+    let body = context.arena.alloc_body(Body {
+        owner,
+        params: &[],
+        value,
+        contracts: &[],
+        invariant_preds: context.arena.alloc_expr_refs(&lowered_predicates),
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Invariant { target },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: Some(body),
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level effect declaration from the current item tree.
 ///
 /// An omitted or parser-diagnosed malformed `covers` set recovers as empty:
@@ -15035,6 +15145,197 @@ mod tests {
                 "absent and malformed covers recover to the empty set: {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn lowers_item_tree_invariant_into_complete_hir_owner() {
+        let file = crate::FileId::new(242);
+        let source = "@deprecated(\"old invariant\")\ninvariant Account {\n self.balance >= 0,\n self.enabled\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("invariant item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Invariant);
+        let entry_id = entry.ast_id;
+        let name = symbols.intern("Account").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::Invariant(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_invariant_owner(owner, &expected_path, &item_tree, entry_id, &context)
+                .expect("invariant item lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level invariant is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Private);
+        assert_eq!(item.name.sym, name);
+        let ItemKind::Invariant { target } = item.kind else {
+            panic!("invariant item retains its invariant kind");
+        };
+        assert_eq!(target.root, PathRoot::Plain);
+        assert_eq!(target.segments.len(), 1);
+        assert_eq!(target.segments[0].name.sym, name);
+        assert!(target.segments[0].args.is_none());
+        let invariant_node = parsed
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::INVARIANT_DECL)
+            .expect("invariant declaration");
+        let declaration = ast::InvariantDecl::cast(invariant_node.clone())
+            .expect("invariant declaration casts to its AST view");
+        let target_name = declaration
+            .name()
+            .expect("invariant target name")
+            .syntax()
+            .clone();
+        assert_eq!(
+            source_map
+                .syntax_for_node(target.hir_id)
+                .expect("target path has a source-map entry")
+                .text_range(),
+            target_name.text_range()
+        );
+        assert_eq!(
+            source_map
+                .syntax_for_node(target.segments[0].hir_id)
+                .expect("target segment has a source-map entry")
+                .text_range(),
+            target_name.text_range()
+        );
+
+        let body = hir_owner.body.expect("invariant owns a body");
+        assert_eq!(body.owner, owner);
+        assert!(body.params.is_empty());
+        assert!(body.contracts.is_empty());
+        assert!(matches!(body.value.kind, ExprKind::Tuple(elements) if elements.is_empty()));
+        assert_eq!(body.invariant_preds.len(), 2);
+        assert!(matches!(
+            body.invariant_preds[0].kind,
+            ExprKind::Binary(BinOp::Ge, _, _)
+        ));
+        assert!(matches!(
+            body.invariant_preds[1].kind,
+            ExprKind::Field { .. }
+        ));
+        let syntax_predicates = declaration
+            .predicates()
+            .expect("invariant expression list")
+            .expressions()
+            .collect::<Vec<_>>();
+        assert_eq!(syntax_predicates.len(), body.invariant_preds.len());
+        for (predicate, syntax) in body.invariant_preds.iter().zip(syntax_predicates) {
+            assert_eq!(
+                source_map
+                    .syntax_for_node(predicate.hir_id)
+                    .expect("predicate has a source-map entry")
+                    .text_range(),
+                syntax.syntax().text_range()
+            );
+        }
+        assert_eq!(item.span.range, invariant_node.text_range());
+        assert_eq!(paths.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn invariant_owner_recovers_empty_and_malformed_predicate_lists() {
+        for (file_id, source, expected_predicates, expect_error_predicate) in [
+            (243, "invariant Account {}\n", 0, false),
+            (244, "invariant Account { self.balance >= 0\n", 1, false),
+            (246, "invariant Account { self.balance >= }\n", 1, true),
+        ] {
+            let file = crate::FileId::new(file_id);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert!(!parsed.errors.is_empty(), "{source:?}");
+            let symbols = Interner::new();
+            let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+                .expect("item tree collects the diagnosed invariant");
+            let entry = item_tree.items.first().expect("invariant item entry");
+            let name = symbols.intern("Account").expect("symbol interns");
+            let (_packages, paths, owner) =
+                owner_context_with_data(&symbols, DefPathData::Invariant(name));
+            let expected_path = owner_def_path(&paths, owner);
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &ast_ids,
+                &snapshot,
+                &parsed.root,
+                &arena,
+                &symbols,
+                &paths,
+            );
+
+            let (hir_owner, _) =
+                lower_invariant_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                    .expect("a diagnosed invariant remains available to later stages");
+            let body = hir_owner.body.expect("invariant still owns a body");
+            assert_eq!(
+                body.invariant_preds.len(),
+                expected_predicates,
+                "{source:?}"
+            );
+            assert!(matches!(body.value.kind, ExprKind::Tuple(elements) if elements.is_empty()));
+            if expect_error_predicate {
+                assert!(matches!(body.invariant_preds[0].kind, ExprKind::Err));
+            }
+        }
+    }
+
+    #[test]
+    fn invariant_owner_assigns_nested_definition_ordinals_across_predicates() {
+        let file = crate::FileId::new(245);
+        let source = "invariant Account { fn() { true }, fn() { false } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("invariant item entry");
+        let name = symbols.intern("Account").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::Invariant(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_invariant_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("invariant predicates share one owner path preorder");
+        let body = hir_owner.body.expect("invariant owns a body");
+        assert_eq!(body.invariant_preds.len(), 2);
+        for (ordinal, predicate) in body.invariant_preds.iter().enumerate() {
+            let ExprKind::Closure(closure) = predicate.kind else {
+                panic!("each predicate retains its closure expression");
+            };
+            let closure_path = paths
+                .resolve(closure.def_id)
+                .expect("closure definition path resolves")
+                .expect("closure definition path exists");
+            assert_eq!(
+                closure_path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Closure,
+                    disambiguator: ordinal as u32,
+                })
+            );
+        }
+        assert_eq!(paths.len().unwrap(), 3);
     }
 
     #[test]
