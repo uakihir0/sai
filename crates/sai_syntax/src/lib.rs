@@ -503,6 +503,7 @@ fn stable_hash_text_range(range: TextRange, hasher: &mut StableHasher) {
 pub enum ParseQueryError {
     Query(QueryError),
     Parse(ParseError),
+    AstIdMap(ast::AstIdMapError),
     FileNotInterned,
     MissingSnapshotFile,
     SnapshotSourceMismatch,
@@ -1023,6 +1024,7 @@ fn bind_green_parse(
 pub struct SyntaxQueries {
     vfs: VfsInputs,
     parse_query: DerivedQuery<FileKey, GreenParse>,
+    ast_id_map_query: DerivedQuery<FileKey, ast::AstIdMapShape>,
 }
 
 impl SyntaxQueries {
@@ -1043,7 +1045,19 @@ impl SyntaxQueries {
                 )
             },
         )?;
-        Ok(Self { vfs, parse_query })
+        let query_parse = parse_query.clone();
+        let ast_id_map_query = DerivedQuery::<FileKey, ast::AstIdMapShape>::new(
+            "ast_id_map",
+            move |database: &mut QueryDatabase, key| {
+                let parsed = query_parse.get(database, key.clone())?;
+                Ok(ast::AstIdMapShape::from_green(parsed.root()))
+            },
+        )?;
+        Ok(Self {
+            vfs,
+            parse_query,
+            ast_id_map_query,
+        })
     }
 
     /// Returns the stable green parse value for one VFS file.
@@ -1066,6 +1080,37 @@ impl SyntaxQueries {
         snapshot: &WorkspaceSnapshot,
         file_id: FileId,
     ) -> Result<Parse, ParseQueryError> {
+        let key = self.validate_file(database, files, snapshot, file_id)?;
+        let file = snapshot
+            .file(file_id)
+            .ok_or(ParseQueryError::MissingSnapshotFile)?;
+        let parsed = self.parse_query.get(database, key)?;
+        bind_green_parse(parsed.as_ref(), snapshot, file_id, file).map_err(ParseQueryError::Parse)
+    }
+
+    /// Builds the AST ID map for the current snapshot from a memoized stable shape.
+    pub fn ast_id_map(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+    ) -> Result<ast::AstIdMap, ParseQueryError> {
+        let key = self.validate_file(database, files, snapshot, file_id)?;
+        let shape = self.ast_id_map_query.get(database, key.clone())?;
+        let parsed = self.parse_query.get(database, key)?;
+        let root = SyntaxNode::new_root_in_snapshot(parsed.root().clone(), file_id, snapshot)
+            .map_err(|error| ParseQueryError::Parse(ParseError::SnapshotBinding(error)))?;
+        ast::AstIdMap::bind_shape(file_id, &root, shape.as_ref()).map_err(ParseQueryError::AstIdMap)
+    }
+
+    fn validate_file(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+    ) -> Result<FileKey, ParseQueryError> {
         let key = files
             .file_key(file_id)
             .ok_or(ParseQueryError::FileNotInterned)?;
@@ -1076,8 +1121,7 @@ impl SyntaxQueries {
         if source.source().raw_bytes() != file.source().raw_bytes() {
             return Err(ParseQueryError::SnapshotSourceMismatch);
         }
-        let parsed = self.parse_query.get(database, key.clone())?;
-        bind_green_parse(parsed.as_ref(), snapshot, file_id, file).map_err(ParseQueryError::Parse)
+        Ok(key.clone())
     }
 }
 
@@ -4294,6 +4338,7 @@ fn digit_value(byte: u8) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ast::AstNode as _;
     use sai_query::{Durability, QueryDatabase};
     use sai_vfs::{FileInterner, FileKey, SnapshotFile, SourceFile};
     use std::sync::Arc;
@@ -4368,6 +4413,34 @@ mod tests {
             .expect("query parse");
         assert_eq!(direct.root.green(), queried.root.green());
         assert_eq!(direct.errors, queried.errors);
+        let direct_ast_ids = ast::AstIdMap::new(first_id, &direct.root).expect("direct AST ID map");
+        let queried_ast_ids = queries
+            .ast_id_map(&mut database, &first_files, &first_snapshot, first_id)
+            .expect("query AST ID map");
+        assert_eq!(direct_ast_ids.len(), queried_ast_ids.len());
+        assert!(queried_ast_ids.matches_snapshot(&first_snapshot));
+        let function = ast::SourceFile::cast(queried.root.clone())
+            .expect("source file")
+            .items()
+            .find_map(|item| match item {
+                ast::Item::Function(function) => Some(function),
+                _ => None,
+            })
+            .expect("function declaration");
+        let function_id = queried_ast_ids
+            .ast_id(&function)
+            .expect("function has an AST ID");
+        assert!(
+            queried_ast_ids
+                .get(function_id)
+                .expect("AST ID resolves")
+                .resolve(first_id, &queried.root)
+                .is_some()
+        );
+        let memoized_shape = queries
+            .ast_id_map_query
+            .get(&mut database, key.clone())
+            .expect("AST ID shape query");
 
         let memo = queries
             .green_parse(&mut database, key.clone())
@@ -4389,6 +4462,12 @@ mod tests {
         let rebound = queries
             .parse(&mut database, &second_files, &second_snapshot, second_id)
             .expect("memo is rebound to the requesting snapshot");
+        let rebound_ast_ids = queries
+            .ast_id_map(&mut database, &second_files, &second_snapshot, second_id)
+            .expect("AST ID shape is rebound to the requesting snapshot");
+        assert_eq!(rebound_ast_ids.len(), queried_ast_ids.len());
+        assert!(rebound_ast_ids.matches_snapshot(&second_snapshot));
+        assert!(rebound_ast_ids.get(function_id).is_none());
         let rebound_diagnostic = rebound
             .errors
             .iter()
@@ -4405,7 +4484,7 @@ mod tests {
             primary.span.range
         );
 
-        let changed_bytes: Arc<[u8]> = Arc::from(&b"fn run() {}\n"[..]);
+        let changed_bytes: Arc<[u8]> = Arc::from(&b"fn run() { let value = 1; }\n"[..]);
         vfs.set_file_contents(
             &mut database,
             key.clone(),
@@ -4414,10 +4493,51 @@ mod tests {
         )
         .expect("updated source bytes are set");
         let changed_memo = queries
-            .green_parse(&mut database, key)
+            .green_parse(&mut database, key.clone())
             .expect("changed source is reparsed");
         assert!(!Arc::ptr_eq(&memo, &changed_memo));
         assert_ne!(memo.root(), changed_memo.root());
+        let body_only_shape = queries
+            .ast_id_map_query
+            .get(&mut database, key.clone())
+            .expect("body-only edit refreshes AST ID shape");
+        assert!(Arc::ptr_eq(&memoized_shape, &body_only_shape));
+        let body_only_snapshot =
+            query_snapshot(second_id, &changed_bytes, Some("sai:core@2.0.0"), Some(23));
+        let body_only_ast_ids = queries
+            .ast_id_map(&mut database, &second_files, &body_only_snapshot, second_id)
+            .expect("AST IDs bind to the body-edited snapshot");
+        assert_eq!(body_only_ast_ids.len(), queried_ast_ids.len());
+
+        let added_item_bytes: Arc<[u8]> =
+            Arc::from(&b"fn run() { let value = 1; }\nfn other() {}\n"[..]);
+        vfs.set_file_contents(
+            &mut database,
+            key.clone(),
+            Arc::clone(&added_item_bytes),
+            Durability::Low,
+        )
+        .expect("added item source bytes are set");
+        let changed_shape = queries
+            .ast_id_map_query
+            .get(&mut database, key.clone())
+            .expect("added item changes AST ID shape");
+        assert!(!Arc::ptr_eq(&memoized_shape, &changed_shape));
+        let added_item_snapshot = query_snapshot(
+            second_id,
+            &added_item_bytes,
+            Some("sai:core@2.0.0"),
+            Some(24),
+        );
+        let added_item_ast_ids = queries
+            .ast_id_map(
+                &mut database,
+                &second_files,
+                &added_item_snapshot,
+                second_id,
+            )
+            .expect("both declarations receive AST IDs");
+        assert_eq!(added_item_ast_ids.len(), 2);
     }
 
     #[test]

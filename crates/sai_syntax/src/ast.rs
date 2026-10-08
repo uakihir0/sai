@@ -1,5 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, marker::PhantomData};
 
+use sai_stable_hash::{StableHash, StableHasher};
 use sai_vfs::{FileId, WorkspaceSnapshot, WorkspaceSnapshotId};
 
 use crate::red::RootIdentity;
@@ -143,7 +144,41 @@ pub enum AstIdMapError {
     FileMismatch,
     NotFileRoot,
     UnboundRoot,
+    ShapeMismatch,
     TooManyNodes,
+}
+
+/// Snapshot-independent item-like node ordering used to memoize AST IDs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AstIdMapShape {
+    kinds: Box<[SyntaxKind]>,
+}
+
+impl AstIdMapShape {
+    pub(crate) fn from_green(root: &crate::GreenNode) -> Self {
+        let mut kinds = Vec::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if is_item_like(node.kind()) {
+                kinds.push(node.kind());
+            }
+            for child in node.children().iter().rev() {
+                if let crate::GreenElement::Node(child) = child {
+                    pending.push(child);
+                }
+            }
+        }
+        Self {
+            kinds: kinds.into_boxed_slice(),
+        }
+    }
+}
+
+impl StableHash for AstIdMapShape {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xC7);
+        self.kinds.as_ref().stable_hash(hasher);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +191,22 @@ pub struct AstIdMap {
 
 impl AstIdMap {
     pub fn new(file: FileId, root: &SyntaxNode) -> Result<Self, AstIdMapError> {
+        Self::build(file, root, None)
+    }
+
+    pub(crate) fn bind_shape(
+        file: FileId,
+        root: &SyntaxNode,
+        shape: &AstIdMapShape,
+    ) -> Result<Self, AstIdMapError> {
+        Self::build(file, root, Some(shape))
+    }
+
+    fn build(
+        file: FileId,
+        root: &SyntaxNode,
+        shape: Option<&AstIdMapShape>,
+    ) -> Result<Self, AstIdMapError> {
         if !root.belongs_to_file(file) {
             return Err(AstIdMapError::FileMismatch);
         }
@@ -169,13 +220,20 @@ impl AstIdMap {
         let mut pointers = Vec::new();
         let mut ids = HashMap::new();
         for node in root.descendants().filter(|node| is_item_like(node.kind())) {
-            let raw = ErasedAstId::new(
-                u32::try_from(pointers.len()).map_err(|_| AstIdMapError::TooManyNodes)?,
-            );
+            let index = pointers.len();
+            if shape.is_some_and(|shape| shape.kinds.get(index) != Some(&node.kind())) {
+                return Err(AstIdMapError::ShapeMismatch);
+            }
+            let raw =
+                ErasedAstId::new(u32::try_from(index).map_err(|_| AstIdMapError::TooManyNodes)?);
             let pointer =
                 SyntaxNodePtr::new(file, &node).map_err(|_| AstIdMapError::FileMismatch)?;
             ids.insert(pointer.clone(), raw);
             pointers.push(pointer);
+        }
+
+        if shape.is_some_and(|shape| shape.kinds.len() != pointers.len()) {
+            return Err(AstIdMapError::ShapeMismatch);
         }
 
         Ok(Self {
