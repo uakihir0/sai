@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 sai_vfs = { path = "../sai_vfs" }
+sai_stable_hash = { path = "../sai_stable_hash" }
 
 [dev-dependencies]
 sai_query = { path = "../sai_query" }

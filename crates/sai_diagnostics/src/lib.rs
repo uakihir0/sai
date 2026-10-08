@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use sai_stable_hash::{StableHash, StableHasher};
+
 mod lint_levels;
 pub use lint_levels::{
     LintPolicies, LintResolution, LintResolutionContext, LintResolutionError, ManifestLintLevel,
@@ -1287,6 +1289,10 @@ pub struct Diagnostic {
     cause: CauseKey,
 }
 
+/// Maximum nesting depth accepted when converting diagnostic data into a
+/// snapshot-independent query template.
+pub const DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH: usize = 128;
+
 impl Diagnostic {
     pub fn new(
         code: Code,
@@ -1437,6 +1443,288 @@ impl Diagnostic {
 
     pub fn cause(&self) -> &CauseKey {
         &self.cause
+    }
+
+    /// Converts a source diagnostic into a snapshot-independent query value.
+    ///
+    /// Locations are retained as byte ranges, while their `FileId` and
+    /// `SourceRef` are removed. The template can later be rebound to the
+    /// requesting snapshot with [`DiagnosticTemplate::bind`]. Diagnostics
+    /// carrying resolved levels, related locations, fixes, a workspace
+    /// snapshot, or poison facts are rejected because those values need
+    /// additional query or snapshot context. Diagnostic data deeper than
+    /// [`DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH`] is also rejected.
+    pub fn to_template(&self) -> Result<DiagnosticTemplate, DiagnosticTemplateError> {
+        if self.level.is_some()
+            || !self.related.is_empty()
+            || !self.fixes.is_empty()
+            || self.workspace_snapshot.is_some()
+            || !self.cause.facts().is_empty()
+        {
+            return Err(DiagnosticTemplateError::ContextualState);
+        }
+        if !value_object_within_depth(&self.data, DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH) {
+            return Err(DiagnosticTemplateError::ValueTooDeep);
+        }
+
+        let mut expected_source = None;
+        let primary_range = template_range(self.primary.as_ref(), &mut expected_source)?;
+        let mut labels = Vec::with_capacity(self.labels.len());
+        for label in &self.labels {
+            let range = template_range(Some(&label.location), &mut expected_source)?
+                .ok_or(DiagnosticTemplateError::MissingLocation)?;
+            labels.push(TemplateLabel {
+                range,
+                message: label.message.clone(),
+            });
+        }
+        let mut children = Vec::with_capacity(self.children.len());
+        for child in &self.children {
+            children.push(TemplateChild {
+                kind: child.kind,
+                message: child.message.clone(),
+                range: template_range(child.location.as_ref(), &mut expected_source)?,
+            });
+        }
+
+        Ok(DiagnosticTemplate {
+            code: self.code,
+            severity: self.severity,
+            message: self.message.clone(),
+            primary_range,
+            primary_label: self.primary_label.clone(),
+            labels,
+            children,
+            data: self.data.clone(),
+            node: self.node.clone(),
+            symbol: self.symbol.clone(),
+            package: self.package.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticTemplateError {
+    ContextualState,
+    MixedSource,
+    MissingLocation,
+    ValueTooDeep,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TemplateLabel {
+    range: TextRange,
+    message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TemplateChild {
+    kind: ChildKind,
+    message: String,
+    range: Option<TextRange>,
+}
+
+/// A source diagnostic value without snapshot-specific file identity.
+///
+/// All stored locations are byte ranges in one source file. Binding supplies
+/// the current file ID and source reference without changing the query value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticTemplate {
+    code: Code,
+    severity: Severity,
+    message: String,
+    primary_range: Option<TextRange>,
+    primary_label: String,
+    labels: Vec<TemplateLabel>,
+    children: Vec<TemplateChild>,
+    data: ValueObject,
+    node: Option<String>,
+    symbol: Option<String>,
+    package: Option<String>,
+}
+
+impl DiagnosticTemplate {
+    /// Recreates this diagnostic with the requesting snapshot's file identity.
+    pub fn bind(&self, file_id: FileId, source_ref: SourceRef) -> Diagnostic {
+        let location = |range: TextRange| Location {
+            file: source_ref.clone(),
+            span: Span::new(file_id, range),
+        };
+        let mut diagnostic = Diagnostic::new(
+            self.code,
+            self.severity,
+            self.message.clone(),
+            self.primary_range.map(location),
+        );
+        diagnostic.primary_label.clone_from(&self.primary_label);
+        diagnostic.labels = self
+            .labels
+            .iter()
+            .map(|label| Label {
+                location: location(label.range),
+                message: label.message.clone(),
+            })
+            .collect();
+        diagnostic.children = self
+            .children
+            .iter()
+            .map(|child| Child {
+                kind: child.kind,
+                message: child.message.clone(),
+                location: child.range.map(location),
+            })
+            .collect();
+        diagnostic.data.clone_from(&self.data);
+        diagnostic.node.clone_from(&self.node);
+        diagnostic.symbol.clone_from(&self.symbol);
+        diagnostic.package.clone_from(&self.package);
+        diagnostic
+    }
+}
+
+impl StableHash for DiagnosticTemplate {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD0);
+        self.code.as_str().stable_hash(hasher);
+        self.severity.stable_hash(hasher);
+        self.message.stable_hash(hasher);
+        stable_hash_range(self.primary_range, hasher);
+        self.primary_label.stable_hash(hasher);
+        hasher.write_len(u64::try_from(self.labels.len()).unwrap_or(u64::MAX));
+        for label in &self.labels {
+            hasher.write_tag(0xD1);
+            stable_hash_range(Some(label.range), hasher);
+            label.message.stable_hash(hasher);
+        }
+        hasher.write_len(u64::try_from(self.children.len()).unwrap_or(u64::MAX));
+        for child in &self.children {
+            hasher.write_tag(0xD2);
+            hasher.write_tag(match child.kind {
+                ChildKind::Note => 0,
+                ChildKind::Help => 1,
+            });
+            child.message.stable_hash(hasher);
+            stable_hash_range(child.range, hasher);
+        }
+        stable_hash_value_object(&self.data, hasher);
+        self.node.stable_hash(hasher);
+        self.symbol.stable_hash(hasher);
+        self.package.stable_hash(hasher);
+    }
+}
+
+fn template_range(
+    location: Option<&Location>,
+    expected_source: &mut Option<(SourceRef, FileId)>,
+) -> Result<Option<TextRange>, DiagnosticTemplateError> {
+    let Some(location) = location else {
+        return Ok(None);
+    };
+    let source = (location.file.clone(), location.span.file);
+    if let Some(expected) = expected_source {
+        if *expected != source {
+            return Err(DiagnosticTemplateError::MixedSource);
+        }
+    } else {
+        *expected_source = Some(source);
+    }
+    Ok(Some(location.span.range))
+}
+
+fn stable_hash_range(range: Option<TextRange>, hasher: &mut StableHasher) {
+    hasher.write_tag(0xD3);
+    match range {
+        None => hasher.write_tag(0),
+        Some(range) => {
+            hasher.write_tag(1);
+            range.start().raw().stable_hash(hasher);
+            range.end().raw().stable_hash(hasher);
+        }
+    }
+}
+
+fn stable_hash_value_object(value: &ValueObject, hasher: &mut StableHasher) {
+    enum Entry<'a> {
+        Value(&'a Value),
+        Key(&'a str),
+    }
+
+    hasher.write_tag(0xD4);
+    hasher.write_len(u64::try_from(value.len()).unwrap_or(u64::MAX));
+    let mut stack = Vec::with_capacity(value.len().saturating_mul(2));
+    for (key, value) in value.iter().rev() {
+        stack.push(Entry::Value(value));
+        stack.push(Entry::Key(key));
+    }
+    while let Some(entry) = stack.pop() {
+        match entry {
+            Entry::Key(key) => key.stable_hash(hasher),
+            Entry::Value(value) => match value {
+                Value::Null => hasher.write_tag(0),
+                Value::Bool(value) => {
+                    hasher.write_tag(1);
+                    value.stable_hash(hasher);
+                }
+                Value::Integer(value) => {
+                    hasher.write_tag(2);
+                    value.stable_hash(hasher);
+                }
+                Value::String(value) => {
+                    hasher.write_tag(3);
+                    value.stable_hash(hasher);
+                }
+                Value::Array(values) => {
+                    hasher.write_tag(4);
+                    hasher.write_len(u64::try_from(values.len()).unwrap_or(u64::MAX));
+                    stack.extend(values.iter().rev().map(Entry::Value));
+                }
+                Value::Object(values) => {
+                    hasher.write_tag(5);
+                    hasher.write_len(u64::try_from(values.len()).unwrap_or(u64::MAX));
+                    for (key, value) in values.iter().rev() {
+                        stack.push(Entry::Value(value));
+                        stack.push(Entry::Key(key));
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn value_object_within_depth(value: &ValueObject, max_depth: usize) -> bool {
+    let mut stack = value
+        .values()
+        .map(|value| (value, 1_usize))
+        .collect::<Vec<_>>();
+    while let Some((value, depth)) = stack.pop() {
+        if depth > max_depth {
+            return false;
+        }
+        match value {
+            Value::Array(values) => {
+                stack.extend(values.iter().map(|value| (value, depth.saturating_add(1))));
+            }
+            Value::Object(values) => {
+                stack.extend(
+                    values
+                        .values()
+                        .map(|value| (value, depth.saturating_add(1))),
+                );
+            }
+            Value::Null | Value::Bool(_) | Value::Integer(_) | Value::String(_) => {}
+        }
+    }
+    true
+}
+
+impl StableHash for Severity {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD5);
+        hasher.write_tag(match self {
+            Self::Error => 0,
+            Self::Warning => 1,
+            Self::Info => 2,
+        });
     }
 }
 
@@ -1620,6 +1908,7 @@ fn validate_related(
 mod tests {
     use super::*;
     use sai_query::{Durability, QueryDatabase};
+    use sai_stable_hash::{StableHasher, fingerprint};
     use sai_vfs::{FileKey, SnapshotFile, SourceFile, SourceText, SourceTextStatus, VfsInputs};
     use std::sync::Arc;
 
@@ -3284,5 +3573,197 @@ mod tests {
             data.keys().map(String::as_str).collect::<Vec<_>>(),
             ["a", "z"]
         );
+    }
+
+    #[test]
+    fn diagnostic_templates_ignore_snapshot_identity_and_rebind_all_locations() {
+        fn template(file_id: u32, path: &str, snapshot: u64) -> DiagnosticTemplate {
+            let file = SourceRef {
+                path: path.to_owned(),
+                package: Some("sai:test@0.1.0".to_owned()),
+                snapshot: Some(snapshot),
+            };
+            let range =
+                TextRange::new(TextSize::new(2), TextSize::new(5)).expect("valid source range");
+            let mut diagnostic = Diagnostic::new(
+                Code::ExpectedToken,
+                Severity::Error,
+                "expected `)`",
+                Some(Location {
+                    file: file.clone(),
+                    span: Span::new(FileId::new(file_id), range),
+                }),
+            );
+            diagnostic.primary_label = "close this list".to_owned();
+            diagnostic.labels.push(Label {
+                location: Location {
+                    file: file.clone(),
+                    span: Span::new(
+                        FileId::new(file_id),
+                        TextRange::new(TextSize::new(0), TextSize::new(1))
+                            .expect("valid label range"),
+                    ),
+                },
+                message: "opening delimiter".to_owned(),
+            });
+            diagnostic.children.push(Child {
+                kind: ChildKind::Note,
+                message: "parser recovered here".to_owned(),
+                location: Some(Location {
+                    file,
+                    span: Span::new(
+                        FileId::new(file_id),
+                        TextRange::new(TextSize::new(5), TextSize::new(5))
+                            .expect("valid empty range"),
+                    ),
+                }),
+            });
+            diagnostic.data.insert(
+                "expected".to_owned(),
+                Value::Array(vec![Value::String(")".to_owned()), Value::Null]),
+            );
+            diagnostic.to_template().expect("diagnostic is query-safe")
+        }
+
+        let first = template(3, "src/main.sai", 1);
+        let second = template(19, "dep:acme:lib@2.4.1/src/main.sai", 99);
+        assert_eq!(first, second);
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+        let mut changed_message = first.clone();
+        changed_message.message.push('.');
+        assert_ne!(fingerprint(&first), fingerprint(&changed_message));
+        let mut changed_data = first.clone();
+        changed_data.data.insert(
+            "expected".to_owned(),
+            Value::Array(vec![Value::String("different".to_owned())]),
+        );
+        assert_ne!(fingerprint(&first), fingerprint(&changed_data));
+
+        let rebound_file = SourceRef {
+            path: "dep:acme:lib@2.4.1/src/main.sai".to_owned(),
+            package: Some("acme:lib@2.4.1".to_owned()),
+            snapshot: Some(100),
+        };
+        let rebound = first.bind(FileId::new(27), rebound_file.clone());
+        assert_eq!(rebound.primary().expect("primary").file, rebound_file);
+        assert_eq!(
+            rebound.primary().expect("primary").span.file,
+            FileId::new(27)
+        );
+        assert_eq!(rebound.labels()[0].location.span.file, FileId::new(27));
+        assert_eq!(
+            rebound.children()[0]
+                .location
+                .as_ref()
+                .expect("child location")
+                .span
+                .file,
+            FileId::new(27)
+        );
+        assert_eq!(
+            rebound.data.get("expected"),
+            Some(&Value::Array(vec![
+                Value::String(")".to_owned()),
+                Value::Null
+            ]))
+        );
+
+        let validated_file = SourceRef {
+            path: "src/main.sai".to_owned(),
+            package: None,
+            snapshot: Some(101),
+        };
+        let validated_source =
+            Arc::new(SourceFile::new(FileId::new(28), "abcdef", false).expect("valid source"));
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            validated_source,
+            validated_file.path.clone(),
+            validated_file.package.clone(),
+            validated_file.snapshot,
+        )])
+        .expect("valid snapshot");
+        first
+            .bind(FileId::new(28), validated_file)
+            .with_workspace_snapshot(&snapshot)
+            .expect("template locations bind to the current snapshot");
+    }
+
+    #[test]
+    fn diagnostic_templates_reject_mixed_files_and_snapshot_bound_state() {
+        let first_file = SourceRef {
+            path: "src/main.sai".to_owned(),
+            package: None,
+            snapshot: Some(1),
+        };
+        let second_file = SourceRef {
+            path: "src/other.sai".to_owned(),
+            package: None,
+            snapshot: Some(1),
+        };
+        let span = TextRange::new(TextSize::new(0), TextSize::new(1)).expect("valid range");
+        let mut diagnostic = Diagnostic::new(
+            Code::ExpectedToken,
+            Severity::Error,
+            "expected token",
+            Some(Location {
+                file: first_file.clone(),
+                span: Span::new(FileId::new(1), span),
+            }),
+        );
+        diagnostic.labels.push(Label {
+            location: Location {
+                file: second_file,
+                span: Span::new(FileId::new(2), span),
+            },
+            message: "other file".to_owned(),
+        });
+        assert_eq!(
+            diagnostic.to_template(),
+            Err(DiagnosticTemplateError::MixedSource)
+        );
+
+        let mut diagnostic =
+            Diagnostic::new(Code::ExpectedToken, Severity::Error, "expected", None);
+        diagnostic
+            .set_level(Some(LevelInfo {
+                value: LintLevel::Deny,
+                source: LevelSource::Attribute,
+                location: None,
+            }))
+            .expect("unbound diagnostic accepts a level");
+        assert_eq!(
+            diagnostic.to_template(),
+            Err(DiagnosticTemplateError::ContextualState)
+        );
+    }
+
+    #[test]
+    fn diagnostic_template_rejects_deep_data_and_hashes_it_iteratively() {
+        let mut accepted_value = Value::Null;
+        for _ in 1..DIAGNOSTIC_TEMPLATE_MAX_VALUE_DEPTH {
+            accepted_value = Value::Array(vec![accepted_value]);
+        }
+        let mut accepted =
+            Diagnostic::new(Code::ExpectedToken, Severity::Error, "expected token", None);
+        accepted.data.insert("nested".to_owned(), accepted_value);
+        assert!(accepted.to_template().is_ok());
+
+        let mut nested = Value::Null;
+        for _ in 0..20_000 {
+            nested = Value::Array(vec![nested]);
+        }
+        let mut diagnostic =
+            Diagnostic::new(Code::ExpectedToken, Severity::Error, "expected token", None);
+        diagnostic.data.insert("nested".to_owned(), nested);
+        assert_eq!(
+            diagnostic.to_template(),
+            Err(DiagnosticTemplateError::ValueTooDeep)
+        );
+        let mut hasher = StableHasher::new();
+        stable_hash_value_object(&diagnostic.data, &mut hasher);
+        assert_ne!(hasher.finish(), StableHasher::new().finish());
+        // Value uses recursive drop; keep this over-limit stress fixture alive
+        // until process exit after checking the template boundary and hasher.
+        std::mem::forget(diagnostic);
     }
 }

@@ -69,6 +69,7 @@ name = "sai_diagnostics"
 version = "0.1.0"
 dependencies = [
  "sai_query",
+ "sai_stable_hash",
  "sai_vfs",
 ]
 
