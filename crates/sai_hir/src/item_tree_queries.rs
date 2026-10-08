@@ -139,6 +139,37 @@ where
     }
 }
 
+/// The implemented portion of the HIR query group.
+///
+/// This currently exposes `def_collector`; `hir_owner`, `hir_source_map`, and
+/// `attrs` are not wired into the query runtime yet.
+pub trait HirQueryGroup {
+    fn def_collector(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+        symbols: &Interner,
+    ) -> Result<Arc<ItemTree>, ItemTreeQueryError>;
+}
+
+impl<S> HirQueryGroup for ItemTreeQueries<S>
+where
+    S: SyntaxQueryGroup + Send + Sync + 'static,
+{
+    fn def_collector(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+        symbols: &Interner,
+    ) -> Result<Arc<ItemTree>, ItemTreeQueryError> {
+        ItemTreeQueries::def_collector(self, database, files, snapshot, file_id, symbols)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +224,17 @@ mod tests {
             Some(version),
         )])
         .expect("workspace snapshot is valid")
+    }
+
+    fn collect_through_hir_group<G: HirQueryGroup>(
+        group: &G,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+        symbols: &Interner,
+    ) -> Result<Arc<ItemTree>, ItemTreeQueryError> {
+        group.def_collector(database, files, snapshot, file_id, symbols)
     }
 
     #[test]
@@ -302,9 +344,15 @@ mod tests {
             Err(ItemTreeQueryError::FileNotInterned)
         ));
 
-        let first_tree = queries
-            .def_collector(&mut database, &files, &first_snapshot, file_id, &symbols)
-            .expect("first snapshot item tree collects");
+        let first_tree = collect_through_hir_group(
+            &queries,
+            &mut database,
+            &files,
+            &first_snapshot,
+            file_id,
+            &symbols,
+        )
+        .expect("first snapshot item tree collects");
         let first_ast_ids = syntax
             .ast_id_map(&mut database, &files, &first_snapshot, file_id)
             .expect("first snapshot AST ID map is available");

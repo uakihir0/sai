@@ -13,6 +13,8 @@ pub mod patterns;
 pub mod source_map;
 pub mod types;
 
+pub use item_tree_queries::{HirQueryGroup, ItemTreeQueries, ItemTreeQueryError};
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};

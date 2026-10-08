@@ -195,6 +195,8 @@ A query that, directly or through other queries, reads itself is a **query cycle
 
 **Implementation update (IR-206, partial).** `sai_syntax::SyntaxQueryGroup` now defines the syntax provider boundary for parsing, AST-ID-map binding, and query-local AST access. `sai_hir::ItemTreeQueries` accepts any `SyntaxQueryGroup`; its provider is held in an `Arc`, so providers need not implement `Clone`. This is an adapter-level boundary: calls still receive `QueryDatabase`, file interning, and snapshot state explicitly. The VFS and HIR query-group traits, `sai_driver::RootDatabase`, other query groups, parallel execution and wait-for cycle detection, LRU policies, and persistent caching remain unimplemented.
 
+**Implementation update (IR-207, partial).** `sai_hir::HirQueryGroup` now exposes the implemented `def_collector` adapter, and `ItemTreeQueries` implements that contract. This group contains only `def_collector`; `hir_owner`, `hir_source_map`, `attrs`, and `RootDatabase` integration remain open.
+
 ## 1.5 Identifiers, interning, and arenas
 
 ### 1.5.1 Session identifiers
