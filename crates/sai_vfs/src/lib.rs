@@ -90,6 +90,54 @@ impl StableHash for FileKey {
     }
 }
 
+/// A session-local interner from stable file keys to syntax-facing file IDs.
+///
+/// The interner must be created once per compiler session. File IDs are
+/// assigned in insertion order and must not be persisted or used as stable
+/// query keys.
+#[derive(Default)]
+pub struct FileInterner {
+    by_key: BTreeMap<FileKey, FileId>,
+    keys: Vec<FileKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileInternerError {
+    TooManyFiles,
+}
+
+impl FileInterner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the session-local `FileId` for a validated stable file key.
+    pub fn intern(&mut self, key: FileKey) -> Result<FileId, FileInternerError> {
+        if let Some(file_id) = self.by_key.get(&key) {
+            return Ok(*file_id);
+        }
+
+        let raw_id = u32::try_from(self.keys.len()).map_err(|_| FileInternerError::TooManyFiles)?;
+        let file_id = FileId::new(raw_id);
+        self.keys.push(key.clone());
+        self.by_key.insert(key, file_id);
+        Ok(file_id)
+    }
+
+    /// Resolves a session ID to its stable file key, if it belongs to this interner.
+    pub fn file_key(&self, file_id: FileId) -> Option<&FileKey> {
+        self.keys.get(file_id.raw() as usize)
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
 /// A validated stable package identity suitable for use as a query key.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PackageKey(String);
@@ -2571,6 +2619,51 @@ mod tests {
 
         assert_ne!(first_package, second_package);
         assert_ne!(first_package, second_path);
+    }
+
+    #[test]
+    fn file_interner_reuses_stable_keys_and_rebinds_vfs_source_ids() {
+        let vfs = VfsInputs::new().expect("VFS queries are available");
+        let mut database = QueryDatabase::new();
+        let mut interner = FileInterner::new();
+        let first_key = FileKey::new("acme:app#0.1", "dep:acme:app@0.1.9/src/lib.sai")
+            .expect("first source key is valid");
+        let same_key = FileKey::new("acme:app#0.1", "dep:acme:app@0.1.0/src/lib.sai")
+            .expect("equivalent source key is valid");
+        let second_key =
+            FileKey::new("acme:app#0.1", "src/main.sai").expect("second source key is valid");
+
+        vfs.set_file_contents(
+            &mut database,
+            first_key.clone(),
+            Arc::from(&b"fn lib() {}"[..]),
+            Durability::Low,
+        )
+        .expect("file contents are set");
+
+        assert!(interner.is_empty());
+        let first_id = interner
+            .intern(first_key.clone())
+            .expect("file key is interned");
+        assert_eq!(
+            first_id,
+            interner.intern(same_key).expect("same key is reused")
+        );
+        let second_id = interner
+            .intern(second_key.clone())
+            .expect("second key is interned");
+        assert_ne!(first_id, second_id);
+        assert_eq!(first_id.raw(), 0);
+        assert_eq!(second_id.raw(), 1);
+        assert_eq!(interner.len(), 2);
+        assert_eq!(interner.file_key(first_id), Some(&first_key));
+        assert_eq!(interner.file_key(second_id), Some(&second_key));
+        assert_eq!(interner.file_key(FileId::new(u32::MAX)), None);
+
+        let source = vfs
+            .source_text(&mut database, first_key, first_id)
+            .expect("VFS source uses the session-local ID");
+        assert_eq!(source.source().id(), first_id);
     }
 
     #[test]

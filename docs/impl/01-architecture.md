@@ -191,7 +191,7 @@ A query that, directly or through other queries, reads itself is a **query cycle
 
 ---
 
-**Implementation update (IR-193–194).** The diagnostic conversion for `SourceTextStatus` is now implemented in `sai_diagnostics`, and `sai_vfs::VfsInputs` exposes a memoized `line_index(FileKey)` query that reuses the decoded source allocation. This supersedes the corresponding unimplemented items in the current-slice note above; `parse`, AST, and HIR query wiring remain open.
+**Implementation update (IR-193–195).** The diagnostic conversion for `SourceTextStatus` is implemented in `sai_diagnostics`. `sai_vfs::VfsInputs` exposes a memoized `line_index(FileKey)` query that reuses the decoded source allocation. `sai_vfs::FileInterner` maps validated stable `FileKey` values to insertion-ordered session-local `FileId`s and supports reverse lookup; callers must create one interner per compiler session. This supersedes the corresponding unimplemented items in the current-slice note above; `parse`, AST, and HIR query wiring remain open.
 
 ## 1.5 Identifiers, interning, and arenas
 
