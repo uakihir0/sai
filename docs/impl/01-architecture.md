@@ -197,6 +197,8 @@ A query that, directly or through other queries, reads itself is a **query cycle
 
 **Implementation update (IR-207, partial).** `sai_hir::HirQueryGroup` now exposes the implemented `def_collector` adapter, and `ItemTreeQueries` implements that contract. This group contains only `def_collector`; `hir_owner`, `hir_source_map`, `attrs`, and `RootDatabase` integration remain open.
 
+**Implementation update (IR-208, partial).** `sai_vfs::VfsQueryGroup` exposes the read queries for file contents, package and WIT listings, decoded source, and line indexes. `VfsInputs` implements the group, and `SyntaxQueries<Q>` now consumes any `VfsQueryGroup` provider. `SourceText::from_file_contents` lets alternate providers decode and bind their tracked file contents. VFS input updates remain driver-side operations on `VfsInputs`; they are not part of this read-only query group. `RootDatabase` and the remaining architecture-wide integration are still unimplemented.
+
 ## 1.5 Identifiers, interning, and arenas
 
 ### 1.5.1 Session identifiers

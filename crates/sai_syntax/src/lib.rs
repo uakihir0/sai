@@ -17,7 +17,7 @@ use sai_diagnostics::{
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
 use sai_stable_hash::{StableHash, StableHasher};
 use sai_vfs::{
-    FileId, FileInterner, FileKey, SourceFile, Span, TextRange, TextSize, VfsInputs,
+    FileId, FileInterner, FileKey, SourceFile, Span, TextRange, TextSize, VfsInputs, VfsQueryGroup,
     WorkspaceSnapshot,
 };
 use unicode_general_category::{GeneralCategory, get_general_category};
@@ -1020,20 +1020,38 @@ fn bind_green_parse(
 }
 
 /// Memoized syntax parsing over stable VFS file keys.
-#[derive(Clone)]
-pub struct SyntaxQueries {
-    vfs: VfsInputs,
+pub struct SyntaxQueries<Q = VfsInputs> {
+    vfs: Arc<Q>,
     parse_query: DerivedQuery<FileKey, GreenParse>,
     ast_id_map_query: DerivedQuery<FileKey, ast::AstIdMapShape>,
 }
 
-impl SyntaxQueries {
-    pub fn new(vfs: VfsInputs) -> Result<Self, QueryError> {
-        let query_vfs = vfs.clone();
+impl<Q> Clone for SyntaxQueries<Q> {
+    fn clone(&self) -> Self {
+        Self {
+            vfs: Arc::clone(&self.vfs),
+            parse_query: self.parse_query.clone(),
+            ast_id_map_query: self.ast_id_map_query.clone(),
+        }
+    }
+}
+
+impl<Q> SyntaxQueries<Q>
+where
+    Q: VfsQueryGroup + Send + Sync + 'static,
+{
+    pub fn new(vfs: Q) -> Result<Self, QueryError> {
+        let vfs = Arc::new(vfs);
+        let query_vfs = Arc::clone(&vfs);
         let parse_query = DerivedQuery::<FileKey, GreenParse>::new(
             "parse",
             move |database: &mut QueryDatabase, key| {
-                let source = query_vfs.source_text(database, key.clone(), FileId::new(0))?;
+                let source = VfsQueryGroup::source_text(
+                    query_vfs.as_ref(),
+                    database,
+                    key.clone(),
+                    FileId::new(0),
+                )?;
                 let source_ref = SourceRef {
                     path: key.path().to_owned(),
                     package: None,
@@ -1118,9 +1136,8 @@ impl SyntaxQueries {
     where
         V: Clone + Eq + StableHash + Send + Sync + 'static,
     {
-        let source = self
-            .vfs
-            .source_text(database, key.clone(), FileId::new(0))?;
+        let source =
+            VfsQueryGroup::source_text(self.vfs.as_ref(), database, key.clone(), FileId::new(0))?;
         let parsed = self.parse_query.get(database, key.clone())?;
         let shape = self.ast_id_map_query.get(database, key)?;
         let root = SyntaxNode::new_root_for_query_callback(parsed.root().clone());
@@ -1183,7 +1200,10 @@ pub trait SyntaxQueryGroup {
         V: Clone + Eq + StableHash + Send + Sync + 'static;
 }
 
-impl SyntaxQueryGroup for SyntaxQueries {
+impl<Q> SyntaxQueryGroup for SyntaxQueries<Q>
+where
+    Q: VfsQueryGroup + Send + Sync + 'static,
+{
     fn parse(
         &self,
         database: &mut QueryDatabase,
@@ -4432,8 +4452,57 @@ mod tests {
     use super::*;
     use ast::AstNode as _;
     use sai_query::{Durability, QueryDatabase};
-    use sai_vfs::{FileInterner, FileKey, SnapshotFile, SourceFile};
+    use sai_vfs::{
+        FileContents, FileInterner, FileKey, LineIndex, PackageFilesSnapshot, PackageKey,
+        SnapshotFile, SourceFile, SourceText, VfsInputs, VfsQueryGroup, WitFilesSnapshot,
+    };
     use std::sync::Arc;
+
+    struct AlternateVfsGroup(VfsInputs);
+
+    impl VfsQueryGroup for AlternateVfsGroup {
+        fn file_contents(
+            &self,
+            database: &mut QueryDatabase,
+            key: FileKey,
+        ) -> Result<Option<FileContents>, QueryError> {
+            VfsQueryGroup::file_contents(&self.0, database, key)
+        }
+
+        fn package_files(
+            &self,
+            database: &mut QueryDatabase,
+            key: PackageKey,
+        ) -> Result<Option<PackageFilesSnapshot>, QueryError> {
+            VfsQueryGroup::package_files(&self.0, database, key)
+        }
+
+        fn wit_files(
+            &self,
+            database: &mut QueryDatabase,
+            key: PackageKey,
+        ) -> Result<Option<WitFilesSnapshot>, QueryError> {
+            VfsQueryGroup::wit_files(&self.0, database, key)
+        }
+
+        fn source_text(
+            &self,
+            database: &mut QueryDatabase,
+            key: FileKey,
+            file_id: FileId,
+        ) -> Result<SourceText, QueryError> {
+            let contents = VfsQueryGroup::file_contents(&self.0, database, key)?;
+            Ok(SourceText::from_file_contents(file_id, contents))
+        }
+
+        fn line_index(
+            &self,
+            database: &mut QueryDatabase,
+            key: FileKey,
+        ) -> Result<Arc<LineIndex>, QueryError> {
+            VfsQueryGroup::line_index(&self.0, database, key)
+        }
+    }
 
     fn lex_text(text: &str) -> LexOutput {
         lex_bytes(text.as_bytes())
@@ -4492,7 +4561,9 @@ mod tests {
             Durability::Low,
         )
         .expect("source bytes are set");
-        let queries = SyntaxQueries::new(vfs.clone()).expect("syntax query is available");
+        let queries =
+            SyntaxQueries::new(AlternateVfsGroup(vfs.clone())).expect("syntax query is available");
+        let cloned_queries = queries.clone();
 
         let mut first_files = FileInterner::new();
         let first_id = first_files
@@ -4500,7 +4571,7 @@ mod tests {
             .expect("stable key is interned");
         let first_snapshot = query_snapshot(first_id, &bytes, Some("sai:core@1.0.0"), Some(11));
         let direct = parse(&first_snapshot, first_id).expect("direct parse");
-        let queried = queries
+        let queried = cloned_queries
             .parse(&mut database, &first_files, &first_snapshot, first_id)
             .expect("query parse");
         assert_eq!(direct.root.green(), queried.root.green());

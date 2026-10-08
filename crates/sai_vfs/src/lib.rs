@@ -855,6 +855,14 @@ pub struct SourceText {
 }
 
 impl SourceText {
+    /// Decodes file contents and binds the result to the requesting session ID.
+    ///
+    /// This lets alternate [`VfsQueryGroup`] providers construct the same
+    /// tracked source value without depending on `VfsInputs`.
+    pub fn from_file_contents(file_id: FileId, contents: Option<FileContents>) -> Self {
+        decode_source_text(contents).for_file_id(file_id)
+    }
+
     pub const fn source(&self) -> &SourceFile {
         &self.source
     }
@@ -1723,6 +1731,86 @@ impl VfsInputs {
             }
         }
         self.apply_updates(database, updates)
+    }
+}
+
+/// Read-only VFS queries available to syntax and later compiler phases.
+///
+/// Input mutation remains on `VfsInputs`; a driver applies input changes
+/// before executing tracked queries.
+pub trait VfsQueryGroup {
+    fn file_contents(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<Option<FileContents>, QueryError>;
+
+    fn package_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<Option<PackageFilesSnapshot>, QueryError>;
+
+    fn wit_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<Option<WitFilesSnapshot>, QueryError>;
+
+    fn source_text(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        file_id: FileId,
+    ) -> Result<SourceText, QueryError>;
+
+    fn line_index(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<Arc<LineIndex>, QueryError>;
+}
+
+impl VfsQueryGroup for VfsInputs {
+    fn file_contents(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<Option<FileContents>, QueryError> {
+        VfsInputs::file_contents(self, database, key)
+    }
+
+    fn package_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<Option<PackageFilesSnapshot>, QueryError> {
+        VfsInputs::package_files(self, database, key)
+    }
+
+    fn wit_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<Option<WitFilesSnapshot>, QueryError> {
+        VfsInputs::wit_files(self, database, key)
+    }
+
+    fn source_text(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        file_id: FileId,
+    ) -> Result<SourceText, QueryError> {
+        VfsInputs::source_text(self, database, key, file_id)
+    }
+
+    fn line_index(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<Arc<LineIndex>, QueryError> {
+        VfsInputs::line_index(self, database, key)
     }
 }
 
@@ -3138,6 +3226,22 @@ mod tests {
             .expect("changed bytes invalidate source text");
         assert_eq!(changed.source().text(), "changed");
         assert_eq!(changed.status(), &SourceTextStatus::Ready);
+    }
+
+    #[test]
+    fn source_text_can_be_built_from_file_contents_for_an_alternate_provider() {
+        let raw = b"\xEF\xBB\xBFA\xFF";
+        let source = SourceText::from_file_contents(
+            FileId::new(31),
+            Some(FileContents::Bytes(Arc::from(&raw[..]))),
+        );
+
+        assert_eq!(source.status(), &SourceTextStatus::Ready);
+        assert_eq!(source.source().id(), FileId::new(31));
+        assert_eq!(source.source().text(), "A\u{FFFD}");
+        assert_eq!(source.source().raw_bytes(), raw);
+        assert!(source.source().had_bom());
+        assert_eq!(source.source().invalid_utf8_sequences().len(), 1);
     }
 
     #[test]
