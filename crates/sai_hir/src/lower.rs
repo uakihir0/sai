@@ -19,8 +19,8 @@ use crate::types::{
     PathRoot, PathSegment, Provenance, Ty as HirTy, TyKind as HirTyKind, WherePred as HirWherePred,
 };
 use crate::{
-    BindingId, DefPathData, DefPathInterner, DefPathInternerError, DesugaringKind, LocalDefId,
-    Mutability, OwnerId, Safety, Span, SpanCtxt,
+    BindingId, DefPath, DefPathData, DefPathInterner, DefPathInternerError, DesugaringKind,
+    LocalDefId, Mutability, OwnerId, Safety, Span, SpanCtxt,
 };
 use sai_diagnostics::Code;
 use sai_intern::{InternError, Interner};
@@ -119,12 +119,14 @@ pub fn lower_function_with_generics<'hir>(
 /// Lower one top-level function entry from the current item tree into a
 /// complete HIR owner and its source map.
 ///
-/// The item's `DefPath` must already be interned in the lowering context, and
-/// the caller must supply the definition allocated for this exact item,
-/// including its enclosing path and sibling disambiguator. The item tree,
-/// AST ID map, snapshot, and root must all describe the same file and snapshot.
+/// `expected_path` must be the complete path derived for this exact item,
+/// including its enclosing path and sibling disambiguator. The resolved owner
+/// must match it exactly and end in this item's value-namespace symbol. The
+/// item tree, AST ID map, snapshot, and root must all describe the same file
+/// and snapshot.
 pub fn lower_function_owner<'hir>(
     owner: OwnerId,
+    expected_path: &DefPath,
     item_tree: &'hir ItemTree,
     item_id: ast::ErasedAstId,
     context: &HirLoweringContext<'_, 'hir>,
@@ -134,7 +136,12 @@ pub fn lower_function_owner<'hir>(
     let function = ast::FnDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
     let visibility = item_visibility(function.syntax());
     validate_current_item_metadata(entry, function.attrs(), visibility, context)?;
-    validate_owner_def_path(owner, entry, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::ValueNs(entry.name),
+        context,
+    )?;
 
     let mut source_map = HirSourceMapBuilder::new(
         owner,
@@ -186,9 +193,11 @@ pub fn lower_function_owner<'hir>(
 /// A diagnosed missing type or initializer is retained as an error HIR node so
 /// the owner remains available to later stages. As with function owners, the
 /// caller must supply the exact already-interned definition path for this
-/// declaration, including its parent and sibling disambiguator.
+/// declaration, including its parent and sibling disambiguator. `expected_path`
+/// is checked against the path resolved from `owner`.
 pub fn lower_const_owner<'hir>(
     owner: OwnerId,
+    expected_path: &DefPath,
     item_tree: &'hir ItemTree,
     item_id: ast::ErasedAstId,
     context: &HirLoweringContext<'_, 'hir>,
@@ -199,7 +208,12 @@ pub fn lower_const_owner<'hir>(
         ast::ConstDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
     let visibility = item_visibility(declaration.syntax());
     validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
-    validate_owner_def_path(owner, entry, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::ValueNs(entry.name),
+        context,
+    )?;
 
     if let Some(ty) = declaration.ty() {
         ensure_supported_type(&ty)?;
@@ -277,6 +291,79 @@ pub fn lower_const_owner<'hir>(
     ))
 }
 
+/// Lower one top-level effect declaration from the current item tree.
+///
+/// An omitted or parser-diagnosed malformed `covers` set recovers as empty:
+/// the HIR has no error effect reference, and retaining only a valid-looking
+/// prefix could grant capabilities not present in the complete declaration.
+/// `expected_path` is checked against the path resolved from `owner`.
+pub fn lower_effect_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Effect, context)?;
+    let declaration =
+        ast::EffectDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::Effect(entry.name),
+        context,
+    )?;
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let covers = match declaration
+        .covers()
+        .and_then(|clause| clause.set())
+        .filter(effect_set_is_well_formed)
+    {
+        Some(set) => lower_effect_set(&set, context.arena, context.symbols, &mut source_map)?,
+        None => context.arena.alloc_effect_refs(&[]),
+    };
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Effect { covers },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: None,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 fn resolve_item_tree_entry<'tree, 'hir>(
     item_tree: &'tree ItemTree,
     item_id: ast::ErasedAstId,
@@ -345,17 +432,20 @@ fn validate_current_item_metadata<'hir>(
 
 fn validate_owner_def_path<'hir>(
     owner: OwnerId,
-    entry: &crate::item_tree::ItemTreeEntry,
+    expected_path: &DefPath,
+    expected_data: DefPathData,
     context: &HirLoweringContext<'_, 'hir>,
 ) -> Result<(), HirLoweringError> {
     let owner_path = context
         .def_paths
         .resolve(owner.def_id)?
         .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
-    if !matches!(
-        owner_path.data().last(),
-        Some(component) if component.data == DefPathData::ValueNs(entry.name)
-    ) {
+    if owner_path != *expected_path
+        || !matches!(
+            expected_path.data().last(),
+            Some(component) if component.data == expected_data
+        )
+    {
         return Err(HirLoweringError::ItemTreeEntryMismatch);
     }
     Ok(())
@@ -1843,9 +1933,24 @@ fn effect_set_is_well_formed(set: &ast::EffectSet) -> bool {
     !contains_error_node(set.syntax())
         && has_direct_token(set.syntax(), SyntaxKind::L_BRACE)
         && has_direct_token(set.syntax(), SyntaxKind::R_BRACE)
-        && set.effects().all(|effect| {
-            !contains_error_node(effect.syntax()) && effect.segments().next().is_some()
-        })
+        && set.effects().all(effect_ref_is_well_formed)
+}
+
+fn effect_ref_is_well_formed(effect: ast::EffectRef) -> bool {
+    !contains_error_node(effect.syntax())
+        && effect
+            .segments()
+            .map(|segment| {
+                let Some(token) = segment.syntax().first_token() else {
+                    return false;
+                };
+                let written = token.text();
+                !token.has_error()
+                    && !invalid_raw_identifier(written)
+                    && (written.starts_with("r#") || !sai_syntax::is_reserved_identifier(written))
+            })
+            .reduce(|all, segment| all && segment)
+            .unwrap_or(false)
 }
 
 fn borrows_clause_is_well_formed(clause: &ast::BorrowsClause) -> bool {
@@ -6106,6 +6211,13 @@ mod tests {
         symbols: &Interner,
         name: Symbol,
     ) -> (PackageInterner, DefPathInterner, OwnerId) {
+        owner_context_with_data(symbols, DefPathData::ValueNs(name))
+    }
+
+    fn owner_context_with_data(
+        symbols: &Interner,
+        data: DefPathData,
+    ) -> (PackageInterner, DefPathInterner, OwnerId) {
         let packages = PackageInterner::new();
         let package = packages
             .intern("acme:closure-lowering#1.0")
@@ -6114,7 +6226,7 @@ mod tests {
         let path = DefPath::new(
             package,
             vec![DisambiguatedDefPathData {
-                data: DefPathData::ValueNs(name),
+                data,
                 disambiguator: 0,
             }],
             &packages,
@@ -6125,6 +6237,13 @@ mod tests {
             def_id: paths.intern(path).expect("definition interns"),
         };
         (packages, paths, owner)
+    }
+
+    fn owner_def_path(paths: &DefPathInterner, owner: OwnerId) -> DefPath {
+        paths
+            .resolve(owner.def_id)
+            .expect("owner path resolves")
+            .expect("owner path exists")
     }
 
     fn function_node(root: &sai_syntax::SyntaxNode) -> sai_syntax::SyntaxNode {
@@ -6428,6 +6547,7 @@ mod tests {
             "fn f(callback: fn() effects) {}\n",
             "fn f(callback: fn() effects { io, 123, net }) {}\n",
             "fn f(callback: fn() effects { io. }) {}\n",
+            "fn f(callback: fn() effects { io, null }) {}\n",
         ]
         .into_iter()
         .enumerate()
@@ -14456,12 +14576,14 @@ mod tests {
         assert_eq!(entry.kind, ItemTreeKind::Function);
         let entry_id = entry.ast_id;
         let (_packages, paths, owner) = owner_context(&symbols);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
 
-        let (hir_owner, source_map) = lower_function_owner(owner, &item_tree, entry_id, &context)
-            .expect("function item lowers to a complete owner");
+        let (hir_owner, source_map) =
+            lower_function_owner(owner, &expected_path, &item_tree, entry_id, &context)
+                .expect("function item lowers to a complete owner");
         assert_eq!(hir_owner.id, owner);
         assert_eq!(hir_owner.body.expect("function has a body").owner, owner);
         assert_eq!(hir_owner.raw_attrs.len(), 2);
@@ -14515,7 +14637,7 @@ mod tests {
         let mut stale_item_tree = item_tree.clone();
         stale_item_tree.items[0].vis = crate::Visibility::Private;
         assert!(matches!(
-            lower_function_owner(owner, &stale_item_tree, entry_id, &context),
+            lower_function_owner(owner, &expected_path, &stale_item_tree, entry_id, &context),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
         assert_eq!(
@@ -14527,7 +14649,7 @@ mod tests {
         let mut stale_attributes = item_tree.clone();
         stale_attributes.items[0].raw_attrs.clear();
         assert!(matches!(
-            lower_function_owner(owner, &stale_attributes, entry_id, &context),
+            lower_function_owner(owner, &expected_path, &stale_attributes, entry_id, &context),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
         assert_eq!(
@@ -14539,7 +14661,13 @@ mod tests {
         let mut changed_attributes = item_tree.clone();
         changed_attributes.items[0].raw_attrs[0].args = Some(Vec::new());
         assert!(matches!(
-            lower_function_owner(owner, &changed_attributes, entry_id, &context),
+            lower_function_owner(
+                owner,
+                &expected_path,
+                &changed_attributes,
+                entry_id,
+                &context
+            ),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
 
@@ -14551,7 +14679,13 @@ mod tests {
         };
         *span = attr.span;
         assert!(matches!(
-            lower_function_owner(owner, &stale_argument_span, entry_id, &context),
+            lower_function_owner(
+                owner,
+                &expected_path,
+                &stale_argument_span,
+                entry_id,
+                &context
+            ),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
 
@@ -14567,7 +14701,13 @@ mod tests {
             &other_paths,
         );
         assert!(matches!(
-            lower_function_owner(other_owner, &item_tree, entry_id, &other_context),
+            lower_function_owner(
+                other_owner,
+                &expected_path,
+                &item_tree,
+                entry_id,
+                &other_context
+            ),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
     }
@@ -14586,12 +14726,14 @@ mod tests {
         let entry_id = entry.ast_id;
         let name = symbols.intern("ANSWER").expect("symbol interns");
         let (_packages, paths, owner) = owner_context_with_symbol(&symbols, name);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
 
-        let (hir_owner, source_map) = lower_const_owner(owner, &item_tree, entry_id, &context)
-            .expect("const item lowers to a complete owner");
+        let (hir_owner, source_map) =
+            lower_const_owner(owner, &expected_path, &item_tree, entry_id, &context)
+                .expect("const item lowers to a complete owner");
         assert_eq!(hir_owner.id, owner);
         assert_eq!(
             hir_owner.body.expect("const has an initializer").owner,
@@ -14659,12 +14801,14 @@ mod tests {
         let entry = item_tree.items.first().expect("const item entry");
         let name = symbols.intern("ANSWER").expect("symbol interns");
         let (_packages, paths, owner) = owner_context_with_symbol(&symbols, name);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
 
-        let (hir_owner, _) = lower_const_owner(owner, &item_tree, entry.ast_id, &context)
-            .expect("missing initializer recovers as an error body");
+        let (hir_owner, _) =
+            lower_const_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing initializer recovers as an error body");
         let body = hir_owner.body.expect("const still has an owner body");
         assert!(matches!(body.value.kind, ExprKind::Err));
         let OwnerNode::Item(item) = hir_owner.node else {
@@ -14688,12 +14832,14 @@ mod tests {
         let entry = item_tree.items.first().expect("const item entry");
         let name = symbols.intern("ANSWER").expect("symbol interns");
         let (_packages, paths, owner) = owner_context_with_symbol(&symbols, name);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
 
-        let (hir_owner, _) = lower_const_owner(owner, &item_tree, entry.ast_id, &context)
-            .expect("missing type recovers as an error HIR type");
+        let (hir_owner, _) =
+            lower_const_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing type recovers as an error HIR type");
         let OwnerNode::Item(item) = hir_owner.node else {
             panic!("constant is represented by an item owner");
         };
@@ -14708,6 +14854,187 @@ mod tests {
                 negated: false
             })
         ));
+    }
+
+    #[test]
+    fn lowers_item_tree_effect_into_complete_hir_owner() {
+        let file = crate::FileId::new(237);
+        let source =
+            "@deprecated(\"old effect\")\npub effect write\n    covers { net.connect, alloc }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("effect item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Effect);
+        let entry_id = entry.ast_id;
+        let name = symbols.intern("write").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::Effect(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_effect_owner(owner, &expected_path, &item_tree, entry_id, &context)
+                .expect("effect item lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert!(hir_owner.body.is_none());
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level effect is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        assert_eq!(item.name.sym, name);
+        let ItemKind::Effect { covers } = item.kind else {
+            panic!("effect item retains its effect kind");
+        };
+        assert_eq!(covers.len(), 2);
+        assert_eq!(
+            symbols.resolve(covers[0].segments[0].sym).unwrap().as_ref(),
+            "net"
+        );
+        assert_eq!(
+            symbols.resolve(covers[0].segments[1].sym).unwrap().as_ref(),
+            "connect"
+        );
+        assert_eq!(
+            symbols.resolve(covers[1].segments[0].sym).unwrap().as_ref(),
+            "alloc"
+        );
+        let effect_ref = parsed
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EFFECT_REF)
+            .expect("covered effect reference");
+        assert_eq!(
+            source_map
+                .syntax_for_node(covers[0].hir_id)
+                .expect("effect reference has a source-map entry")
+                .text_range(),
+            effect_ref.text_range()
+        );
+        let effect_node = parsed
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::EFFECT_DECL)
+            .expect("effect declaration");
+        assert_eq!(item.span.range, effect_node.text_range());
+        assert_eq!(paths.len().unwrap(), 1);
+
+        let wrong_parent_path = DefPath::new(
+            expected_path.package(),
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Module(
+                        symbols.intern("other_module").expect("symbol interns"),
+                    ),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::Effect(name),
+                    disambiguator: 0,
+                },
+            ],
+            &_packages,
+            &symbols,
+        )
+        .expect("wrong-parent path is valid");
+        let wrong_parent_owner = OwnerId {
+            def_id: paths
+                .intern(wrong_parent_path)
+                .expect("wrong-parent definition interns"),
+        };
+        assert!(matches!(
+            lower_effect_owner(
+                wrong_parent_owner,
+                &expected_path,
+                &item_tree,
+                entry_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+
+        let (_wrong_packages, wrong_paths, wrong_owner) = owner_context_with_symbol(&symbols, name);
+        let wrong_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &wrong_paths,
+        );
+        assert!(matches!(
+            lower_effect_owner(
+                wrong_owner,
+                &expected_path,
+                &item_tree,
+                entry_id,
+                &wrong_context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+    }
+
+    #[test]
+    fn effect_owner_recovers_absent_and_malformed_covers_as_empty() {
+        for (file_id, source, expected_parse_errors) in [
+            (238, "effect audit\n", false),
+            (239, "effect audit covers { net.connect\n", true),
+            (240, "effect audit covers { alloc, null }\n", true),
+            (241, "effect audit covers { alloc, r#self }\n", true),
+        ] {
+            let file = crate::FileId::new(file_id);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert_eq!(
+                !parsed.errors.is_empty(),
+                expected_parse_errors,
+                "{source:?}: {:?}",
+                parsed.errors
+            );
+            let symbols = Interner::new();
+            let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+                .expect("item tree collects the effect");
+            let entry = item_tree.items.first().expect("effect item entry");
+            let name = symbols.intern("audit").expect("symbol interns");
+            let (_packages, paths, owner) =
+                owner_context_with_data(&symbols, DefPathData::Effect(name));
+            let expected_path = owner_def_path(&paths, owner);
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &ast_ids,
+                &snapshot,
+                &parsed.root,
+                &arena,
+                &symbols,
+                &paths,
+            );
+
+            let (hir_owner, _) =
+                lower_effect_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                    .expect("effect keeps an owner when covers is absent or malformed");
+            let OwnerNode::Item(item) = hir_owner.node else {
+                panic!("top-level effect is represented by an item owner");
+            };
+            let ItemKind::Effect { covers } = item.kind else {
+                panic!("effect item retains its effect kind");
+            };
+            assert!(
+                covers.is_empty(),
+                "absent and malformed covers recover to the empty set: {source:?}"
+            );
+        }
     }
 
     #[test]
@@ -14727,12 +15054,14 @@ mod tests {
         let entry = item_tree.items.first().expect("function item entry");
         assert!(entry.name.is_error());
         let (_packages, paths, owner) = owner_context_with_symbol(&symbols, crate::Symbol::ERROR);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
 
-        let (hir_owner, _) = lower_function_owner(owner, &item_tree, entry.ast_id, &context)
-            .expect("a parser-diagnosed name still lowers the function body");
+        let (hir_owner, _) =
+            lower_function_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("a parser-diagnosed name still lowers the function body");
         let OwnerNode::Item(item) = hir_owner.node else {
             panic!("function is represented by an item owner");
         };
@@ -14752,12 +15081,14 @@ mod tests {
         let entry = item_tree.items.first().expect("function item entry");
         assert!(entry.name.is_error());
         let (_packages, paths, owner) = owner_context_with_symbol(&symbols, crate::Symbol::ERROR);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
 
-        let (hir_owner, _) = lower_function_owner(owner, &item_tree, entry.ast_id, &context)
-            .expect("a parser-diagnosed reserved name still lowers the function body");
+        let (hir_owner, _) =
+            lower_function_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("a parser-diagnosed reserved name still lowers the function body");
         let OwnerNode::Item(item) = hir_owner.node else {
             panic!("function is represented by an item owner");
         };
@@ -14776,12 +15107,13 @@ mod tests {
             .expect("item tree collects");
         let entry_id = item_tree.items[0].ast_id;
         let (_packages, paths, owner) = owner_context(&symbols);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
 
         assert!(matches!(
-            lower_function_owner(owner, &item_tree, entry_id, &context),
+            lower_function_owner(owner, &expected_path, &item_tree, entry_id, &context),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
         assert_eq!(
@@ -14818,11 +15150,18 @@ mod tests {
         assert!(current_item_tree.matches_ast_ids(&ast_ids));
 
         let (_packages, paths, owner) = owner_context(&symbols);
+        let expected_path = owner_def_path(&paths, owner);
         let arena = HirArena::new();
         let context =
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
         assert!(matches!(
-            lower_function_owner(owner, &old_item_tree, stale_item_id, &context),
+            lower_function_owner(
+                owner,
+                &expected_path,
+                &old_item_tree,
+                stale_item_id,
+                &context
+            ),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
         assert_eq!(
@@ -15003,6 +15342,7 @@ mod tests {
             file,
             "fn missing_borrows() borrows effects {}\n\
              fn missing_effects() effects borrows {}\n\
+             fn reserved_effect() effects { alloc, null } {}\n\
              fn unclosed_effects() effects {\n",
         );
         assert!(
@@ -15014,7 +15354,7 @@ mod tests {
             .descendants()
             .filter_map(ast::FnDecl::cast)
             .collect::<Vec<_>>();
-        assert_eq!(declarations.len(), 3);
+        assert_eq!(declarations.len(), 4);
 
         for (index, declaration) in declarations.iter().enumerate() {
             let function = declaration.syntax().clone();
@@ -15038,6 +15378,12 @@ mod tests {
                     assert!(signature.effects.is_none());
                 }
                 2 => {
+                    assert!(
+                        signature.effects.is_none(),
+                        "a reserved identifier invalidates the complete effect set"
+                    );
+                }
+                3 => {
                     assert!(signature.effects.is_none());
                 }
                 _ => unreachable!(),
