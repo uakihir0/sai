@@ -187,6 +187,8 @@ A query that, directly or through other queries, reads itself is a **query cycle
 1. Memos are kept for the whole session, except for the queries marked **LRU** in their chapter. `parse` and `line_index` are LRU queries with a capacity of 256 files in the LSP server and unbounded in the CLI. An evicted memo is recomputed when it is needed again, which is safe because queries are pure.
 2. Interned values live as long as the session.
 
+**Current implementation slice.** `sai_query` now provides typed `InputQuery` and `DerivedQuery` handles over a synchronous session database. Inputs support set, removal, and tracked absence through `get_opt`; changed values advance the revision and the durability stamps for their level and every less durable level. Derived queries record reads in order, validate dependencies recursively, replace dynamic dependencies after recomputation, detect cycles, and backdate equal values. Input mutation is rejected during query execution, and query failures cannot be swallowed by a parent query and then memoized. Cancellation is exposed through an atomic token and can also be checked by long-running query bodies. Query keys are bucketed by their stable fingerprint and compared by `Eq`, so a fingerprint collision does not alias keys. This is the initial runtime only: query-group traits, interned and transparent query kinds, parallel execution, LRU policies, VFS/frontend wiring, and the persistent cache of §1.6 remain unimplemented.
+
 ---
 
 ## 1.5 Identifiers, interning, and arenas

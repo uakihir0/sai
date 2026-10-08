@@ -90,6 +90,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sai_query"
+version = "0.1.0"
+dependencies = [
+ "sai_intern",
+ "sai_stable_hash",
+]
+
+[[package]]
 name = "sai_stable_hash"
 version = "0.1.0"
 dependencies = [

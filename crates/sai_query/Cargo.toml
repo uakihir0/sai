@@ -1,0 +1,9 @@
+[package]
+name = "sai_query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sai_intern = { path = "../sai_intern" }
+sai_stable_hash = { path = "../sai_stable_hash" }
