@@ -3,6 +3,7 @@ use std::{collections::HashMap, mem, sync::Arc};
 use std::{fmt, fmt::Formatter};
 
 use sai_diagnostics::Diagnostic;
+use sai_stable_hash::{StableHash, StableHasher};
 use sai_vfs::{TextRange, TextSize};
 
 use crate::{SyntaxKind, Token, TokenFlags, Trivia, TriviaKind};
@@ -42,6 +43,21 @@ impl GreenTrivia {
     }
 }
 
+impl StableHash for GreenTrivia {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xC0);
+        hasher.write_tag(match self.kind {
+            TriviaKind::Whitespace => 0,
+            TriviaKind::LineBreak => 1,
+            TriviaKind::LineComment => 2,
+            TriviaKind::BlockComment => 3,
+            TriviaKind::Shebang => 4,
+            TriviaKind::Skipped => 5,
+        });
+        self.text.as_ref().stable_hash(hasher);
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct GreenTokenData {
     kind: SyntaxKind,
@@ -78,6 +94,18 @@ impl GreenToken {
 
     pub fn full_text_len(&self) -> TextSize {
         self.0.full_text_len
+    }
+}
+
+impl StableHash for GreenToken {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xC1);
+        self.kind().stable_hash(hasher);
+        self.text().stable_hash(hasher);
+        self.leading_trivia().stable_hash(hasher);
+        self.trailing_trivia().stable_hash(hasher);
+        self.has_error().stable_hash(hasher);
+        self.full_text_len().raw().stable_hash(hasher);
     }
 }
 
@@ -151,6 +179,47 @@ impl GreenNode {
             }
         }
         None
+    }
+}
+
+impl StableHash for GreenNode {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        enum Entry<'a> {
+            Node(&'a GreenNode),
+            Token(&'a GreenToken),
+        }
+
+        hasher.write_tag(0xC2);
+        let mut stack = vec![Entry::Node(self)];
+        while let Some(entry) = stack.pop() {
+            match entry {
+                Entry::Node(node) => {
+                    hasher.write_tag(0);
+                    node.kind().stable_hash(hasher);
+                    node.text_len().raw().stable_hash(hasher);
+                    u64::try_from(node.children().len())
+                        .unwrap_or(u64::MAX)
+                        .stable_hash(hasher);
+                    for child in node.children().iter().rev() {
+                        match child {
+                            GreenElement::Node(child) => stack.push(Entry::Node(child)),
+                            GreenElement::Token(child) => stack.push(Entry::Token(child)),
+                        }
+                    }
+                }
+                Entry::Token(token) => {
+                    hasher.write_tag(1);
+                    token.stable_hash(hasher);
+                }
+            }
+        }
+    }
+}
+
+impl StableHash for SyntaxKind {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xC3);
+        (*self as u16).stable_hash(hasher);
     }
 }
 
@@ -749,10 +818,11 @@ fn checked_add_text_len(total: TextSize, additional: usize) -> Result<TextSize, 
 
 #[cfg(test)]
 mod tests {
+    use sai_stable_hash::{StableHash, fingerprint};
     use sai_vfs::{FileId, SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     use super::*;
-    use crate::{LexOutput, lex};
+    use crate::{LexOutput, Parser, lex};
 
     fn lex_text(text: &str) -> LexOutput {
         let file_id = FileId::new(1);
@@ -829,6 +899,41 @@ mod tests {
             tree.root.last_token().map(GreenToken::kind),
             Some(SyntaxKind::EOF)
         );
+    }
+
+    #[test]
+    fn green_tree_fingerprint_is_stable_across_allocations_and_tracks_structure() {
+        fn parse_green(source: &str) -> GreenNode {
+            let file_id = FileId::new(1);
+            let source_file = Arc::new(SourceFile::new(file_id, source, false).expect("source"));
+            let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+                source_file,
+                "src/main.sai",
+                Some("sai:test@0.1.0".to_owned()),
+                None,
+            )])
+            .expect("snapshot");
+            let file = snapshot.file(file_id).expect("snapshot file");
+            let lexed = lex(&snapshot, file_id).expect("lex source");
+            let mut parser = Parser::new_for_file(file, &lexed.tokens).expect("valid token stream");
+            parser.parse_source_file().expect("valid source file");
+            let events = parser.into_events().expect("complete parser events");
+            let mut cache = NodeCache::new();
+            build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache)
+                .expect("build green tree")
+                .root
+        }
+
+        let first = parse_green("fn main() { let value = 1 }\n");
+        let second = parse_green("fn main() { let value = 1 }\n");
+        let changed = parse_green("fn main() { let value = 2 }\n");
+        let changed_trivia = parse_green("fn main(){ let value = 1 }\n");
+
+        assert_eq!(first, second);
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+        assert_ne!(fingerprint(&first), fingerprint(&changed));
+        assert_ne!(fingerprint(&first), fingerprint(&changed_trivia));
+        assert_eq!(first.fingerprint(), fingerprint(&first));
     }
 
     #[test]
