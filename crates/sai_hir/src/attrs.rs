@@ -2,8 +2,9 @@ use crate::item_tree::{AttrName, RawAttr, RawAttrArg, RawAttrValue};
 use crate::types::LangItem;
 use sai_diagnostics::{
     Applicability, Child, ChildKind, Code, Diagnostic, Fix, FixOperation, FixOperationName,
-    FixOperationPlanner, Label, LintLevel as DiagnosticLintLevel, Location, NodeGroup, NodeId,
-    OperationPlanError, Severity, SourceRef, TextEdit, Value, ValueObject, WorkspaceSnapshot,
+    FixOperationPlanner, LINT_REGISTRY, Label, LintLevel as DiagnosticLintLevel, LintNameLookup,
+    Location, NodeGroup, NodeId, OperationPlanError, Severity, SourceRef, TextEdit, Value,
+    ValueObject, WorkspaceSnapshot,
 };
 use sai_intern::{Interner, Symbol};
 use sai_vfs::{FileId, Span, WorkspaceSnapshot as VfsWorkspaceSnapshot};
@@ -860,6 +861,11 @@ pub(crate) fn validate_attrs_at_stage(
         else {
             continue;
         };
+        let Some(prepared) =
+            validate_lint_names(prepared, symbols, snapshot, &mut validated.diagnostics)?
+        else {
+            continue;
+        };
         apply_prepared(&mut validated, attribute, prepared.clone());
         accepted.push(AcceptedAttribute {
             name: attribute.name,
@@ -958,6 +964,124 @@ fn validate_derive_names(
     } else {
         Ok(Some(PreparedAttribute::ValidatedDerives(derives)))
     }
+}
+
+fn validate_lint_names(
+    prepared: PreparedAttribute,
+    symbols: &Interner,
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Option<PreparedAttribute>, AttrValidationError> {
+    let PreparedAttribute::Lints(lints) = prepared else {
+        return Ok(Some(prepared));
+    };
+    let mut retained = Vec::with_capacity(lints.len());
+
+    for lint in lints {
+        let spelling = symbols
+            .resolve(lint.name)
+            .map_err(|_| AttrValidationError::ForeignSymbol)?;
+        match sai_diagnostics::lookup_lint_name(&spelling) {
+            LintNameLookup::Lint(_) => retained.push(lint),
+            LintNameLookup::HardDiagnostic(severity) => {
+                let mut diagnostic = diagnostic_at(
+                    Code::NotALint,
+                    format!("`{spelling}` is a hard diagnostic, not a lint"),
+                    lint.span,
+                    snapshot,
+                )?;
+                let help = if severity == Severity::Warning {
+                    "hard warnings have a fixed level; use `--deny-warnings` to report them as errors"
+                } else {
+                    "hard diagnostics have a fixed severity and cannot be controlled by lint levels"
+                };
+                diagnostic
+                    .push_child(Child {
+                        kind: ChildKind::Help,
+                        message: help.to_owned(),
+                        location: None,
+                    })
+                    .map_err(|_| AttrValidationError::SnapshotMismatch)?;
+                diagnostics.push(diagnostic);
+            }
+            LintNameLookup::Unknown => {
+                let candidates = lint_name_candidates(&spelling);
+                let mut diagnostic = diagnostic_at(
+                    Code::UnknownLint,
+                    format!("unknown lint `{spelling}`"),
+                    lint.span,
+                    snapshot,
+                )?;
+                diagnostic
+                    .data
+                    .insert("name".to_owned(), Value::String(spelling.to_string()));
+                diagnostic.data.insert(
+                    "candidates".to_owned(),
+                    Value::Array(
+                        candidates
+                            .iter()
+                            .map(|(name, _)| Value::String((*name).to_owned()))
+                            .collect(),
+                    ),
+                );
+                if !candidates.is_empty() {
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Help,
+                            message: format!(
+                                "possible lint names: {}",
+                                candidates
+                                    .iter()
+                                    .map(|(name, _)| *name)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            location: None,
+                        })
+                        .map_err(|_| AttrValidationError::SnapshotMismatch)?;
+                }
+
+                let uppercase = spelling.to_ascii_uppercase();
+                if LINT_REGISTRY
+                    .iter()
+                    .any(|candidate| candidate.code == uppercase)
+                {
+                    let primary = diagnostic
+                        .primary()
+                        .cloned()
+                        .ok_or(AttrValidationError::FixPlanningFailed)?;
+                    let fix = sai_syntax::token_replacement_fix(
+                        snapshot,
+                        lint.span.file,
+                        lint.span.range,
+                        &uppercase,
+                        format!("replace with `{uppercase}`"),
+                        &primary,
+                    )
+                    .map_err(|_| AttrValidationError::FixPlanningFailed)?;
+                    diagnostic
+                        .push_fix(fix)
+                        .map_err(|_| AttrValidationError::SnapshotMismatch)?;
+                }
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+
+    Ok(Some(PreparedAttribute::Lints(retained)))
+}
+
+fn lint_name_candidates(name: &str) -> Vec<(&'static str, usize)> {
+    let mut candidates = LINT_REGISTRY
+        .iter()
+        .filter_map(|candidate| {
+            let distance = damerau_levenshtein(name, candidate.code);
+            (distance <= 2).then_some((candidate.code, distance))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, distance)| *distance);
+    candidates.truncate(10);
+    candidates
 }
 
 pub(crate) fn derive_lang_item(name: &str) -> Option<LangItem> {
@@ -2762,11 +2886,11 @@ mod tests {
     }
 
     #[test]
-    fn lint_attribute_shape_preserves_case_for_registry_validation() {
+    fn lint_attribute_shape_rejects_non_name_arguments_and_keeps_valid_lints() {
         let source = Arc::new(
             SourceFile::new(
                 sai_vfs::FileId::new(45),
-                "@allow(unused_variable, \"not-a-name\", UNUSED_VARIABLE)\nfn f() {}\n",
+                "@allow(UNUSED_VARIABLE, \"not-a-name\", UNUSED_IMPORT)\nfn f() {}\n",
                 false,
             )
             .expect("source"),
@@ -2786,14 +2910,123 @@ mod tests {
                 .resolve(validated.lint_levels[0].name)
                 .expect("lint symbol")
                 .as_ref(),
-            "unused_variable"
+            "UNUSED_VARIABLE"
         );
         assert_eq!(
             symbols
                 .resolve(validated.lint_levels[1].name)
                 .expect("lint symbol")
                 .as_ref(),
-            "UNUSED_VARIABLE"
+            "UNUSED_IMPORT"
+        );
+    }
+
+    #[test]
+    fn lint_name_validation_distinguishes_unknown_and_hard_codes() {
+        let source = concat!(
+            "@allow(UNUSED_VARIABLES, UNUSED_MUST_USE, MISPLACED_DOC_COMMENT, MISSING_SAFETY_DOC, unused_must_use)\n",
+            "fn f() {}\n",
+        );
+        let (validated, _) = validate_source(source, function_target());
+
+        assert_eq!(validated.lint_levels.len(), 1);
+        assert_eq!(validated.diagnostics.len(), 4);
+        assert_eq!(validated.diagnostics[0].code, Code::UnknownLint);
+        assert_eq!(
+            validated.diagnostics[0].data.get("candidates"),
+            Some(&Value::Array(vec![Value::String(
+                "UNUSED_VARIABLE".to_owned()
+            )]))
+        );
+        assert!(
+            validated.diagnostics[0].children()[0]
+                .message
+                .contains("UNUSED_VARIABLE")
+        );
+        assert_eq!(validated.diagnostics[1].code, Code::NotALint);
+        assert!(
+            validated.diagnostics[1].children()[0]
+                .message
+                .contains("fixed severity")
+        );
+        assert_eq!(validated.diagnostics[2].code, Code::NotALint);
+        assert!(
+            validated.diagnostics[2].children()[0]
+                .message
+                .contains("--deny-warnings")
+        );
+        assert_eq!(validated.diagnostics[3].code, Code::UnknownLint);
+        assert!(validated.diagnostics[3].fixes().is_empty());
+        assert_eq!(
+            validated.diagnostics[3].data.get("candidates"),
+            Some(&Value::Array(Vec::new()))
+        );
+
+        let expected_name_start = u32::try_from(
+            source
+                .find("MISSING_SAFETY_DOC")
+                .expect("later-stage lint name"),
+        )
+        .expect("source offset fits");
+        assert_eq!(
+            validated.diagnostics[0]
+                .primary()
+                .expect("unknown lint has a primary")
+                .span
+                .range
+                .start(),
+            sai_vfs::TextSize::new(
+                u32::try_from(source.find("UNUSED_VARIABLES").expect("unknown name"))
+                    .expect("source offset fits")
+            )
+        );
+        assert_eq!(
+            validated.lint_levels[0].span.range.start(),
+            sai_vfs::TextSize::new(expected_name_start)
+        );
+    }
+
+    #[test]
+    fn lowercase_known_lint_gets_a_machine_applicable_case_fix() {
+        let source = "@allow(unused_variable)\nfn f() {}\n";
+        let (validated, _) = validate_source(source, function_target());
+
+        assert!(validated.lint_levels.is_empty());
+        assert_eq!(validated.diagnostics.len(), 1);
+        let diagnostic = &validated.diagnostics[0];
+        assert_eq!(diagnostic.code, Code::UnknownLint);
+        assert_eq!(diagnostic.fixes().len(), 1);
+        assert_eq!(
+            diagnostic.fixes()[0].applicability(),
+            Applicability::MachineApplicable
+        );
+        assert_eq!(diagnostic.fixes()[0].edits().len(), 1);
+        assert_eq!(diagnostic.fixes()[0].edits()[0].new_text, "UNUSED_VARIABLE");
+        assert_eq!(
+            diagnostic.fixes()[0].edits()[0].range.range,
+            sai_vfs::TextRange::new(
+                sai_vfs::TextSize::new(
+                    u32::try_from(source.find("unused_variable").expect("lowercase name"))
+                        .expect("source offset fits")
+                ),
+                sai_vfs::TextSize::new(
+                    u32::try_from(source.find("unused_variable").expect("lowercase name") + 15)
+                        .expect("source offset fits")
+                )
+            )
+            .expect("ordered range")
+        );
+    }
+
+    #[test]
+    fn lint_name_candidates_use_the_specified_distance_limit() {
+        let (validated, _) = validate_source("@allow(XXXSED_ITEM)\nfn f() {}\n", function_target());
+
+        assert_eq!(validated.diagnostics.len(), 1);
+        assert_eq!(validated.diagnostics[0].code, Code::UnknownLint);
+        assert_eq!(
+            validated.diagnostics[0].data.get("candidates"),
+            Some(&Value::Array(Vec::new()))
         );
     }
 

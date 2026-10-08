@@ -93,6 +93,8 @@ The diagnostic registry is the list of all codes. It is published as [appendix-a
 | `data_schema` | the JSON Schema of the code's `data` object (§11.4.5), or `null` |
 | `explanation` | the text of `sai explain` (§11.13) |
 
+**Current implementation slice.** `sai_diagnostics` compiles a sorted snapshot of all 492 v0.1 code names from Appendix A and exposes `lookup_lint_name`, which returns a lint entry with its default level and stage, a hard diagnostic with its fixed severity, or unknown. The 28-entry `LINT_REGISTRY` follows spec/15 §15.17.2; tests compare the checked-in code-name snapshot, hard warning/info classifications, and lint metadata against the workspace specifications. This API deliberately sits beside `Code`: `Code::ALL` and `Code::from_name` still cover only variants emitted by the implemented frontend. `Code` is non-exhaustive so the diagnostic set can grow without requiring downstream exhaustive matches to change. The full `sai explain` metadata record, registry lifecycle, and callers for package `lints { }` and CLI flags remain unimplemented.
+
 ---
 
 ## 11.3 Severities and lint levels
@@ -217,7 +219,18 @@ The fields of draft §60 belong under `data`:
 }
 ```
 
-Candidate lists in `data` (and in help messages) are ordered by increasing edit distance (the Damerau–Levenshtein distance over Unicode scalar values), with ties broken by declaration order. A list contains only names whose distance from the written name is at most `max(1, n / 3)`, where `n` is the number of scalar values in the written name (integer division). If the set of candidates (fields, variants, or items in scope) has at most 5 members, all of them are listed whatever their distance, still in distance order. In the example above, both fields of `User` are listed for this reason. A list has at most 10 entries (N-H-5).
+Candidate lists in `data` (and in help messages) are ordered by increasing edit distance (the Damerau–Levenshtein distance over Unicode scalar values), with ties broken by declaration order. A list contains only names whose distance from the written name is at most `max(1, n / 3)`, where `n` is the number of scalar values in the written name (integer division). If the set of candidates (fields, variants, or items in scope) has at most 5 members, all of them are listed whatever their distance, still in distance order. In the example above, both fields of `User` are listed for this reason. A list has at most 10 entries (N-H-5). `UNKNOWN_LINT` is an exception to the relative distance threshold: spec/15 §15.15.4 admits registered lint names within distance 2, so its candidate list uses that fixed limit and still follows the ordering and length limit here.
+
+`UNKNOWN_LINT` has this `data` shape, including when there are no candidates:
+
+```json
+{
+  "name": "UNUSED_VARIABLES",
+  "candidates": ["UNUSED_VARIABLE"]
+}
+```
+
+`name` is the exact spelling the user wrote. `candidates` contains at most 10 registered lint codes within Damerau–Levenshtein distance 2, ordered by distance and then by their declaration order in spec/15 §15.17.2. A case-only correction is represented by the diagnostic's machine-applicable fix, not by adding a case variant to `candidates`.
 
 ### 11.4.6 Internal compiler errors
 

@@ -8,6 +8,7 @@ pub use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot, Workspac
 macro_rules! define_codes {
     ($($variant:ident => $name:literal),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[non_exhaustive]
         pub enum Code {
             $($variant),+
         }
@@ -107,6 +108,8 @@ define_codes! {
     UnknownAbi => "UNKNOWN_ABI",
     InvalidExternBlock => "INVALID_EXTERN_BLOCK",
     UnexpectedFnBody => "UNEXPECTED_FN_BODY",
+    UnknownLint => "UNKNOWN_LINT",
+    NotALint => "NOT_A_LINT",
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -122,6 +125,226 @@ pub enum LintLevel {
     Info,
     Warn,
     Deny,
+}
+
+/// The registered metadata needed to recognize and configure one lint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LintRegistryEntry {
+    /// The exact, case-sensitive diagnostic code.
+    pub code: &'static str,
+    /// The level used when no source overrides this lint.
+    pub default_level: LintLevel,
+    /// The language stage that introduces this lint.
+    pub stage: u8,
+}
+
+/// The result of checking whether a name can be assigned a lint level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LintNameLookup {
+    /// A lint with its registry metadata.
+    Lint(&'static LintRegistryEntry),
+    /// A registered hard diagnostic and its fixed severity.
+    HardDiagnostic(Severity),
+    /// A name absent from the complete v0.1 registry.
+    Unknown,
+}
+
+/// Every v0.1 lint in declaration order from spec/15 §15.17.2.
+pub const LINT_REGISTRY: &[LintRegistryEntry] = &[
+    LintRegistryEntry {
+        code: "NON_ASCII_IDENTIFIER",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNNECESSARY_RAW_IDENT",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNUSED_IMPORT",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "REDUNDANT_IMPORT",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "SHADOWS_PRELUDE",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "IRREFUTABLE_CONDITION_PATTERN",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "REDUNDANT_BINDING_MODE",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "REDUNDANT_UPDATE_BASE",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "STATEMENT_HAS_NO_EFFECT",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNREACHABLE_CODE",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNREACHABLE_PATTERN",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "REDUNDANT_PROVENANCE",
+        default_level: LintLevel::Warn,
+        stage: 2,
+    },
+    LintRegistryEntry {
+        code: "UNUSED_UNSAFE",
+        default_level: LintLevel::Warn,
+        stage: 2,
+    },
+    LintRegistryEntry {
+        code: "MISSING_SAFETY_DOC",
+        default_level: LintLevel::Warn,
+        stage: 2,
+    },
+    LintRegistryEntry {
+        code: "DUPLICATE_EFFECT",
+        default_level: LintLevel::Warn,
+        stage: 3,
+    },
+    LintRegistryEntry {
+        code: "UNUSED_EFFECT_DECLARATION",
+        default_level: LintLevel::Warn,
+        stage: 3,
+    },
+    LintRegistryEntry {
+        code: "PUBLIC_EFFECTS_INFERRED",
+        default_level: LintLevel::Warn,
+        stage: 3,
+    },
+    LintRegistryEntry {
+        code: "CONTRACT_RUNTIME_CHECK",
+        default_level: LintLevel::Info,
+        stage: 3,
+    },
+    LintRegistryEntry {
+        code: "DUPLICATE_PACKAGE_LINE",
+        default_level: LintLevel::Warn,
+        stage: 3,
+    },
+    LintRegistryEntry {
+        code: "AMBIENT_IMPORT",
+        default_level: LintLevel::Warn,
+        stage: 4,
+    },
+    LintRegistryEntry {
+        code: "UNUSED_VARIABLE",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNNECESSARY_VAR",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNUSED_ITEM",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNUSED_LABEL",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "NAMING_CONVENTION",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "UNUSED_ATTRIBUTE",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "DEPRECATED_REFERENCE",
+        default_level: LintLevel::Warn,
+        stage: 0,
+    },
+    LintRegistryEntry {
+        code: "MISSING_DOCS",
+        default_level: LintLevel::Allow,
+        stage: 0,
+    },
+];
+
+// Sorted snapshot of Appendix A; the registry test checks it against the docs.
+const DIAGNOSTIC_CODE_NAMES: &str = include_str!("diagnostic_code_names.txt");
+const HARD_WARNING_CODES: &[&str] = &[
+    "MISPLACED_DOC_COMMENT",
+    "WIT_ITEM_SHADOWED",
+    "CACHE_CORRUPT",
+    "CONFUSABLE_PACKAGE_NAME",
+    "DUPLICATE_LIST_ITEM",
+    "INVALID_LICENSE_EXPRESSION",
+    "LOCK_NOT_CANONICAL",
+    "SUBMODULE_IGNORED",
+    "SYMLINK_IGNORED",
+    "TAG_MISSING",
+    "UNUSED_OVERRIDE",
+    "VERSION_REQ_SPANS_LINES",
+    "DEPRECATED_DIAGNOSTIC_CODE",
+];
+const HARD_INFO_CODES: &[&str] = &[
+    "EXPORT_FN_NOT_APPLIED",
+    "EXPORT_WORLD_NOT_APPLIED",
+    "FOOTPRINT_EXCEEDS_POLICY",
+    "FOOTPRINT_NOT_GRANTED",
+    "ENTRY_POINT_NOT_APPLIED",
+    "LARGE_STACK_FRAME",
+    "NOT_PRESENT_IN_BUILD",
+    "SYMBOL_INDEX_DISCARDED",
+];
+
+/// Classifies a name using the complete v0.1 diagnostic-code namespace.
+///
+/// This registry includes codes for stages that this workspace has not
+/// implemented yet, so configuring a later-stage lint remains valid.
+pub fn lookup_lint_name(name: &str) -> LintNameLookup {
+    if let Some(lint) = LINT_REGISTRY.iter().find(|lint| lint.code == name) {
+        return LintNameLookup::Lint(lint);
+    }
+
+    if !DIAGNOSTIC_CODE_NAMES
+        .split_ascii_whitespace()
+        .any(|registered| registered == name)
+    {
+        return LintNameLookup::Unknown;
+    }
+
+    let severity = if HARD_WARNING_CODES.contains(&name) {
+        Severity::Warning
+    } else if HARD_INFO_CODES.contains(&name) {
+        Severity::Info
+    } else {
+        Severity::Error
+    };
+    LintNameLookup::HardDiagnostic(severity)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1699,7 +1922,171 @@ mod tests {
             Some(Code::OrPatternBindingMismatch)
         );
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
+        assert_eq!(Code::from_name("UNKNOWN_LINT"), Some(Code::UnknownLint));
+        assert_eq!(Code::from_name("NOT_A_LINT"), Some(Code::NotALint));
         assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));
+    }
+
+    #[test]
+    fn lint_name_lookup_uses_the_complete_v01_registry() {
+        let registered = DIAGNOSTIC_CODE_NAMES
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        let unique = registered.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(registered.len(), 492);
+        assert_eq!(unique.len(), registered.len());
+        assert!(registered.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(LINT_REGISTRY.len(), 28);
+        assert!(
+            registered
+                .iter()
+                .all(|name| !matches!(lookup_lint_name(name), LintNameLookup::Unknown))
+        );
+
+        for lint in LINT_REGISTRY {
+            assert!(registered.contains(&lint.code));
+            assert!(matches!(
+                lookup_lint_name(lint.code),
+                LintNameLookup::Lint(found) if found == lint
+            ));
+        }
+
+        assert_eq!(
+            lookup_lint_name("MISSING_SAFETY_DOC"),
+            LintNameLookup::Lint(&LintRegistryEntry {
+                code: "MISSING_SAFETY_DOC",
+                default_level: LintLevel::Warn,
+                stage: 2,
+            })
+        );
+        assert_eq!(
+            lookup_lint_name("CONTRACT_RUNTIME_CHECK"),
+            LintNameLookup::Lint(&LintRegistryEntry {
+                code: "CONTRACT_RUNTIME_CHECK",
+                default_level: LintLevel::Info,
+                stage: 3,
+            })
+        );
+        assert_eq!(
+            lookup_lint_name("MISSING_DOCS"),
+            LintNameLookup::Lint(&LintRegistryEntry {
+                code: "MISSING_DOCS",
+                default_level: LintLevel::Allow,
+                stage: 0,
+            })
+        );
+        assert_eq!(
+            lookup_lint_name("UNKNOWN_FIELD"),
+            LintNameLookup::HardDiagnostic(Severity::Error)
+        );
+        assert_eq!(
+            lookup_lint_name("MISPLACED_DOC_COMMENT"),
+            LintNameLookup::HardDiagnostic(Severity::Warning)
+        );
+        assert_eq!(
+            lookup_lint_name("LARGE_STACK_FRAME"),
+            LintNameLookup::HardDiagnostic(Severity::Info)
+        );
+        assert_eq!(
+            lookup_lint_name("UNUSED_VARIABLES"),
+            LintNameLookup::Unknown
+        );
+        assert_eq!(lookup_lint_name("unused_variable"), LintNameLookup::Unknown);
+        assert_eq!(
+            lookup_lint_name("UNUSED_MUST_USE"),
+            LintNameLookup::HardDiagnostic(Severity::Error)
+        );
+        assert!(
+            Code::ALL.iter().all(|code| {
+                !matches!(lookup_lint_name(code.as_str()), LintNameLookup::Unknown)
+            })
+        );
+    }
+
+    #[test]
+    fn checked_in_registry_snapshot_matches_the_spec_tables() {
+        let docs = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/spec");
+        let appendix_path = docs.join("appendix-a-diagnostic-codes.md");
+        let Ok(appendix) = std::fs::read_to_string(appendix_path) else {
+            // Packaged crates do not contain the workspace's specification sources.
+            return;
+        };
+
+        let mut documented_codes = appendix
+            .lines()
+            .filter_map(|line| {
+                let row = line.strip_prefix("| `")?;
+                let (code, _) = row.split_once('`')?;
+                Some(code)
+            })
+            .collect::<Vec<_>>();
+        documented_codes.sort_unstable();
+        assert_eq!(
+            DIAGNOSTIC_CODE_NAMES
+                .split_ascii_whitespace()
+                .collect::<Vec<_>>(),
+            documented_codes
+        );
+
+        let mut documented_warnings = Vec::new();
+        let mut documented_infos = Vec::new();
+        for line in appendix.lines() {
+            let columns = line.split('|').map(str::trim).collect::<Vec<_>>();
+            if columns.len() < 4 {
+                continue;
+            }
+            let Some(code) = columns[1]
+                .strip_prefix('`')
+                .and_then(|code| code.strip_suffix('`'))
+            else {
+                continue;
+            };
+            match columns[2] {
+                "warning" => documented_warnings.push(code),
+                "info" => documented_infos.push(code),
+                _ => {}
+            }
+        }
+        documented_warnings.sort_unstable();
+        documented_infos.sort_unstable();
+        let mut implemented_warnings = HARD_WARNING_CODES.to_vec();
+        implemented_warnings.sort_unstable();
+        let mut implemented_infos = HARD_INFO_CODES.to_vec();
+        implemented_infos.sort_unstable();
+        assert_eq!(implemented_warnings, documented_warnings);
+        assert_eq!(implemented_infos, documented_infos);
+
+        let spec = std::fs::read_to_string(docs.join("15-attributes-and-lints.md"))
+            .expect("workspace lint specification");
+        let lint_table = spec
+            .split("### 15.17.2 The lints of v0.1")
+            .nth(1)
+            .and_then(|section| section.split("### 15.17.3").next())
+            .expect("v0.1 lint registry table");
+        let documented_lints = lint_table
+            .lines()
+            .filter_map(|line| {
+                let columns = line.split('|').map(str::trim).collect::<Vec<_>>();
+                if columns.len() < 6 {
+                    return None;
+                }
+                let code = columns[1].strip_prefix('`')?.strip_suffix('`')?;
+                let level = match columns[2].trim_matches('`') {
+                    "allow" => LintLevel::Allow,
+                    "info" => LintLevel::Info,
+                    "warn" => LintLevel::Warn,
+                    "deny" => LintLevel::Deny,
+                    _ => return None,
+                };
+                let stage = columns[4].parse::<u8>().ok()?;
+                Some((code, level, stage))
+            })
+            .collect::<Vec<_>>();
+        let implemented_lints = LINT_REGISTRY
+            .iter()
+            .map(|lint| (lint.code, lint.default_level, lint.stage))
+            .collect::<Vec<_>>();
+        assert_eq!(implemented_lints, documented_lints);
     }
 
     #[test]
