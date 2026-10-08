@@ -44,6 +44,7 @@ The architecture and the query system are owned by [01-architecture.md](01-archi
 - `RootDatabase::intern_wit_files(PackageId)` converts tracked package-relative WIT paths to session-local `FileId`s. Its result preserves missing input, not-applicable inventory, an empty listed directory, and actual files as distinct states.
 - `RootDatabase::intern_package_files(PackageId, PackageSourceDirectory)` converts tracked source-file inventory entries into session-local IDs while preserving directory and symlink entries and distinguishing missing input, a missing source directory, and an empty source directory.
 - `RootDatabase::line_index(FileId)` resolves the ID through the session's file interner and reads the memoized index by its stable `FileKey`. The caller must pass an ID from the same root database: `FileId` carries only a numeric index, so an in-range foreign ID cannot be detected.
+- `RootDatabase::source_text_and_diagnostic(FileId, SourceRef)` returns tracked decoded source and any source-read or size-limit diagnostic. The caller supplies a `SourceRef` identifying the same file and a snapshot/version corresponding to the VFS source returned by the call; the driver does not validate this correspondence. `SourceRef` carries command- or document-specific path and version information not stored in the stable file key.
 - Diagnostics are not side effects. Every query returns its diagnostics as part of its value (`Parse::errors`, `HirOwner::diagnostics`, and so on); the driver collects them through the diagnostic sink of [11-diagnostics.md](11-diagnostics.md). The phrase "report X" in this chapter means "push a `Diagnostic` with code X into the diagnostics vector of the query being computed".
 - Queries can be cancelled between steps; the lexer and the parser are pure functions with no global state, so cancellation never leaves partial state behind.
 
@@ -1637,6 +1638,8 @@ Item-tree equality is structural within one symbol-interner session. It ignores 
 **Implementation update (IR-211, partial).** The driver now adapts the tracked package source inventory using the configured source directory. File entries receive `FileId`s; directory and symlink entries preserve their source-relative paths and kinds without being treated as readable files.
 
 **Implementation update (IR-212, partial).** The root database now provides the syntax-facing `line_index(FileId)` operation by resolving the ID to its stable key before querying the VFS.
+
+**Implementation update (IR-213, partial).** The root database now combines tracked source decoding with `source_text_status_diagnostic`, returning the diagnostic alongside the empty-or-ready source so later frontend work can continue after read failures or size-limit errors.
 
 ## 2.9 HIR-lowering desugarings
 

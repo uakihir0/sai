@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use sai_diagnostics::{Diagnostic, SourceRef, source_text_status_diagnostic};
 use sai_hir::item_tree::ItemTree;
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -284,6 +285,23 @@ impl RootDatabase {
             .map_err(RootDatabaseError::from)
     }
 
+    /// Reads source text and converts a non-ready status to its diagnostic.
+    ///
+    /// The caller supplies the command- or document-specific source reference,
+    /// since the stable file key does not contain a workspace-relative path or
+    /// a document version. `source_ref` must identify the same file as
+    /// `file_id`, and its snapshot must correspond to the VFS source returned
+    /// by this call. This relationship cannot be validated here.
+    pub fn source_text_and_diagnostic(
+        &mut self,
+        file_id: FileId,
+        source_ref: SourceRef,
+    ) -> Result<(SourceText, Option<Diagnostic>), RootDatabaseError> {
+        let source_text = self.source_text(file_id)?;
+        let diagnostic = source_text_status_diagnostic(&source_text, source_ref);
+        Ok((source_text, diagnostic))
+    }
+
     /// Reads the memoized line index for the local file key at `file_id`.
     ///
     /// `file_id` must have been created by this database; its numeric
@@ -523,6 +541,47 @@ mod tests {
             "beta"
         );
         assert!(second_tree.matches_ast_ids(&second_ast_ids));
+    }
+
+    #[test]
+    fn root_database_returns_source_status_diagnostics_with_bound_file_ids() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let key = FileKey::new("acme:app#0.1", "src/lib.sai").expect("file key is valid");
+        let file_id = database
+            .intern_file_key(key.clone())
+            .expect("file key is interned");
+        let source_ref = SourceRef {
+            path: "src/lib.sai".to_owned(),
+            package: Some("acme:app@0.1.0".to_owned()),
+            snapshot: None,
+        };
+
+        let (missing_source, diagnostic) = database
+            .source_text_and_diagnostic(file_id, source_ref.clone())
+            .expect("missing source is returned as a value");
+        assert_eq!(missing_source.source().id(), file_id);
+        let diagnostic = diagnostic.expect("missing source gets a read diagnostic");
+        assert_eq!(diagnostic.code, sai_diagnostics::Code::SourceReadFailed);
+        assert_eq!(
+            diagnostic
+                .primary()
+                .expect("source read diagnostic has a location")
+                .span
+                .file,
+            file_id
+        );
+        assert_eq!(
+            diagnostic.data.get("reason"),
+            Some(&sai_diagnostics::Value::String("not found".to_owned()))
+        );
+
+        database
+            .set_file_contents(key, Arc::from(&b"fn ready() {}\n"[..]), Durability::Low)
+            .expect("source bytes are set");
+        let (_, diagnostic) = database
+            .source_text_and_diagnostic(file_id, source_ref)
+            .expect("ready source is returned");
+        assert!(diagnostic.is_none());
     }
 
     #[test]

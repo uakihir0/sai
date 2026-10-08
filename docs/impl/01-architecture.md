@@ -207,6 +207,8 @@ A query that, directly or through other queries, reads itself is a **query cycle
 
 **Implementation update (IR-212, partial).** `RootDatabase::line_index(FileId)` resolves the numeric file index through its interner before requesting the stable-keyed VFS line index. `FileId` carries no session provenance, so callers must supply an ID from that same root database; the root can reject out-of-range values but cannot detect an in-range foreign ID.
 
+**Implementation update (IR-213, partial).** `RootDatabase::source_text_and_diagnostic(FileId, SourceRef)` returns decoded source together with the `SOURCE_READ_FAILED` or `IMPLEMENTATION_LIMIT_EXCEEDED` diagnostic derived from its tracked status. The caller supplies a source reference identifying the same file and a snapshot/version corresponding to the VFS source returned by the call because stable file keys do not encode workspace-relative paths or document versions; the adapter does not validate the correspondence.
+
 ## 1.5 Identifiers, interning, and arenas
 
 ### 1.5.1 Session identifiers
