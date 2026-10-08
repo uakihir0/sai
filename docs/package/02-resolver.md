@@ -138,7 +138,7 @@ The syntax and the validation rules of requirements are in [01 §1.10.2](01-pack
 ### 2.3.2 Satisfaction
 
 1. A version `x` **satisfies** a requirement `r` when `x` lies in the interval of `r`.
-2. For resolution, a requirement `r` can only be satisfied by a version of its own line: the resolver assigns the edge to the node `(id, line(min(r)))` and checks the selected version of that node (§2.4.3). Versions of other lines that lie in the interval (as with `>=1.2` or `~0`) are never used; this is the reason for the warning `VERSION_REQ_SPANS_LINES` ([01 §1.10.2](01-package-contract.md) rule 9).
+2. For resolution, a requirement `r` can only be satisfied by a version of its own line: the resolver assigns the edge to the node `(id, line(min(r)))` and checks the selected version of that node (§2.4.3). Stable versions of other lines that lie in the interval (as with `>=1.2` or `~0`) are never used; when the interval contains the stable start of the next line, this is the reason for the warning `VERSION_REQ_SPANS_LINES` ([01 §1.10.2](01-package-contract.md) rule 9). A boundary pre-release can lie in the interval without triggering the warning when its stable boundary is excluded.
 3. The selected version of a node is always at least the minimum of every edge to it (§2.4.2). A range check can therefore fail only through an upper bound (`<`, `<=`, the upper end of `~`, or `=`), or through a path pin (§2.7.1).
 
 ### 2.3.3 Pre-releases
@@ -731,7 +731,7 @@ Codes defined in another document are marked with that document.
 | `INVALID_VERSION` | error | defined in [01](01-package-contract.md) §1.2; malformed version |
 | `BUILD_METADATA_NOT_ALLOWED` | error | defined in [01](01-package-contract.md) §1.2; build metadata in a version |
 | `INVALID_VERSION_REQUIREMENT` | error | defined in [01](01-package-contract.md) §1.10.2; malformed requirement, including `^0` and `^0.0` (§2.3.1) |
-| `VERSION_REQ_SPANS_LINES` | warning | defined in [01](01-package-contract.md) §1.10.2; a requirement admits versions of other lines |
+| `VERSION_REQ_SPANS_LINES` | warning | defined in [01](01-package-contract.md) §1.10.2; a requirement interval contains the stable start of the next compatibility line |
 | `PACKAGE_REQUIRES_ITSELF` | error | defined in [01](01-package-contract.md) §1.10; a package requires its own identity |
 | `IMPLICIT_PACKAGE_REQUIRED` | error | defined in [01](01-package-contract.md) §1.10.1; `sai:core` or `sai:alloc` required |
 | `COMPILER_VERSION_MISMATCH` | error | defined in [01](01-package-contract.md) §1.5; a selected version's `compiler` requirement is not met |

@@ -2492,10 +2492,14 @@ mod tests {
             .split_ascii_whitespace()
             .collect::<Vec<_>>();
         let unique = registered.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(registered.len(), 492);
+        assert_eq!(registered.len(), 493);
         assert_eq!(unique.len(), registered.len());
         assert!(registered.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(LINT_REGISTRY.len(), 28);
+        assert!(matches!(
+            lookup_lint_name("INVALID_DESCRIPTION"),
+            LintNameLookup::HardDiagnostic(_)
+        ));
         assert!(
             registered
                 .iter()

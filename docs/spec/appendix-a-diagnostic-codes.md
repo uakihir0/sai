@@ -368,7 +368,7 @@ Codes owned by the language specification (`spec/`). 344 codes.
 
 ## A.3 Package, lock file and distribution codes
 
-Codes owned by the package documents (`package/`). 100 codes.
+Codes owned by the package documents (`package/`). 101 codes.
 
 | Code | Severity | Owner | Summary |
 |---|---|---|---|
@@ -405,6 +405,7 @@ Codes owned by the package documents (`package/`). 100 codes.
 | `INSECURE_GIT_URL` | error | [package/04](../package/04-distribution-and-security.md) | A Git URL uses `http` or `git` (§4.2.1) |
 | `INVALID_ARTIFACT` | error | [package/04](../package/04-distribution-and-security.md) | An artifact is not a valid Wasm component, or uses the wrong memory width (§4.5.2) |
 | `INVALID_CAPABILITY_NAME` | error | [package/01](../package/01-package-contract.md) | A name that is not a capability name of D-CAP-01 |
+| `INVALID_DESCRIPTION` | error | [package/01](../package/01-package-contract.md) | `description` contains a line break or exceeds 1024 UTF-8 bytes |
 | `INVALID_LICENSE_EXPRESSION` | warning | [package/01](../package/01-package-contract.md) | `license` is not a valid SPDX expression |
 | `INVALID_OVERRIDE` | error | [package/01](../package/01-package-contract.md) | `use artifact` on a package that is not hybrid |
 | `INVALID_PACKAGE_FILE_PATH` | error | [package/03](../package/03-lock-file.md) | A file path in fetched content violates §3.4.3 |
@@ -425,7 +426,7 @@ Codes owned by the package documents (`package/`). 100 codes.
 | `MISSING_PACKAGE_DECL` | error | [package/01](../package/01-package-contract.md) | No `package` declaration |
 | `MISSING_PACKAGE_FILE` | error | [package/02](../package/02-resolver.md) | The package directory of a fetched commit has no `sai.package` (§2.6.2) |
 | `MISSING_SOURCE` | error | [package/01](../package/01-package-contract.md) | A requirement without `from` |
-| `MISSING_TARGETS` | error | [package/01](../package/01-package-contract.md) | No `targets` declaration |
+| `MISSING_TARGETS` | error | [package/01](../package/01-package-contract.md) | No `targets` declaration, or the list is empty |
 | `NOT_REQUIRED` | error | [package/02](../package/02-resolver.md) | `sai remove` for an identity that the root does not require (§2.10.6) |
 | `NO_RELEASE_TAGS` | error | [package/02](../package/02-resolver.md) | `sai add` found no release tag in the repository (§2.11) |
 | `OFFLINE_FETCH_REQUIRED` | error | [package/03](../package/03-lock-file.md) | `--offline` or `--frozen` and needed content or tag information is not cached (§3.8.2) |
@@ -468,7 +469,7 @@ Codes owned by the package documents (`package/`). 100 codes.
 | `VERSION_CONFLICT` | error | [package/02](../package/02-resolver.md) | A selected version does not satisfy a requirement of the selected graph, or a pin; reported with both chains (§2.4.3, §2.13.1; named by D-PKG-02) |
 | `VERSION_NOT_FOUND` | error | [package/02](../package/02-resolver.md) | The release tag of a requested version does not exist (§2.6.2, §2.10.5, §2.11) |
 | `VERSION_REQ_NO_LOWER_BOUND` | error | [package/01](../package/01-package-contract.md) | A requirement without `^`, `~`, `=`, or `>=` |
-| `VERSION_REQ_SPANS_LINES` | warning | [package/01](../package/01-package-contract.md) | A requirement admits versions outside its own compatibility line |
+| `VERSION_REQ_SPANS_LINES` | warning | [package/01](../package/01-package-contract.md) | A requirement interval contains the stable start of the next compatibility line |
 | `WIT_DIR_NOT_FOUND` | error | [package/01](../package/01-package-contract.md) | The `wit` directory does not exist |
 | `WIT_PACKAGE_MISMATCH` | error | [package/01](../package/01-package-contract.md) | The WIT package name or version differs from the package identity |
 | `WIT_REQUIRED` | error | [package/01](../package/01-package-contract.md) | An artifact or hybrid package without `wit` |

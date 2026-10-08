@@ -22,7 +22,7 @@ impl PackageIdentity {
         let (namespace, name) = value
             .split_once(':')
             .ok_or(PackageIdentityError::InvalidPackageName)?;
-        if name.contains(':') || !is_valid_segment(namespace) || !is_valid_segment(name) {
+        if !is_valid_identity_spelling(value) {
             return Err(PackageIdentityError::InvalidPackageName);
         }
         if namespace == "wasi" {
@@ -65,6 +65,13 @@ impl fmt::Display for PackageIdentityError {
 }
 
 impl std::error::Error for PackageIdentityError {}
+
+pub(crate) fn is_valid_identity_spelling(value: &str) -> bool {
+    let Some((namespace, name)) = value.split_once(':') else {
+        return false;
+    };
+    !name.contains(':') && is_valid_segment(namespace) && is_valid_segment(name)
+}
 
 impl FromStr for PackageIdentity {
     type Err = PackageIdentityError;

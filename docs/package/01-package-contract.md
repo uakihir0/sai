@@ -398,7 +398,7 @@ Validation rules (N-G-10):
 6. `=` and `<=` require a full three-component version. `^`, `~`, `>=`, and `<` accept partial versions (`1`, `1.4`), which are completed with zeros. A partial version where a full one is required is `INVALID_VERSION_REQUIREMENT`, and so are `^0` and `^0.0`, whose meaning would be ambiguous ([02-resolver.md](02-resolver.md) §2.3.1 rule 4).
 7. A requirement that denotes no version at all (for example `>=2.0, <1.5`, or `^1.4, <1.4`) is `EMPTY_VERSION_REQUIREMENT`.
 8. The **minimum** of a requirement is the lower bound of its lower-bound comparator, completed with zeros. Its **compatibility line** is the line of its minimum (D-PKG-02, [02-resolver.md](02-resolver.md) §2.2.3). The resolver never selects a version outside that line for the requirement.
-9. If the requirement admits versions outside its own compatibility line (for example `>=1.2` without an upper bound, `>=1.2, <3.0`, or `~0`), it is the warning `VERSION_REQ_SPANS_LINES`. The note explains that versions outside the line can never be selected, and the fix replaces the requirement with the equivalent one restricted to its line (for `>=1.2, <3.0`: `^1.2`).
+9. If the requirement's interval contains the stable start of the next compatibility line (for example `>=1.2` without an upper bound, `>=1.2, <3.0`, or `~0`), it is the warning `VERSION_REQ_SPANS_LINES`. A pre-release below that stable boundary does not trigger the warning by itself: `>=0.7.1, <0.8` admits `0.8.0-rc.1` by precedence but excludes stable `0.8.0`, so it does not warn. The note explains that stable versions outside the line can never be selected, and the fix replaces the requirement with the equivalent one restricted to its line (for `>=1.2, <3.0`: `^1.2`).
 10. A pre-release in a requirement is allowed (`^1.0.0-rc.1`); its meaning is defined in [02-resolver.md](02-resolver.md) §2.3.3.
 
 ### 1.10.3 Sources
@@ -590,7 +590,7 @@ repository "https://github.com/acme/image"
 ```
 
 1. Metadata declarations are informative for tools and humans and have **no effect** on resolution, building, or checking (N-G-18).
-2. `description` is a single-line string of at most 1024 bytes.
+2. `description` MUST be a single-line string of at most 1024 bytes. A decoded LF or CR, or a value longer than 1024 UTF-8 bytes, is `INVALID_DESCRIPTION`.
 3. `license` is an SPDX license expression (SPDX specification, Annex D). An expression that does not parse, or that uses an identifier that is neither on the SPDX license list nor of the form `LicenseRef-...`, is the warning `INVALID_LICENSE_EXPRESSION`.
 4. `authors` is a list of free-form strings.
 5. `repository` is an informative URL. It is never used for fetching: the source of a dependency is always the `from` clause of a requirement (P6, draft §28). `sai add` does not read it.
@@ -859,7 +859,7 @@ overrides {
 
 Notes:
 
-- `acme:exif @ >=0.7.1, <0.8` is in the compatibility line `0.7`; the explicit upper bound coincides with the end of the line, so no `VERSION_REQ_SPANS_LINES` warning is issued. `^0.7.1` is the equivalent canonical spelling.
+- `acme:exif @ >=0.7.1, <0.8` is in the compatibility line `0.7`; it admits `0.8.0` pre-releases but excludes the stable `0.8.0` boundary, so no `VERSION_REQ_SPANS_LINES` warning is issued. `^0.7.1` is the equivalent canonical spelling.
 - `deny { wasi:http/incoming-handler }` narrows `wasi:http` to the other interfaces of `wasi:http`, such as `wasi:http/outgoing-handler`.
 - A `tiny` build may use `alloc` only: WASI is denied by default in `tiny` (D-TGT-02) and is not lifted by `profile tiny { allow }`.
 - `acme:image use artifact` takes effect only on `wasm32-wasi` with the `dev` or `release` profile (D-PKG-05, §1.16).
@@ -880,7 +880,7 @@ Each entry has a provisional ID. The rationale cites the principles of [decision
 | N-G-7 | `targets` is required and non-empty. Every dependency active for a target must list that target. | P1, P2: target support is a checked, visible promise (draft §75). |
 | N-G-8 | `export world` names a local world (a module path relative to the root module, or a world of the `wit` package for artifact packages) or an external world `ns:pkg/world`. Declaring it in a package whose `targets` include a core target is valid; the core build follows spec/13 §13.6.2 (N-D-32): `sai build` emits a core module from `export fn` items with `EXPORT_WORLD_NOT_APPLIED`, and `sai component build` wraps it with the world's exports only. | P8: the outcome depends only on the target; keeps draft §30 valid; matches D-TGT-01's wrapping of core output. |
 | N-G-9 | Every requirement has an explicit `from` source, including the bundled standard packages. | P1, P6: the source is always visible; the pre-populated cache only avoids the network. |
-| N-G-10 | A version requirement has exactly one lower-bound comparator (`^ ~ = >=`) and at most one upper bound (`< <=`); `>` does not exist; `=` stands alone; `=` and `<=` need full versions. The line of a requirement is the line of its minimum; a requirement admitting versions outside that line gets `VERSION_REQ_SPANS_LINES`. | P8: MVS needs a well-defined minimum (D-PKG-02); the warning exposes bounds that can never matter. |
+| N-G-10 | A version requirement has exactly one lower-bound comparator (`^ ~ = >=`) and at most one upper bound (`< <=`); `>` does not exist; `=` stands alone; `=` and `<=` need full versions. The line of a requirement is the line of its minimum; an interval containing the stable start of the next line gets `VERSION_REQ_SPANS_LINES`. A pre-release below that stable boundary does not trigger the warning. | P8: MVS needs a well-defined minimum (D-PKG-02); the warning exposes stable bounds that can never matter while preserving the documented boundary range. |
 | N-G-11 | No optional, feature, or build-time dependencies. `requires test` is root-only; a dependency's test requirements are never resolved. An identity appears at most once across `requires` and `requires test`. | P1, P8: the graph does not depend on hidden configuration; `use` by identity is unambiguous. |
 | N-G-12 | A requirement may carry `grant { .. }`, the maximum set of capabilities granted to that dependency (including its transitive dependencies). Omitted means no extra restriction. | P5: least authority per dependency; P1: visible at the requirement. |
 | N-G-13 | `policy` items are `deny unsafe`, `deny ambient_imports`, `deny runtime_contracts` (package-local), and `deny duplicate_lines` (graph-wide, root-only). A capability name used as a policy item is `POLICY_ITEM_IS_CAPABILITY`. | P9: one way to deny a capability (D-CAP-01); package-local promises are checkable per package. |
@@ -933,7 +933,7 @@ A compiler that implements Stage 3 but not Stage 4 rejects `wit`, `artifact`, an
 | `ARTIFACT_NOT_FOUND` | error | an artifact file that does not exist or is not a regular file |
 | `MISSING_ARTIFACT_FOR_TARGET` | error | an artifact package without an artifact for one of its targets |
 | `MISSING_EXPORT_WORLD` | error | an artifact or hybrid package without `export world` |
-| `MISSING_TARGETS` | error | no `targets` declaration |
+| `MISSING_TARGETS` | error | no `targets` declaration or its list is empty |
 | `UNKNOWN_TARGET` | error | a name that is not a target name |
 | `TARGET_NOT_DECLARED` | error | building the root for a target not in its `targets` |
 | `TARGET_NOT_SUPPORTED_BY_DEPENDENCY` | error | an active dependency does not list the build target |
@@ -951,7 +951,7 @@ A compiler that implements Stage 3 but not Stage 4 rejects `wit`, `artifact`, an
 | `VERSION_REQ_NO_LOWER_BOUND` | error | a requirement without `^`, `~`, `=`, or `>=` |
 | `INVALID_VERSION_REQUIREMENT` | error | two lower or two upper bounds, `=` combined with another comparator, or a partial version with `=` or `<=` |
 | `EMPTY_VERSION_REQUIREMENT` | error | a requirement that no version satisfies |
-| `VERSION_REQ_SPANS_LINES` | warning | a requirement admits versions outside its own compatibility line |
+| `VERSION_REQ_SPANS_LINES` | warning | a requirement interval contains the stable start of the next compatibility line; a boundary pre-release alone does not trigger it |
 | `MISSING_SOURCE` | error | a requirement without `from` |
 | `PATH_PACKAGE_NOT_FOUND` | error | a `from path` or `use path` directory without `sai.package` |
 | `PATH_ESCAPES_REPOSITORY` | error | defined in [02](02-resolver.md) §2.7.2; a path source in a Git package leaves the repository |
@@ -982,4 +982,5 @@ A compiler that implements Stage 3 but not Stage 4 rejects `wit`, `artifact`, an
 | `INVALID_OVERRIDE` | error | `use artifact` on a package that is not hybrid |
 | `DUPLICATE_OVERRIDE` | error | two overrides of the same kind for one identity |
 | `UNUSED_OVERRIDE` | warning | an override that matches nothing in the resolved graph |
+| `INVALID_DESCRIPTION` | error | `description` contains a line break or exceeds 1024 UTF-8 bytes |
 | `INVALID_LICENSE_EXPRESSION` | warning | `license` is not a valid SPDX expression |

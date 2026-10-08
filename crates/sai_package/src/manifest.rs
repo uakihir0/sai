@@ -26,6 +26,14 @@ pub struct PackageHeader {
     pub version: Version,
 }
 
+/// Whether a package contract is checked as the build root or a dependency.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PackageRole {
+    #[default]
+    Root,
+    Dependency,
+}
+
 /// A parsed package contract. Declarations with invalid headers, required
 /// structure, or local path values are omitted. Within a recoverable list,
 /// valid entries are retained alongside parser diagnostics for malformed
@@ -198,8 +206,20 @@ impl PackageParseOutput {
 ///
 /// Source positions are UTF-8 byte offsets. Lexical errors are returned
 /// separately from parser errors. Later declarations are retained when the
-/// parser can recover an unambiguous declaration boundary.
+/// parser can recover an unambiguous declaration boundary. This entry point
+/// treats the package as the build root; use [`parse_for_role`] for a
+/// dependency so ignored root-only declarations do not produce duplicate
+/// diagnostics.
 pub fn parse(source: &[u8]) -> PackageParseOutput {
+    parse_for_role(source, PackageRole::Root)
+}
+
+/// Lexes and parses one `sai.package` file in its package-graph role.
+///
+/// Root-only declarations remain in the syntax tree for dependencies, but
+/// duplicate-declaration and duplicate-list diagnostics for those ignored
+/// declarations are suppressed.
+pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
     let lexed = lex(source);
     let mut file = PackageFile {
         trivia: lexed.trivia,
@@ -219,9 +239,9 @@ pub fn parse(source: &[u8]) -> PackageParseOutput {
     }
 
     let text = std::str::from_utf8(source).expect("lexer only returns tokens for UTF-8 input");
-    let mut parser = Parser::new(text, lexed.tokens, &lexical_errors);
+    let mut parser = Parser::new(text, lexed.tokens, &lexical_errors, role);
     parser.parse_file(&mut file);
-    collect_list_diagnostics(&file, &mut parser.warnings, &mut parser.errors);
+    collect_list_diagnostics(&file, role, &mut parser.warnings, &mut parser.errors);
     PackageParseOutput {
         file,
         lexical_errors,
@@ -238,12 +258,18 @@ struct Parser<'a> {
     errors: Vec<PackageParseError>,
     warnings: Vec<PackageParseWarning>,
     declaration_keys: HashSet<DeclarationKey>,
+    role: PackageRole,
     package_declarations: usize,
     recovered_declaration_boundary: Option<usize>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(text: &'a str, tokens: Vec<PackageToken>, lexical_errors: &[PackageLexError]) -> Self {
+    fn new(
+        text: &'a str,
+        tokens: Vec<PackageToken>,
+        lexical_errors: &[PackageLexError],
+        role: PackageRole,
+    ) -> Self {
         Self {
             text,
             tokens,
@@ -255,6 +281,7 @@ impl<'a> Parser<'a> {
             errors: Vec::new(),
             warnings: Vec::new(),
             declaration_keys: HashSet::new(),
+            role,
             package_declarations: 0,
             recovered_declaration_boundary: None,
         }
@@ -290,7 +317,9 @@ impl<'a> Parser<'a> {
                 recovered_declaration_boundary =
                     self.recovered_declaration_boundary.take().is_some();
                 if let Some(key) = declaration_key {
-                    if !self.declaration_keys.insert(key.clone()) {
+                    if (self.role == PackageRole::Root || !key.is_root_only())
+                        && !self.declaration_keys.insert(key.clone())
+                    {
                         self.error(
                             PackageParseErrorKind::DuplicateDeclaration(key.name()),
                             declaration.as_ref().map_or_else(
@@ -662,6 +691,7 @@ impl<'a> Parser<'a> {
     fn parse_profile(&mut self) -> Option<PackageDeclaration> {
         self.bump();
         let name = self.parse_word()?;
+        let role = self.role;
         let mut seen = HashSet::new();
         let items = self.parse_braced_list_inner(
             true,
@@ -705,7 +735,7 @@ impl<'a> Parser<'a> {
                     ProfileItem::Allow(_) => "allow",
                     ProfileItem::Budget(_) => "budget",
                 };
-                if !seen.insert(key) {
+                if !seen.insert(key) && role == PackageRole::Root {
                     parser.error(
                         PackageParseErrorKind::DuplicateDeclaration(key.into()),
                         parser.span_from(item_start),
@@ -757,7 +787,7 @@ impl<'a> Parser<'a> {
 
     fn parse_targets_list(&mut self) -> Option<Vec<Spanned<Box<str>>>> {
         self.parse_braced_list_inner(
-            false,
+            true,
             ListSeparator::CommaOrLine,
             ListRecovery::Declarations,
             |parser| parser.parse_word(),
@@ -1414,6 +1444,7 @@ fn version_requirement_error_span(
 
 fn collect_list_diagnostics(
     file: &PackageFile,
+    role: PackageRole,
     warnings: &mut Vec<PackageParseWarning>,
     errors: &mut Vec<PackageParseError>,
 ) {
@@ -1422,11 +1453,15 @@ fn collect_list_diagnostics(
             PackageDeclaration::Targets(items)
             | PackageDeclaration::Allow(items)
             | PackageDeclaration::Deny(items)
-            | PackageDeclaration::Policy(items)
             | PackageDeclaration::Authors(items) => {
                 add_duplicate_text_warnings(items, |value| value, warnings);
             }
-            PackageDeclaration::Requires { entries, .. } => {
+            PackageDeclaration::Policy(items) => {
+                add_duplicate_policy_warnings(items, role, warnings);
+            }
+            PackageDeclaration::Requires { test, entries }
+                if !(*test && role == PackageRole::Dependency) =>
+            {
                 for entry in entries {
                     if let Some(only) = &entry.value.only {
                         add_duplicate_text_warnings(&only.value, |value| value, warnings);
@@ -1449,7 +1484,7 @@ fn collect_list_diagnostics(
                     }
                 }
             }
-            PackageDeclaration::Lints(items) => {
+            PackageDeclaration::Lints(items) if role == PackageRole::Root => {
                 let mut seen = HashMap::<&str, (LintLevel, Range<usize>)>::new();
                 for item in items {
                     let code = item.value.code.as_ref();
@@ -1470,7 +1505,7 @@ fn collect_list_diagnostics(
                     }
                 }
             }
-            PackageDeclaration::Profile { items, .. } => {
+            PackageDeclaration::Profile { items, .. } if role == PackageRole::Root => {
                 for item in items {
                     match &item.value {
                         ProfileItem::Allow(capabilities) => {
@@ -1490,6 +1525,9 @@ fn collect_list_diagnostics(
             | PackageDeclaration::Source(_)
             | PackageDeclaration::Wit(_)
             | PackageDeclaration::ExportWorld(_)
+            | PackageDeclaration::Requires { .. }
+            | PackageDeclaration::Lints(_)
+            | PackageDeclaration::Profile { .. }
             | PackageDeclaration::Allocator(_)
             | PackageDeclaration::Overrides(_)
             | PackageDeclaration::Description(_)
@@ -1515,6 +1553,26 @@ fn add_duplicate_text_warnings<'a, T>(
     }
 }
 
+fn add_duplicate_policy_warnings(
+    items: &[Spanned<Box<str>>],
+    role: PackageRole,
+    warnings: &mut Vec<PackageParseWarning>,
+) {
+    let mut seen = HashSet::new();
+    for item in items {
+        let value = item.value.as_ref();
+        if role == PackageRole::Dependency && value == "duplicate_lines" {
+            continue;
+        }
+        if !seen.insert(value) {
+            warnings.push(PackageParseWarning {
+                kind: PackageParseWarningKind::DuplicateListItem,
+                span: item.span.clone(),
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ListSeparator {
     LinesOnly,
@@ -1528,7 +1586,7 @@ enum ListRecovery {
     ProfileItems,
 }
 
-fn is_target_name(name: &str) -> bool {
+pub(crate) fn is_target_name(name: &str) -> bool {
     matches!(
         name,
         "wasm32-core"
@@ -1565,6 +1623,17 @@ enum DeclarationKey {
 }
 
 impl DeclarationKey {
+    fn is_root_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Requires(true)
+                | Self::Lints
+                | Self::Profile(_)
+                | Self::Allocator
+                | Self::Overrides
+        )
+    }
+
     fn name(&self) -> Box<str> {
         match self {
             Self::Compiler => "compiler".into(),
@@ -1651,7 +1720,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 mod tests {
     use super::{
         LintLevel, OverrideSource, PackageDeclaration, PackageIdentityError, PackageParseErrorKind,
-        ProfileItem, RequirementSource, parse,
+        PackageRole, ProfileItem, RequirementSource, parse, parse_for_role,
     };
 
     fn parse_text(source: &str) -> super::PackageParseOutput {
@@ -1667,6 +1736,68 @@ mod tests {
             output.errors
         );
         output
+    }
+
+    #[test]
+    fn dependency_parsing_suppresses_diagnostics_for_ignored_root_only_declarations() {
+        let source = "package acme:dep @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core }\n\
+             requires test { acme:ignored @ ^1 from path \"../ignored\" }\n\
+             requires test { acme:ignored @ ^1 from path \"../ignored\" }\n\
+             lints { allow NAMING_CONVENTION, deny NAMING_CONVENTION }\n\
+             lints { allow UNKNOWN_LINT }\n\
+             profile tiny {\n\
+                 allow { host, host }\n\
+                 allow { threads }\n\
+                 budget { wasm <= 1 B, wasm <= 2 B }\n\
+             }\n\
+             profile tiny { allow { host } }\n\
+             allocator acme:alloc\n\
+             allocator acme:other-alloc\n\
+             overrides { acme:other use artifact }\n\
+             overrides { acme:another use artifact }\n";
+        let dependency = parse_for_role(source.as_bytes(), PackageRole::Dependency);
+        assert!(dependency.is_syntax_valid(), "{:?}", dependency.errors);
+        assert!(dependency.warnings.is_empty(), "{:?}", dependency.warnings);
+        assert!(
+            dependency
+                .file
+                .declarations
+                .iter()
+                .filter(|declaration| matches!(
+                    declaration.value,
+                    PackageDeclaration::Profile { .. }
+                ))
+                .count()
+                == 2
+        );
+
+        let root = parse_text(source);
+        assert!(
+            root.errors.iter().any(|error| matches!(
+                error.kind,
+                PackageParseErrorKind::DuplicateDeclaration(_)
+                    | PackageParseErrorKind::ConflictingLintLevel
+            )),
+            "{:?}",
+            root.errors
+        );
+        assert!(!root.warnings.is_empty());
+    }
+
+    #[test]
+    fn dependency_policy_suppresses_only_root_only_item_duplicates() {
+        let source = "package acme:dep @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core }\n\
+             policy { deny duplicate_lines, deny duplicate_lines, deny unsafe, deny unsafe }\n";
+        let dependency = parse_for_role(source.as_bytes(), PackageRole::Dependency);
+        assert_eq!(dependency.warnings.len(), 1);
+        assert_eq!(&source[dependency.warnings[0].span.clone()], "deny unsafe");
+
+        let root = parse_text(source);
+        assert_eq!(root.warnings.len(), 2);
     }
 
     #[test]
@@ -1874,13 +2005,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_required_empty_lists_and_trailing_tokens() {
+    fn retains_empty_targets_for_semantic_validation_and_reports_trailing_tokens() {
         let output = parse_text(
             "package acme:app @ 1.0.0\n\
              targets {}\n\
              source \"src\" trailing\n",
         );
-        assert!(output.errors.iter().any(|error| matches!(
+        assert!(output.file.declarations.iter().any(|declaration| matches!(
+            &declaration.value,
+            PackageDeclaration::Targets(items) if items.is_empty()
+        )));
+        assert!(!output.errors.iter().any(|error| matches!(
             error.kind,
             PackageParseErrorKind::ExpectedToken(ref expected)
                 if expected.as_ref() == "at least one list item"
