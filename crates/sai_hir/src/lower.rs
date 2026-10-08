@@ -401,6 +401,105 @@ pub fn lower_invariant_owner<'hir>(
     ))
 }
 
+/// Lower one top-level test declaration from the current item tree.
+///
+/// Test names are decoded string literals and form their own DefPath
+/// component. Nested closure and async-block paths are prepared over the whole
+/// test declaration before its body is lowered.
+pub fn lower_test_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) = resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Test, context)?;
+    let declaration = ast::TestDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+
+    let name_token = declaration
+        .name()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let name_value = name_token.value().into_owned();
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::Test(std::sync::Arc::<str>::from(name_value.as_str())),
+        context,
+    )?;
+    if let Some(body) = declaration.body() {
+        ensure_supported_block(&body)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name_sym = context.symbols.intern(&name_value)?;
+    if name_sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let token = name_token.syntax();
+    let parent_span = source_map.span_for(token.parent(), SpanCtxt::Root)?;
+    let name_span = Span {
+        range: token.text_range(),
+        ..parent_span
+    };
+    let name = Name {
+        sym: name_sym,
+        span: name_span,
+    };
+    prepare_nested_definition_ids(declaration.syntax(), &mut source_map)?;
+    let value = match declaration.body() {
+        Some(body) => lower_block_as_expr(
+            declaration.syntax(),
+            &body,
+            context.arena,
+            context.symbols,
+            &mut source_map,
+        )?,
+        None => {
+            let error_syntax = direct_error_child_from_end(declaration.syntax())
+                .unwrap_or_else(|| declaration.syntax().clone());
+            lower_error_expr(&error_syntax, context.arena, &mut source_map)?
+        }
+    };
+    let body = context.arena.alloc_body(Body {
+        owner,
+        params: &[],
+        value,
+        contracts: &[],
+        invariant_preds: &[],
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Test {
+            name: context.arena.alloc_str(&name_value),
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: Some(body),
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level effect declaration from the current item tree.
 ///
 /// An omitted or parser-diagnosed malformed `covers` set recovers as empty:
@@ -15336,6 +15435,131 @@ mod tests {
             );
         }
         assert_eq!(paths.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn lowers_item_tree_test_into_complete_hir_owner() {
+        let file = crate::FileId::new(247);
+        let source = "@deprecated(\"legacy test\")\ntest \"line\\nname\" { fn() { true } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("test item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Test);
+        let entry_id = entry.ast_id;
+        let decoded_name = "line\nname";
+        let name = symbols.intern(decoded_name).expect("symbol interns");
+        let (_packages, paths, owner) = owner_context_with_data(
+            &symbols,
+            DefPathData::Test(std::sync::Arc::<str>::from(decoded_name)),
+        );
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_test_owner(owner, &expected_path, &item_tree, entry_id, &context)
+                .expect("test item lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level test is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Private);
+        assert_eq!(item.name.sym, name);
+        assert_eq!(
+            symbols.resolve(item.name.sym).unwrap().as_ref(),
+            decoded_name
+        );
+        let ItemKind::Test { name: hir_name } = item.kind else {
+            panic!("test item retains its test kind");
+        };
+        assert_eq!(hir_name, decoded_name);
+        let declaration = parsed
+            .root
+            .descendants()
+            .find_map(ast::TestDecl::cast)
+            .expect("test declaration");
+        let name_token = declaration.name().expect("test name literal");
+        assert_eq!(item.name.span.range, name_token.syntax().text_range());
+
+        let body = hir_owner.body.expect("test owns its body");
+        assert_eq!(body.owner, owner);
+        assert!(body.params.is_empty());
+        assert!(body.contracts.is_empty());
+        assert!(body.invariant_preds.is_empty());
+        let ExprKind::Block(block) = body.value.kind else {
+            panic!("test body is represented by a block expression");
+        };
+        let tail = block
+            .tail
+            .expect("test block preserves its tail expression");
+        let ExprKind::Closure(closure) = tail.kind else {
+            panic!("nested closure is retained in the test body");
+        };
+        let closure_path = paths
+            .resolve(closure.def_id)
+            .expect("closure path resolves")
+            .expect("closure path exists");
+        assert_eq!(
+            closure_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Closure,
+                disambiguator: 0,
+            })
+        );
+        assert_eq!(paths.len().unwrap(), 2);
+        assert_eq!(
+            source_map
+                .syntax_for_node(body.value.hir_id)
+                .expect("test body has a source-map entry")
+                .text_range(),
+            declaration.syntax().text_range()
+        );
+        assert_eq!(item.span.range, declaration.syntax().text_range());
+    }
+
+    #[test]
+    fn test_owner_recovers_a_missing_body() {
+        let file = crate::FileId::new(248);
+        let source = "test \"missing body\"\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(!parsed.errors.is_empty(), "the missing body is diagnosed");
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed test");
+        let entry = item_tree.items.first().expect("test item entry");
+        let decoded_name = "missing body";
+        let name = symbols.intern(decoded_name).expect("symbol interns");
+        let (_packages, paths, owner) = owner_context_with_data(
+            &symbols,
+            DefPathData::Test(std::sync::Arc::<str>::from(decoded_name)),
+        );
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_test_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing test body recovers as an error expression");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level test is represented by an item owner");
+        };
+        assert_eq!(item.name.sym, name);
+        let body = hir_owner.body.expect("test still owns a body");
+        assert!(matches!(body.value.kind, ExprKind::Err));
     }
 
     #[test]
