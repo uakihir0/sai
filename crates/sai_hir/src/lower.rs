@@ -289,6 +289,117 @@ pub fn lower_alias_owner<'hir>(
     ))
 }
 
+/// Lower one top-level refined type from the current item tree.
+///
+/// The base type is stored on `ItemKind::Refined`; the predicate is the body
+/// value and sees `self` through the refined owner's semantic context. Generic
+/// parameter syntax remains in ItemTree for `GENERIC_REFINED_TYPE` validation,
+/// because refined HIR has no generic-parameter field.
+pub fn lower_refined_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Refined, context)?;
+    let declaration = ast::TypeDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+    if declaration.struct_def().is_some() {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let definition = declaration
+        .alias_def()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let refinement = definition
+        .refinement()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let base_type = definition.ty();
+    if let Some(base_type) = &base_type {
+        ensure_supported_type(base_type)?;
+    }
+    let predicate = refinement.expression();
+    if let Some(predicate) = &predicate {
+        ensure_supported_expr(predicate)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    prepare_nested_definition_ids(declaration.syntax(), &mut source_map)?;
+
+    let base = match base_type {
+        Some(base_type) => lower_type(&base_type, context.arena, context.symbols, &mut source_map)?,
+        None => {
+            let error_syntax = direct_error_child(definition.syntax())
+                .unwrap_or_else(|| definition.syntax().clone());
+            lower_error_type(&error_syntax, context.arena, &mut source_map)?
+        }
+    };
+    let value = match predicate {
+        Some(predicate) => lower_expr_in_prepared_owner(
+            &predicate,
+            context.arena,
+            context.symbols,
+            &mut source_map,
+        )?,
+        None => {
+            let error_syntax = direct_error_child(refinement.syntax())
+                .unwrap_or_else(|| refinement.syntax().clone());
+            lower_error_expr(&error_syntax, context.arena, &mut source_map)?
+        }
+    };
+    let body = context.arena.alloc_body(Body {
+        owner,
+        params: &[],
+        value,
+        contracts: &[],
+        invariant_preds: context.arena.alloc_expr_refs(&[]),
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Refined { base },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: Some(body),
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level record declaration from the current item tree.
 ///
 /// Generic parameter definitions and field definitions are interned below the
@@ -15590,6 +15701,241 @@ mod tests {
             1,
             "a constant entry cannot allocate alias generics"
         );
+    }
+
+    #[test]
+    fn lowers_item_tree_refined_type_with_base_predicate_and_implicit_self() {
+        let file = crate::FileId::new(259);
+        let source = "@deprecated(\"bounded\")\npub type Positive<T> = I32 where self > 0\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("refined item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Refined);
+        assert_eq!(entry.children.len(), 1);
+        assert_eq!(
+            entry.children[0].kind,
+            ItemTreeKind::TypeParam,
+            "the invalid generic declaration remains available for validation"
+        );
+        let name = symbols.intern("Positive").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_refined_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("refined type lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level refined type is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        assert_eq!(item.name.sym, name);
+        let ItemKind::Refined { base } = item.kind else {
+            panic!("refined declaration retains its refined item kind");
+        };
+        let HirTyKind::Path(base_path) = base.kind else {
+            panic!("refined type retains its base path");
+        };
+        assert_eq!(base_path.segments.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(base_path.segments[0].name.sym)
+                .expect("base path name resolves")
+                .as_ref(),
+            "I32"
+        );
+        assert!(matches!(
+            paths.resolve(owner.def_id).unwrap().unwrap().data().last(),
+            Some(DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(symbol),
+                disambiguator: 0,
+            }) if *symbol == name
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "refined type HIR does not fabricate generic parameter paths"
+        );
+
+        let body = hir_owner
+            .body
+            .expect("refined type owns its predicate body");
+        assert!(
+            body.params.is_empty(),
+            "self is implicit in the owner context"
+        );
+        assert!(body.contracts.is_empty());
+        assert!(body.invariant_preds.is_empty());
+        let ExprKind::Binary(BinOp::Gt, lhs, _) = body.value.kind else {
+            panic!("predicate is retained as the owner's body value");
+        };
+        let ExprKind::Path(self_path) = lhs.kind else {
+            panic!("self is retained as a value path");
+        };
+        assert_eq!(self_path.root, PathRoot::SelfValue);
+        assert!(self_path.segments.is_empty());
+
+        let declaration = parsed
+            .root
+            .descendants()
+            .find_map(ast::TypeDecl::cast)
+            .expect("type declaration");
+        let definition = declaration.alias_def().expect("alias definition");
+        let source_base = definition.ty().expect("base type");
+        let source_predicate = definition
+            .refinement()
+            .and_then(|clause| clause.expression())
+            .expect("refinement predicate");
+        assert_eq!(item.span.range, declaration.syntax().text_range());
+        assert_eq!(
+            source_map
+                .syntax_for_node(base.hir_id)
+                .expect("base type has a source-map entry")
+                .text_range(),
+            source_base.syntax().text_range()
+        );
+        assert_eq!(
+            source_map
+                .syntax_for_node(body.value.hir_id)
+                .expect("predicate has a source-map entry")
+                .text_range(),
+            source_predicate.syntax().text_range()
+        );
+    }
+
+    #[test]
+    fn refined_owner_recovers_a_missing_predicate() {
+        let file = crate::FileId::new(260);
+        let source = "type Broken = I32 where\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing predicate is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed refined type");
+        let entry = item_tree.items.first().expect("refined item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Refined);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_refined_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing predicate recovers to error HIR");
+        let body = hir_owner.body.expect("refined type retains its body");
+        assert!(matches!(body.value.kind, ExprKind::Err));
+    }
+
+    #[test]
+    fn refined_owner_recovers_a_missing_base_type() {
+        let file = crate::FileId::new(262);
+        let source = "type Broken = where self > 0\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing base type is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed refined type");
+        let entry = item_tree.items.first().expect("refined item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Refined);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_refined_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing base type recovers to error HIR");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level refined type is represented by an item owner");
+        };
+        let ItemKind::Refined { base } = item.kind else {
+            panic!("refined declaration retains its refined item kind");
+        };
+        assert!(matches!(base.kind, HirTyKind::Err));
+        let body = hir_owner.body.expect("refined type retains its predicate");
+        assert!(matches!(body.value.kind, ExprKind::Binary(BinOp::Gt, ..)));
+    }
+
+    #[test]
+    fn refined_owner_rejects_wrong_paths_and_other_item_kinds() {
+        let file = crate::FileId::new(261);
+        let source = "type Refined = I32 where self > 0\ntype Alias = I32\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let refined_entry = item_tree.items.first().expect("refined item entry");
+        let alias_entry = item_tree.items.get(1).expect("alias item entry");
+        assert_eq!(refined_entry.kind, ItemTreeKind::Refined);
+        assert_eq!(alias_entry.kind, ItemTreeKind::Alias);
+
+        let wrong_name = symbols.intern("Refined").expect("symbol interns");
+        let (_packages, wrong_paths, wrong_owner) =
+            owner_context_with_data(&symbols, DefPathData::ValueNs(wrong_name));
+        let wrong_expected_path = owner_def_path(&wrong_paths, wrong_owner);
+        let arena = HirArena::new();
+        let wrong_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &wrong_paths,
+        );
+        assert!(matches!(
+            lower_refined_owner(
+                wrong_owner,
+                &wrong_expected_path,
+                &item_tree,
+                refined_entry.ast_id,
+                &wrong_context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(wrong_paths.len().unwrap(), 1);
+
+        let name = symbols.intern("Refined").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        assert!(matches!(
+            lower_refined_owner(
+                owner,
+                &expected_path,
+                &item_tree,
+                alias_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(paths.len().unwrap(), 1);
     }
 
     #[test]
