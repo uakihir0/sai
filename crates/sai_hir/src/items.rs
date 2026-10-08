@@ -1,4 +1,4 @@
-use crate::body::{Body, BodyParam, FnSig};
+use crate::body::{Body, FnParam, FnSig};
 use crate::item_tree::RawAttr;
 use crate::types::{Bound, EffectRef, Generics, LangItem, Name, Path, Ty};
 use crate::{HirId, LocalDefId, OwnerId, Safety, Span, Symbol, Visibility};
@@ -126,7 +126,7 @@ pub enum ItemKind<'hir> {
     },
     Property {
         name: &'hir str,
-        params: &'hir [BodyParam],
+        params: &'hir [FnParam<'hir>],
     },
 }
 

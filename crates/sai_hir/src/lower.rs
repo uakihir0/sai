@@ -500,6 +500,135 @@ pub fn lower_test_owner<'hir>(
     ))
 }
 
+/// Lower one top-level property declaration from the current item tree.
+///
+/// Property parameters retain their declared types in `ItemKind::Property`
+/// and receive corresponding body bindings. The property body and parameter
+/// types are preflighted before HIR allocation; nested closure and async-block
+/// paths are prepared over the whole declaration.
+pub fn lower_property_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Property, context)?;
+    let declaration =
+        ast::PropertyDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+
+    let name_token = declaration
+        .name()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let name_value = name_token.value().into_owned();
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::Property(std::sync::Arc::<str>::from(name_value.as_str())),
+        context,
+    )?;
+    let params = declaration
+        .params()
+        .map(|list| {
+            list.params()
+                .map(FunctionParamSyntax::Param)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for param in &params {
+        if let Some(ty) = param.ty() {
+            ensure_supported_type(&ty)?;
+        }
+    }
+    if let Some(body) = declaration.body() {
+        ensure_supported_block(&body)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name_sym = context.symbols.intern(&name_value)?;
+    if name_sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let token = name_token.syntax();
+    let parent_span = source_map.span_for(token.parent(), SpanCtxt::Root)?;
+    let name_span = Span {
+        range: token.text_range(),
+        ..parent_span
+    };
+    let name = Name {
+        sym: name_sym,
+        span: name_span,
+    };
+    prepare_nested_definition_ids(declaration.syntax(), &mut source_map)?;
+
+    let mut lowered_params = Vec::with_capacity(params.len());
+    let mut pending_body_params = Vec::with_capacity(params.len());
+    for param in params {
+        let (lowered, body_param) =
+            lower_function_param(param, context.arena, context.symbols, &mut source_map)?;
+        lowered_params.push(lowered);
+        pending_body_params.push(body_param);
+    }
+    let body_params = pending_body_params
+        .into_iter()
+        .map(|pending| lower_body_param(pending, &mut source_map))
+        .collect::<Result<Vec<_>, _>>()?;
+    let value = match declaration.body() {
+        Some(body) => lower_block_as_expr(
+            declaration.syntax(),
+            &body,
+            context.arena,
+            context.symbols,
+            &mut source_map,
+        )?,
+        None => {
+            let error_syntax = direct_error_child_from_end(declaration.syntax())
+                .unwrap_or_else(|| declaration.syntax().clone());
+            lower_error_expr(&error_syntax, context.arena, &mut source_map)?
+        }
+    };
+    let body = context.arena.alloc_body(Body {
+        owner,
+        params: context.arena.alloc_body_params(&body_params),
+        value,
+        contracts: &[],
+        invariant_preds: &[],
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Property {
+            name: context.arena.alloc_str(&name_value),
+            params: context.arena.alloc_fn_params(&lowered_params),
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: Some(body),
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level effect declaration from the current item tree.
 ///
 /// An omitted or parser-diagnosed malformed `covers` set recovers as empty:
@@ -15528,6 +15657,284 @@ mod tests {
             declaration.syntax().text_range()
         );
         assert_eq!(item.span.range, declaration.syntax().text_range());
+    }
+
+    #[test]
+    fn lowers_item_tree_property_into_typed_hir_owner() {
+        let file = crate::FileId::new(249);
+        let source = "@deprecated(\"old property\")\nproperty \"line\\npositive\" (var x: I32, _: Bool) { x >= 0 }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("property item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Property);
+        let decoded_name = "line\npositive";
+        let name = symbols.intern(decoded_name).expect("symbol interns");
+        let (_packages, paths, owner) = owner_context_with_data(
+            &symbols,
+            DefPathData::Property(std::sync::Arc::<str>::from(decoded_name)),
+        );
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_property_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("property item lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level property is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.name.sym, name);
+        assert_eq!(
+            symbols.resolve(item.name.sym).unwrap().as_ref(),
+            decoded_name
+        );
+        let ItemKind::Property {
+            name: hir_name,
+            params,
+        } = item.kind
+        else {
+            panic!("property item retains its property kind");
+        };
+        assert_eq!(hir_name, decoded_name);
+        assert_eq!(params.len(), 2);
+        assert!(params[0].mutable);
+        assert!(!params[0].is_self);
+        assert_eq!(
+            params[0].name.expect("named property param").sym,
+            symbols.intern("x").unwrap()
+        );
+        assert!(matches!(params[0].ty.kind, HirTyKind::Path(_)));
+        assert!(!params[1].mutable);
+        assert!(params[1].name.is_none(), "wildcard parameter has no name");
+        assert!(matches!(params[1].ty.kind, HirTyKind::Path(_)));
+
+        let declaration = parsed
+            .root
+            .descendants()
+            .find_map(ast::PropertyDecl::cast)
+            .expect("property declaration");
+        let name_token = declaration.name().expect("property string name");
+        assert_eq!(item.name.span.range, name_token.syntax().text_range());
+        assert_eq!(item.span.range, declaration.syntax().text_range());
+        let syntax_params = declaration
+            .params()
+            .expect("property has a parameter list")
+            .params()
+            .collect::<Vec<_>>();
+        for (lowered, syntax) in params.iter().zip(&syntax_params) {
+            assert_eq!(
+                source_map
+                    .syntax_for_node(lowered.hir_id)
+                    .expect("declaration parameter has a source-map entry")
+                    .text_range(),
+                syntax.syntax().text_range()
+            );
+            let source_type = syntax.ty().expect("well-formed property parameter type");
+            assert_eq!(
+                source_map
+                    .syntax_for_node(lowered.ty.hir_id)
+                    .expect("property parameter type has a source-map entry")
+                    .text_range(),
+                source_type.syntax().text_range()
+            );
+        }
+        let body = hir_owner.body.expect("property owns a body");
+        assert_eq!(body.owner, owner);
+        assert_eq!(body.params.len(), 2);
+        assert_eq!(body.params[0].name, params[0].name);
+        assert_eq!(body.params[0].mutable, params[0].mutable);
+        assert_ne!(
+            body.params[0].hir_id, params[0].hir_id,
+            "declaration and body parameter records have distinct HIR IDs"
+        );
+        assert_eq!(body.params[1].name, params[1].name);
+        assert_eq!(body.params[1].mutable, params[1].mutable);
+        assert!(body.contracts.is_empty());
+        assert!(body.invariant_preds.is_empty());
+        assert!(matches!(body.value.kind, ExprKind::Block(_)));
+        assert_eq!(
+            source_map
+                .syntax_for_binding(body.params[0].binding)
+                .expect("named body binding has a source-map entry")
+                .text_range(),
+            syntax_params[0]
+                .name()
+                .expect("named source parameter")
+                .syntax()
+                .text_range()
+        );
+        let path = paths
+            .resolve(owner.def_id)
+            .expect("property path resolves")
+            .expect("property path exists");
+        assert!(matches!(
+            path.data().last(),
+            Some(DisambiguatedDefPathData {
+                data: DefPathData::Property(path_name),
+                disambiguator: 0
+            }) if path_name.as_ref() == decoded_name
+        ));
+    }
+
+    #[test]
+    fn property_owner_supports_no_parameters_and_prepares_nested_paths() {
+        let file = crate::FileId::new(250);
+        let source = "property \"zero inputs\" () { [fn() { true }, fn() { false }] }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("property item entry");
+        let (_packages, paths, owner) = owner_context_with_data(
+            &symbols,
+            DefPathData::Property(std::sync::Arc::<str>::from("zero inputs")),
+        );
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_property_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("parameterless property lowers");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level property is represented by an item owner");
+        };
+        let ItemKind::Property { params, .. } = item.kind else {
+            panic!("property item retains its property kind");
+        };
+        assert!(params.is_empty());
+        let body = hir_owner.body.expect("property owns a body");
+        assert!(body.params.is_empty());
+        let ExprKind::Block(block) = body.value.kind else {
+            panic!("property body is a block");
+        };
+        let Some(tail) = block.tail else {
+            panic!("property array is the block tail");
+        };
+        let ExprKind::Array(elements) = tail.kind else {
+            panic!("property tail retains its array");
+        };
+        assert_eq!(elements.len(), 2);
+        for (ordinal, element) in elements.iter().enumerate() {
+            let ExprKind::Closure(closure) = element.kind else {
+                panic!("array element remains a closure");
+            };
+            let closure_path = paths
+                .resolve(closure.def_id)
+                .expect("closure path resolves")
+                .expect("closure path exists");
+            assert_eq!(
+                closure_path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Closure,
+                    disambiguator: ordinal as u32,
+                })
+            );
+        }
+        assert_eq!(paths.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn property_owner_recovers_missing_parameter_type_and_body() {
+        for (file_id, source, expect_missing_type, expect_missing_body) in [
+            (251, "property \"without type\" (value:) {}\n", true, false),
+            (252, "property \"without body\" (value: I32)\n", false, true),
+        ] {
+            let file = crate::FileId::new(file_id);
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert!(!parsed.errors.is_empty(), "{source:?}");
+            let symbols = Interner::new();
+            let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+                .expect("item tree collects the diagnosed property");
+            let entry = item_tree.items.first().expect("property item entry");
+            let decoded_name = if expect_missing_type {
+                "without type"
+            } else {
+                "without body"
+            };
+            let (_packages, paths, owner) = owner_context_with_data(
+                &symbols,
+                DefPathData::Property(std::sync::Arc::<str>::from(decoded_name)),
+            );
+            let expected_path = owner_def_path(&paths, owner);
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &ast_ids,
+                &snapshot,
+                &parsed.root,
+                &arena,
+                &symbols,
+                &paths,
+            );
+
+            let (hir_owner, _) =
+                lower_property_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                    .expect("diagnosed property remains available to later stages");
+            let OwnerNode::Item(item) = hir_owner.node else {
+                panic!("top-level property is represented by an item owner");
+            };
+            let ItemKind::Property { params, .. } = item.kind else {
+                panic!("property item retains its property kind");
+            };
+            assert_eq!(params.len(), 1);
+            if expect_missing_type {
+                assert!(matches!(params[0].ty.kind, HirTyKind::Err));
+            }
+            let body = hir_owner.body.expect("property still owns a body");
+            assert_eq!(body.params.len(), 1);
+            assert_eq!(body.params[0].name, params[0].name);
+            if expect_missing_body {
+                assert!(matches!(body.value.kind, ExprKind::Err));
+            } else {
+                assert!(matches!(body.value.kind, ExprKind::Block(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn property_owner_rejects_a_non_property_definition_path() {
+        let file = crate::FileId::new(253);
+        let source = "property \"path mismatch\" () {}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("property item entry");
+        let (_packages, paths, owner) = owner_context_with_data(
+            &symbols,
+            DefPathData::Test(std::sync::Arc::<str>::from("path mismatch")),
+        );
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        assert!(matches!(
+            lower_property_owner(owner, &expected_path, &item_tree, entry.ast_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "rejected owner path does not allocate nested definitions"
+        );
     }
 
     #[test]
