@@ -8,8 +8,8 @@ use crate::expressions::{
 };
 use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
 use crate::items::{
-    FieldDef, HirOwner, Item, ItemKind, OwnerNode, TraitItem, TraitItemKind, Variant as HirVariant,
-    VariantShape as HirVariantShape,
+    FieldDef, HirOwner, ImplItem, ImplItemKind, Item, ItemKind, OwnerNode, TraitItem,
+    TraitItemKind, Variant as HirVariant, VariantShape as HirVariantShape,
 };
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
@@ -1456,6 +1456,273 @@ pub fn lower_trait_item_owner<'hir>(
                 HirOwner {
                     id: owner,
                     node: OwnerNode::TraitItem(item),
+                    body,
+                    raw_attrs: &item_entry.raw_attrs,
+                    diagnostics,
+                },
+                source_map,
+            ))
+        }
+        _ => Err(HirLoweringError::ItemTreeEntryMismatch),
+    }
+}
+
+/// Lower one associated type definition or function from an impl as a separate owner.
+///
+/// `impl_owner` is the already-lowered enclosing impl, and `impl_item_id`
+/// identifies its ItemTree entry. `item_id` selects a direct associated
+/// declaration from that impl's `ItemList`. The associated item's complete
+/// expected `DefPath` must be nested immediately below the impl owner.
+pub fn lower_impl_item_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    impl_owner: &HirOwner<'hir>,
+    impl_item_id: ast::ErasedAstId,
+    item_id: ast::ErasedAstId,
+    item_tree: &'hir ItemTree,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let OwnerNode::Item(parent_item) = impl_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item.owner_id != impl_owner.id || !matches!(parent_item.kind, ItemKind::Impl { .. }) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let impl_def = impl_owner.id.def_id;
+    let (impl_entry, impl_syntax) =
+        resolve_item_tree_entry(item_tree, impl_item_id, ItemTreeKind::Impl, context)?;
+    let impl_declaration =
+        ast::ImplDecl::cast(impl_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if parent_item.span
+        != (Span {
+            file: item_tree.file,
+            range: impl_declaration.syntax().text_range(),
+            ctxt: SpanCtxt::Root,
+        })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    validate_current_item_metadata(
+        impl_entry,
+        impl_declaration.attrs(),
+        crate::Visibility::Private,
+        context,
+    )?;
+    let header_hash = impl_entry
+        .header_hash
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let impl_disambiguator = impl_entry_disambiguator(item_tree, impl_entry)?;
+    let impl_path = context
+        .def_paths
+        .resolve(impl_def)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    validate_owner_def_path(
+        impl_owner.id,
+        &impl_path,
+        DefPathData::Impl { header_hash },
+        context,
+    )?;
+    if !matches!(
+        impl_path.data().last(),
+        Some(component) if component.disambiguator == impl_disambiguator
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_list = impl_declaration
+        .items()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::ITEM_LIST,
+        ))?;
+    let item_entry = impl_entry
+        .children
+        .iter()
+        .find(|child| {
+            child.ast_id == item_id
+                && matches!(child.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn)
+        })
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let associated_index = impl_entry
+        .children
+        .iter()
+        .filter(|child| matches!(child.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn))
+        .position(|child| child.ast_id == item_id)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let ItemKind::Impl {
+        items: parent_item_owners,
+        ..
+    } = parent_item.kind
+    else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item_owners.get(associated_index) != Some(&owner) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_syntax = context
+        .ast_ids
+        .pointer(item_id)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if !item_list.syntax().children().any(|child| {
+        child.kind() == item_syntax.kind() && child.text_range() == item_syntax.text_range()
+    }) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let expected_component = match item_entry.kind {
+        ItemTreeKind::AssocType => DefPathData::AssocType(item_entry.name),
+        ItemTreeKind::AssocFn => DefPathData::AssocFn(item_entry.name),
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    };
+    match item_entry.kind {
+        ItemTreeKind::AssocType => {
+            let definition = ast::AssocTypeDef::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            validate_current_item_metadata(
+                item_entry,
+                definition.attrs().collect::<Vec<_>>().into_iter(),
+                crate::Visibility::Private,
+                context,
+            )?;
+        }
+        ItemTreeKind::AssocFn => {
+            let function = ast::FnDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            validate_current_item_metadata(
+                item_entry,
+                function.attrs().collect::<Vec<_>>().into_iter(),
+                item_visibility(function.syntax()),
+                context,
+            )?;
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    }
+    validate_owner_def_path(owner, expected_path, expected_component.clone(), context)?;
+    let owner_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    let source_disambiguator = impl_entry
+        .children
+        .iter()
+        .take_while(|child| child.ast_id != item_id)
+        .filter(|child| child.kind == item_entry.kind && child.name == item_entry.name)
+        .count();
+    let source_disambiguator = u32::try_from(source_disambiguator)
+        .map_err(|_| DefPathInternerError::TooManyDefinitions)?;
+    let Some(parent_components) = owner_path.data().get(..impl_path.data().len()) else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_components != impl_path.data()
+        || owner_path.data().len() != impl_path.data().len() + 1
+        || !matches!(
+            owner_path.data().last(),
+            Some(component)
+                if component.data == expected_component
+                    && component.disambiguator == source_disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    match item_entry.kind {
+        ItemTreeKind::AssocType => {
+            let definition = ast::AssocTypeDef::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            if let Some(ty) = definition.ty() {
+                ensure_supported_type(&ty)?;
+            }
+        }
+        ItemTreeKind::AssocFn => {
+            let function = ast::FnDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            ensure_supported_generics(&function)?;
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        &item_syntax,
+    )?
+    .with_def_path_interner(context.def_paths);
+    match item_entry.kind {
+        ItemTreeKind::AssocType => {
+            let definition = ast::AssocTypeDef::cast(item_syntax)
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let name = lower_item_name(
+                definition.name(),
+                definition.syntax(),
+                context.symbols,
+                &source_map,
+            )?;
+            if name.sym != item_entry.name {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            let ty = match definition.ty() {
+                Some(ty) => lower_type_inner(&ty, context.arena, context.symbols, &mut source_map)?,
+                None => lower_error_type(definition.syntax(), context.arena, &mut source_map)?,
+            };
+            let span = source_map.span_for(definition.syntax(), SpanCtxt::Root)?;
+            let item = context.arena.alloc_impl_item(ImplItem {
+                owner_id: owner,
+                impl_def,
+                name,
+                vis: crate::Visibility::Private,
+                kind: ImplItemKind::AssocType { ty },
+                span,
+            });
+            let source_map = source_map.finish();
+            let diagnostics = source_map.diagnostics().to_vec();
+            Ok((
+                HirOwner {
+                    id: owner,
+                    node: OwnerNode::ImplItem(item),
+                    body: None,
+                    raw_attrs: &item_entry.raw_attrs,
+                    diagnostics,
+                },
+                source_map,
+            ))
+        }
+        ItemTreeKind::AssocFn => {
+            let function =
+                ast::FnDecl::cast(item_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let name = lower_item_name(
+                function.name(),
+                function.syntax(),
+                context.symbols,
+                &source_map,
+            )?;
+            if name.sym != item_entry.name {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            let (sig, generics, body) = lower_function_with_generics(
+                &function,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            let span = source_map.span_for(function.syntax(), SpanCtxt::Root)?;
+            let item = context.arena.alloc_impl_item(ImplItem {
+                owner_id: owner,
+                impl_def,
+                name,
+                vis: item_visibility(function.syntax()),
+                kind: ImplItemKind::Fn {
+                    sig,
+                    generics: *generics,
+                    has_body: function.body().is_some(),
+                },
+                span,
+            });
+            let source_map = source_map.finish();
+            let diagnostics = source_map.diagnostics().to_vec();
+            Ok((
+                HirOwner {
+                    id: owner,
+                    node: OwnerNode::ImplItem(item),
                     body,
                     raw_attrs: &item_entry.raw_attrs,
                     diagnostics,
@@ -19300,6 +19567,302 @@ mod tests {
             panic!("impl declaration retains its impl kind");
         };
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn lowers_impl_associated_type_and_function_owners() {
+        let file = crate::FileId::new(288);
+        let source = concat!(
+            "impl Box<I32> {\n",
+            "    type Output = I32\n",
+            "    pub fn identity<T: Clone>(value: T) -> T where T: Copy requires true ensures true { value }\n",
+            "    fn repeated() -> I32 { 1 }\n",
+            "    fn repeated() -> I32 { 2 }\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let impl_entry = item_tree.items.first().expect("impl item entry");
+        assert_eq!(impl_entry.kind, ItemTreeKind::Impl);
+        let header_hash = impl_entry
+            .header_hash
+            .expect("impl entry has a header hash");
+        let (_packages, paths, impl_owner) =
+            owner_context_with_data(&symbols, DefPathData::Impl { header_hash });
+        let impl_path = owner_def_path(&paths, impl_owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (impl_hir_owner, _) = lower_impl_owner(
+            impl_owner,
+            &impl_path,
+            &item_tree,
+            impl_entry.ast_id,
+            &context,
+        )
+        .expect("impl lowers before its associated owners");
+        let OwnerNode::Item(impl_item) = impl_hir_owner.node else {
+            panic!("impl declaration is represented by an item owner");
+        };
+        let ItemKind::Impl {
+            items: associated_owners,
+            ..
+        } = impl_item.kind
+        else {
+            panic!("impl declaration retains its impl item kind");
+        };
+        let associated_entries = impl_entry
+            .children
+            .iter()
+            .filter(|child| matches!(child.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn))
+            .collect::<Vec<_>>();
+        assert_eq!(associated_owners.len(), 4);
+        assert_eq!(associated_entries.len(), associated_owners.len());
+
+        let expected_path_components = [
+            (DefPathData::AssocType(symbols.intern("Output").unwrap()), 0),
+            (DefPathData::AssocFn(symbols.intern("identity").unwrap()), 0),
+            (DefPathData::AssocFn(symbols.intern("repeated").unwrap()), 0),
+            (DefPathData::AssocFn(symbols.intern("repeated").unwrap()), 1),
+        ];
+        for (index, ((owner, entry), (component, disambiguator))) in associated_owners
+            .iter()
+            .zip(associated_entries)
+            .zip(expected_path_components)
+            .enumerate()
+        {
+            let expected_path = owner_def_path(&paths, *owner);
+            assert_eq!(
+                expected_path.data().last(),
+                Some(&crate::DisambiguatedDefPathData {
+                    data: component,
+                    disambiguator,
+                })
+            );
+            let (hir_owner, source_map) = lower_impl_item_owner(
+                *owner,
+                &expected_path,
+                &impl_hir_owner,
+                impl_entry.ast_id,
+                entry.ast_id,
+                &item_tree,
+                &context,
+            )
+            .expect("associated impl item lowers as a separate owner");
+            assert_eq!(hir_owner.id, *owner);
+            assert_eq!(source_map.owner(), *owner);
+            assert!(hir_owner.diagnostics.is_empty());
+            match (index, hir_owner.node) {
+                (0, OwnerNode::ImplItem(item)) => {
+                    assert_eq!(item.impl_def, impl_owner.def_id);
+                    assert_eq!(item.vis, crate::Visibility::Private);
+                    assert_eq!(item.name.sym, symbols.intern("Output").unwrap());
+                    let ImplItemKind::AssocType { ty } = item.kind else {
+                        panic!("associated type definition lowers to its value type");
+                    };
+                    assert!(matches!(ty.kind, HirTyKind::Path(_)));
+                    assert!(source_map.syntax_for_node(ty.hir_id).is_some());
+                    assert!(hir_owner.body.is_none());
+                }
+                (1, OwnerNode::ImplItem(item)) => {
+                    assert_eq!(item.impl_def, impl_owner.def_id);
+                    assert_eq!(item.vis, crate::Visibility::Pub);
+                    assert_eq!(item.name.sym, symbols.intern("identity").unwrap());
+                    let ImplItemKind::Fn {
+                        sig,
+                        generics,
+                        has_body,
+                    } = item.kind
+                    else {
+                        panic!("associated function lowers to its signature");
+                    };
+                    assert!(has_body);
+                    assert_eq!(sig.params.len(), 1);
+                    assert_eq!(sig.requires.len(), 1);
+                    assert_eq!(sig.ensures.len(), 1);
+                    assert_eq!(generics.params.len(), 1);
+                    assert_eq!(generics.where_preds.len(), 1);
+                    assert!(source_map.syntax_for_node(sig.params[0].hir_id).is_some());
+                    let body = hir_owner.body.expect("function body exists");
+                    assert_eq!(body.contracts.len(), 2);
+                }
+                (2 | 3, OwnerNode::ImplItem(item)) => {
+                    assert_eq!(item.impl_def, impl_owner.def_id);
+                    assert_eq!(item.vis, crate::Visibility::Private);
+                    assert_eq!(item.name.sym, symbols.intern("repeated").unwrap());
+                    let ImplItemKind::Fn { has_body, .. } = item.kind else {
+                        panic!("repeated declaration remains a function owner");
+                    };
+                    assert!(has_body);
+                    assert!(hir_owner.body.is_some());
+                }
+                _ => panic!("each associated declaration has an impl-item owner"),
+            }
+        }
+    }
+
+    #[test]
+    fn impl_item_owner_recovers_missing_type_and_function_body() {
+        let file = crate::FileId::new(289);
+        let source = "impl Value {\ntype Output =\nfn missing() -> I32\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(!parsed.errors.is_empty(), "missing syntax is diagnosed");
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects diagnosed impl members");
+        let impl_entry = item_tree.items.first().expect("impl item entry");
+        assert_eq!(impl_entry.children.len(), 2);
+        let header_hash = impl_entry
+            .header_hash
+            .expect("impl entry has a header hash");
+        let (_packages, paths, impl_owner) =
+            owner_context_with_data(&symbols, DefPathData::Impl { header_hash });
+        let impl_path = owner_def_path(&paths, impl_owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (impl_hir_owner, _) = lower_impl_owner(
+            impl_owner,
+            &impl_path,
+            &item_tree,
+            impl_entry.ast_id,
+            &context,
+        )
+        .expect("impl owner preserves diagnosed members");
+        let OwnerNode::Item(impl_item) = impl_hir_owner.node else {
+            panic!("impl declaration is represented by an item owner");
+        };
+        let ItemKind::Impl {
+            items: associated_owners,
+            ..
+        } = impl_item.kind
+        else {
+            panic!("impl declaration retains its impl item kind");
+        };
+        assert_eq!(associated_owners.len(), 2);
+
+        let associated_entries = impl_entry.children.iter().collect::<Vec<_>>();
+        for (owner, entry) in associated_owners.iter().zip(associated_entries) {
+            let expected_path = owner_def_path(&paths, *owner);
+            let (hir_owner, _) = lower_impl_item_owner(
+                *owner,
+                &expected_path,
+                &impl_hir_owner,
+                impl_entry.ast_id,
+                entry.ast_id,
+                &item_tree,
+                &context,
+            )
+            .expect("diagnosed associated item lowers with recovery HIR");
+            match (entry.kind, hir_owner.node) {
+                (ItemTreeKind::AssocType, OwnerNode::ImplItem(item)) => {
+                    let ImplItemKind::AssocType { ty } = item.kind else {
+                        panic!("associated type definition retains its kind");
+                    };
+                    assert!(matches!(ty.kind, HirTyKind::Err));
+                }
+                (ItemTreeKind::AssocFn, OwnerNode::ImplItem(item)) => {
+                    let ImplItemKind::Fn { has_body, .. } = item.kind else {
+                        panic!("associated function retains its kind");
+                    };
+                    assert!(!has_body);
+                    assert!(hir_owner.body.is_none());
+                }
+                _ => panic!("diagnosed member keeps its ItemTree kind"),
+            }
+        }
+    }
+
+    #[test]
+    fn impl_item_owner_rejects_a_same_named_sibling_parent() {
+        let file = crate::FileId::new(290);
+        let source = concat!(
+            "impl Box<I32> {\n",
+            "    type Output = I32\n",
+            "}\n",
+            "impl Box<I32> {\n",
+            "    type Output = U8\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects same-header impls");
+        let impl_entries = item_tree
+            .items
+            .iter()
+            .filter(|entry| entry.kind == ItemTreeKind::Impl)
+            .collect::<Vec<_>>();
+        assert_eq!(impl_entries.len(), 2);
+        let header_hash = impl_entries[0]
+            .header_hash
+            .expect("impl entry has a header hash");
+        assert_eq!(impl_entries[1].header_hash, Some(header_hash));
+        let (packages, paths, seed_owner) =
+            owner_context_with_data(&symbols, DefPathData::Impl { header_hash });
+        let package = owner_def_path(&paths, seed_owner).package();
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let mut parent_owners = Vec::new();
+        for (disambiguator, entry) in impl_entries.iter().enumerate() {
+            let expected_path = DefPath::new(
+                package,
+                vec![crate::DisambiguatedDefPathData {
+                    data: DefPathData::Impl { header_hash },
+                    disambiguator: u32::try_from(disambiguator).unwrap(),
+                }],
+                &packages,
+                &symbols,
+            )
+            .expect("impl path is valid");
+            let owner = OwnerId {
+                def_id: paths
+                    .intern(expected_path.clone())
+                    .expect("impl path interns"),
+            };
+            let (hir_owner, _) =
+                lower_impl_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                    .expect("each same-header impl gets its own owner");
+            parent_owners.push((owner, expected_path, hir_owner));
+        }
+
+        let second_entry = impl_entries[1];
+        let second_item_entry = second_entry
+            .children
+            .first()
+            .expect("second impl has an associated type");
+        let second_item_owner = match parent_owners[1].2.node {
+            OwnerNode::Item(item) => match item.kind {
+                ItemKind::Impl { items, .. } => items[0],
+                _ => panic!("parent retains impl item kind"),
+            },
+            _ => panic!("parent impl is represented by an item owner"),
+        };
+        let second_item_path = owner_def_path(&paths, second_item_owner);
+        let path_count = paths.len().unwrap();
+        assert!(matches!(
+            lower_impl_item_owner(
+                second_item_owner,
+                &second_item_path,
+                &parent_owners[0].2,
+                second_entry.ast_id,
+                second_item_entry.ast_id,
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            path_count,
+            "rejecting a sibling parent must not mutate the DefPath interner"
+        );
     }
 
     #[test]
