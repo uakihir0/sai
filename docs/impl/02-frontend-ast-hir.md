@@ -51,7 +51,7 @@ The architecture and the query system are owned by [01-architecture.md](01-archi
 ### 2.2.1 Files and decoding
 
 ```rust
-pub struct FileId(u32);                 // interned (package, relative path); assigned by impl/01
+pub struct FileId(u32);                 // interned (package key, package-relative path); assigned by impl/01
 
 pub struct SourceFile {
     pub id: FileId,

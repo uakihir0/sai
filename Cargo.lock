@@ -121,6 +121,7 @@ dependencies = [
 name = "sai_vfs"
 version = "0.1.0"
 dependencies = [
+ "sai_intern",
  "sai_query",
  "sai_stable_hash",
 ]

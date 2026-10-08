@@ -5,5 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sai_intern = { path = "../sai_intern" }
 sai_query = { path = "../sai_query" }
 sai_stable_hash = { path = "../sai_stable_hash" }

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use sai_intern::{PackageId, PackageIdError, PackageInterner};
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_stable_hash::{StableHash, StableHasher};
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,9 +25,10 @@ impl FileId {
 
 /// A session-independent file identity used as a stable query key.
 ///
-/// The package key and canonical source path are explicit. The document
-/// version and `FileId` are deliberately excluded: versions describe
-/// snapshots, and `FileId` is assigned within one compiler session.
+/// The package key and canonical package-relative path are explicit; `<stdin>`
+/// is retained as a special path for standard input. The document version and
+/// `FileId` are deliberately excluded: versions describe snapshots, and
+/// `FileId` is assigned within one compiler session.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileKey {
     package_key: String,
@@ -36,17 +38,18 @@ pub struct FileKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileKeyError {
     InvalidPackageKey,
-    InvalidSourcePath,
+    InvalidPath,
     PackageIdentityMismatch,
 }
 
 impl FileKey {
-    /// Constructs a stable identity from a package key and a source path.
+    /// Constructs a stable file identity from a package key and package-relative path.
     ///
-    /// Dependency source references are checked against the package key's
-    /// compatibility line, then reduced to their package-relative path.
-    /// For workspace files, `path` must already be relative to the owning
-    /// package; a `SnapshotFile::path` may instead be relative to the workspace.
+    /// A diagnostic dependency reference is checked against the package
+    /// key's compatibility line, then reduced to its package-relative path.
+    /// The `<stdin>` sentinel is also accepted for standard input.
+    /// For source files, callers with typed source-directory and source paths
+    /// should use [`Self::from_source_path`].
     pub fn new(
         package_key: impl Into<String>,
         path: impl Into<String>,
@@ -57,20 +60,41 @@ impl FileKey {
             return Err(FileKeyError::InvalidPackageKey);
         }
         if !is_canonical_source_path(&path) {
-            return Err(FileKeyError::InvalidSourcePath);
+            return Err(FileKeyError::InvalidPath);
         }
-        let path = if let Some(dependency) = path.strip_prefix("dep:") {
-            let Some((release_identity, source_path)) = dependency.split_once('/') else {
-                return Err(FileKeyError::InvalidSourcePath);
-            };
-            if !package_key_matches_release(&package_key, release_identity) {
-                return Err(FileKeyError::PackageIdentityMismatch);
-            }
-            source_path.to_owned()
-        } else {
-            path
-        };
+        let path = normalize_dependency_source_path(&package_key, path)?;
         Ok(Self { package_key, path })
+    }
+
+    /// Constructs a stable source-file identity from its source directory and relative path.
+    pub fn from_source_path(
+        package_key: impl Into<String>,
+        source_directory: PackageSourceDirectory,
+        path: PackageSourcePath,
+    ) -> Result<Self, FileKeyError> {
+        let package_relative_path = if source_directory.as_str() == "." {
+            path.as_str().to_owned()
+        } else {
+            format!("{}/{}", source_directory.as_str(), path.as_str())
+        };
+        let package_relative_path = PackageRelativePath::new(package_relative_path)
+            .map_err(|_| FileKeyError::InvalidPath)?;
+        Self::from_package_path(package_key, package_relative_path)
+    }
+
+    /// Constructs a stable package-file identity from a typed package-relative path.
+    pub fn from_package_path(
+        package_key: impl Into<String>,
+        path: PackageRelativePath,
+    ) -> Result<Self, FileKeyError> {
+        let package_key = package_key.into();
+        if !is_stable_package_key(&package_key) {
+            return Err(FileKeyError::InvalidPackageKey);
+        }
+        Ok(Self {
+            package_key,
+            path: path.as_str().to_owned(),
+        })
     }
 
     pub fn path(&self) -> &str {
@@ -103,6 +127,8 @@ pub struct FileInterner {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileInternerError {
+    Package(PackageIdError),
+    FileKey(FileKeyError),
     TooManyFiles,
 }
 
@@ -122,6 +148,44 @@ impl FileInterner {
         self.keys.push(key.clone());
         self.by_key.insert(key, file_id);
         Ok(file_id)
+    }
+
+    /// Interns a source file using its package's configured source directory.
+    ///
+    /// `package_id` must belong to `packages`. The source-directory and
+    /// source-relative paths are combined into the package-relative stable key.
+    pub fn intern_source_file(
+        &mut self,
+        packages: &PackageInterner,
+        package_id: PackageId,
+        source_directory: PackageSourceDirectory,
+        source_relative_path: PackageSourcePath,
+    ) -> Result<FileId, FileInternerError> {
+        let package_key = packages
+            .resolve(package_id)
+            .map_err(FileInternerError::Package)?;
+        let key =
+            FileKey::from_source_path(package_key.as_ref(), source_directory, source_relative_path)
+                .map_err(FileInternerError::FileKey)?;
+        self.intern(key)
+    }
+
+    /// Interns a package-root-relative path, such as `sai.package` or a WIT file.
+    ///
+    /// `package_id` must belong to `packages`. Source files use
+    /// [`Self::intern_source_file`] instead.
+    pub fn intern_package_file(
+        &mut self,
+        packages: &PackageInterner,
+        package_id: PackageId,
+        package_relative_path: PackageRelativePath,
+    ) -> Result<FileId, FileInternerError> {
+        let package_key = packages
+            .resolve(package_id)
+            .map_err(FileInternerError::Package)?;
+        let key = FileKey::from_package_path(package_key.as_ref(), package_relative_path)
+            .map_err(FileInternerError::FileKey)?;
+        self.intern(key)
     }
 
     /// Resolves a session ID to its stable file key, if it belongs to this interner.
@@ -172,6 +236,10 @@ impl StableHash for PackageKey {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PackageRelativePath(String);
 
+/// The package's configured source directory, relative to its root.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageSourceDirectory(String);
+
 /// A canonical path relative to a package's configured source directory.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PackageSourcePath(String);
@@ -182,9 +250,25 @@ pub enum PackagePathError {
 }
 
 impl PackageRelativePath {
+    /// Validates a package-root-relative path, not a diagnostic `dep:` reference.
     pub fn new(path: impl Into<String>) -> Result<Self, PackagePathError> {
         let path = path.into();
-        if !is_canonical_relative_path(&path) {
+        if path.starts_with("dep:") || !is_canonical_relative_path(&path) {
+            return Err(PackagePathError::InvalidRelativePath);
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PackageSourceDirectory {
+    /// Validates the configured source directory; `.` denotes the package root.
+    pub fn new(path: impl Into<String>) -> Result<Self, PackagePathError> {
+        let path = path.into();
+        if path != "." && (path.starts_with("dep:") || !is_canonical_relative_path(&path)) {
             return Err(PackagePathError::InvalidRelativePath);
         }
         Ok(Self(path))
@@ -196,9 +280,10 @@ impl PackageRelativePath {
 }
 
 impl PackageSourcePath {
+    /// Validates a source-directory-relative path, not a diagnostic `dep:` reference.
     pub fn new(path: impl Into<String>) -> Result<Self, PackagePathError> {
         let path = path.into();
-        if !is_canonical_relative_path(&path) {
+        if path.starts_with("dep:") || !is_canonical_relative_path(&path) {
             return Err(PackagePathError::InvalidRelativePath);
         }
         Ok(Self(path))
@@ -1975,8 +2060,25 @@ fn is_canonical_source_path(path: &str) -> bool {
     is_canonical_relative_path(relative_path)
 }
 
+fn normalize_dependency_source_path(
+    package_key: &str,
+    path: String,
+) -> Result<String, FileKeyError> {
+    let Some(dependency) = path.strip_prefix("dep:") else {
+        return Ok(path);
+    };
+    let Some((release_identity, source_path)) = dependency.split_once('/') else {
+        return Err(FileKeyError::InvalidPath);
+    };
+    if !package_key_matches_release(package_key, release_identity) {
+        return Err(FileKeyError::PackageIdentityMismatch);
+    }
+    Ok(source_path.to_owned())
+}
+
 fn is_canonical_relative_path(path: &str) -> bool {
     if path.is_empty()
+        || path == "<stdin>"
         || path.starts_with('/')
         || is_windows_drive_path(path)
         || path.contains('\\')
@@ -2600,11 +2702,21 @@ mod tests {
     fn file_keys_and_fingerprints_use_explicit_stable_identity() {
         let first = FileKey::new("acme:app#0.1", "src/lib.sai").expect("file key is valid");
         let second = FileKey::new("acme:app#0.1", "src/lib.sai").expect("file key is valid");
+        let package_relative = FileKey::from_package_path(
+            "acme:app#0.1",
+            PackageRelativePath::new("src/lib.sai").expect("package-relative path is valid"),
+        )
+        .expect("package file key is valid");
 
         assert_eq!(first, second);
+        assert_eq!(first, package_relative);
         assert_eq!(
             sai_stable_hash::fingerprint(&first),
             sai_stable_hash::fingerprint(&second)
+        );
+        assert_eq!(
+            sai_stable_hash::fingerprint(&first),
+            sai_stable_hash::fingerprint(&package_relative)
         );
     }
 
@@ -2667,10 +2779,156 @@ mod tests {
     }
 
     #[test]
+    fn file_interner_resolves_package_ids_and_normalizes_source_paths() {
+        let packages = PackageInterner::new();
+        let package_id = packages
+            .intern("acme:app#0.1")
+            .expect("package key is interned");
+        let other_package_id = packages
+            .intern("acme:other#0.1")
+            .expect("second package key is interned");
+        let mut files = FileInterner::new();
+
+        let file_id = files
+            .intern_source_file(
+                &packages,
+                package_id,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                PackageSourcePath::new("lib.sai").expect("source-relative path is valid"),
+            )
+            .expect("source-relative file path is interned");
+        assert_eq!(
+            files.file_key(file_id),
+            Some(
+                &FileKey::from_source_path(
+                    "acme:app#0.1",
+                    PackageSourceDirectory::new("src").expect("source directory is valid"),
+                    PackageSourcePath::new("lib.sai").expect("source-relative path is valid"),
+                )
+                .expect("key is valid")
+            )
+        );
+        assert_eq!(
+            files.file_key(file_id),
+            Some(
+                &FileKey::new("acme:app#0.1", "dep:acme:app@0.1.9/src/lib.sai")
+                    .expect("dependency reference resolves to the same stable key")
+            )
+        );
+
+        let manifest_id = files
+            .intern_package_file(
+                &packages,
+                package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("package-relative manifest path is interned");
+        assert_eq!(
+            files.file_key(manifest_id),
+            Some(
+                &FileKey::from_package_path(
+                    "acme:app#0.1",
+                    PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+                )
+                .expect("key is valid")
+            )
+        );
+
+        let same_physical_file = files
+            .intern_package_file(
+                &packages,
+                package_id,
+                PackageRelativePath::new("src/lib.sai").expect("package-relative path is valid"),
+            )
+            .expect("source path is normalized to package-relative identity");
+        assert_eq!(file_id, same_physical_file);
+
+        let different_physical_file = files
+            .intern_package_file(
+                &packages,
+                package_id,
+                PackageRelativePath::new("lib.sai").expect("package-relative path is valid"),
+            )
+            .expect("package-root path is interned");
+        assert_ne!(file_id, different_physical_file);
+
+        let wit_id = files
+            .intern_package_file(
+                &packages,
+                package_id,
+                PackageRelativePath::new("wit/app.wit").expect("WIT path is valid"),
+            )
+            .expect("package-relative WIT path is interned");
+        assert_ne!(file_id, wit_id);
+
+        let other_file_id = files
+            .intern_source_file(
+                &packages,
+                other_package_id,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                PackageSourcePath::new("lib.sai").expect("source-relative path is valid"),
+            )
+            .expect("same path in another package remains distinct");
+        assert_ne!(file_id, other_file_id);
+        let package_root_source_id = files
+            .intern_source_file(
+                &packages,
+                package_id,
+                PackageSourceDirectory::new(".").expect("package root is a valid source dir"),
+                PackageSourcePath::new("root.sai").expect("source-relative path is valid"),
+            )
+            .expect("package-root source file is interned");
+        assert_eq!(
+            files.file_key(package_root_source_id).map(FileKey::path),
+            Some("root.sai")
+        );
+        assert_eq!(
+            PackageSourcePath::new("src/../lib.sai"),
+            Err(PackagePathError::InvalidRelativePath)
+        );
+        assert_eq!(
+            PackageSourcePath::new("dep:acme:app@0.1.9/lib.sai"),
+            Err(PackagePathError::InvalidRelativePath)
+        );
+        assert_eq!(
+            PackageRelativePath::new("<stdin>"),
+            Err(PackagePathError::InvalidRelativePath)
+        );
+        assert_eq!(
+            PackageSourcePath::new("<stdin>"),
+            Err(PackagePathError::InvalidRelativePath)
+        );
+        assert_eq!(
+            PackageSourceDirectory::new("<stdin>"),
+            Err(PackagePathError::InvalidRelativePath)
+        );
+
+        let foreign_packages = PackageInterner::new();
+        let foreign_package_id = foreign_packages
+            .intern("acme:app#0.1")
+            .expect("foreign session package is interned");
+        assert_eq!(
+            files.intern_source_file(
+                &packages,
+                foreign_package_id,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                PackageSourcePath::new("lib.sai").expect("source-relative path is valid"),
+            ),
+            Err(FileInternerError::Package(PackageIdError::UnknownPackage))
+        );
+    }
+
+    #[test]
     fn file_keys_require_explicit_canonical_package_and_path_identity() {
         assert_eq!(
+            FileKey::new("acme:app#0.1", "<stdin>")
+                .expect("standard input sentinel is a valid stable key")
+                .path(),
+            "<stdin>"
+        );
+        assert_eq!(
             FileKey::new("acme:app#0.1", "src/../lib.sai"),
-            Err(FileKeyError::InvalidSourcePath)
+            Err(FileKeyError::InvalidPath)
         );
         assert_eq!(
             FileKey::new("acme:app#0.1", "dep:acme:other@0.1.0/src/lib.sai"),
@@ -3250,7 +3508,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_member_file_keys_use_package_relative_paths() {
+    fn workspace_member_file_keys_use_package_relative_identity_paths() {
         let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
             Arc::new(SourceFile::new(FileId::new(1), "x", false).expect("small source file")),
             "members/widget/src/lib.sai",
@@ -3259,8 +3517,12 @@ mod tests {
         )])
         .expect("workspace snapshot is valid");
         let package_file = snapshot.iter().next().expect("snapshot contains a file");
-        let file_key =
-            FileKey::new("acme:widget#1", "src/lib.sai").expect("package-relative key is valid");
+        let file_key = FileKey::from_source_path(
+            "acme:widget#1",
+            PackageSourceDirectory::new("src").expect("source directory is valid"),
+            PackageSourcePath::new("lib.sai").expect("source-relative path is valid"),
+        )
+        .expect("stable source key is valid");
 
         assert_eq!(package_file.path(), "members/widget/src/lib.sai");
         assert_eq!(file_key.path(), "src/lib.sai");
