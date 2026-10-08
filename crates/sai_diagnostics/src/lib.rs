@@ -3,6 +3,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+mod lint_levels;
+pub use lint_levels::{
+    LintPolicies, LintResolution, LintResolutionContext, LintResolutionError, ManifestLintLevel,
+    OverrideLintLevel, ScopedLintLevel, apply_deny_warnings, resolve_lint_occurrence,
+};
+
 pub use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot, WorkspaceSnapshotId};
 
 macro_rules! define_codes {

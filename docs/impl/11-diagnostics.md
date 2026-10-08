@@ -143,6 +143,10 @@ Every emitted lint diagnostic records how its severity was reached in the field 
 
 The human renderer prints a note for every source other than `default`, for example `= note: `UNUSED_VARIABLE` is denied by `@deny(UNUSED_VARIABLE)` at src/lib.sai:3:1`. Hard diagnostics have `level: null`.
 
+**Current implementation slice.** `sai_diagnostics::resolve_lint_occurrence` resolves a registered lint from prevalidated CLI and manifest overrides, source-ordered attribute scopes, the occurrence package's local policy, and the root package's graph-wide `deny duplicate_lines` policy. It selects the innermost applicable attribute by the smallest containing syntax range in the same file, applies policy > attribute > CLI > manifest > default, suppresses `allow`, applies the dependency cap, and then applies `--deny-warnings`. Its result contains the emitted severity and `LevelInfo`, or reports that the code is hard or unknown. `apply_deny_warnings` also handles hard warnings; callers leave their `level` field null. `LevelInfo.value` remains the resolved lint level when `--deny-warnings` raises a warning, while its source becomes `deny_warnings` and its location becomes null.
+
+The API deliberately accepts resolved package membership and policy settings. Manifest and CLI parsing, construction of full attribute syntax ranges from HIR owners, diagnostic-pipeline integration, and the `lint_levels(OwnerId)` query remain follow-up work because this workspace has no package loader, command driver, or query engine.
+
 ---
 
 ## 11.4 Data model
