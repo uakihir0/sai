@@ -698,6 +698,35 @@ impl DefPathInterner {
         self.intern_paths(paths)
     }
 
+    /// Intern a source-ordered batch of definition components below one owner.
+    ///
+    /// The caller supplies the disambiguator for each component. The complete
+    /// batch is validated before any path is added to the interner.
+    pub fn intern_children(
+        &self,
+        parent: LocalDefId,
+        children: &[(DefPathData, u32)],
+    ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        let parent_path = self
+            .resolve(parent)?
+            .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+        let paths = children
+            .iter()
+            .map(|(component, disambiguator)| {
+                let mut path = parent_path.clone();
+                path.data.push(DisambiguatedDefPathData {
+                    data: component.clone(),
+                    disambiguator: *disambiguator,
+                });
+                path
+            })
+            .collect();
+        self.intern_paths(paths)
+    }
+
     /// Intern a type or const generic parameter below its declaring definition.
     ///
     /// The disambiguator is the ordinal among siblings with the same parameter
@@ -1500,6 +1529,85 @@ mod tests {
             paths.len(),
             Ok(5),
             "failed associated item batches leave the interner unchanged"
+        );
+    }
+
+    #[test]
+    fn definition_path_interner_batches_mixed_child_paths_atomically() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let interface = symbols.intern("api").unwrap();
+        let shared_name = symbols.intern("Item").unwrap();
+        let function = symbols.intern("read").unwrap();
+        let parent = paths
+            .intern(
+                DefPath::new(
+                    package,
+                    vec![DisambiguatedDefPathData {
+                        data: DefPathData::Interface(interface),
+                        disambiguator: 0,
+                    }],
+                    &packages,
+                    &symbols,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let children = paths
+            .intern_children(
+                parent,
+                &[
+                    (DefPathData::TypeNs(shared_name), 0),
+                    (DefPathData::ValueNs(shared_name), 0),
+                    (DefPathData::ValueNs(function), 0),
+                    (DefPathData::ValueNs(function), 1),
+                ],
+            )
+            .expect("mixed child definitions intern as one batch");
+        assert_eq!(children.len(), 4);
+        for (index, component) in [
+            DefPathData::TypeNs(shared_name),
+            DefPathData::ValueNs(shared_name),
+            DefPathData::ValueNs(function),
+            DefPathData::ValueNs(function),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = paths
+                .resolve(children[index])
+                .expect("child path resolves")
+                .expect("child path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: component,
+                    disambiguator: u32::from(index == 3),
+                })
+            );
+        }
+        assert!(paths.intern_children(parent, &[]).unwrap().is_empty());
+        assert_eq!(paths.len(), Ok(5));
+
+        let foreign_symbols = Interner::new();
+        let foreign_name = foreign_symbols.intern("Foreign").unwrap();
+        assert_eq!(
+            paths.intern_children(
+                parent,
+                &[
+                    (DefPathData::TypeNs(shared_name), 1),
+                    (DefPathData::ValueNs(foreign_name), 0),
+                ],
+            ),
+            Err(DefPathInternerError::InternerSessionMismatch)
+        );
+        assert_eq!(
+            paths.len(),
+            Ok(5),
+            "failed mixed child batches leave the interner unchanged"
         );
     }
 
