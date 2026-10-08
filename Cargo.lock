@@ -112,6 +112,7 @@ name = "sai_syntax"
 version = "0.1.0"
 dependencies = [
  "sai_diagnostics",
+ "sai_query",
  "sai_stable_hash",
  "sai_vfs",
  "unicode-general-category",

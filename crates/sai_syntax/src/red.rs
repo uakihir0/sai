@@ -243,6 +243,12 @@ impl SyntaxNode {
         Self::new_root_with_identity(green, RootIdentity::Tree(next_tree_id()))
     }
 
+    /// Creates an ephemeral root for query-local AST traversal. Pointers and
+    /// IDs from this root must not escape the query computation.
+    pub(crate) fn new_root_for_query(green: GreenNode) -> Self {
+        Self::new_root_with_identity(green, RootIdentity::Tree(u64::MAX))
+    }
+
     pub(crate) fn new_root_in_snapshot(
         green: GreenNode,
         file: FileId,

@@ -10,11 +10,16 @@ pub mod ast;
 mod ast_generator_build_support;
 
 use sai_diagnostics::{
-    Applicability, Child, ChildKind, Code, Diagnostic, Fix, FixOperation, FixOperationName,
-    FixOperationPlanner, Location, NodeGroup, NodeId, OperationPlanError, Severity, SourceRef,
-    TextEdit, Value, ValueObject,
+    Applicability, Child, ChildKind, Code, Diagnostic, DiagnosticTemplate, DiagnosticTemplateError,
+    Fix, FixOperation, FixOperationName, FixOperationPlanner, Location, NodeGroup, NodeId,
+    OperationPlanError, Severity, SourceRef, TextEdit, Value, ValueObject,
 };
-use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot};
+use sai_query::{DerivedQuery, QueryDatabase, QueryError};
+use sai_stable_hash::{StableHash, StableHasher};
+use sai_vfs::{
+    FileId, FileInterner, FileKey, SourceFile, Span, TextRange, TextSize, VfsInputs,
+    WorkspaceSnapshot,
+};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
@@ -444,6 +449,71 @@ pub struct Parse {
     pub errors: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParseFix {
+    token_index: u64,
+    decoded_range: TextRange,
+    replacement: String,
+}
+
+/// The snapshot-independent output memoized by the `parse` query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GreenParse {
+    root: GreenNode,
+    diagnostics: Vec<DiagnosticTemplate>,
+    fixes: Vec<ParseFix>,
+}
+
+impl GreenParse {
+    pub fn root(&self) -> &GreenNode {
+        &self.root
+    }
+
+    pub fn diagnostics(&self) -> &[DiagnosticTemplate] {
+        &self.diagnostics
+    }
+}
+
+impl StableHash for ParseFix {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xC4);
+        self.token_index.stable_hash(hasher);
+        stable_hash_text_range(self.decoded_range, hasher);
+        self.replacement.stable_hash(hasher);
+    }
+}
+
+impl StableHash for GreenParse {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xC5);
+        self.root.stable_hash(hasher);
+        self.diagnostics.stable_hash(hasher);
+        self.fixes.stable_hash(hasher);
+    }
+}
+
+fn stable_hash_text_range(range: TextRange, hasher: &mut StableHasher) {
+    hasher.write_tag(0xC6);
+    range.start().raw().stable_hash(hasher);
+    range.end().raw().stable_hash(hasher);
+}
+
+/// An error while binding or retrieving a memoized parse result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseQueryError {
+    Query(QueryError),
+    Parse(ParseError),
+    FileNotInterned,
+    MissingSnapshotFile,
+    SnapshotSourceMismatch,
+}
+
+impl From<QueryError> for ParseQueryError {
+    fn from(error: QueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
 /// An internal failure while producing a snapshot-bound parse result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseError {
@@ -451,6 +521,7 @@ pub enum ParseError {
     Parser(ParserError),
     Tree(TreeBuildError),
     SnapshotBinding(SyntaxRootError),
+    DiagnosticTemplate(DiagnosticTemplateError),
 }
 
 impl LexOutput {
@@ -736,12 +807,19 @@ impl FixOperationPlanner for LexicalFixPlanner<'_> {
 /// text offsets, as required by the frontend and diagnostic contracts.
 pub fn lex(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<LexOutput, LexError> {
     let file = snapshot.file(file_id).ok_or(LexError::MissingFile)?;
-    let source = file.source().as_ref();
     let source_ref = SourceRef {
         path: file.path().to_owned(),
         package: file.package().map(str::to_owned),
         snapshot: file.document_version(),
     };
+    lex_source(file_id, file.source(), source_ref)
+}
+
+fn lex_source(
+    file_id: FileId,
+    source: &SourceFile,
+    source_ref: SourceRef,
+) -> Result<LexOutput, LexError> {
     let mut lexer = Lexer::new(file_id, source, source_ref);
 
     for sequence in source.invalid_utf8_sequences() {
@@ -793,26 +871,45 @@ pub fn parse(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<Parse, Par
     let file = snapshot
         .file(file_id)
         .ok_or(ParseError::Lex(LexError::MissingFile))?;
-    let lexed = lex(snapshot, file_id).map_err(ParseError::Lex)?;
-    let mut parser = Parser::new_for_file(file, &lexed.tokens).map_err(ParseError::Parser)?;
+    let source_ref = source_ref(file);
+    let parsed = parse_green_source(file.source(), file_id, source_ref)?;
+    bind_green_parse(&parsed, snapshot, file_id, file)
+}
+
+fn parse_green_source(
+    source: &SourceFile,
+    file_id: FileId,
+    source_ref: SourceRef,
+) -> Result<GreenParse, ParseError> {
+    let lexed = lex_source(file_id, source, source_ref.clone()).map_err(ParseError::Lex)?;
+    let mut parser = Parser::new_for_source(source, source_ref.clone(), &lexed.tokens)
+        .map_err(ParseError::Parser)?;
     parser.parse_source_file().map_err(ParseError::Parser)?;
     let events = parser.into_events().map_err(ParseError::Parser)?;
     let mut cache = NodeCache::new();
     let tree = build_green_tree(
-        file.source().text(),
+        source.text(),
         &lexed.tokens,
         &lexed.trivia,
         events,
         &mut cache,
     )
     .map_err(ParseError::Tree)?;
-    let root = SyntaxNode::new_root_in_snapshot(tree.root, file_id, snapshot)
-        .map_err(ParseError::SnapshotBinding)?;
+    let root = SyntaxNode::new_root_for_query(tree.root.clone());
 
     let mut errors = lexed.errors;
     errors.extend(tree.errors);
-    report_unknown_attributes(&root, &lexed.tokens, snapshot, file_id, &mut errors)
-        .map_err(ParseError::Lex)?;
+    let mut fixes = Vec::new();
+    report_unknown_attributes(
+        &root,
+        &lexed.tokens,
+        source,
+        source_ref,
+        file_id,
+        &mut errors,
+        &mut fixes,
+    )
+    .map_err(ParseError::Lex)?;
     errors.sort_by(|left, right| {
         let location_key = |diagnostic: &Diagnostic| {
             diagnostic
@@ -825,25 +922,175 @@ pub fn parse(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<Parse, Par
             .then_with(|| left.code.as_str().cmp(right.code.as_str()))
             .then_with(|| left.message.cmp(&right.message))
     });
+    let diagnostics = errors
+        .into_iter()
+        .map(|diagnostic| {
+            diagnostic
+                .to_template()
+                .map_err(ParseError::DiagnosticTemplate)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GreenParse {
+        root: tree.root,
+        diagnostics,
+        fixes,
+    })
+}
+
+fn source_ref(file: &sai_vfs::SnapshotFile) -> SourceRef {
+    SourceRef {
+        path: file.path().to_owned(),
+        package: file.package().map(str::to_owned),
+        snapshot: file.document_version(),
+    }
+}
+
+fn bind_green_parse(
+    parsed: &GreenParse,
+    snapshot: &WorkspaceSnapshot,
+    file_id: FileId,
+    file: &sai_vfs::SnapshotFile,
+) -> Result<Parse, ParseError> {
+    let root = SyntaxNode::new_root_in_snapshot(parsed.root.clone(), file_id, snapshot)
+        .map_err(ParseError::SnapshotBinding)?;
+    let source = file.source();
+    let source_ref = source_ref(file);
+    let mut errors = parsed
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.bind(file_id, source_ref.clone()))
+        .collect::<Vec<_>>();
+
+    for template in &parsed.fixes {
+        let original_range = source
+            .to_original_range(template.decoded_range)
+            .ok_or(ParseError::Lex(LexError::FixPlanningFailed))?;
+        let diagnostic_index = errors
+            .iter()
+            .position(|diagnostic| {
+                diagnostic.code == Code::UnknownAttribute
+                    && diagnostic.primary().is_some_and(|primary| {
+                        primary.span.file == file_id && primary.span.range == original_range
+                    })
+            })
+            .ok_or(ParseError::Lex(LexError::FixPlanningFailed))?;
+        let primary = errors[diagnostic_index]
+            .primary()
+            .cloned()
+            .ok_or(ParseError::Lex(LexError::FixPlanningFailed))?;
+        let operation = FixOperation::new(
+            FixOperationName::ReplaceNode,
+            NodeId::new(NodeGroup::Token, template.token_index),
+            ValueObject::from([(
+                "text".to_owned(),
+                Value::String(template.replacement.clone()),
+            )]),
+        )
+        .map_err(|_| ParseError::Lex(LexError::FixPlanningFailed))?;
+        let planner = LexicalFixPlanner {
+            token_index: template.token_index,
+            decoded_range: template.decoded_range,
+            operation: FixOperationName::ReplaceNode,
+            replacement: &template.replacement,
+        };
+        let fix = Fix::new(
+            format!("replace with `@{}`", template.replacement),
+            Applicability::MachineApplicable,
+            operation,
+            Vec::new(),
+            &primary,
+            snapshot,
+            &planner,
+        )
+        .map_err(|_| ParseError::Lex(LexError::FixPlanningFailed))?;
+        let diagnostic = errors
+            .get_mut(diagnostic_index)
+            .ok_or(ParseError::Lex(LexError::FixPlanningFailed))?;
+        *diagnostic = diagnostic
+            .clone()
+            .with_workspace_snapshot(snapshot)
+            .map_err(|_| ParseError::Lex(LexError::FixPlanningFailed))?;
+        diagnostic
+            .push_fix(fix)
+            .map_err(|_| ParseError::Lex(LexError::FixPlanningFailed))?;
+    }
+
     Ok(Parse { root, errors })
+}
+
+/// Memoized syntax parsing over stable VFS file keys.
+#[derive(Clone)]
+pub struct SyntaxQueries {
+    vfs: VfsInputs,
+    parse_query: DerivedQuery<FileKey, GreenParse>,
+}
+
+impl SyntaxQueries {
+    pub fn new(vfs: VfsInputs) -> Result<Self, QueryError> {
+        let query_vfs = vfs.clone();
+        let parse_query = DerivedQuery::<FileKey, GreenParse>::new(
+            "parse",
+            move |database: &mut QueryDatabase, key| {
+                let source = query_vfs.source_text(database, key.clone(), FileId::new(0))?;
+                let source_ref = SourceRef {
+                    path: key.path().to_owned(),
+                    package: None,
+                    snapshot: None,
+                };
+                Ok(
+                    parse_green_source(source.source(), FileId::new(0), source_ref)
+                        .unwrap_or_else(|error| panic!("parse query invariant failed: {error:?}")),
+                )
+            },
+        )?;
+        Ok(Self { vfs, parse_query })
+    }
+
+    /// Returns the stable green parse value for one VFS file.
+    pub fn green_parse(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<Arc<GreenParse>, QueryError> {
+        self.parse_query.get(database, key)
+    }
+
+    /// Returns the memoized parse result bound to one file in a workspace snapshot.
+    ///
+    /// The session interner must map `file_id` to the same stable key used by
+    /// the query, and its VFS source bytes must match the snapshot file.
+    pub fn parse(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+    ) -> Result<Parse, ParseQueryError> {
+        let key = files
+            .file_key(file_id)
+            .ok_or(ParseQueryError::FileNotInterned)?;
+        let file = snapshot
+            .file(file_id)
+            .ok_or(ParseQueryError::MissingSnapshotFile)?;
+        let source = self.vfs.source_text(database, key.clone(), file_id)?;
+        if source.source().raw_bytes() != file.source().raw_bytes() {
+            return Err(ParseQueryError::SnapshotSourceMismatch);
+        }
+        let parsed = self.parse_query.get(database, key.clone())?;
+        bind_green_parse(parsed.as_ref(), snapshot, file_id, file).map_err(ParseQueryError::Parse)
+    }
 }
 
 fn report_unknown_attributes(
     root: &SyntaxNode,
     tokens: &[Token],
-    snapshot: &WorkspaceSnapshot,
+    source: &SourceFile,
+    source_ref: SourceRef,
     file_id: FileId,
     errors: &mut Vec<Diagnostic>,
+    fixes: &mut Vec<ParseFix>,
 ) -> Result<(), LexError> {
     use ast::AstNode;
-
-    let file = snapshot.file(file_id).ok_or(LexError::MissingFile)?;
-    let source = file.source();
-    let source_ref = SourceRef {
-        path: file.path().to_owned(),
-        package: file.package().map(str::to_owned),
-        snapshot: file.document_version(),
-    };
 
     for attribute in root.descendants().filter_map(ast::Attribute::cast) {
         let Some(name) = attribute.name() else {
@@ -861,7 +1108,7 @@ fn report_unknown_attributes(
         let span = Span::new(file_id, range);
         let location = Location::from_decoded_source(source_ref.clone(), span, source)
             .ok_or(LexError::InvalidSourceSpan)?;
-        let mut diagnostic = Diagnostic::new(
+        let diagnostic = Diagnostic::new(
             Code::UnknownAttribute,
             Severity::Error,
             format!("unknown attribute `@{source_name}`"),
@@ -874,38 +1121,11 @@ fn report_unknown_attributes(
                 .position(|token| token.range == range)
                 .and_then(|index| u64::try_from(index).ok())
                 .ok_or(LexError::FixPlanningFailed)?;
-            let operation = FixOperation::new(
-                FixOperationName::ReplaceNode,
-                NodeId::new(NodeGroup::Token, token_index),
-                ValueObject::from([("text".to_owned(), Value::String(suggestion.to_owned()))]),
-            )
-            .map_err(|_| LexError::FixPlanningFailed)?;
-            let primary = diagnostic
-                .primary()
-                .cloned()
-                .ok_or(LexError::FixPlanningFailed)?;
-            let planner = LexicalFixPlanner {
+            fixes.push(ParseFix {
                 token_index,
                 decoded_range: range,
-                operation: FixOperationName::ReplaceNode,
-                replacement: suggestion,
-            };
-            let fix = Fix::new(
-                format!("replace with `@{suggestion}`"),
-                Applicability::MachineApplicable,
-                operation,
-                Vec::new(),
-                &primary,
-                snapshot,
-                &planner,
-            )
-            .map_err(|_| LexError::FixPlanningFailed)?;
-            diagnostic = diagnostic
-                .with_workspace_snapshot(snapshot)
-                .map_err(|_| LexError::FixPlanningFailed)?;
-            diagnostic
-                .push_fix(fix)
-                .map_err(|_| LexError::FixPlanningFailed)?;
+                replacement: suggestion.to_owned(),
+            });
         }
 
         errors.push(diagnostic);
@@ -4074,7 +4294,8 @@ fn digit_value(byte: u8) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sai_vfs::{SnapshotFile, SourceFile};
+    use sai_query::{Durability, QueryDatabase};
+    use sai_vfs::{FileInterner, FileKey, SnapshotFile, SourceFile};
     use std::sync::Arc;
 
     fn lex_text(text: &str) -> LexOutput {
@@ -4104,6 +4325,141 @@ mod tests {
         .expect("snapshot");
         let parsed = parse(&snapshot, file_id).expect("parse succeeds");
         (snapshot, parsed)
+    }
+
+    fn query_snapshot(
+        file_id: FileId,
+        bytes: &[u8],
+        package: Option<&str>,
+        document_version: Option<u64>,
+    ) -> WorkspaceSnapshot {
+        WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::decode(file_id, bytes).expect("source")),
+            "src/main.sai",
+            package.map(str::to_owned),
+            document_version,
+        )])
+        .expect("snapshot")
+    }
+
+    #[test]
+    fn syntax_parse_query_memoizes_rebinds_and_invalidates_by_source() {
+        let key = FileKey::new("sai:core", "src/main.sai").expect("stable key");
+        let bytes: Arc<[u8]> = Arc::from(&b"\xEF\xBB\xBF@dervie\r\nfn run() {}\r\n"[..]);
+        let vfs = VfsInputs::new().expect("VFS query IDs are available");
+        let mut database = QueryDatabase::new();
+        vfs.set_file_contents(
+            &mut database,
+            key.clone(),
+            Arc::clone(&bytes),
+            Durability::Low,
+        )
+        .expect("source bytes are set");
+        let queries = SyntaxQueries::new(vfs.clone()).expect("syntax query is available");
+
+        let mut first_files = FileInterner::new();
+        let first_id = first_files
+            .intern(key.clone())
+            .expect("stable key is interned");
+        let first_snapshot = query_snapshot(first_id, &bytes, Some("sai:core@1.0.0"), Some(11));
+        let direct = parse(&first_snapshot, first_id).expect("direct parse");
+        let queried = queries
+            .parse(&mut database, &first_files, &first_snapshot, first_id)
+            .expect("query parse");
+        assert_eq!(direct.root.green(), queried.root.green());
+        assert_eq!(direct.errors, queried.errors);
+
+        let memo = queries
+            .green_parse(&mut database, key.clone())
+            .expect("green parse query");
+        let memo_again = queries
+            .green_parse(&mut database, key.clone())
+            .expect("green parse query is memoized");
+        assert!(Arc::ptr_eq(&memo, &memo_again));
+
+        let mut second_files = FileInterner::new();
+        second_files
+            .intern(FileKey::new("sai:core", "src/other.sai").expect("other key"))
+            .expect("other key is interned first");
+        let second_id = second_files
+            .intern(key.clone())
+            .expect("same stable key is interned");
+        assert_ne!(first_id, second_id);
+        let second_snapshot = query_snapshot(second_id, &bytes, Some("sai:core@2.0.0"), Some(22));
+        let rebound = queries
+            .parse(&mut database, &second_files, &second_snapshot, second_id)
+            .expect("memo is rebound to the requesting snapshot");
+        let rebound_diagnostic = rebound
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownAttribute)
+            .expect("unknown attribute diagnostic");
+        let primary = rebound_diagnostic.primary().expect("diagnostic location");
+        assert_eq!(primary.span.file, second_id);
+        assert_eq!(primary.file.path, "src/main.sai");
+        assert_eq!(primary.file.package.as_deref(), Some("sai:core@2.0.0"));
+        assert_eq!(primary.file.snapshot, Some(22));
+        assert_eq!(rebound_diagnostic.fixes().len(), 1);
+        assert_eq!(
+            rebound_diagnostic.fixes()[0].edits()[0].range.range,
+            primary.span.range
+        );
+
+        let changed_bytes: Arc<[u8]> = Arc::from(&b"fn run() {}\n"[..]);
+        vfs.set_file_contents(
+            &mut database,
+            key.clone(),
+            Arc::clone(&changed_bytes),
+            Durability::Low,
+        )
+        .expect("updated source bytes are set");
+        let changed_memo = queries
+            .green_parse(&mut database, key)
+            .expect("changed source is reparsed");
+        assert!(!Arc::ptr_eq(&memo, &changed_memo));
+        assert_ne!(memo.root(), changed_memo.root());
+    }
+
+    #[test]
+    fn syntax_parse_query_rejects_unbound_or_mismatched_snapshot_sources() {
+        let key = FileKey::new("sai:core", "src/main.sai").expect("stable key");
+        let bytes: Arc<[u8]> = Arc::from(&b"fn run() {}\n"[..]);
+        let vfs = VfsInputs::new().expect("VFS query IDs are available");
+        let mut database = QueryDatabase::new();
+        vfs.set_file_contents(
+            &mut database,
+            key.clone(),
+            Arc::clone(&bytes),
+            Durability::Low,
+        )
+        .expect("source bytes are set");
+        let queries = SyntaxQueries::new(vfs).expect("syntax query is available");
+        let mut files = FileInterner::new();
+        let file_id = files.intern(key).expect("stable key is interned");
+
+        let uninterned_files = FileInterner::new();
+        let uninterned_snapshot = query_snapshot(file_id, &bytes, None, None);
+        assert!(matches!(
+            queries.parse(
+                &mut database,
+                &uninterned_files,
+                &uninterned_snapshot,
+                file_id
+            ),
+            Err(ParseQueryError::FileNotInterned)
+        ));
+
+        let mismatched = query_snapshot(file_id, b"fn other() {}\n", None, None);
+        assert!(matches!(
+            queries.parse(&mut database, &files, &mismatched, file_id),
+            Err(ParseQueryError::SnapshotSourceMismatch)
+        ));
+
+        let missing_snapshot = query_snapshot(FileId::new(file_id.raw() + 1), &bytes, None, None);
+        assert!(matches!(
+            queries.parse(&mut database, &files, &missing_snapshot, file_id),
+            Err(ParseQueryError::MissingSnapshotFile)
+        ));
     }
 
     fn kinds(output: &LexOutput) -> Vec<SyntaxKind> {

@@ -215,6 +215,24 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         tokens: &'tokens [Token],
     ) -> Result<Self, ParserError> {
         let source_file = file.source().as_ref();
+        Self::new_for_source(
+            source_file,
+            SourceRef {
+                path: file.path().to_owned(),
+                package: file.package().map(str::to_owned),
+                snapshot: file.document_version(),
+            },
+            tokens,
+        )
+    }
+
+    /// Creates a parser with diagnostics bound to one decoded source and its
+    /// source-reference metadata, without requiring a workspace snapshot.
+    pub fn new_for_source(
+        source_file: &'src SourceFile,
+        source_ref: SourceRef,
+        tokens: &'tokens [Token],
+    ) -> Result<Self, ParserError> {
         let mut parser = Self::new(source_file.text(), tokens)?;
         for (position, token) in tokens.iter().enumerate() {
             if source_file.to_original_range(token.range).is_none() {
@@ -223,11 +241,7 @@ impl<'src, 'tokens> Parser<'src, 'tokens> {
         }
         parser.diagnostic_source = Some(DiagnosticSource {
             file: source_file,
-            source_ref: SourceRef {
-                path: file.path().to_owned(),
-                package: file.package().map(str::to_owned),
-                snapshot: file.document_version(),
-            },
+            source_ref,
         });
         Ok(parser)
     }

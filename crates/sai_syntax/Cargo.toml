@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 sai_diagnostics = { path = "../sai_diagnostics" }
+sai_query = { path = "../sai_query" }
 sai_vfs = { path = "../sai_vfs" }
 sai_stable_hash = { path = "../sai_stable_hash" }
 unicode-general-category.workspace = true
