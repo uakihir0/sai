@@ -787,6 +787,11 @@ world image_service {
 - Both forms provide the interfaces of the package's export world. In source form the calls are linked inside the root's module through Canonical ABI glue, so the choice does not change what the build provides or requires (spec/13 N-D-104).
 - The chosen form is shown in the build metadata (`sai size`, `sai inspect`).
 
+### D-PKG-06 Portable package paths
+
+- Paths written in `sai.package` must retain their meaning on every supported host. In addition to the existing character, relativity, and traversal rules (N-G-20), limit paths to 4096 bytes and components to 255 bytes; reject components ending in `.` or a space (except the whole path `.` and exact `..` dependency components), Windows device-name components (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, including extension suffixes), and ASCII case variants of reserved `.git`, `.sai`, and `out` components where N-G-20 reserves them.
+- Rationale: Windows strips trailing dots and spaces and treats device names as special; common Windows and macOS filesystems compare names without ASCII case distinctions. Explicitly rejecting these ambiguous names keeps package paths stable across supported hosts (P6, P8).
+
 ---
 
 ## 15. Targets and profiles (TGT) — details in `docs/targets/targets-and-profiles.md`

@@ -2,7 +2,7 @@
 
 **Status:** Normative
 **Stage:** 3 (`artifact`, `wit`, and `export world`: Stage 4)
-**Related:** [decisions.md](../design/decisions.md) D-PKG-01..05, D-CAP-01, D-CAP-02, D-TGT-01, D-TGT-02, D-WASM-05; [02-resolver.md](02-resolver.md); [03-lock-file.md](03-lock-file.md); [04-distribution-and-security.md](04-distribution-and-security.md); [spec/02-lexical-structure.md](../spec/02-lexical-structure.md); [spec/04-modules-and-names.md](../spec/04-modules-and-names.md); [spec/08-effects-and-capabilities.md](../spec/08-effects-and-capabilities.md); [spec/13-components-and-wit.md](../spec/13-components-and-wit.md); [spec/15-attributes-and-lints.md](../spec/15-attributes-and-lints.md); [targets/targets-and-profiles.md](../targets/targets-and-profiles.md); [impl/13-cli.md](../impl/13-cli.md)
+**Related:** [decisions.md](../design/decisions.md) D-PKG-01..06, D-CAP-01, D-CAP-02, D-TGT-01, D-TGT-02, D-WASM-05; [02-resolver.md](02-resolver.md); [03-lock-file.md](03-lock-file.md); [04-distribution-and-security.md](04-distribution-and-security.md); [spec/02-lexical-structure.md](../spec/02-lexical-structure.md); [spec/04-modules-and-names.md](../spec/04-modules-and-names.md); [spec/08-effects-and-capabilities.md](../spec/08-effects-and-capabilities.md); [spec/13-components-and-wit.md](../spec/13-components-and-wit.md); [spec/15-attributes-and-lints.md](../spec/15-attributes-and-lints.md); [targets/targets-and-profiles.md](../targets/targets-and-profiles.md); [impl/13-cli.md](../impl/13-cli.md)
 
 This chapter defines the language of the `sai.package` file: its lexical rules, its complete grammar, and the meaning and validation of every declaration. A `sai.package` file is the **package contract**: it states what a package is (identity and version), what it contains (source, WIT, prebuilt artifacts), what it needs (dependencies), where it runs (targets), and what it may do (capability policy). Version selection is defined in [02-resolver.md](02-resolver.md), the lock file in [03-lock-file.md](03-lock-file.md), and fetching, artifacts, and security in [04-distribution-and-security.md](04-distribution-and-security.md). The meaning of capabilities is owned by [spec/08](../spec/08-effects-and-capabilities.md); this chapter owns only their spelling in `sai.package` and the checks that need nothing but manifests.
 
@@ -275,7 +275,10 @@ All paths in `sai.package` (`source`, `wit`, artifact files, `from path`, `use p
 3. A path is non-empty and has no empty components (no `//`, no leading or trailing `/`), and no `.` components. The single path `"."` is allowed and denotes the package directory itself.
 4. `..` components are allowed only in `from path` and `use path` (dependencies outside the package). In `source`, `wit`, and artifact paths, `..` is not allowed: package content MUST lie inside the package directory.
 5. Characters: printable ASCII, excluding `<>:"|?*` (so that the package can be materialized on every supported host).
-6. No component may be `.git`. For `source`, `wit`, and artifact paths, the first component MUST NOT be `.sai` or `out`: those top-level directories hold tool state and build outputs (D-TOOL-03) and are excluded from package checksums ([03-lock-file.md](03-lock-file.md) §3.4).
+6. No component may be `.git`, compared using ASCII case-insensitive matching.
+7. Except for the whole path `"."` and an exact `..` component allowed by rule 4, a component MUST NOT end in `.` or a space. A component whose name before its first `.` suffix, after trimming trailing spaces from that name, is `CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, or `LPT1` through `LPT9` (ASCII case-insensitive) is also forbidden. These names are reserved by Windows even when followed by an extension.
+8. For `source`, `wit`, and artifact paths, the first component MUST NOT be `.sai` or `out`, compared using ASCII case-insensitive matching: those top-level directories hold tool state and build outputs (D-TOOL-03) and are excluded from package checksums ([03-lock-file.md](03-lock-file.md) §3.4).
+9. A component is at most 255 bytes, and the whole path is at most 4096 bytes ([03-lock-file.md](03-lock-file.md) §3.4.3).
 
 ### 1.6.2 `source`
 
@@ -887,7 +890,7 @@ Each entry has a provisional ID. The rationale cites the principles of [decision
 | N-G-17 | Overrides are `use artifact`, `use path`, and `use git`. There are no version overrides. A `use path` override affects only the line of the path package's version. | P8: every selected version satisfies every requirement (D-PKG-02). |
 | N-G-18 | Metadata declarations `description`, `license` (SPDX), `authors`, and `repository` exist and never affect the build; `repository` is never used for fetching. | P6: identity and source are separate from informative locations. |
 | N-G-19 | The only artifact kind is `artifact component`, keyed by component target names. Artifact and hybrid packages require `wit` and `export world`; an artifact package needs an artifact for every target. The WIT package name must equal the package identity. | P4: only typed component boundaries; P2: the artifact can be checked against a declared contract. |
-| N-G-20 | Paths in `sai.package` are relative, `/`-separated, without `.` components; `..` is allowed only for `from path` and `use path`; content paths stay inside the package directory. | P6, P8: portable, host-independent package layout. |
+| N-G-20 | Paths in `sai.package` are relative and `/`-separated; `..` is allowed only for `from path` and `use path`; content paths stay inside the package directory. Paths are limited to 4096 bytes with 255-byte components and reject host-ambiguous trailing dots/spaces and Windows device names; `.git`, `.sai`, and `out` are reserved case-insensitively where applicable. | P6, P8: portable, host-independent package layout. |
 
 ## 1.21 Diagnostics
 

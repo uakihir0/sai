@@ -533,7 +533,7 @@ Defined in package/01, package/02, package/03, package/04.
 | N-G-17 | [package/01](../package/01-package-contract.md) §1.20 | Overrides are `use artifact`, `use path`, and `use git`. |
 | N-G-18 | [package/01](../package/01-package-contract.md) §1.20 | Metadata declarations `description`, `license` (SPDX), `authors`, and `repository` exist and never affect the build; `repository` is never used for fetching. |
 | N-G-19 | [package/01](../package/01-package-contract.md) §1.20 | The only artifact kind is `artifact component`, keyed by component target names. |
-| N-G-20 | [package/01](../package/01-package-contract.md) §1.20 | Paths in `sai.package` are relative, `/`-separated, without `.` components; `..` is allowed only for `from path` and `use path`; content paths stay inside the package directory. |
+| N-G-20 | [package/01](../package/01-package-contract.md) §1.20 | Paths in `sai.package` are relative and `/`-separated; `..` is allowed only for `from path` and `use path`; content paths stay inside the package directory. Paths are limited to 4096 bytes with 255-byte components and reject host-ambiguous trailing dots/spaces and Windows device names; `.git`, `.sai`, and `out` are reserved case-insensitively where applicable. |
 | N-G-21 | [package/02](../package/02-resolver.md) §2.16 | Range checks treat pre-releases by plain SemVer precedence. |
 | N-G-22 | [package/02](../package/02-resolver.md) §2.16 | `^V` denotes exactly the part of `line(V)` at or above `V` (partial versions are completed with zeros); `^0` and `^0.0` are `INVALID_VERSION_REQUIREMENT`. |
 | N-G-23 | [package/02](../package/02-resolver.md) §2.16 | The root's `requires` and `requires test` edges are resolved together; dependencies contribute `requires` only. |
