@@ -93,7 +93,7 @@ The reference implementation is a Rust workspace (D-TOOL-05). Each crate has one
 | `sai_vfs` | file identities, snapshots and overlays (§1.7) | §1.7 | `sai_intern`, `sai_query`, `sai_stable_hash` |
 | `sai_diagnostics` | the `Diagnostic` model, level resolution, ordering, JSON and human rendering | [11](11-diagnostics.md) | `sai_intern`, `sai_vfs` |
 | `sai_syntax` | lexer, parser, CST, AST views, `sai.ungram` and its generated code | [02](02-frontend-ast-hir.md) §2.2–§2.7 | `sai_diagnostics`, `sai_query`, `sai_vfs` |
-| `sai_hir` | item trees, `DefPath`s, HIR and HIR lowering | [02](02-frontend-ast-hir.md) §2.8–§2.10 | `sai_syntax`, `sai_diagnostics` |
+| `sai_hir` | item trees, `DefPath`s, HIR and HIR lowering | [02](02-frontend-ast-hir.md) §2.8–§2.10 | `sai_diagnostics`, `sai_intern`, `sai_query`, `sai_stable_hash`, `sai_syntax`, `sai_vfs` |
 | `sai_wit` | WIT units, WIT loading (`wit-parser`), the WIT model and its printer, the `DefId`s of SAI views | [16](16-interfaces-and-wit.md) §16.1.2, §16.2–§16.4 | `sai_hir`, `sai_package` |
 | `sai_resolve` | module trees, scopes, name resolution, lang items, interface implementations and world references | [03](03-name-resolution-and-type-checking.md) §3.2–§3.4, [16](16-interfaces-and-wit.md) §16.6–§16.8 | `sai_hir`, `sai_package`, `sai_wit` |
 | `sai_ty` | types, signatures, the trait solver, type checking, match checking, constant evaluation, interface and world checks, flags, WIT generation | [03](03-name-resolution-and-type-checking.md), [16](16-interfaces-and-wit.md) | `sai_resolve`, `sai_wit` |

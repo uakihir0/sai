@@ -5,6 +5,7 @@ pub mod attrs;
 pub mod body;
 pub mod expressions;
 pub mod item_tree;
+pub mod item_tree_queries;
 pub mod items;
 pub mod literals;
 pub mod lower;

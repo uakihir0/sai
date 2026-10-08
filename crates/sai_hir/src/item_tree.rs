@@ -269,8 +269,9 @@ pub struct ItemTreeEntry {
 #[derive(Clone, Debug)]
 pub struct ItemTree {
     pub file: FileId,
-    /// Snapshot that supplied the AST pointers; ignored by structural equality.
-    snapshot_id: WorkspaceSnapshotId,
+    /// Snapshot that supplied the AST pointers; absent for query-local trees.
+    /// Ignored by structural equality.
+    snapshot_id: Option<WorkspaceSnapshotId>,
     /// Inner module documentation has a separate syntax role from attributes.
     pub module_docs: Option<ast::AstPtr<ast::Docs>>,
     /// Source text used to compare module documentation across snapshots.
@@ -738,7 +739,8 @@ impl TargetFilterResult {
         if !self.item_tree.matches_ast_ids(ast_ids) || !ast_ids.matches_root(file, root) {
             return Err(LintScopeCollectionError::StaleItemTree);
         }
-        if !ast_ids.matches_snapshot(snapshot) || snapshot.id() != self.item_tree.snapshot_id {
+        if !ast_ids.matches_snapshot(snapshot) || self.item_tree.snapshot_id != Some(snapshot.id())
+        {
             return Err(LintScopeCollectionError::SnapshotMismatch);
         }
 
@@ -921,7 +923,9 @@ pub enum ItemTreeError {
 impl ItemTree {
     /// Whether this item tree was collected from the AST map's exact snapshot.
     pub fn matches_ast_ids(&self, ast_ids: &ast::AstIdMap) -> bool {
-        self.file == ast_ids.file() && ast_ids.snapshot_id() == Some(self.snapshot_id)
+        self.file == ast_ids.file()
+            && self.snapshot_id.is_some()
+            && ast_ids.snapshot_id() == self.snapshot_id
     }
 
     /// Returns the stable semantic shape without snapshot-local source locations.
@@ -944,7 +948,7 @@ impl ItemTree {
         if !green_text_matches_source(root, source) {
             return Err(ItemTreeError::SourceMismatch);
         }
-        let snapshot_id = ast_ids.snapshot_id().ok_or(ItemTreeError::FileMismatch)?;
+        let snapshot_id = ast_ids.snapshot_id();
         let source_file = ast::SourceFile::cast(root.clone()).ok_or(ItemTreeError::FileMismatch)?;
         let mut tree = Self {
             file,
@@ -1114,7 +1118,7 @@ impl ItemTree {
         let current = Self::collect(file, source, root, ast_ids, symbols)
             .map_err(TargetFilterError::ItemTree)?;
         if !ast_ids.matches_snapshot(snapshot)
-            || snapshot.id() != current.snapshot_id
+            || current.snapshot_id != Some(snapshot.id())
             || snapshot
                 .file(file)
                 .is_none_or(|snapshot_file| snapshot_file.source().text() != source)
@@ -1143,7 +1147,7 @@ impl ItemTree {
             return Err(TargetFilterError::StaleItemTree);
         }
         if !ast_ids.matches_snapshot(snapshot)
-            || snapshot.id() != self.snapshot_id
+            || self.snapshot_id != Some(snapshot.id())
             || snapshot
                 .file(self.file)
                 .is_none_or(|file| file.source().text() != source)
