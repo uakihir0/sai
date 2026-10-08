@@ -91,9 +91,18 @@ pub struct PackageLexOutput {
 
 /// Lexes either a package contract or lock file.
 ///
-/// The two formats share tokenization and newline rules. Parsing determines
-/// which contextual keywords and tokens are valid in each format.
+/// The two formats share tokenization. Package contracts and lock files use
+/// their own contextual newline continuation sets.
 pub fn lex(source: &[u8]) -> PackageLexOutput {
+    lex_with_mode(source, LexMode::Package)
+}
+
+/// Lexes a lock file using its field-aware newline continuation set.
+pub(crate) fn lex_lock(source: &[u8]) -> PackageLexOutput {
+    lex_with_mode(source, LexMode::Lock)
+}
+
+fn lex_with_mode(source: &[u8], mode: LexMode) -> PackageLexOutput {
     let text = match std::str::from_utf8(source) {
         Ok(text) => text,
         Err(error) => {
@@ -115,11 +124,18 @@ pub fn lex(source: &[u8]) -> PackageLexOutput {
             };
         }
     };
-    Lexer::new(text).run()
+    Lexer::new(text, mode).run()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LexMode {
+    Package,
+    Lock,
 }
 
 struct Lexer<'a> {
     text: &'a str,
+    mode: LexMode,
     pos: usize,
     tokens: Vec<PackageToken>,
     trivia: Vec<PackageTrivia>,
@@ -129,9 +145,10 @@ struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    fn new(text: &'a str) -> Self {
+    fn new(text: &'a str, mode: LexMode) -> Self {
         Self {
             text,
+            mode,
             pos: 0,
             tokens: Vec::new(),
             trivia: Vec::new(),
@@ -325,7 +342,12 @@ impl<'a> Lexer<'a> {
         let Some(end) = scan_word(self.text, self.pos) else {
             return false;
         };
-        matches!(&self.text[self.pos..end], "from" | "dir" | "only" | "grant")
+        match self.mode {
+            LexMode::Package => {
+                matches!(&self.text[self.pos..end], "from" | "dir" | "only" | "grant")
+            }
+            LexMode::Lock => &self.text[self.pos..end] == "only",
+        }
     }
 
     fn lex_token(&mut self) -> PackageToken {
@@ -937,7 +959,8 @@ fn punctuator_at(text: &str, start: usize) -> Option<(PackagePunctuator, usize)>
 #[cfg(test)]
 mod tests {
     use super::{
-        PackageLexErrorKind as ErrorKind, PackagePunctuator as Punct, PackageTokenKind as Kind, lex,
+        PackageLexErrorKind as ErrorKind, PackagePunctuator as Punct, PackageTokenKind as Kind,
+        lex, lex_lock,
     };
 
     fn token_text(source: &str, kind: Kind, index: usize) -> &str {
@@ -974,6 +997,34 @@ mod tests {
             "acme:json/client_v2"
         );
         assert_eq!(token_text(source, Kind::Version, 4), "1.2.3");
+    }
+
+    #[test]
+    fn lock_newlines_separate_dir_fields_but_continue_only_clauses() {
+        let source = "source git \"https://example.test/repo\"\n\
+                     dir \"packages/lib\"\n\
+                     requires acme:dep @ ^1 -> 1.2.0\n\
+                     only { wasm32-wasi }\n";
+        let output = lex_lock(source.as_bytes());
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let tokens = &output.tokens;
+        let dir = tokens
+            .iter()
+            .position(|token| token.kind == Kind::Word && &source[token.span.clone()] == "dir")
+            .unwrap();
+        assert_eq!(tokens[dir - 1].kind, Kind::Newline);
+        let only = tokens
+            .iter()
+            .position(|token| token.kind == Kind::Word && &source[token.span.clone()] == "only")
+            .unwrap();
+        assert_ne!(tokens[only - 1].kind, Kind::Newline);
+
+        let package_tokens = lex(source.as_bytes()).tokens;
+        let package_dir = package_tokens
+            .iter()
+            .position(|token| token.kind == Kind::Word && &source[token.span.clone()] == "dir")
+            .unwrap();
+        assert_ne!(package_tokens[package_dir - 1].kind, Kind::Newline);
     }
 
     #[test]

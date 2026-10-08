@@ -31,7 +31,7 @@ This chapter defines `sai.lock` byte for byte: its lexical form, its grammar, it
 
 ### 3.2.1 Lexical rules
 
-1. The lock is UTF-8 text tokenized exactly as `sai.package` ([01 §1.2](01-package-contract.md)), including the NEWLINE rules and the continuation set of [01 §1.2.6](01-package-contract.md). The diagnostics of spec/02 apply (`INVALID_UTF8`, `INVALID_LINE_ENDING`, `FORBIDDEN_CHARACTER`, ...).
+1. The lock is UTF-8 text tokenized with the same token kinds and string, comment, and line-ending rules as `sai.package` ([01 §1.2](01-package-contract.md)). Its NEWLINE continuation set is `{ only }`: `only` may continue a requirement field, while `dir` starts a separate lock field and therefore always follows a NEWLINE. The other package-contract continuation words (`from`, `dir`, and `grant`) do not continue a lock line. The diagnostics of spec/02 apply (`INVALID_UTF8`, `INVALID_LINE_ENDING`, `FORBIDDEN_CHARACTER`, ...).
 2. The punctuator `->` occurs only in the lock (§3.3).
 3. The contextual keywords of the lock are: `artifact`, `capabilities`, `checksum`, `commit`, `compiler`, `dir`, `git`, `imports`, `lock`, `only`, `package`, `path`, `requires`, `root`, `source`, `targets`, `test`, `wit`.
 4. Comments are lexically valid in a lock, but the toolchain never writes them, and a lock that contains them is not canonical (§3.2.3).

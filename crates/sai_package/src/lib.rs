@@ -2,6 +2,7 @@
 
 pub mod identity;
 pub mod lexer;
+pub mod lock;
 pub mod manifest;
 pub mod package_path;
 pub mod validation;
