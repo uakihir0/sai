@@ -41,8 +41,8 @@ impl CancellationToken {
         self.0.store(true, Ordering::Release);
     }
 
-    /// Clears a prior cancellation request before starting new work.
-    pub fn reset(&self) {
+    /// Clears a cancellation request after the database has stopped its work.
+    fn reset(&self) {
         self.0.store(false, Ordering::Release);
     }
 
@@ -60,9 +60,12 @@ pub enum QueryError {
     MissingInput { query: String },
     Panicked { query: String, message: String },
     InputMutationDuringQuery { input: String, query: String },
+    CancellationResetDuringQuery { query: String },
     QueryIdExhausted,
+    InternedIdExhausted { query: String },
     RevisionExhausted,
     QueryKindMismatch { query: String },
+    InvalidInternedId { query: String },
 }
 
 impl fmt::Display for QueryError {
@@ -78,13 +81,23 @@ impl fmt::Display for QueryError {
                 formatter,
                 "query `{query}` attempted to change input `{input}`"
             ),
+            Self::CancellationResetDuringQuery { query } => write!(
+                formatter,
+                "query `{query}` attempted to reset cancellation while running"
+            ),
             Self::QueryIdExhausted => formatter.write_str("query ID space is exhausted"),
+            Self::InternedIdExhausted { query } => {
+                write!(formatter, "interned ID space for `{query}` is exhausted")
+            }
             Self::RevisionExhausted => formatter.write_str("query revision space is exhausted"),
             Self::QueryKindMismatch { query } => {
                 write!(
                     formatter,
                     "query `{query}` was used with an incompatible query kind"
                 )
+            }
+            Self::InvalidInternedId { query } => {
+                write!(formatter, "invalid interned ID for query `{query}`")
             }
         }
     }
@@ -101,8 +114,11 @@ pub struct QueryDatabase {
     revision: u64,
     durability_changed_at: [u64; 3],
     memos: HashMap<NodeKey, Vec<Box<dyn Any + Send + Sync>>>,
+    interned: HashMap<QueryId, Box<dyn Any + Send + Sync>>,
     active: Vec<ActiveQuery>,
     cancellation: CancellationToken,
+    poisoned: Option<QueryError>,
+    session: Arc<()>,
 }
 
 impl Default for QueryDatabase {
@@ -117,18 +133,12 @@ impl QueryDatabase {
             revision: 1,
             durability_changed_at: [1; 3],
             memos: HashMap::new(),
+            interned: HashMap::new(),
             active: Vec::new(),
             cancellation: CancellationToken::default(),
+            poisoned: None,
+            session: Arc::new(()),
         }
-    }
-
-    pub const fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// Returns the last revision in which an input of this durability changed.
-    pub fn durability_changed_at(&self, durability: Durability) -> u64 {
-        self.durability_changed_at[durability.index()]
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -136,17 +146,39 @@ impl QueryDatabase {
     }
 
     pub fn check_cancellation(&mut self) -> Result<(), QueryError> {
+        if let Some(error) = &self.poisoned {
+            return Err(error.clone());
+        }
         if self.cancellation.is_cancelled() {
             let error = QueryError::Cancelled;
-            self.record_query_error(&error);
-            Err(error)
+            Err(self.record_query_error(&error))
         } else {
             Ok(())
         }
     }
 
+    /// Clears a cancellation request between queries.
+    pub fn reset_cancellation(&mut self) -> Result<(), QueryError> {
+        if let Some(error) = &self.poisoned {
+            return Err(error.clone());
+        }
+        if let Some(query) = self.active.last() {
+            let error = QueryError::CancellationResetDuringQuery {
+                query: query.name.to_string(),
+            };
+            return Err(self.record_query_error(&error));
+        }
+        self.cancellation.reset();
+        Ok(())
+    }
+
     fn record_dependency(&mut self, dependency: Dependency) {
-        if let Some(active) = self.active.last_mut() {
+        if let Some(active) = self
+            .active
+            .iter_mut()
+            .rev()
+            .find(|active| active.kind == QueryFrameKind::Derived)
+        {
             active.dependencies.push(dependency);
         }
     }
@@ -206,27 +238,62 @@ impl QueryDatabase {
     }
 
     fn ensure_input_mutation_allowed(&mut self, input: &str) -> Result<(), QueryError> {
+        self.check_cancellation()?;
         if let Some(query) = self.active.last() {
             let error = QueryError::InputMutationDuringQuery {
                 input: input.to_owned(),
                 query: query.name.to_string(),
             };
-            self.record_query_error(&error);
-            return Err(error);
+            return Err(self.record_query_error(&error));
         }
         Ok(())
     }
 
-    fn record_query_error(&mut self, error: &QueryError) {
+    fn record_query_error(&mut self, error: &QueryError) -> QueryError {
+        let is_fatal = !matches!(error, QueryError::Cancelled);
+        if is_fatal && self.poisoned.is_none() {
+            self.poisoned = Some(error.clone());
+            self.cancellation.cancel();
+        }
+        let effective_error = self.poisoned.clone().unwrap_or_else(|| error.clone());
         if let Some(active) = self.active.last_mut() {
-            if active.failure.is_none() {
-                active.failure = Some(error.clone());
+            if active.failure.is_none()
+                || (is_fatal
+                    && active
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| matches!(failure, QueryError::Cancelled)))
+            {
+                active.failure = Some(effective_error.clone());
             }
+            active.failure.clone().unwrap_or(effective_error)
+        } else {
+            effective_error
         }
     }
 
     fn active_failure(&self) -> Option<QueryError> {
         self.active.last().and_then(|active| active.failure.clone())
+    }
+
+    fn finish_query_frame<T>(
+        &mut self,
+        failure: Option<QueryError>,
+        result: Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        match (failure, result) {
+            (Some(failure), Ok(_)) => Err(failure),
+            (Some(failure), Err(error)) => {
+                let error = self.record_query_error(&error);
+                if matches!(failure, QueryError::Cancelled) {
+                    Err(error)
+                } else {
+                    Err(self.poisoned.clone().unwrap_or(failure))
+                }
+            }
+            (None, Ok(value)) => Ok(value),
+            (None, Err(error)) => Err(self.record_query_error(&error)),
+        }
     }
 }
 
@@ -277,14 +344,20 @@ where
                 }) if *old == value => return Ok(false),
                 MemoState::Input(_) => {}
                 MemoState::Derived(_) => {
-                    return Err(QueryError::QueryKindMismatch {
+                    let error = QueryError::QueryKindMismatch {
                         query: self.name.to_string(),
-                    });
+                    };
+                    return Err(database.record_query_error(&error));
                 }
             }
         }
 
-        let revision = database.next_revision()?;
+        let revision = match database.next_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Err(database.record_query_error(&error));
+            }
+        };
         let durability = self.durability;
         database.revision = revision;
         for index in 0..=durability.index() {
@@ -312,13 +385,19 @@ where
                 return Ok(false);
             }
             Some(MemoState::Derived(_)) => {
-                return Err(QueryError::QueryKindMismatch {
+                let error = QueryError::QueryKindMismatch {
                     query: self.name.to_string(),
-                });
+                };
+                return Err(database.record_query_error(&error));
             }
         }
 
-        let revision = database.next_revision()?;
+        let revision = match database.next_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Err(database.record_query_error(&error));
+            }
+        };
         let durability = self.durability;
         database.revision = revision;
         for index in 0..=durability.index() {
@@ -341,8 +420,7 @@ where
             let error = QueryError::MissingInput {
                 query: self.name.to_string(),
             };
-            database.record_query_error(&error);
-            error
+            database.record_query_error(&error)
         })
     }
 
@@ -359,8 +437,7 @@ where
         let result = match self.evaluate(database, &key) {
             Ok(result) => result,
             Err(error) => {
-                database.record_query_error(&error);
-                return Err(error);
+                return Err(database.record_query_error(&error));
             }
         };
         let query = self.clone();
@@ -395,6 +472,188 @@ where
                     durability: self.durability,
                 },
             }),
+        }
+    }
+}
+
+/// A session-local interner exposed as an interned query kind.
+pub struct InternedQuery<T> {
+    id: QueryId,
+    name: Arc<str>,
+    marker: std::marker::PhantomData<fn() -> T>,
+}
+
+/// An ID for one value in an `InternedQuery`.
+///
+/// The ID is valid only for the query table and database session that created
+/// it. It deliberately does not implement `StableHash`.
+pub struct InternedId<T> {
+    query_id: QueryId,
+    session: Arc<()>,
+    index: u32,
+    marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for InternedId<T> {
+    fn clone(&self) -> Self {
+        Self {
+            query_id: self.query_id,
+            session: Arc::clone(&self.session),
+            index: self.index,
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> PartialEq for InternedId<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.query_id == other.query_id
+            && Arc::ptr_eq(&self.session, &other.session)
+            && self.index == other.index
+    }
+}
+
+impl<T> Eq for InternedId<T> {}
+
+impl<T> fmt::Debug for InternedId<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("InternedId")
+            .field(&self.index)
+            .finish()
+    }
+}
+
+impl<T> Clone for InternedQuery<T> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            name: Arc::clone(&self.name),
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> InternedQuery<T>
+where
+    T: Eq + StableHash + Send + Sync + 'static,
+{
+    pub fn new(name: impl Into<Arc<str>>) -> Result<Self, QueryError> {
+        Ok(Self {
+            id: allocate_query_id()?,
+            name: name.into(),
+            marker: std::marker::PhantomData,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn intern(
+        &self,
+        database: &mut QueryDatabase,
+        value: T,
+    ) -> Result<InternedId<T>, QueryError> {
+        database.check_cancellation()?;
+        let session = Arc::clone(&database.session);
+        let value_fingerprint = fingerprint(&value);
+        let intern_result = (|| {
+            let state = database
+                .interned
+                .entry(self.id)
+                .or_insert_with(|| Box::new(InternedState::<T>::default()));
+            let Some(state) = state.downcast_mut::<InternedState<T>>() else {
+                return Err(QueryError::QueryKindMismatch {
+                    query: self.name.to_string(),
+                });
+            };
+
+            if let Some(indices) = state.buckets.get(&value_fingerprint) {
+                for index in indices {
+                    if state
+                        .values
+                        .get(*index as usize)
+                        .is_some_and(|existing| **existing == value)
+                    {
+                        return Ok(*index);
+                    }
+                }
+            }
+
+            let index =
+                u32::try_from(state.values.len()).map_err(|_| QueryError::InternedIdExhausted {
+                    query: self.name.to_string(),
+                })?;
+            state.values.push(Arc::new(value));
+            state
+                .buckets
+                .entry(value_fingerprint)
+                .or_default()
+                .push(index);
+            Ok(index)
+        })();
+        match intern_result {
+            Ok(index) => Ok(self.make_id(&session, index)),
+            Err(error) => Err(database.record_query_error(&error)),
+        }
+    }
+
+    pub fn lookup(
+        &self,
+        database: &mut QueryDatabase,
+        id: &InternedId<T>,
+    ) -> Result<Arc<T>, QueryError> {
+        database.check_cancellation()?;
+        let result = (|| {
+            if id.query_id != self.id || !Arc::ptr_eq(&id.session, &database.session) {
+                return Err(QueryError::InvalidInternedId {
+                    query: self.name.to_string(),
+                });
+            }
+            let Some(state) = database.interned.get(&self.id) else {
+                return Err(QueryError::InvalidInternedId {
+                    query: self.name.to_string(),
+                });
+            };
+            let Some(state) = state.downcast_ref::<InternedState<T>>() else {
+                return Err(QueryError::QueryKindMismatch {
+                    query: self.name.to_string(),
+                });
+            };
+            state.values.get(id.index as usize).cloned().ok_or_else(|| {
+                QueryError::InvalidInternedId {
+                    query: self.name.to_string(),
+                }
+            })
+        })();
+        if let Err(error) = &result {
+            let effective_error = database.record_query_error(error);
+            return Err(effective_error);
+        }
+        result
+    }
+
+    fn make_id(&self, session: &Arc<()>, index: u32) -> InternedId<T> {
+        InternedId {
+            query_id: self.id,
+            session: Arc::clone(session),
+            index,
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+struct InternedState<T> {
+    values: Vec<Arc<T>>,
+    buckets: HashMap<Fingerprint, Vec<u32>>,
+}
+
+impl<T> Default for InternedState<T> {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            buckets: HashMap::new(),
         }
     }
 }
@@ -450,15 +709,13 @@ where
                 .collect::<Vec<_>>();
             stack.push(self.name.to_string());
             let error = QueryError::Cycle { stack };
-            database.record_query_error(&error);
-            return Err(error);
+            return Err(database.record_query_error(&error));
         }
 
         let result = match self.evaluate(database, &key) {
             Ok(result) => result,
             Err(error) => {
-                database.record_query_error(&error);
-                return Err(error);
+                return Err(database.record_query_error(&error));
             }
         };
         let query = self.clone();
@@ -507,21 +764,26 @@ where
             query_id: self.id,
             key: Box::new(key.clone()),
             name: Arc::clone(&self.name),
+            kind: QueryFrameKind::Derived,
             dependencies: Vec::new(),
             failure: None,
         });
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.evaluate_active(database, key, node, previous.as_ref())
         }));
-        database.active.pop();
+        let frame = database
+            .active
+            .pop()
+            .expect("the derived query has an active frame");
 
-        match result {
+        let result = match result {
             Ok(result) => result,
             Err(payload) => Err(QueryError::Panicked {
                 query: self.name.to_string(),
                 message: panic_message(payload.as_ref()),
             }),
-        }
+        };
+        database.finish_query_frame(frame.failure, result)
     }
 
     fn evaluate_active(
@@ -569,8 +831,7 @@ where
         let value = match (self.compute)(database, key) {
             Ok(value) => value,
             Err(error) => {
-                database.record_query_error(&error);
-                return Err(error);
+                return Err(database.record_query_error(&error));
             }
         };
         if let Some(error) = database.active_failure() {
@@ -625,6 +886,91 @@ where
     }
 }
 
+/// A query function evaluated on every call without its own memo.
+///
+/// Reads made by the function are attributed to the nearest enclosing derived
+/// query, so a memoized parent still tracks the data on which the transparent
+/// function depends.
+pub struct TransparentQuery<K, V> {
+    id: QueryId,
+    name: Arc<str>,
+    compute: Arc<QueryFunction<K, V>>,
+}
+
+impl<K, V> Clone for TransparentQuery<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            name: Arc::clone(&self.name),
+            compute: Arc::clone(&self.compute),
+        }
+    }
+}
+
+impl<K, V> TransparentQuery<K, V>
+where
+    K: Clone + Eq + StableHash + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    pub fn new(
+        name: impl Into<Arc<str>>,
+        compute: impl Fn(&mut QueryDatabase, &K) -> Result<V, QueryError> + Send + Sync + 'static,
+    ) -> Result<Self, QueryError> {
+        Ok(Self {
+            id: allocate_query_id()?,
+            name: name.into(),
+            compute: Arc::new(compute),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn get(&self, database: &mut QueryDatabase, key: K) -> Result<Arc<V>, QueryError> {
+        database.check_cancellation()?;
+        if let Some(cycle_start) = database.active_cycle(self.id, &key) {
+            let mut stack = database.active[cycle_start..]
+                .iter()
+                .map(|active| active.name.to_string())
+                .collect::<Vec<_>>();
+            stack.push(self.name.to_string());
+            let error = QueryError::Cycle { stack };
+            return Err(database.record_query_error(&error));
+        }
+
+        database.active.push(ActiveQuery {
+            query_id: self.id,
+            key: Box::new(key.clone()),
+            name: Arc::clone(&self.name),
+            kind: QueryFrameKind::Transparent,
+            dependencies: Vec::new(),
+            failure: None,
+        });
+        let result = catch_unwind(AssertUnwindSafe(|| (self.compute)(database, &key)));
+        let frame = database
+            .active
+            .pop()
+            .expect("the transparent query has an active frame");
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => Err(QueryError::Panicked {
+                query: self.name.to_string(),
+                message: panic_message(payload.as_ref()),
+            }),
+        };
+        let result = database.finish_query_frame(frame.failure, result);
+
+        match result {
+            Ok(value) => match database.check_cancellation() {
+                Ok(()) => Ok(Arc::new(value)),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(database.record_query_error(&error)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct QueryId(u64);
 
@@ -660,8 +1006,15 @@ struct ActiveQuery {
     query_id: QueryId,
     key: Box<dyn Any + Send + Sync>,
     name: Arc<str>,
+    kind: QueryFrameKind,
     dependencies: Vec<Dependency>,
     failure: Option<QueryError>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QueryFrameKind {
+    Derived,
+    Transparent,
 }
 
 #[derive(Clone)]
@@ -793,16 +1146,16 @@ mod tests {
     fn inputs_advance_only_the_changed_durability_revision() {
         let mut database = QueryDatabase::new();
         let low = input::<&'static str>("source_text", Durability::Low);
-        let initial_revision = database.revision();
+        let initial_revision = database.revision;
 
         assert!(low.set(&mut database, 1, "one").expect("set succeeds"));
-        assert_eq!(database.revision(), initial_revision + 1);
+        assert_eq!(database.revision, initial_revision + 1);
         assert_eq!(
-            database.durability_changed_at(Durability::Low),
-            database.revision()
+            database.durability_changed_at[Durability::Low.index()],
+            database.revision
         );
         assert_eq!(
-            database.durability_changed_at(Durability::Medium),
+            database.durability_changed_at[Durability::Medium.index()],
             initial_revision
         );
 
@@ -810,14 +1163,14 @@ mod tests {
             !low.set(&mut database, 1, "one")
                 .expect("equal set succeeds")
         );
-        assert_eq!(database.revision(), initial_revision + 1);
+        assert_eq!(database.revision, initial_revision + 1);
         assert_eq!(*low.get(&mut database, 1).expect("input exists"), "one");
 
         assert!(
             low.set(&mut database, 1, "two")
                 .expect("changed set succeeds")
         );
-        assert_eq!(database.revision(), initial_revision + 2);
+        assert_eq!(database.revision, initial_revision + 2);
         assert_eq!(*low.get(&mut database, 1).expect("input exists"), "two");
     }
 
@@ -878,37 +1231,44 @@ mod tests {
         let mut database = QueryDatabase::new();
         let source = input::<u32>("source", Durability::Low);
         source.set(&mut database, 0, 1).expect("input sets");
+        let revision = database.revision;
         let source_in_query = source.clone();
         let query = derived("impure_query", move |database, key| {
             let _ = source_in_query.set(database, *key, 2);
             Ok(0_u32)
         });
 
-        assert_eq!(
-            query.get(&mut database, 0),
-            Err(QueryError::InputMutationDuringQuery {
-                input: "source".to_owned(),
-                query: "impure_query".to_owned()
-            })
-        );
+        let mutation_error = QueryError::InputMutationDuringQuery {
+            input: "source".to_owned(),
+            query: "impure_query".to_owned(),
+        };
+        assert_eq!(query.get(&mut database, 0), Err(mutation_error.clone()));
+        assert_eq!(database.check_cancellation(), Err(mutation_error));
+
+        let mut remove_database = QueryDatabase::new();
+        source.set(&mut remove_database, 0, 1).expect("input sets");
+        let remove_revision = remove_database.revision;
         let source_in_remove_query = source.clone();
         let remove_query = derived("impure_remove_query", move |database, key| {
             let _ = source_in_remove_query.remove(database, *key);
             Ok(0_u32)
         });
         assert_eq!(
-            remove_query.get(&mut database, 0),
+            remove_query.get(&mut remove_database, 0),
             Err(QueryError::InputMutationDuringQuery {
                 input: "source".to_owned(),
                 query: "impure_remove_query".to_owned()
             })
         );
         assert_eq!(
-            *source
-                .get(&mut database, 0)
-                .expect("original value remains"),
-            1
+            remove_database.check_cancellation(),
+            Err(QueryError::InputMutationDuringQuery {
+                input: "source".to_owned(),
+                query: "impure_remove_query".to_owned()
+            })
         );
+        assert_eq!(database.revision, revision);
+        assert_eq!(remove_database.revision, remove_revision);
     }
 
     #[test]
@@ -1020,20 +1380,20 @@ mod tests {
 
         assert_eq!(*low_only.get(&mut database, 0).expect("query succeeds"), 1);
         assert_eq!(*mixed.get(&mut database, 0).expect("query succeeds"), 5);
-        let before_medium_change = database.revision();
+        let before_medium_change = database.revision;
         medium
             .set(&mut database, 0, 3)
             .expect("medium input changes");
         assert_eq!(
-            database.durability_changed_at(Durability::Low),
-            database.revision()
+            database.durability_changed_at[Durability::Low.index()],
+            database.revision
         );
         assert_eq!(
-            database.durability_changed_at(Durability::Medium),
-            database.revision()
+            database.durability_changed_at[Durability::Medium.index()],
+            database.revision
         );
         assert_eq!(
-            database.durability_changed_at(Durability::High),
+            database.durability_changed_at[Durability::High.index()],
             before_medium_change
         );
         assert_eq!(
@@ -1055,6 +1415,175 @@ mod tests {
             6
         );
         assert_eq!(mixed_runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn interned_queries_are_idempotent_session_local_and_collision_safe() {
+        let mut database = QueryDatabase::new();
+        let interned = InternedQuery::<String>::new("names").expect("query ID is available");
+        let first = interned
+            .intern(&mut database, "alpha".to_owned())
+            .expect("value interns");
+        let repeated = interned
+            .intern(&mut database, "alpha".to_owned())
+            .expect("equal value interns to the same ID");
+        assert_eq!(first, repeated);
+        assert_eq!(
+            &*interned.lookup(&mut database, &first).expect("ID resolves"),
+            "alpha"
+        );
+
+        let mut other_session = QueryDatabase::new();
+        assert_eq!(
+            interned.lookup(&mut other_session, &first),
+            Err(QueryError::InvalidInternedId {
+                query: "names".to_owned()
+            })
+        );
+        assert_eq!(
+            other_session.check_cancellation(),
+            Err(QueryError::InvalidInternedId {
+                query: "names".to_owned()
+            })
+        );
+        let another_table =
+            InternedQuery::<String>::new("other_names").expect("query ID is available");
+        assert_eq!(
+            another_table.lookup(&mut database, &first),
+            Err(QueryError::InvalidInternedId {
+                query: "other_names".to_owned()
+            })
+        );
+        assert_eq!(
+            database.check_cancellation(),
+            Err(QueryError::InvalidInternedId {
+                query: "other_names".to_owned()
+            })
+        );
+
+        let mut collision_database = QueryDatabase::new();
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct CollidingValue(u8);
+
+        impl StableHash for CollidingValue {
+            fn stable_hash(&self, hasher: &mut StableHasher) {
+                hasher.write_tag(0xFD);
+            }
+        }
+
+        let colliding = InternedQuery::<CollidingValue>::new("colliding_values")
+            .expect("query ID is available");
+        let left = colliding
+            .intern(&mut collision_database, CollidingValue(1))
+            .expect("first colliding value interns");
+        let right = colliding
+            .intern(&mut collision_database, CollidingValue(2))
+            .expect("second colliding value interns");
+        assert_ne!(left, right);
+        assert_eq!(
+            *colliding
+                .lookup(&mut collision_database, &left)
+                .expect("left resolves"),
+            CollidingValue(1)
+        );
+        assert_eq!(
+            *colliding
+                .lookup(&mut collision_database, &right)
+                .expect("right resolves"),
+            CollidingValue(2)
+        );
+    }
+
+    #[test]
+    fn transparent_queries_run_each_time_and_track_reads_in_the_parent() {
+        let mut database = QueryDatabase::new();
+        let source = input::<u32>("source", Durability::Low);
+        source.set(&mut database, 0, 2).expect("input sets");
+        let source_in_transparent = source.clone();
+        let transparent_runs = Arc::new(AtomicUsize::new(0));
+        let transparent_runs_in_query = Arc::clone(&transparent_runs);
+        let transparent = TransparentQuery::new("triple", move |database, key| {
+            transparent_runs_in_query.fetch_add(1, Ordering::SeqCst);
+            source_in_transparent
+                .get(database, *key)
+                .map(|value| *value * 3)
+        })
+        .expect("query ID is available");
+        let transparent_in_parent = transparent.clone();
+        let parent = derived("plus_one", move |database, key| {
+            transparent_in_parent
+                .get(database, *key)
+                .map(|value| *value + 1)
+        });
+
+        assert_eq!(*parent.get(&mut database, 0).expect("parent computes"), 7);
+        assert_eq!(
+            *parent.get(&mut database, 0).expect("parent memo is reused"),
+            7
+        );
+        assert_eq!(transparent_runs.load(Ordering::SeqCst), 1);
+
+        source.set(&mut database, 0, 3).expect("input changes");
+        assert_eq!(
+            *parent.get(&mut database, 0).expect("parent invalidates"),
+            10
+        );
+        assert_eq!(transparent_runs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *transparent
+                .get(&mut database, 0)
+                .expect("transparent query executes"),
+            9
+        );
+        assert_eq!(
+            *transparent
+                .get(&mut database, 0)
+                .expect("transparent query executes again"),
+            9
+        );
+        assert_eq!(transparent_runs.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn transparent_query_cycles_cannot_be_swallowed_or_memoized() {
+        let mut database = QueryDatabase::new();
+        let recursive = Arc::new(std::sync::OnceLock::<TransparentQuery<u32, u32>>::new());
+        let recursive_in_compute = Arc::clone(&recursive);
+        let transparent =
+            TransparentQuery::<u32, u32>::new("recursive_transparent", move |database, key| {
+                match recursive_in_compute
+                    .get()
+                    .expect("query initialized")
+                    .get(database, *key)
+                {
+                    Ok(value) => Ok(*value),
+                    Err(_) => Ok(0),
+                }
+            })
+            .expect("query ID is available");
+        assert!(recursive.set(transparent.clone()).is_ok());
+
+        let parent_runs = Arc::new(AtomicUsize::new(0));
+        let parent_runs_in_query = Arc::clone(&parent_runs);
+        let transparent_in_parent = transparent.clone();
+        let parent = derived("transparent_cycle_parent", move |database, key| {
+            parent_runs_in_query.fetch_add(1, Ordering::SeqCst);
+            match transparent_in_parent.get(database, *key) {
+                Ok(value) => Ok(*value),
+                Err(_) => Ok(7),
+            }
+        });
+        let expected_error = QueryError::Cycle {
+            stack: vec![
+                "recursive_transparent".to_owned(),
+                "recursive_transparent".to_owned(),
+            ],
+        };
+        let expected = Err(expected_error.clone());
+        assert_eq!(parent.get(&mut database, 0), expected);
+        assert_eq!(parent.get(&mut database, 0), expected);
+        assert_eq!(parent_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(database.check_cancellation(), Err(expected_error));
     }
 
     #[test]
@@ -1148,6 +1677,12 @@ mod tests {
                 stack: vec!["recursive".to_owned(), "recursive".to_owned()]
             })
         );
+        assert_eq!(
+            database.check_cancellation(),
+            Err(QueryError::Cycle {
+                stack: vec!["recursive".to_owned(), "recursive".to_owned()]
+            })
+        );
     }
 
     #[test]
@@ -1174,17 +1709,41 @@ mod tests {
                 Err(_) => Ok(0),
             }
         });
-        let expected = Err(QueryError::Cycle {
+        let expected_error = QueryError::Cycle {
             stack: vec!["recursive_child".to_owned(), "recursive_child".to_owned()],
-        });
+        };
+        let expected = Err(expected_error.clone());
 
         assert_eq!(parent.get(&mut database, 0), expected);
         assert_eq!(parent.get(&mut database, 0), expected);
-        assert_eq!(parent_runs.load(Ordering::SeqCst), 2);
+        assert_eq!(parent_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(database.check_cancellation(), Err(expected_error));
     }
 
     #[test]
-    fn parent_queries_cannot_swallow_child_panics() {
+    fn derived_queries_preserve_a_cycle_over_a_later_panic() {
+        let mut database = QueryDatabase::new();
+        let recursive_query = Arc::new(std::sync::OnceLock::<DerivedQuery<u32, u32>>::new());
+        let recursive_query_in_compute = Arc::clone(&recursive_query);
+        let query = DerivedQuery::<u32, u32>::new("cycle_then_panic", move |database, key| {
+            let _ = recursive_query_in_compute
+                .get()
+                .expect("query initialized")
+                .get(database, *key);
+            panic!("later panic");
+        })
+        .expect("query ID is available");
+        assert!(recursive_query.set(query.clone()).is_ok());
+
+        let expected = QueryError::Cycle {
+            stack: vec!["cycle_then_panic".to_owned(), "cycle_then_panic".to_owned()],
+        };
+        assert_eq!(query.get(&mut database, 0), Err(expected.clone()));
+        assert_eq!(database.check_cancellation(), Err(expected));
+    }
+
+    #[test]
+    fn parent_queries_preserve_child_panics_over_later_errors() {
         let mut database = QueryDatabase::new();
         let child_attempts = Arc::new(AtomicUsize::new(0));
         let child_attempts_in_query = Arc::clone(&child_attempts);
@@ -1200,7 +1759,9 @@ mod tests {
             parent_runs_in_query.fetch_add(1, Ordering::SeqCst);
             match child.get(database, *key) {
                 Ok(value) => Ok(*value),
-                Err(_) => Ok(0),
+                Err(_) => Err(QueryError::MissingInput {
+                    query: "later_error".to_owned(),
+                }),
             }
         });
 
@@ -1211,13 +1772,15 @@ mod tests {
                 message: "child failure".to_owned()
             })
         );
-        assert_eq!(*parent.get(&mut database, 0).expect("child recovers"), 7);
         assert_eq!(
-            *parent.get(&mut database, 0).expect("parent memo is reused"),
-            7
+            parent.get(&mut database, 0),
+            Err(QueryError::Panicked {
+                query: "panic_once_child".to_owned(),
+                message: "child failure".to_owned()
+            })
         );
-        assert_eq!(parent_runs.load(Ordering::SeqCst), 2);
-        assert_eq!(child_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(parent_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(child_attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1235,10 +1798,14 @@ mod tests {
 
         token.cancel();
         assert_eq!(query.get(&mut database, 0), Err(QueryError::Cancelled));
-        token.reset();
+        database
+            .reset_cancellation()
+            .expect("cancellation resets between queries");
         assert_eq!(query.get(&mut database, 0), Err(QueryError::Cancelled));
 
-        token.reset();
+        database
+            .reset_cancellation()
+            .expect("cancellation resets between queries");
         let successful = derived("after_cancel", |_database, _key| Ok(2_u32));
         assert_eq!(
             *successful.get(&mut database, 0).expect("query succeeds"),
@@ -1247,7 +1814,116 @@ mod tests {
     }
 
     #[test]
-    fn panics_do_not_leave_stale_active_frames_or_memos() {
+    fn transparent_queries_observe_cancellation_during_computation() {
+        let mut database = QueryDatabase::new();
+        let token = database.cancellation_token();
+        let token_in_query = token.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_in_query = Arc::clone(&attempts);
+        let query = TransparentQuery::new("cancel_during_transparent", move |_database, _key| {
+            if attempts_in_query.fetch_add(1, Ordering::SeqCst) == 0 {
+                token_in_query.cancel();
+            }
+            Ok(42_u32)
+        })
+        .expect("query ID is available");
+
+        assert_eq!(query.get(&mut database, 0), Err(QueryError::Cancelled));
+        database
+            .reset_cancellation()
+            .expect("cancellation resets between queries");
+        assert_eq!(
+            *query
+                .get(&mut database, 0)
+                .expect("transparent query can run after cancellation"),
+            42
+        );
+    }
+
+    #[test]
+    fn queries_cannot_reset_cancellation_while_running() {
+        let mut database = QueryDatabase::new();
+        let token = database.cancellation_token();
+        let token_in_query = token.clone();
+        let query = derived("reset_cancellation", move |database, _key| {
+            token_in_query.cancel();
+            let _ = database.reset_cancellation();
+            Ok(42_u32)
+        });
+        let expected = QueryError::CancellationResetDuringQuery {
+            query: "reset_cancellation".to_owned(),
+        };
+
+        assert_eq!(query.get(&mut database, 0), Err(expected.clone()));
+        assert!(token.is_cancelled());
+        assert_eq!(database.check_cancellation(), Err(expected));
+    }
+
+    #[test]
+    fn cancellation_does_not_hide_a_later_internal_failure() {
+        let mut derived_database = QueryDatabase::new();
+        let derived_token = derived_database.cancellation_token();
+        let token_in_derived = derived_token.clone();
+        let derived_query = derived::<u32>("cancel_then_panic", move |database, _key| {
+            token_in_derived.cancel();
+            let _ = database.check_cancellation();
+            panic!("panic after cancellation");
+        });
+        let expected_panic = QueryError::Panicked {
+            query: "cancel_then_panic".to_owned(),
+            message: "panic after cancellation".to_owned(),
+        };
+        assert_eq!(
+            derived_query.get(&mut derived_database, 0),
+            Err(expected_panic.clone())
+        );
+        assert_eq!(derived_database.check_cancellation(), Err(expected_panic));
+
+        let mut transparent_database = QueryDatabase::new();
+        let transparent_token = transparent_database.cancellation_token();
+        let token_in_transparent = transparent_token.clone();
+        let transparent_query =
+            TransparentQuery::<u32, u32>::new("cancel_then_error", move |database, _key| {
+                token_in_transparent.cancel();
+                let _ = database.check_cancellation();
+                Err(QueryError::MissingInput {
+                    query: "after_cancellation".to_owned(),
+                })
+            })
+            .expect("query ID is available");
+        let expected_error = QueryError::MissingInput {
+            query: "after_cancellation".to_owned(),
+        };
+        assert_eq!(
+            transparent_query.get(&mut transparent_database, 0),
+            Err(expected_error.clone())
+        );
+        assert_eq!(
+            transparent_database.check_cancellation(),
+            Err(expected_error)
+        );
+    }
+
+    #[test]
+    fn transparent_query_panics_poison_the_session() {
+        let mut database = QueryDatabase::new();
+        let query = TransparentQuery::<u32, u32>::new("transparent_panic", |_database, _key| {
+            panic!("transparent failure");
+        })
+        .expect("query ID is available");
+        let expected_error = QueryError::Panicked {
+            query: "transparent_panic".to_owned(),
+            message: "transparent failure".to_owned(),
+        };
+        let expected = Err(expected_error.clone());
+
+        assert_eq!(query.get(&mut database, 0), expected);
+        assert_eq!(query.get(&mut database, 0), expected);
+        assert_eq!(database.check_cancellation(), Err(expected_error));
+    }
+
+    #[test]
+    fn panics_poison_the_session_without_leaving_active_frames_or_memos() {
         let mut database = QueryDatabase::new();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_in_query = Arc::clone(&attempts);
@@ -1266,10 +1942,12 @@ mod tests {
             })
         );
         assert_eq!(
-            *query
-                .get(&mut database, 0)
-                .expect("second attempt succeeds"),
-            42
+            query.get(&mut database, 0),
+            Err(QueryError::Panicked {
+                query: "panic_once".to_owned(),
+                message: "first attempt".to_owned()
+            })
         );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }
