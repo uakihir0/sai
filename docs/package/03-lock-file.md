@@ -85,7 +85,7 @@ A lock that parses and validates (§3.3) but whose bytes differ from the canonic
 The notation is that of [01 §1.3](01-package-contract.md). `VersionReq`, `OnlyClause`, and `CapName` are the productions of 01.
 
 ```ebnf
-LockFile      ::= nl Header NL RootBlock ( NL EntryBlock )* nl EOF
+LockFile      ::= Header NL RootBlock ( NL EntryBlock )* nl EOF
 Header        ::= "lock" INT
 RootBlock     ::= "root" PKG_PATH '@' VERSION ( NL RootField )*
 RootField     ::= TargetsField | RootEdge
@@ -165,7 +165,7 @@ Consistency between entries (for example an edge whose recorded version has no e
 1. **Versions** are written in the canonical form of [02 §2.2.1](02-resolver.md): numeric identifiers without leading zeros, pre-release identifiers as in the source, no build metadata. Within a requirement, a partial version keeps its number of components (`^1.6` stays `^1.6`), but each present component is written without leading zeros.
 2. **Requirements** are written as the package author wrote them, normalized by rule 1 and by the spacing of §3.2.3. Two requirements with the same comparators in the same order are the same requirement; the resolver compares requirements in this canonical form ([02 §2.10.2](02-resolver.md) rule 3).
 3. **Strings.** No string in a lock contains a control character (U+0000–U+001F, U+007F–U+009F) or a bidirectional control character (U+202A–U+202E, U+2066–U+2069). URLs are ASCII ([04 §4.2](04-distribution-and-security.md)); paths satisfy [01 §1.6.1](01-package-contract.md); digests and commits are lowercase hexadecimal. A lock string that violates this is `LOCK_CORRUPT`.
-4. **Names** in lists (targets, `only` sets, capabilities) are written as `WORD` or `PKG_PATH` tokens exactly as in `sai.package`, sorted by their bytes, without duplicates.
+4. **Names** in lists (targets, `only` sets, capabilities, and each `imports` capability set) are written as `WORD` or `PKG_PATH` tokens exactly as in `sai.package`, sorted by their bytes, without duplicates. These lists have set semantics: a reader treats a repeated member as one value, and canonical serialization removes repetitions. Repeated `artifact` or `imports` fields for the same target remain corrupt because each target has at most one field of each kind.
 
 ---
 
@@ -389,7 +389,7 @@ A clean textual merge can leave two entries for one node, for example when both 
 
 ## 3.10 Format versioning
 
-1. The header `lock <n>` names the format version. This document defines **format 1**.
+1. The header `lock <n>` names the format version. `<n>` is an `INT` from [01 §1.2.3](01-package-contract.md) and must fit in an unsigned 64-bit integer; an out-of-range value is lexically invalid. This document defines **format 1**.
 2. A lock whose format is greater than the highest format the toolchain supports is the error `UNSUPPORTED_LOCK_VERSION`; the help suggests upgrading the toolchain. A format of 0 is `LOCK_CORRUPT`.
 3. Within a format, the set of fields, the canonical layout, and the checksum algorithms are fixed. There is no rule that unknown fields are ignored: an unknown field could carry security-relevant data, such as a new checksum, which an older toolchain would silently drop when it rewrites the file. Any additional field therefore requires a new format.
 4. The checksum prefix names the algorithm. Format 1 defines only `sai1:`. A new algorithm gets a new prefix (for example `sai2:`), introduced by a new format.

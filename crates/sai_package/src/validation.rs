@@ -602,7 +602,7 @@ fn validate_capability_items(items: &[Spanned<Box<str>>], output: &mut PackageVa
     }
 }
 
-fn is_valid_capability(value: &str) -> bool {
+pub(crate) fn is_valid_capability(value: &str) -> bool {
     if matches!(
         value,
         "alloc" | "threads" | "host" | "native_ffi" | "process" | "memory64"
@@ -660,7 +660,7 @@ fn is_implicit_package(package: &str) -> bool {
     matches!(package, "sai:core" | "sai:alloc")
 }
 
-fn is_component_target(target: &str) -> bool {
+pub(crate) fn is_component_target(target: &str) -> bool {
     matches!(target, "wasm32-wasi" | "wasm64-wasi")
 }
 

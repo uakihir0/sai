@@ -3,7 +3,8 @@
 use std::ops::Range;
 
 use crate::lexer::{
-    PackageLexError, PackagePunctuator, PackageToken, PackageTokenKind, PackageTrivia, lex_lock,
+    PackageLexError, PackagePunctuator, PackageToken, PackageTokenKind, PackageTrivia,
+    is_forbidden_non_ascii_whitespace, lex_lock,
 };
 use crate::manifest::Spanned;
 use crate::version::{Version, VersionParseError};
@@ -27,6 +28,7 @@ impl LockParseOutput {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LockFile {
     pub format_version: Option<u64>,
+    pub format_version_span: Option<Range<usize>>,
     pub root: Option<Spanned<LockRoot>>,
     pub packages: Vec<Spanned<LockPackage>>,
     pub trivia: Vec<PackageTrivia>,
@@ -34,8 +36,8 @@ pub struct LockFile {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockRoot {
-    /// Kept as spelling so validation can allow the implicit `sai:core` and
-    /// `sai:alloc` identities while rejecting other reserved identities.
+    /// Kept as spelling so validation can report reserved identities at their
+    /// original source span.
     pub package: Box<str>,
     pub version: Version,
     pub fields: Vec<Spanned<LockRootField>>,
@@ -49,8 +51,8 @@ pub enum LockRootField {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockPackage {
-    /// Kept as spelling so validation can recognize implicit toolchain
-    /// packages, which are valid graph entries but not user declarations.
+    /// Kept as spelling so validation can report reserved identities at their
+    /// original source span.
     pub package: Box<str>,
     pub version: Version,
     pub fields: Vec<Spanned<LockPackageField>>,
@@ -107,6 +109,7 @@ pub enum LockParseErrorKind {
     UnknownRootField(Box<str>),
     UnknownPackageField(Box<str>),
     InvalidFormatVersion,
+    HeaderNotFirstLine,
     InvalidVersion(VersionParseError),
     InvalidVersionRequirement(VersionReqParseError),
     LockMergeConflict,
@@ -130,12 +133,17 @@ pub fn parse(source: &[u8]) -> LockParseOutput {
         };
     }
 
+    let mut header = LockFile::default();
+    if let Some((version, span)) = detect_format_version(source) {
+        header.format_version = Some(version);
+        header.format_version_span = Some(span);
+    }
     let lexed = lex_lock(source);
     if !lexed.errors.is_empty() {
         return LockParseOutput {
             file: LockFile {
                 trivia: lexed.trivia,
-                ..LockFile::default()
+                ..header
             },
             lexical_errors: lexed.errors,
             errors: Vec::new(),
@@ -152,6 +160,99 @@ pub fn parse(source: &[u8]) -> LockParseOutput {
         file,
         lexical_errors: Vec::new(),
         errors: parser.errors,
+    }
+}
+
+fn detect_format_version(source: &[u8]) -> Option<(u64, Range<usize>)> {
+    let newline = source.iter().position(|byte| *byte == b'\n');
+    let line_end = newline.unwrap_or(source.len());
+    let mut end = line_end;
+    if newline.is_some() && end > 0 && source[end - 1] == b'\r' {
+        end -= 1;
+    } else if newline.is_none() && source.last() == Some(&b'\r') {
+        return None;
+    }
+    let header_text = std::str::from_utf8(&source[..end]).ok()?;
+    if header_text.contains('\r')
+        || header_text.chars().any(|character| {
+            is_forbidden_non_ascii_whitespace(character)
+                || matches!(
+                    character as u32,
+                    0x202a..=0x202e | 0x2066..=0x2069
+                )
+        })
+    {
+        return None;
+    }
+    let mut position = if source.starts_with(b"\xef\xbb\xbf") {
+        3
+    } else {
+        0
+    };
+    skip_header_trivia(source, &mut position, end)?;
+    if !source[position..end].starts_with(b"lock") {
+        return None;
+    }
+    position += 4;
+    if position < end
+        && !matches!(source[position], b' ' | b'\t')
+        && !source[position..end].starts_with(b"/*")
+        && !source[position..end].starts_with(b"//")
+    {
+        return None;
+    }
+    skip_header_trivia(source, &mut position, end)?;
+    let digits_start = position;
+    while position < end && source[position].is_ascii_digit() {
+        position += 1;
+    }
+    if position == digits_start || (position - digits_start > 1 && source[digits_start] == b'0') {
+        return None;
+    }
+    let digits_end = position;
+    let version = std::str::from_utf8(&source[digits_start..position])
+        .ok()?
+        .parse()
+        .ok()?;
+    skip_header_trivia(source, &mut position, end)?;
+    if position != end {
+        return None;
+    }
+    Some((version, digits_start..digits_end))
+}
+
+fn skip_header_trivia(source: &[u8], position: &mut usize, end: usize) -> Option<()> {
+    loop {
+        while *position < end && matches!(source[*position], b' ' | b'\t') {
+            *position += 1;
+        }
+        if source[*position..end].starts_with(b"//") {
+            *position = end;
+            return Some(());
+        }
+        if !source[*position..end].starts_with(b"/*") {
+            return Some(());
+        }
+
+        *position += 2;
+        let mut depth = 1usize;
+        while *position < end {
+            if source[*position..end].starts_with(b"/*") {
+                depth += 1;
+                *position += 2;
+            } else if source[*position..end].starts_with(b"*/") {
+                depth -= 1;
+                *position += 2;
+                if depth == 0 {
+                    break;
+                }
+            } else {
+                *position += 1;
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
     }
 }
 
@@ -210,16 +311,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_file(&mut self, file: &mut LockFile) {
+        if let Some(first_token) = self.tokens.iter().find(|token| {
+            !matches!(
+                token.kind,
+                PackageTokenKind::Newline | PackageTokenKind::Eof
+            )
+        }) && self.text[..first_token.span.start].contains('\n')
+        {
+            self.error(
+                LockParseErrorKind::HeaderNotFirstLine,
+                0..first_token.span.start,
+            );
+            return;
+        }
         self.skip_newlines();
         if !self.at_word("lock") {
             self.error_here(LockParseErrorKind::ExpectedToken("`lock`".into()));
             return;
         }
         self.bump();
+        let header_error_start = self.errors.len();
+        let mut parsed_version = None;
         if self.at_kind(PackageTokenKind::Integer) {
             let token = self.bump();
             match self.token_text(token).parse::<u64>() {
-                Ok(version) => file.format_version = Some(version),
+                Ok(version) => parsed_version = Some((version, self.tokens[token].span.clone())),
                 Err(_) => self.error(
                     LockParseErrorKind::InvalidFormatVersion,
                     self.tokens[token].span.clone(),
@@ -231,6 +347,12 @@ impl<'a> Parser<'a> {
             ));
         }
         self.finish_line();
+        if self.errors.len() == header_error_start {
+            if let Some((version, span)) = parsed_version {
+                file.format_version = Some(version);
+                file.format_version_span = Some(span);
+            }
+        }
 
         self.skip_newlines();
         if self.at_word("root") {
@@ -864,5 +986,55 @@ mod tests {
             LockParseErrorKind::LockMergeConflict
         );
         assert_eq!(bom_marker.errors[0].span, 3..10);
+    }
+
+    #[test]
+    fn rejects_malformed_format_headers_without_recording_a_version() {
+        for source in [
+            b"lock 02\n".as_slice(),
+            b"lock 2x\n",
+            b"lock 2 trailing\n",
+            b"lock 2\r",
+            b"lock /* \xff */ 2\n",
+            b"lock /* \xe2\x80\xae */ 2\n",
+        ] {
+            let output = parse(source);
+            assert_ne!(
+                output.file.format_version,
+                Some(2),
+                "malformed header unexpectedly recorded version 2: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_the_header_to_be_on_the_first_line() {
+        for source in [
+            b"\nlock 1\nroot acme:app @ 1.0.0\ntargets { wasm32-wasi }\n".as_slice(),
+            b"// leading comment\nlock 1\nroot acme:app @ 1.0.0\ntargets { wasm32-wasi }\n",
+            b"/* leading\ncomment */ lock 1\nroot acme:app @ 1.0.0\ntargets { wasm32-wasi }\n",
+        ] {
+            let output = parse(source);
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .any(|error| { error.kind == LockParseErrorKind::HeaderNotFirstLine }),
+                "expected first-line header error for {source:?}, got {:?}",
+                output.errors
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_detect_future_versions_through_forbidden_header_whitespace() {
+        for source in [
+            b"lock /* \xc2\xa0 */ 2\n".as_slice(),
+            b"lock /* \xe2\x80\x8b */ 2\n",
+        ] {
+            let output = parse(source);
+            assert_eq!(output.file.format_version, None);
+            assert!(!output.lexical_errors.is_empty());
+        }
     }
 }

@@ -50,9 +50,10 @@ A Git URL appears in `from git` and `use git` in `sai.package` ([01 §1.10.3](01
 6. An `https` URL with any user information (`user@`, `user:password@`, `token@`) is `CREDENTIALS_IN_URL`: the URL is written to `sai.package` and `sai.lock` and would leak the credential. An `ssh` URL may carry a user name (`ssh://git@github.com/...`) but not a password (`CREDENTIALS_IN_URL`).
 7. The host is an ASCII DNS name (letters, digits, `-`, and `.`), an IPv4 address, or an IPv6 address in brackets. A non-ASCII host is `UNSUPPORTED_GIT_URL`. An internationalized host name MUST be written in its ASCII form (`xn--...`), which makes look-alike host names visible.
 8. A port, if present, is a decimal number from 1 to 65535.
-9. The path is not empty and consists of segments separated by `/`. A segment consists of ASCII letters, digits, `-`, `.`, `_`, and `~`. Empty segments (except a single trailing `/`), `.` and `..` segments, and percent-encoding are `UNSUPPORTED_GIT_URL`.
+9. The path is not empty and consists of segments separated by `/`. A segment consists of ASCII letters, digits, `-`, `.`, `_`, and `~`. Empty segments (except a single trailing `/`), `.` and `..` segments, and percent-encoding in the path are `UNSUPPORTED_GIT_URL`.
 10. A query (`?`) or a fragment (`#`) is `UNSUPPORTED_GIT_URL`.
 11. The URL is at most 2048 bytes long.
+12. Percent-encoding is unsupported in every URL component, including an SSH username. A username, when present, is preserved as written; it cannot use percent-encoded spellings.
 
 ### 4.2.2 Canonical form
 

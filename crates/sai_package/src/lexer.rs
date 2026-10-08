@@ -273,7 +273,7 @@ impl<'a> Lexer<'a> {
             }
             let character_start = self.pos;
             self.pos += character.len_utf8();
-            if is_bidi_control(character) {
+            if is_bidi_control(character) || is_forbidden_non_ascii_whitespace(character) {
                 self.error(
                     PackageLexErrorKind::ForbiddenCharacter,
                     character_start..self.pos,
@@ -303,7 +303,7 @@ impl<'a> Lexer<'a> {
                 let character_start = self.pos;
                 let character = self.peek().expect("not at end of input");
                 self.pos += character.len_utf8();
-                if is_bidi_control(character) {
+                if is_bidi_control(character) || is_forbidden_non_ascii_whitespace(character) {
                     self.error(
                         PackageLexErrorKind::ForbiddenCharacter,
                         character_start..self.pos,
@@ -819,12 +819,16 @@ fn is_bidi_control(character: char) -> bool {
     )
 }
 
+pub(crate) fn is_forbidden_non_ascii_whitespace(character: char) -> bool {
+    character == '\u{200b}'
+        || (character.is_whitespace() && !matches!(character, '\t' | '\n' | '\r' | ' '))
+}
+
 fn is_forbidden_outside_literal(character: char) -> bool {
     (character <= '\u{001f}' && !matches!(character, '\t' | '\n' | '\r'))
         || character == '\u{007f}'
         || is_bidi_control(character)
-        || (character.is_whitespace() && !matches!(character, '\t' | '\n' | '\r' | ' '))
-        || character == '\u{200b}'
+        || is_forbidden_non_ascii_whitespace(character)
 }
 
 fn scan_word(text: &str, start: usize) -> Option<usize> {
@@ -1199,6 +1203,27 @@ mod tests {
             [ErrorKind::UnsupportedStringForm]
         );
         assert_eq!(continued.tokens[0].string_value.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn rejects_invisible_whitespace_in_line_and_block_comments() {
+        for source in [
+            "// comment\u{00a0}\nword",
+            "/* comment\u{00a0} */ word",
+            "// comment\u{200b}\nword",
+            "/* comment\u{200b} */ word",
+        ] {
+            let output = lex(source.as_bytes());
+            assert_eq!(
+                output
+                    .errors
+                    .iter()
+                    .map(|error| error.kind)
+                    .collect::<Vec<_>>(),
+                [ErrorKind::ForbiddenCharacter],
+                "unexpected lexical diagnostics for {source:?}"
+            );
+        }
     }
 
     #[test]
