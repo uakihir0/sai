@@ -188,6 +188,109 @@ pub fn lower_function_owner<'hir>(
     ))
 }
 
+/// Lower one top-level type alias from the current item tree.
+///
+/// Generic parameter definitions are interned below the complete type-item
+/// path. A diagnosed missing alias type recovers as `TyKind::Err`; refined
+/// aliases and record declarations are handled by their own item kinds.
+pub fn lower_alias_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Alias, context)?;
+    let declaration = ast::TypeDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+    if declaration.struct_def().is_some()
+        || declaration
+            .alias_def()
+            .is_some_and(|definition| definition.refinement().is_some())
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    ensure_supported_generic_params(declaration.generic_params())?;
+    let alias_type = declaration
+        .alias_def()
+        .and_then(|definition| definition.ty());
+    if let Some(ty) = &alias_type {
+        ensure_supported_type(ty)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let pending_generic_params =
+        prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+    let generic_params = lower_generic_params(
+        pending_generic_params,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let ty = match alias_type {
+        Some(ty) => lower_type(&ty, context.arena, context.symbols, &mut source_map)?,
+        None => {
+            let error_syntax = declaration
+                .alias_def()
+                .and_then(|definition| direct_error_child(definition.syntax()))
+                .or_else(|| direct_error_child(declaration.syntax()))
+                .unwrap_or_else(|| declaration.syntax().clone());
+            lower_error_type(&error_syntax, context.arena, &mut source_map)?
+        }
+    };
+    let generics = context.arena.alloc_generics(HirGenerics {
+        params: context.arena.alloc_generic_params(&generic_params),
+        where_preds: &[],
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Alias {
+            generics: *generics,
+            ty,
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: None,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level constant entry from the current item tree.
 ///
 /// A diagnosed missing type or initializer is retained as an error HIR node so
@@ -951,7 +1054,7 @@ fn lower_function_inner<'hir>(
     }
 
     let pending_generic_params = if lower_generics {
-        prepare_generic_params(declaration, symbols, source_map)?
+        prepare_generic_params(declaration.generic_params(), symbols, source_map)?
     } else {
         Vec::new()
     };
@@ -1331,12 +1434,11 @@ struct PendingGenericParam {
 }
 
 fn prepare_generic_params(
-    declaration: &ast::FnDecl,
+    generic_params: Option<ast::GenericParamList>,
     symbols: &Interner,
     source_map: &HirSourceMapBuilder<'_>,
 ) -> Result<Vec<PendingGenericParam>, HirLoweringError> {
-    let params = declaration
-        .generic_params()
+    let params = generic_params
         .map(|params| params.params().collect::<Vec<_>>())
         .unwrap_or_default();
     if params.is_empty() {
@@ -5276,7 +5378,28 @@ fn ensure_supported_type(ty: &ast::Type) -> Result<(), HirLoweringError> {
 }
 
 fn ensure_supported_generics(declaration: &ast::FnDecl) -> Result<(), HirLoweringError> {
-    if let Some(params) = declaration.generic_params() {
+    ensure_supported_generic_params(declaration.generic_params())?;
+    for where_clause in declaration
+        .syntax()
+        .children()
+        .filter_map(ast::WhereClause::cast)
+    {
+        for predicate in where_clause.predicates() {
+            if let Some(ty) = predicate.ty() {
+                ensure_supported_type(&ty)?;
+            }
+            for bound in predicate.bounds() {
+                ensure_supported_bound(bound)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_generic_params(
+    generic_params: Option<ast::GenericParamList>,
+) -> Result<(), HirLoweringError> {
+    if let Some(params) = generic_params {
         for param in params.params() {
             match param {
                 ast::GenericParam::Type(param) => {
@@ -5291,20 +5414,6 @@ fn ensure_supported_generics(declaration: &ast::FnDecl) -> Result<(), HirLowerin
                         ensure_supported_type(&ty)?;
                     }
                 }
-            }
-        }
-    }
-    for where_clause in declaration
-        .syntax()
-        .children()
-        .filter_map(ast::WhereClause::cast)
-    {
-        for predicate in where_clause.predicates() {
-            if let Some(ty) = predicate.ty() {
-                ensure_supported_type(&ty)?;
-            }
-            for bound in predicate.bounds() {
-                ensure_supported_bound(bound)?;
             }
         }
     }
@@ -15048,6 +15157,211 @@ mod tests {
             ),
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
+    }
+
+    #[test]
+    fn lowers_item_tree_alias_with_generic_parameters() {
+        let file = crate::FileId::new(254);
+        let source = "@deprecated(\"legacy alias\")\npub type Pair<T: Clone> = (T, T)\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("alias item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Alias);
+        let name = symbols.intern("Pair").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_alias_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("type alias lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+        assert!(hir_owner.body.is_none(), "type aliases do not own a body");
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level alias is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        assert_eq!(item.name.sym, name);
+        let ItemKind::Alias { generics, ty } = item.kind else {
+            panic!("alias item retains its alias kind");
+        };
+        assert_eq!(generics.params.len(), 1);
+        let generic_param = generics.params[0];
+        assert_eq!(generic_param.name.sym, symbols.intern("T").unwrap());
+        assert!(matches!(
+            generic_param.kind,
+            HirGenericParamKind::Type { bounds }
+                if matches!(bounds, [HirBound { kind: HirBoundKind::Trait(_), .. }])
+        ));
+        let generic_path = paths
+            .resolve(generic_param.def_id)
+            .expect("generic parameter path resolves")
+            .expect("generic parameter path exists");
+        assert_eq!(
+            generic_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::TypeParam(generic_param.name.sym),
+                disambiguator: 0,
+            })
+        );
+        let HirTyKind::Tuple(elements) = ty.kind else {
+            panic!("alias retains its tuple type");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(elements.iter().all(|element| matches!(
+            element.kind,
+            HirTyKind::Path(path)
+                if path.segments.len() == 1
+                    && path.segments[0].name.sym == generic_param.name.sym
+        )));
+        let declaration = parsed
+            .root
+            .descendants()
+            .find_map(ast::TypeDecl::cast)
+            .expect("type declaration");
+        let source_ty = declaration
+            .alias_def()
+            .and_then(|definition| definition.ty())
+            .expect("alias type");
+        assert_eq!(item.span.range, declaration.syntax().text_range());
+        assert_eq!(
+            item.name.span.range,
+            declaration
+                .name()
+                .and_then(|name| name.token())
+                .expect("type name token")
+                .text_range()
+        );
+        assert_eq!(
+            source_map
+                .syntax_for_node(ty.hir_id)
+                .expect("alias type has a source-map entry")
+                .text_range(),
+            source_ty.syntax().text_range()
+        );
+        assert!(source_map.syntax_for_node(elements[0].hir_id).is_some());
+        let path = paths
+            .resolve(owner.def_id)
+            .expect("type path resolves")
+            .expect("type path exists");
+        assert_eq!(
+            path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(name),
+                disambiguator: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn alias_owner_recovers_a_missing_type() {
+        let file = crate::FileId::new(255);
+        let source = "type Broken =\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(!parsed.errors.is_empty(), "the missing type is diagnosed");
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed alias");
+        let entry = item_tree.items.first().expect("alias item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Alias);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_alias_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing alias type recovers to error HIR");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level alias is represented by an item owner");
+        };
+        let ItemKind::Alias { generics, ty } = item.kind else {
+            panic!("alias item retains its alias kind");
+        };
+        assert!(generics.params.is_empty());
+        assert!(matches!(ty.kind, HirTyKind::Err));
+        assert!(hir_owner.body.is_none());
+    }
+
+    #[test]
+    fn alias_owner_rejects_non_type_paths_and_other_item_kinds() {
+        let file = crate::FileId::new(256);
+        let source = "type Alias = I32\nconst VALUE: I32 = 1\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let alias_entry = item_tree.items.first().expect("alias item entry");
+        let const_entry = item_tree.items.get(1).expect("constant item entry");
+        let wrong_name = symbols.intern("Alias").expect("symbol interns");
+        let (_packages, wrong_paths, wrong_owner) =
+            owner_context_with_data(&symbols, DefPathData::ValueNs(wrong_name));
+        let wrong_expected_path = owner_def_path(&wrong_paths, wrong_owner);
+        let arena = HirArena::new();
+        let wrong_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &wrong_paths,
+        );
+        assert!(matches!(
+            lower_alias_owner(
+                wrong_owner,
+                &wrong_expected_path,
+                &item_tree,
+                alias_entry.ast_id,
+                &wrong_context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            wrong_paths.len().unwrap(),
+            1,
+            "wrong namespace is rejected before generic paths are interned"
+        );
+
+        let name = symbols.intern("Alias").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        assert!(matches!(
+            lower_alias_owner(
+                owner,
+                &expected_path,
+                &item_tree,
+                const_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "a constant entry cannot allocate alias generics"
+        );
     }
 
     #[test]
