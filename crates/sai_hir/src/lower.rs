@@ -8,7 +8,7 @@ use crate::expressions::{
 };
 use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
 use crate::items::{
-    FieldDef, HirOwner, Item, ItemKind, OwnerNode, Variant as HirVariant,
+    FieldDef, HirOwner, Item, ItemKind, OwnerNode, TraitItem, TraitItemKind, Variant as HirVariant,
     VariantShape as HirVariantShape,
 };
 use crate::literals::Lit;
@@ -1019,6 +1019,269 @@ pub fn lower_trait_owner<'hir>(
         },
         source_map,
     ))
+}
+
+/// Lower one associated type or method from a trait as a separate owner.
+///
+/// `trait_owner` is the already-lowered enclosing trait, and `trait_item_id`
+/// identifies its ItemTree entry. `item_id` selects a direct associated
+/// declaration from that trait's `ItemList`. The associated item's complete
+/// expected `DefPath` must be nested immediately below the trait owner.
+pub fn lower_trait_item_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    trait_owner: &HirOwner<'hir>,
+    trait_item_id: ast::ErasedAstId,
+    item_id: ast::ErasedAstId,
+    item_tree: &'hir ItemTree,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let OwnerNode::Item(parent_item) = trait_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item.owner_id != trait_owner.id || !matches!(parent_item.kind, ItemKind::Trait { .. })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let trait_def = trait_owner.id.def_id;
+    let (trait_entry, trait_syntax) =
+        resolve_item_tree_entry(item_tree, trait_item_id, ItemTreeKind::Trait, context)?;
+    let trait_declaration =
+        ast::TraitDecl::cast(trait_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if parent_item.span
+        != (Span {
+            file: item_tree.file,
+            range: trait_declaration.syntax().text_range(),
+            ctxt: SpanCtxt::Root,
+        })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    validate_current_item_metadata(
+        trait_entry,
+        trait_declaration.attrs(),
+        item_visibility(trait_declaration.syntax()),
+        context,
+    )?;
+    let trait_path = context
+        .def_paths
+        .resolve(trait_def)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    if !matches!(
+        trait_path.data().last(),
+        Some(component) if component.data == DefPathData::TypeNs(trait_entry.name)
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_list = trait_declaration
+        .items()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::ITEM_LIST,
+        ))?;
+    let item_entry = trait_entry
+        .children
+        .iter()
+        .find(|child| {
+            child.ast_id == item_id
+                && matches!(child.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn)
+        })
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let associated_index = trait_entry
+        .children
+        .iter()
+        .filter(|child| matches!(child.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn))
+        .position(|child| child.ast_id == item_id)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let ItemKind::Trait {
+        items: parent_item_owners,
+        ..
+    } = parent_item.kind
+    else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item_owners.get(associated_index) != Some(&owner) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_syntax = context
+        .ast_ids
+        .pointer(item_id)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if !item_list.syntax().children().any(|child| {
+        child.kind() == item_syntax.kind() && child.text_range() == item_syntax.text_range()
+    }) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let expected_component = match item_entry.kind {
+        ItemTreeKind::AssocType => DefPathData::AssocType(item_entry.name),
+        ItemTreeKind::AssocFn => DefPathData::AssocFn(item_entry.name),
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    };
+    match item_entry.kind {
+        ItemTreeKind::AssocType => {
+            let declaration = ast::AssocTypeDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            validate_current_item_metadata(
+                item_entry,
+                declaration.attrs().collect::<Vec<_>>().into_iter(),
+                crate::Visibility::Private,
+                context,
+            )?;
+        }
+        ItemTreeKind::AssocFn => {
+            let function = ast::FnDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            validate_current_item_metadata(
+                item_entry,
+                function.attrs().collect::<Vec<_>>().into_iter(),
+                item_visibility(function.syntax()),
+                context,
+            )?;
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    }
+    validate_owner_def_path(owner, expected_path, expected_component.clone(), context)?;
+    let owner_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    let source_disambiguator = trait_entry
+        .children
+        .iter()
+        .take_while(|child| child.ast_id != item_id)
+        .filter(|child| child.kind == item_entry.kind && child.name == item_entry.name)
+        .count();
+    let source_disambiguator = u32::try_from(source_disambiguator)
+        .map_err(|_| DefPathInternerError::TooManyDefinitions)?;
+    let Some(parent_components) = owner_path.data().get(..trait_path.data().len()) else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_components != trait_path.data()
+        || owner_path.data().len() != trait_path.data().len() + 1
+        || !matches!(
+            owner_path.data().last(),
+            Some(component)
+                if component.data == expected_component
+                    && component.disambiguator == source_disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    match item_entry.kind {
+        ItemTreeKind::AssocType => {
+            let declaration = ast::AssocTypeDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            if let Some(bounds) = declaration.bounds() {
+                for bound in bounds.bounds() {
+                    ensure_supported_bound(bound)?;
+                }
+            }
+        }
+        ItemTreeKind::AssocFn => {
+            let function = ast::FnDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            ensure_supported_generics(&function)?;
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        &item_syntax,
+    )?
+    .with_def_path_interner(context.def_paths);
+    match item_entry.kind {
+        ItemTreeKind::AssocType => {
+            let declaration = ast::AssocTypeDecl::cast(item_syntax)
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let name = lower_item_name(
+                declaration.name(),
+                declaration.syntax(),
+                context.symbols,
+                &source_map,
+            )?;
+            if name.sym != item_entry.name {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            let bounds = declaration
+                .bounds()
+                .map(|bounds| {
+                    lower_bounds(&bounds, context.arena, context.symbols, &mut source_map)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+            let item = context.arena.alloc_trait_item(TraitItem {
+                owner_id: owner,
+                trait_def,
+                name,
+                kind: TraitItemKind::AssocType {
+                    bounds: context.arena.alloc_bounds(&bounds),
+                },
+                span,
+            });
+            let source_map = source_map.finish();
+            let diagnostics = source_map.diagnostics().to_vec();
+            Ok((
+                HirOwner {
+                    id: owner,
+                    node: OwnerNode::TraitItem(item),
+                    body: None,
+                    raw_attrs: &item_entry.raw_attrs,
+                    diagnostics,
+                },
+                source_map,
+            ))
+        }
+        ItemTreeKind::AssocFn => {
+            let function =
+                ast::FnDecl::cast(item_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let name = lower_item_name(
+                function.name(),
+                function.syntax(),
+                context.symbols,
+                &source_map,
+            )?;
+            if name.sym != item_entry.name {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            let (sig, generics, body) = lower_function_with_generics(
+                &function,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            let span = source_map.span_for(function.syntax(), SpanCtxt::Root)?;
+            let item = context.arena.alloc_trait_item(TraitItem {
+                owner_id: owner,
+                trait_def,
+                name,
+                kind: TraitItemKind::Fn {
+                    sig,
+                    generics: *generics,
+                    has_body: function.body().is_some(),
+                },
+                span,
+            });
+            let source_map = source_map.finish();
+            let diagnostics = source_map.diagnostics().to_vec();
+            Ok((
+                HirOwner {
+                    id: owner,
+                    node: OwnerNode::TraitItem(item),
+                    body,
+                    raw_attrs: &item_entry.raw_attrs,
+                    diagnostics,
+                },
+                source_map,
+            ))
+        }
+        _ => Err(HirLoweringError::ItemTreeEntryMismatch),
+    }
 }
 
 /// Lower one top-level constant entry from the current item tree.
@@ -17980,6 +18243,266 @@ mod tests {
             1,
             "rejected owner inputs do not intern associated item paths"
         );
+    }
+
+    #[test]
+    fn lowers_trait_associated_type_and_function_owners() {
+        let file = crate::FileId::new(283);
+        let source = concat!(
+            "trait Convert<T> {\n",
+            "    type Output: Clone\n",
+            "    fn convert<U: Clone>(self: borrow Self, value: U) -> U\n",
+            "    fn identity(self: borrow Self, value: T) -> T { value }\n",
+            "    fn contracted(self: borrow Self) -> Bool requires result ensures result\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let trait_entry = item_tree.items.first().expect("trait item entry");
+        let trait_name = symbols.intern("Convert").expect("symbol interns");
+        let (_packages, paths, trait_owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(trait_name));
+        let trait_path = owner_def_path(&paths, trait_owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (trait_hir, _) = lower_trait_owner(
+            trait_owner,
+            &trait_path,
+            &item_tree,
+            trait_entry.ast_id,
+            &context,
+        )
+        .expect("trait owner lowers");
+        let OwnerNode::Item(trait_item) = trait_hir.node else {
+            panic!("trait declaration is represented by an item owner");
+        };
+        let ItemKind::Trait {
+            items: trait_item_owners,
+            ..
+        } = trait_item.kind
+        else {
+            panic!("trait declaration retains its trait item kind");
+        };
+        let associated_entries = trait_entry
+            .children
+            .iter()
+            .filter(|child| matches!(child.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn))
+            .collect::<Vec<_>>();
+        assert_eq!(associated_entries.len(), 4);
+        assert_eq!(trait_item_owners.len(), associated_entries.len());
+
+        for (index, (owner, entry)) in trait_item_owners.iter().zip(associated_entries).enumerate()
+        {
+            let expected_path = paths
+                .resolve(owner.def_id)
+                .expect("associated path resolves")
+                .expect("associated path exists");
+            let (hir_owner, source_map) = lower_trait_item_owner(
+                *owner,
+                &expected_path,
+                &trait_hir,
+                trait_entry.ast_id,
+                entry.ast_id,
+                &item_tree,
+                &context,
+            )
+            .expect("associated trait item lowers as an owner");
+            assert_eq!(hir_owner.id, *owner);
+            assert_eq!(hir_owner.raw_attrs, entry.raw_attrs);
+            assert_eq!(source_map.owner(), *owner);
+            let OwnerNode::TraitItem(item) = hir_owner.node else {
+                panic!("trait member has a TraitItem owner node");
+            };
+            assert_eq!(item.owner_id, *owner);
+            assert_eq!(item.trait_def, trait_owner.def_id);
+            assert_eq!(item.name.sym, entry.name);
+
+            match (index, item.kind) {
+                (0, TraitItemKind::AssocType { bounds }) => {
+                    assert_eq!(bounds.len(), 1);
+                    assert!(source_map.syntax_for_node(bounds[0].hir_id).is_some());
+                    assert!(hir_owner.body.is_none());
+                }
+                (
+                    1,
+                    TraitItemKind::Fn {
+                        generics, has_body, ..
+                    },
+                ) => {
+                    assert_eq!(generics.params.len(), 1);
+                    assert!(!has_body);
+                    assert!(hir_owner.body.is_none());
+                }
+                (2, TraitItemKind::Fn { has_body, .. }) => {
+                    assert!(has_body);
+                    assert!(matches!(
+                        hir_owner.body.map(|body| &body.value.kind),
+                        Some(ExprKind::Block(_))
+                    ));
+                }
+                (3, TraitItemKind::Fn { sig, has_body, .. }) => {
+                    assert!(!has_body, "trait contracts do not make a default method");
+                    assert_eq!(sig.requires.len(), 1);
+                    assert_eq!(sig.ensures.len(), 1);
+                    let body = hir_owner
+                        .body
+                        .expect("bodiless contract clauses have a synthetic body");
+                    assert_eq!(body.contracts.len(), 2);
+                    assert!(
+                        matches!(body.value.kind, ExprKind::Tuple(elements) if elements.is_empty())
+                    );
+                }
+                _ => panic!("associated item kind and source order are preserved"),
+            }
+        }
+    }
+
+    #[test]
+    fn trait_associated_owner_rejects_mismatched_parent_and_sibling_identity() {
+        let file = crate::FileId::new(284);
+        let source = concat!(
+            "trait Duplicate {\n",
+            "    fn same()\n",
+            "    fn same()\n",
+            "}\n",
+            "trait Duplicate {\n",
+            "    fn same()\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let trait_entry = item_tree.items.first().expect("first trait item entry");
+        let other_trait_entry = item_tree.items.get(1).expect("same-named trait entry");
+        let trait_name = symbols.intern("Duplicate").expect("symbol interns");
+        let (_packages, paths, trait_owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(trait_name));
+        let trait_path = owner_def_path(&paths, trait_owner);
+        let mut other_trait_path_data = trait_path.data().to_vec();
+        other_trait_path_data
+            .last_mut()
+            .expect("trait path has a terminal component")
+            .disambiguator = 1;
+        let other_trait_path = DefPath::new(
+            trait_path.package(),
+            other_trait_path_data,
+            &_packages,
+            &symbols,
+        )
+        .expect("duplicate trait path is valid");
+        let other_trait_owner = OwnerId {
+            def_id: paths
+                .intern(other_trait_path.clone())
+                .expect("duplicate trait path interns"),
+        };
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (trait_hir, _) = lower_trait_owner(
+            trait_owner,
+            &trait_path,
+            &item_tree,
+            trait_entry.ast_id,
+            &context,
+        )
+        .expect("trait owner lowers");
+        let (other_trait_hir, _) = lower_trait_owner(
+            other_trait_owner,
+            &other_trait_path,
+            &item_tree,
+            other_trait_entry.ast_id,
+            &context,
+        )
+        .expect("same-named trait owner lowers independently");
+        let OwnerNode::Item(item) = trait_hir.node else {
+            panic!("trait declaration is represented by an item owner");
+        };
+        let ItemKind::Trait {
+            items: associated_owners,
+            ..
+        } = item.kind
+        else {
+            panic!("trait declaration retains associated owners");
+        };
+        assert_eq!(associated_owners.len(), 2);
+
+        let associated_entries = trait_entry
+            .children
+            .iter()
+            .filter(|child| child.kind == ItemTreeKind::AssocFn)
+            .collect::<Vec<_>>();
+        assert_eq!(associated_entries.len(), 2);
+        let OwnerNode::Item(other_item) = other_trait_hir.node else {
+            panic!("second trait declaration is represented by an item owner");
+        };
+        let ItemKind::Trait {
+            items: other_associated_owners,
+            ..
+        } = other_item.kind
+        else {
+            panic!("second trait declaration retains associated owners");
+        };
+        assert_eq!(other_associated_owners.len(), 1);
+        let first_path = paths
+            .resolve(associated_owners[0].def_id)
+            .expect("first path resolves")
+            .expect("first path exists");
+        let mut wrong_path_data = first_path.data().to_vec();
+        wrong_path_data
+            .last_mut()
+            .expect("associated path has a terminal component")
+            .disambiguator = 7;
+        let wrong_path = DefPath::new(first_path.package(), wrong_path_data, &_packages, &symbols)
+            .expect("alternate disambiguator forms a valid path");
+
+        assert!(matches!(
+            lower_trait_item_owner(
+                associated_owners[0],
+                &wrong_path,
+                &trait_hir,
+                trait_entry.ast_id,
+                associated_entries[0].ast_id,
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+
+        let other_path = paths
+            .resolve(other_associated_owners[0].def_id)
+            .expect("other associated path resolves")
+            .expect("other associated path exists");
+        assert!(matches!(
+            lower_trait_item_owner(
+                other_associated_owners[0],
+                &other_path,
+                &other_trait_hir,
+                trait_entry.ast_id,
+                associated_entries[0].ast_id,
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+
+        assert!(matches!(
+            lower_trait_item_owner(
+                associated_owners[0],
+                &first_path,
+                &trait_hir,
+                trait_entry.ast_id,
+                associated_entries[1].ast_id,
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
     }
 
     #[test]
