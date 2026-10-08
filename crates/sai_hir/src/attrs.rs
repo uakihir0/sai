@@ -716,6 +716,7 @@ pub(crate) fn validate_attrs_at_stage(
     let mut first_by_name = HashMap::<AttrName, Span>::new();
     let mut first_attribute_by_name = HashMap::<AttrName, usize>::new();
     let mut seen_lint_codes = HashSet::<(DiagnosticLintLevel, Symbol)>::new();
+    let mut first_lint_level_by_code = HashMap::<Symbol, (DiagnosticLintLevel, Span)>::new();
 
     for (attribute_index, attribute) in attributes.iter().enumerate() {
         if attribute.has_error {
@@ -817,6 +818,8 @@ pub(crate) fn validate_attrs_at_stage(
         drop_duplicate_arguments(
             &mut prepared,
             &mut seen_lint_codes,
+            &mut first_lint_level_by_code,
+            symbols,
             snapshot,
             &mut validated.diagnostics,
         )?;
@@ -1787,6 +1790,8 @@ fn parse_deprecated(
 fn drop_duplicate_arguments(
     prepared: &mut PreparedAttribute,
     seen_lint_codes: &mut HashSet<(DiagnosticLintLevel, Symbol)>,
+    first_lint_level_by_code: &mut HashMap<Symbol, (DiagnosticLintLevel, Span)>,
+    symbols: &Interner,
     snapshot: &WorkspaceSnapshot,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), AttrValidationError> {
@@ -1811,16 +1816,43 @@ fn drop_duplicate_arguments(
         PreparedAttribute::Lints(lints) => {
             let mut retained = Vec::with_capacity(lints.len());
             for lint in std::mem::take(lints) {
-                if seen_lint_codes.insert((lint.level, lint.name)) {
-                    retained.push(lint);
-                } else {
+                if !seen_lint_codes.insert((lint.level, lint.name)) {
                     diagnostics.push(diagnostic_at(
                         Code::DuplicateAttributeArgument,
                         "duplicate lint code at the same level on this target",
                         lint.span,
                         snapshot,
                     )?);
+                    continue;
                 }
+
+                if let Some((previous_level, previous_span)) =
+                    first_lint_level_by_code.get(&lint.name).copied()
+                {
+                    if previous_level != lint.level {
+                        let name = symbols
+                            .resolve(lint.name)
+                            .map_err(|_| AttrValidationError::ForeignSymbol)?;
+                        let mut diagnostic = diagnostic_at(
+                            Code::ConflictingLintLevel,
+                            format!("conflicting levels for lint `{name}` on this target"),
+                            lint.span,
+                            snapshot,
+                        )?;
+                        push_label(
+                            &mut diagnostic,
+                            previous_span,
+                            "first level is here",
+                            snapshot,
+                        )?;
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                } else {
+                    first_lint_level_by_code.insert(lint.name, (lint.level, lint.span));
+                }
+
+                retained.push(lint);
             }
             *lints = retained;
         }
@@ -2762,6 +2794,48 @@ mod tests {
                 .expect("lint symbol")
                 .as_ref(),
             "UNUSED_VARIABLE"
+        );
+    }
+
+    #[test]
+    fn lint_level_conflicts_report_the_later_level_and_keep_the_first() {
+        let source = concat!(
+            "@warn(UNUSED_VARIABLE)\n",
+            "@deny(UNUSED_VARIABLE, UNUSED_VARIABLE)\n",
+            "fn f() {}\n",
+        );
+        let (validated, _) = validate_source(source, function_target());
+
+        assert_eq!(validated.lint_levels.len(), 1);
+        assert_eq!(validated.lint_levels[0].level, DiagnosticLintLevel::Warn);
+        assert_eq!(validated.diagnostics.len(), 2);
+        assert_eq!(validated.diagnostics[0].code, Code::ConflictingLintLevel);
+        assert!(validated.diagnostics[0].message.contains("UNUSED_VARIABLE"));
+        assert_eq!(
+            validated.diagnostics[0]
+                .primary()
+                .expect("conflict has a primary")
+                .span
+                .range
+                .start()
+                .to_usize(),
+            source.find("@deny").expect("later lint level") + "@deny(".len()
+        );
+        assert_eq!(validated.diagnostics[0].labels().len(), 1);
+        let first_code_offset =
+            u32::try_from(source.find("UNUSED_VARIABLE").expect("first lint level"))
+                .expect("source offset fits");
+        assert_eq!(
+            validated.diagnostics[0].labels()[0]
+                .location
+                .span
+                .range
+                .start(),
+            sai_vfs::TextSize::new(first_code_offset)
+        );
+        assert_eq!(
+            validated.diagnostics[1].code,
+            Code::DuplicateAttributeArgument
         );
     }
 

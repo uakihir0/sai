@@ -87,6 +87,7 @@ define_codes! {
     InvalidAttributeArgument => "INVALID_ATTRIBUTE_ARGUMENT",
     DuplicateAttribute => "DUPLICATE_ATTRIBUTE",
     DuplicateAttributeArgument => "DUPLICATE_ATTRIBUTE_ARGUMENT",
+    ConflictingLintLevel => "CONFLICTING_LINT_LEVEL",
     ConflictingAttributes => "CONFLICTING_ATTRIBUTES",
     UnknownAttribute => "UNKNOWN_ATTRIBUTE",
     UnknownDerive => "UNKNOWN_DERIVE",
@@ -1635,6 +1636,10 @@ mod tests {
             Some(Code::UnexpectedCharacter)
         );
         assert_eq!(Code::from_name("EXPECTED_TOKEN"), Some(Code::ExpectedToken));
+        assert_eq!(
+            Code::from_name("CONFLICTING_LINT_LEVEL"),
+            Some(Code::ConflictingLintLevel)
+        );
         assert_eq!(
             Code::from_name("VISIBILITY_ON_TRAIT_IMPL_ITEM"),
             Some(Code::VisibilityOnTraitImplItem)
