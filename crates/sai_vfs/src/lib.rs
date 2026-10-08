@@ -188,6 +188,39 @@ impl FileInterner {
         self.intern(key)
     }
 
+    /// Interns package-root-relative paths as one all-or-nothing batch.
+    ///
+    /// All paths and the available `FileId` range are validated before any
+    /// IDs are assigned, so a failed batch does not partially mutate the
+    /// interner.
+    pub fn intern_package_files(
+        &mut self,
+        packages: &PackageInterner,
+        package_id: PackageId,
+        package_relative_paths: impl IntoIterator<Item = PackageRelativePath>,
+    ) -> Result<Vec<FileId>, FileInternerError> {
+        let package_key = packages
+            .resolve(package_id)
+            .map_err(FileInternerError::Package)?;
+        let keys = package_relative_paths
+            .into_iter()
+            .map(|path| {
+                FileKey::from_package_path(package_key.as_ref(), path)
+                    .map_err(FileInternerError::FileKey)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let new_keys = keys
+            .iter()
+            .filter(|key| !self.by_key.contains_key(*key))
+            .collect::<BTreeSet<_>>();
+        if !can_assign_file_ids(self.keys.len(), new_keys.len()) {
+            return Err(FileInternerError::TooManyFiles);
+        }
+
+        keys.into_iter().map(|key| self.intern(key)).collect()
+    }
+
     /// Resolves a session ID to its stable file key, if it belongs to this interner.
     pub fn file_key(&self, file_id: FileId) -> Option<&FileKey> {
         self.keys.get(file_id.raw() as usize)
@@ -200,6 +233,16 @@ impl FileInterner {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+}
+
+fn can_assign_file_ids(current_len: usize, additional_ids: usize) -> bool {
+    if additional_ids == 0 {
+        return true;
+    }
+
+    current_len
+        .checked_add(additional_ids - 1)
+        .is_some_and(|last_index| u32::try_from(last_index).is_ok())
 }
 
 /// A validated stable package identity suitable for use as a query key.
@@ -2864,6 +2907,66 @@ mod tests {
             .source_text(&mut database, first_key, first_id)
             .expect("VFS source uses the session-local ID");
         assert_eq!(source.source().id(), first_id);
+    }
+
+    #[test]
+    fn file_interner_batch_interning_preserves_order_and_reuses_duplicate_paths() {
+        let packages = PackageInterner::new();
+        let package_id = packages
+            .intern("acme:app#0.1")
+            .expect("package key is interned");
+        let mut files = FileInterner::new();
+        let invalid_package_id = packages
+            .intern("not-canonical")
+            .expect("the interner leaves key validation to its caller");
+
+        assert_eq!(
+            files.intern_package_files(
+                &packages,
+                invalid_package_id,
+                [PackageRelativePath::new("wit/invalid.wit").expect("path is valid")],
+            ),
+            Err(FileInternerError::FileKey(FileKeyError::InvalidPackageKey))
+        );
+        assert!(files.is_empty());
+
+        let ids = files
+            .intern_package_files(
+                &packages,
+                package_id,
+                [
+                    PackageRelativePath::new("wit/a.wit").expect("first path is valid"),
+                    PackageRelativePath::new("wit/b.wit").expect("second path is valid"),
+                    PackageRelativePath::new("wit/a.wit").expect("duplicate path is valid"),
+                ],
+            )
+            .expect("batch paths are interned");
+        assert_eq!(ids[0].raw(), 0);
+        assert_eq!(ids[1].raw(), 1);
+        assert_eq!(ids[0], ids[2]);
+        assert_eq!(files.len(), 2);
+
+        let later_ids = files
+            .intern_package_files(
+                &packages,
+                package_id,
+                [
+                    PackageRelativePath::new("wit/b.wit").expect("existing path is valid"),
+                    PackageRelativePath::new("wit/c.wit").expect("new path is valid"),
+                ],
+            )
+            .expect("existing IDs can be reused in a later batch");
+        assert_eq!(later_ids[0], ids[1]);
+        assert_eq!(later_ids[1].raw(), 2);
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn file_interner_batch_capacity_check_accepts_only_representable_ids() {
+        assert!(can_assign_file_ids(0, 0));
+        assert!(can_assign_file_ids(u32::MAX as usize, 1));
+        assert!(!can_assign_file_ids(u32::MAX as usize, 2));
+        assert!(!can_assign_file_ids(usize::MAX, 2));
     }
 
     #[test]

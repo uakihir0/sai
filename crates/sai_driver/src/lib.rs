@@ -7,7 +7,7 @@ use sai_query::{Durability, QueryDatabase, QueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex,
-    PackageFilesSnapshot, PackageKey, PackageRelativePath, PackageSourceDirectory,
+    PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
     PackageSourcePath, SourceText, VfsInputSnapshot, VfsInputUpdate, VfsInputs, WitFilesSnapshot,
     WorkspaceSnapshot,
 };
@@ -31,12 +31,39 @@ pub struct RootDatabase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RootDatabaseError {
     Query(QueryError),
+    Package(PackageIdError),
+    PackageKey(PackageKeyError),
+    FileInterner(FileInternerError),
     FileNotInterned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InternedWitFiles {
+    NotApplicable,
+    Listed(Vec<FileId>),
 }
 
 impl From<QueryError> for RootDatabaseError {
     fn from(error: QueryError) -> Self {
         Self::Query(error)
+    }
+}
+
+impl From<PackageIdError> for RootDatabaseError {
+    fn from(error: PackageIdError) -> Self {
+        Self::Package(error)
+    }
+}
+
+impl From<PackageKeyError> for RootDatabaseError {
+    fn from(error: PackageKeyError) -> Self {
+        Self::PackageKey(error)
+    }
+}
+
+impl From<FileInternerError> for RootDatabaseError {
+    fn from(error: FileInternerError) -> Self {
+        Self::FileInterner(error)
     }
 }
 
@@ -201,6 +228,33 @@ impl RootDatabase {
         self.vfs.line_index(&mut self.query_database, key)
     }
 
+    /// Reads WIT paths and interns them as session-local file IDs.
+    ///
+    /// `None` means no WIT inventory input exists. `NotApplicable` preserves
+    /// an explicitly recorded package without a usable WIT directory, while
+    /// `Listed([])` preserves an existing directory with no direct WIT files.
+    pub fn intern_wit_files(
+        &mut self,
+        package_id: PackageId,
+    ) -> Result<Option<InternedWitFiles>, RootDatabaseError> {
+        let package_name = self.packages.resolve(package_id)?;
+        let package_key = PackageKey::new(package_name.as_ref())?;
+        let Some(snapshot) = self.vfs.wit_files(&mut self.query_database, package_key)? else {
+            return Ok(None);
+        };
+        match snapshot {
+            WitFilesSnapshot::NotApplicable => Ok(Some(InternedWitFiles::NotApplicable)),
+            WitFilesSnapshot::Listed { files, .. } => {
+                let file_ids = self.files.intern_package_files(
+                    &self.packages,
+                    package_id,
+                    files.iter().cloned(),
+                )?;
+                Ok(Some(InternedWitFiles::Listed(file_ids)))
+            }
+        }
+    }
+
     /// Parses a file and binds syntax diagnostics to the supplied snapshot.
     pub fn parse_file(
         &mut self,
@@ -331,5 +385,88 @@ mod tests {
             "beta"
         );
         assert!(second_tree.matches_ast_ids(&second_ast_ids));
+    }
+
+    #[test]
+    fn root_database_interns_wit_paths_and_preserves_listing_states() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let package_id = database
+            .intern_package("acme:app#0.1")
+            .expect("package is interned");
+        let package_key = PackageKey::new("acme:app#0.1").expect("package key is valid");
+
+        assert_eq!(database.intern_wit_files(package_id), Ok(None));
+
+        let foreign_packages = PackageInterner::new();
+        let foreign_package_id = foreign_packages
+            .intern("acme:app#0.1")
+            .expect("foreign package is interned");
+        assert_eq!(
+            database.intern_wit_files(foreign_package_id),
+            Err(RootDatabaseError::Package(PackageIdError::UnknownPackage))
+        );
+
+        assert!(
+            database
+                .set_wit_files(
+                    package_key.clone(),
+                    WitFilesSnapshot::not_applicable(),
+                    Durability::Low,
+                )
+                .expect("not-applicable inventory is set")
+        );
+        assert_eq!(
+            database.intern_wit_files(package_id),
+            Ok(Some(InternedWitFiles::NotApplicable))
+        );
+
+        assert!(
+            database
+                .set_wit_files(
+                    package_key.clone(),
+                    WitFilesSnapshot::listed("wit", []).expect("empty WIT inventory is valid"),
+                    Durability::Low,
+                )
+                .expect("empty inventory is set")
+        );
+        assert_eq!(
+            database.intern_wit_files(package_id),
+            Ok(Some(InternedWitFiles::Listed(Vec::new())))
+        );
+
+        assert!(
+            database
+                .set_wit_files(
+                    package_key,
+                    WitFilesSnapshot::listed(
+                        "wit",
+                        [PackageRelativePath::new("wit/app.wit").expect("WIT path is valid")],
+                    )
+                    .expect("WIT inventory is valid"),
+                    Durability::Low,
+                )
+                .expect("WIT file inventory is set")
+        );
+        let Some(InternedWitFiles::Listed(file_ids)) = database
+            .intern_wit_files(package_id)
+            .expect("WIT paths intern")
+        else {
+            panic!("one WIT file should be listed");
+        };
+        assert_eq!(file_ids.len(), 1);
+        assert_eq!(
+            database
+                .file_key(file_ids[0])
+                .expect("WIT file ID resolves")
+                .path(),
+            "wit/app.wit"
+        );
+        assert_eq!(
+            database
+                .file_key(file_ids[0])
+                .expect("WIT file ID resolves")
+                .package_key(),
+            "acme:app#0.1"
+        );
     }
 }

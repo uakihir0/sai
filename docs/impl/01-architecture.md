@@ -201,6 +201,8 @@ A query that, directly or through other queries, reads itself is a **query cycle
 
 **Implementation update (IR-209, partial).** The new `sai_driver::RootDatabase` owns the query runtime, VFS inputs, package/file/symbol interners, syntax queries, and item-tree queries for a compiler session. Its driver methods apply individual or batched VFS updates and request decoded source, line indexes, snapshot-bound parses, AST-ID maps, and item trees. This is a composition facade over the existing adapter APIs; it does not yet implement every query group or provide owner-level HIR, source-map, and attribute queries.
 
+**Implementation update (IR-210, partial).** `RootDatabase::intern_wit_files(PackageId)` reads the tracked WIT inventory, interns each package-relative WIT path as a session-local `FileId`, and preserves the differences between a missing inventory, `NotApplicable`, an empty `Listed` set, and listed files. The rest of package discovery and WIT loading remains outside this driver slice.
+
 ## 1.5 Identifiers, interning, and arenas
 
 ### 1.5.1 Session identifiers
