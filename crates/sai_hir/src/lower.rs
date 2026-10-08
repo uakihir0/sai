@@ -87,6 +87,13 @@ pub struct InterfaceResourceMemberIds {
     pub member: ast::ErasedAstId,
 }
 
+/// AST identities that locate one world item within its world declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorldItemIds {
+    pub world: ast::ErasedAstId,
+    pub item: ast::ErasedAstId,
+}
+
 /// Lower a function declaration's signature and body within its HIR owner.
 ///
 /// The source-map builder must be rooted at `declaration`. An async function
@@ -103,7 +110,7 @@ pub fn lower_function<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(FnSig<'hir>, Option<&'hir Body<'hir>>), HirLoweringError> {
     let (signature, _, body) =
-        lower_function_inner(declaration, arena, symbols, source_map, false, true)?;
+        lower_function_inner(declaration, arena, symbols, source_map, false, true, false)?;
     Ok((signature, body))
 }
 
@@ -126,13 +133,14 @@ pub fn lower_function_with_generics<'hir>(
     ),
     HirLoweringError,
 > {
-    lower_function_inner(declaration, arena, symbols, source_map, true, true)
+    lower_function_inner(declaration, arena, symbols, source_map, true, true, false)
 }
 
 /// Lower a function signature and generics without lowering a body or
-/// contracts. Interface and world function declarations use this entry point:
-/// their grammar diagnoses bodies and contracts, and their HIR owners never
-/// contain a `Body`.
+/// contracts. Interface function declarations use this entry point: their
+/// grammar diagnoses bodies and contracts, and their HIR owners never contain
+/// a `Body`. World function owners use a separate signature-only path because
+/// their HIR schema does not retain generic parameters.
 pub fn lower_function_signature_with_generics<'hir>(
     declaration: &ast::FnDecl,
     arena: &'hir HirArena<'hir>,
@@ -140,8 +148,19 @@ pub fn lower_function_signature_with_generics<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(FnSig<'hir>, &'hir HirGenerics<'hir>), HirLoweringError> {
     let (signature, generics, _) =
-        lower_function_inner(declaration, arena, symbols, source_map, true, false)?;
+        lower_function_inner(declaration, arena, symbols, source_map, true, false, false)?;
     Ok((signature, generics))
+}
+
+fn lower_world_function_signature<'hir>(
+    declaration: &ast::FnDecl,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<FnSig<'hir>, HirLoweringError> {
+    let (signature, _, _) =
+        lower_function_inner(declaration, arena, symbols, source_map, false, false, true)?;
+    Ok(signature)
 }
 
 /// Lower one top-level function entry from the current item tree into a
@@ -1211,6 +1230,327 @@ pub fn lower_world_owner<'hir>(
         },
         source_map,
     ))
+}
+
+/// Lower one direct import, export, or include owner from a world.
+///
+/// The world owner, ItemTree entry, child syntax, owner slot, and complete
+/// DefPath must all refer to the same source-ordered declaration.
+pub fn lower_world_item_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    world_owner: &HirOwner<'hir>,
+    item_ids: WorldItemIds,
+    item_tree: &'hir ItemTree,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let OwnerNode::Item(parent_item) = world_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    let ItemKind::World {
+        items: parent_item_owners,
+    } = parent_item.kind
+    else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item.owner_id != world_owner.id {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let (world_entry, world_syntax) =
+        resolve_item_tree_entry(item_tree, item_ids.world, ItemTreeKind::World, context)?;
+    let world_declaration =
+        ast::WorldDecl::cast(world_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let world_visibility = item_visibility(world_declaration.syntax());
+    validate_current_item_metadata(
+        world_entry,
+        world_declaration.attrs(),
+        world_visibility,
+        context,
+    )?;
+    if parent_item.name.sym != world_entry.name
+        || parent_item.vis != world_visibility
+        || !raw_attrs_match(world_owner.raw_attrs, &world_entry.raw_attrs)
+        || parent_item.span
+            != (Span {
+                file: item_tree.file,
+                range: world_declaration.syntax().text_range(),
+                ctxt: SpanCtxt::Root,
+            })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let world_path = context
+        .def_paths
+        .resolve(world_owner.id.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    validate_owner_def_path(
+        world_owner.id,
+        &world_path,
+        DefPathData::World(world_entry.name),
+        context,
+    )?;
+    if !matches!(
+        world_path.data().last(),
+        Some(component)
+            if component.disambiguator == world_entry_disambiguator(world_entry, context)?
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let item_list = world_declaration
+        .items()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::ITEM_LIST,
+        ))?;
+    let child_paths = prepare_world_item_paths(world_entry, &item_list, context)?;
+    let item_entry = world_entry
+        .children
+        .iter()
+        .find(|child| child.ast_id == item_ids.item)
+        .filter(|child| {
+            matches!(
+                child.kind,
+                ItemTreeKind::WorldItem { .. } | ItemTreeKind::WorldInclude
+            )
+        })
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+
+    let mut child_index = 0;
+    let mut item_syntax = None;
+    for syntax in item_list.syntax().children() {
+        let item_ast_id = if let Some(item) = ast::WorldImport::cast(syntax.clone()) {
+            context.ast_ids.ast_id(&item).map(ast::AstId::erase)
+        } else if let Some(item) = ast::WorldExport::cast(syntax.clone()) {
+            context.ast_ids.ast_id(&item).map(ast::AstId::erase)
+        } else if let Some(item) = ast::WorldInclude::cast(syntax.clone()) {
+            context.ast_ids.ast_id(&item).map(ast::AstId::erase)
+        } else {
+            continue;
+        }
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+        if item_ast_id == item_ids.item {
+            item_syntax = Some(syntax);
+            break;
+        }
+        child_index += 1;
+    }
+    let item_syntax = item_syntax.ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if parent_item_owners.get(child_index) != Some(&owner) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let (component, disambiguator) = child_paths
+        .get(child_index)
+        .cloned()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    validate_owner_def_path(owner, expected_path, component.clone(), context)?;
+    let item_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    if item_path.data().get(..world_path.data().len()) != Some(world_path.data())
+        || item_path.data().len() != world_path.data().len() + 1
+        || !matches!(
+            item_path.data().last(),
+            Some(path_component)
+                if path_component.data == component
+                    && path_component.disambiguator == disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let (attrs, kind) = match item_entry.kind {
+        ItemTreeKind::WorldItem { import: true } => {
+            let declaration = ast::WorldImport::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                declaration.attrs().collect::<Vec<_>>(),
+                WorldItemSyntax::Import(declaration),
+            )
+        }
+        ItemTreeKind::WorldItem { import: false } => {
+            let declaration = ast::WorldExport::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                declaration.attrs().collect::<Vec<_>>(),
+                WorldItemSyntax::Export(declaration),
+            )
+        }
+        ItemTreeKind::WorldInclude => {
+            let declaration = ast::WorldInclude::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                declaration.attrs().collect::<Vec<_>>(),
+                WorldItemSyntax::Include(declaration),
+            )
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    };
+    validate_current_item_metadata(
+        item_entry,
+        attrs.into_iter(),
+        crate::Visibility::Private,
+        context,
+    )?;
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        &item_syntax,
+    )?
+    .with_def_path_interner(context.def_paths);
+    let source = context
+        .snapshot
+        .file(context.ast_ids.file())
+        .ok_or(HirSourceMapError::WorkspaceSnapshotMismatch)?
+        .source()
+        .text();
+    let kind = match kind {
+        WorldItemSyntax::Import(declaration) => {
+            match (declaration.function(), declaration.reference()) {
+                (Some(function), None) => {
+                    let name = lower_item_name(
+                        function.name(),
+                        function.syntax(),
+                        context.symbols,
+                        &source_map,
+                    )?;
+                    if name.sym != item_entry.name {
+                        return Err(HirLoweringError::ItemTreeEntryMismatch);
+                    }
+                    let sig = lower_world_function_signature(
+                        &function,
+                        context.arena,
+                        context.symbols,
+                        &mut source_map,
+                    )?;
+                    crate::items::WorldItemKind::ImportFn { name, sig }
+                }
+                (None, Some(reference)) => {
+                    if world_reference_symbol(source, Some(reference.clone()), context.symbols)?
+                        != item_entry.name
+                    {
+                        return Err(HirLoweringError::ItemTreeEntryMismatch);
+                    }
+                    let reference = lower_world_ref(
+                        &reference,
+                        context.arena,
+                        context.symbols,
+                        &mut source_map,
+                    )?;
+                    crate::items::WorldItemKind::Import(reference)
+                }
+                _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+            }
+        }
+        WorldItemSyntax::Export(declaration) => {
+            match (declaration.function(), declaration.reference()) {
+                (Some(function), None) => {
+                    let name = lower_item_name(
+                        function.name(),
+                        function.syntax(),
+                        context.symbols,
+                        &source_map,
+                    )?;
+                    if name.sym != item_entry.name {
+                        return Err(HirLoweringError::ItemTreeEntryMismatch);
+                    }
+                    let sig = lower_world_function_signature(
+                        &function,
+                        context.arena,
+                        context.symbols,
+                        &mut source_map,
+                    )?;
+                    crate::items::WorldItemKind::ExportFn { name, sig }
+                }
+                (None, Some(reference)) => {
+                    if world_reference_symbol(source, Some(reference.clone()), context.symbols)?
+                        != item_entry.name
+                    {
+                        return Err(HirLoweringError::ItemTreeEntryMismatch);
+                    }
+                    let reference = lower_world_ref(
+                        &reference,
+                        context.arena,
+                        context.symbols,
+                        &mut source_map,
+                    )?;
+                    crate::items::WorldItemKind::Export(reference)
+                }
+                _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+            }
+        }
+        WorldItemSyntax::Include(declaration) => {
+            let reference =
+                declaration
+                    .reference()
+                    .ok_or(HirLoweringError::MissingRequiredSyntax(
+                        SyntaxKind::WORLD_REF,
+                    ))?;
+            if world_reference_symbol(source, Some(reference.clone()), context.symbols)?
+                != item_entry.name
+            {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            let reference =
+                lower_world_ref(&reference, context.arena, context.symbols, &mut source_map)?;
+            crate::items::WorldItemKind::Include(reference)
+        }
+    };
+    let span = source_map.span_for(&item_syntax, SpanCtxt::Root)?;
+    let item = context.arena.alloc_world_item(crate::items::WorldItem {
+        owner_id: owner,
+        world: world_owner.id.def_id,
+        kind,
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::WorldItem(item),
+            body: None,
+            raw_attrs: &item_entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
+enum WorldItemSyntax {
+    Import(ast::WorldImport),
+    Export(ast::WorldExport),
+    Include(ast::WorldInclude),
+}
+
+fn lower_world_ref<'hir>(
+    reference: &ast::WorldRef,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<crate::items::WorldRef<'hir>, HirLoweringError> {
+    if let Some(package) = reference.package() {
+        let hir_id = source_map.add_node(reference.syntax())?;
+        let path = arena.alloc_str(package.syntax().text());
+        let span = source_map.span_for(reference.syntax(), SpanCtxt::Root)?;
+        return Ok(crate::items::WorldRef::Pkg { hir_id, path, span });
+    }
+    let segments = reference
+        .mod_path()
+        .filter(|path| !contains_error_node(path.syntax()))
+        .map(|path| path.segments().collect())
+        .unwrap_or_default();
+    Ok(crate::items::WorldRef::Mod(*lower_mod_path(
+        reference.syntax(),
+        segments,
+        arena,
+        symbols,
+        source_map,
+    )?))
 }
 
 /// Lower one direct type, enum, resource, or function member of an interface.
@@ -3695,6 +4035,7 @@ fn lower_function_inner<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
     lower_generics: bool,
     lower_body: bool,
+    allow_nested_declaration: bool,
 ) -> Result<
     (
         FnSig<'hir>,
@@ -3703,8 +4044,9 @@ fn lower_function_inner<'hir>(
     ),
     HirLoweringError,
 > {
-    if source_map.pointer_for(declaration.syntax())?
-        != source_map.pointer_for(source_map.owner_syntax())?
+    if !allow_nested_declaration
+        && source_map.pointer_for(declaration.syntax())?
+            != source_map.pointer_for(source_map.owner_syntax())?
     {
         return Err(HirLoweringError::UnsupportedSyntax(
             declaration.syntax().kind(),
@@ -10033,6 +10375,7 @@ fn is_direct_block_error(error: &SyntaxNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::items::{WorldItemKind, WorldRef};
     use crate::{DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, OwnerId};
     use sai_intern::PackageInterner;
     use sai_syntax::{SyntaxKind, ast::AstNode};
@@ -21645,6 +21988,438 @@ mod tests {
                 "stale world-item names must be rejected before path interning"
             );
         }
+    }
+
+    #[test]
+    fn lowers_world_item_owners_and_their_references() {
+        let file = crate::FileId::new(303);
+        let source = concat!(
+            "world client {\n",
+            "    import wasi:http/clock\n",
+            "    export local.api\n",
+            "    include common.base\n",
+            "    import fn tick(value: U32) -> U64\n",
+            "    export fn start()\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects world items");
+        let world_entry = item_tree.items.first().expect("world item-tree entry");
+        assert_eq!(world_entry.children.len(), 5);
+        let world_name = symbols.intern("client").expect("world name interns");
+        let (_packages, paths, world_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::World(world_name));
+        let world_path = owner_def_path(&paths, world_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (world_owner, _) = lower_world_owner(
+            world_owner_id,
+            &world_path,
+            &item_tree,
+            world_entry.ast_id,
+            &context,
+        )
+        .expect("world owner lowers");
+        let OwnerNode::Item(world_item) = world_owner.node else {
+            panic!("world declaration has an item owner");
+        };
+        let ItemKind::World { items: world_items } = world_item.kind else {
+            panic!("world declaration retains its child owners");
+        };
+        assert_eq!(world_items.len(), 5);
+
+        let world_refs = parsed
+            .root
+            .descendants()
+            .filter_map(ast::WorldRef::cast)
+            .collect::<Vec<_>>();
+        assert_eq!(world_refs.len(), 3);
+        let mut lowered_items = Vec::new();
+        let mut source_maps = Vec::new();
+        for (index, entry) in world_entry.children.iter().enumerate() {
+            let owner = world_items[index];
+            let expected_path = owner_def_path(&paths, owner);
+            let (hir_owner, source_map) = lower_world_item_owner(
+                owner,
+                &expected_path,
+                &world_owner,
+                WorldItemIds {
+                    world: world_entry.ast_id,
+                    item: entry.ast_id,
+                },
+                &item_tree,
+                &context,
+            )
+            .expect("world item owner lowers");
+            assert_eq!(hir_owner.id, owner);
+            assert_eq!(source_map.owner(), owner);
+            assert!(hir_owner.body.is_none());
+            let OwnerNode::WorldItem(item) = hir_owner.node else {
+                panic!("world child has a world-item owner");
+            };
+            assert_eq!(item.world, world_owner_id.def_id);
+            assert_eq!(item.span.file, file);
+            assert!(!item.span.range.is_empty());
+            lowered_items.push(item.kind);
+            source_maps.push(source_map);
+        }
+
+        let package_path = "wasi:http/clock";
+        let WorldItemKind::Import(WorldRef::Pkg { hir_id, path, span }) = lowered_items[0] else {
+            panic!("package imports lower as package world references");
+        };
+        assert_eq!(path, package_path);
+        assert_eq!(span.file, file);
+        assert_eq!(span.range, world_refs[0].syntax().text_range());
+        assert_eq!(
+            source_maps[0]
+                .syntax_for_node(hir_id)
+                .expect("package reference has a source-map entry")
+                .kind(),
+            SyntaxKind::WORLD_REF
+        );
+        assert_eq!(
+            source_maps[0].syntax_for_node(hir_id).unwrap().text_range(),
+            world_refs[0].syntax().text_range()
+        );
+
+        let WorldItemKind::Export(WorldRef::Mod(path)) = lowered_items[1] else {
+            panic!("module exports lower as module world references");
+        };
+        assert_eq!(path.root, PathRoot::Plain);
+        assert_eq!(path.segments.len(), 2);
+        assert_eq!(path.segments[0].name.sym, symbols.intern("local").unwrap());
+        assert_eq!(path.segments[1].name.sym, symbols.intern("api").unwrap());
+        let reference_path = world_refs[1].mod_path().expect("export has a module path");
+        assert_eq!(
+            source_maps[1]
+                .syntax_for_node(path.hir_id)
+                .expect("module reference has a source-map entry")
+                .kind(),
+            SyntaxKind::WORLD_REF,
+            "the WorldRef HIR ID maps to its enclosing WorldRef syntax"
+        );
+        assert_eq!(
+            source_maps[1]
+                .syntax_for_node(path.hir_id)
+                .unwrap()
+                .text_range(),
+            world_refs[1].syntax().text_range()
+        );
+        for (hir_segment, source_segment) in path.segments.iter().zip(reference_path.segments()) {
+            let mapped = source_maps[1]
+                .syntax_for_node(hir_segment.hir_id)
+                .expect("module segment has a source-map entry");
+            assert_eq!(mapped.kind(), SyntaxKind::NAME_REF);
+            assert_eq!(mapped.text_range(), source_segment.syntax().text_range());
+        }
+
+        let WorldItemKind::Include(WorldRef::Mod(path)) = lowered_items[2] else {
+            panic!("includes lower as module world references");
+        };
+        assert_eq!(path.segments.len(), 2);
+        assert_eq!(path.segments[0].name.sym, symbols.intern("common").unwrap());
+        assert_eq!(path.segments[1].name.sym, symbols.intern("base").unwrap());
+        assert!(source_maps[2].syntax_for_node(path.hir_id).is_some());
+
+        let WorldItemKind::ImportFn { name, sig } = lowered_items[3] else {
+            panic!("world import functions lower with signatures");
+        };
+        assert_eq!(name.sym, symbols.intern("tick").unwrap());
+        assert_eq!(sig.params.len(), 1);
+        assert!(sig.ret.is_some());
+        assert!(sig.requires.is_empty());
+        assert!(sig.ensures.is_empty());
+        assert!(
+            source_maps[3]
+                .syntax_for_node(sig.params[0].hir_id)
+                .is_some()
+        );
+
+        let WorldItemKind::ExportFn { name, sig } = lowered_items[4] else {
+            panic!("world export functions lower with signatures");
+        };
+        assert_eq!(name.sym, symbols.intern("start").unwrap());
+        assert!(sig.params.is_empty());
+        assert!(sig.ret.is_none());
+        assert_eq!(source_maps[4].node_to_syntax().len(), 1);
+    }
+
+    #[test]
+    fn world_item_owner_rejects_crosswired_children_and_stale_names() {
+        let file = crate::FileId::new(304);
+        let source = concat!(
+            "world client {\n",
+            "    import local.api\n",
+            "    import local.api\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects duplicate world imports");
+        let world_entry = item_tree.items.first().expect("world item-tree entry");
+        assert_eq!(world_entry.children.len(), 2);
+        let world_name = symbols.intern("client").expect("world name interns");
+        let (_packages, paths, world_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::World(world_name));
+        let world_path = owner_def_path(&paths, world_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (world_owner, _) = lower_world_owner(
+            world_owner_id,
+            &world_path,
+            &item_tree,
+            world_entry.ast_id,
+            &context,
+        )
+        .expect("world owner lowers");
+        let OwnerNode::Item(world_item) = world_owner.node else {
+            panic!("world declaration has an item owner");
+        };
+        let ItemKind::World { items } = world_item.kind else {
+            panic!("world declaration retains its child owners");
+        };
+        let first_path = owner_def_path(&paths, items[0]);
+        assert!(matches!(
+            lower_world_item_owner(
+                items[1],
+                &owner_def_path(&paths, items[1]),
+                &world_owner,
+                WorldItemIds {
+                    world: world_entry.ast_id,
+                    item: world_entry.children[0].ast_id,
+                },
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        let mut wrong_disambiguator = first_path.data().to_vec();
+        wrong_disambiguator.last_mut().unwrap().disambiguator = 1;
+        let wrong_path = DefPath::new(
+            first_path.package(),
+            wrong_disambiguator,
+            &_packages,
+            &symbols,
+        )
+        .expect("wrong disambiguator path is well formed");
+        assert!(matches!(
+            lower_world_item_owner(
+                items[0],
+                &wrong_path,
+                &world_owner,
+                WorldItemIds {
+                    world: world_entry.ast_id,
+                    item: world_entry.children[0].ast_id,
+                },
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+
+        let forged = symbols.intern("forged").expect("forged symbol interns");
+        let mut stale_item_tree = item_tree.clone();
+        stale_item_tree.items[0].children[0].name = forged;
+        let path_count = paths.len().unwrap();
+        assert!(matches!(
+            lower_world_item_owner(
+                items[0],
+                &first_path,
+                &world_owner,
+                WorldItemIds {
+                    world: world_entry.ast_id,
+                    item: world_entry.children[0].ast_id,
+                },
+                &stale_item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(paths.len().unwrap(), path_count);
+    }
+
+    #[test]
+    fn world_item_owner_keeps_error_recovery_and_drops_diagnosed_generics() {
+        let file = crate::FileId::new(305);
+        let source = concat!(
+            "world client {\n",
+            "    import 3\n",
+            "    export fn convert<T>(value: T) -> T where T: Copy\n",
+            "    export fn broken(value: ) ->\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ExpectedToken)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::GenericInterfaceItem)
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects recovered world items");
+        let world_entry = item_tree.items.first().expect("world item-tree entry");
+        assert_eq!(world_entry.children.len(), 3);
+        let world_name = symbols.intern("client").expect("world name interns");
+        let (_packages, paths, world_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::World(world_name));
+        let world_path = owner_def_path(&paths, world_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (world_owner, _) = lower_world_owner(
+            world_owner_id,
+            &world_path,
+            &item_tree,
+            world_entry.ast_id,
+            &context,
+        )
+        .expect("world owner lowers recovered items");
+        let OwnerNode::Item(world_item) = world_owner.node else {
+            panic!("world declaration has an item owner");
+        };
+        let ItemKind::World { items } = world_item.kind else {
+            panic!("world declaration retains its child owners");
+        };
+        for (index, entry) in world_entry.children.iter().enumerate() {
+            let owner = items[index];
+            let expected_path = owner_def_path(&paths, owner);
+            let (hir_owner, _) = lower_world_item_owner(
+                owner,
+                &expected_path,
+                &world_owner,
+                WorldItemIds {
+                    world: world_entry.ast_id,
+                    item: entry.ast_id,
+                },
+                &item_tree,
+                &context,
+            )
+            .expect("parser-recovered world item lowers");
+            let OwnerNode::WorldItem(item) = hir_owner.node else {
+                panic!("world child has a world-item owner");
+            };
+            match (index, item.kind) {
+                (0, WorldItemKind::Import(WorldRef::Mod(path))) => {
+                    assert!(path.segments.is_empty());
+                }
+                (1, WorldItemKind::ExportFn { name, sig }) => {
+                    assert_eq!(name.sym, symbols.intern("convert").unwrap());
+                    assert_eq!(sig.params.len(), 1);
+                    assert!(sig.ret.is_some());
+                }
+                (2, WorldItemKind::ExportFn { name, sig }) => {
+                    assert_eq!(name.sym, symbols.intern("broken").unwrap());
+                    assert_eq!(sig.params.len(), 1);
+                    assert!(matches!(sig.params[0].ty.kind, HirTyKind::Err));
+                    assert!(sig.ret.is_some_and(|ty| matches!(ty.kind, HirTyKind::Err)));
+                }
+                _ => panic!("recovered world item has the expected HIR shape"),
+            }
+            assert!(hir_owner.body.is_none());
+        }
+        assert_eq!(
+            paths.len().unwrap(),
+            4,
+            "only the world and its three item paths are interned; diagnosed generic syntax has no owner path"
+        );
+    }
+
+    #[test]
+    fn world_item_owner_rejects_a_same_name_sibling_world() {
+        let file = crate::FileId::new(306);
+        let source = concat!(
+            "world client {\n",
+            "    import local.api\n",
+            "}\n",
+            "world client {\n",
+            "    import local.api\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects sibling worlds");
+        let worlds = item_tree
+            .items
+            .iter()
+            .filter(|entry| entry.kind == ItemTreeKind::World)
+            .collect::<Vec<_>>();
+        assert_eq!(worlds.len(), 2);
+        let world_name = symbols.intern("client").expect("world name interns");
+        let (packages, paths, first_world_id) =
+            owner_context_with_data(&symbols, DefPathData::World(world_name));
+        let first_world_path = owner_def_path(&paths, first_world_id);
+        let mut second_path_data = first_world_path.data().to_vec();
+        second_path_data.last_mut().unwrap().disambiguator = 1;
+        let second_world_path = DefPath::new(
+            first_world_path.package(),
+            second_path_data,
+            &packages,
+            &symbols,
+        )
+        .expect("sibling world path is valid");
+        let second_world_id = OwnerId {
+            def_id: paths
+                .intern(second_world_path.clone())
+                .expect("sibling world path interns"),
+        };
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (first_world, _) = lower_world_owner(
+            first_world_id,
+            &first_world_path,
+            &item_tree,
+            worlds[0].ast_id,
+            &context,
+        )
+        .expect("first world lowers");
+        let (second_world, _) = lower_world_owner(
+            second_world_id,
+            &second_world_path,
+            &item_tree,
+            worlds[1].ast_id,
+            &context,
+        )
+        .expect("second world lowers");
+        let OwnerNode::Item(first_item) = first_world.node else {
+            panic!("world declaration has an item owner");
+        };
+        let ItemKind::World { items: first_items } = first_item.kind else {
+            panic!("world declaration retains its child owners");
+        };
+        let expected_path = owner_def_path(&paths, first_items[0]);
+        assert!(matches!(
+            lower_world_item_owner(
+                first_items[0],
+                &expected_path,
+                &first_world,
+                WorldItemIds {
+                    world: worlds[1].ast_id,
+                    item: worlds[1].children[0].ast_id,
+                },
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(second_world.id, second_world_id);
     }
 
     #[test]
