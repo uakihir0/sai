@@ -606,7 +606,7 @@ pub fn validate_attrs(
     )
 }
 
-fn validate_attrs_at_stage(
+pub(crate) fn validate_attrs_at_stage(
     attributes: &[RawAttr],
     target: Option<AttributeTarget>,
     symbols: &Interner,
@@ -863,7 +863,7 @@ fn validate_derive_names(
     }
 }
 
-fn derive_lang_item(name: &str) -> Option<LangItem> {
+pub(crate) fn derive_lang_item(name: &str) -> Option<LangItem> {
     Some(match name {
         "Copy" => LangItem::Copy,
         "Clone" => LangItem::Clone,

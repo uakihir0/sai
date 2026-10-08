@@ -1,5 +1,6 @@
 use crate::Symbol;
 use crate::arena::HirArena;
+use crate::attrs::{TargetKind, ValidatedAttrs};
 use crate::body::{Body, BodyParam, Contract, ContractKind, FnParam, FnSig};
 use crate::expressions::{
     Arg, Arm as HirArm, BinOp, Block as HirBlock, CaptureBy, Closure, ClosureParam, Expr, ExprKind,
@@ -8,8 +9,8 @@ use crate::expressions::{
 };
 use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
 use crate::items::{
-    FieldDef, HirOwner, ImplItem, ImplItemKind, InterfaceItem, InterfaceItemKind, Item, ItemKind,
-    MemberRole, OwnerNode, TraitItem, TraitItemKind, Variant as HirVariant,
+    DerivedImpl, FieldDef, HirOwner, ImplItem, ImplItemKind, InterfaceItem, InterfaceItemKind,
+    Item, ItemKind, MemberRole, OwnerNode, TraitItem, TraitItemKind, Variant as HirVariant,
     VariantShape as HirVariantShape,
 };
 use crate::literals::Lit;
@@ -951,6 +952,163 @@ pub fn lower_enum_owner<'hir>(
         },
         source_map,
     ))
+}
+
+/// Lower one synthetic owner for every validated derive on a type owner.
+///
+/// The supplied type owner may be a top-level item or a type member of an
+/// interface. The validated derive list is checked against the current
+/// ItemTree and syntax before any child DefPaths are interned.
+pub fn lower_derived_impl_owners<'hir>(
+    type_owner: &HirOwner<'hir>,
+    expected_type_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    attrs: &ValidatedAttrs,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<Vec<(HirOwner<'hir>, HirSourceMap)>, HirLoweringError> {
+    let (entry, parent_entry, syntax) =
+        resolve_item_tree_entry_anywhere(item_tree, item_id, context)?;
+    let (target_kind, name, attributes, visibility) = derive_parent_syntax(entry, &syntax)?;
+    validate_current_item_metadata(entry, attributes.into_iter(), visibility, context)?;
+    validate_owner_def_path(
+        type_owner.id,
+        expected_type_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+
+    let type_source_map = HirSourceMapBuilder::new(
+        type_owner.id,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        &syntax,
+    )?;
+    let source_name = lower_item_name(name, &syntax, context.symbols, &type_source_map)?;
+    let source_span = type_source_map.span_for(&syntax, SpanCtxt::Root)?;
+    if source_name.sym != entry.name
+        || !derived_parent_hir_matches(
+            type_owner,
+            entry,
+            target_kind,
+            source_name,
+            source_span,
+            visibility,
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let expected_type_disambiguator = match parent_entry {
+        Some(interface_entry) => {
+            validate_derived_interface_parent(
+                type_owner,
+                interface_entry,
+                &syntax,
+                expected_type_path,
+                &type_source_map,
+                item_tree,
+                context,
+            )?;
+            interface_child_source_disambiguator(
+                interface_entry,
+                &syntax,
+                source_name.sym,
+                &type_source_map,
+                context,
+            )?
+        }
+        None => top_level_type_source_disambiguator(
+            &syntax,
+            source_name.sym,
+            &type_source_map,
+            context,
+        )?,
+    };
+    if !matches!(
+        expected_type_path.data().last(),
+        Some(component) if component.disambiguator == expected_type_disambiguator
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let pending =
+        validated_derive_sources(entry, target_kind, parent_entry.is_some(), attrs, context)?;
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let child_paths = pending
+        .iter()
+        .map(|source| {
+            (
+                DefPathData::DerivedImpl {
+                    trait_name: source.name,
+                },
+                0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let child_def_ids = context
+        .def_paths
+        .intern_children(type_owner.id.def_id, &child_paths)?;
+    if child_def_ids.len() != pending.len() {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let mut owners = Vec::with_capacity(pending.len());
+    for (source, def_id) in pending.into_iter().zip(child_def_ids) {
+        let owner_id = OwnerId { def_id };
+        let source_map = HirSourceMapBuilder::new(
+            owner_id,
+            context.ast_ids,
+            context.snapshot,
+            context.root,
+            source.name_syntax.syntax(),
+        )?;
+        let span = source_map.span_for(
+            source.name_syntax.syntax(),
+            SpanCtxt::Desugared(DesugaringKind::Derive),
+        )?;
+        let derived = context.arena.alloc_derived_impl(DerivedImpl {
+            owner_id,
+            trait_: source.trait_,
+            self_def: type_owner.id.def_id,
+            span,
+        });
+        let source_map = source_map.finish();
+        let child_path = context
+            .def_paths
+            .resolve(def_id)?
+            .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+        let expected_component = DefPathData::DerivedImpl {
+            trait_name: source.name,
+        };
+        if child_path.package() != expected_type_path.package()
+            || child_path.data().len() != expected_type_path.data().len() + 1
+            || child_path.data().get(..expected_type_path.data().len())
+                != Some(expected_type_path.data())
+            || !matches!(
+                child_path.data().last(),
+                Some(component)
+                    if component.data == expected_component && component.disambiguator == 0
+            )
+        {
+            return Err(HirLoweringError::ItemTreeEntryMismatch);
+        }
+        let diagnostics = source_map.diagnostics().to_vec();
+        owners.push((
+            HirOwner {
+                id: owner_id,
+                node: OwnerNode::DerivedImpl(derived),
+                body: None,
+                raw_attrs: &[],
+                diagnostics,
+            },
+            source_map,
+        ));
+    }
+    Ok(owners)
 }
 
 /// Lower a trait declaration into its HIR owner.
@@ -3877,6 +4035,525 @@ pub fn lower_effect_owner<'hir>(
         },
         source_map,
     ))
+}
+
+struct ValidatedDerivedSource {
+    trait_: LangItem,
+    name: Symbol,
+    name_syntax: ast::NameRef,
+}
+
+fn resolve_item_tree_entry_anywhere<'tree, 'hir>(
+    item_tree: &'tree ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<
+    (
+        &'tree crate::item_tree::ItemTreeEntry,
+        Option<&'tree crate::item_tree::ItemTreeEntry>,
+        SyntaxNode,
+    ),
+    HirLoweringError,
+> {
+    if !item_tree.matches_ast_ids(context.ast_ids) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    if item_tree.file != context.ast_ids.file()
+        || !context.ast_ids.matches_root(item_tree.file, context.root)
+    {
+        return Err(HirSourceMapError::AstIdMapMismatch.into());
+    }
+    if !context.ast_ids.matches_snapshot(context.snapshot) {
+        return Err(HirSourceMapError::WorkspaceSnapshotMismatch.into());
+    }
+
+    fn find<'tree>(
+        entries: &'tree [crate::item_tree::ItemTreeEntry],
+        parent: Option<&'tree crate::item_tree::ItemTreeEntry>,
+        item_id: ast::ErasedAstId,
+        found: &mut Option<(
+            &'tree crate::item_tree::ItemTreeEntry,
+            Option<&'tree crate::item_tree::ItemTreeEntry>,
+        )>,
+    ) -> Result<(), HirLoweringError> {
+        for entry in entries {
+            if entry.ast_id == item_id {
+                if found.is_some() {
+                    return Err(HirLoweringError::ItemTreeEntryMismatch);
+                }
+                *found = Some((entry, parent));
+            }
+            find(&entry.children, Some(entry), item_id, found)?;
+        }
+        Ok(())
+    }
+
+    let mut found = None;
+    find(&item_tree.items, None, item_id, &mut found)?;
+    let (entry, parent) = found.ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let syntax = context
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    Ok((entry, parent, syntax))
+}
+
+fn derive_parent_syntax(
+    entry: &crate::item_tree::ItemTreeEntry,
+    syntax: &SyntaxNode,
+) -> Result<
+    (
+        TargetKind,
+        Option<ast::Name>,
+        Vec<ast::Attribute>,
+        crate::Visibility,
+    ),
+    HirLoweringError,
+> {
+    let (target, name, attrs, visibility) = match entry.kind {
+        ItemTreeKind::Struct | ItemTreeKind::Refined => {
+            let declaration = ast::TypeDecl::cast(syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let actual_kind = type_decl_item_tree_kind(&declaration);
+            if actual_kind != entry.kind {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            (
+                if entry.kind == ItemTreeKind::Struct {
+                    TargetKind::Record
+                } else {
+                    TargetKind::Refined
+                },
+                declaration.name(),
+                declaration.attrs().collect(),
+                item_visibility(declaration.syntax()),
+            )
+        }
+        ItemTreeKind::Distinct => {
+            let declaration = ast::DistinctDecl::cast(syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                TargetKind::Distinct,
+                declaration.name(),
+                declaration.attrs().collect(),
+                item_visibility(declaration.syntax()),
+            )
+        }
+        ItemTreeKind::Enum => {
+            let declaration = ast::EnumDecl::cast(syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                TargetKind::Enum,
+                declaration.name(),
+                declaration.attrs().collect(),
+                item_visibility(declaration.syntax()),
+            )
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    };
+    Ok((target, name, attrs, visibility))
+}
+
+fn type_decl_item_tree_kind(declaration: &ast::TypeDecl) -> ItemTreeKind {
+    if declaration.struct_def().is_some() {
+        ItemTreeKind::Struct
+    } else if declaration
+        .alias_def()
+        .is_some_and(|definition| definition.refinement().is_some())
+    {
+        ItemTreeKind::Refined
+    } else {
+        ItemTreeKind::Alias
+    }
+}
+
+fn derived_parent_hir_matches(
+    owner: &HirOwner<'_>,
+    entry: &crate::item_tree::ItemTreeEntry,
+    target: TargetKind,
+    name: Name,
+    span: Span,
+    visibility: crate::Visibility,
+) -> bool {
+    if !raw_attrs_match(owner.raw_attrs, &entry.raw_attrs) {
+        return false;
+    }
+    match owner.node {
+        OwnerNode::Item(item) => {
+            item.owner_id == owner.id
+                && item.name == name
+                && item.vis == visibility
+                && item.span == span
+                && match (entry.kind, target, item.kind) {
+                    (ItemTreeKind::Struct, TargetKind::Record, ItemKind::Struct { .. }) => {
+                        owner.body.is_none()
+                    }
+                    (ItemTreeKind::Enum, TargetKind::Enum, ItemKind::Enum { .. }) => {
+                        owner.body.is_none()
+                    }
+                    (
+                        ItemTreeKind::Distinct,
+                        TargetKind::Distinct,
+                        ItemKind::Distinct { has_predicate, .. },
+                    ) => owner.body.is_some() == has_predicate,
+                    (ItemTreeKind::Refined, TargetKind::Refined, ItemKind::Refined { .. }) => {
+                        owner.body.is_some()
+                    }
+                    _ => false,
+                }
+        }
+        OwnerNode::InterfaceItem(item) => {
+            item.owner_id == owner.id
+                && item.name == name
+                && item.span == span
+                && owner.body.is_none()
+                && matches!(
+                    (entry.kind, target, item.kind),
+                    (
+                        ItemTreeKind::Struct,
+                        TargetKind::Record,
+                        InterfaceItemKind::Struct { .. }
+                    ) | (
+                        ItemTreeKind::Enum,
+                        TargetKind::Enum,
+                        InterfaceItemKind::Enum { .. }
+                    ) | (
+                        ItemTreeKind::Refined,
+                        TargetKind::Refined,
+                        InterfaceItemKind::Refined { .. }
+                    )
+                )
+        }
+        _ => false,
+    }
+}
+
+fn validate_derived_interface_parent<'hir>(
+    type_owner: &HirOwner<'hir>,
+    interface_entry: &crate::item_tree::ItemTreeEntry,
+    type_syntax: &SyntaxNode,
+    type_path: &DefPath,
+    source_map: &HirSourceMapBuilder<'_>,
+    item_tree: &ItemTree,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(), HirLoweringError> {
+    let OwnerNode::InterfaceItem(interface_item) = type_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if interface_entry.kind != ItemTreeKind::Interface {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let interface_syntax = context
+        .ast_ids
+        .pointer(interface_entry.ast_id)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let declaration = ast::InterfaceDecl::cast(interface_syntax.clone())
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(interface_entry, declaration.attrs(), visibility, context)?;
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        source_map,
+    )?;
+    if name.sym != interface_entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_list = declaration
+        .items()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::ITEM_LIST,
+        ))?;
+    if !item_list.syntax().children().any(|child| {
+        child.kind() == type_syntax.kind() && child.text_range() == type_syntax.text_range()
+    }) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let interface_path = context
+        .def_paths
+        .resolve(interface_item.interface)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    let interface_disambiguator =
+        top_level_interface_source_disambiguator(&interface_syntax, name.sym, source_map, context)?;
+    if type_path.package() != interface_path.package()
+        || type_path.data().len() != interface_path.data().len() + 1
+        || type_path.data().get(..interface_path.data().len()) != Some(interface_path.data())
+        || !matches!(
+            interface_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::Interface(interface_entry.name)
+                    && component.disambiguator == interface_disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    Ok(())
+}
+
+fn validated_derive_sources(
+    entry: &crate::item_tree::ItemTreeEntry,
+    target_kind: TargetKind,
+    inside_interface: bool,
+    attrs: &ValidatedAttrs,
+    context: &HirLoweringContext<'_, '_>,
+) -> Result<Vec<ValidatedDerivedSource>, HirLoweringError> {
+    let mut target = crate::attrs::AttributeTarget::new(target_kind);
+    target.inside_interface = inside_interface;
+    let current_attrs = crate::attrs::validate_attrs_at_stage(
+        &entry.raw_attrs,
+        Some(target),
+        context.symbols,
+        context.snapshot,
+        2,
+    )
+    .map_err(|_| HirLoweringError::ItemTreeEntryMismatch)?;
+    if current_attrs.derives != attrs.derives {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let mut sources = Vec::with_capacity(attrs.derives.len());
+    let mut previous_start = None;
+    let mut seen_traits = HashSet::with_capacity(attrs.derives.len());
+    for (trait_, span) in &attrs.derives {
+        if span.file != context.ast_ids.file()
+            || previous_start.is_some_and(|start| start >= span.range.start())
+            || !seen_traits.insert(*trait_)
+        {
+            return Err(HirLoweringError::ItemTreeEntryMismatch);
+        }
+        previous_start = Some(span.range.start());
+        let mut matched_name = None;
+        let mut matched_attribute = None;
+        for attribute in &entry.raw_attrs {
+            if attribute.name != crate::item_tree::AttrName::Derive || attribute.has_error {
+                continue;
+            }
+            let Some(arguments) = attribute.args.as_deref() else {
+                continue;
+            };
+            for argument in arguments {
+                let RawAttrArg::Word {
+                    name,
+                    raw: false,
+                    is_upper: true,
+                    args: None,
+                    span: argument_span,
+                } = argument
+                else {
+                    continue;
+                };
+                if argument_span.file != span.file || argument_span.range != span.range {
+                    continue;
+                }
+                let spelling = context
+                    .symbols
+                    .resolve(*name)
+                    .map_err(|_| HirLoweringError::ItemTreeEntryMismatch)?;
+                if crate::attrs::derive_lang_item(&spelling) != Some(*trait_)
+                    || matched_name.replace(*name).is_some()
+                {
+                    return Err(HirLoweringError::ItemTreeEntryMismatch);
+                }
+                matched_attribute = Some(attribute);
+            }
+        }
+        let name = matched_name.ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+        let attribute = matched_attribute.ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+        let syntax = attribute
+            .ptr
+            .resolve(context.ast_ids.file(), context.root)
+            .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+        let args = syntax
+            .args()
+            .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+        let mut name_syntax = None;
+        for argument in args.items() {
+            if argument.args().is_some() {
+                continue;
+            }
+            let Some(argument_name) = argument.name() else {
+                continue;
+            };
+            if argument_name.syntax().text_range() != span.range {
+                continue;
+            }
+            if argument_name
+                .syntax()
+                .first_token()
+                .is_none_or(|token| token.kind() != SyntaxKind::UIDENT)
+            {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            if name_syntax.replace(argument_name).is_some() {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+        }
+        sources.push(ValidatedDerivedSource {
+            trait_: *trait_,
+            name,
+            name_syntax: name_syntax.ok_or(HirLoweringError::ItemTreeEntryMismatch)?,
+        });
+    }
+    Ok(sources)
+}
+
+fn top_level_type_source_disambiguator(
+    target_syntax: &SyntaxNode,
+    target_name: Symbol,
+    source_map: &HirSourceMapBuilder<'_>,
+    context: &HirLoweringContext<'_, '_>,
+) -> Result<u32, HirLoweringError> {
+    let mut disambiguator = 0u32;
+    for syntax in context.root.children() {
+        let Some(name) = type_namespace_name(&syntax, context.symbols, source_map)? else {
+            continue;
+        };
+        if name != target_name {
+            continue;
+        }
+        if same_syntax_node(&syntax, target_syntax) {
+            return Ok(disambiguator);
+        }
+        disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+    }
+    Err(HirLoweringError::ItemTreeEntryMismatch)
+}
+
+fn type_namespace_name(
+    syntax: &SyntaxNode,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Option<Symbol>, HirLoweringError> {
+    let name = if let Some(declaration) = ast::TypeDecl::cast(syntax.clone()) {
+        lower_item_name(
+            declaration.name(),
+            declaration.syntax(),
+            symbols,
+            source_map,
+        )?
+    } else if let Some(declaration) = ast::EnumDecl::cast(syntax.clone()) {
+        lower_item_name(
+            declaration.name(),
+            declaration.syntax(),
+            symbols,
+            source_map,
+        )?
+    } else if let Some(declaration) = ast::DistinctDecl::cast(syntax.clone()) {
+        lower_item_name(
+            declaration.name(),
+            declaration.syntax(),
+            symbols,
+            source_map,
+        )?
+    } else if let Some(declaration) = ast::ResourceDecl::cast(syntax.clone()) {
+        lower_item_name(
+            declaration.name(),
+            declaration.syntax(),
+            symbols,
+            source_map,
+        )?
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(name.sym))
+}
+
+fn interface_child_source_disambiguator(
+    interface_entry: &crate::item_tree::ItemTreeEntry,
+    target_syntax: &SyntaxNode,
+    target_name: Symbol,
+    source_map: &HirSourceMapBuilder<'_>,
+    context: &HirLoweringContext<'_, '_>,
+) -> Result<u32, HirLoweringError> {
+    let interface_syntax = context
+        .ast_ids
+        .pointer(interface_entry.ast_id)
+        .and_then(|pointer| pointer.resolve(context.ast_ids.file(), context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let declaration = ast::InterfaceDecl::cast(interface_syntax)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let item_list = declaration
+        .items()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::ITEM_LIST,
+        ))?;
+    let mut disambiguator = 0u32;
+    for syntax in item_list.syntax().children() {
+        let name = if let Some(declaration) = ast::TypeDecl::cast(syntax.clone()) {
+            Some(lower_item_name(
+                declaration.name(),
+                declaration.syntax(),
+                context.symbols,
+                source_map,
+            )?)
+        } else if let Some(declaration) = ast::EnumDecl::cast(syntax.clone()) {
+            Some(lower_item_name(
+                declaration.name(),
+                declaration.syntax(),
+                context.symbols,
+                source_map,
+            )?)
+        } else if let Some(declaration) = ast::IfaceResource::cast(syntax.clone()) {
+            Some(lower_item_name(
+                declaration.name(),
+                declaration.syntax(),
+                context.symbols,
+                source_map,
+            )?)
+        } else {
+            None
+        };
+        if name.is_none_or(|name| name.sym != target_name) {
+            continue;
+        }
+        if same_syntax_node(&syntax, target_syntax) {
+            return Ok(disambiguator);
+        }
+        disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+    }
+    Err(HirLoweringError::ItemTreeEntryMismatch)
+}
+
+fn top_level_interface_source_disambiguator(
+    target_syntax: &SyntaxNode,
+    target_name: Symbol,
+    source_map: &HirSourceMapBuilder<'_>,
+    context: &HirLoweringContext<'_, '_>,
+) -> Result<u32, HirLoweringError> {
+    let mut disambiguator = 0u32;
+    for syntax in context.root.children() {
+        let Some(declaration) = ast::InterfaceDecl::cast(syntax.clone()) else {
+            continue;
+        };
+        let name = lower_item_name(
+            declaration.name(),
+            declaration.syntax(),
+            context.symbols,
+            source_map,
+        )?;
+        if name.sym != target_name {
+            continue;
+        }
+        if same_syntax_node(&syntax, target_syntax) {
+            return Ok(disambiguator);
+        }
+        disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+    }
+    Err(HirLoweringError::ItemTreeEntryMismatch)
+}
+
+fn same_syntax_node(left: &SyntaxNode, right: &SyntaxNode) -> bool {
+    left.kind() == right.kind() && left.text_range() == right.text_range()
 }
 
 fn resolve_item_tree_entry<'tree, 'hir>(
@@ -10867,6 +11544,43 @@ mod tests {
             .resolve(owner.def_id)
             .expect("owner path resolves")
             .expect("owner path exists")
+    }
+
+    fn intern_type_owner(
+        package: crate::PackageId,
+        packages: &PackageInterner,
+        paths: &DefPathInterner,
+        symbols: &Interner,
+        name: Symbol,
+        disambiguator: u32,
+    ) -> (OwnerId, DefPath) {
+        let path = DefPath::new(
+            package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(name),
+                disambiguator,
+            }],
+            packages,
+            symbols,
+        )
+        .expect("type definition path");
+        let owner = OwnerId {
+            def_id: paths.intern(path.clone()).expect("type definition interns"),
+        };
+        (owner, path)
+    }
+
+    fn validate_test_derives(
+        entry: &crate::item_tree::ItemTreeEntry,
+        kind: TargetKind,
+        inside_interface: bool,
+        symbols: &Interner,
+        snapshot: &WorkspaceSnapshot,
+    ) -> ValidatedAttrs {
+        let mut target = crate::attrs::AttributeTarget::new(kind);
+        target.inside_interface = inside_interface;
+        crate::attrs::validate_attrs_at_stage(&entry.raw_attrs, Some(target), symbols, snapshot, 2)
+            .expect("Stage 2 attribute validation")
     }
 
     fn function_node(root: &sai_syntax::SyntaxNode) -> sai_syntax::SyntaxNode {
@@ -23743,10 +24457,13 @@ mod tests {
         let file = crate::FileId::new(295);
         let source = concat!(
             "pub interface storage {\n",
+            "    @derive(Clone)\n",
             "    type Entry { pub key: Str, label: U32 }\n",
             "    type Alias = Str\n",
+            "    @derive(Arbitrary)\n",
             "    type Positive = U32 where self > 0\n",
-            "    enum Status {\n",
+            "    @derive(PartialEq)\n",
+            "    enum Entry {\n",
             "        Ready\n",
             "        Failed(U32)\n",
             "        Named(code: U32)\n",
@@ -23800,6 +24517,21 @@ mod tests {
             member_owners.iter().copied().zip(&interface_entry.children)
         {
             let member_path = owner_def_path(&paths, member_owner);
+            if member_entry.kind == ItemTreeKind::Struct
+                || (member_entry.kind == ItemTreeKind::Enum
+                    && member_entry.name == symbols.intern("Entry").unwrap())
+            {
+                let expected_disambiguator = if member_entry.kind == ItemTreeKind::Struct {
+                    0
+                } else {
+                    1
+                };
+                assert_eq!(
+                    member_path.data().last().unwrap().disambiguator,
+                    expected_disambiguator,
+                    "same-named interface types follow source-order disambiguation"
+                );
+            }
             let (hir_owner, source_map) = lower_interface_item_owner(
                 member_owner,
                 &member_path,
@@ -23823,6 +24555,79 @@ mod tests {
                 .and_then(|pointer| pointer.resolve(file, &parsed.root))
                 .expect("member AST pointer resolves in the source snapshot");
             assert_eq!(item.span.range, source_syntax.text_range());
+
+            if member_entry
+                .raw_attrs
+                .iter()
+                .any(|attribute| attribute.name == crate::item_tree::AttrName::Derive)
+            {
+                let target_kind = match member_entry.kind {
+                    ItemTreeKind::Struct => TargetKind::Record,
+                    ItemTreeKind::Refined => TargetKind::Refined,
+                    ItemTreeKind::Enum => TargetKind::Enum,
+                    _ => panic!("only supported interface type kinds carry derives"),
+                };
+                let attrs =
+                    validate_test_derives(member_entry, target_kind, true, &symbols, &snapshot);
+                assert!(attrs.diagnostics.is_empty());
+                let derived_owners = lower_derived_impl_owners(
+                    &hir_owner,
+                    &member_path,
+                    &item_tree,
+                    member_entry.ast_id,
+                    &attrs,
+                    &context,
+                )
+                .expect("interface type derives lower to child owners");
+                assert_eq!(derived_owners.len(), 1);
+                let (derived_owner, derived_source_map) = &derived_owners[0];
+                assert_eq!(derived_source_map.owner(), derived_owner.id);
+                assert!(derived_owner.body.is_none());
+                assert!(derived_owner.raw_attrs.is_empty());
+                let OwnerNode::DerivedImpl(derived) = derived_owner.node else {
+                    panic!("derive creates a synthetic implementation owner");
+                };
+                let expected_trait = match member_entry.kind {
+                    ItemTreeKind::Struct => LangItem::Clone,
+                    ItemTreeKind::Refined => LangItem::Arbitrary,
+                    ItemTreeKind::Enum => LangItem::PartialEq,
+                    _ => unreachable!(),
+                };
+                assert_eq!(derived.trait_, expected_trait);
+                assert_eq!(derived.self_def, member_owner.def_id);
+                assert_eq!(
+                    derived.span.ctxt,
+                    SpanCtxt::Desugared(DesugaringKind::Derive)
+                );
+                assert_eq!(derived.span.range, attrs.derives[0].1.range);
+                let derived_path = owner_def_path(&paths, derived_owner.id);
+                assert_eq!(
+                    derived_path.data().get(..member_path.data().len()),
+                    Some(member_path.data())
+                );
+                assert!(matches!(
+                    derived_path.data().last(),
+                    Some(component)
+                        if component.data
+                            == DefPathData::DerivedImpl {
+                                trait_name: match member_entry.kind {
+                                    ItemTreeKind::Struct => symbols.intern("Clone").unwrap(),
+                                    ItemTreeKind::Refined => symbols.intern("Arbitrary").unwrap(),
+                                    ItemTreeKind::Enum => symbols.intern("PartialEq").unwrap(),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            && component.disambiguator == 0
+                ));
+                let root_syntax = derived_source_map
+                    .node_to_syntax()
+                    .get(Default::default())
+                    .expect("synthetic source map roots at the derive name")
+                    .resolve(file, &parsed.root)
+                    .expect("derive name source resolves");
+                assert_eq!(root_syntax.kind(), SyntaxKind::NAME_REF);
+                assert_eq!(root_syntax.text_range(), derived.span.range);
+            }
 
             match (member_entry.kind, item.kind) {
                 (ItemTreeKind::Struct, InterfaceItemKind::Struct { fields, .. }) => {
@@ -23910,6 +24715,379 @@ mod tests {
             [0, 1],
             "duplicate interface functions use source-order disambiguators"
         );
+    }
+
+    #[test]
+    fn lowers_derived_impl_owners_for_top_level_type_kinds() {
+        let file = crate::FileId::new(309);
+        let source = concat!(
+            "@derive(Clone, Copy)\n",
+            "type Pair { first: I32 }\n",
+            "@derive(PartialEq)\n",
+            "enum State { Ready }\n",
+            "@derive(Add)\n",
+            "distinct Counter = I32\n",
+            "@derive(Arbitrary)\n",
+            "type Positive = I32 where self > 0\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects derived types");
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:derived-lowering#1.0")
+            .expect("package interns");
+        let paths = DefPathInterner::new(package, &packages, &symbols).expect("path interner");
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let cases = [
+            (
+                ItemTreeKind::Struct,
+                TargetKind::Record,
+                [LangItem::Clone, LangItem::Copy].as_slice(),
+            ),
+            (
+                ItemTreeKind::Enum,
+                TargetKind::Enum,
+                [LangItem::PartialEq].as_slice(),
+            ),
+            (
+                ItemTreeKind::Distinct,
+                TargetKind::Distinct,
+                [LangItem::Add].as_slice(),
+            ),
+            (
+                ItemTreeKind::Refined,
+                TargetKind::Refined,
+                [LangItem::Arbitrary].as_slice(),
+            ),
+        ];
+        let entries = item_tree.items.iter().collect::<Vec<_>>();
+        assert_eq!(entries.len(), cases.len());
+
+        for (entry, (expected_kind, target_kind, expected_traits)) in entries.into_iter().zip(cases)
+        {
+            assert_eq!(entry.kind, expected_kind);
+            let (owner_id, expected_path) =
+                intern_type_owner(package, &packages, &paths, &symbols, entry.name, 0);
+            let (type_owner, _) = match entry.kind {
+                ItemTreeKind::Struct => {
+                    lower_struct_owner(owner_id, &expected_path, &item_tree, entry.ast_id, &context)
+                }
+                ItemTreeKind::Enum => {
+                    lower_enum_owner(owner_id, &expected_path, &item_tree, entry.ast_id, &context)
+                }
+                ItemTreeKind::Distinct => lower_distinct_owner(
+                    owner_id,
+                    &expected_path,
+                    &item_tree,
+                    entry.ast_id,
+                    &context,
+                ),
+                ItemTreeKind::Refined => lower_refined_owner(
+                    owner_id,
+                    &expected_path,
+                    &item_tree,
+                    entry.ast_id,
+                    &context,
+                ),
+                _ => unreachable!(),
+            }
+            .expect("parent type owner lowers");
+            let attrs = validate_test_derives(entry, target_kind, false, &symbols, &snapshot);
+            assert!(attrs.diagnostics.is_empty());
+            assert_eq!(
+                attrs
+                    .derives
+                    .iter()
+                    .map(|(trait_, _)| *trait_)
+                    .collect::<Vec<_>>(),
+                expected_traits
+            );
+            let derived_owners = lower_derived_impl_owners(
+                &type_owner,
+                &expected_path,
+                &item_tree,
+                entry.ast_id,
+                &attrs,
+                &context,
+            )
+            .expect("each validated derive lowers to an owner");
+            assert_eq!(derived_owners.len(), expected_traits.len());
+
+            for ((derived_owner, source_map), (expected_trait, (_, validated_span))) in
+                derived_owners
+                    .iter()
+                    .zip(expected_traits.iter().zip(&attrs.derives))
+            {
+                assert_eq!(source_map.owner(), derived_owner.id);
+                assert!(source_map.diagnostics().is_empty());
+                assert!(derived_owner.body.is_none());
+                assert!(derived_owner.raw_attrs.is_empty());
+                let OwnerNode::DerivedImpl(derived) = derived_owner.node else {
+                    panic!("derive lowering returns synthetic owners");
+                };
+                assert_eq!(derived.owner_id, derived_owner.id);
+                assert_eq!(derived.trait_, *expected_trait);
+                assert_eq!(derived.self_def, owner_id.def_id);
+                assert_eq!(derived.span.file, file);
+                assert_eq!(derived.span.range, validated_span.range);
+                assert_eq!(
+                    derived.span.ctxt,
+                    SpanCtxt::Desugared(DesugaringKind::Derive)
+                );
+
+                let derived_path = owner_def_path(&paths, derived_owner.id);
+                assert_eq!(derived_path.package(), expected_path.package());
+                assert_eq!(derived_path.data().len(), expected_path.data().len() + 1);
+                assert_eq!(
+                    derived_path.data().get(..expected_path.data().len()),
+                    Some(expected_path.data())
+                );
+                let expected_trait_name = match expected_trait {
+                    LangItem::Clone => "Clone",
+                    LangItem::Copy => "Copy",
+                    LangItem::PartialEq => "PartialEq",
+                    LangItem::Add => "Add",
+                    LangItem::Arbitrary => "Arbitrary",
+                    _ => unreachable!(),
+                };
+                assert!(matches!(
+                    derived_path.data().last(),
+                    Some(component)
+                        if component.data
+                            == DefPathData::DerivedImpl {
+                                trait_name: symbols.intern(expected_trait_name).unwrap()
+                            }
+                            && component.disambiguator == 0
+                ));
+
+                let source_root = source_map
+                    .node_to_syntax()
+                    .get(Default::default())
+                    .expect("synthetic source map has its name as root")
+                    .resolve(file, &parsed.root)
+                    .expect("derive name syntax resolves");
+                assert_eq!(source_root.kind(), SyntaxKind::NAME_REF);
+                assert_eq!(source_root.text_range(), derived.span.range);
+            }
+        }
+    }
+
+    #[test]
+    fn derived_impl_lowering_rejects_stale_validated_attribute_before_interning() {
+        let file = crate::FileId::new(310);
+        let source = "@derive(Clone)\ntype Value { field: I32 }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("type entry");
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:derived-stale-attrs#1.0")
+            .expect("package interns");
+        let paths = DefPathInterner::new(package, &packages, &symbols).expect("path interner");
+        let (owner_id, expected_path) =
+            intern_type_owner(package, &packages, &paths, &symbols, entry.name, 0);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (type_owner, _) =
+            lower_struct_owner(owner_id, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("parent type owner lowers");
+        let mut attrs =
+            validate_test_derives(entry, TargetKind::Record, false, &symbols, &snapshot);
+        attrs.derives[0].1.file = crate::FileId::new(999);
+        let paths_before = paths.len().expect("path count");
+
+        assert!(matches!(
+            lower_derived_impl_owners(
+                &type_owner,
+                &expected_path,
+                &item_tree,
+                entry.ast_id,
+                &attrs,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().expect("path count"),
+            paths_before,
+            "invalid derive provenance must be rejected before child paths are interned"
+        );
+    }
+
+    #[test]
+    fn derived_impl_lowering_rejects_an_incomplete_stale_attribute_result() {
+        let file = crate::FileId::new(312);
+        let old_source = "@derive(Clone)\ntype Value { field: I32 }\n";
+        let (old_snapshot, old_parsed, old_ast_ids) = parse_file(file, old_source);
+        assert!(old_parsed.errors.is_empty(), "{:?}", old_parsed.errors);
+        let symbols = Interner::new();
+        let old_item_tree =
+            ItemTree::collect(file, old_source, &old_parsed.root, &old_ast_ids, &symbols)
+                .expect("old item tree collects");
+        let old_entry = old_item_tree.items.first().expect("old type entry");
+        let stale_attrs = validate_test_derives(
+            old_entry,
+            TargetKind::Record,
+            false,
+            &symbols,
+            &old_snapshot,
+        );
+        assert_eq!(stale_attrs.derives.len(), 1);
+
+        let current_source = "@derive(Clone, Bogus)\ntype Value { field: I32 }\n";
+        let (current_snapshot, current_parsed, current_ast_ids) = parse_file(file, current_source);
+        assert!(
+            current_parsed.errors.is_empty(),
+            "{:?}",
+            current_parsed.errors
+        );
+        let current_item_tree = ItemTree::collect(
+            file,
+            current_source,
+            &current_parsed.root,
+            &current_ast_ids,
+            &symbols,
+        )
+        .expect("current item tree collects");
+        let current_entry = current_item_tree.items.first().expect("current type entry");
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:derived-stale-results#1.0")
+            .expect("package interns");
+        let paths = DefPathInterner::new(package, &packages, &symbols).expect("path interner");
+        let (owner_id, expected_path) =
+            intern_type_owner(package, &packages, &paths, &symbols, current_entry.name, 0);
+        let arena = HirArena::new();
+        let context = HirLoweringContext::new(
+            &current_ast_ids,
+            &current_snapshot,
+            &current_parsed.root,
+            &arena,
+            &symbols,
+            &paths,
+        );
+        let (type_owner, _) = lower_struct_owner(
+            owner_id,
+            &expected_path,
+            &current_item_tree,
+            current_entry.ast_id,
+            &context,
+        )
+        .expect("current parent type owner lowers");
+        let paths_before = paths.len().expect("path count");
+
+        assert!(matches!(
+            lower_derived_impl_owners(
+                &type_owner,
+                &expected_path,
+                &current_item_tree,
+                current_entry.ast_id,
+                &stale_attrs,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().expect("path count"),
+            paths_before,
+            "stale results must not produce owners after the current attribute became invalid"
+        );
+    }
+
+    #[test]
+    fn derived_impl_paths_follow_duplicate_top_level_type_disambiguators() {
+        let file = crate::FileId::new(311);
+        let source = concat!(
+            "@derive(Clone)\n",
+            "type Value { field: I32 }\n",
+            "@derive(Copy)\n",
+            "enum Value { Empty }\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects same-named types");
+        assert_eq!(item_tree.items.len(), 2);
+        assert!(
+            item_tree
+                .items
+                .iter()
+                .all(|entry| entry.name == item_tree.items[0].name)
+        );
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:derived-duplicate-types#1.0")
+            .expect("package interns");
+        let paths = DefPathInterner::new(package, &packages, &symbols).expect("path interner");
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let expected_traits = [LangItem::Clone, LangItem::Copy];
+
+        for (index, (entry, expected_trait)) in
+            item_tree.items.iter().zip(expected_traits).enumerate()
+        {
+            let (owner_id, expected_path) = intern_type_owner(
+                package,
+                &packages,
+                &paths,
+                &symbols,
+                entry.name,
+                index as u32,
+            );
+            let (type_owner, _) = match entry.kind {
+                ItemTreeKind::Struct => {
+                    lower_struct_owner(owner_id, &expected_path, &item_tree, entry.ast_id, &context)
+                }
+                ItemTreeKind::Enum => {
+                    lower_enum_owner(owner_id, &expected_path, &item_tree, entry.ast_id, &context)
+                }
+                _ => unreachable!("same-named type fixture has a record and enum"),
+            }
+            .expect("same-named type lowers under its canonical path");
+            let target_kind = if entry.kind == ItemTreeKind::Struct {
+                TargetKind::Record
+            } else {
+                TargetKind::Enum
+            };
+            let attrs = validate_test_derives(entry, target_kind, false, &symbols, &snapshot);
+            let derived_owners = lower_derived_impl_owners(
+                &type_owner,
+                &expected_path,
+                &item_tree,
+                entry.ast_id,
+                &attrs,
+                &context,
+            )
+            .expect("each same-named declaration gets its own derived owner");
+            assert_eq!(derived_owners.len(), 1);
+            let (derived_owner, _) = &derived_owners[0];
+            let path = owner_def_path(&paths, derived_owner.id);
+            assert_eq!(path.data()[0].disambiguator, index as u32);
+            assert!(matches!(
+                path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::DerivedImpl {
+                        trait_name: symbols
+                            .intern(match expected_trait {
+                                LangItem::Clone => "Clone",
+                                LangItem::Copy => "Copy",
+                                _ => unreachable!(),
+                            })
+                            .unwrap()
+                    } && component.disambiguator == 0
+            ));
+        }
     }
 
     #[test]
