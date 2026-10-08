@@ -289,12 +289,12 @@ impl PartialEq for ItemTree {
 
 impl Eq for ItemTree {}
 
-/// A target-filtered item tree and the validation results used to select it.
+/// A target-filtered item tree and attribute results for retained entries.
 #[derive(Clone, Debug)]
 pub struct TargetFilterResult {
     pub item_tree: ItemTree,
-    /// Target-only attribute results for retained module-level entries.
-    pub validated_targets: BTreeMap<ErasedAstId, ValidatedAttrs>,
+    /// Validated attributes for retained module-level entries.
+    pub validated_attrs: BTreeMap<ErasedAstId, ValidatedAttrs>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -512,15 +512,15 @@ impl ItemTree {
         {
             return Err(TargetFilterError::SnapshotMismatch);
         }
-        filter_collected_tree(current, symbols, snapshot, target_cfg)
+        filter_collected_tree(current, root, ast_ids, symbols, snapshot, target_cfg)
     }
 
     /// Removes module-level entries whose valid `@target` predicate is false.
     ///
     /// The item tree is checked against the current AST map, source, and
-    /// workspace snapshot before its attributes are used. Only `@target` is
-    /// validated here: diagnostics on a filtered-out declaration are
-    /// suppressed along with that declaration.
+    /// workspace snapshot before its attributes are used. `@target` is
+    /// validated first; other attributes are validated only for retained
+    /// declarations.
     pub fn filter_for_target(
         &self,
         source: &str,
@@ -548,38 +548,48 @@ impl ItemTree {
             return Err(TargetFilterError::StaleItemTree);
         }
 
-        filter_collected_tree(current, symbols, snapshot, target_cfg)
+        filter_collected_tree(current, root, ast_ids, symbols, snapshot, target_cfg)
     }
 }
 
 fn filter_collected_tree(
     current: ItemTree,
+    root: &SyntaxNode,
+    ast_ids: &ast::AstIdMap,
     symbols: &Interner,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<TargetFilterResult, TargetFilterError> {
-    let mut validated_targets = BTreeMap::new();
+    let mut validated_attrs = BTreeMap::new();
     let mut diagnostics = Vec::new();
     let mut uses = Vec::with_capacity(current.uses.len());
     for entry in current.uses.iter().cloned() {
-        let validated =
-            validate_target_attrs(&entry.raw_attrs, TargetKind::Use, symbols, snapshot)?;
-        if target_matches(&validated, target_cfg) {
-            diagnostics.extend(validated.diagnostics.iter().cloned());
-            validated_targets.insert(entry.ast_id, validated);
-            uses.push(entry);
+        let target = AttributeTarget {
+            module_level: true,
+            ..AttributeTarget::new(TargetKind::Use)
+        };
+        let target_attrs = validate_target_attrs(&entry.raw_attrs, target, symbols, snapshot)?;
+        if !target_matches(&target_attrs, target_cfg) {
+            continue;
         }
+        let validated = validate_module_attrs(&entry.raw_attrs, target, symbols, snapshot)?;
+        diagnostics.extend(validated.diagnostics.iter().cloned());
+        validated_attrs.insert(entry.ast_id, validated);
+        uses.push(entry);
     }
 
     let mut items = Vec::with_capacity(current.items.len());
     for entry in current.items.iter().cloned() {
         let kind = module_target_kind(entry.kind).ok_or(TargetFilterError::StaleItemTree)?;
-        let validated = validate_target_attrs(&entry.raw_attrs, kind, symbols, snapshot)?;
-        if target_matches(&validated, target_cfg) {
-            diagnostics.extend(validated.diagnostics.iter().cloned());
-            validated_targets.insert(entry.ast_id, validated);
-            items.push(entry);
+        let target = module_attribute_target(&entry, kind, current.file, root, ast_ids)?;
+        let target_attrs = validate_target_attrs(&entry.raw_attrs, target, symbols, snapshot)?;
+        if !target_matches(&target_attrs, target_cfg) {
+            continue;
         }
+        let validated = validate_module_attrs(&entry.raw_attrs, target, symbols, snapshot)?;
+        diagnostics.extend(validated.diagnostics.iter().cloned());
+        validated_attrs.insert(entry.ast_id, validated);
+        items.push(entry);
     }
     diagnostics.sort_by_key(|diagnostic| {
         diagnostic
@@ -592,14 +602,50 @@ fn filter_collected_tree(
     item_tree.items = items;
     Ok(TargetFilterResult {
         item_tree,
-        validated_targets,
+        validated_attrs,
         diagnostics,
     })
 }
 
+fn module_attribute_target(
+    entry: &ItemTreeEntry,
+    kind: TargetKind,
+    file: FileId,
+    root: &SyntaxNode,
+    ast_ids: &ast::AstIdMap,
+) -> Result<AttributeTarget, TargetFilterError> {
+    let mut target = AttributeTarget {
+        module_level: true,
+        is_exported: entry.vis == crate::Visibility::Export,
+        ..AttributeTarget::new(kind)
+    };
+    if kind == TargetKind::Fn {
+        let syntax = ast_ids
+            .pointer(entry.ast_id)
+            .and_then(|pointer| pointer.resolve(file, root))
+            .ok_or(TargetFilterError::StaleItemTree)?;
+        let function = ast::FnDecl::cast(syntax).ok_or(TargetFilterError::StaleItemTree)?;
+        target.has_body = function
+            .syntax()
+            .children()
+            .any(|child| child.kind() == SyntaxKind::BLOCK);
+    }
+    Ok(target)
+}
+
+fn validate_module_attrs(
+    raw_attrs: &[RawAttr],
+    target: AttributeTarget,
+    symbols: &Interner,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<ValidatedAttrs, TargetFilterError> {
+    validate_attrs(raw_attrs, Some(target), symbols, snapshot)
+        .map_err(TargetFilterError::AttributeValidation)
+}
+
 fn validate_target_attrs(
     raw_attrs: &[RawAttr],
-    kind: TargetKind,
+    target: AttributeTarget,
     symbols: &Interner,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<ValidatedAttrs, TargetFilterError> {
@@ -611,16 +657,7 @@ fn validate_target_attrs(
     if target_attrs.is_empty() {
         return Ok(ValidatedAttrs::default());
     }
-    validate_attrs(
-        &target_attrs,
-        Some(AttributeTarget {
-            module_level: true,
-            ..AttributeTarget::new(kind)
-        }),
-        symbols,
-        snapshot,
-    )
-    .map_err(TargetFilterError::AttributeValidation)
+    validate_module_attrs(&target_attrs, target, symbols, snapshot)
 }
 
 fn target_matches(validated: &ValidatedAttrs, target_cfg: &TargetCfg) -> bool {
@@ -1799,8 +1836,75 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["choose", "common"]
         );
-        assert_eq!(result.validated_targets.len(), 2);
+        assert_eq!(result.validated_attrs.len(), 2);
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn target_collection_returns_full_attributes_with_function_context() {
+        let source = concat!(
+            "@inline\n",
+            "fn with_body() {}\n",
+            "@inline\n",
+            "fn without_body() -> U32\n",
+            "@export_name(\"entry\")\n",
+            "export fn exported() {}\n",
+        );
+        let file = FileId::new(726);
+        let (parsed, ast_ids, symbols, _, snapshot) = collect_with_snapshot(source, file);
+
+        let result = ItemTree::collect_for_target(
+            file,
+            source,
+            &parsed.root,
+            &ast_ids,
+            &symbols,
+            &snapshot,
+            &target_cfg("wasm32-core", &[]),
+        )
+        .expect("target collection succeeds");
+        let inline_for = |name: &str| {
+            let entry = result
+                .item_tree
+                .items
+                .iter()
+                .find(|entry| symbols.resolve(entry.name).unwrap().as_ref() == name)
+                .expect("function retained");
+            result
+                .validated_attrs
+                .get(&entry.ast_id)
+                .expect("attributes validated")
+        };
+        assert!(inline_for("with_body").inline.is_some());
+        assert!(inline_for("without_body").inline.is_none());
+        let exported = result
+            .item_tree
+            .items
+            .iter()
+            .find(|entry| symbols.resolve(entry.name).unwrap().as_ref() == "exported")
+            .expect("exported function retained");
+        let exported_context =
+            module_attribute_target(exported, TargetKind::Fn, file, &parsed.root, &ast_ids)
+                .expect("exported function context resolves");
+        assert!(exported_context.is_exported);
+        assert!(exported_context.has_body);
+        let private_context = module_attribute_target(
+            result
+                .item_tree
+                .items
+                .iter()
+                .find(|entry| symbols.resolve(entry.name).unwrap().as_ref() == "with_body")
+                .expect("private function retained"),
+            TargetKind::Fn,
+            file,
+            &parsed.root,
+            &ast_ids,
+        )
+        .expect("private function context resolves");
+        assert!(!private_context.is_exported);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+        }));
     }
 
     #[test]
