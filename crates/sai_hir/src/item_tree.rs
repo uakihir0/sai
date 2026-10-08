@@ -6,8 +6,8 @@ use sai_diagnostics::{
     Diagnostic, LintLevel as DiagnosticLintLevel, Location, OverrideLintLevel, ScopedLintLevel,
     SourceRef,
 };
-use sai_intern::{InternError, Interner, Symbol};
-use sai_stable_hash::StableHasher;
+use sai_intern::{InternError, Interner, LookupError, Symbol};
+use sai_stable_hash::{StableHash, StableHasher};
 use sai_syntax::{
     GreenElement, SyntaxElement, SyntaxKind, SyntaxNode,
     ast::{self, AstNode, AstToken},
@@ -293,6 +293,412 @@ impl PartialEq for ItemTree {
 
 impl Eq for ItemTree {}
 
+/// The snapshot-independent semantic shape of an item tree.
+///
+/// Source ranges, syntax pointers, file IDs, and interner-local symbols are
+/// intentionally absent. This makes the value suitable for stable query
+/// fingerprints; snapshot-bound trees must still be collected or rebound for
+/// source navigation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StableItemTree {
+    has_module_docs: bool,
+    module_docs_text: Option<String>,
+    is_unsafe_module: bool,
+    uses: Vec<StableUseEntry>,
+    items: Vec<StableItemTreeEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableUseEntry {
+    ast_id: ErasedAstId,
+    is_pub: bool,
+    pkg_path: String,
+    alias: Option<StableSymbol>,
+    items: Vec<StableUseItem>,
+    raw_attrs: Vec<StableRawAttr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableUseItem {
+    name: StableSymbol,
+    alias: Option<StableSymbol>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableItemTreeEntry {
+    ast_id: ErasedAstId,
+    kind: ItemTreeKind,
+    name: StableSymbol,
+    vis: crate::Visibility,
+    raw_attrs: Vec<StableRawAttr>,
+    children: Vec<StableItemTreeEntry>,
+    header_hash: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableRawAttr {
+    name: AttrName,
+    args: Option<Vec<StableRawAttrArg>>,
+    has_error: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StableRawAttrArg {
+    Word {
+        name: StableSymbol,
+        raw: bool,
+        is_upper: bool,
+        args: Option<Vec<StableRawAttrArg>>,
+    },
+    Str(String),
+    Int(Option<u128>),
+    KeyValue {
+        key: StableSymbol,
+        raw: bool,
+        value: StableRawAttrValue,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StableRawAttrValue {
+    Str(String),
+    Int(Option<u128>),
+    Word(StableSymbol),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StableSymbol {
+    Error,
+    Name(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StableItemTreeError {
+    Interner(LookupError),
+}
+
+impl StableItemTree {
+    fn from_item_tree(tree: &ItemTree, symbols: &Interner) -> Result<Self, StableItemTreeError> {
+        Ok(Self {
+            has_module_docs: tree.module_docs.is_some(),
+            module_docs_text: tree.module_docs_text.clone(),
+            is_unsafe_module: tree.is_unsafe_module,
+            uses: tree
+                .uses
+                .iter()
+                .map(|entry| StableUseEntry::from_entry(entry, symbols))
+                .collect::<Result<_, _>>()?,
+            items: tree
+                .items
+                .iter()
+                .map(|entry| StableItemTreeEntry::from_entry(entry, symbols))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl StableUseEntry {
+    fn from_entry(entry: &UseEntry, symbols: &Interner) -> Result<Self, StableItemTreeError> {
+        Ok(Self {
+            ast_id: entry.ast_id,
+            is_pub: entry.is_pub,
+            pkg_path: entry.pkg_path.clone(),
+            alias: entry
+                .alias
+                .map(|symbol| stable_symbol(symbol, symbols))
+                .transpose()?,
+            items: entry
+                .items
+                .iter()
+                .map(|item| {
+                    Ok(StableUseItem {
+                        name: stable_symbol(item.name, symbols)?,
+                        alias: item
+                            .alias
+                            .map(|symbol| stable_symbol(symbol, symbols))
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<_, StableItemTreeError>>()?,
+            raw_attrs: stable_raw_attrs(&entry.raw_attrs, symbols)?,
+        })
+    }
+}
+
+impl StableItemTreeEntry {
+    fn from_entry(entry: &ItemTreeEntry, symbols: &Interner) -> Result<Self, StableItemTreeError> {
+        Ok(Self {
+            ast_id: entry.ast_id,
+            kind: entry.kind,
+            name: stable_symbol(entry.name, symbols)?,
+            vis: entry.vis,
+            raw_attrs: stable_raw_attrs(&entry.raw_attrs, symbols)?,
+            children: entry
+                .children
+                .iter()
+                .map(|child| Self::from_entry(child, symbols))
+                .collect::<Result<_, _>>()?,
+            header_hash: entry.header_hash,
+        })
+    }
+}
+
+fn stable_raw_attrs(
+    attrs: &[RawAttr],
+    symbols: &Interner,
+) -> Result<Vec<StableRawAttr>, StableItemTreeError> {
+    attrs
+        .iter()
+        .map(|attr| {
+            Ok(StableRawAttr {
+                name: attr.name,
+                args: attr
+                    .args
+                    .as_ref()
+                    .map(|args| {
+                        args.iter()
+                            .map(|arg| StableRawAttrArg::from_arg(arg, symbols))
+                            .collect::<Result<_, _>>()
+                    })
+                    .transpose()?,
+                has_error: attr.has_error,
+            })
+        })
+        .collect()
+}
+
+impl StableRawAttrArg {
+    fn from_arg(arg: &RawAttrArg, symbols: &Interner) -> Result<Self, StableItemTreeError> {
+        Ok(match arg {
+            RawAttrArg::Word {
+                name,
+                raw,
+                is_upper,
+                args,
+                ..
+            } => Self::Word {
+                name: stable_symbol(*name, symbols)?,
+                raw: *raw,
+                is_upper: *is_upper,
+                args: args
+                    .as_ref()
+                    .map(|args| {
+                        args.iter()
+                            .map(|arg| Self::from_arg(arg, symbols))
+                            .collect::<Result<_, _>>()
+                    })
+                    .transpose()?,
+            },
+            RawAttrArg::Str { value, .. } => Self::Str(value.clone()),
+            RawAttrArg::Int { value, .. } => Self::Int(*value),
+            RawAttrArg::KeyValue {
+                key, raw, value, ..
+            } => Self::KeyValue {
+                key: stable_symbol(*key, symbols)?,
+                raw: *raw,
+                value: StableRawAttrValue::from_value(value, symbols)?,
+            },
+        })
+    }
+}
+
+impl StableRawAttrValue {
+    fn from_value(value: &RawAttrValue, symbols: &Interner) -> Result<Self, StableItemTreeError> {
+        Ok(match value {
+            RawAttrValue::Str(value) => Self::Str(value.clone()),
+            RawAttrValue::Int(value) => Self::Int(*value),
+            RawAttrValue::Word(symbol) => Self::Word(stable_symbol(*symbol, symbols)?),
+        })
+    }
+}
+
+fn stable_symbol(symbol: Symbol, symbols: &Interner) -> Result<StableSymbol, StableItemTreeError> {
+    if symbol.is_error() {
+        return Ok(StableSymbol::Error);
+    }
+    symbols
+        .resolve(symbol)
+        .map(|name| StableSymbol::Name(name.to_string()))
+        .map_err(StableItemTreeError::Interner)
+}
+
+impl StableHash for StableItemTree {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD0);
+        self.has_module_docs.stable_hash(hasher);
+        stable_hash_option(&self.module_docs_text, hasher);
+        self.is_unsafe_module.stable_hash(hasher);
+        self.uses.stable_hash(hasher);
+        self.items.stable_hash(hasher);
+    }
+}
+
+impl StableHash for StableUseEntry {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD1);
+        self.ast_id.index().stable_hash(hasher);
+        self.is_pub.stable_hash(hasher);
+        self.pkg_path.stable_hash(hasher);
+        stable_hash_option(&self.alias, hasher);
+        self.items.stable_hash(hasher);
+        self.raw_attrs.stable_hash(hasher);
+    }
+}
+
+impl StableHash for StableUseItem {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD2);
+        self.name.stable_hash(hasher);
+        stable_hash_option(&self.alias, hasher);
+    }
+}
+
+impl StableHash for StableItemTreeEntry {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD3);
+        self.ast_id.index().stable_hash(hasher);
+        stable_hash_item_kind(self.kind, hasher);
+        self.name.stable_hash(hasher);
+        stable_hash_visibility(self.vis, hasher);
+        self.raw_attrs.stable_hash(hasher);
+        self.children.stable_hash(hasher);
+        stable_hash_option(&self.header_hash, hasher);
+    }
+}
+
+impl StableHash for StableRawAttr {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD4);
+        self.name.as_str().stable_hash(hasher);
+        stable_hash_option(&self.args, hasher);
+        self.has_error.stable_hash(hasher);
+    }
+}
+
+impl StableHash for StableRawAttrArg {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD5);
+        match self {
+            Self::Word {
+                name,
+                raw,
+                is_upper,
+                args,
+            } => {
+                hasher.write_tag(0);
+                name.stable_hash(hasher);
+                raw.stable_hash(hasher);
+                is_upper.stable_hash(hasher);
+                stable_hash_option(args, hasher);
+            }
+            Self::Str(value) => {
+                hasher.write_tag(1);
+                value.stable_hash(hasher);
+            }
+            Self::Int(value) => {
+                hasher.write_tag(2);
+                stable_hash_option(value, hasher);
+            }
+            Self::KeyValue { key, raw, value } => {
+                hasher.write_tag(3);
+                key.stable_hash(hasher);
+                raw.stable_hash(hasher);
+                value.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+impl StableHash for StableRawAttrValue {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD6);
+        match self {
+            Self::Str(value) => {
+                hasher.write_tag(0);
+                value.stable_hash(hasher);
+            }
+            Self::Int(value) => {
+                hasher.write_tag(1);
+                stable_hash_option(value, hasher);
+            }
+            Self::Word(value) => {
+                hasher.write_tag(2);
+                value.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+impl StableHash for StableSymbol {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD7);
+        match self {
+            Self::Error => hasher.write_tag(0),
+            Self::Name(name) => {
+                hasher.write_tag(1);
+                name.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+fn stable_hash_item_kind(kind: ItemTreeKind, hasher: &mut StableHasher) {
+    hasher.write_tag(0xD8);
+    let (tag, payload): (u8, Option<bool>) = match kind {
+        ItemTreeKind::Function => (0, None),
+        ItemTreeKind::Struct => (1, None),
+        ItemTreeKind::Alias => (2, None),
+        ItemTreeKind::Refined => (3, None),
+        ItemTreeKind::Enum => (4, None),
+        ItemTreeKind::Distinct => (5, None),
+        ItemTreeKind::Resource => (6, None),
+        ItemTreeKind::Trait => (7, None),
+        ItemTreeKind::Impl => (8, None),
+        ItemTreeKind::Const => (9, None),
+        ItemTreeKind::Invariant => (10, None),
+        ItemTreeKind::Effect => (11, None),
+        ItemTreeKind::Interface => (12, None),
+        ItemTreeKind::World => (13, None),
+        ItemTreeKind::ExternBlock => (14, None),
+        ItemTreeKind::Test => (15, None),
+        ItemTreeKind::Property => (16, None),
+        ItemTreeKind::TypeParam => (17, None),
+        ItemTreeKind::ConstParam => (18, None),
+        ItemTreeKind::Field => (19, None),
+        ItemTreeKind::Variant => (20, None),
+        ItemTreeKind::VariantField => (21, None),
+        ItemTreeKind::AssocType => (22, None),
+        ItemTreeKind::AssocFn => (23, None),
+        ItemTreeKind::InterfaceFn => (24, None),
+        ItemTreeKind::ExternFn => (25, None),
+        ItemTreeKind::WorldItem { import } => (26, Some(import)),
+        ItemTreeKind::WorldInclude => (27, None),
+    };
+    tag.stable_hash(hasher);
+    if let Some(payload) = payload {
+        payload.stable_hash(hasher);
+    }
+}
+
+fn stable_hash_visibility(visibility: crate::Visibility, hasher: &mut StableHasher) {
+    hasher.write_tag(0xD9);
+    match visibility {
+        crate::Visibility::Private => hasher.write_tag(0),
+        crate::Visibility::Pub => hasher.write_tag(1),
+        crate::Visibility::Export => hasher.write_tag(2),
+    }
+}
+
+fn stable_hash_option<T: StableHash>(value: &Option<T>, hasher: &mut StableHasher) {
+    match value {
+        None => hasher.write_tag(0),
+        Some(value) => {
+            hasher.write_tag(1);
+            value.stable_hash(hasher);
+        }
+    }
+}
+
 /// A target-filtered item tree and attribute results for retained entries.
 #[derive(Clone, Debug)]
 pub struct TargetFilterResult {
@@ -516,6 +922,13 @@ impl ItemTree {
     /// Whether this item tree was collected from the AST map's exact snapshot.
     pub fn matches_ast_ids(&self, ast_ids: &ast::AstIdMap) -> bool {
         self.file == ast_ids.file() && ast_ids.snapshot_id() == Some(self.snapshot_id)
+    }
+
+    /// Returns the stable semantic shape without snapshot-local source locations.
+    ///
+    /// The supplied interner must own every non-error symbol in this tree.
+    pub fn stable_shape(&self, symbols: &Interner) -> Result<StableItemTree, StableItemTreeError> {
+        StableItemTree::from_item_tree(self, symbols)
     }
 
     pub fn collect(
@@ -3148,6 +3561,97 @@ mod tests {
                 .ptr
                 .resolve(file, &second.root)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn stable_item_tree_shape_resolves_symbols_and_omits_source_locations() {
+        let first_source = concat!(
+            "//! module docs\n",
+            "fn before() { 1 }\n",
+            "@derive(Foo(bar))\n",
+            "@deprecated(note = \"use replacement\")\n",
+            "@seed(123)\n",
+            "fn run() { 2 }\n",
+            "pub use sai:core/fmt.{Format as Fmt}\n",
+        );
+        let second_source = first_source.replace("{ 1 }", "{ 123456 }");
+        let file = FileId::new(711);
+
+        let (first, first_ids) = parse_snapshot(first_source, file);
+        let first_symbols = Interner::new();
+        let first_tree =
+            ItemTree::collect(file, first_source, &first.root, &first_ids, &first_symbols)
+                .expect("first item tree collects");
+
+        let (second, second_ids) = parse_snapshot(&second_source, file);
+        let second_symbols = Interner::new();
+        second_symbols
+            .intern("reserved-before-collection")
+            .expect("reserved symbol interns");
+        let second_tree = ItemTree::collect(
+            file,
+            &second_source,
+            &second.root,
+            &second_ids,
+            &second_symbols,
+        )
+        .expect("second item tree collects");
+
+        let first_shape = first_tree
+            .stable_shape(&first_symbols)
+            .expect("first item tree resolves through its interner");
+        let second_shape = second_tree
+            .stable_shape(&second_symbols)
+            .expect("second item tree resolves through its interner");
+
+        assert_eq!(first_shape, second_shape);
+        assert_eq!(first_shape.fingerprint(), second_shape.fingerprint());
+        assert_ne!(
+            first_tree.uses[0].items[0].range,
+            second_tree.uses[0].items[0].range
+        );
+        assert_ne!(
+            first_tree.items[1].raw_attrs[0].span,
+            second_tree.items[1].raw_attrs[0].span
+        );
+
+        let changed_source = second_source.replace("fn run()", "fn renamed()");
+        let (changed, changed_ids) = parse_snapshot(&changed_source, file);
+        let changed_tree = ItemTree::collect(
+            file,
+            &changed_source,
+            &changed.root,
+            &changed_ids,
+            &second_symbols,
+        )
+        .expect("changed item tree collects");
+        let changed_shape = changed_tree
+            .stable_shape(&second_symbols)
+            .expect("changed item tree resolves through its interner");
+        assert_ne!(second_shape, changed_shape);
+        assert_ne!(second_shape.fingerprint(), changed_shape.fingerprint());
+    }
+
+    #[test]
+    fn stable_item_tree_shape_preserves_error_names_and_rejects_foreign_symbols() {
+        let file = FileId::new(712);
+        let (_, symbols, tree) = collect("fn named() {}\n", file);
+        let valid_shape = tree
+            .stable_shape(&symbols)
+            .expect("item tree resolves through its interner");
+
+        let mut error_tree = tree.clone();
+        error_tree.items[0].name = Symbol::ERROR;
+        let error_shape = error_tree
+            .stable_shape(&symbols)
+            .expect("error symbols have a stable sentinel representation");
+        assert_ne!(valid_shape, error_shape);
+        assert_ne!(valid_shape.fingerprint(), error_shape.fingerprint());
+
+        assert_eq!(
+            tree.stable_shape(&Interner::new()),
+            Err(StableItemTreeError::Interner(LookupError::UnknownSymbol))
         );
     }
 
