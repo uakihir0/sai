@@ -1,5 +1,6 @@
 use crate::attrs::{
-    AttrValidationError, AttributeTarget, TargetCfg, TargetKind, ValidatedAttrs, validate_attrs,
+    AttrValidationError, AttributeTarget, ExternAbi, ImplKind, TargetCfg, TargetKind,
+    ValidatedAttrs, validate_attrs,
 };
 use sai_diagnostics::Diagnostic;
 use sai_intern::{InternError, Interner, Symbol};
@@ -293,7 +294,7 @@ impl Eq for ItemTree {}
 #[derive(Clone, Debug)]
 pub struct TargetFilterResult {
     pub item_tree: ItemTree,
-    /// Validated attributes for retained module-level entries.
+    /// Validated attributes for every retained item-tree entry and `use`.
     pub validated_attrs: BTreeMap<ErasedAstId, ValidatedAttrs>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -560,8 +561,8 @@ fn filter_collected_tree(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<TargetFilterResult, TargetFilterError> {
-    let mut validated_attrs = BTreeMap::new();
-    let mut diagnostics = Vec::new();
+    let mut attribute_validation =
+        ItemAttributeValidation::new(current.file, root, ast_ids, symbols, snapshot);
     let mut uses = Vec::with_capacity(current.uses.len());
     for entry in current.uses.iter().cloned() {
         let target = AttributeTarget {
@@ -572,26 +573,26 @@ fn filter_collected_tree(
         if !target_matches(&target_attrs, target_cfg) {
             continue;
         }
-        let validated = validate_module_attrs(&entry.raw_attrs, target, symbols, snapshot)?;
-        diagnostics.extend(validated.diagnostics.iter().cloned());
-        validated_attrs.insert(entry.ast_id, validated);
+        attribute_validation.validate_raw(entry.ast_id, &entry.raw_attrs, target)?;
         uses.push(entry);
     }
 
     let mut items = Vec::with_capacity(current.items.len());
     for entry in current.items.iter().cloned() {
-        let kind = module_target_kind(entry.kind).ok_or(TargetFilterError::StaleItemTree)?;
-        let target = module_attribute_target(&entry, kind, current.file, root, ast_ids)?;
+        if module_target_kind(entry.kind).is_none() {
+            return Err(TargetFilterError::StaleItemTree);
+        }
+        let target = attribute_validation
+            .target_for_entry(&entry, true)?
+            .ok_or(TargetFilterError::StaleItemTree)?;
         let target_attrs = validate_target_attrs(&entry.raw_attrs, target, symbols, snapshot)?;
         if !target_matches(&target_attrs, target_cfg) {
             continue;
         }
-        let validated = validate_module_attrs(&entry.raw_attrs, target, symbols, snapshot)?;
-        diagnostics.extend(validated.diagnostics.iter().cloned());
-        validated_attrs.insert(entry.ast_id, validated);
+        attribute_validation.validate_entry_tree(&entry, Some(target))?;
         items.push(entry);
     }
-    diagnostics.sort_by_key(|diagnostic| {
+    attribute_validation.diagnostics.sort_by_key(|diagnostic| {
         diagnostic
             .primary()
             .map(|primary| primary.span.range.start())
@@ -602,35 +603,203 @@ fn filter_collected_tree(
     item_tree.items = items;
     Ok(TargetFilterResult {
         item_tree,
-        validated_attrs,
-        diagnostics,
+        validated_attrs: attribute_validation.validated_attrs,
+        diagnostics: attribute_validation.diagnostics,
     })
 }
 
-fn module_attribute_target(
+struct ItemAttributeValidation<'a> {
+    file: FileId,
+    root: &'a SyntaxNode,
+    ast_ids: &'a ast::AstIdMap,
+    symbols: &'a Interner,
+    snapshot: &'a WorkspaceSnapshot,
+    validated_attrs: BTreeMap<ErasedAstId, ValidatedAttrs>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl<'a> ItemAttributeValidation<'a> {
+    fn new(
+        file: FileId,
+        root: &'a SyntaxNode,
+        ast_ids: &'a ast::AstIdMap,
+        symbols: &'a Interner,
+        snapshot: &'a WorkspaceSnapshot,
+    ) -> Self {
+        Self {
+            file,
+            root,
+            ast_ids,
+            symbols,
+            snapshot,
+            validated_attrs: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn target_for_entry(
+        &self,
+        entry: &ItemTreeEntry,
+        module_level: bool,
+    ) -> Result<Option<AttributeTarget>, TargetFilterError> {
+        entry_attribute_target(entry, module_level, self.file, self.root, self.ast_ids)
+    }
+
+    fn validate_raw(
+        &mut self,
+        ast_id: ErasedAstId,
+        raw_attrs: &[RawAttr],
+        target: AttributeTarget,
+    ) -> Result<(), TargetFilterError> {
+        let validated = validate_module_attrs(raw_attrs, target, self.symbols, self.snapshot)?;
+        self.diagnostics
+            .extend(validated.diagnostics.iter().cloned());
+        self.validated_attrs.insert(ast_id, validated);
+        Ok(())
+    }
+
+    fn validate_entry_tree(
+        &mut self,
+        entry: &ItemTreeEntry,
+        target: Option<AttributeTarget>,
+    ) -> Result<(), TargetFilterError> {
+        if let Some(target) = target {
+            self.validate_raw(entry.ast_id, &entry.raw_attrs, target)?;
+        } else {
+            // The parser owns the single INVALID_ATTRIBUTE_TARGET diagnostic
+            // for positions where the grammar prohibits attributes.
+            self.validated_attrs
+                .insert(entry.ast_id, ValidatedAttrs::default());
+        }
+        for child in &entry.children {
+            let target = self.target_for_entry(child, false)?;
+            self.validate_entry_tree(child, target)?;
+        }
+        Ok(())
+    }
+}
+
+fn entry_attribute_target(
     entry: &ItemTreeEntry,
-    kind: TargetKind,
+    module_level: bool,
     file: FileId,
     root: &SyntaxNode,
     ast_ids: &ast::AstIdMap,
-) -> Result<AttributeTarget, TargetFilterError> {
+) -> Result<Option<AttributeTarget>, TargetFilterError> {
+    let syntax = ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(file, root))
+        .ok_or(TargetFilterError::StaleItemTree)?;
+    let mut ancestors = Vec::new();
+    let mut parent = syntax.parent();
+    while let Some(node) = parent {
+        parent = node.parent();
+        ancestors.push(node);
+    }
+    let containing_owner = || {
+        ancestors.iter().find(|node| {
+            matches!(
+                node.kind(),
+                SyntaxKind::TRAIT_DECL
+                    | SyntaxKind::IMPL_DECL
+                    | SyntaxKind::INTERFACE_DECL
+                    | SyntaxKind::IFACE_RESOURCE
+                    | SyntaxKind::EXTERN_BLOCK
+            )
+        })
+    };
+    let kind = match entry.kind {
+        ItemTreeKind::Function if module_level => TargetKind::Fn,
+        ItemTreeKind::Function | ItemTreeKind::AssocFn => {
+            match containing_owner().map(SyntaxNode::kind) {
+                Some(SyntaxKind::TRAIT_DECL) => TargetKind::TraitFn,
+                Some(SyntaxKind::IMPL_DECL) => TargetKind::ImplFn,
+                Some(SyntaxKind::INTERFACE_DECL | SyntaxKind::IFACE_RESOURCE) => {
+                    TargetKind::InterfaceFn
+                }
+                Some(SyntaxKind::EXTERN_BLOCK) => TargetKind::ExternFn,
+                _ => return Err(TargetFilterError::StaleItemTree),
+            }
+        }
+        ItemTreeKind::Struct => TargetKind::Record,
+        ItemTreeKind::Alias => TargetKind::Alias,
+        ItemTreeKind::Refined => TargetKind::Refined,
+        ItemTreeKind::Enum => TargetKind::Enum,
+        ItemTreeKind::Distinct => TargetKind::Distinct,
+        ItemTreeKind::Resource => TargetKind::Resource,
+        ItemTreeKind::Trait => TargetKind::Trait,
+        ItemTreeKind::Impl => TargetKind::Impl,
+        ItemTreeKind::Const => TargetKind::Const,
+        ItemTreeKind::Invariant => TargetKind::Invariant,
+        ItemTreeKind::Effect => TargetKind::Effect,
+        ItemTreeKind::Interface => TargetKind::Interface,
+        ItemTreeKind::World => TargetKind::World,
+        ItemTreeKind::ExternBlock => TargetKind::ExternBlock,
+        ItemTreeKind::Test => TargetKind::Test,
+        ItemTreeKind::Property => TargetKind::Property,
+        ItemTreeKind::TypeParam
+        | ItemTreeKind::ConstParam
+        | ItemTreeKind::VariantField
+        | ItemTreeKind::WorldItem { .. }
+        | ItemTreeKind::WorldInclude => return Ok(None),
+        ItemTreeKind::Field => TargetKind::Field,
+        ItemTreeKind::Variant => TargetKind::Variant,
+        ItemTreeKind::AssocType => TargetKind::AssocType,
+        ItemTreeKind::InterfaceFn => TargetKind::InterfaceFn,
+        ItemTreeKind::ExternFn => TargetKind::ExternFn,
+    };
     let mut target = AttributeTarget {
-        module_level: true,
-        is_exported: entry.vis == crate::Visibility::Export,
+        module_level,
+        is_exported: module_level && entry.vis == crate::Visibility::Export,
         ..AttributeTarget::new(kind)
     };
-    if kind == TargetKind::Fn {
-        let syntax = ast_ids
-            .pointer(entry.ast_id)
-            .and_then(|pointer| pointer.resolve(file, root))
-            .ok_or(TargetFilterError::StaleItemTree)?;
+    if matches!(
+        kind,
+        TargetKind::Fn | TargetKind::TraitFn | TargetKind::ImplFn
+    ) {
         let function = ast::FnDecl::cast(syntax).ok_or(TargetFilterError::StaleItemTree)?;
-        target.has_body = function
-            .syntax()
-            .children()
-            .any(|child| child.kind() == SyntaxKind::BLOCK);
+        target.has_body = function.body().is_some();
     }
-    Ok(target)
+    target.inside_interface = ancestors
+        .iter()
+        .any(|node| node.kind() == SyntaxKind::INTERFACE_DECL);
+    target.assoc_type_in_trait = kind == TargetKind::AssocType
+        && ancestors
+            .iter()
+            .any(|node| node.kind() == SyntaxKind::TRAIT_DECL);
+    if let Some(impl_node) = ancestors
+        .iter()
+        .find(|node| node.kind() == SyntaxKind::IMPL_DECL)
+        .and_then(|node| ast::ImplDecl::cast(node.clone()))
+    {
+        target.impl_kind = Some(if impl_node.interface_path().is_some() {
+            ImplKind::Interface
+        } else if impl_node
+            .syntax()
+            .children_with_tokens()
+            .any(|element| element.kind() == SyntaxKind::FOR_KW)
+        {
+            ImplKind::Trait
+        } else {
+            ImplKind::Inherent
+        });
+    }
+    if let Some(extern_node) = ancestors
+        .iter()
+        .find(|node| node.kind() == SyntaxKind::EXTERN_BLOCK)
+    {
+        target.extern_abi = ast::ExternBlock::cast(extern_node.clone())
+            .and_then(|block| block.abi())
+            .map(|abi| match abi.value().as_ref() {
+                "wasm" => ExternAbi::Wasm,
+                "C" => ExternAbi::C,
+                _ => ExternAbi::Other,
+            });
+        target.extern_unsafe = extern_node
+            .children_with_tokens()
+            .any(|element| element.kind() == SyntaxKind::UNSAFE_KW);
+    }
+    Ok(Some(target))
 }
 
 fn validate_module_attrs(
@@ -1883,28 +2052,311 @@ mod tests {
             .iter()
             .find(|entry| symbols.resolve(entry.name).unwrap().as_ref() == "exported")
             .expect("exported function retained");
-        let exported_context =
-            module_attribute_target(exported, TargetKind::Fn, file, &parsed.root, &ast_ids)
-                .expect("exported function context resolves");
+        let exported_context = entry_attribute_target(exported, true, file, &parsed.root, &ast_ids)
+            .expect("exported function context resolves")
+            .expect("function has an attribute target");
         assert!(exported_context.is_exported);
         assert!(exported_context.has_body);
-        let private_context = module_attribute_target(
+        let private_context = entry_attribute_target(
             result
                 .item_tree
                 .items
                 .iter()
                 .find(|entry| symbols.resolve(entry.name).unwrap().as_ref() == "with_body")
                 .expect("private function retained"),
-            TargetKind::Fn,
+            true,
             file,
             &parsed.root,
             &ast_ids,
         )
-        .expect("private function context resolves");
+        .expect("private function context resolves")
+        .expect("function has an attribute target");
         assert!(!private_context.is_exported);
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
         }));
+    }
+
+    #[test]
+    fn target_collection_validates_nested_attributes_with_owner_context() {
+        fn find_entry<'a>(
+            entries: &'a [ItemTreeEntry],
+            symbols: &Interner,
+            kind: ItemTreeKind,
+            name: &str,
+        ) -> Option<&'a ItemTreeEntry> {
+            entries.iter().find_map(|entry| {
+                if entry.kind == kind && symbols.resolve(entry.name).unwrap().as_ref() == name {
+                    Some(entry)
+                } else {
+                    find_entry(&entry.children, symbols, kind, name)
+                }
+            })
+        }
+
+        let source = concat!(
+            "trait Trait {\n",
+            "    @inline fn defaulted() {}\n",
+            "    @inline fn required()\n",
+            "    @deprecated type Assoc\n",
+            "}\n",
+            "impl Value {\n",
+            "    @deprecated fn inherent() {}\n",
+            "    @deprecated type Assoc = U32\n",
+            "}\n",
+            "impl Trait for Value {\n",
+            "    @deprecated fn trait_impl() {}\n",
+            "}\n",
+            "impl api {\n",
+            "    @deprecated fn interface_impl() {}\n",
+            "}\n",
+            "interface api {\n",
+            "    @repr(C) type Record { @deprecated field: U32 }\n",
+            "    @must_use fn call() -> U32\n",
+            "    resource Thing {\n",
+            "        @must_use fn read()\n",
+            "    }\n",
+            "}\n",
+            "extern \"wasm\" module \"env\" {\n",
+            "    @deprecated fn imported()\n",
+            "}\n",
+            "unsafe extern \"C\" {\n",
+            "    @deprecated fn c_import()\n",
+            "}\n",
+            "world sample {\n",
+            "    @deprecated import fn now() -> U64\n",
+            "    @doc(hidden) include base\n",
+            "}\n",
+            "fn generic<@deprecated T>() {}\n",
+        );
+        let file = FileId::new(727);
+        let (parsed, ast_ids, symbols, _, snapshot) = collect_with_snapshot(source, file);
+        let target_for = |entry: &ItemTreeEntry, module_level| {
+            entry_attribute_target(entry, module_level, file, &parsed.root, &ast_ids)
+                .expect("attribute target resolves")
+                .expect("entry has an attribute target")
+        };
+        let result = ItemTree::collect_for_target(
+            file,
+            source,
+            &parsed.root,
+            &ast_ids,
+            &symbols,
+            &snapshot,
+            &target_cfg("wasm32-core", &[]),
+        )
+        .expect("target collection succeeds");
+        let entries = &result.item_tree.items;
+        let attribute_for = |kind, name: &str| {
+            let entry = find_entry(entries, &symbols, kind, name)
+                .unwrap_or_else(|| panic!("missing retained {kind:?} entry `{name}`"));
+            result
+                .validated_attrs
+                .get(&entry.ast_id)
+                .expect("entry attributes validated")
+        };
+
+        assert!(
+            attribute_for(ItemTreeKind::AssocFn, "defaulted")
+                .inline
+                .is_some()
+        );
+        assert!(
+            attribute_for(ItemTreeKind::AssocFn, "required")
+                .inline
+                .is_none()
+        );
+        assert!(
+            attribute_for(ItemTreeKind::AssocType, "Assoc")
+                .deprecated
+                .is_some()
+        );
+        assert!(
+            attribute_for(ItemTreeKind::AssocFn, "inherent")
+                .deprecated
+                .is_some()
+        );
+        assert!(
+            attribute_for(ItemTreeKind::AssocFn, "trait_impl")
+                .deprecated
+                .is_none()
+        );
+        assert!(attribute_for(ItemTreeKind::Struct, "Record").repr.is_none());
+        assert!(
+            attribute_for(ItemTreeKind::Field, "field")
+                .deprecated
+                .is_some()
+        );
+        assert!(
+            attribute_for(ItemTreeKind::InterfaceFn, "call")
+                .must_use
+                .is_some()
+        );
+        assert!(
+            attribute_for(ItemTreeKind::AssocFn, "read")
+                .must_use
+                .is_some()
+        );
+        let resource_method = find_entry(entries, &symbols, ItemTreeKind::AssocFn, "read").unwrap();
+        assert_eq!(
+            target_for(resource_method, false).kind,
+            TargetKind::InterfaceFn
+        );
+        assert!(
+            attribute_for(ItemTreeKind::ExternFn, "imported")
+                .deprecated
+                .is_some()
+        );
+
+        let trait_fn = find_entry(entries, &symbols, ItemTreeKind::AssocFn, "defaulted")
+            .expect("trait method retained");
+        let trait_context = target_for(trait_fn, false);
+        assert!(trait_context.has_body);
+        let required_fn = find_entry(entries, &symbols, ItemTreeKind::AssocFn, "required").unwrap();
+        assert!(!target_for(required_fn, false).has_body);
+
+        let impl_method = find_entry(entries, &symbols, ItemTreeKind::AssocFn, "inherent").unwrap();
+        assert_eq!(
+            target_for(impl_method, false).impl_kind,
+            Some(ImplKind::Inherent)
+        );
+        let trait_impl_method =
+            find_entry(entries, &symbols, ItemTreeKind::AssocFn, "trait_impl").unwrap();
+        assert_eq!(
+            target_for(trait_impl_method, false).impl_kind,
+            Some(ImplKind::Trait)
+        );
+        let interface_impl_method =
+            find_entry(entries, &symbols, ItemTreeKind::AssocFn, "interface_impl").unwrap();
+        assert_eq!(
+            target_for(interface_impl_method, false).impl_kind,
+            Some(ImplKind::Interface)
+        );
+
+        let interface_record =
+            find_entry(entries, &symbols, ItemTreeKind::Struct, "Record").unwrap();
+        assert!(target_for(interface_record, false).inside_interface);
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::WitIncompatibleType
+            })
+        );
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+        }));
+
+        let imported = find_entry(entries, &symbols, ItemTreeKind::ExternFn, "imported").unwrap();
+        let extern_context = target_for(imported, false);
+        assert_eq!(extern_context.extern_abi, Some(ExternAbi::Wasm));
+        assert!(!extern_context.extern_unsafe);
+        let c_import = find_entry(entries, &symbols, ItemTreeKind::ExternFn, "c_import").unwrap();
+        let c_context = target_for(c_import, false);
+        assert_eq!(c_context.extern_abi, Some(ExternAbi::C));
+        assert!(c_context.extern_unsafe);
+
+        let world_item = find_entry(
+            entries,
+            &symbols,
+            ItemTreeKind::WorldItem { import: true },
+            "now",
+        )
+        .expect("world item retained");
+        assert!(
+            entry_attribute_target(world_item, false, file, &parsed.root, &ast_ids)
+                .unwrap()
+                .is_none()
+        );
+        let world_include =
+            find_entry(entries, &symbols, ItemTreeKind::WorldInclude, "base").unwrap();
+        assert!(
+            entry_attribute_target(world_include, false, file, &parsed.root, &ast_ids)
+                .unwrap()
+                .is_none()
+        );
+
+        let generic = find_entry(entries, &symbols, ItemTreeKind::Function, "generic").unwrap();
+        let generic_parameter = generic
+            .children
+            .iter()
+            .find(|entry| entry.kind == ItemTreeKind::TypeParam)
+            .expect("generic parameter collected");
+        assert!(
+            result
+                .validated_attrs
+                .get(&generic_parameter.ast_id)
+                .unwrap()
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn target_collection_does_not_revalidate_parser_rejected_attribute_positions() {
+        fn find_entry<'a>(
+            entries: &'a [ItemTreeEntry],
+            symbols: &Interner,
+            kind: ItemTreeKind,
+            name: &str,
+        ) -> Option<&'a ItemTreeEntry> {
+            entries.iter().find_map(|entry| {
+                if entry.kind == kind && symbols.resolve(entry.name).unwrap().as_ref() == name {
+                    Some(entry)
+                } else {
+                    find_entry(&entry.children, symbols, kind, name)
+                }
+            })
+        }
+
+        let source = concat!(
+            "enum Message { Error(@deprecated @derive(Clone) code: U32) }\n",
+            "fn generic<@deprecated @derive(Clone) T>() {}\n",
+            "world sample {\n",
+            "    @deprecated @derive(Clone) import fn now() -> U64\n",
+            "    @deprecated @derive(Clone) include base\n",
+            "}\n",
+        );
+        let file = FileId::new(728);
+        let (parsed, ast_ids, symbols, _, snapshot) = collect_with_snapshot(source, file);
+        let parser_target_errors = parsed
+            .errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget)
+            .count();
+        assert_eq!(parser_target_errors, 4, "{:?}", parsed.errors);
+
+        let result = ItemTree::collect_for_target(
+            file,
+            source,
+            &parsed.root,
+            &ast_ids,
+            &symbols,
+            &snapshot,
+            &target_cfg("wasm32-core", &[]),
+        )
+        .expect("target collection succeeds");
+        assert!(
+            result.diagnostics.is_empty(),
+            "HIR must not duplicate parser diagnostics or stage errors: {:?}",
+            result.diagnostics
+        );
+
+        for (kind, name) in [
+            (ItemTreeKind::VariantField, "code"),
+            (ItemTreeKind::TypeParam, "T"),
+            (ItemTreeKind::WorldItem { import: true }, "now"),
+            (ItemTreeKind::WorldInclude, "base"),
+        ] {
+            let entry = find_entry(&result.item_tree.items, &symbols, kind, name)
+                .unwrap_or_else(|| panic!("missing retained {kind:?} `{name}`"));
+            let attrs = result
+                .validated_attrs
+                .get(&entry.ast_id)
+                .expect("all retained entries have an attribute result");
+            assert!(attrs.inline.is_none());
+            assert!(attrs.deprecated.is_none());
+            assert!(attrs.derives.is_empty());
+            assert!(attrs.diagnostics.is_empty());
+        }
     }
 
     #[test]
@@ -2012,7 +2464,10 @@ mod tests {
         let source = concat!(
             "@target(\"wasm64-core\")\n",
             "@derive(UnknownTrait)\n",
-            "fn omitted() {}\n",
+            "trait Omitted {\n",
+            "    @target(\"wasm32-core\")\n",
+            "    fn nested() {}\n",
+            "}\n",
             "@target(\"wasm32-linux\")\n",
             "fn retained() {}\n",
         );
