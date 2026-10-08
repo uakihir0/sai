@@ -9,7 +9,8 @@ use crate::expressions::{
 use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
 use crate::items::{
     FieldDef, HirOwner, ImplItem, ImplItemKind, InterfaceItem, InterfaceItemKind, Item, ItemKind,
-    OwnerNode, TraitItem, TraitItemKind, Variant as HirVariant, VariantShape as HirVariantShape,
+    MemberRole, OwnerNode, TraitItem, TraitItemKind, Variant as HirVariant,
+    VariantShape as HirVariantShape,
 };
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
@@ -76,6 +77,14 @@ impl<'source, 'hir> HirLoweringContext<'source, 'hir> {
             def_paths,
         }
     }
+}
+
+/// AST identities that locate one resource member within its interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceResourceMemberIds {
+    pub interface: ast::ErasedAstId,
+    pub resource: ast::ErasedAstId,
+    pub member: ast::ErasedAstId,
 }
 
 /// Lower a function declaration's signature and body within its HIR owner.
@@ -1650,6 +1659,303 @@ pub fn lower_interface_item_owner<'hir>(
     ))
 }
 
+/// Lower one function declared directly in an interface resource.
+///
+/// The interface, resource, and member HIR owners must match their ItemTree
+/// declarations and source-ordered owner slots. The member receives the
+/// `AssocFn` path that was interned while lowering its resource.
+pub fn lower_interface_resource_member_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    interface_owner: &HirOwner<'hir>,
+    resource_owner: &HirOwner<'hir>,
+    item_ids: InterfaceResourceMemberIds,
+    item_tree: &'hir ItemTree,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let OwnerNode::Item(parent_item) = interface_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    let ItemKind::Interface {
+        items: parent_item_owners,
+    } = parent_item.kind
+    else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item.owner_id != interface_owner.id {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let (interface_entry, interface_syntax) = resolve_item_tree_entry(
+        item_tree,
+        item_ids.interface,
+        ItemTreeKind::Interface,
+        context,
+    )?;
+    let interface_declaration = ast::InterfaceDecl::cast(interface_syntax)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let interface_visibility = item_visibility(interface_declaration.syntax());
+    validate_current_item_metadata(
+        interface_entry,
+        interface_declaration.attrs(),
+        interface_visibility,
+        context,
+    )?;
+    if parent_item.owner_id != interface_owner.id
+        || parent_item.name.sym != interface_entry.name
+        || parent_item.vis != interface_visibility
+        || !raw_attrs_match(interface_owner.raw_attrs, &interface_entry.raw_attrs)
+        || parent_item.span
+            != (Span {
+                file: item_tree.file,
+                range: interface_declaration.syntax().text_range(),
+                ctxt: SpanCtxt::Root,
+            })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let interface_path = context
+        .def_paths
+        .resolve(interface_owner.id.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    validate_owner_def_path(
+        interface_owner.id,
+        &interface_path,
+        DefPathData::Interface(interface_entry.name),
+        context,
+    )?;
+    if !matches!(
+        interface_path.data().last(),
+        Some(component)
+            if component.disambiguator
+                == interface_entry_disambiguator(item_tree, interface_entry)?
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let OwnerNode::InterfaceItem(resource_item) = resource_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    let InterfaceItemKind::Resource {
+        members: resource_members,
+    } = resource_item.kind
+    else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if resource_item.owner_id != resource_owner.id
+        || resource_item.interface != interface_owner.id.def_id
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let resource_entry = interface_entry
+        .children
+        .iter()
+        .find(|child| child.ast_id == item_ids.resource && child.kind == ItemTreeKind::Resource)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let interface_item_index = interface_entry
+        .children
+        .iter()
+        .filter(|child| {
+            matches!(
+                child.kind,
+                ItemTreeKind::Struct
+                    | ItemTreeKind::Alias
+                    | ItemTreeKind::Refined
+                    | ItemTreeKind::Enum
+                    | ItemTreeKind::Resource
+                    | ItemTreeKind::InterfaceFn
+            )
+        })
+        .position(|child| child.ast_id == item_ids.resource)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if parent_item_owners.get(interface_item_index) != Some(&resource_owner.id) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let item_list =
+        interface_declaration
+            .items()
+            .ok_or(HirLoweringError::MissingRequiredSyntax(
+                SyntaxKind::ITEM_LIST,
+            ))?;
+    let resource_syntax = context
+        .ast_ids
+        .pointer(item_ids.resource)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if !item_list.syntax().children().any(|child| {
+        child.kind() == resource_syntax.kind() && child.text_range() == resource_syntax.text_range()
+    }) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let resource_declaration =
+        ast::IfaceResource::cast(resource_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    validate_current_item_metadata(
+        resource_entry,
+        resource_declaration.attrs(),
+        item_visibility(resource_declaration.syntax()),
+        context,
+    )?;
+    if resource_item.name.sym != resource_entry.name
+        || !raw_attrs_match(resource_owner.raw_attrs, &resource_entry.raw_attrs)
+        || resource_item.span
+            != (Span {
+                file: item_tree.file,
+                range: resource_declaration.syntax().text_range(),
+                ctxt: SpanCtxt::Root,
+            })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let resource_path = context
+        .def_paths
+        .resolve(resource_owner.id.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    validate_owner_def_path(
+        resource_owner.id,
+        &resource_path,
+        DefPathData::TypeNs(resource_entry.name),
+        context,
+    )?;
+    let resource_disambiguator = interface_child_disambiguator(
+        interface_entry,
+        resource_entry,
+        &DefPathData::TypeNs(resource_entry.name),
+    )?;
+    if resource_path.data().get(..interface_path.data().len()) != Some(interface_path.data())
+        || resource_path.data().len() != interface_path.data().len() + 1
+        || !matches!(
+            resource_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(resource_entry.name)
+                    && component.disambiguator == resource_disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let member_entry = resource_entry
+        .children
+        .iter()
+        .find(|child| child.ast_id == item_ids.member && child.kind == ItemTreeKind::AssocFn)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let member_index = resource_entry
+        .children
+        .iter()
+        .filter(|child| child.kind == ItemTreeKind::AssocFn)
+        .position(|child| child.ast_id == item_ids.member)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if resource_members.get(member_index) != Some(&owner) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let resource_item_list = resource_declaration
+        .items()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let member_syntax = context
+        .ast_ids
+        .pointer(item_ids.member)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if !resource_item_list.syntax().children().any(|child| {
+        child.kind() == member_syntax.kind() && child.text_range() == member_syntax.text_range()
+    }) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let function =
+        ast::FnDecl::cast(member_syntax.clone()).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    validate_current_item_metadata(
+        member_entry,
+        function.attrs(),
+        item_visibility(function.syntax()),
+        context,
+    )?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::AssocFn(member_entry.name),
+        context,
+    )?;
+    let member_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    let member_disambiguator =
+        interface_resource_member_disambiguator(resource_entry, member_entry)?;
+    if member_path.data().get(..resource_path.data().len()) != Some(resource_path.data())
+        || member_path.data().len() != resource_path.data().len() + 1
+        || !matches!(
+            member_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::AssocFn(member_entry.name)
+                    && component.disambiguator == member_disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    ensure_supported_interface_function(&function)?;
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        &member_syntax,
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        function.name(),
+        function.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != member_entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let (sig, generics) = lower_function_signature_with_generics(
+        &function,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let role = if sig.params.first().is_some_and(|param| param.is_self) {
+        MemberRole::Method
+    } else if name.sym == context.symbols.intern("new")?
+        && sig
+            .ret
+            .is_some_and(|ty| is_interface_resource_type(ty, resource_entry.name))
+    {
+        MemberRole::Constructor
+    } else {
+        MemberRole::Static
+    };
+    let span = source_map.span_for(function.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_interface_item(InterfaceItem {
+        owner_id: owner,
+        interface: interface_owner.id.def_id,
+        name,
+        kind: InterfaceItemKind::ResourceMember {
+            resource: resource_owner.id.def_id,
+            role,
+            sig,
+            generics: *generics,
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::InterfaceItem(item),
+            body: None,
+            raw_attrs: &member_entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one inherent, trait, or interface impl declaration.
 ///
 /// The complete expected impl path includes the header hash stored in the
@@ -3032,6 +3338,41 @@ fn interface_child_disambiguator(
             .ok_or(DefPathInternerError::TooManyDefinitions)?;
     }
     Err(HirLoweringError::ItemTreeEntryMismatch)
+}
+
+fn interface_resource_member_disambiguator(
+    resource_entry: &crate::item_tree::ItemTreeEntry,
+    member_entry: &crate::item_tree::ItemTreeEntry,
+) -> Result<u32, HirLoweringError> {
+    let mut disambiguator = 0u32;
+    for candidate in &resource_entry.children {
+        if candidate.kind != ItemTreeKind::AssocFn || candidate.name != member_entry.name {
+            continue;
+        }
+        if candidate.ast_id == member_entry.ast_id {
+            return Ok(disambiguator);
+        }
+        disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+    }
+    Err(HirLoweringError::ItemTreeEntryMismatch)
+}
+
+fn is_interface_resource_type(ty: &HirTy<'_>, resource_name: Symbol) -> bool {
+    let HirTyKind::Path(path) = ty.kind else {
+        return false;
+    };
+    (path.root == PathRoot::SelfType && path.segments.is_empty())
+        || (path.root == PathRoot::Plain
+            && matches!(
+                path.segments,
+                [PathSegment {
+                    name: Name { sym, .. },
+                    args: None,
+                    ..
+                }] if *sym == resource_name
+            ))
 }
 
 fn prepare_interface_resource_member_paths(
@@ -21296,6 +21637,299 @@ mod tests {
                 .unwrap()
                 .data,
             DefPathData::TypeParam(symbols.intern("T").unwrap())
+        );
+    }
+
+    #[test]
+    fn interface_resource_member_owner_classifies_roles_and_keeps_duplicate_paths() {
+        let file = crate::FileId::new(298);
+        let source = concat!(
+            "interface images {\n",
+            "    resource Image {\n",
+            "        fn width(self: borrow Self) -> U32\n",
+            "        fn new(data: Bytes) -> Self\n",
+            "        fn new() -> Image\n",
+            "        fn info() -> Str\n",
+            "        fn info<T>(value: T) -> T where T: Copy requires true ensures true { value }\n",
+            "        fn new() -> Result<Self, E>\n",
+            "    }\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::GenericInterfaceItem)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InterfaceFnClause)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InterfaceFnBody)
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects resource members");
+        let interface_entry = item_tree.items.first().expect("interface entry");
+        let resource_entry = interface_entry
+            .children
+            .iter()
+            .find(|entry| entry.kind == ItemTreeKind::Resource)
+            .expect("interface resource entry");
+        assert_eq!(resource_entry.children.len(), 6);
+        let name = symbols.intern("images").expect("interface name interns");
+        let (_packages, paths, interface_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::Interface(name));
+        let interface_path = owner_def_path(&paths, interface_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (interface_owner, _) = lower_interface_owner(
+            interface_owner_id,
+            &interface_path,
+            &item_tree,
+            interface_entry.ast_id,
+            &context,
+        )
+        .expect("interface owner lowers");
+        let OwnerNode::Item(interface_item) = interface_owner.node else {
+            panic!("interface owner is an item");
+        };
+        let ItemKind::Interface { items } = interface_item.kind else {
+            panic!("interface owner retains its interface kind");
+        };
+        let resource_index = interface_entry
+            .children
+            .iter()
+            .position(|entry| entry.ast_id == resource_entry.ast_id)
+            .expect("resource has a source-ordered parent slot");
+        let resource_owner_id = items[resource_index];
+        let resource_path = owner_def_path(&paths, resource_owner_id);
+        let (resource_owner, _) = lower_interface_item_owner(
+            resource_owner_id,
+            &resource_path,
+            &interface_owner,
+            interface_entry.ast_id,
+            resource_entry.ast_id,
+            &item_tree,
+            &context,
+        )
+        .expect("resource owner lowers and interns its member paths");
+        let OwnerNode::InterfaceItem(resource_item) = resource_owner.node else {
+            panic!("resource has an interface-item owner");
+        };
+        let InterfaceItemKind::Resource { members } = resource_item.kind else {
+            panic!("resource owner retains its member owners");
+        };
+        assert_eq!(members.len(), resource_entry.children.len());
+
+        let expected_roles = [
+            MemberRole::Method,
+            MemberRole::Constructor,
+            MemberRole::Constructor,
+            MemberRole::Static,
+            MemberRole::Static,
+            MemberRole::Static,
+        ];
+        let mut duplicate_disambiguators = Vec::new();
+        for (index, (member_owner, member_entry)) in members
+            .iter()
+            .copied()
+            .zip(&resource_entry.children)
+            .enumerate()
+        {
+            let member_path = owner_def_path(&paths, member_owner);
+            let (hir_owner, source_map) = lower_interface_resource_member_owner(
+                member_owner,
+                &member_path,
+                &interface_owner,
+                &resource_owner,
+                InterfaceResourceMemberIds {
+                    interface: interface_entry.ast_id,
+                    resource: resource_entry.ast_id,
+                    member: member_entry.ast_id,
+                },
+                &item_tree,
+                &context,
+            )
+            .expect("resource member lowers under its resource owner");
+            assert_eq!(source_map.owner(), member_owner);
+            assert!(hir_owner.body.is_none());
+            let OwnerNode::InterfaceItem(item) = hir_owner.node else {
+                panic!("resource member has an interface-item owner");
+            };
+            assert_eq!(item.owner_id, member_owner);
+            assert_eq!(item.interface, interface_owner_id.def_id);
+            assert_eq!(item.name.sym, member_entry.name);
+            let InterfaceItemKind::ResourceMember {
+                resource,
+                role,
+                sig,
+                generics,
+            } = item.kind
+            else {
+                panic!("resource function retains its resource-member kind");
+            };
+            assert_eq!(resource, resource_owner_id.def_id);
+            assert_eq!(role, expected_roles[index]);
+            if index == 4 {
+                assert_eq!(generics.params.len(), 1);
+                assert_eq!(generics.params[0].name.sym, symbols.intern("T").unwrap());
+                assert_eq!(generics.where_preds.len(), 1);
+                assert_eq!(sig.params.len(), 1);
+                assert_eq!(
+                    sig.params[0].name.expect("named resource parameter").sym,
+                    symbols.intern("value").unwrap()
+                );
+                assert!(!sig.params[0].is_self);
+                assert!(matches!(
+                    sig.params[0].ty.kind,
+                    HirTyKind::Path(path)
+                        if path.segments.len() == 1
+                            && path.segments[0].name.sym == symbols.intern("T").unwrap()
+                ));
+                assert!(matches!(
+                    sig.ret.expect("resource signature retains its return type").kind,
+                    HirTyKind::Path(path)
+                        if path.segments.len() == 1
+                            && path.segments[0].name.sym == symbols.intern("T").unwrap()
+                ));
+            } else {
+                assert!(generics.params.is_empty());
+                assert!(generics.where_preds.is_empty());
+            }
+            assert!(sig.requires.is_empty());
+            assert!(sig.ensures.is_empty());
+            assert_eq!(
+                sig.params.first().is_some_and(|param| param.is_self),
+                role == MemberRole::Method
+            );
+            let path_component = member_path
+                .data()
+                .last()
+                .expect("resource member path has a terminal component");
+            assert_eq!(path_component.data, DefPathData::AssocFn(member_entry.name));
+            if member_entry.name == symbols.intern("info").unwrap() {
+                duplicate_disambiguators.push(path_component.disambiguator);
+            }
+            if index == 5 {
+                let result_ty = sig.ret.expect("static new retains its Result return type");
+                assert!(
+                    !is_interface_resource_type(result_ty, resource_entry.name),
+                    "Result<Self, E> does not classify a new function as a constructor"
+                );
+            }
+        }
+        assert_eq!(duplicate_disambiguators, [0, 1]);
+    }
+
+    #[test]
+    fn interface_resource_member_owner_rejects_a_sibling_resource_parent() {
+        let file = crate::FileId::new(299);
+        let source = concat!(
+            "interface api {\n",
+            "    resource File { fn read() -> U32 }\n",
+            "    resource File { fn read() -> U64 }\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects duplicate resource declarations");
+        let interface_entry = item_tree.items.first().expect("interface entry");
+        let resources = interface_entry
+            .children
+            .iter()
+            .filter(|entry| entry.kind == ItemTreeKind::Resource)
+            .collect::<Vec<_>>();
+        assert_eq!(resources.len(), 2);
+        let name = symbols.intern("api").expect("interface name interns");
+        let (_packages, paths, interface_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::Interface(name));
+        let interface_path = owner_def_path(&paths, interface_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (interface_owner, _) = lower_interface_owner(
+            interface_owner_id,
+            &interface_path,
+            &item_tree,
+            interface_entry.ast_id,
+            &context,
+        )
+        .expect("interface owner lowers");
+        let OwnerNode::Item(interface_item) = interface_owner.node else {
+            panic!("interface owner is an item");
+        };
+        let ItemKind::Interface { items } = interface_item.kind else {
+            panic!("interface owner retains its interface kind");
+        };
+        let first_resource = resources[0];
+        let second_resource = resources[1];
+        let first_resource_owner_id = items[0];
+        let second_resource_owner_id = items[1];
+        let first_path = owner_def_path(&paths, first_resource_owner_id);
+        let second_path = owner_def_path(&paths, second_resource_owner_id);
+        let (first_resource_owner, _) = lower_interface_item_owner(
+            first_resource_owner_id,
+            &first_path,
+            &interface_owner,
+            interface_entry.ast_id,
+            first_resource.ast_id,
+            &item_tree,
+            &context,
+        )
+        .expect("first resource lowers");
+        let (second_resource_owner, _) = lower_interface_item_owner(
+            second_resource_owner_id,
+            &second_path,
+            &interface_owner,
+            interface_entry.ast_id,
+            second_resource.ast_id,
+            &item_tree,
+            &context,
+        )
+        .expect("second resource lowers");
+        let OwnerNode::InterfaceItem(second_resource_item) = second_resource_owner.node else {
+            panic!("second resource has an interface-item owner");
+        };
+        let InterfaceItemKind::Resource {
+            members: second_members,
+        } = second_resource_item.kind
+        else {
+            panic!("second resource retains its member owner");
+        };
+        let second_member_owner = second_members[0];
+        let second_member_path = owner_def_path(&paths, second_member_owner);
+        let path_count = paths.len().unwrap();
+        assert!(matches!(
+            lower_interface_resource_member_owner(
+                second_member_owner,
+                &second_member_path,
+                &interface_owner,
+                &first_resource_owner,
+                InterfaceResourceMemberIds {
+                    interface: interface_entry.ast_id,
+                    resource: second_resource.ast_id,
+                    member: second_resource.children[0].ast_id,
+                },
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            path_count,
+            "a sibling resource owner cannot claim the other resource's member"
         );
     }
 

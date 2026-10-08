@@ -575,11 +575,13 @@ pub enum WorldRef<'hir> {
 
 The reference implementation stores the package path in the query-session HIR arena; this uses `&'hir str` in place of `SmolStr` so world-item nodes remain copyable.
 
-`MemberRole` is decided syntactically by spec/13 §13.2.4:
+`MemberRole` follows the classification in spec/13 §13.2.4:
 
 - a member whose first parameter has `is_self` is a `Method`;
-- a member named `new` without `self` is the `Constructor`;
+- a member named `new` without `self` is the `Constructor` only when its return type is exactly `Self` or the resource's own name;
 - every other member is `Static`.
+
+In particular, `new` returning `Result<Self, E>` is `Static` for a declared interface resource.
 
 The generics of an interface item are lowered so that §16.6.1 can report them, and they are otherwise ignored.
 
@@ -628,7 +630,7 @@ Interface items and world items have no bodies. The parser reports a `{` after a
 For each member of an interface `resource R` (spec/13 §13.2.4):
 
 - A `Method` must have the receiver `self: borrow Self` or `self: borrow mut Self`, where `Self` and `R` are the same after alias expansion. Any other receiver type, including `self: Self`, is `WIT_INCOMPATIBLE_TYPE` at the receiver.
-- The `Constructor` must return exactly `Self` or `R`. Any other return type, or a missing return type, is `WIT_INCOMPATIBLE_TYPE` at the return type, or at the name when the return type is missing.
+- A member is a `Constructor` only when it is named `new`, has no `self` parameter, and returns exactly `Self` or `R`. A `new` with any other or missing return type is `Static`, following spec/13 §13.2.4.
 - A `Static` member has no extra rule.
 
 The boundary types of members are then checked by §16.6.3. The receiver is not a boundary type, because WIT does not print it (spec/13 §13.11.2).
