@@ -1,15 +1,23 @@
 use crate::item_tree::{ItemTree, ItemTreeError, StableItemTree};
 use sai_intern::Interner;
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
-use sai_syntax::{ParseQueryError, SyntaxQueries};
+use sai_syntax::{ParseQueryError, SyntaxQueries, SyntaxQueryGroup};
 use sai_vfs::{FileId, FileInterner, FileKey, WorkspaceSnapshot};
 use std::sync::Arc;
 
 /// Memoizes snapshot-independent item-tree shapes by stable file identity.
-#[derive(Clone)]
-pub struct ItemTreeQueries {
-    syntax: SyntaxQueries,
+pub struct ItemTreeQueries<S = SyntaxQueries> {
+    syntax: Arc<S>,
     stable_item_tree: DerivedQuery<FileKey, StableItemTree>,
+}
+
+impl<S> Clone for ItemTreeQueries<S> {
+    fn clone(&self) -> Self {
+        Self {
+            syntax: Arc::clone(&self.syntax),
+            stable_item_tree: self.stable_item_tree.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,27 +40,41 @@ impl From<QueryError> for ItemTreeQueryError {
     }
 }
 
-impl ItemTreeQueries {
-    pub fn new(syntax: SyntaxQueries) -> Result<Self, QueryError> {
-        let query_syntax = syntax.clone();
+impl<S> ItemTreeQueries<S>
+where
+    S: SyntaxQueryGroup + Send + Sync + 'static,
+{
+    pub fn new(syntax: S) -> Result<Self, QueryError> {
+        let syntax = Arc::new(syntax);
+        let query_syntax = Arc::clone(&syntax);
         let stable_item_tree = DerivedQuery::<FileKey, StableItemTree>::new(
             "def_collector",
             move |database: &mut QueryDatabase, key| {
                 let symbols = Interner::new();
-                query_syntax.with_query_ast(database, key.clone(), |source, root, ast_ids| {
-                    let tree =
-                        ItemTree::collect(FileId::new(0), source.text(), root, ast_ids, &symbols)
-                            .unwrap_or_else(|error| {
-                                panic!("query-local item-tree collection failed: {error:?}")
-                            });
-                    assert!(
-                        !tree.matches_ast_ids(ast_ids),
-                        "query-local trees must not claim snapshot validity"
-                    );
-                    tree.stable_shape(&symbols).unwrap_or_else(|error| {
-                        panic!("query-local item-tree symbol resolution failed: {error:?}")
-                    })
-                })
+                SyntaxQueryGroup::with_query_ast(
+                    query_syntax.as_ref(),
+                    database,
+                    key.clone(),
+                    |source, root, ast_ids| {
+                        let tree = ItemTree::collect(
+                            FileId::new(0),
+                            source.text(),
+                            root,
+                            ast_ids,
+                            &symbols,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("query-local item-tree collection failed: {error:?}")
+                        });
+                        assert!(
+                            !tree.matches_ast_ids(ast_ids),
+                            "query-local trees must not claim snapshot validity"
+                        );
+                        tree.stable_shape(&symbols).unwrap_or_else(|error| {
+                            panic!("query-local item-tree symbol resolution failed: {error:?}")
+                        })
+                    },
+                )
             },
         )?;
         Ok(Self {
@@ -91,14 +113,12 @@ impl ItemTreeQueries {
             .file_key(file_id)
             .cloned()
             .ok_or(ItemTreeQueryError::FileNotInterned)?;
-        let parsed = self
-            .syntax
-            .parse(database, files, snapshot, file_id)
-            .map_err(ItemTreeQueryError::Syntax)?;
-        let ast_ids = self
-            .syntax
-            .ast_id_map(database, files, snapshot, file_id)
-            .map_err(ItemTreeQueryError::Syntax)?;
+        let parsed =
+            SyntaxQueryGroup::parse(self.syntax.as_ref(), database, files, snapshot, file_id)
+                .map_err(ItemTreeQueryError::Syntax)?;
+        let ast_ids =
+            SyntaxQueryGroup::ast_id_map(self.syntax.as_ref(), database, files, snapshot, file_id)
+                .map_err(ItemTreeQueryError::Syntax)?;
         let source = snapshot.file(file_id).ok_or(ItemTreeQueryError::Syntax(
             ParseQueryError::MissingSnapshotFile,
         ))?;
@@ -125,9 +145,45 @@ mod tests {
     use sai_intern::Interner;
     use sai_query::{Durability, QueryDatabase};
     use sai_stable_hash::StableHash;
-    use sai_syntax::SyntaxQueries;
+    use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, SyntaxQueryGroup};
     use sai_vfs::{FileInterner, FileKey, SnapshotFile, SourceFile, VfsInputs, WorkspaceSnapshot};
     use std::sync::Arc;
+
+    struct AlternateSyntaxGroup(SyntaxQueries);
+
+    impl SyntaxQueryGroup for AlternateSyntaxGroup {
+        fn parse(
+            &self,
+            database: &mut QueryDatabase,
+            files: &FileInterner,
+            snapshot: &WorkspaceSnapshot,
+            file_id: FileId,
+        ) -> Result<Parse, ParseQueryError> {
+            SyntaxQueryGroup::parse(&self.0, database, files, snapshot, file_id)
+        }
+
+        fn ast_id_map(
+            &self,
+            database: &mut QueryDatabase,
+            files: &FileInterner,
+            snapshot: &WorkspaceSnapshot,
+            file_id: FileId,
+        ) -> Result<sai_syntax::ast::AstIdMap, ParseQueryError> {
+            SyntaxQueryGroup::ast_id_map(&self.0, database, files, snapshot, file_id)
+        }
+
+        fn with_query_ast<V>(
+            &self,
+            database: &mut QueryDatabase,
+            key: FileKey,
+            build: impl FnOnce(&SourceFile, &sai_syntax::SyntaxNode, &sai_syntax::ast::AstIdMap) -> V,
+        ) -> Result<V, sai_query::QueryError>
+        where
+            V: Clone + Eq + StableHash + Send + Sync + 'static,
+        {
+            SyntaxQueryGroup::with_query_ast(&self.0, database, key, build)
+        }
+    }
 
     fn snapshot(file_id: FileId, bytes: &[u8], version: u64) -> WorkspaceSnapshot {
         WorkspaceSnapshot::new([SnapshotFile::new(
@@ -216,7 +272,8 @@ mod tests {
         let first_snapshot = snapshot(file_id, original, 1);
         let vfs = VfsInputs::new().expect("VFS query IDs are available");
         let syntax = SyntaxQueries::new(vfs.clone()).expect("syntax query is available");
-        let queries = ItemTreeQueries::new(syntax.clone()).expect("item-tree query is available");
+        let queries = ItemTreeQueries::new(AlternateSyntaxGroup(syntax.clone()))
+            .expect("item-tree query is available");
         let mut database = QueryDatabase::new();
         vfs.set_file_contents(
             &mut database,
@@ -225,6 +282,14 @@ mod tests {
             Durability::Low,
         )
         .expect("original source is set");
+        let first_shape = queries
+            .stable_item_tree(&mut database, key.clone())
+            .expect("item-tree shape collects");
+        let cloned_queries = queries.clone();
+        let cloned_shape = cloned_queries
+            .stable_item_tree(&mut database, key.clone())
+            .expect("cloned query holder shares its memo");
+        assert!(Arc::ptr_eq(&first_shape, &cloned_shape));
         let symbols = Interner::new();
         assert!(matches!(
             queries.def_collector(

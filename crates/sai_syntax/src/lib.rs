@@ -1150,6 +1150,73 @@ impl SyntaxQueries {
     }
 }
 
+/// The syntax query group consumed by later compiler phases.
+///
+/// Query runtime and snapshot state are explicit parameters because the
+/// current frontend adapters are not yet owned by a root database. A root
+/// database can implement this trait by forwarding to its syntax query
+/// storage while keeping the same query boundary.
+pub trait SyntaxQueryGroup {
+    fn parse(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+    ) -> Result<Parse, ParseQueryError>;
+
+    fn ast_id_map(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+    ) -> Result<ast::AstIdMap, ParseQueryError>;
+
+    fn with_query_ast<V>(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        build: impl FnOnce(&SourceFile, &SyntaxNode, &ast::AstIdMap) -> V,
+    ) -> Result<V, QueryError>
+    where
+        V: Clone + Eq + StableHash + Send + Sync + 'static;
+}
+
+impl SyntaxQueryGroup for SyntaxQueries {
+    fn parse(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+    ) -> Result<Parse, ParseQueryError> {
+        SyntaxQueries::parse(self, database, files, snapshot, file_id)
+    }
+
+    fn ast_id_map(
+        &self,
+        database: &mut QueryDatabase,
+        files: &FileInterner,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+    ) -> Result<ast::AstIdMap, ParseQueryError> {
+        SyntaxQueries::ast_id_map(self, database, files, snapshot, file_id)
+    }
+
+    fn with_query_ast<V>(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        build: impl FnOnce(&SourceFile, &SyntaxNode, &ast::AstIdMap) -> V,
+    ) -> Result<V, QueryError>
+    where
+        V: Clone + Eq + StableHash + Send + Sync + 'static,
+    {
+        SyntaxQueries::with_query_ast(self, database, key, build)
+    }
+}
+
 fn report_unknown_attributes(
     root: &SyntaxNode,
     tokens: &[Token],
