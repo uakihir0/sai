@@ -105,6 +105,7 @@ pub enum RawAttrArg {
     Word {
         name: Symbol,
         raw: bool,
+        is_upper: bool,
         args: Option<Vec<RawAttrArg>>,
         /// Current-snapshot source location; excluded from structural equality.
         span: Span,
@@ -137,16 +138,23 @@ impl PartialEq for RawAttrArg {
                 Self::Word {
                     name: left_name,
                     raw: left_raw,
+                    is_upper: left_is_upper,
                     args: left_args,
                     ..
                 },
                 Self::Word {
                     name: right_name,
                     raw: right_raw,
+                    is_upper: right_is_upper,
                     args: right_args,
                     ..
                 },
-            ) => left_name == right_name && left_raw == right_raw && left_args == right_args,
+            ) => {
+                left_name == right_name
+                    && left_raw == right_raw
+                    && left_is_upper == right_is_upper
+                    && left_args == right_args
+            }
             (Self::Str { value: left, .. }, Self::Str { value: right, .. }) => left == right,
             (Self::Int { value: left, .. }, Self::Int { value: right, .. }) => left == right,
             (
@@ -1334,6 +1342,10 @@ fn raw_attr_arg(
     }
 
     if let Some(name) = arg.name() {
+        let is_upper = name
+            .syntax()
+            .first_token()
+            .is_some_and(|token| token.kind() == SyntaxKind::UIDENT);
         let raw = node_text(source, name.syntax())?.starts_with("r#");
         let name = name_symbol(source, &name, symbols);
         let args = if let Some(args) = arg.args() {
@@ -1350,6 +1362,7 @@ fn raw_attr_arg(
         return Ok(Some(RawAttrArg::Word {
             name: name?,
             raw,
+            is_upper,
             args,
             span,
         }));

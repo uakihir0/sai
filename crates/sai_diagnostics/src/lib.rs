@@ -89,6 +89,7 @@ define_codes! {
     DuplicateAttributeArgument => "DUPLICATE_ATTRIBUTE_ARGUMENT",
     ConflictingAttributes => "CONFLICTING_ATTRIBUTES",
     UnknownAttribute => "UNKNOWN_ATTRIBUTE",
+    UnknownDerive => "UNKNOWN_DERIVE",
     RedundantPubExport => "REDUNDANT_PUB_EXPORT",
     InvalidExportTarget => "INVALID_EXPORT_TARGET",
     ExplicitDiscriminantOnDataEnum => "EXPLICIT_DISCRIMINANT_ON_DATA_ENUM",
@@ -322,6 +323,7 @@ pub enum FixOperationName {
     InlineFunction,
     AddTest,
     ImplementTrait,
+    MergeDeriveAttributes,
 }
 
 impl FixOperationName {
@@ -347,6 +349,7 @@ impl FixOperationName {
             Self::InlineFunction => "inline_function",
             Self::AddTest => "add_test",
             Self::ImplementTrait => "implement_trait",
+            Self::MergeDeriveAttributes => "merge_derive_attributes",
         }
     }
 }
@@ -712,6 +715,7 @@ fn argument_schema(name: FixOperationName) -> Vec<ArgumentSpec> {
             optional("types", Text),
             optional("derive", TextOrBool),
         ],
+        Op::MergeDeriveAttributes => vec![required("into", Text)],
     }
 }
 
@@ -952,7 +956,11 @@ fn apply_text_edits(
     Ok(result)
 }
 
-fn first_line_uses_crlf(bytes: &[u8]) -> bool {
+/// Returns whether edit text should use CR LF line endings for this source file.
+///
+/// Fix edits store normalized LF text; application follows the first line
+/// terminator in the original file, matching [`apply_text_edits`].
+pub fn first_line_uses_crlf(bytes: &[u8]) -> bool {
     bytes
         .iter()
         .position(|byte| matches!(byte, b'\r' | b'\n'))
@@ -1647,6 +1655,7 @@ mod tests {
             Code::from_name("FEATURE_NOT_IMPLEMENTED"),
             Some(Code::FeatureNotImplemented)
         );
+        assert_eq!(Code::from_name("UNKNOWN_DERIVE"), Some(Code::UnknownDerive));
         assert_eq!(
             Code::from_name("GENERIC_INTERFACE_ITEM"),
             Some(Code::GenericInterfaceItem)

@@ -4239,18 +4239,21 @@ fn raw_attr_arg_match(current: &RawAttrArg, item_tree: &RawAttrArg) -> bool {
             RawAttrArg::Word {
                 name: current_name,
                 raw: current_raw,
+                is_upper: current_is_upper,
                 args: current_args,
                 span: current_span,
             },
             RawAttrArg::Word {
                 name: item_tree_name,
                 raw: item_tree_raw,
+                is_upper: item_tree_is_upper,
                 args: item_tree_args,
                 span: item_tree_span,
             },
         ) => {
             current_name == item_tree_name
                 && current_raw == item_tree_raw
+                && current_is_upper == item_tree_is_upper
                 && current_span == item_tree_span
                 && raw_attr_args_match(current_args, item_tree_args)
         }

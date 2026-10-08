@@ -594,6 +594,49 @@ pub fn lex_with_fixes(
     Ok(output)
 }
 
+/// Plans a machine-applicable replacement of one exact lexical token.
+///
+/// The range uses decoded source offsets, like `Token::range`. `primary` must
+/// identify that same token in the supplied snapshot.
+pub fn token_replacement_fix(
+    snapshot: &WorkspaceSnapshot,
+    file_id: FileId,
+    decoded_range: TextRange,
+    replacement: &str,
+    title: impl Into<String>,
+    primary: &Location,
+) -> Result<Fix, LexError> {
+    let lexed = lex(snapshot, file_id)?;
+    let token_index = lexed
+        .tokens
+        .iter()
+        .position(|token| token.range == decoded_range)
+        .ok_or(LexError::FixPlanningFailed)?;
+    let token_index = u64::try_from(token_index).map_err(|_| LexError::FixPlanningFailed)?;
+    let operation = FixOperation::new(
+        FixOperationName::ReplaceNode,
+        NodeId::new(NodeGroup::Token, token_index),
+        ValueObject::from([("text".to_owned(), Value::String(replacement.to_owned()))]),
+    )
+    .map_err(|_| LexError::FixPlanningFailed)?;
+    let planner = LexicalFixPlanner {
+        token_index,
+        decoded_range,
+        operation: FixOperationName::ReplaceNode,
+        replacement,
+    };
+    Fix::new(
+        title,
+        Applicability::MachineApplicable,
+        operation,
+        Vec::new(),
+        primary,
+        snapshot,
+        &planner,
+    )
+    .map_err(|_| LexError::FixPlanningFailed)
+}
+
 struct LexicalFixPlanner<'a> {
     token_index: u64,
     decoded_range: TextRange,

@@ -1,10 +1,12 @@
 use crate::item_tree::{AttrName, RawAttr, RawAttrArg, RawAttrValue};
+use crate::types::LangItem;
 use sai_diagnostics::{
-    Child, ChildKind, Code, Diagnostic, Label, LintLevel as DiagnosticLintLevel, Location,
-    Severity, SourceRef, Value, WorkspaceSnapshot,
+    Applicability, Child, ChildKind, Code, Diagnostic, Fix, FixOperation, FixOperationName,
+    FixOperationPlanner, Label, LintLevel as DiagnosticLintLevel, Location, NodeGroup, NodeId,
+    OperationPlanError, Severity, SourceRef, TextEdit, Value, ValueObject, WorkspaceSnapshot,
 };
 use sai_intern::{Interner, Symbol};
-use sai_vfs::{Span, WorkspaceSnapshot as VfsWorkspaceSnapshot};
+use sai_vfs::{FileId, Span, WorkspaceSnapshot as VfsWorkspaceSnapshot};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -564,6 +566,7 @@ pub enum TargetPredicate {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ValidatedAttrs {
+    pub derives: Vec<(LangItem, Span)>,
     pub inline: Option<(InlineHint, Span)>,
     pub cold: Option<Span>,
     pub must_use: Option<(Option<String>, Span)>,
@@ -581,6 +584,7 @@ pub enum AttrValidationError {
     InvalidSourceSpan,
     SnapshotMismatch,
     ForeignSymbol,
+    FixPlanningFailed,
 }
 
 /// Validates the attributes of one syntactic target at the implemented stage.
@@ -593,6 +597,22 @@ pub fn validate_attrs(
     symbols: &Interner,
     snapshot: &VfsWorkspaceSnapshot,
 ) -> Result<ValidatedAttrs, AttrValidationError> {
+    validate_attrs_at_stage(
+        attributes,
+        target,
+        symbols,
+        snapshot,
+        IMPLEMENTED_ATTRIBUTE_STAGE,
+    )
+}
+
+fn validate_attrs_at_stage(
+    attributes: &[RawAttr],
+    target: Option<AttributeTarget>,
+    symbols: &Interner,
+    snapshot: &VfsWorkspaceSnapshot,
+    implemented_stage: u8,
+) -> Result<ValidatedAttrs, AttrValidationError> {
     let Some(target) = target else {
         return Ok(ValidatedAttrs::default());
     };
@@ -600,15 +620,16 @@ pub fn validate_attrs(
     let mut validated = ValidatedAttrs::default();
     let mut accepted = Vec::<AcceptedAttribute>::new();
     let mut first_by_name = HashMap::<AttrName, Span>::new();
+    let mut first_attribute_by_name = HashMap::<AttrName, usize>::new();
     let mut seen_lint_codes = HashSet::<(DiagnosticLintLevel, Symbol)>::new();
 
-    for attribute in attributes {
+    for (attribute_index, attribute) in attributes.iter().enumerate() {
         if attribute.has_error {
             continue;
         }
 
         let attribute_schema = schema(attribute.name);
-        if attribute_schema.stage > IMPLEMENTED_ATTRIBUTE_STAGE {
+        if attribute_schema.stage > implemented_stage {
             let mut diagnostic = diagnostic_at(
                 Code::FeatureNotImplemented,
                 format!(
@@ -677,6 +698,23 @@ pub fn validate_attrs(
                     "first occurrence is here",
                     snapshot,
                 )?;
+                if attribute.name == AttrName::Derive {
+                    let first_index = first_attribute_by_name
+                        .get(&attribute.name)
+                        .copied()
+                        .ok_or(AttrValidationError::FixPlanningFailed)?;
+                    let first_attribute = attributes
+                        .get(first_index)
+                        .ok_or(AttrValidationError::FixPlanningFailed)?;
+                    let primary = diagnostic
+                        .primary()
+                        .cloned()
+                        .ok_or(AttrValidationError::FixPlanningFailed)?;
+                    let fix = derive_merge_fix(first_attribute, attribute, snapshot, &primary)?;
+                    diagnostic
+                        .push_fix(fix)
+                        .map_err(|_| AttrValidationError::FixPlanningFailed)?;
+                }
                 validated.diagnostics.push(diagnostic);
                 continue;
             }
@@ -688,6 +726,13 @@ pub fn validate_attrs(
             snapshot,
             &mut validated.diagnostics,
         )?;
+
+        if !attribute_schema.repeatable {
+            first_by_name.insert(attribute.name, attribute.span);
+            first_attribute_by_name
+                .entry(attribute.name)
+                .or_insert(attribute_index);
+        }
 
         if let Some(previous) = accepted
             .iter()
@@ -713,9 +758,11 @@ pub fn validate_attrs(
             continue;
         }
 
-        if !attribute_schema.repeatable {
-            first_by_name.insert(attribute.name, attribute.span);
-        }
+        let Some(prepared) =
+            validate_derive_names(prepared, symbols, snapshot, &mut validated.diagnostics)?
+        else {
+            continue;
+        };
         apply_prepared(&mut validated, attribute, prepared.clone());
         accepted.push(AcceptedAttribute {
             name: attribute.name,
@@ -741,6 +788,8 @@ struct AcceptedAttribute {
 
 #[derive(Clone, Debug)]
 enum PreparedAttribute {
+    Derives(Vec<(Symbol, Span)>),
+    ValidatedDerives(Vec<(LangItem, Span)>),
     Inline(InlineHint),
     Cold,
     MustUse(Option<String>),
@@ -758,6 +807,393 @@ impl PreparedAttribute {
             Self::Inline(hint) => Some(*hint),
             _ => None,
         }
+    }
+}
+
+fn validate_derive_names(
+    prepared: PreparedAttribute,
+    symbols: &Interner,
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Option<PreparedAttribute>, AttrValidationError> {
+    let PreparedAttribute::Derives(names) = prepared else {
+        return Ok(Some(prepared));
+    };
+    let mut derives = Vec::with_capacity(names.len());
+    let mut has_unknown = false;
+    for (name, span) in names {
+        let spelling = symbols
+            .resolve(name)
+            .map_err(|_| AttrValidationError::ForeignSymbol)?;
+        let Some(item) = derive_lang_item(&spelling) else {
+            let mut diagnostic = diagnostic_at(
+                Code::UnknownDerive,
+                format!("unknown derive `{spelling}`"),
+                span,
+                snapshot,
+            )?;
+            if let Some(suggestion) = unique_derive_suggestion(&spelling) {
+                let primary = diagnostic
+                    .primary()
+                    .cloned()
+                    .ok_or(AttrValidationError::FixPlanningFailed)?;
+                let fix = sai_syntax::token_replacement_fix(
+                    snapshot,
+                    span.file,
+                    span.range,
+                    suggestion,
+                    format!("replace with `{suggestion}`"),
+                    &primary,
+                )
+                .map_err(|_| AttrValidationError::FixPlanningFailed)?;
+                diagnostic
+                    .push_fix(fix)
+                    .map_err(|_| AttrValidationError::FixPlanningFailed)?;
+            }
+            diagnostics.push(diagnostic);
+            has_unknown = true;
+            continue;
+        };
+        derives.push((item, span));
+    }
+    if has_unknown {
+        Ok(None)
+    } else {
+        Ok(Some(PreparedAttribute::ValidatedDerives(derives)))
+    }
+}
+
+fn derive_lang_item(name: &str) -> Option<LangItem> {
+    Some(match name {
+        "Copy" => LangItem::Copy,
+        "Clone" => LangItem::Clone,
+        "PartialEq" => LangItem::PartialEq,
+        "Eq" => LangItem::Eq,
+        "PartialOrd" => LangItem::PartialOrd,
+        "Ord" => LangItem::Ord,
+        "Hash" => LangItem::Hash,
+        "Default" => LangItem::Default,
+        "Arbitrary" => LangItem::Arbitrary,
+        "Add" => LangItem::Add,
+        "Sub" => LangItem::Sub,
+        "Mul" => LangItem::Mul,
+        "Div" => LangItem::Div,
+        "Rem" => LangItem::Rem,
+        "Neg" => LangItem::Neg,
+        "BitAnd" => LangItem::BitAnd,
+        "BitOr" => LangItem::BitOr,
+        "BitXor" => LangItem::BitXor,
+        "BitNot" => LangItem::BitNot,
+        _ => return None,
+    })
+}
+
+const DERIVE_NAMES: &[&str] = &[
+    "Copy",
+    "Clone",
+    "PartialEq",
+    "Eq",
+    "PartialOrd",
+    "Ord",
+    "Hash",
+    "Default",
+    "Arbitrary",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Rem",
+    "Neg",
+    "BitAnd",
+    "BitOr",
+    "BitXor",
+    "BitNot",
+];
+
+fn unique_derive_suggestion(name: &str) -> Option<&'static str> {
+    let name_chars = name.chars().count();
+    let mut suggestions = DERIVE_NAMES
+        .iter()
+        .copied()
+        .filter(|candidate| name_chars.abs_diff(candidate.chars().count()) <= 2)
+        .filter(|candidate| damerau_levenshtein(name, candidate) <= 2);
+    let suggestion = suggestions.next()?;
+    suggestions.next().is_none().then_some(suggestion)
+}
+
+fn damerau_levenshtein(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let max_distance = left.len().saturating_add(right.len());
+    let mut distances = vec![vec![0; right.len() + 2]; left.len() + 2];
+    distances[0][0] = max_distance;
+    for row in 0..=left.len() {
+        distances[row + 1][0] = max_distance;
+        distances[row + 1][1] = row;
+    }
+    for column in 0..=right.len() {
+        distances[0][column + 1] = max_distance;
+        distances[1][column + 1] = column;
+    }
+
+    let mut last_row = HashMap::new();
+    for row in 1..=left.len() {
+        let mut last_match_column = 0;
+        for column in 1..=right.len() {
+            let prior_row = last_row.get(&right[column - 1]).copied().unwrap_or(0);
+            let prior_column = last_match_column;
+            let mut substitution_cost = 1;
+            if left[row - 1] == right[column - 1] {
+                substitution_cost = 0;
+                last_match_column = column;
+            }
+
+            distances[row + 1][column + 1] = [
+                distances[row][column] + substitution_cost,
+                distances[row + 1][column] + 1,
+                distances[row][column + 1] + 1,
+                distances[prior_row][prior_column]
+                    + (row - prior_row - 1)
+                    + 1
+                    + (column - prior_column - 1),
+            ]
+            .into_iter()
+            .min()
+            .unwrap_or(max_distance);
+        }
+        last_row.insert(left[row - 1], row);
+    }
+    distances[left.len() + 1][right.len() + 1]
+}
+
+fn derive_merge_fix(
+    first: &RawAttr,
+    duplicate: &RawAttr,
+    snapshot: &VfsWorkspaceSnapshot,
+    primary: &Location,
+) -> Result<Fix, AttrValidationError> {
+    let file = snapshot
+        .file(first.span.file)
+        .filter(|_| first.span.file == duplicate.span.file)
+        .ok_or(AttrValidationError::MissingFile)?;
+    let source = file.source().text();
+    let lexed = sai_syntax::lex(snapshot, first.span.file)
+        .map_err(|_| AttrValidationError::FixPlanningFailed)?;
+    let first_tokens = derive_attribute_tokens(&lexed, source, first.span)?;
+    let duplicate_tokens = derive_attribute_tokens(&lexed, source, duplicate.span)?;
+
+    let second_args = source
+        .get(
+            duplicate_tokens.open.range.end().to_usize()
+                ..duplicate_tokens.close.range.start().to_usize(),
+        )
+        .ok_or(AttrValidationError::InvalidSourceSpan)?;
+    if second_args.trim().is_empty() {
+        return Err(AttrValidationError::FixPlanningFailed);
+    }
+    let trivia_after_at = source
+        .get(duplicate_tokens.at_end.to_usize()..duplicate_tokens.name_start.to_usize())
+        .ok_or(AttrValidationError::InvalidSourceSpan)?;
+    let trivia_before_args = source
+        .get(duplicate_tokens.name_end.to_usize()..duplicate_tokens.open.range.start().to_usize())
+        .ok_or(AttrValidationError::InvalidSourceSpan)?;
+    let first_has_trailing_comma = lexed
+        .tokens
+        .iter()
+        .rfind(|token| {
+            token.range.start() >= first_tokens.open.range.end()
+                && token.range.end() <= first_tokens.close.range.start()
+        })
+        .is_some_and(|token| token.kind == sai_syntax::SyntaxKind::COMMA);
+    let separator = if first_has_trailing_comma { " " } else { ", " };
+    let inserted_text = format!("{separator}{trivia_after_at}{trivia_before_args}{second_args}")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let insertion_range = sai_vfs::TextRange::new(
+        first_tokens.close.range.start(),
+        first_tokens.close.range.start(),
+    )
+    .ok_or(AttrValidationError::FixPlanningFailed)?;
+    let first_name = NodeId::new(NodeGroup::Token, first_tokens.name_index);
+    let duplicate_name = NodeId::new(NodeGroup::Token, duplicate_tokens.name_index);
+    let operation = FixOperation::new(
+        FixOperationName::MergeDeriveAttributes,
+        duplicate_name,
+        ValueObject::from([("into".to_owned(), Value::String(first_name.to_string()))]),
+    )
+    .map_err(|_| AttrValidationError::FixPlanningFailed)?;
+    let planner = DeriveMergeFixPlanner {
+        file: first.span.file,
+        first_name,
+        duplicate_name,
+        insertion_range,
+        duplicate_range: duplicate.span.range,
+        inserted_text,
+    };
+    Fix::new(
+        "merge duplicate @derive attributes",
+        Applicability::MachineApplicable,
+        operation,
+        Vec::new(),
+        primary,
+        snapshot,
+        &planner,
+    )
+    .map_err(|_| AttrValidationError::FixPlanningFailed)
+}
+
+struct DeriveAttributeTokens {
+    at_end: sai_vfs::TextSize,
+    name_index: u64,
+    name_start: sai_vfs::TextSize,
+    name_end: sai_vfs::TextSize,
+    open: sai_syntax::Token,
+    close: sai_syntax::Token,
+}
+
+fn derive_attribute_tokens(
+    lexed: &sai_syntax::LexOutput,
+    source: &str,
+    span: Span,
+) -> Result<DeriveAttributeTokens, AttrValidationError> {
+    let tokens_in_attribute = lexed.tokens.iter().enumerate().filter(|(_, token)| {
+        token.range.start() >= span.range.start() && token.range.end() <= span.range.end()
+    });
+    let mut at_end = None;
+    let mut name_index = None;
+    let mut name_start = None;
+    let mut name_end = None;
+    let mut open = None;
+    let mut close = None;
+    for (index, token) in tokens_in_attribute {
+        match token.kind {
+            sai_syntax::SyntaxKind::AT if at_end.is_none() => at_end = Some(token.range.end()),
+            sai_syntax::SyntaxKind::LIDENT | sai_syntax::SyntaxKind::UIDENT
+                if name_index.is_none()
+                    && source.get(token.range.start().to_usize()..token.range.end().to_usize())
+                        == Some("derive") =>
+            {
+                name_index =
+                    Some(u64::try_from(index).map_err(|_| AttrValidationError::FixPlanningFailed)?);
+                name_start = Some(token.range.start());
+                name_end = Some(token.range.end());
+            }
+            sai_syntax::SyntaxKind::L_PAREN if open.is_none() => open = Some(token.clone()),
+            sai_syntax::SyntaxKind::R_PAREN => close = Some(token.clone()),
+            _ => {}
+        }
+    }
+    let at_end = at_end.ok_or(AttrValidationError::FixPlanningFailed)?;
+    let name_index = name_index.ok_or(AttrValidationError::FixPlanningFailed)?;
+    let name_start = name_start.ok_or(AttrValidationError::FixPlanningFailed)?;
+    let name_end = name_end.ok_or(AttrValidationError::FixPlanningFailed)?;
+    let open = open.ok_or(AttrValidationError::FixPlanningFailed)?;
+    let close = close.ok_or(AttrValidationError::FixPlanningFailed)?;
+    if open.range.start() >= close.range.start() {
+        return Err(AttrValidationError::FixPlanningFailed);
+    }
+    Ok(DeriveAttributeTokens {
+        at_end,
+        name_index,
+        name_start,
+        name_end,
+        open,
+        close,
+    })
+}
+
+struct DeriveMergeFixPlanner {
+    file: FileId,
+    first_name: NodeId,
+    duplicate_name: NodeId,
+    insertion_range: sai_vfs::TextRange,
+    duplicate_range: sai_vfs::TextRange,
+    inserted_text: String,
+}
+
+impl DeriveMergeFixPlanner {
+    fn edits(
+        &self,
+        operation: &FixOperation,
+        primary: &Location,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<TextEdit>, OperationPlanError> {
+        let file = snapshot
+            .file(self.file)
+            .ok_or(OperationPlanError::TargetNotFound)?;
+        let duplicate_original = file
+            .source()
+            .to_original_range(self.duplicate_range)
+            .ok_or(OperationPlanError::NotApplicable)?;
+        let into = operation.args().get("into");
+        if operation.name() != FixOperationName::MergeDeriveAttributes
+            || operation.node() != self.duplicate_name
+            || into != Some(&Value::String(self.first_name.to_string()))
+            || primary.span.file != self.file
+            || primary.span.range != duplicate_original
+        {
+            return Err(OperationPlanError::NotApplicable);
+        }
+        let source = SourceRef {
+            path: file.path().to_owned(),
+            package: file.package().map(str::to_owned),
+            snapshot: file.document_version(),
+        };
+        let insertion = file
+            .source()
+            .to_original_range(self.insertion_range)
+            .ok_or(OperationPlanError::NotApplicable)?;
+        Ok(vec![
+            TextEdit {
+                file: source.clone(),
+                range: Span::new(self.file, insertion),
+                new_text: self.inserted_text.clone(),
+            },
+            TextEdit {
+                file: source,
+                range: Span::new(self.file, duplicate_original),
+                new_text: String::new(),
+            },
+        ])
+    }
+}
+
+impl FixOperationPlanner for DeriveMergeFixPlanner {
+    fn apply_operation(
+        &self,
+        operation: &FixOperation,
+        primary: &Location,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<std::collections::BTreeMap<FileId, Vec<u8>>, OperationPlanError> {
+        let edits = self.edits(operation, primary, snapshot)?;
+        let file = snapshot
+            .file(self.file)
+            .ok_or(OperationPlanError::TargetNotFound)?;
+        let mut bytes = file.source().raw_bytes().to_vec();
+        let crlf = sai_diagnostics::first_line_uses_crlf(&bytes);
+        for edit in edits.iter().rev() {
+            let start = edit.range.range.start().to_usize();
+            let end = edit.range.range.end().to_usize();
+            let replacement = if crlf {
+                edit.new_text.replace('\n', "\r\n").into_bytes()
+            } else {
+                edit.new_text.as_bytes().to_vec()
+            };
+            if start > end || end > bytes.len() {
+                return Err(OperationPlanError::NotApplicable);
+            }
+            bytes.splice(start..end, replacement);
+        }
+        Ok(std::collections::BTreeMap::from([(self.file, bytes)]))
+    }
+
+    fn plan_edits(
+        &self,
+        operation: &FixOperation,
+        primary: &Location,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<TextEdit>, OperationPlanError> {
+        self.edits(operation, primary, snapshot)
     }
 }
 
@@ -996,6 +1432,7 @@ fn prepare_attribute(
                         raw: false,
                         args: None,
                         span,
+                        ..
                     } => {
                         symbols
                             .resolve(*name)
@@ -1025,6 +1462,7 @@ fn prepare_attribute(
                         raw: false,
                         args: None,
                         span,
+                        ..
                     },
                 ],
             ) = attribute.args.as_deref()
@@ -1107,8 +1545,53 @@ fn prepare_attribute(
                 None
             }
         },
-        AttrName::Derive
-        | AttrName::ExportName
+        AttrName::Derive => {
+            let Some(arguments) = attribute.args.as_deref() else {
+                invalid(
+                    attribute.span,
+                    "one or more plain derive names",
+                    diagnostics,
+                )?;
+                return Ok(None);
+            };
+            if arguments.is_empty() {
+                invalid(
+                    attribute.span,
+                    "one or more plain derive names",
+                    diagnostics,
+                )?;
+                return Ok(None);
+            }
+
+            let mut derives = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                match argument {
+                    RawAttrArg::Word {
+                        name,
+                        raw: false,
+                        is_upper: true,
+                        args: None,
+                        span,
+                        ..
+                    } => {
+                        symbols
+                            .resolve(*name)
+                            .map_err(|_| AttrValidationError::ForeignSymbol)?;
+                        derives.push((*name, *span));
+                    }
+                    _ => {
+                        invalid(
+                            argument_span(argument),
+                            "one or more plain derive names",
+                            diagnostics,
+                        )?;
+                        return Ok(None);
+                    }
+                }
+            }
+            Some(PreparedAttribute::Derives(derives))
+        }
+        AttrName::ExportName
         | AttrName::ImportName
         | AttrName::Flags
         | AttrName::Cases
@@ -1214,6 +1697,23 @@ fn drop_duplicate_arguments(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), AttrValidationError> {
     match prepared {
+        PreparedAttribute::Derives(derives) => {
+            let mut seen = HashSet::new();
+            let mut retained = Vec::with_capacity(derives.len());
+            for (name, span) in std::mem::take(derives) {
+                if seen.insert(name) {
+                    retained.push((name, span));
+                } else {
+                    diagnostics.push(diagnostic_at(
+                        Code::DuplicateAttributeArgument,
+                        "duplicate derive name",
+                        span,
+                        snapshot,
+                    )?);
+                }
+            }
+            *derives = retained;
+        }
         PreparedAttribute::Lints(lints) => {
             let mut retained = Vec::with_capacity(lints.len());
             for lint in std::mem::take(lints) {
@@ -1245,6 +1745,9 @@ fn apply_prepared(
     prepared: PreparedAttribute,
 ) {
     match prepared {
+        PreparedAttribute::ValidatedDerives(derives) => {
+            validated.derives.extend(derives);
+        }
         PreparedAttribute::Inline(hint) => validated.inline = Some((hint, attribute.span)),
         PreparedAttribute::Cold => validated.cold = Some(attribute.span),
         PreparedAttribute::MustUse(reason) => {
@@ -1266,8 +1769,8 @@ fn apply_prepared(
             validated.target = Some((predicate, attribute.span));
         }
         PreparedAttribute::DocHidden => validated.doc_hidden = Some(attribute.span),
-        PreparedAttribute::Target(_) => {
-            unreachable!("target predicates are finalized before application")
+        PreparedAttribute::Derives(_) | PreparedAttribute::Target(_) => {
+            unreachable!("attributes are finalized before application")
         }
     }
 }
@@ -1343,6 +1846,7 @@ fn parse_pending_target(
             raw: false,
             args,
             span,
+            ..
         } => {
             let spelling = symbols
                 .resolve(*name)
@@ -1537,6 +2041,20 @@ mod tests {
         (validated, snapshot)
     }
 
+    fn validate_source_at_stage(
+        source: &str,
+        target: AttributeTarget,
+        implemented_stage: u8,
+    ) -> (ValidatedAttrs, WorkspaceSnapshot) {
+        let file = sai_vfs::FileId::new(41);
+        let source_file = Arc::new(SourceFile::new(file, source, false).expect("valid source"));
+        let (attrs, symbols, snapshot) = collect_raw_attrs(source_file);
+        let validated =
+            validate_attrs_at_stage(&attrs, Some(target), &symbols, &snapshot, implemented_stage)
+                .expect("validation");
+        (validated, snapshot)
+    }
+
     fn collect_raw_attrs(
         source_file: Arc<SourceFile>,
     ) -> (Vec<RawAttr>, Interner, WorkspaceSnapshot) {
@@ -1590,6 +2108,283 @@ mod tests {
         ];
         for (name, stage) in stages {
             assert_eq!(schema(name).stage, stage, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn derives_validate_every_fixed_name_in_source_order() {
+        let (validated, snapshot) = validate_source_at_stage(
+            "@derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Arbitrary, Add, Sub, Mul, Div, Rem, Neg, BitAnd, BitOr, BitXor, BitNot)\ntype Value { field: I32 }",
+            AttributeTarget::new(TargetKind::Record),
+            2,
+        );
+
+        assert_eq!(
+            validated
+                .derives
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            [
+                LangItem::Copy,
+                LangItem::Clone,
+                LangItem::PartialEq,
+                LangItem::Eq,
+                LangItem::PartialOrd,
+                LangItem::Ord,
+                LangItem::Hash,
+                LangItem::Default,
+                LangItem::Arbitrary,
+                LangItem::Add,
+                LangItem::Sub,
+                LangItem::Mul,
+                LangItem::Div,
+                LangItem::Rem,
+                LangItem::Neg,
+                LangItem::BitAnd,
+                LangItem::BitOr,
+                LangItem::BitXor,
+                LangItem::BitNot,
+            ]
+        );
+        assert!(validated.diagnostics.is_empty());
+        assert_eq!(
+            validated.derives[0].1.range.start().to_usize(),
+            "@derive(".len()
+        );
+        assert_eq!(
+            snapshot
+                .file(sai_vfs::FileId::new(41))
+                .expect("file")
+                .source()
+                .text()
+                .get(
+                    validated.derives[0].1.range.start().to_usize()
+                        ..validated.derives[0].1.range.end().to_usize()
+                ),
+            Some("Copy")
+        );
+    }
+
+    #[test]
+    fn duplicate_derive_names_are_dropped_but_unknown_names_drop_the_attribute() {
+        let (duplicate, snapshot) = validate_source_at_stage(
+            "@derive(Clone, Clone)\ntype Value { field: I32 }",
+            AttributeTarget::new(TargetKind::Record),
+            2,
+        );
+        assert_eq!(
+            duplicate
+                .derives
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            [LangItem::Clone]
+        );
+        assert_eq!(
+            duplicate
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::DuplicateAttributeArgument]
+        );
+        assert_eq!(
+            snapshot
+                .file(sai_vfs::FileId::new(41))
+                .expect("file")
+                .source()
+                .text()
+                .get(
+                    duplicate.diagnostics[0]
+                        .primary()
+                        .expect("primary")
+                        .span
+                        .range
+                        .start()
+                        .to_usize()
+                        ..duplicate.diagnostics[0]
+                            .primary()
+                            .expect("primary")
+                            .span
+                            .range
+                            .end()
+                            .to_usize()
+                ),
+            Some("Clone")
+        );
+
+        let (unknown, snapshot) = validate_source_at_stage(
+            "@derive(Clnoe, Clone)\ntype Value { field: I32 }",
+            AttributeTarget::new(TargetKind::Record),
+            2,
+        );
+        assert!(unknown.derives.is_empty());
+        assert_eq!(
+            unknown
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::UnknownDerive]
+        );
+        assert_eq!(
+            snapshot
+                .file(sai_vfs::FileId::new(41))
+                .expect("file")
+                .source()
+                .text()
+                .get(
+                    unknown.diagnostics[0]
+                        .primary()
+                        .expect("primary")
+                        .span
+                        .range
+                        .start()
+                        .to_usize()
+                        ..unknown.diagnostics[0]
+                            .primary()
+                            .expect("primary")
+                            .span
+                            .range
+                            .end()
+                            .to_usize()
+                ),
+            Some("Clnoe")
+        );
+        assert_eq!(unknown.diagnostics[0].fixes().len(), 1);
+        let fix = &unknown.diagnostics[0].fixes()[0];
+        assert_eq!(fix.title(), "replace with `Clone`");
+        assert_eq!(
+            fix.applicability(),
+            sai_diagnostics::Applicability::MachineApplicable
+        );
+        assert_eq!(fix.edits()[0].new_text, "Clone");
+
+        let (unicode_typo, _) = validate_source_at_stage(
+            "@derive(Clonあ)\ntype Value { field: I32 }",
+            AttributeTarget::new(TargetKind::Record),
+            2,
+        );
+        assert_eq!(unicode_typo.diagnostics[0].code, Code::UnknownDerive);
+        assert_eq!(
+            unicode_typo.diagnostics[0].fixes()[0].title(),
+            "replace with `Clone`"
+        );
+    }
+
+    #[test]
+    fn duplicate_derive_attributes_offer_a_machine_applicable_merge() {
+        let source = "@derive(Clone,)\n@ /* keep this leading note */ derive /* keep this note */ (Copy, PartialEq,)\ntype Value { field: I32 }";
+        let (validated, snapshot) =
+            validate_source_at_stage(source, AttributeTarget::new(TargetKind::Record), 2);
+        assert_eq!(
+            validated
+                .derives
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            [LangItem::Clone]
+        );
+        assert_eq!(validated.diagnostics[0].code, Code::DuplicateAttribute);
+        let fix = validated.diagnostics[0]
+            .fixes()
+            .first()
+            .expect("duplicate derive has a merge fix");
+        assert_eq!(fix.title(), "merge duplicate @derive attributes");
+        assert_eq!(
+            fix.applicability(),
+            sai_diagnostics::Applicability::MachineApplicable
+        );
+        assert_eq!(
+            fix.operation().name(),
+            FixOperationName::MergeDeriveAttributes
+        );
+        assert_eq!(fix.edits().len(), 2);
+        assert_eq!(
+            fix.edits()[0].new_text,
+            "  /* keep this leading note */  /* keep this note */ Copy, PartialEq,"
+        );
+        assert_eq!(fix.edits()[1].new_text, "");
+
+        let mut bytes = snapshot
+            .file(sai_vfs::FileId::new(41))
+            .expect("file")
+            .source()
+            .raw_bytes()
+            .to_vec();
+        for edit in fix.edits().iter().rev() {
+            bytes.splice(
+                edit.range.range.start().to_usize()..edit.range.range.end().to_usize(),
+                edit.new_text.bytes(),
+            );
+        }
+        let merged = String::from_utf8(bytes).expect("merged source is utf-8");
+        assert!(merged.contains(
+            "@derive(Clone,  /* keep this leading note */  /* keep this note */ Copy, PartialEq,)"
+        ));
+        assert_eq!(merged.matches("@derive").count(), 1);
+    }
+
+    #[test]
+    fn duplicate_derive_merge_uses_the_first_line_ending_in_mixed_line_files() {
+        let source = "@derive(Clone)\n@derive(Copy,\r\nPartialEq)\ntype Value { field: I32 }";
+        let (validated, snapshot) =
+            validate_source_at_stage(source, AttributeTarget::new(TargetKind::Record), 2);
+        let fix = validated.diagnostics[0]
+            .fixes()
+            .first()
+            .expect("duplicate derive has a merge fix");
+        assert!(!sai_diagnostics::first_line_uses_crlf(
+            snapshot
+                .file(sai_vfs::FileId::new(41))
+                .expect("file")
+                .source()
+                .raw_bytes()
+        ));
+
+        let mut bytes = snapshot
+            .file(sai_vfs::FileId::new(41))
+            .expect("file")
+            .source()
+            .raw_bytes()
+            .to_vec();
+        for edit in fix.edits().iter().rev() {
+            bytes.splice(
+                edit.range.range.start().to_usize()..edit.range.range.end().to_usize(),
+                edit.new_text.bytes(),
+            );
+        }
+        let merged = String::from_utf8(bytes).expect("merged source is utf-8");
+        assert!(merged.contains("@derive(Clone, Copy,\nPartialEq)"));
+        assert_eq!(merged.matches("@derive").count(), 1);
+    }
+
+    #[test]
+    fn derive_keeps_stage_gate_and_rejects_invalid_argument_shapes() {
+        let (stage_zero, _) = validate_source(
+            "@derive(Clone)\ntype Value { field: I32 }",
+            AttributeTarget::new(TargetKind::Record),
+        );
+        assert!(stage_zero.derives.is_empty());
+        assert_eq!(stage_zero.diagnostics[0].code, Code::FeatureNotImplemented);
+
+        for source in [
+            "@derive()\ntype Value { field: I32 }",
+            "@derive(\"Clone\")\ntype Value { field: I32 }",
+            "@derive(Clone(Inner))\ntype Value { field: I32 }",
+            "@derive(clone)\ntype Value { field: I32 }",
+        ] {
+            let (validated, _) =
+                validate_source_at_stage(source, AttributeTarget::new(TargetKind::Record), 2);
+            assert!(validated.derives.is_empty(), "{source}");
+            assert!(
+                validated
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Code::InvalidAttributeArgument),
+                "{source}"
+            );
         }
     }
 
