@@ -1440,6 +1440,120 @@ impl Diagnostic {
     }
 }
 
+/// Converts a tracked source-text status into its source-level diagnostic.
+///
+/// The caller supplies the canonical source reference for this file. A
+/// `Missing` status represents a listed file for which the driver supplied no
+/// contents, so it is reported as a read failure with the reason `"not found"`.
+/// Error locations point at byte zero in the empty source retained by the VFS.
+pub fn source_text_status_diagnostic(
+    source_text: &sai_vfs::SourceText,
+    source_ref: SourceRef,
+) -> Option<Diagnostic> {
+    let (code, message, data) = match source_text.status() {
+        sai_vfs::SourceTextStatus::Ready => return None,
+        sai_vfs::SourceTextStatus::Missing => {
+            let reason = "not found";
+            let mut data = ValueObject::new();
+            data.insert("path".to_owned(), Value::String(source_ref.path.clone()));
+            data.insert("reason".to_owned(), Value::String(reason.to_owned()));
+            (
+                Code::SourceReadFailed,
+                format!("could not read source file: {reason}"),
+                data,
+            )
+        }
+        sai_vfs::SourceTextStatus::ReadError { io_error_kind } => {
+            let reason = normalize_io_error_reason(io_error_kind);
+            let mut data = ValueObject::new();
+            data.insert("path".to_owned(), Value::String(source_ref.path.clone()));
+            data.insert("reason".to_owned(), Value::String(reason.clone()));
+            (
+                Code::SourceReadFailed,
+                format!("could not read source file: {reason}"),
+                data,
+            )
+        }
+        sai_vfs::SourceTextStatus::TooLarge { byte_len } => {
+            let mut data = ValueObject::new();
+            data.insert(
+                "limit".to_owned(),
+                Value::String("size of a source file".to_owned()),
+            );
+            data.insert("value".to_owned(), Value::Integer(*byte_len as u128));
+            (
+                Code::ImplementationLimitExceeded,
+                format!(
+                    "source file is {byte_len} bytes, exceeding the {} MiB limit",
+                    sai_vfs::MAX_SOURCE_BYTES / (1024 * 1024)
+                ),
+                data,
+            )
+        }
+    };
+
+    let package = source_ref.package.clone();
+    let primary = Location {
+        file: source_ref,
+        span: Span::new(
+            source_text.source().id(),
+            TextRange::empty(TextSize::new(0)),
+        ),
+    };
+    let mut diagnostic = Diagnostic::new(code, Severity::Error, message, Some(primary));
+    diagnostic.data = data;
+    diagnostic.package = package;
+    Some(diagnostic)
+}
+
+const MAX_IO_ERROR_REASON_CHARS: usize = 64;
+const MAX_IO_ERROR_REASON_INPUT_CHARS: usize = 256;
+
+fn normalize_io_error_reason(reason: &str) -> String {
+    let chars = reason
+        .chars()
+        .take_while(|character| *character != '\r' && *character != '\n')
+        .take(MAX_IO_ERROR_REASON_INPUT_CHARS)
+        .collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(chars.len());
+
+    for (index, character) in chars.iter().copied().enumerate() {
+        if character.is_whitespace() || character.is_control() {
+            if !normalized.is_empty() && !normalized.ends_with(' ') {
+                normalized.push(' ');
+            }
+            continue;
+        }
+
+        let previous = index.checked_sub(1).and_then(|index| chars.get(index));
+        let next = chars.get(index + 1);
+        let camel_case_boundary = character.is_uppercase()
+            && (previous.is_some_and(|previous| previous.is_lowercase() || previous.is_numeric())
+                || (previous.is_some_and(|previous| previous.is_uppercase())
+                    && next.is_some_and(|next| next.is_lowercase())));
+        if camel_case_boundary && !normalized.is_empty() && !normalized.ends_with(' ') {
+            normalized.push(' ');
+        }
+        normalized.extend(character.to_lowercase());
+    }
+
+    let normalized = normalized.trim().trim_end_matches('.');
+    if normalized.is_empty() {
+        return "unknown error".to_owned();
+    }
+
+    if normalized.chars().nth(MAX_IO_ERROR_REASON_CHARS).is_some() {
+        let mut truncated = normalized
+            .chars()
+            .take(MAX_IO_ERROR_REASON_CHARS - 1)
+            .collect::<String>();
+        truncated.push('…');
+        return truncated;
+    }
+
+    normalized.to_owned()
+}
+
 fn validate_cause(
     snapshot: &WorkspaceSnapshot,
     cause: &CauseKey,
@@ -1505,8 +1619,43 @@ fn validate_related(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sai_vfs::{SnapshotFile, SourceFile};
+    use sai_query::{Durability, QueryDatabase};
+    use sai_vfs::{FileKey, SnapshotFile, SourceFile, SourceText, SourceTextStatus, VfsInputs};
     use std::sync::Arc;
+
+    fn source_text_with_status(file_id: u32, status: SourceTextStatus) -> SourceText {
+        let vfs = VfsInputs::new().expect("VFS query handles are valid");
+        let mut database = QueryDatabase::new();
+        let key = FileKey::new("sai:core", "dep:sai:core@1.0.0/src/lib.sai")
+            .expect("built-in source key is valid");
+        match status {
+            SourceTextStatus::Ready => {
+                vfs.set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::<[u8]>::from([]),
+                    Durability::Low,
+                )
+                .expect("source input can be set");
+            }
+            SourceTextStatus::Missing => {}
+            SourceTextStatus::ReadError { io_error_kind } => {
+                vfs.set_file_read_error(&mut database, key.clone(), io_error_kind, Durability::Low)
+                    .expect("source read error can be set");
+            }
+            SourceTextStatus::TooLarge { byte_len } => {
+                vfs.set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::<[u8]>::from(vec![b'x'; byte_len]),
+                    Durability::Low,
+                )
+                .expect("oversized source input can be set");
+            }
+        }
+        vfs.source_text(&mut database, key, FileId::new(file_id))
+            .expect("source text query succeeds")
+    }
 
     fn replace_node_operation() -> FixOperation {
         FixOperation::new(
@@ -1529,6 +1678,191 @@ mod tests {
                 TextRange::new(TextSize::new(0), TextSize::new(1)).expect("ordered range"),
             ),
         }
+    }
+
+    #[test]
+    fn ready_source_text_has_no_status_diagnostic() {
+        let source = source_text_with_status(7, SourceTextStatus::Ready);
+        let source_ref = SourceRef {
+            path: "src/lib.sai".to_owned(),
+            package: Some("sai:demo@0.1.0".to_owned()),
+            snapshot: Some(4),
+        };
+
+        assert!(source_text_status_diagnostic(&source, source_ref).is_none());
+    }
+
+    #[test]
+    fn missing_source_text_becomes_a_not_found_read_diagnostic() {
+        let source = source_text_with_status(7, SourceTextStatus::Missing);
+        let source_ref = SourceRef {
+            path: "dep:sai:core@1.0.0/src/lib.sai".to_owned(),
+            package: Some("sai:core@1.0.0".to_owned()),
+            snapshot: None,
+        };
+
+        let diagnostic = source_text_status_diagnostic(&source, source_ref.clone())
+            .expect("missing source produces a diagnostic");
+
+        assert_eq!(diagnostic.code, Code::SourceReadFailed);
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(diagnostic.message, "could not read source file: not found");
+        assert_eq!(
+            diagnostic.data,
+            ValueObject::from([
+                ("path".to_owned(), Value::String(source_ref.path.clone())),
+                ("reason".to_owned(), Value::String("not found".to_owned())),
+            ])
+        );
+        assert_eq!(diagnostic.package.as_deref(), source_ref.package.as_deref());
+        let primary = diagnostic
+            .primary()
+            .expect("read error has a source location");
+        assert_eq!(primary.file, source_ref);
+        assert_eq!(primary.span.file, FileId::new(7));
+        assert_eq!(primary.span.range, TextRange::empty(TextSize::new(0)));
+    }
+
+    #[test]
+    fn read_error_preserves_the_io_reason_and_source_reference() {
+        let source = source_text_with_status(
+            11,
+            SourceTextStatus::ReadError {
+                io_error_kind: "permission denied".to_owned(),
+            },
+        );
+        let source_ref = SourceRef {
+            path: "src/private.sai".to_owned(),
+            package: None,
+            snapshot: Some(9),
+        };
+
+        let diagnostic = source_text_status_diagnostic(&source, source_ref.clone())
+            .expect("read error produces a diagnostic");
+
+        assert_eq!(diagnostic.code, Code::SourceReadFailed);
+        assert_eq!(
+            diagnostic.message,
+            "could not read source file: permission denied"
+        );
+        assert_eq!(
+            diagnostic.data,
+            ValueObject::from([
+                ("path".to_owned(), Value::String(source_ref.path.clone())),
+                (
+                    "reason".to_owned(),
+                    Value::String("permission denied".to_owned())
+                ),
+            ])
+        );
+        assert_eq!(
+            diagnostic
+                .primary()
+                .expect("read error has a location")
+                .file,
+            source_ref
+        );
+    }
+
+    #[test]
+    fn read_error_reason_is_lowercase_and_single_line() {
+        let source = source_text_with_status(
+            12,
+            SourceTextStatus::ReadError {
+                io_error_kind: "PermissionDenied.\nadditional details".to_owned(),
+            },
+        );
+        let source_ref = SourceRef {
+            path: "src/private.sai".to_owned(),
+            package: None,
+            snapshot: None,
+        };
+
+        let diagnostic = source_text_status_diagnostic(&source, source_ref)
+            .expect("read error produces a diagnostic");
+
+        assert_eq!(
+            diagnostic.message,
+            "could not read source file: permission denied"
+        );
+        assert!(!diagnostic.message.ends_with('.'));
+        assert_eq!(
+            diagnostic.data.get("reason"),
+            Some(&Value::String("permission denied".to_owned()))
+        );
+    }
+
+    #[test]
+    fn read_error_reason_is_bounded_with_a_truncation_marker() {
+        let source = source_text_with_status(
+            14,
+            SourceTextStatus::ReadError {
+                io_error_kind: format!("PermissionDenied{}", "x".repeat(120)),
+            },
+        );
+
+        let diagnostic = source_text_status_diagnostic(
+            &source,
+            SourceRef {
+                path: "src/private.sai".to_owned(),
+                package: None,
+                snapshot: None,
+            },
+        )
+        .expect("read error produces a diagnostic");
+        let reason = match diagnostic.data.get("reason") {
+            Some(Value::String(reason)) => reason,
+            other => panic!("reason is a string, got {other:?}"),
+        };
+
+        assert_eq!(reason.chars().count(), MAX_IO_ERROR_REASON_CHARS);
+        assert!(reason.ends_with('…'));
+        assert_eq!(
+            diagnostic.message,
+            format!("could not read source file: {reason}")
+        );
+        assert!(!diagnostic.message.ends_with('.'));
+        assert!(diagnostic.message.chars().count() <= 100);
+    }
+
+    #[test]
+    fn oversized_source_text_reports_the_limit_and_exact_byte_length() {
+        let byte_len = sai_vfs::MAX_SOURCE_BYTES + 1;
+        let source = source_text_with_status(13, SourceTextStatus::TooLarge { byte_len });
+        let source_ref = SourceRef {
+            path: "src/large.sai".to_owned(),
+            package: Some("sai:demo@0.1.0".to_owned()),
+            snapshot: None,
+        };
+
+        let diagnostic = source_text_status_diagnostic(&source, source_ref.clone())
+            .expect("oversized source produces a diagnostic");
+
+        assert_eq!(diagnostic.code, Code::ImplementationLimitExceeded);
+        assert_eq!(
+            diagnostic.message,
+            format!(
+                "source file is {byte_len} bytes, exceeding the {} MiB limit",
+                sai_vfs::MAX_SOURCE_BYTES / (1024 * 1024)
+            )
+        );
+        assert_eq!(
+            diagnostic.data,
+            ValueObject::from([
+                (
+                    "limit".to_owned(),
+                    Value::String("size of a source file".to_owned())
+                ),
+                ("value".to_owned(), Value::Integer(byte_len as u128)),
+            ])
+        );
+        assert_eq!(
+            diagnostic
+                .primary()
+                .expect("size limit has a source location")
+                .file,
+            source_ref
+        );
     }
 
     #[test]
