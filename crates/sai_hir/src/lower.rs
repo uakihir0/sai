@@ -7,7 +7,7 @@ use crate::expressions::{
     MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
 };
 use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
-use crate::items::{HirOwner, Item, ItemKind, OwnerNode};
+use crate::items::{FieldDef, HirOwner, Item, ItemKind, OwnerNode};
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMap, HirSourceMapBuilder, HirSourceMapError};
@@ -211,17 +211,17 @@ pub fn lower_alias_owner<'hir>(
         DefPathData::TypeNs(entry.name),
         context,
     )?;
-    if declaration.struct_def().is_some()
-        || declaration
-            .alias_def()
-            .is_some_and(|definition| definition.refinement().is_some())
-    {
+    if declaration.struct_def().is_some() {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let alias_definition = declaration
+        .alias_def()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if alias_definition.refinement().is_some() {
         return Err(HirLoweringError::ItemTreeEntryMismatch);
     }
     ensure_supported_generic_params(declaration.generic_params())?;
-    let alias_type = declaration
-        .alias_def()
-        .and_then(|definition| definition.ty());
+    let alias_type = alias_definition.ty();
     if let Some(ty) = &alias_type {
         ensure_supported_type(ty)?;
     }
@@ -254,9 +254,7 @@ pub fn lower_alias_owner<'hir>(
     let ty = match alias_type {
         Some(ty) => lower_type(&ty, context.arena, context.symbols, &mut source_map)?,
         None => {
-            let error_syntax = declaration
-                .alias_def()
-                .and_then(|definition| direct_error_child(definition.syntax()))
+            let error_syntax = direct_error_child(alias_definition.syntax())
                 .or_else(|| direct_error_child(declaration.syntax()))
                 .unwrap_or_else(|| declaration.syntax().clone());
             lower_error_type(&error_syntax, context.arena, &mut source_map)?
@@ -274,6 +272,115 @@ pub fn lower_alias_owner<'hir>(
         kind: ItemKind::Alias {
             generics: *generics,
             ty,
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: None,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
+/// Lower one top-level record declaration from the current item tree.
+///
+/// Generic parameter definitions and field definitions are interned below the
+/// complete type-item path. Diagnosed missing field types recover as
+/// `TyKind::Err`; the record itself has no body.
+pub fn lower_struct_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Struct, context)?;
+    let declaration = ast::TypeDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+    if declaration.alias_def().is_some() {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let definition = declaration
+        .struct_def()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let fields = definition
+        .fields()
+        .map(|list| list.fields().collect::<Vec<_>>())
+        .unwrap_or_default();
+    ensure_supported_generic_params(declaration.generic_params())?;
+    if let Some(where_clause) = definition.where_clause() {
+        ensure_supported_where_clause(&where_clause)?;
+    }
+    for field in &fields {
+        if let Some(ty) = field.ty() {
+            ensure_supported_type(&ty)?;
+        }
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let pending_generic_params =
+        prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+    let pending_fields = prepare_field_defs(fields, context.symbols, &source_map)?;
+    let generic_params = lower_generic_params(
+        pending_generic_params,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let where_preds = definition
+        .where_clause()
+        .map(|clause| lower_where_clause(&clause, context.arena, context.symbols, &mut source_map))
+        .transpose()?
+        .unwrap_or_default();
+    let fields = lower_field_defs(
+        pending_fields,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let generics = context.arena.alloc_generics(HirGenerics {
+        params: context.arena.alloc_generic_params(&generic_params),
+        where_preds: context.arena.alloc_where_preds(&where_preds),
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Struct {
+            generics: *generics,
+            fields: context.arena.alloc_field_defs(&fields),
         },
         span,
     });
@@ -1433,6 +1540,12 @@ struct PendingGenericParam {
     def_id: LocalDefId,
 }
 
+struct PendingFieldDef {
+    field: ast::FieldDecl,
+    name: Name,
+    def_id: LocalDefId,
+}
+
 fn prepare_generic_params(
     generic_params: Option<ast::GenericParamList>,
     symbols: &Interner,
@@ -1488,6 +1601,83 @@ fn prepare_generic_params(
             def_id,
         })
         .collect())
+}
+
+fn prepare_field_defs(
+    fields: Vec<ast::FieldDecl>,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Vec<PendingFieldDef>, HirLoweringError> {
+    if fields.is_empty() {
+        return Ok(Vec::new());
+    }
+    let def_paths = source_map
+        .def_path_interner()
+        .ok_or(HirLoweringError::DefPathInternerRequired)?;
+    let mut pending = Vec::with_capacity(fields.len());
+    let mut disambiguators = HashMap::<Symbol, u32>::new();
+    for field in fields {
+        let name = lower_item_name(field.name(), field.syntax(), symbols, source_map)?;
+        let disambiguator = disambiguators.entry(name.sym).or_default();
+        let ordinal = *disambiguator;
+        *disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+        pending.push((field, name, ordinal));
+    }
+    let field_paths = pending
+        .iter()
+        .map(|(_, name, disambiguator)| (name.sym, *disambiguator))
+        .collect::<Vec<_>>();
+    let def_ids = def_paths.intern_fields(source_map.owner().def_id, &field_paths)?;
+    Ok(pending
+        .into_iter()
+        .zip(def_ids)
+        .map(|((field, name, _), def_id)| PendingFieldDef {
+            field,
+            name,
+            def_id,
+        })
+        .collect())
+}
+
+fn lower_field_defs<'hir>(
+    pending_fields: Vec<PendingFieldDef>,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<Vec<FieldDef<'hir>>, HirLoweringError> {
+    pending_fields
+        .into_iter()
+        .map(
+            |PendingFieldDef {
+                 field,
+                 name,
+                 def_id,
+             }| {
+                let hir_id = source_map.add_node(field.syntax())?;
+                let ty = match field.ty() {
+                    Some(ty) => lower_type(&ty, arena, symbols, source_map)?,
+                    None => {
+                        let error_syntax = direct_error_child(field.syntax())
+                            .unwrap_or_else(|| field.syntax().clone());
+                        lower_error_type(&error_syntax, arena, source_map)?
+                    }
+                };
+                Ok(FieldDef {
+                    hir_id,
+                    def_id,
+                    vis: if field.pub_token().is_some() {
+                        crate::Visibility::Pub
+                    } else {
+                        crate::Visibility::Private
+                    },
+                    name,
+                    ty,
+                })
+            },
+        )
+        .collect()
 }
 
 fn lower_generic_params<'hir>(
@@ -5384,14 +5574,7 @@ fn ensure_supported_generics(declaration: &ast::FnDecl) -> Result<(), HirLowerin
         .children()
         .filter_map(ast::WhereClause::cast)
     {
-        for predicate in where_clause.predicates() {
-            if let Some(ty) = predicate.ty() {
-                ensure_supported_type(&ty)?;
-            }
-            for bound in predicate.bounds() {
-                ensure_supported_bound(bound)?;
-            }
-        }
+        ensure_supported_where_clause(&where_clause)?;
     }
     Ok(())
 }
@@ -5415,6 +5598,18 @@ fn ensure_supported_generic_params(
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_where_clause(where_clause: &ast::WhereClause) -> Result<(), HirLoweringError> {
+    for predicate in where_clause.predicates() {
+        if let Some(ty) = predicate.ty() {
+            ensure_supported_type(&ty)?;
+        }
+        for bound in predicate.bounds() {
+            ensure_supported_bound(bound)?;
         }
     }
     Ok(())
@@ -15302,6 +15497,39 @@ mod tests {
     }
 
     #[test]
+    fn alias_owner_rejects_a_type_declaration_without_a_definition() {
+        let file = crate::FileId::new(258);
+        let source = "type Broken\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing definition is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed declaration");
+        let entry = item_tree.items.first().expect("fallback alias item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Alias);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        assert!(matches!(
+            lower_alias_owner(owner, &expected_path, &item_tree, entry.ast_id, &context),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "an unclassified type declaration must not allocate alias paths"
+        );
+    }
+
+    #[test]
     fn alias_owner_rejects_non_type_paths_and_other_item_kinds() {
         let file = crate::FileId::new(256);
         let source = "type Alias = I32\nconst VALUE: I32 = 1\n";
@@ -15362,6 +15590,283 @@ mod tests {
             1,
             "a constant entry cannot allocate alias generics"
         );
+    }
+
+    #[test]
+    fn lowers_item_tree_struct_with_generics_where_and_fields() {
+        let file = crate::FileId::new(257);
+        let source = concat!(
+            "@deprecated(\"record\")\n",
+            "pub type Pair<T>\n",
+            "where T: Clone\n",
+            "{\n",
+            "    pub first: T\n",
+            "    second: T\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("struct item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Struct);
+        let name = symbols.intern("Pair").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_struct_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("record lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert_eq!(
+            hir_owner.raw_attrs[0].name,
+            crate::item_tree::AttrName::Deprecated
+        );
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+        assert!(hir_owner.body.is_none(), "records do not own a body");
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level record is represented by an item owner");
+        };
+        assert_eq!(item.owner_id, owner);
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        assert_eq!(item.name.sym, name);
+        let ItemKind::Struct { generics, fields } = item.kind else {
+            panic!("record item retains its struct kind");
+        };
+        assert_eq!(generics.params.len(), 1);
+        assert_eq!(generics.where_preds.len(), 1);
+        assert!(matches!(
+            generics.params[0].kind,
+            HirGenericParamKind::Type { bounds } if bounds.is_empty()
+        ));
+        assert!(matches!(
+            generics.where_preds[0].bounds,
+            [HirBound {
+                kind: HirBoundKind::Trait(_),
+                ..
+            }]
+        ));
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].vis, crate::Visibility::Pub);
+        assert_eq!(fields[1].vis, crate::Visibility::Private);
+        assert_eq!(fields[0].name.sym, symbols.intern("first").unwrap());
+        assert_eq!(fields[1].name.sym, symbols.intern("second").unwrap());
+        assert!(fields.iter().all(|field| matches!(
+            field.ty.kind,
+            HirTyKind::Path(path)
+                if path.segments.len() == 1
+                    && path.segments[0].name.sym == generics.params[0].name.sym
+        )));
+
+        let declaration = parsed
+            .root
+            .descendants()
+            .find_map(ast::TypeDecl::cast)
+            .expect("type declaration");
+        assert_eq!(item.span.range, declaration.syntax().text_range());
+        let field_syntax = declaration
+            .struct_def()
+            .and_then(|definition| definition.fields())
+            .expect("record field list")
+            .fields()
+            .collect::<Vec<_>>();
+        for (field, syntax) in fields.iter().zip(&field_syntax) {
+            assert_eq!(
+                source_map
+                    .syntax_for_node(field.hir_id)
+                    .expect("field has a source-map entry")
+                    .text_range(),
+                syntax.syntax().text_range()
+            );
+            assert_eq!(
+                field.name.span.range,
+                syntax
+                    .name()
+                    .and_then(|name| name.token())
+                    .expect("field name token")
+                    .text_range()
+            );
+            assert_eq!(
+                source_map
+                    .syntax_for_node(field.ty.hir_id)
+                    .expect("field type has a source-map entry")
+                    .text_range(),
+                syntax.ty().expect("field type").syntax().text_range()
+            );
+        }
+        for (ordinal, field) in fields.iter().enumerate() {
+            let field_path = paths
+                .resolve(field.def_id)
+                .expect("field definition path resolves")
+                .expect("field definition path exists");
+            assert_eq!(
+                field_path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Field(field.name.sym),
+                    disambiguator: 0,
+                })
+            );
+            assert_eq!(field_path.data().len(), 2);
+            assert_eq!(
+                field_path.data()[0].data,
+                DefPathData::TypeNs(name),
+                "field {ordinal} is nested below its record"
+            );
+        }
+        let record_path = paths
+            .resolve(owner.def_id)
+            .expect("record path resolves")
+            .expect("record path exists");
+        assert_eq!(
+            record_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(name),
+                disambiguator: 0,
+            })
+        );
+        assert_eq!(paths.len().unwrap(), 4);
+    }
+
+    #[test]
+    fn struct_owner_disambiguates_duplicate_field_names_in_source_order() {
+        let file = crate::FileId::new(260);
+        let source = "type Duplicate {\n    value: I32\n    value: U32\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("record item entry");
+        let value = symbols.intern("Duplicate").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(value));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_struct_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("duplicate field declarations remain available to semantic checking");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level record is represented by an item owner");
+        };
+        let ItemKind::Struct { fields, .. } = item.kind else {
+            panic!("record item retains its struct kind");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name.sym, fields[1].name.sym);
+        for (ordinal, field) in fields.iter().enumerate() {
+            let path = paths
+                .resolve(field.def_id)
+                .expect("field path resolves")
+                .expect("field path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Field(field.name.sym),
+                    disambiguator: ordinal as u32,
+                })
+            );
+        }
+        assert_eq!(paths.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn struct_owner_recovers_a_missing_field_type() {
+        let file = crate::FileId::new(258);
+        let source = "type Broken {\n    value:\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing field type is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed record");
+        let entry = item_tree.items.first().expect("record item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Struct);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_struct_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("diagnosed record remains available to later stages");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level record is represented by an item owner");
+        };
+        let ItemKind::Struct { fields, .. } = item.kind else {
+            panic!("record item retains its struct kind");
+        };
+        assert_eq!(fields.len(), 1);
+        assert!(matches!(fields[0].ty.kind, HirTyKind::Err));
+    }
+
+    #[test]
+    fn struct_owner_rejects_wrong_paths_and_other_item_kinds() {
+        let file = crate::FileId::new(259);
+        let source = "type Record {\n}\ntype Alias = I32\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let record_entry = item_tree.items.first().expect("record item entry");
+        let alias_entry = item_tree.items.get(1).expect("alias item entry");
+        let name = symbols.intern("Record").expect("symbol interns");
+        let (_packages, wrong_paths, wrong_owner) =
+            owner_context_with_data(&symbols, DefPathData::ValueNs(name));
+        let wrong_expected_path = owner_def_path(&wrong_paths, wrong_owner);
+        let arena = HirArena::new();
+        let wrong_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &wrong_paths,
+        );
+        assert!(matches!(
+            lower_struct_owner(
+                wrong_owner,
+                &wrong_expected_path,
+                &item_tree,
+                record_entry.ast_id,
+                &wrong_context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(wrong_paths.len().unwrap(), 1);
+
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        assert!(matches!(
+            lower_struct_owner(
+                owner,
+                &expected_path,
+                &item_tree,
+                alias_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(paths.len().unwrap(), 1);
     }
 
     #[test]

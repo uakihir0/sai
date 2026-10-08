@@ -571,6 +571,40 @@ impl DefPathInterner {
         self.intern(path)
     }
 
+    /// Intern a batch of fields below their declaring definition.
+    ///
+    /// The disambiguator is the ordinal among sibling fields with the same
+    /// symbol, in source order. All symbol sessions and path capacity are
+    /// validated before any path is added.
+    pub fn intern_fields(
+        &self,
+        parent: LocalDefId,
+        fields: &[(Symbol, u32)],
+    ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        if fields
+            .iter()
+            .any(|(name, _)| !name.is_error() && name.session_id() != self.symbol_interner)
+        {
+            return Err(DefPathInternerError::InternerSessionMismatch);
+        }
+
+        let parent_path = self
+            .resolve(parent)?
+            .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+        let paths = fields
+            .iter()
+            .map(|(name, disambiguator)| {
+                let mut path = parent_path.clone();
+                path.data.push(DisambiguatedDefPathData {
+                    data: DefPathData::Field(*name),
+                    disambiguator: *disambiguator,
+                });
+                path
+            })
+            .collect();
+        self.intern_paths(paths)
+    }
+
     /// Intern a type or const generic parameter below its declaring definition.
     ///
     /// The disambiguator is the ordinal among siblings with the same parameter
@@ -622,6 +656,28 @@ impl DefPathInterner {
                 path
             })
             .collect::<Vec<_>>();
+
+        self.intern_paths(paths)
+    }
+
+    fn intern_paths(&self, paths: Vec<DefPath>) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        if paths.iter().any(|path| {
+            path.package != self.package
+                || path.package_interner != self.package_interner
+                || path.symbol_interner != self.symbol_interner
+                || path.data.iter().any(|component| {
+                    component
+                        .data
+                        .symbols()
+                        .into_iter()
+                        .flatten()
+                        .any(|symbol| {
+                            !symbol.is_error() && symbol.session_id() != self.symbol_interner
+                        })
+                })
+        }) {
+            return Err(DefPathInternerError::InternerSessionMismatch);
+        }
 
         let mut storage = self
             .storage
@@ -1143,6 +1199,49 @@ mod tests {
                 3
             ),
             Err(DefPathInternerError::InvalidNestedComponent)
+        );
+    }
+
+    #[test]
+    fn definition_path_interner_interns_field_batches_atomically() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let owner = paths
+            .intern(def_path(package, &packages, &symbols, "Record"))
+            .unwrap();
+        let field = symbols.intern("value").unwrap();
+
+        let fields = paths
+            .intern_fields(owner, &[(field, 0), (field, 1)])
+            .expect("duplicate field names receive separate paths");
+        assert_eq!(fields.len(), 2);
+        for (disambiguator, field_id) in fields.iter().enumerate() {
+            let path = paths
+                .resolve(*field_id)
+                .expect("field path resolves")
+                .expect("field path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Field(field),
+                    disambiguator: disambiguator as u32,
+                })
+            );
+        }
+        assert_eq!(paths.len(), Ok(3));
+
+        let foreign_symbols = Interner::new();
+        let foreign_field = foreign_symbols.intern("foreign").unwrap();
+        assert_eq!(
+            paths.intern_fields(owner, &[(field, 2), (foreign_field, 0)]),
+            Err(DefPathInternerError::InternerSessionMismatch)
+        );
+        assert_eq!(
+            paths.len(),
+            Ok(3),
+            "a failed field batch leaves the interner unchanged"
         );
     }
 
