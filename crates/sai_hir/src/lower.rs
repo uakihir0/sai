@@ -400,6 +400,139 @@ pub fn lower_refined_owner<'hir>(
     ))
 }
 
+/// Lower one top-level distinct type from the current item tree.
+///
+/// A refinement predicate, when present, becomes the body value and sees
+/// `self` through the distinct owner's semantic context.
+pub fn lower_distinct_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Distinct, context)?;
+    let declaration =
+        ast::DistinctDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+    let base_type = declaration.base_type();
+    if let Some(base_type) = &base_type {
+        ensure_supported_type(base_type)?;
+    }
+    ensure_supported_generic_params(declaration.generic_params())?;
+    let refinement = declaration.refinement();
+    let has_predicate = refinement.is_some();
+    let predicate = refinement.as_ref().and_then(|clause| clause.expression());
+    if let Some(predicate) = &predicate {
+        ensure_supported_expr(predicate)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let pending_generic_params =
+        prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+    if refinement.is_some() {
+        prepare_nested_definition_ids(declaration.syntax(), &mut source_map)?;
+    }
+    let generic_params = lower_generic_params(
+        pending_generic_params,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let generics = context.arena.alloc_generics(HirGenerics {
+        params: context.arena.alloc_generic_params(&generic_params),
+        where_preds: &[],
+    });
+    let base = match base_type {
+        Some(base_type) => lower_type(&base_type, context.arena, context.symbols, &mut source_map)?,
+        None => {
+            let error_syntax = direct_error_child(declaration.syntax())
+                .unwrap_or_else(|| declaration.syntax().clone());
+            lower_error_type(&error_syntax, context.arena, &mut source_map)?
+        }
+    };
+    let body = match (refinement, predicate) {
+        (Some(_), Some(predicate)) => {
+            let value = lower_expr_in_prepared_owner(
+                &predicate,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            Some(context.arena.alloc_body(Body {
+                owner,
+                params: &[],
+                value,
+                contracts: &[],
+                invariant_preds: context.arena.alloc_expr_refs(&[]),
+            }))
+        }
+        (Some(refinement), None) => {
+            let error_syntax = direct_error_child(refinement.syntax())
+                .unwrap_or_else(|| refinement.syntax().clone());
+            let value = lower_error_expr(&error_syntax, context.arena, &mut source_map)?;
+            Some(context.arena.alloc_body(Body {
+                owner,
+                params: &[],
+                value,
+                contracts: &[],
+                invariant_preds: context.arena.alloc_expr_refs(&[]),
+            }))
+        }
+        (None, None) => None,
+        (None, Some(_)) => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    };
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Distinct {
+            generics: *generics,
+            pub_ctor: declaration.inner_pub_token().is_some(),
+            base,
+            has_predicate,
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level record declaration from the current item tree.
 ///
 /// Generic parameter definitions and field definitions are interned below the
@@ -15927,6 +16060,335 @@ mod tests {
             HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
         assert!(matches!(
             lower_refined_owner(
+                owner,
+                &expected_path,
+                &item_tree,
+                alias_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(paths.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn lowers_item_tree_distinct_with_generics_and_public_constructor() {
+        let file = crate::FileId::new(263);
+        let source = "distinct Meters<T: Clone> = pub T\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("distinct item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Distinct);
+        let name = symbols.intern("Meters").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_distinct_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("distinct type lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(source_map.owner(), owner);
+        assert!(hir_owner.body.is_none());
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level distinct type is represented by an item owner");
+        };
+        assert_eq!(item.vis, crate::Visibility::Private);
+        let ItemKind::Distinct {
+            generics,
+            pub_ctor,
+            base,
+            has_predicate,
+        } = item.kind
+        else {
+            panic!("distinct declaration retains its distinct item kind");
+        };
+        assert!(pub_ctor, "the inner `pub` exposes the constructor");
+        assert!(!has_predicate);
+        assert_eq!(generics.params.len(), 1);
+        let generic = generics.params[0];
+        assert_eq!(generic.name.sym, symbols.intern("T").unwrap());
+        let generic_path = paths
+            .resolve(generic.def_id)
+            .expect("generic parameter path resolves")
+            .expect("generic parameter path exists");
+        assert_eq!(
+            generic_path.data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::TypeParam(generic.name.sym),
+                disambiguator: 0,
+            })
+        );
+        assert!(matches!(
+            generic.kind,
+            HirGenericParamKind::Type { bounds }
+                if matches!(bounds, [HirBound { kind: HirBoundKind::Trait(_), .. }])
+        ));
+        assert!(matches!(
+            base.kind,
+            HirTyKind::Path(path)
+                if path.segments.len() == 1 && path.segments[0].name.sym == generic.name.sym
+        ));
+    }
+
+    #[test]
+    fn lowers_item_tree_refined_distinct_with_implicit_self() {
+        let file = crate::FileId::new(264);
+        let source = "distinct Age = U8 where self <= 150\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("distinct item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Distinct);
+        let name = symbols.intern("Age").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_distinct_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("refined distinct type lowers to a complete owner");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level distinct type is represented by an item owner");
+        };
+        let ItemKind::Distinct {
+            has_predicate,
+            pub_ctor,
+            ..
+        } = item.kind
+        else {
+            panic!("distinct declaration retains its distinct item kind");
+        };
+        assert!(!pub_ctor);
+        assert!(has_predicate);
+        let body = hir_owner
+            .body
+            .expect("refined distinct owns a predicate body");
+        assert!(body.params.is_empty());
+        let ExprKind::Binary(BinOp::Le, lhs, _) = body.value.kind else {
+            panic!("predicate is retained as the body value");
+        };
+        let ExprKind::Path(self_path) = lhs.kind else {
+            panic!("self is retained as a value path");
+        };
+        assert_eq!(self_path.root, PathRoot::SelfValue);
+        assert!(self_path.segments.is_empty());
+    }
+
+    #[test]
+    fn distinct_owner_keeps_outer_visibility_separate_from_constructor_visibility() {
+        let file = crate::FileId::new(268);
+        let source = "pub distinct PublicType = I32\ndistinct PublicCtor = pub I32\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let public_type_entry = item_tree.items.first().expect("public distinct entry");
+        let public_ctor_entry = item_tree.items.get(1).expect("public constructor entry");
+        let arena = HirArena::new();
+
+        let public_type_name = symbols.intern("PublicType").expect("symbol interns");
+        let (_public_type_packages, public_type_paths, public_type_owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(public_type_name));
+        let public_type_expected_path = owner_def_path(&public_type_paths, public_type_owner);
+        let public_type_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &public_type_paths,
+        );
+        let (public_type_owner, _) = lower_distinct_owner(
+            public_type_owner,
+            &public_type_expected_path,
+            &item_tree,
+            public_type_entry.ast_id,
+            &public_type_context,
+        )
+        .expect("outer visibility lowers");
+        let OwnerNode::Item(public_type) = public_type_owner.node else {
+            panic!("top-level distinct type is represented by an item owner");
+        };
+        assert_eq!(public_type.vis, crate::Visibility::Pub);
+        assert!(matches!(
+            public_type.kind,
+            ItemKind::Distinct {
+                pub_ctor: false,
+                ..
+            }
+        ));
+
+        let public_ctor_name = symbols.intern("PublicCtor").expect("symbol interns");
+        let (_public_ctor_packages, public_ctor_paths, public_ctor_owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(public_ctor_name));
+        let public_ctor_expected_path = owner_def_path(&public_ctor_paths, public_ctor_owner);
+        let public_ctor_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &public_ctor_paths,
+        );
+        let (public_ctor_owner, _) = lower_distinct_owner(
+            public_ctor_owner,
+            &public_ctor_expected_path,
+            &item_tree,
+            public_ctor_entry.ast_id,
+            &public_ctor_context,
+        )
+        .expect("constructor visibility lowers");
+        let OwnerNode::Item(public_ctor) = public_ctor_owner.node else {
+            panic!("top-level distinct type is represented by an item owner");
+        };
+        assert_eq!(public_ctor.vis, crate::Visibility::Private);
+        assert!(matches!(
+            public_ctor.kind,
+            ItemKind::Distinct { pub_ctor: true, .. }
+        ));
+    }
+
+    #[test]
+    fn distinct_owner_recovers_a_missing_predicate() {
+        let file = crate::FileId::new(265);
+        let source = "distinct Broken = I32 where\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing predicate is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed distinct type");
+        let entry = item_tree.items.first().expect("distinct item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Distinct);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_distinct_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing predicate recovers to error HIR");
+        let body = hir_owner
+            .body
+            .expect("the clause still defines a predicate body");
+        assert!(matches!(body.value.kind, ExprKind::Err));
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level distinct type is represented by an item owner");
+        };
+        assert!(matches!(
+            item.kind,
+            ItemKind::Distinct {
+                has_predicate: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn distinct_owner_recovers_a_missing_base_type() {
+        let file = crate::FileId::new(267);
+        let source = "distinct Broken =\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing base type is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed distinct type");
+        let entry = item_tree.items.first().expect("distinct item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Distinct);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_distinct_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing base type recovers to error HIR");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level distinct type is represented by an item owner");
+        };
+        assert!(matches!(
+            item.kind,
+            ItemKind::Distinct {
+                base: HirTy {
+                    kind: HirTyKind::Err,
+                    ..
+                },
+                has_predicate: false,
+                ..
+            }
+        ));
+        assert!(hir_owner.body.is_none());
+    }
+
+    #[test]
+    fn distinct_owner_rejects_wrong_paths_and_other_item_kinds() {
+        let file = crate::FileId::new(266);
+        let source = "distinct Distinct = I32\ntype Alias = I32\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let distinct_entry = item_tree.items.first().expect("distinct item entry");
+        let alias_entry = item_tree.items.get(1).expect("alias item entry");
+
+        let wrong_name = symbols.intern("Distinct").expect("symbol interns");
+        let (_packages, wrong_paths, wrong_owner) =
+            owner_context_with_data(&symbols, DefPathData::ValueNs(wrong_name));
+        let wrong_expected_path = owner_def_path(&wrong_paths, wrong_owner);
+        let arena = HirArena::new();
+        let wrong_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &wrong_paths,
+        );
+        assert!(matches!(
+            lower_distinct_owner(
+                wrong_owner,
+                &wrong_expected_path,
+                &item_tree,
+                distinct_entry.ast_id,
+                &wrong_context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(wrong_paths.len().unwrap(), 1);
+
+        let name = symbols.intern("Distinct").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        assert!(matches!(
+            lower_distinct_owner(
                 owner,
                 &expected_path,
                 &item_tree,
