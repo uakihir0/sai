@@ -190,6 +190,8 @@ The embedded WASI units are the packages that spec/13 §13.7.1 item 1 lists, wit
 
 The input `wit_files(P)` is set by the driver in phase 3 for each package whose contract declares `wit` and whose directory exists. `WIT_DIR_NOT_FOUND` belongs to package/01 §1.6.3. The input lists every file with the extension `.wit` directly inside the directory, sorted by the bytes of its relative path. Subdirectories, including `deps/`, are not read (§16.2.3).
 
+The VFS currently stores this listing as sorted package-relative paths under a validated stable `PackageKey`; the driver must intern each path to a session-local `FileId` when adapting it to the `wit_files(P)` query value above. `NotApplicable` denotes the absence of a usable declared directory, while a present empty directory is represented by an empty path list. The driver reports `WIT_DIR_NOT_FOUND` separately.
+
 `wit_package(Dir(P))` parses these files as follows:
 
 1. **Reading.** Each file is read from `file_contents` ([01](01-architecture.md) §1.7.2) and never from the file system. A file that is not valid UTF-8 is `WIT_PARSE_ERROR`, at the first invalid byte.

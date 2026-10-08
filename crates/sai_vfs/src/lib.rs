@@ -90,6 +90,91 @@ impl StableHash for FileKey {
     }
 }
 
+/// A validated stable package identity suitable for use as a query key.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageKey(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageKeyError {
+    InvalidPackageKey,
+}
+
+impl PackageKey {
+    pub fn new(package_key: impl Into<String>) -> Result<Self, PackageKeyError> {
+        let package_key = package_key.into();
+        if !is_stable_package_key(&package_key) {
+            return Err(PackageKeyError::InvalidPackageKey);
+        }
+        Ok(Self(package_key))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl StableHash for PackageKey {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xAB);
+        self.0.stable_hash(hasher);
+    }
+}
+
+/// A canonical path relative to the package root.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageRelativePath(String);
+
+/// A canonical path relative to a package's configured source directory.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageSourcePath(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackagePathError {
+    InvalidRelativePath,
+}
+
+impl PackageRelativePath {
+    pub fn new(path: impl Into<String>) -> Result<Self, PackagePathError> {
+        let path = path.into();
+        if !is_canonical_relative_path(&path) {
+            return Err(PackagePathError::InvalidRelativePath);
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PackageSourcePath {
+    pub fn new(path: impl Into<String>) -> Result<Self, PackagePathError> {
+        let path = path.into();
+        if !is_canonical_relative_path(&path) {
+            return Err(PackagePathError::InvalidRelativePath);
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl StableHash for PackageRelativePath {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xAC);
+        self.0.stable_hash(hasher);
+    }
+}
+
+impl StableHash for PackageSourcePath {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xAD);
+        self.0.stable_hash(hasher);
+    }
+}
+
 /// A UTF-8 byte offset into decoded source text.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TextSize(u32);
@@ -784,15 +869,283 @@ impl StableHash for FileContents {
     }
 }
 
+/// The kind recorded by the package source-directory inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageFileKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl StableHash for PackageFileKind {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xAE);
+        hasher.write_tag(match self {
+            Self::File => 0,
+            Self::Directory => 1,
+            Self::Symlink => 2,
+        });
+    }
+}
+
+/// One entry below a package's source directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageFileEntry {
+    path: PackageSourcePath,
+    kind: PackageFileKind,
+}
+
+impl PackageFileEntry {
+    pub fn new(path: impl Into<String>, kind: PackageFileKind) -> Result<Self, PackagePathError> {
+        Ok(Self {
+            path: PackageSourcePath::new(path)?,
+            kind,
+        })
+    }
+
+    pub fn path(&self) -> &PackageSourcePath {
+        &self.path
+    }
+
+    pub const fn kind(&self) -> PackageFileKind {
+        self.kind
+    }
+}
+
+impl StableHash for PackageFileEntry {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xAF);
+        self.path.stable_hash(hasher);
+        self.kind.stable_hash(hasher);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageFilesSnapshotError {
+    EntriesForMissingSourceDirectory,
+    DuplicatePath,
+    MissingDirectoryAncestor,
+    DescendantOfNonDirectory,
+}
+
+/// The observed state of one package's source directory and all its entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageFilesSnapshot {
+    source_directory_exists: bool,
+    entries: Arc<[PackageFileEntry]>,
+}
+
+impl PackageFilesSnapshot {
+    pub fn new(
+        source_directory_exists: bool,
+        entries: impl IntoIterator<Item = PackageFileEntry>,
+    ) -> Result<Self, PackageFilesSnapshotError> {
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        if !source_directory_exists && !entries.is_empty() {
+            return Err(PackageFilesSnapshotError::EntriesForMissingSourceDirectory);
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        if entries.windows(2).any(|pair| pair[0].path == pair[1].path) {
+            return Err(PackageFilesSnapshotError::DuplicatePath);
+        }
+        let kinds_by_path = entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.kind))
+            .collect::<BTreeMap<_, _>>();
+        for entry in &entries {
+            let mut path = entry.path.as_str();
+            while let Some((parent, _)) = path.rsplit_once('/') {
+                match kinds_by_path.get(parent) {
+                    Some(PackageFileKind::Directory) => {}
+                    Some(PackageFileKind::File | PackageFileKind::Symlink) => {
+                        return Err(PackageFilesSnapshotError::DescendantOfNonDirectory);
+                    }
+                    None => return Err(PackageFilesSnapshotError::MissingDirectoryAncestor),
+                }
+                path = parent;
+            }
+        }
+        Ok(Self {
+            source_directory_exists,
+            entries: entries.into(),
+        })
+    }
+
+    pub const fn source_directory_exists(&self) -> bool {
+        self.source_directory_exists
+    }
+
+    pub fn entries(&self) -> &[PackageFileEntry] {
+        &self.entries
+    }
+}
+
+impl StableHash for PackageFilesSnapshot {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xB0);
+        self.source_directory_exists.stable_hash(hasher);
+        self.entries.stable_hash(hasher);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WitFilesSnapshotError {
+    NotDirectWitFile,
+    DuplicatePath,
+    InvalidDirectory,
+}
+
+/// The WIT file paths selected for one package, in package-relative form.
+///
+/// `NotApplicable` represents a package without a usable declared WIT
+/// directory; `Listed([])` represents an existing declared directory with no
+/// direct `.wit` files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WitFilesSnapshot {
+    NotApplicable,
+    Listed {
+        directory: String,
+        files: Arc<[PackageRelativePath]>,
+    },
+}
+
+impl WitFilesSnapshot {
+    pub fn listed(
+        directory: impl Into<String>,
+        paths: impl IntoIterator<Item = PackageRelativePath>,
+    ) -> Result<Self, WitFilesSnapshotError> {
+        let directory = directory.into();
+        if directory != "." && !is_canonical_relative_path(&directory) {
+            return Err(WitFilesSnapshotError::InvalidDirectory);
+        }
+        let directory_prefix = (directory != ".").then(|| format!("{directory}/"));
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        if paths.iter().any(|path| {
+            let relative_path = match directory_prefix.as_deref() {
+                None => path.as_str(),
+                Some(prefix) => {
+                    let Some(relative_path) = path.as_str().strip_prefix(prefix) else {
+                        return true;
+                    };
+                    relative_path
+                }
+            };
+            relative_path.contains('/')
+                || relative_path.len() <= 4
+                || !relative_path.ends_with(".wit")
+        }) {
+            return Err(WitFilesSnapshotError::NotDirectWitFile);
+        }
+        paths.sort();
+        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(WitFilesSnapshotError::DuplicatePath);
+        }
+        Ok(Self::Listed {
+            directory,
+            files: paths.into(),
+        })
+    }
+
+    pub const fn not_applicable() -> Self {
+        Self::NotApplicable
+    }
+
+    pub fn files(&self) -> Option<&[PackageRelativePath]> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Listed { files, .. } => Some(files),
+        }
+    }
+
+    pub fn directory(&self) -> Option<&str> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Listed { directory, .. } => Some(directory),
+        }
+    }
+}
+
+impl StableHash for WitFilesSnapshot {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xB1);
+        match self {
+            Self::NotApplicable => hasher.write_tag(0),
+            Self::Listed { directory, files } => {
+                hasher.write_tag(1);
+                directory.stable_hash(hasher);
+                files.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum VfsInputKey {
+    FileContents(FileKey),
+    PackageFiles(PackageKey),
+    WitFiles(PackageKey),
+}
+
+impl StableHash for VfsInputKey {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xB2);
+        match self {
+            Self::FileContents(key) => {
+                hasher.write_tag(0);
+                key.stable_hash(hasher);
+            }
+            Self::PackageFiles(key) => {
+                hasher.write_tag(1);
+                key.stable_hash(hasher);
+            }
+            Self::WitFiles(key) => {
+                hasher.write_tag(2);
+                key.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum VfsInputValue {
+    FileContents(FileContents),
+    PackageFiles(PackageFilesSnapshot),
+    WitFiles(WitFilesSnapshot),
+}
+
+impl StableHash for VfsInputValue {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xB3);
+        match self {
+            Self::FileContents(contents) => {
+                hasher.write_tag(0);
+                contents.stable_hash(hasher);
+            }
+            Self::PackageFiles(snapshot) => {
+                hasher.write_tag(1);
+                snapshot.stable_hash(hasher);
+            }
+            Self::WitFiles(snapshot) => {
+                hasher.write_tag(2);
+                snapshot.stable_hash(hasher);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VfsInputSnapshotError {
     DuplicateFileKey,
+    DuplicatePackageFilesKey,
+    DuplicateWitFilesKey,
 }
 
-/// An immutable set of raw file inputs, collected before source decoding.
+/// An immutable set of filesystem inputs, collected before source decoding.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VfsInputSnapshot {
     files: BTreeMap<FileKey, (FileContents, Durability)>,
+    package_files: BTreeMap<PackageKey, (PackageFilesSnapshot, Durability)>,
+    wit_files: BTreeMap<PackageKey, (WitFilesSnapshot, Durability)>,
 }
 
 impl VfsInputSnapshot {
@@ -808,22 +1161,64 @@ impl VfsInputSnapshot {
         Ok(snapshot)
     }
 
+    pub fn with_package_files(
+        mut self,
+        packages: impl IntoIterator<Item = (PackageKey, PackageFilesSnapshot, Durability)>,
+    ) -> Result<Self, VfsInputSnapshotError> {
+        for (key, files, durability) in packages {
+            if self
+                .package_files
+                .insert(key, (files, durability))
+                .is_some()
+            {
+                return Err(VfsInputSnapshotError::DuplicatePackageFilesKey);
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn with_wit_files(
+        mut self,
+        packages: impl IntoIterator<Item = (PackageKey, WitFilesSnapshot, Durability)>,
+    ) -> Result<Self, VfsInputSnapshotError> {
+        for (key, files, durability) in packages {
+            if self.wit_files.insert(key, (files, durability)).is_some() {
+                return Err(VfsInputSnapshotError::DuplicateWitFilesKey);
+            }
+        }
+        Ok(self)
+    }
+
     pub fn len(&self) -> usize {
-        self.files.len()
+        self.files.len() + self.package_files.len() + self.wit_files.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.files.is_empty() && self.package_files.is_empty() && self.wit_files.is_empty()
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&FileKey, &FileContents, Durability)> {
+    fn file_iter(&self) -> impl Iterator<Item = (&FileKey, &FileContents, Durability)> {
         self.files
             .iter()
             .map(|(key, (contents, durability))| (key, contents, *durability))
     }
+
+    fn package_files_iter(
+        &self,
+    ) -> impl Iterator<Item = (&PackageKey, &PackageFilesSnapshot, Durability)> {
+        self.package_files
+            .iter()
+            .map(|(key, (files, durability))| (key, files, *durability))
+    }
+
+    fn wit_files_iter(&self) -> impl Iterator<Item = (&PackageKey, &WitFilesSnapshot, Durability)> {
+        self.wit_files
+            .iter()
+            .map(|(key, (files, durability))| (key, files, *durability))
+    }
 }
 
-/// One file-content input change in a snapshot update.
+/// One filesystem input change in a snapshot update.
 pub enum VfsInputUpdate {
     Set {
         key: FileKey,
@@ -833,6 +1228,22 @@ pub enum VfsInputUpdate {
     Remove {
         key: FileKey,
     },
+    SetPackageFiles {
+        key: PackageKey,
+        files: PackageFilesSnapshot,
+        durability: Durability,
+    },
+    RemovePackageFiles {
+        key: PackageKey,
+    },
+    SetWitFiles {
+        key: PackageKey,
+        files: WitFilesSnapshot,
+        durability: Durability,
+    },
+    RemoveWitFiles {
+        key: PackageKey,
+    },
 }
 
 /// Query-backed raw source inputs for the virtual file system.
@@ -841,25 +1252,28 @@ pub enum VfsInputUpdate {
 /// queries consume the decoded source values above it.
 #[derive(Clone)]
 pub struct VfsInputs {
-    file_contents: InputQuery<FileKey, FileContents>,
+    inputs: InputQuery<VfsInputKey, VfsInputValue>,
     source_text_query: DerivedQuery<FileKey, SourceText>,
 }
 
 impl VfsInputs {
     pub fn new() -> Result<Self, QueryError> {
-        let file_contents = InputQuery::new("file_contents", Durability::Low)?;
-        let source_text_inputs = file_contents.clone();
+        let inputs = InputQuery::new("vfs_inputs", Durability::Low)?;
+        let source_text_inputs = inputs.clone();
         let source_text_query = DerivedQuery::<FileKey, SourceText>::new(
             "source_text",
             move |database: &mut QueryDatabase, key| {
                 let contents = source_text_inputs
-                    .get_opt(database, key.clone())?
-                    .map(|contents: Arc<FileContents>| contents.as_ref().clone());
+                    .get_opt(database, VfsInputKey::FileContents(key.clone()))?
+                    .map(|value: Arc<VfsInputValue>| match value.as_ref() {
+                        VfsInputValue::FileContents(contents) => contents.clone(),
+                        _ => unreachable!("file-content keys only store file-content values"),
+                    });
                 Ok(decode_source_text(contents))
             },
         )?;
         Ok(Self {
-            file_contents,
+            inputs,
             source_text_query,
         })
     }
@@ -900,8 +1314,12 @@ impl VfsInputs {
         contents: FileContents,
         durability: Durability,
     ) -> Result<bool, QueryError> {
-        self.file_contents
-            .set_at_durability(database, key, contents, durability)
+        self.inputs.set_at_durability(
+            database,
+            VfsInputKey::FileContents(key),
+            VfsInputValue::FileContents(contents),
+            durability,
+        )
     }
 
     /// Removes a file input when it leaves the current source snapshot.
@@ -910,7 +1328,7 @@ impl VfsInputs {
         database: &mut QueryDatabase,
         key: FileKey,
     ) -> Result<bool, QueryError> {
-        self.file_contents.remove(database, key)
+        self.inputs.remove(database, VfsInputKey::FileContents(key))
     }
 
     /// Reads raw bytes and tracks absence as a dependency.
@@ -919,9 +1337,90 @@ impl VfsInputs {
         database: &mut QueryDatabase,
         key: FileKey,
     ) -> Result<Option<FileContents>, QueryError> {
-        self.file_contents
-            .get_opt(database, key)
-            .map(|contents| contents.map(|contents| contents.as_ref().clone()))
+        self.inputs
+            .get_opt(database, VfsInputKey::FileContents(key))
+            .map(|value| {
+                value.map(|value| match value.as_ref() {
+                    VfsInputValue::FileContents(contents) => contents.clone(),
+                    _ => unreachable!("file-content keys only store file-content values"),
+                })
+            })
+    }
+
+    pub fn set_package_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+        files: PackageFilesSnapshot,
+        durability: Durability,
+    ) -> Result<bool, QueryError> {
+        self.inputs.set_at_durability(
+            database,
+            VfsInputKey::PackageFiles(key),
+            VfsInputValue::PackageFiles(files),
+            durability,
+        )
+    }
+
+    pub fn remove_package_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<bool, QueryError> {
+        self.inputs.remove(database, VfsInputKey::PackageFiles(key))
+    }
+
+    pub fn package_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<Option<PackageFilesSnapshot>, QueryError> {
+        self.inputs
+            .get_opt(database, VfsInputKey::PackageFiles(key))
+            .map(|value| {
+                value.map(|value| match value.as_ref() {
+                    VfsInputValue::PackageFiles(files) => files.clone(),
+                    _ => unreachable!("package-file keys only store package-file values"),
+                })
+            })
+    }
+
+    pub fn set_wit_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+        files: WitFilesSnapshot,
+        durability: Durability,
+    ) -> Result<bool, QueryError> {
+        self.inputs.set_at_durability(
+            database,
+            VfsInputKey::WitFiles(key),
+            VfsInputValue::WitFiles(files),
+            durability,
+        )
+    }
+
+    pub fn remove_wit_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<bool, QueryError> {
+        self.inputs.remove(database, VfsInputKey::WitFiles(key))
+    }
+
+    pub fn wit_files(
+        &self,
+        database: &mut QueryDatabase,
+        key: PackageKey,
+    ) -> Result<Option<WitFilesSnapshot>, QueryError> {
+        self.inputs
+            .get_opt(database, VfsInputKey::WitFiles(key))
+            .map(|value| {
+                value.map(|value| match value.as_ref() {
+                    VfsInputValue::WitFiles(files) => files.clone(),
+                    _ => unreachable!("WIT-file keys only store WIT-file values"),
+                })
+            })
     }
 
     /// Decodes a file as a tracked query and binds it to the requested session ID.
@@ -945,7 +1444,7 @@ impl VfsInputs {
         database: &mut QueryDatabase,
         updates: impl IntoIterator<Item = VfsInputUpdate>,
     ) -> Result<usize, QueryError> {
-        self.file_contents.apply_changes(
+        self.inputs.apply_changes(
             database,
             updates.into_iter().map(|update| match update {
                 VfsInputUpdate::Set {
@@ -953,11 +1452,37 @@ impl VfsInputs {
                     contents,
                     durability,
                 } => sai_query::InputChange::Set {
-                    key,
-                    value: contents,
+                    key: VfsInputKey::FileContents(key),
+                    value: VfsInputValue::FileContents(contents),
                     durability,
                 },
-                VfsInputUpdate::Remove { key } => sai_query::InputChange::Remove { key },
+                VfsInputUpdate::Remove { key } => sai_query::InputChange::Remove {
+                    key: VfsInputKey::FileContents(key),
+                },
+                VfsInputUpdate::SetPackageFiles {
+                    key,
+                    files,
+                    durability,
+                } => sai_query::InputChange::Set {
+                    key: VfsInputKey::PackageFiles(key),
+                    value: VfsInputValue::PackageFiles(files),
+                    durability,
+                },
+                VfsInputUpdate::RemovePackageFiles { key } => sai_query::InputChange::Remove {
+                    key: VfsInputKey::PackageFiles(key),
+                },
+                VfsInputUpdate::SetWitFiles {
+                    key,
+                    files,
+                    durability,
+                } => sai_query::InputChange::Set {
+                    key: VfsInputKey::WitFiles(key),
+                    value: VfsInputValue::WitFiles(files),
+                    durability,
+                },
+                VfsInputUpdate::RemoveWitFiles { key } => sai_query::InputChange::Remove {
+                    key: VfsInputKey::WitFiles(key),
+                },
             }),
         )
     }
@@ -974,19 +1499,47 @@ impl VfsInputs {
     ) -> Result<usize, QueryError> {
         let mut updates = Vec::with_capacity(current.len());
         let mut current_keys = BTreeSet::new();
-        for (key, contents, durability) in current.iter() {
+        for (key, contents, durability) in current.file_iter() {
             let key = key.clone();
-            current_keys.insert(key.clone());
+            current_keys.insert(VfsInputKey::FileContents(key.clone()));
             updates.push(VfsInputUpdate::Set {
                 key,
                 contents: contents.clone(),
                 durability,
             });
         }
+        for (key, files, durability) in current.package_files_iter() {
+            let key = key.clone();
+            current_keys.insert(VfsInputKey::PackageFiles(key.clone()));
+            updates.push(VfsInputUpdate::SetPackageFiles {
+                key,
+                files: files.clone(),
+                durability,
+            });
+        }
+        for (key, files, durability) in current.wit_files_iter() {
+            let key = key.clone();
+            current_keys.insert(VfsInputKey::WitFiles(key.clone()));
+            updates.push(VfsInputUpdate::SetWitFiles {
+                key,
+                files: files.clone(),
+                durability,
+            });
+        }
         if let Some(previous) = previous {
-            for (key, _, _) in previous.iter() {
-                if !current_keys.contains(key) {
+            for (key, _, _) in previous.file_iter() {
+                if !current_keys.contains(&VfsInputKey::FileContents(key.clone())) {
                     updates.push(VfsInputUpdate::Remove { key: key.clone() });
+                }
+            }
+            for (key, _, _) in previous.package_files_iter() {
+                if !current_keys.contains(&VfsInputKey::PackageFiles(key.clone())) {
+                    updates.push(VfsInputUpdate::RemovePackageFiles { key: key.clone() });
+                }
+            }
+            for (key, _, _) in previous.wit_files_iter() {
+                if !current_keys.contains(&VfsInputKey::WitFiles(key.clone())) {
+                    updates.push(VfsInputUpdate::RemoveWitFiles { key: key.clone() });
                 }
             }
         }
@@ -1313,17 +1866,6 @@ fn is_canonical_source_path(path: &str) -> bool {
     if path == "<stdin>" {
         return true;
     }
-    if path.is_empty()
-        || path.starts_with('/')
-        || is_windows_drive_path(path)
-        || path.contains('\\')
-        || path
-            .bytes()
-            .any(|byte| byte == 0 || byte.is_ascii_control())
-    {
-        return false;
-    }
-
     let relative_path = if let Some(dependency) = path.strip_prefix("dep:") {
         let Some((identity, relative_path)) = dependency.split_once('/') else {
             return false;
@@ -1336,10 +1878,23 @@ fn is_canonical_source_path(path: &str) -> bool {
         path
     };
 
-    !relative_path.is_empty()
-        && !relative_path
-            .split('/')
-            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    is_canonical_relative_path(relative_path)
+}
+
+fn is_canonical_relative_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.starts_with('/')
+        || is_windows_drive_path(path)
+        || path.contains('\\')
+        || path
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return false;
+    }
+    !path
+        .split('/')
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
 }
 
 fn is_windows_drive_path(path: &str) -> bool {
@@ -2342,6 +2897,146 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_replacement_reconciles_content_package_and_wit_inputs_together() {
+        let inputs = VfsInputs::new().expect("input query ID is available");
+        let mut database = QueryDatabase::new();
+        let package = PackageKey::new("acme:app#0.1").expect("package key is valid");
+        let departed_package = PackageKey::new("acme:old#1").expect("package key is valid");
+        let source_file = FileKey::new(package.as_str(), "src/lib.sai").expect("file key is valid");
+        let previous = VfsInputSnapshot::new([(
+            source_file.clone(),
+            FileContents::Bytes(Arc::from(&b"a"[..])),
+            Durability::Low,
+        )])
+        .expect("source content snapshot is valid")
+        .with_package_files([
+            (
+                package.clone(),
+                PackageFilesSnapshot::new(
+                    true,
+                    [PackageFileEntry::new("lib.sai", PackageFileKind::File)
+                        .expect("source path is valid")],
+                )
+                .expect("package listing is valid"),
+                Durability::Low,
+            ),
+            (
+                departed_package.clone(),
+                PackageFilesSnapshot::new(
+                    true,
+                    [
+                        PackageFileEntry::new("a", PackageFileKind::Directory)
+                            .expect("source path is valid"),
+                        PackageFileEntry::new("b", PackageFileKind::Symlink)
+                            .expect("source path is valid"),
+                    ],
+                )
+                .expect("departed package listing is valid"),
+                Durability::Medium,
+            ),
+        ])
+        .expect("package listings are unique")
+        .with_wit_files([(
+            package.clone(),
+            WitFilesSnapshot::listed(
+                "wit",
+                [PackageRelativePath::new("wit/app.wit").expect("WIT path is valid")],
+            )
+            .expect("WIT listing is valid"),
+            Durability::Low,
+        )])
+        .expect("WIT listing is unique");
+        let current = VfsInputSnapshot::new([(
+            source_file.clone(),
+            FileContents::Bytes(Arc::from(&b"bb"[..])),
+            Durability::Low,
+        )])
+        .expect("updated source content snapshot is valid")
+        .with_package_files([(
+            package.clone(),
+            PackageFilesSnapshot::new(
+                true,
+                [
+                    PackageFileEntry::new("lib.sai", PackageFileKind::File)
+                        .expect("source path is valid"),
+                    PackageFileEntry::new("nested", PackageFileKind::Directory)
+                        .expect("source path is valid"),
+                ],
+            )
+            .expect("updated package listing is valid"),
+            Durability::Low,
+        )])
+        .expect("package listing is unique")
+        .with_wit_files([(
+            package.clone(),
+            WitFilesSnapshot::not_applicable(),
+            Durability::Low,
+        )])
+        .expect("WIT listing is unique");
+
+        assert_eq!(
+            inputs
+                .replace_snapshot(&mut database, None, &previous)
+                .expect("initial filesystem snapshot applies"),
+            4
+        );
+        let inputs_in_query = inputs.clone();
+        let source_in_query = source_file.clone();
+        let departed_in_query = departed_package.clone();
+        let package_in_query = package.clone();
+        let summary =
+            DerivedQuery::<u32, u64>::new("filesystem_snapshot_summary", move |database, _| {
+                let bytes = inputs_in_query
+                    .file_contents(database, source_in_query.clone())?
+                    .and_then(|contents| contents.bytes().map(<[u8]>::len))
+                    .unwrap_or(0);
+                let mut package_entries = 0;
+                for key in [package_in_query.clone(), departed_in_query.clone()] {
+                    if let Some(files) = inputs_in_query.package_files(database, key)? {
+                        package_entries += files.entries().len();
+                    }
+                }
+                let wit_files = inputs_in_query
+                    .wit_files(database, package_in_query.clone())?
+                    .and_then(|files| files.files().map(<[PackageRelativePath]>::len))
+                    .unwrap_or(0);
+                Ok((bytes + package_entries + wit_files) as u64)
+            })
+            .expect("query ID is available");
+        assert_eq!(
+            *summary
+                .get(&mut database, 0)
+                .expect("query reads all filesystem input kinds"),
+            5
+        );
+
+        assert_eq!(
+            inputs
+                .replace_snapshot(&mut database, Some(&previous), &current)
+                .expect("complete filesystem snapshot delta applies"),
+            4
+        );
+        assert_eq!(
+            *summary
+                .get(&mut database, 0)
+                .expect("query sees one coherent replacement"),
+            4
+        );
+        assert_eq!(
+            inputs
+                .package_files(&mut database, departed_package)
+                .expect("departed package absence is readable"),
+            None
+        );
+        assert_eq!(
+            inputs
+                .wit_files(&mut database, package)
+                .expect("not-applicable WIT state is readable"),
+            Some(WitFilesSnapshot::NotApplicable)
+        );
+    }
+
+    #[test]
     fn workspace_member_file_keys_use_package_relative_paths() {
         let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
             Arc::new(SourceFile::new(FileId::new(1), "x", false).expect("small source file")),
@@ -2362,6 +3057,10 @@ mod tests {
     #[test]
     fn raw_input_snapshots_reject_duplicate_keys() {
         let key = FileKey::new("acme:app#0.1", "src/main.sai").expect("file key is valid");
+        let package_key = PackageKey::new("acme:app#0.1").expect("package key is valid");
+        let empty_files =
+            PackageFilesSnapshot::new(true, []).expect("empty source listing is valid");
+        let empty_wit = WitFilesSnapshot::listed("wit", []).expect("empty WIT listing is valid");
 
         assert_eq!(
             VfsInputSnapshot::new([
@@ -2378,6 +3077,258 @@ mod tests {
             ]),
             Err(VfsInputSnapshotError::DuplicateFileKey)
         );
+        assert_eq!(
+            VfsInputSnapshot::new([])
+                .expect("empty input snapshot is valid")
+                .with_package_files([
+                    (package_key.clone(), empty_files.clone(), Durability::Low),
+                    (package_key.clone(), empty_files, Durability::Low),
+                ]),
+            Err(VfsInputSnapshotError::DuplicatePackageFilesKey)
+        );
+        assert_eq!(
+            VfsInputSnapshot::new([])
+                .expect("empty input snapshot is valid")
+                .with_wit_files([
+                    (package_key.clone(), empty_wit.clone(), Durability::Low),
+                    (package_key, empty_wit, Durability::Low),
+                ]),
+            Err(VfsInputSnapshotError::DuplicateWitFilesKey)
+        );
+    }
+
+    #[test]
+    fn package_file_snapshots_sort_paths_and_reject_invalid_states() {
+        let entry = |path, kind| PackageFileEntry::new(path, kind).expect("path is valid");
+        let snapshot = PackageFilesSnapshot::new(
+            true,
+            [
+                entry("z.sai", PackageFileKind::File),
+                entry("link", PackageFileKind::Symlink),
+                entry("a", PackageFileKind::Directory),
+            ],
+        )
+        .expect("source directory snapshot is valid");
+        assert_eq!(
+            snapshot
+                .entries()
+                .iter()
+                .map(|entry| (entry.path().as_str(), entry.kind()))
+                .collect::<Vec<_>>(),
+            [
+                ("a", PackageFileKind::Directory),
+                ("link", PackageFileKind::Symlink),
+                ("z.sai", PackageFileKind::File),
+            ]
+        );
+        assert_eq!(
+            snapshot.fingerprint(),
+            PackageFilesSnapshot::new(
+                true,
+                [
+                    entry("a", PackageFileKind::Directory),
+                    entry("link", PackageFileKind::Symlink),
+                    entry("z.sai", PackageFileKind::File),
+                ],
+            )
+            .expect("same entries form a valid snapshot")
+            .fingerprint()
+        );
+        assert!(
+            !PackageFilesSnapshot::new(false, [])
+                .expect("missing source dir is valid")
+                .source_directory_exists()
+        );
+        assert_eq!(
+            PackageFilesSnapshot::new(false, [entry("lib.sai", PackageFileKind::File)]),
+            Err(PackageFilesSnapshotError::EntriesForMissingSourceDirectory)
+        );
+        assert_eq!(
+            PackageFilesSnapshot::new(
+                true,
+                [
+                    entry("lib.sai", PackageFileKind::File),
+                    entry("lib.sai", PackageFileKind::Symlink),
+                ],
+            ),
+            Err(PackageFilesSnapshotError::DuplicatePath)
+        );
+        assert!(
+            PackageFilesSnapshot::new(
+                true,
+                [
+                    entry("src", PackageFileKind::Directory),
+                    entry("src/lib.sai", PackageFileKind::File),
+                ],
+            )
+            .is_ok(),
+            "valid directories must be listed before their children"
+        );
+        assert_eq!(
+            PackageFilesSnapshot::new(
+                true,
+                [
+                    entry("link", PackageFileKind::Symlink),
+                    entry("link/outside.sai", PackageFileKind::File),
+                ],
+            ),
+            Err(PackageFilesSnapshotError::DescendantOfNonDirectory)
+        );
+        assert_eq!(
+            PackageFilesSnapshot::new(
+                true,
+                [
+                    entry("plain.sai", PackageFileKind::File),
+                    entry("plain.sai/child.sai", PackageFileKind::File),
+                ],
+            ),
+            Err(PackageFilesSnapshotError::DescendantOfNonDirectory)
+        );
+        assert_eq!(
+            PackageFilesSnapshot::new(true, [entry("missing/child.sai", PackageFileKind::File)],),
+            Err(PackageFilesSnapshotError::MissingDirectoryAncestor)
+        );
+        for path in ["", "/lib.sai", "a/../lib.sai", "a//lib.sai", "a\\lib.sai"] {
+            assert_eq!(
+                PackageFileEntry::new(path, PackageFileKind::File),
+                Err(PackagePathError::InvalidRelativePath),
+                "path should be rejected: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn wit_file_snapshots_are_sorted_and_distinguish_empty_from_not_applicable() {
+        let path = |path| PackageRelativePath::new(path).expect("package-relative path is valid");
+        let not_applicable = WitFilesSnapshot::not_applicable();
+        let empty = WitFilesSnapshot::listed("wit", []).expect("an empty WIT directory is valid");
+        assert_eq!(not_applicable.files(), None);
+        assert_eq!(empty.files(), Some([].as_slice()));
+        assert_ne!(
+            not_applicable.fingerprint(),
+            empty.fingerprint(),
+            "no declared directory differs from an existing empty directory"
+        );
+
+        let files = WitFilesSnapshot::listed("wit", [path("wit/z.wit"), path("wit/a.wit")])
+            .expect("WIT file list is valid");
+        assert_eq!(files.directory(), Some("wit"));
+        assert_eq!(
+            files
+                .files()
+                .expect("listed WIT files are available")
+                .iter()
+                .map(PackageRelativePath::as_str)
+                .collect::<Vec<_>>(),
+            ["wit/a.wit", "wit/z.wit"]
+        );
+        assert_eq!(
+            WitFilesSnapshot::listed("wit", [path("wit/a.txt")]),
+            Err(WitFilesSnapshotError::NotDirectWitFile)
+        );
+        assert_eq!(
+            WitFilesSnapshot::listed("wit", [path("wit/a.wit"), path("wit/a.wit")]),
+            Err(WitFilesSnapshotError::DuplicatePath)
+        );
+        assert_eq!(
+            WitFilesSnapshot::listed("wit", [path("wit/deps/extra.wit")]),
+            Err(WitFilesSnapshotError::NotDirectWitFile)
+        );
+        assert_eq!(
+            WitFilesSnapshot::listed("wit/../wit", []),
+            Err(WitFilesSnapshotError::InvalidDirectory)
+        );
+        assert_ne!(
+            WitFilesSnapshot::listed("interfaces", [])
+                .expect("directory key is canonical")
+                .fingerprint(),
+            empty.fingerprint(),
+            "the declared WIT directory affects the input value even when empty"
+        );
+    }
+
+    #[test]
+    fn package_and_wit_file_inputs_track_absence_and_changes() {
+        let inputs = VfsInputs::new().expect("input query ID is available");
+        let mut database = QueryDatabase::new();
+        let key = PackageKey::new("acme:app#0.1").expect("package key is valid");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_in_query = Arc::clone(&runs);
+        let inputs_in_query = inputs.clone();
+        let query =
+            DerivedQuery::<PackageKey, u64>::new("package_file_summary", move |database, key| {
+                runs_in_query.fetch_add(1, Ordering::SeqCst);
+                let package_count = inputs_in_query
+                    .package_files(database, key.clone())?
+                    .map_or(0, |files| files.entries().len());
+                let wit_count = inputs_in_query
+                    .wit_files(database, key.clone())?
+                    .and_then(|files| files.files().map(<[PackageRelativePath]>::len))
+                    .unwrap_or(0);
+                Ok((package_count + wit_count) as u64)
+            })
+            .expect("query ID is available");
+
+        assert_eq!(
+            *query
+                .get(&mut database, key.clone())
+                .expect("absent listing inputs are tracked"),
+            0
+        );
+        let package_files = PackageFilesSnapshot::new(
+            true,
+            [
+                PackageFileEntry::new("lib.sai", PackageFileKind::File)
+                    .expect("source path is valid"),
+                PackageFileEntry::new("nested", PackageFileKind::Directory)
+                    .expect("directory path is valid"),
+            ],
+        )
+        .expect("package listing is valid");
+        let wit_files = WitFilesSnapshot::listed(
+            "wit",
+            [PackageRelativePath::new("wit/main.wit").expect("WIT path is valid")],
+        )
+        .expect("WIT listing is valid");
+        assert!(
+            inputs
+                .set_package_files(&mut database, key.clone(), package_files, Durability::Low,)
+                .expect("package listing is set")
+        );
+        assert!(
+            inputs
+                .set_wit_files(&mut database, key.clone(), wit_files, Durability::Low,)
+                .expect("WIT listing is set")
+        );
+        assert_eq!(
+            *query
+                .get(&mut database, key.clone())
+                .expect("both listings invalidate"),
+            3
+        );
+        assert!(
+            inputs
+                .remove_package_files(&mut database, key.clone())
+                .expect("package listing removal is recorded")
+        );
+        assert_eq!(
+            *query
+                .get(&mut database, key.clone())
+                .expect("package listing removal invalidates"),
+            1
+        );
+        assert!(
+            inputs
+                .remove_wit_files(&mut database, key.clone())
+                .expect("WIT listing removal is recorded")
+        );
+        assert_eq!(
+            *query
+                .get(&mut database, key)
+                .expect("WIT listing removal invalidates"),
+            0
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 4);
     }
 
     #[test]
