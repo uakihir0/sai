@@ -18,6 +18,10 @@ use std::sync::Arc;
 /// The driver applies VFS inputs before requesting tracked syntax and
 /// item-tree queries. Snapshot-bound results are always rebound to the
 /// [`WorkspaceSnapshot`] passed by the caller.
+///
+/// Callers must pass `FileId`s created by this database. `FileId` contains
+/// only a numeric index, so an in-range ID from another database cannot be
+/// distinguished from the local ID with the same index.
 pub struct RootDatabase {
     query_database: QueryDatabase,
     vfs: VfsInputs,
@@ -34,6 +38,7 @@ pub enum RootDatabaseError {
     Package(PackageIdError),
     PackageKey(PackageKeyError),
     FileInterner(FileInternerError),
+    /// The numeric file index is outside this database's file interner.
     FileNotInterned,
 }
 
@@ -264,7 +269,10 @@ impl RootDatabase {
         self.vfs.file_contents(&mut self.query_database, key)
     }
 
-    /// Reads decoded source and binds it to an ID interned by this database.
+    /// Reads decoded source using the local key assigned to `file_id`.
+    ///
+    /// `file_id` must have been created by this database; its numeric
+    /// representation cannot prove that it came from this session.
     pub fn source_text(&mut self, file_id: FileId) -> Result<SourceText, RootDatabaseError> {
         let key = self
             .files
@@ -276,9 +284,19 @@ impl RootDatabase {
             .map_err(RootDatabaseError::from)
     }
 
-    /// Reads the memoized line index for a stable file identity.
-    pub fn line_index(&mut self, key: FileKey) -> Result<Arc<LineIndex>, QueryError> {
-        self.vfs.line_index(&mut self.query_database, key)
+    /// Reads the memoized line index for the local file key at `file_id`.
+    ///
+    /// `file_id` must have been created by this database; its numeric
+    /// representation cannot prove that it came from this session.
+    pub fn line_index(&mut self, file_id: FileId) -> Result<Arc<LineIndex>, RootDatabaseError> {
+        let key = self
+            .files
+            .file_key(file_id)
+            .cloned()
+            .ok_or(RootDatabaseError::FileNotInterned)?;
+        self.vfs
+            .line_index(&mut self.query_database, key)
+            .map_err(RootDatabaseError::from)
     }
 
     /// Reads a package's source inventory and interns file entries.
@@ -462,7 +480,18 @@ mod tests {
             "fn alpha() {}\n"
         );
         assert_eq!(
+            database
+                .line_index(file_id)
+                .expect("interned file has a line index")
+                .line_count(),
+            2
+        );
+        assert_eq!(
             database.source_text(FileId::new(99)),
+            Err(RootDatabaseError::FileNotInterned)
+        );
+        assert_eq!(
+            database.line_index(FileId::new(99)),
             Err(RootDatabaseError::FileNotInterned)
         );
 

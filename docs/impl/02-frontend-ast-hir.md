@@ -43,6 +43,7 @@ The architecture and the query system are owned by [01-architecture.md](01-archi
 - **Partial root database (IR-209).** `sai_driver::RootDatabase` composes the current VFS, syntax, and item-tree adapters. Full query-group integration, `hir_owner`, `hir_source_map`, and `attrs` remain open.
 - `RootDatabase::intern_wit_files(PackageId)` converts tracked package-relative WIT paths to session-local `FileId`s. Its result preserves missing input, not-applicable inventory, an empty listed directory, and actual files as distinct states.
 - `RootDatabase::intern_package_files(PackageId, PackageSourceDirectory)` converts tracked source-file inventory entries into session-local IDs while preserving directory and symlink entries and distinguishing missing input, a missing source directory, and an empty source directory.
+- `RootDatabase::line_index(FileId)` resolves the ID through the session's file interner and reads the memoized index by its stable `FileKey`. The caller must pass an ID from the same root database: `FileId` carries only a numeric index, so an in-range foreign ID cannot be detected.
 - Diagnostics are not side effects. Every query returns its diagnostics as part of its value (`Parse::errors`, `HirOwner::diagnostics`, and so on); the driver collects them through the diagnostic sink of [11-diagnostics.md](11-diagnostics.md). The phrase "report X" in this chapter means "push a `Diagnostic` with code X into the diagnostics vector of the query being computed".
 - Queries can be cancelled between steps; the lexer and the parser are pure functions with no global state, so cancellation never leaves partial state behind.
 
@@ -1634,6 +1635,8 @@ Item-tree equality is structural within one symbol-interner session. It ignores 
 **Implementation update (IR-210, partial).** The driver now queries the WIT inventory by the canonical package identity and interns each listed package-relative WIT path through the session's package and file interners. `InternedWitFiles` preserves `NotApplicable` versus `Listed([])`, and a missing inventory remains `None`.
 
 **Implementation update (IR-211, partial).** The driver now adapts the tracked package source inventory using the configured source directory. File entries receive `FileId`s; directory and symlink entries preserve their source-relative paths and kinds without being treated as readable files.
+
+**Implementation update (IR-212, partial).** The root database now provides the syntax-facing `line_index(FileId)` operation by resolving the ID to its stable key before querying the VFS.
 
 ## 2.9 HIR-lowering desugarings
 

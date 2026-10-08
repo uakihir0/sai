@@ -205,6 +205,8 @@ A query that, directly or through other queries, reads itself is a **query cycle
 
 **Implementation update (IR-211, partial).** `RootDatabase::intern_package_files(PackageId, PackageSourceDirectory)` reads the tracked source inventory and maps each file's source-relative path through the configured source directory to a session-local `FileId`. Directory and symlink entries remain in the result without file IDs, and a missing inventory, missing source directory, and existing empty directory remain distinct.
 
+**Implementation update (IR-212, partial).** `RootDatabase::line_index(FileId)` resolves the numeric file index through its interner before requesting the stable-keyed VFS line index. `FileId` carries no session provenance, so callers must supply an ID from that same root database; the root can reject out-of-range values but cannot detect an in-range foreign ID.
+
 ## 1.5 Identifiers, interning, and arenas
 
 ### 1.5.1 Session identifiers
