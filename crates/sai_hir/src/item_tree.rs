@@ -13,7 +13,7 @@ use sai_syntax::{
     ast::{self, AstNode, AstToken},
 };
 use sai_vfs::{FileId, Span, TextRange, WorkspaceSnapshot, WorkspaceSnapshotId};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub use sai_syntax::ast::ErasedAstId;
 
@@ -396,6 +396,172 @@ impl StableItemTree {
                 .collect::<Result<_, _>>()?,
         })
     }
+
+    /// Rebuilds snapshot-local pointers and spans from this stable shape.
+    ///
+    /// The stable shape must describe this source's item-tree semantics; it may
+    /// be reused after edits that leave those semantics unchanged. The binder
+    /// verifies each stored AST ID, module header, use declaration, and raw
+    /// attribute before exposing the rebound tree.
+    pub(crate) fn bind_to_snapshot(
+        &self,
+        file: FileId,
+        source: &str,
+        root: &SyntaxNode,
+        ast_ids: &ast::AstIdMap,
+        symbols: &Interner,
+    ) -> Result<ItemTree, ItemTreeError> {
+        if !ast_ids.matches_root(file, root) {
+            return Err(ItemTreeError::FileMismatch);
+        }
+        if !green_text_matches_source(root, source) {
+            return Err(ItemTreeError::SourceMismatch);
+        }
+
+        let expected_id_count = self
+            .uses
+            .len()
+            .checked_add(count_entry_ids(&self.items))
+            .ok_or(ItemTreeError::StableShapeMismatch)?;
+        let mut seen_ids = HashSet::with_capacity(expected_id_count);
+        // ItemTree is a projection of AstIdMap, not a complete copy. In
+        // particular, the function syntax inside a world import is represented
+        // by the enclosing world-item entry, so unrecorded IDs are permitted.
+
+        let source_file = ast::SourceFile::cast(root.clone()).ok_or(ItemTreeError::FileMismatch)?;
+        let mut module_docs = None;
+        let mut module_docs_text = None;
+        let mut is_unsafe_module = false;
+        if let Some(header) = source_file.module_header() {
+            is_unsafe_module = header.unsafe_token().is_some();
+            if let Some(docs) = header.docs() {
+                module_docs_text = Some(node_text(source, docs.syntax())?.to_owned());
+                module_docs = Some(
+                    ast::AstPtr::new(file, &docs).map_err(|_| ItemTreeError::InvalidAstPointer)?,
+                );
+            }
+        }
+        if self.has_module_docs != module_docs.is_some()
+            || self.module_docs_text != module_docs_text
+            || self.is_unsafe_module != is_unsafe_module
+        {
+            return Err(ItemTreeError::StableShapeMismatch);
+        }
+
+        let mut uses = Vec::with_capacity(self.uses.len());
+        for expected in &self.uses {
+            check_shape_ast_id(expected.ast_id, ast_ids, &mut seen_ids)?;
+            let syntax = resolve_shape_ast_id(expected.ast_id, file, root, ast_ids)?;
+            let declaration =
+                ast::UseDecl::cast(syntax).ok_or(ItemTreeError::StableShapeMismatch)?;
+            let entry = collect_use(file, source, &declaration, ast_ids, symbols)?;
+            let actual =
+                StableUseEntry::from_entry(&entry, symbols).map_err(ItemTreeError::StableShape)?;
+            if &actual != expected {
+                return Err(ItemTreeError::StableShapeMismatch);
+            }
+            uses.push(entry);
+        }
+
+        let mut items = Vec::with_capacity(self.items.len());
+        for entry in &self.items {
+            items.push(bind_stable_entry(
+                entry,
+                file,
+                source,
+                root,
+                ast_ids,
+                symbols,
+                &mut seen_ids,
+            )?);
+        }
+        if seen_ids.len() != expected_id_count {
+            return Err(ItemTreeError::StableShapeMismatch);
+        }
+
+        Ok(ItemTree {
+            file,
+            snapshot_id: ast_ids.snapshot_id(),
+            module_docs,
+            module_docs_text,
+            is_unsafe_module,
+            uses,
+            items,
+        })
+    }
+}
+
+fn count_entry_ids(entries: &[StableItemTreeEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| 1 + count_entry_ids(&entry.children))
+        .sum()
+}
+
+fn check_shape_ast_id(
+    id: ErasedAstId,
+    ast_ids: &ast::AstIdMap,
+    seen_ids: &mut HashSet<u32>,
+) -> Result<(), ItemTreeError> {
+    let index = id.index();
+    if usize::try_from(index).map_or(true, |index| index >= ast_ids.len())
+        || !seen_ids.insert(index)
+        || ast_ids.pointer(id).is_none()
+    {
+        return Err(ItemTreeError::StableShapeMismatch);
+    }
+    Ok(())
+}
+
+fn resolve_shape_ast_id(
+    id: ErasedAstId,
+    file: FileId,
+    root: &SyntaxNode,
+    ast_ids: &ast::AstIdMap,
+) -> Result<SyntaxNode, ItemTreeError> {
+    ast_ids
+        .pointer(id)
+        .and_then(|pointer| pointer.resolve(file, root))
+        .ok_or(ItemTreeError::StableShapeMismatch)
+}
+
+fn bind_stable_entry(
+    stable: &StableItemTreeEntry,
+    file: FileId,
+    source: &str,
+    root: &SyntaxNode,
+    ast_ids: &ast::AstIdMap,
+    symbols: &Interner,
+    seen_ids: &mut HashSet<u32>,
+) -> Result<ItemTreeEntry, ItemTreeError> {
+    check_shape_ast_id(stable.ast_id, ast_ids, seen_ids)?;
+    let syntax = resolve_shape_ast_id(stable.ast_id, file, root, ast_ids)?;
+    let raw_attrs = raw_attrs(
+        file,
+        source,
+        syntax.children().filter_map(ast::Attribute::cast),
+        symbols,
+    )?;
+    if stable_raw_attrs(&raw_attrs, symbols).map_err(ItemTreeError::StableShape)?
+        != stable.raw_attrs
+    {
+        return Err(ItemTreeError::StableShapeMismatch);
+    }
+
+    let children = stable
+        .children
+        .iter()
+        .map(|child| bind_stable_entry(child, file, source, root, ast_ids, symbols, seen_ids))
+        .collect::<Result<_, _>>()?;
+    Ok(ItemTreeEntry {
+        ast_id: stable.ast_id,
+        kind: stable.kind,
+        name: stable.name.intern(symbols)?,
+        vis: stable.vis,
+        raw_attrs,
+        children,
+        header_hash: stable.header_hash,
+    })
 }
 
 impl StableUseEntry {
@@ -510,6 +676,15 @@ impl StableRawAttrValue {
             RawAttrValue::Int(value) => Self::Int(*value),
             RawAttrValue::Word(symbol) => Self::Word(stable_symbol(*symbol, symbols)?),
         })
+    }
+}
+
+impl StableSymbol {
+    fn intern(&self, symbols: &Interner) -> Result<Symbol, ItemTreeError> {
+        match self {
+            Self::Error => Ok(Symbol::ERROR),
+            Self::Name(name) => symbols.intern(name).map_err(ItemTreeError::Interner),
+        }
     }
 }
 
@@ -918,6 +1093,8 @@ pub enum ItemTreeError {
     MissingAstId,
     InvalidAstPointer,
     Interner(InternError),
+    StableShape(StableItemTreeError),
+    StableShapeMismatch,
 }
 
 impl ItemTree {
@@ -3390,7 +3567,7 @@ mod tests {
             "property \"laws\"() {}\n",
         );
         let file = FileId::new(701);
-        let (parsed, symbols, tree) = collect(source, file);
+        let (parsed, ast_ids, symbols, tree, _snapshot) = collect_with_snapshot(source, file);
 
         assert!(
             parsed.errors.is_empty(),
@@ -3403,6 +3580,14 @@ mod tests {
             docs.resolve(file, &parsed.root).is_some(),
             "module docs pointer resolves in the source snapshot"
         );
+        let stable = tree
+            .stable_shape(&symbols)
+            .expect("item tree has a stable shape");
+        let rebound = stable
+            .bind_to_snapshot(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("all item-like nodes and locations rebind");
+        assert_eq!(rebound, tree);
+        assert!(rebound.matches_ast_ids(&ast_ids));
         assert_eq!(tree.uses.len(), 1);
         assert_eq!(tree.uses[0].pkg_path, "sai:core/fmt");
         assert!(tree.uses[0].is_pub);
@@ -3619,6 +3804,18 @@ mod tests {
             first_tree.items[1].raw_attrs[0].span,
             second_tree.items[1].raw_attrs[0].span
         );
+        let rebound = first_shape
+            .bind_to_snapshot(
+                file,
+                &second_source,
+                &second.root,
+                &second_ids,
+                &second_symbols,
+            )
+            .expect("stable shape rebinds without collecting a new item tree");
+        assert_eq!(rebound, second_tree);
+        assert!(rebound.matches_ast_ids(&second_ids));
+        assert!(!rebound.matches_ast_ids(&first_ids));
 
         let changed_source = second_source.replace("fn run()", "fn renamed()");
         let (changed, changed_ids) = parse_snapshot(&changed_source, file);
@@ -3656,6 +3853,30 @@ mod tests {
         assert_eq!(
             tree.stable_shape(&Interner::new()),
             Err(StableItemTreeError::Interner(LookupError::UnknownSymbol))
+        );
+    }
+
+    #[test]
+    fn stable_item_tree_binding_rejects_duplicate_and_unresolvable_ids() {
+        let source = "use sai:core/fmt.{Format}\nfn run() {}\n";
+        let file = FileId::new(713);
+        let (parsed, ast_ids, symbols, tree, _) = collect_with_snapshot(source, file);
+        let stable = tree
+            .stable_shape(&symbols)
+            .expect("item tree has a stable shape");
+
+        let mut duplicate_id = stable.clone();
+        duplicate_id.items[0].ast_id = duplicate_id.uses[0].ast_id;
+        assert_eq!(
+            duplicate_id.bind_to_snapshot(file, source, &parsed.root, &ast_ids, &symbols),
+            Err(ItemTreeError::StableShapeMismatch)
+        );
+
+        let mut missing_id = stable;
+        missing_id.items[0].ast_id = ErasedAstId::new(u32::MAX);
+        assert_eq!(
+            missing_id.bind_to_snapshot(file, source, &parsed.root, &ast_ids, &symbols),
+            Err(ItemTreeError::StableShapeMismatch)
         );
     }
 

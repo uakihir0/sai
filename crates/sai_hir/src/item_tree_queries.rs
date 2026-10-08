@@ -1,4 +1,4 @@
-use crate::item_tree::{ItemTree, ItemTreeError, StableItemTree, StableItemTreeError};
+use crate::item_tree::{ItemTree, ItemTreeError, StableItemTree};
 use sai_intern::Interner;
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
 use sai_syntax::{ParseQueryError, SyntaxQueries};
@@ -18,8 +18,6 @@ pub enum ItemTreeQueryError {
     Query(QueryError),
     FileNotInterned,
     ItemTree(ItemTreeError),
-    StableShape(StableItemTreeError),
-    ShapeMismatch,
 }
 
 impl From<ParseQueryError> for ItemTreeQueryError {
@@ -78,8 +76,9 @@ impl ItemTreeQueries {
     /// Returns the item tree rebound to the supplied workspace snapshot.
     ///
     /// The memoized query stores only its stable shape. This adapter resolves
-    /// current symbols, AST pointers, and source ranges from the requesting
-    /// snapshot, then verifies that the bound tree matches the cached shape.
+    /// current AST pointers, attributes, and ranges from the requesting
+    /// snapshot while checking the source-bound pieces against the cached
+    /// shape.
     pub fn def_collector(
         &self,
         database: &mut QueryDatabase,
@@ -103,24 +102,19 @@ impl ItemTreeQueries {
         let source = snapshot.file(file_id).ok_or(ItemTreeQueryError::Syntax(
             ParseQueryError::MissingSnapshotFile,
         ))?;
-        let tree = ItemTree::collect(
-            file_id,
-            source.source().text(),
-            &parsed.root,
-            &ast_ids,
-            symbols,
-        )
-        .map_err(ItemTreeQueryError::ItemTree)?;
         let stable_shape = self
             .stable_item_tree
             .get(database, key)
             .map_err(ItemTreeQueryError::Query)?;
-        let bound_shape = tree
-            .stable_shape(symbols)
-            .map_err(ItemTreeQueryError::StableShape)?;
-        if stable_shape.as_ref() != &bound_shape {
-            return Err(ItemTreeQueryError::ShapeMismatch);
-        }
+        let tree = stable_shape
+            .bind_to_snapshot(
+                file_id,
+                source.source().text(),
+                &parsed.root,
+                &ast_ids,
+                symbols,
+            )
+            .map_err(ItemTreeQueryError::ItemTree)?;
         Ok(Arc::new(tree))
     }
 }
