@@ -2,7 +2,10 @@ use crate::attrs::{
     AttrValidationError, AttributeTarget, ExternAbi, ImplKind, TargetCfg, TargetKind,
     ValidatedAttrs, validate_attrs,
 };
-use sai_diagnostics::Diagnostic;
+use sai_diagnostics::{
+    Diagnostic, LintLevel as DiagnosticLintLevel, Location, OverrideLintLevel, ScopedLintLevel,
+    SourceRef,
+};
 use sai_intern::{InternError, Interner, Symbol};
 use sai_stable_hash::StableHasher;
 use sai_syntax::{
@@ -10,7 +13,7 @@ use sai_syntax::{
     ast::{self, AstNode, AstToken},
 };
 use sai_vfs::{FileId, Span, TextRange, WorkspaceSnapshot, WorkspaceSnapshotId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use sai_syntax::ast::ErasedAstId;
 
@@ -297,6 +300,198 @@ pub struct TargetFilterResult {
     /// Validated attributes for every retained item-tree entry and `use`.
     pub validated_attrs: BTreeMap<ErasedAstId, ValidatedAttrs>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LintScopeCollectionError {
+    StaleItemTree,
+    SnapshotMismatch,
+    MissingValidatedAttrs,
+    UnexpectedValidatedAttrs,
+    MissingAstNode,
+    InvalidSourceRange,
+    ForeignSymbol,
+    InvalidLintAttributeScope,
+    InvalidLintLevel,
+}
+
+impl TargetFilterResult {
+    /// Builds source-bound lint attribute scopes for the retained item tree.
+    ///
+    /// Each scope runs from the first outer doc comment or attribute through
+    /// the declaration's last token. The returned spans use original-file
+    /// offsets, matching diagnostic locations.
+    pub fn scoped_lint_levels(
+        &self,
+        ast_ids: &ast::AstIdMap,
+        root: &SyntaxNode,
+        symbols: &Interner,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<ScopedLintLevel>, LintScopeCollectionError> {
+        let file = self.item_tree.file;
+        if !self.item_tree.matches_ast_ids(ast_ids) || !ast_ids.matches_root(file, root) {
+            return Err(LintScopeCollectionError::StaleItemTree);
+        }
+        if !ast_ids.matches_snapshot(snapshot) || snapshot.id() != self.item_tree.snapshot_id {
+            return Err(LintScopeCollectionError::SnapshotMismatch);
+        }
+
+        let snapshot_file = snapshot
+            .file(file)
+            .ok_or(LintScopeCollectionError::SnapshotMismatch)?;
+        let source = snapshot_file.source();
+        if !green_text_matches_source(root, source.text()) {
+            return Err(LintScopeCollectionError::SnapshotMismatch);
+        }
+        let source_ref = SourceRef {
+            path: snapshot_file.path().to_owned(),
+            package: snapshot_file.package().map(str::to_owned),
+            snapshot: snapshot_file.document_version(),
+        };
+
+        let mut seen_ids = BTreeSet::new();
+        let mut scopes = Vec::new();
+        for entry in &self.item_tree.uses {
+            collect_lint_scopes_for_id(
+                entry.ast_id,
+                &self.validated_attrs,
+                ast_ids,
+                root,
+                source_ref.clone(),
+                source,
+                symbols,
+                &mut seen_ids,
+                &mut scopes,
+            )?;
+        }
+        collect_entry_lint_scopes(
+            &self.item_tree.items,
+            &self.validated_attrs,
+            ast_ids,
+            root,
+            &source_ref,
+            source,
+            symbols,
+            &mut seen_ids,
+            &mut scopes,
+        )?;
+
+        if seen_ids.len() != self.validated_attrs.len()
+            || self
+                .validated_attrs
+                .keys()
+                .any(|ast_id| !seen_ids.contains(ast_id))
+        {
+            return Err(LintScopeCollectionError::UnexpectedValidatedAttrs);
+        }
+
+        scopes.sort_by(|left, right| {
+            let left_range = left.syntax_range().range;
+            let right_range = right.syntax_range().range;
+            left_range
+                .start()
+                .cmp(&right_range.start())
+                .then_with(|| right_range.end().cmp(&left_range.end()))
+                .then_with(|| {
+                    left.location()
+                        .span
+                        .range
+                        .start()
+                        .cmp(&right.location().span.range.start())
+                })
+                .then_with(|| left.code().cmp(right.code()))
+        });
+        Ok(scopes)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_entry_lint_scopes(
+    entries: &[ItemTreeEntry],
+    validated_attrs: &BTreeMap<ErasedAstId, ValidatedAttrs>,
+    ast_ids: &ast::AstIdMap,
+    root: &SyntaxNode,
+    source_ref: &SourceRef,
+    source: &sai_vfs::SourceFile,
+    symbols: &Interner,
+    seen_ids: &mut BTreeSet<ErasedAstId>,
+    scopes: &mut Vec<ScopedLintLevel>,
+) -> Result<(), LintScopeCollectionError> {
+    for entry in entries {
+        collect_lint_scopes_for_id(
+            entry.ast_id,
+            validated_attrs,
+            ast_ids,
+            root,
+            source_ref.clone(),
+            source,
+            symbols,
+            seen_ids,
+            scopes,
+        )?;
+        collect_entry_lint_scopes(
+            &entry.children,
+            validated_attrs,
+            ast_ids,
+            root,
+            source_ref,
+            source,
+            symbols,
+            seen_ids,
+            scopes,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_lint_scopes_for_id(
+    ast_id: ErasedAstId,
+    validated_attrs: &BTreeMap<ErasedAstId, ValidatedAttrs>,
+    ast_ids: &ast::AstIdMap,
+    root: &SyntaxNode,
+    source_ref: SourceRef,
+    source: &sai_vfs::SourceFile,
+    symbols: &Interner,
+    seen_ids: &mut BTreeSet<ErasedAstId>,
+    scopes: &mut Vec<ScopedLintLevel>,
+) -> Result<(), LintScopeCollectionError> {
+    if !seen_ids.insert(ast_id) {
+        return Err(LintScopeCollectionError::UnexpectedValidatedAttrs);
+    }
+    let validated = validated_attrs
+        .get(&ast_id)
+        .ok_or(LintScopeCollectionError::MissingValidatedAttrs)?;
+    if validated.lint_levels.is_empty() {
+        return Ok(());
+    }
+
+    let syntax = ast_ids
+        .pointer(ast_id)
+        .ok_or(LintScopeCollectionError::MissingAstNode)?
+        .resolve(ast_ids.file(), root)
+        .ok_or(LintScopeCollectionError::MissingAstNode)?;
+    let decoded_scope = Span::new(ast_ids.file(), syntax.text_range());
+    let scope_location = Location::from_decoded_source(source_ref.clone(), decoded_scope, source)
+        .ok_or(LintScopeCollectionError::InvalidSourceRange)?;
+
+    for lint in &validated.lint_levels {
+        let level = match lint.level {
+            DiagnosticLintLevel::Allow => OverrideLintLevel::Allow,
+            DiagnosticLintLevel::Warn => OverrideLintLevel::Warn,
+            DiagnosticLintLevel::Deny => OverrideLintLevel::Deny,
+            DiagnosticLintLevel::Info => return Err(LintScopeCollectionError::InvalidLintLevel),
+        };
+        let name = symbols
+            .resolve(lint.name)
+            .map_err(|_| LintScopeCollectionError::ForeignSymbol)?;
+        let location = Location::from_decoded_source(source_ref.clone(), lint.span, source)
+            .ok_or(LintScopeCollectionError::InvalidSourceRange)?;
+        let scoped = ScopedLintLevel::new(name.as_ref(), level, scope_location.span, location)
+            .ok_or(LintScopeCollectionError::InvalidLintAttributeScope)?;
+        scopes.push(scoped);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2075,6 +2270,141 @@ mod tests {
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
         }));
+    }
+
+    #[test]
+    fn retained_attributes_produce_original_source_lint_scopes() {
+        let source = concat!(
+            "/// record documentation\n",
+            "@allow(UNUSED_VARIABLE)\n",
+            "type Record {\n",
+            "    @deny(UNUSED_VARIABLE)\n",
+            "    field: U32,\n",
+            "}\n",
+            "@warn(UNUSED_VARIABLE)\n",
+            "use sai:core/fmt.{Format}\n",
+            "@target(\"wasm64-core\")\n",
+            "@warn(UNUSED_VARIABLE)\n",
+            "fn removed() {}\n",
+        );
+        let file = FileId::new(730);
+        let (parsed, ast_ids, symbols, _, snapshot) = collect_with_snapshot(source, file);
+        assert!(parsed.errors.is_empty());
+
+        let result = ItemTree::collect_for_target(
+            file,
+            source,
+            &parsed.root,
+            &ast_ids,
+            &symbols,
+            &snapshot,
+            &target_cfg("wasm32-core", &[]),
+        )
+        .expect("target collection succeeds");
+        let scopes = result
+            .scoped_lint_levels(&ast_ids, &parsed.root, &symbols, &snapshot)
+            .expect("scopes come from the retained validated attributes");
+        assert_eq!(result.item_tree.uses.len(), 1);
+        assert_eq!(scopes.len(), 3);
+        assert_eq!(
+            scopes.iter().map(|scope| scope.level()).collect::<Vec<_>>(),
+            [
+                OverrideLintLevel::Allow,
+                OverrideLintLevel::Deny,
+                OverrideLintLevel::Warn
+            ]
+        );
+
+        let record_start = source.find("/// record documentation").unwrap();
+        let record_end = source.find("}\n@warn").unwrap() + 1;
+        assert_eq!(
+            scopes[0].syntax_range().range,
+            TextRange::new(
+                sai_vfs::TextSize::new(record_start as u32),
+                sai_vfs::TextSize::new(record_end as u32),
+            )
+            .unwrap()
+        );
+        let field_attribute_start = source.find("@deny(UNUSED_VARIABLE)").unwrap();
+        let field_end = source.find("field: U32").unwrap() + "field: U32".len();
+        assert_eq!(
+            scopes[1].syntax_range().range,
+            TextRange::new(
+                sai_vfs::TextSize::new(field_attribute_start as u32),
+                sai_vfs::TextSize::new(field_end as u32),
+            )
+            .unwrap()
+        );
+        assert_eq!(scopes[0].syntax_range().file, file);
+        assert_eq!(scopes[0].location().file.path, "src/lib.sai");
+
+        let record_name_start = source.find("Record").unwrap() as u32;
+        let record_primary = Location::new(
+            "src/lib.sai",
+            Span::new(
+                file,
+                TextRange::new(
+                    sai_vfs::TextSize::new(record_name_start),
+                    sai_vfs::TextSize::new(record_name_start + "Record".len() as u32),
+                )
+                .unwrap(),
+            ),
+        );
+        let field_primary_start =
+            source.find("field: U32").unwrap() as u32 + "field: ".len() as u32;
+        let primary = Location::new(
+            "src/lib.sai",
+            Span::new(
+                file,
+                TextRange::new(
+                    sai_vfs::TextSize::new(field_primary_start),
+                    sai_vfs::TextSize::new(field_primary_start + 3),
+                )
+                .unwrap(),
+            ),
+        );
+        let policies = sai_diagnostics::LintPolicies::default();
+        let record_level = sai_diagnostics::resolve_lint_occurrence(
+            "UNUSED_VARIABLE",
+            &sai_diagnostics::LintResolutionContext {
+                primary: Some(&record_primary),
+                attributes: &scopes,
+                cli: None,
+                manifest: None,
+                package_policy: &policies,
+                root_policy: &policies,
+                is_root_or_workspace_member: true,
+                deny_warnings: false,
+            },
+        )
+        .expect("registered lint");
+        assert_eq!(record_level, sai_diagnostics::LintResolution::Suppressed);
+
+        let resolved = sai_diagnostics::resolve_lint_occurrence(
+            "UNUSED_VARIABLE",
+            &sai_diagnostics::LintResolutionContext {
+                primary: Some(&primary),
+                attributes: &scopes,
+                cli: None,
+                manifest: None,
+                package_policy: &policies,
+                root_policy: &policies,
+                is_root_or_workspace_member: true,
+                deny_warnings: false,
+            },
+        )
+        .expect("registered lint");
+        assert!(matches!(
+            resolved,
+            sai_diagnostics::LintResolution::Emitted {
+                severity: sai_diagnostics::Severity::Error,
+                level: sai_diagnostics::LevelInfo {
+                    value: DiagnosticLintLevel::Deny,
+                    source: sai_diagnostics::LevelSource::Attribute,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
