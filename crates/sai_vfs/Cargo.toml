@@ -3,3 +3,7 @@ name = "sai_vfs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+sai_query = { path = "../sai_query" }
+sai_stable_hash = { path = "../sai_stable_hash" }

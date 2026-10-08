@@ -3,6 +3,7 @@
 use siphasher::sip128::{Hasher128, SipHasher13};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
+use std::sync::Arc;
 
 /// The 128-bit fingerprint used for compiler values and query keys.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -234,6 +235,12 @@ impl<T: StableHash + ?Sized> StableHash for &T {
     }
 }
 
+impl<T: StableHash + ?Sized> StableHash for Arc<T> {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        T::stable_hash(self, hasher);
+    }
+}
+
 impl<T: StableHash> StableHash for [T] {
     fn stable_hash(&self, hasher: &mut StableHasher) {
         stable_hash_sequence(self, 0x40, hasher);
@@ -352,6 +359,13 @@ mod tests {
         assert_ne!(fingerprint("ab"), fingerprint("a"));
         assert_ne!(fingerprint(&vec!["a", "bc"]), fingerprint(&vec!["ab", "c"]));
         assert_ne!(fingerprint(&Some(1_u8)), fingerprint(&None::<u8>));
+    }
+
+    #[test]
+    fn shared_values_hash_their_contents_without_hashing_the_pointer() {
+        let shared: Arc<[u8]> = Arc::from(&b"source"[..]);
+        assert_eq!(fingerprint(&shared), fingerprint(&b"source"[..]));
+        assert_ne!(fingerprint(&shared), fingerprint(&b"other"[..]));
     }
 
     #[test]

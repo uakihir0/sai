@@ -113,12 +113,19 @@ impl std::error::Error for QueryError {}
 pub struct QueryDatabase {
     revision: u64,
     durability_changed_at: [u64; 3],
+    input_batch: Option<InputBatchState>,
     memos: HashMap<NodeKey, Vec<Box<dyn Any + Send + Sync>>>,
     interned: HashMap<QueryId, Box<dyn Any + Send + Sync>>,
     active: Vec<ActiveQuery>,
     cancellation: CancellationToken,
     poisoned: Option<QueryError>,
     session: Arc<()>,
+}
+
+#[derive(Default)]
+struct InputBatchState {
+    revision: Option<u64>,
+    durability_through: Option<usize>,
 }
 
 impl Default for QueryDatabase {
@@ -132,6 +139,7 @@ impl QueryDatabase {
         Self {
             revision: 1,
             durability_changed_at: [1; 3],
+            input_batch: None,
             memos: HashMap::new(),
             interned: HashMap::new(),
             active: Vec::new(),
@@ -237,8 +245,62 @@ impl QueryDatabase {
             .ok_or(QueryError::RevisionExhausted)
     }
 
+    fn begin_input_batch(&mut self, input: &str) -> Result<(), QueryError> {
+        self.ensure_input_mutation_allowed(input)?;
+        self.input_batch = Some(InputBatchState::default());
+        Ok(())
+    }
+
+    fn finish_input_batch(&mut self) {
+        if let Some(batch) = self.input_batch.take() {
+            if let (Some(revision), Some(durability_through)) =
+                (batch.revision, batch.durability_through)
+            {
+                self.revision = revision;
+                for index in 0..=durability_through {
+                    self.durability_changed_at[index] = revision;
+                }
+            }
+        }
+    }
+
+    fn record_input_change(&mut self, durability: Durability) -> Result<u64, QueryError> {
+        let durability_through = durability.index();
+        if let Some(batch) = &self.input_batch {
+            let revision = match batch.revision {
+                Some(revision) => revision,
+                None => self.next_revision()?,
+            };
+            let batch = self
+                .input_batch
+                .as_mut()
+                .expect("batch state is present when recording a batch input");
+            batch.revision = Some(revision);
+            batch.durability_through = Some(
+                batch
+                    .durability_through
+                    .map_or(durability_through, |previous| {
+                        previous.max(durability_through)
+                    }),
+            );
+            return Ok(revision);
+        }
+
+        let revision = self.next_revision()?;
+        self.revision = revision;
+        for index in 0..=durability_through {
+            self.durability_changed_at[index] = revision;
+        }
+        Ok(revision)
+    }
+
     fn ensure_input_mutation_allowed(&mut self, input: &str) -> Result<(), QueryError> {
-        self.check_cancellation()?;
+        if let Some(error) = &self.poisoned {
+            return Err(error.clone());
+        }
+        if self.input_batch.is_none() {
+            self.check_cancellation()?;
+        }
         if let Some(query) = self.active.last() {
             let error = QueryError::InputMutationDuringQuery {
                 input: input.to_owned(),
@@ -297,6 +359,18 @@ impl QueryDatabase {
     }
 }
 
+/// One mutation to apply as part of an atomic input revision.
+pub enum InputChange<K, V> {
+    Set {
+        key: K,
+        value: V,
+        durability: Durability,
+    },
+    Remove {
+        key: K,
+    },
+}
+
 /// A typed, mutable input query.
 pub struct InputQuery<K, V> {
     id: QueryId,
@@ -335,34 +409,48 @@ where
     }
 
     pub fn set(&self, database: &mut QueryDatabase, key: K, value: V) -> Result<bool, QueryError> {
+        self.set_at_durability(database, key, value, self.durability)
+    }
+
+    /// Sets an input with a per-key durability.
+    ///
+    /// The input query's configured durability remains the default for `set`.
+    /// Changing an existing key's durability advances all stamps through the
+    /// more durable of its old and new levels.
+    pub fn set_at_durability(
+        &self,
+        database: &mut QueryDatabase,
+        key: K,
+        value: V,
+        durability: Durability,
+    ) -> Result<bool, QueryError> {
         database.ensure_input_mutation_allowed(&self.name)?;
         let node = NodeKey::new(self.id, &key);
-        if let Some(state) = database.memo_state::<K, V>(node, &key)? {
-            match state {
-                MemoState::Input(InputMemo {
-                    value: Some(old), ..
-                }) if *old == value => return Ok(false),
-                MemoState::Input(_) => {}
-                MemoState::Derived(_) => {
-                    let error = QueryError::QueryKindMismatch {
-                        query: self.name.to_string(),
-                    };
-                    return Err(database.record_query_error(&error));
-                }
-            }
-        }
-
-        let revision = match database.next_revision() {
-            Ok(revision) => revision,
-            Err(error) => {
+        let previous = match database.memo_state::<K, V>(node, &key)? {
+            Some(MemoState::Input(input)) => Some(input),
+            Some(MemoState::Derived(_)) => {
+                let error = QueryError::QueryKindMismatch {
+                    query: self.name.to_string(),
+                };
                 return Err(database.record_query_error(&error));
             }
+            None => None,
         };
-        let durability = self.durability;
-        database.revision = revision;
-        for index in 0..=durability.index() {
-            database.durability_changed_at[index] = revision;
+        if previous.as_ref().is_some_and(|input| {
+            input.durability == durability
+                && input
+                    .value
+                    .as_deref()
+                    .is_some_and(|old_value| old_value == &value)
+        }) {
+            return Ok(false);
         }
+        let changed_durability =
+            previous.map_or(durability, |input| input.durability.max(durability));
+        let revision = match database.record_input_change(changed_durability) {
+            Ok(revision) => revision,
+            Err(error) => return Err(database.record_query_error(&error)),
+        };
         database.store_state(
             node,
             key,
@@ -379,8 +467,12 @@ where
     pub fn remove(&self, database: &mut QueryDatabase, key: K) -> Result<bool, QueryError> {
         database.ensure_input_mutation_allowed(&self.name)?;
         let node = NodeKey::new(self.id, &key);
-        match database.memo_state::<K, V>(node, &key)? {
-            Some(MemoState::Input(InputMemo { value: Some(_), .. })) => {}
+        let durability = match database.memo_state::<K, V>(node, &key)? {
+            Some(MemoState::Input(InputMemo {
+                value: Some(_),
+                durability,
+                ..
+            })) => durability,
             Some(MemoState::Input(InputMemo { value: None, .. })) | None => {
                 return Ok(false);
             }
@@ -390,19 +482,11 @@ where
                 };
                 return Err(database.record_query_error(&error));
             }
-        }
-
-        let revision = match database.next_revision() {
-            Ok(revision) => revision,
-            Err(error) => {
-                return Err(database.record_query_error(&error));
-            }
         };
-        let durability = self.durability;
-        database.revision = revision;
-        for index in 0..=durability.index() {
-            database.durability_changed_at[index] = revision;
-        }
+        let revision = match database.record_input_change(durability) {
+            Ok(revision) => revision,
+            Err(error) => return Err(database.record_query_error(&error)),
+        };
         database.store_state(
             node,
             key,
@@ -413,6 +497,51 @@ where
             }),
         );
         Ok(true)
+    }
+
+    /// Applies input changes together, assigning all changed values one
+    /// revision and updating the durability stamps once.
+    ///
+    /// The caller should provide at most one final change for each key.
+    pub fn apply_changes(
+        &self,
+        database: &mut QueryDatabase,
+        changes: impl IntoIterator<Item = InputChange<K, V>>,
+    ) -> Result<usize, QueryError> {
+        let changes = changes.into_iter().collect::<Vec<_>>();
+        database.begin_input_batch(&self.name)?;
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut changed = 0;
+            for change in changes {
+                let result = match change {
+                    InputChange::Set {
+                        key,
+                        value,
+                        durability,
+                    } => self.set_at_durability(database, key, value, durability),
+                    InputChange::Remove { key } => self.remove(database, key),
+                };
+                match result {
+                    Ok(true) => changed += 1,
+                    Ok(false) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(changed)
+        }));
+
+        database.finish_input_batch();
+        match result {
+            Ok(result) => result,
+            Err(payload) => {
+                let error = QueryError::Panicked {
+                    query: self.name.to_string(),
+                    message: panic_message(payload.as_ref()),
+                };
+                Err(database.record_query_error(&error))
+            }
+        }
     }
 
     pub fn get(&self, database: &mut QueryDatabase, key: K) -> Result<Arc<V>, QueryError> {
@@ -1125,6 +1254,16 @@ mod tests {
     use sai_stable_hash::StableHasher;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[derive(Clone, Eq, PartialEq)]
+    struct MaybePanicsOnStableHash(u32, bool);
+
+    impl StableHash for MaybePanicsOnStableHash {
+        fn stable_hash(&self, hasher: &mut StableHasher) {
+            assert!(!self.1, "test key requested a stable-hash panic");
+            self.0.stable_hash(hasher);
+        }
+    }
+
     fn input<V>(name: &'static str, durability: Durability) -> InputQuery<u32, V>
     where
         V: Clone + Eq + StableHash + Send + Sync + 'static,
@@ -1172,6 +1311,126 @@ mod tests {
         );
         assert_eq!(database.revision, initial_revision + 2);
         assert_eq!(*low.get(&mut database, 1).expect("input exists"), "two");
+    }
+
+    #[test]
+    fn input_batches_share_one_revision_and_the_most_durable_stamp() {
+        let mut database = QueryDatabase::new();
+        let source = input::<&'static str>("batched_source", Durability::Low);
+        let initial_revision = database.revision;
+
+        assert_eq!(
+            source
+                .apply_changes(
+                    &mut database,
+                    [
+                        InputChange::Set {
+                            key: 1,
+                            value: "low",
+                            durability: Durability::Low,
+                        },
+                        InputChange::Set {
+                            key: 2,
+                            value: "high",
+                            durability: Durability::High,
+                        },
+                    ],
+                )
+                .expect("batch applies"),
+            2
+        );
+        assert_eq!(database.revision, initial_revision + 1);
+        assert_eq!(database.durability_changed_at, [database.revision; 3]);
+        assert_eq!(
+            *source.get(&mut database, 1).expect("low input exists"),
+            "low"
+        );
+        assert_eq!(
+            *source.get(&mut database, 2).expect("high input exists"),
+            "high"
+        );
+    }
+
+    #[test]
+    fn a_panicking_input_batch_finishes_its_revision_and_poisons_the_session() {
+        let mut database = QueryDatabase::new();
+        let source =
+            InputQuery::<MaybePanicsOnStableHash, u32>::new("panicking_batch", Durability::Low)
+                .expect("input query ID is available");
+        let revision = database.revision;
+        let error = source
+            .apply_changes(
+                &mut database,
+                [
+                    InputChange::Set {
+                        key: MaybePanicsOnStableHash(1, false),
+                        value: 1,
+                        durability: Durability::Low,
+                    },
+                    InputChange::Set {
+                        key: MaybePanicsOnStableHash(2, true),
+                        value: 2,
+                        durability: Durability::Low,
+                    },
+                ],
+            )
+            .expect_err("the test key panics during stable hashing");
+
+        assert_eq!(
+            error,
+            QueryError::Panicked {
+                query: "panicking_batch".to_owned(),
+                message: "test key requested a stable-hash panic".to_owned(),
+            }
+        );
+        assert_eq!(database.revision, revision + 1);
+        assert!(database.input_batch.is_none());
+        assert_eq!(database.check_cancellation(), Err(error));
+    }
+
+    #[test]
+    fn input_durability_is_per_key_and_changes_are_tracked() {
+        let mut database = QueryDatabase::new();
+        let source = input::<u32>("tiered_source", Durability::Low);
+        assert!(
+            source
+                .set_at_durability(&mut database, 1, 7, Durability::High)
+                .expect("high durability input sets")
+        );
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_in_query = Arc::clone(&runs);
+        let source_in_query = source.clone();
+        let query = derived("read_high_input", move |database, key| {
+            runs_in_query.fetch_add(1, Ordering::SeqCst);
+            source_in_query.get(database, *key).map(|value| *value)
+        });
+
+        assert_eq!(*query.get(&mut database, 1).expect("query computes"), 7);
+        assert!(
+            source
+                .set_at_durability(&mut database, 2, 8, Durability::Low)
+                .expect("low durability input sets")
+        );
+        assert_eq!(
+            *query
+                .get(&mut database, 1)
+                .expect("high input remains green"),
+            7
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        assert!(
+            source
+                .set_at_durability(&mut database, 1, 7, Durability::Low)
+                .expect("durability change is recorded")
+        );
+        assert_eq!(
+            *query
+                .get(&mut database, 1)
+                .expect("durability change invalidates"),
+            7
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use sai_query::{Durability, InputQuery, QueryDatabase, QueryError};
+use sai_stable_hash::{StableHash, StableHasher};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// Maximum source-file size, measured in bytes as read from disk.
@@ -17,6 +19,74 @@ impl FileId {
 
     pub const fn raw(self) -> u32 {
         self.0
+    }
+}
+
+/// A session-independent file identity used as a stable query key.
+///
+/// The package key and canonical source path are explicit. The document
+/// version and `FileId` are deliberately excluded: versions describe
+/// snapshots, and `FileId` is assigned within one compiler session.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FileKey {
+    package_key: String,
+    path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileKeyError {
+    InvalidPackageKey,
+    InvalidSourcePath,
+    PackageIdentityMismatch,
+}
+
+impl FileKey {
+    /// Constructs a stable identity from a package key and a source path.
+    ///
+    /// Dependency source references are checked against the package key's
+    /// compatibility line, then reduced to their package-relative path.
+    /// For workspace files, `path` must already be relative to the owning
+    /// package; a `SnapshotFile::path` may instead be relative to the workspace.
+    pub fn new(
+        package_key: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Result<Self, FileKeyError> {
+        let package_key = package_key.into();
+        let path = path.into();
+        if !is_stable_package_key(&package_key) {
+            return Err(FileKeyError::InvalidPackageKey);
+        }
+        if !is_canonical_source_path(&path) {
+            return Err(FileKeyError::InvalidSourcePath);
+        }
+        let path = if let Some(dependency) = path.strip_prefix("dep:") {
+            let Some((release_identity, source_path)) = dependency.split_once('/') else {
+                return Err(FileKeyError::InvalidSourcePath);
+            };
+            if !package_key_matches_release(&package_key, release_identity) {
+                return Err(FileKeyError::PackageIdentityMismatch);
+            }
+            source_path.to_owned()
+        } else {
+            path
+        };
+        Ok(Self { package_key, path })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn package_key(&self) -> &str {
+        &self.package_key
+    }
+}
+
+impl StableHash for FileKey {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xA7);
+        self.package_key.stable_hash(hasher);
+        self.path.stable_hash(hasher);
     }
 }
 
@@ -571,6 +641,227 @@ impl SnapshotFile {
     }
 }
 
+/// The content or read failure observed for one file input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileContents {
+    Bytes(Arc<[u8]>),
+    ReadError { io_error_kind: String },
+}
+
+impl FileContents {
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::ReadError { .. } => None,
+        }
+    }
+
+    pub fn io_error_kind(&self) -> Option<&str> {
+        match self {
+            Self::Bytes(_) => None,
+            Self::ReadError { io_error_kind } => Some(io_error_kind),
+        }
+    }
+}
+
+impl StableHash for FileContents {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xA8);
+        match self {
+            Self::Bytes(bytes) => {
+                hasher.write_tag(0);
+                bytes.stable_hash(hasher);
+            }
+            Self::ReadError { io_error_kind } => {
+                hasher.write_tag(1);
+                io_error_kind.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VfsInputSnapshotError {
+    DuplicateFileKey,
+}
+
+/// An immutable set of raw file inputs, collected before source decoding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VfsInputSnapshot {
+    files: BTreeMap<FileKey, (FileContents, Durability)>,
+}
+
+impl VfsInputSnapshot {
+    pub fn new(
+        files: impl IntoIterator<Item = (FileKey, FileContents, Durability)>,
+    ) -> Result<Self, VfsInputSnapshotError> {
+        let mut snapshot = Self::default();
+        for (key, contents, durability) in files {
+            if snapshot.files.insert(key, (contents, durability)).is_some() {
+                return Err(VfsInputSnapshotError::DuplicateFileKey);
+            }
+        }
+        Ok(snapshot)
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&FileKey, &FileContents, Durability)> {
+        self.files
+            .iter()
+            .map(|(key, (contents, durability))| (key, contents, *durability))
+    }
+}
+
+/// One file-content input change in a snapshot update.
+pub enum VfsInputUpdate {
+    Set {
+        key: FileKey,
+        contents: FileContents,
+        durability: Durability,
+    },
+    Remove {
+        key: FileKey,
+    },
+}
+
+/// Query-backed raw source inputs for the virtual file system.
+///
+/// This is the input layer only; decoding and syntax queries consume these
+/// bytes in higher compiler layers.
+#[derive(Clone)]
+pub struct VfsInputs {
+    file_contents: InputQuery<FileKey, FileContents>,
+}
+
+impl VfsInputs {
+    pub fn new() -> Result<Self, QueryError> {
+        Ok(Self {
+            file_contents: InputQuery::new("file_contents", Durability::Low)?,
+        })
+    }
+
+    /// Sets the exact raw bytes for a stable file identity and package role.
+    pub fn set_file_contents(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        contents: Arc<[u8]>,
+        durability: Durability,
+    ) -> Result<bool, QueryError> {
+        self.set_file_input(database, key, FileContents::Bytes(contents), durability)
+    }
+
+    /// Records an I/O failure as a file input value.
+    pub fn set_file_read_error(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        io_error_kind: impl Into<String>,
+        durability: Durability,
+    ) -> Result<bool, QueryError> {
+        self.set_file_input(
+            database,
+            key,
+            FileContents::ReadError {
+                io_error_kind: io_error_kind.into(),
+            },
+            durability,
+        )
+    }
+
+    fn set_file_input(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        contents: FileContents,
+        durability: Durability,
+    ) -> Result<bool, QueryError> {
+        self.file_contents
+            .set_at_durability(database, key, contents, durability)
+    }
+
+    /// Removes a file input when it leaves the current source snapshot.
+    pub fn remove_file(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<bool, QueryError> {
+        self.file_contents.remove(database, key)
+    }
+
+    /// Reads raw bytes and tracks absence as a dependency.
+    pub fn file_contents(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<Option<FileContents>, QueryError> {
+        self.file_contents
+            .get_opt(database, key)
+            .map(|contents| contents.map(|contents| contents.as_ref().clone()))
+    }
+
+    /// Applies a group of file changes in one query revision.
+    pub fn apply_updates(
+        &self,
+        database: &mut QueryDatabase,
+        updates: impl IntoIterator<Item = VfsInputUpdate>,
+    ) -> Result<usize, QueryError> {
+        self.file_contents.apply_changes(
+            database,
+            updates.into_iter().map(|update| match update {
+                VfsInputUpdate::Set {
+                    key,
+                    contents,
+                    durability,
+                } => sai_query::InputChange::Set {
+                    key,
+                    value: contents,
+                    durability,
+                },
+                VfsInputUpdate::Remove { key } => sai_query::InputChange::Remove { key },
+            }),
+        )
+    }
+
+    /// Reconciles raw input snapshots, removing omitted files and applying
+    /// every content change in one query revision.
+    ///
+    /// Pass `None` only when initializing an empty database's VFS inputs.
+    pub fn replace_snapshot(
+        &self,
+        database: &mut QueryDatabase,
+        previous: Option<&VfsInputSnapshot>,
+        current: &VfsInputSnapshot,
+    ) -> Result<usize, QueryError> {
+        let mut updates = Vec::with_capacity(current.len());
+        let mut current_keys = BTreeSet::new();
+        for (key, contents, durability) in current.iter() {
+            let key = key.clone();
+            current_keys.insert(key.clone());
+            updates.push(VfsInputUpdate::Set {
+                key,
+                contents: contents.clone(),
+                durability,
+            });
+        }
+        if let Some(previous) = previous {
+            for (key, _, _) in previous.iter() {
+                if !current_keys.contains(key) {
+                    updates.push(VfsInputUpdate::Remove { key: key.clone() });
+                }
+            }
+        }
+        self.apply_updates(database, updates)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceSnapshotError {
     EmptySnapshot,
@@ -662,6 +953,10 @@ impl WorkspaceSnapshot {
 
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SnapshotFile> {
+        self.files.values()
     }
 }
 
@@ -922,6 +1217,90 @@ fn is_package_identity(identity: &str) -> bool {
         && is_semver_without_build(version)
 }
 
+fn is_stable_package_key(package_key: &str) -> bool {
+    if matches!(package_key, "sai:core" | "sai:alloc") {
+        return true;
+    }
+    if let Some(wasi_key) = package_key.strip_prefix("wit:wasi:") {
+        let Some((name, version)) = wasi_key.split_once('@') else {
+            return false;
+        };
+        return !version.contains('@')
+            && is_package_segment(name)
+            && is_semver_without_build(version);
+    }
+    if let Some(package_key) = package_key
+        .strip_prefix("wit:dir:")
+        .or_else(|| package_key.strip_prefix("wit:gen:"))
+    {
+        return matches!(package_key, "sai:core" | "sai:alloc")
+            || is_regular_package_key(package_key);
+    }
+    is_regular_package_key(package_key)
+}
+
+fn is_regular_package_key(package_key: &str) -> bool {
+    let Some((identity, line)) = package_key.split_once('#') else {
+        return false;
+    };
+    let Some((namespace, name)) = identity.split_once(':') else {
+        return false;
+    };
+    is_package_segment(namespace) && is_package_segment(name) && is_compatibility_line(line)
+}
+
+fn is_compatibility_line(line: &str) -> bool {
+    let components = line.split('.').collect::<Vec<_>>();
+    match components.as_slice() {
+        [major] => canonical_decimal(major).is_some_and(|major| major >= 1),
+        ["0", minor] => canonical_decimal(minor).is_some_and(|minor| minor >= 1),
+        ["0", "0", patch] => canonical_decimal(patch).is_some(),
+        _ => false,
+    }
+}
+
+fn canonical_decimal(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn package_key_matches_release(package_key: &str, package_identity: &str) -> bool {
+    let Some((identity, version)) = package_identity.split_once('@') else {
+        return false;
+    };
+    if !is_package_identity(package_identity) {
+        return false;
+    }
+    if matches!(package_key, "sai:core" | "sai:alloc") {
+        return identity == package_key;
+    }
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let mut components = core.split('.');
+    let (Some(major), Some(minor), Some(patch)) = (
+        components.next().and_then(canonical_decimal),
+        components.next().and_then(canonical_decimal),
+        components.next().and_then(canonical_decimal),
+    ) else {
+        return false;
+    };
+    if components.next().is_some() {
+        return false;
+    }
+    let line = if major >= 1 {
+        major.to_string()
+    } else if minor >= 1 {
+        format!("0.{minor}")
+    } else {
+        format!("0.0.{patch}")
+    };
+    package_key == format!("{identity}#{line}")
+}
+
 fn dependency_path_identity(path: &str) -> Option<&str> {
     Some(path.strip_prefix("dep:")?.split_once('/')?.0)
 }
@@ -985,6 +1364,8 @@ fn is_semver_without_build(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sai_query::DerivedQuery;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn size(raw: usize) -> TextSize {
         TextSize::from_usize(raw).expect("test offset fits in u32")
@@ -1421,5 +1802,364 @@ mod tests {
         };
 
         assert_ne!(make_snapshot().id(), make_snapshot().id());
+    }
+
+    #[test]
+    fn file_keys_and_fingerprints_use_explicit_stable_identity() {
+        let first = FileKey::new("acme:app#0.1", "src/lib.sai").expect("file key is valid");
+        let second = FileKey::new("acme:app#0.1", "src/lib.sai").expect("file key is valid");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            sai_stable_hash::fingerprint(&first),
+            sai_stable_hash::fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn file_keys_include_package_and_path_identity() {
+        let first_package =
+            FileKey::new("acme:first#0.1", "src/lib.sai").expect("file key is valid");
+        let second_package =
+            FileKey::new("acme:second#0.1", "src/lib.sai").expect("file key is valid");
+        let second_path =
+            FileKey::new("acme:first#0.1", "src/main.sai").expect("file key is valid");
+
+        assert_ne!(first_package, second_package);
+        assert_ne!(first_package, second_path);
+    }
+
+    #[test]
+    fn file_keys_require_explicit_canonical_package_and_path_identity() {
+        assert_eq!(
+            FileKey::new("acme:app#0.1", "src/../lib.sai"),
+            Err(FileKeyError::InvalidSourcePath)
+        );
+        assert_eq!(
+            FileKey::new("acme:app#0.1", "dep:acme:other@0.1.0/src/lib.sai"),
+            Err(FileKeyError::PackageIdentityMismatch)
+        );
+        assert_eq!(
+            FileKey::new("acme:app@0.1.0", "src/lib.sai"),
+            Err(FileKeyError::InvalidPackageKey)
+        );
+        assert_eq!(
+            FileKey::new("acme:app#0.2", "dep:acme:app@0.1.9/src/lib.sai"),
+            Err(FileKeyError::PackageIdentityMismatch)
+        );
+        let dependency_091 = FileKey::new("acme:app#0.1", "dep:acme:app@0.1.9/src/lib.sai")
+            .expect("package reference is valid");
+        let dependency_010 = FileKey::new("acme:app#0.1", "dep:acme:app@0.1.0/src/lib.sai")
+            .expect("same compatibility line is valid");
+        assert_eq!(dependency_091, dependency_010);
+        assert_eq!(dependency_091.path(), "src/lib.sai");
+
+        let core_dependency = FileKey::new("sai:core", "dep:sai:core@1.2.3/src/lib.sai")
+            .expect("built-in package dependency is valid");
+        assert_eq!(core_dependency.package_key(), "sai:core");
+        assert_eq!(core_dependency.path(), "src/lib.sai");
+        let alloc_dependency = FileKey::new("sai:alloc", "dep:sai:alloc@1.2.3/src/lib.sai")
+            .expect("built-in package dependency is valid");
+        assert_eq!(alloc_dependency.package_key(), "sai:alloc");
+        assert_eq!(alloc_dependency.path(), "src/lib.sai");
+
+        for package_key in [
+            "sai:core",
+            "sai:alloc",
+            "acme:json#1",
+            "acme:json#0.4",
+            "acme:json#0.0.7",
+            "wit:wasi:cli@0.2.0",
+            "wit:dir:acme:json#0.4",
+            "wit:gen:sai:core",
+        ] {
+            assert!(
+                FileKey::new(package_key, "src/lib.sai").is_ok(),
+                "stable package key should be accepted: {package_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_file_inputs_invalidate_derived_queries_and_track_removal() {
+        let inputs = VfsInputs::new().expect("input query ID is available");
+        let mut database = QueryDatabase::new();
+        let key = FileKey::new("acme:app#0.1", "src/main.sai").expect("file key is valid");
+        assert_eq!(
+            inputs
+                .file_contents(&mut database, key.clone())
+                .expect("absent input is tracked"),
+            None
+        );
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_in_query = Arc::clone(&runs);
+        let inputs_in_query = inputs.clone();
+        let raw_length =
+            DerivedQuery::<FileKey, u32>::new("raw_file_length", move |database, key| {
+                runs_in_query.fetch_add(1, Ordering::SeqCst);
+                Ok(inputs_in_query
+                    .file_contents(database, key.clone())?
+                    .and_then(|contents| contents.bytes().map(<[u8]>::len))
+                    .map_or(0, |length| length as u32))
+            })
+            .expect("query ID is available");
+
+        assert_eq!(
+            *raw_length
+                .get(&mut database, key.clone())
+                .expect("query runs"),
+            0
+        );
+        assert!(
+            inputs
+                .set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::from(&b"old"[..]),
+                    Durability::Low,
+                )
+                .expect("snapshot bytes set")
+        );
+        assert_eq!(
+            *raw_length
+                .get(&mut database, key.clone())
+                .expect("input invalidates"),
+            3
+        );
+
+        assert!(
+            !inputs
+                .set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::from(&b"old"[..]),
+                    Durability::Low,
+                )
+                .expect("equal bytes remain unchanged")
+        );
+        assert_eq!(
+            *raw_length
+                .get(&mut database, key.clone())
+                .expect("memo stays green"),
+            3
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        assert!(
+            inputs
+                .set_file_contents(
+                    &mut database,
+                    key.clone(),
+                    Arc::from(&b"new source"[..]),
+                    Durability::Low,
+                )
+                .expect("changed bytes set")
+        );
+        assert_eq!(
+            *raw_length
+                .get(&mut database, key.clone())
+                .expect("changed input invalidates"),
+            10
+        );
+
+        assert!(
+            inputs
+                .remove_file(&mut database, key.clone())
+                .expect("file removal recorded")
+        );
+        assert_eq!(
+            *raw_length
+                .get(&mut database, key.clone())
+                .expect("removal invalidates"),
+            0
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn snapshot_replacement_sets_and_removes_files_together() {
+        let inputs = VfsInputs::new().expect("input query ID is available");
+        let mut database = QueryDatabase::new();
+        let a = FileKey::new("acme:app#0.1", "src/a.sai").expect("file key is valid");
+        let b = FileKey::new("acme:app#0.1", "src/b.sai").expect("file key is valid");
+        let c = FileKey::new("acme:app#0.1", "src/c.sai").expect("file key is valid");
+        let previous = VfsInputSnapshot::new([
+            (
+                a.clone(),
+                FileContents::Bytes(Arc::from(&b"a"[..])),
+                Durability::Low,
+            ),
+            (
+                b.clone(),
+                FileContents::Bytes(Arc::from(&b"bb"[..])),
+                Durability::High,
+            ),
+        ])
+        .expect("initial raw input snapshot is valid");
+        let current = VfsInputSnapshot::new([
+            (
+                a.clone(),
+                FileContents::Bytes(Arc::from(&b"\xffa"[..])),
+                Durability::Low,
+            ),
+            (
+                c.clone(),
+                FileContents::ReadError {
+                    io_error_kind: "permission denied".to_owned(),
+                },
+                Durability::Medium,
+            ),
+        ])
+        .expect("updated raw input snapshot is valid");
+
+        assert_eq!(
+            inputs
+                .replace_snapshot(&mut database, None, &previous)
+                .expect("initial snapshot applies"),
+            2
+        );
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_in_query = Arc::clone(&runs);
+        let inputs_in_query = inputs.clone();
+        let b_in_query = b.clone();
+        let c_in_query = c.clone();
+        let total_bytes =
+            DerivedQuery::<u32, u32>::new("snapshot_byte_count", move |database, _| {
+                runs_in_query.fetch_add(1, Ordering::SeqCst);
+                let mut total = 0;
+                for key in [a.clone(), b_in_query.clone(), c_in_query.clone()] {
+                    if let Some(contents) = inputs_in_query.file_contents(database, key)? {
+                        total += contents.bytes().map_or(0, <[u8]>::len) as u32;
+                    }
+                }
+                Ok(total)
+            })
+            .expect("query ID is available");
+
+        assert_eq!(
+            *total_bytes
+                .get(&mut database, 0)
+                .expect("query reads initial snapshot"),
+            3
+        );
+        assert_eq!(
+            inputs
+                .replace_snapshot(&mut database, Some(&previous), &current)
+                .expect("snapshot delta applies"),
+            3
+        );
+        assert_eq!(
+            *total_bytes
+                .get(&mut database, 0)
+                .expect("query reads new snapshot"),
+            2
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            inputs
+                .file_contents(&mut database, b)
+                .expect("removed input is readable"),
+            None
+        );
+        assert_eq!(
+            inputs
+                .file_contents(&mut database, c)
+                .expect("read error remains an input"),
+            Some(FileContents::ReadError {
+                io_error_kind: "permission denied".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_member_file_keys_use_package_relative_paths() {
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(FileId::new(1), "x", false).expect("small source file")),
+            "members/widget/src/lib.sai",
+            Some("acme:widget@1.2.3".to_owned()),
+            None,
+        )])
+        .expect("workspace snapshot is valid");
+        let package_file = snapshot.iter().next().expect("snapshot contains a file");
+        let file_key =
+            FileKey::new("acme:widget#1", "src/lib.sai").expect("package-relative key is valid");
+
+        assert_eq!(package_file.path(), "members/widget/src/lib.sai");
+        assert_eq!(file_key.path(), "src/lib.sai");
+        assert_ne!(file_key.path(), package_file.path());
+    }
+
+    #[test]
+    fn raw_input_snapshots_reject_duplicate_keys() {
+        let key = FileKey::new("acme:app#0.1", "src/main.sai").expect("file key is valid");
+
+        assert_eq!(
+            VfsInputSnapshot::new([
+                (
+                    key.clone(),
+                    FileContents::Bytes(Arc::from(&b"first"[..])),
+                    Durability::Low,
+                ),
+                (
+                    key,
+                    FileContents::Bytes(Arc::from(&b"second"[..])),
+                    Durability::Low,
+                ),
+            ]),
+            Err(VfsInputSnapshotError::DuplicateFileKey)
+        );
+    }
+
+    #[test]
+    fn file_read_failures_are_query_inputs() {
+        let inputs = VfsInputs::new().expect("input query ID is available");
+        let mut database = QueryDatabase::new();
+        let key = FileKey::new("acme:app#0.1", "src/main.sai").expect("file key is valid");
+        let key_in_query = key.clone();
+        let inputs_in_query = inputs.clone();
+        let query = DerivedQuery::<u32, String>::new("file_read_status", move |database, _| {
+            Ok(
+                match inputs_in_query.file_contents(database, key_in_query.clone())? {
+                    None => "absent".to_owned(),
+                    Some(FileContents::Bytes(_)) => "read".to_owned(),
+                    Some(FileContents::ReadError { io_error_kind }) => io_error_kind,
+                },
+            )
+        })
+        .expect("query ID is available");
+
+        assert_eq!(
+            *query.get(&mut database, 0).expect("absence is tracked"),
+            "absent"
+        );
+        assert!(
+            inputs
+                .set_file_read_error(
+                    &mut database,
+                    key.clone(),
+                    "permission denied",
+                    Durability::Low,
+                )
+                .expect("read failure is stored")
+        );
+        assert_eq!(
+            *query.get(&mut database, 0).expect("read error invalidates"),
+            "permission denied"
+        );
+        assert!(
+            inputs
+                .set_file_contents(
+                    &mut database,
+                    key,
+                    Arc::from(&b"contents"[..]),
+                    Durability::Low,
+                )
+                .expect("bytes replace read failure")
+        );
+        assert_eq!(
+            *query.get(&mut database, 0).expect("bytes invalidate"),
+            "read"
+        );
     }
 }
