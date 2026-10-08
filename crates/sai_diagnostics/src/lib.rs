@@ -11,112 +11,7 @@ pub use lint_levels::{
 
 pub use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot, WorkspaceSnapshotId};
 
-macro_rules! define_codes {
-    ($($variant:ident => $name:literal),+ $(,)?) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        #[non_exhaustive]
-        pub enum Code {
-            $($variant),+
-        }
-
-        impl Code {
-            /// Subset of the documented diagnostic registry implemented here.
-            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
-
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $name),+
-                }
-            }
-
-            pub fn from_name(name: &str) -> Option<Self> {
-                Self::ALL
-                    .iter()
-                    .copied()
-                    .find(|code| code.as_str() == name)
-            }
-        }
-    };
-}
-
-define_codes! {
-    InvalidUtf8 => "INVALID_UTF8",
-    InvalidLineEnding => "INVALID_LINE_ENDING",
-    ForbiddenCharacter => "FORBIDDEN_CHARACTER",
-    UnterminatedComment => "UNTERMINATED_COMMENT",
-    MisplacedDocComment => "MISPLACED_DOC_COMMENT",
-    IdentNotNfc => "IDENT_NOT_NFC",
-    NonAsciiIdentifier => "NON_ASCII_IDENTIFIER",
-    NonAsciiPublicName => "NON_ASCII_PUBLIC_NAME",
-    UnnecessaryRawIdent => "UNNECESSARY_RAW_IDENT",
-    InvalidRawIdent => "INVALID_RAW_IDENT",
-    ReservedWord => "RESERVED_WORD",
-    NoNull => "NO_NULL",
-    NoExceptions => "NO_EXCEPTIONS",
-    MalformedNumber => "MALFORMED_NUMBER",
-    LiteralOutOfRange => "LITERAL_OUT_OF_RANGE",
-    InvalidEscape => "INVALID_ESCAPE",
-    UnterminatedString => "UNTERMINATED_STRING",
-    InconsistentIndent => "INCONSISTENT_INDENT",
-    UnterminatedChar => "UNTERMINATED_CHAR",
-    NoAsyncClosure => "NO_ASYNC_CLOSURE",
-    InvalidCharLiteral => "INVALID_CHAR_LITERAL",
-    MalformedRawString => "MALFORMED_RAW_STRING",
-    MalformedMultilineString => "MALFORMED_MULTILINE_STRING",
-    InvalidInterpolation => "INVALID_INTERPOLATION",
-    InvalidFormatSpec => "INVALID_FORMAT_SPEC",
-    MalformedPackagePath => "MALFORMED_PACKAGE_PATH",
-    UnexpectedCharacter => "UNEXPECTED_CHARACTER",
-    NoSemicolon => "NO_SEMICOLON",
-    NoBangOperator => "NO_BANG_OPERATOR",
-    NoDoubleColon => "NO_DOUBLE_COLON",
-    UseAndOr => "USE_AND_OR",
-    UnexpectedNewline => "UNEXPECTED_NEWLINE",
-    ExpectedToken => "EXPECTED_TOKEN",
-    ExpectedExpression => "EXPECTED_EXPRESSION",
-    MissingInitializer => "MISSING_INITIALIZER",
-    ItemInBlock => "ITEM_IN_BLOCK",
-    BlockInCondition => "BLOCK_IN_CONDITION",
-    ChainedComparison => "CHAINED_COMPARISON",
-    ChainedRange => "CHAINED_RANGE",
-    BaseArgNotLast => "BASE_ARG_NOT_LAST",
-    InvalidTupleIndex => "INVALID_TUPLE_INDEX",
-    FloatPattern => "FLOAT_PATTERN",
-    MultipleRestPatterns => "MULTIPLE_REST_PATTERNS",
-    DuplicateBinding => "DUPLICATE_BINDING",
-    OrPatternBindingMismatch => "OR_PATTERN_BINDING_MISMATCH",
-    MissingFnBody => "MISSING_FN_BODY",
-    ImplementationLimitExceeded => "IMPLEMENTATION_LIMIT_EXCEEDED",
-    ClauseOrder => "CLAUSE_ORDER",
-    DuplicateClause => "DUPLICATE_CLAUSE",
-    VisibilityOnTraitImplItem => "VISIBILITY_ON_TRAIT_IMPL_ITEM",
-    InvalidAttributeTarget => "INVALID_ATTRIBUTE_TARGET",
-    InvalidAttributeArgument => "INVALID_ATTRIBUTE_ARGUMENT",
-    DuplicateAttribute => "DUPLICATE_ATTRIBUTE",
-    DuplicateAttributeArgument => "DUPLICATE_ATTRIBUTE_ARGUMENT",
-    ConflictingLintLevel => "CONFLICTING_LINT_LEVEL",
-    ConflictingAttributes => "CONFLICTING_ATTRIBUTES",
-    UnknownAttribute => "UNKNOWN_ATTRIBUTE",
-    UnknownDerive => "UNKNOWN_DERIVE",
-    RedundantPubExport => "REDUNDANT_PUB_EXPORT",
-    InvalidExportTarget => "INVALID_EXPORT_TARGET",
-    ExplicitDiscriminantOnDataEnum => "EXPLICIT_DISCRIMINANT_ON_DATA_ENUM",
-    FeatureNotImplemented => "FEATURE_NOT_IMPLEMENTED",
-    UnknownTarget => "UNKNOWN_TARGET",
-    DeriveNotSupported => "DERIVE_NOT_SUPPORTED",
-    WitIncompatibleType => "WIT_INCOMPATIBLE_TYPE",
-    InvalidFlagsEnum => "INVALID_FLAGS_ENUM",
-    GenericInterfaceItem => "GENERIC_INTERFACE_ITEM",
-    InterfaceFnClause => "INTERFACE_FN_CLAUSE",
-    EffectsOnInterfaceFn => "EFFECTS_ON_INTERFACE_FN",
-    InterfaceFnBody => "INTERFACE_FN_BODY",
-    WorldImportNeedsInterface => "WORLD_IMPORT_NEEDS_INTERFACE",
-    UnknownAbi => "UNKNOWN_ABI",
-    InvalidExternBlock => "INVALID_EXTERN_BLOCK",
-    UnexpectedFnBody => "UNEXPECTED_FN_BODY",
-    UnknownLint => "UNKNOWN_LINT",
-    NotALint => "NOT_A_LINT",
-}
+include!(concat!(env!("OUT_DIR"), "/diagnostic_codes.rs"));
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Severity {
@@ -1859,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_codes_are_limited_to_the_implemented_registry() {
+    fn diagnostic_codes_cover_the_complete_registry() {
         assert_eq!(
             Code::from_name("UNEXPECTED_CHARACTER"),
             Some(Code::UnexpectedCharacter)
@@ -1927,10 +1822,45 @@ mod tests {
             Code::from_name("OR_PATTERN_BINDING_MISMATCH"),
             Some(Code::OrPatternBindingMismatch)
         );
+        assert!(Code::from_name("AMBIGUOUS_ASSOCIATED_TYPE").is_some());
+        assert!(Code::from_name("WIT_PACKAGE_MISMATCH").is_some());
         assert_eq!(Code::from_name("NOT_A_DIAGNOSTIC"), None);
         assert_eq!(Code::from_name("UNKNOWN_LINT"), Some(Code::UnknownLint));
         assert_eq!(Code::from_name("NOT_A_LINT"), Some(Code::NotALint));
-        assert!(Code::ALL.iter().all(|code| code.as_str().is_ascii()));
+
+        let names = DIAGNOSTIC_CODE_NAMES
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(Code::ALL.len(), names.len());
+        let mut code_names = Code::ALL
+            .iter()
+            .map(|code| code.as_str())
+            .collect::<Vec<_>>();
+        code_names.sort_unstable();
+        assert_eq!(code_names, names);
+        for name in names {
+            let code = Code::from_name(name).expect("registered code");
+            assert_eq!(code.as_str(), name);
+            assert!(code.as_str().is_ascii());
+        }
+
+        let legacy_names = include_str!("diagnostic_code_legacy_order.txt")
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            Code::ALL
+                .iter()
+                .take(legacy_names.len())
+                .map(|code| code.as_str())
+                .collect::<Vec<_>>(),
+            legacy_names
+        );
+        for pair in legacy_names.windows(2) {
+            assert!(
+                Code::from_name(pair[0]).expect("registered legacy code")
+                    < Code::from_name(pair[1]).expect("registered legacy code")
+            );
+        }
     }
 
     #[test]
