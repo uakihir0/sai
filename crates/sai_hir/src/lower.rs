@@ -903,6 +903,124 @@ pub fn lower_enum_owner<'hir>(
     ))
 }
 
+/// Lower a trait declaration into its HIR owner.
+///
+/// Associated declarations remain separate owners; this owner stores their
+/// `OwnerId`s in source order. The caller supplies the complete trait
+/// `DefPath`, including its enclosing module and sibling disambiguator.
+pub fn lower_trait_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Trait, context)?;
+    let declaration =
+        ast::TraitDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+    let item_list = declaration
+        .items()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::ITEM_LIST,
+        ))?;
+
+    ensure_supported_generic_params(declaration.generic_params())?;
+    if let Some(bounds) = declaration.bounds() {
+        for bound in bounds.bounds() {
+            ensure_supported_bound(bound)?;
+        }
+    }
+    if let Some(where_clause) = declaration.where_clause() {
+        ensure_supported_where_clause(&where_clause)?;
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_paths = prepare_trait_item_paths(entry, &item_list, context, &source_map)?;
+
+    let pending_generic_params =
+        prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+    let item_owners = context
+        .def_paths
+        .intern_assoc_items(owner.def_id, &item_paths)?
+        .into_iter()
+        .map(|def_id| OwnerId { def_id })
+        .collect::<Vec<_>>();
+    let generic_params = lower_generic_params(
+        pending_generic_params,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let supertraits = declaration
+        .bounds()
+        .map(|bounds| lower_bounds(&bounds, context.arena, context.symbols, &mut source_map))
+        .transpose()?
+        .unwrap_or_default();
+    let where_preds = declaration
+        .where_clause()
+        .map(|clause| lower_where_clause(&clause, context.arena, context.symbols, &mut source_map))
+        .transpose()?
+        .unwrap_or_default();
+    let generics = context.arena.alloc_generics(HirGenerics {
+        params: context.arena.alloc_generic_params(&generic_params),
+        where_preds: context.arena.alloc_where_preds(&where_preds),
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Trait {
+            safety: if declaration.unsafe_token().is_some() {
+                Safety::Unsafe
+            } else {
+                Safety::Safe
+            },
+            generics: *generics,
+            supertraits: context.arena.alloc_bounds(&supertraits),
+            items: context.arena.alloc_owner_ids(&item_owners),
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: None,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level constant entry from the current item tree.
 ///
 /// A diagnosed missing type or initializer is retained as an error HIR node so
@@ -2061,6 +2179,93 @@ struct PendingVariantField {
     field: ast::VariantField,
     name: Name,
     def_id: LocalDefId,
+}
+
+fn prepare_trait_item_paths(
+    trait_entry: &crate::item_tree::ItemTreeEntry,
+    item_list: &ast::ItemList,
+    context: &HirLoweringContext<'_, '_>,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Vec<(DefPathData, u32)>, HirLoweringError> {
+    let expected_items = trait_entry
+        .children
+        .iter()
+        .filter(|child| matches!(child.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn))
+        .count();
+    let mut seen = HashSet::new();
+    let mut components = Vec::with_capacity(expected_items);
+    let mut disambiguators = HashMap::<DefPathData, u32>::new();
+
+    for syntax in item_list.syntax().children() {
+        let (ast_id, item_kind, name, attrs, visibility) =
+            if let Some(function) = ast::FnDecl::cast(syntax.clone()) {
+                let ast_id = context
+                    .ast_ids
+                    .ast_id(&function)
+                    .map(ast::AstId::erase)
+                    .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+                (
+                    ast_id,
+                    ItemTreeKind::AssocFn,
+                    lower_item_name(
+                        function.name(),
+                        function.syntax(),
+                        context.symbols,
+                        source_map,
+                    )?,
+                    function.attrs().collect::<Vec<_>>(),
+                    item_visibility(function.syntax()),
+                )
+            } else if let Some(associated_type) = ast::AssocTypeDecl::cast(syntax) {
+                let ast_id = context
+                    .ast_ids
+                    .ast_id(&associated_type)
+                    .map(ast::AstId::erase)
+                    .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+                (
+                    ast_id,
+                    ItemTreeKind::AssocType,
+                    lower_item_name(
+                        associated_type.name(),
+                        associated_type.syntax(),
+                        context.symbols,
+                        source_map,
+                    )?,
+                    associated_type.attrs().collect::<Vec<_>>(),
+                    crate::Visibility::Private,
+                )
+            } else {
+                continue;
+            };
+
+        let item_entry = trait_entry
+            .children
+            .iter()
+            .find(|child| child.ast_id == ast_id)
+            .filter(|child| child.kind == item_kind)
+            .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+        if !seen.insert(ast_id) || item_entry.name != name.sym {
+            return Err(HirLoweringError::ItemTreeEntryMismatch);
+        }
+        validate_current_item_metadata(item_entry, attrs.into_iter(), visibility, context)?;
+
+        let component = match item_kind {
+            ItemTreeKind::AssocType => DefPathData::AssocType(name.sym),
+            ItemTreeKind::AssocFn => DefPathData::AssocFn(name.sym),
+            _ => unreachable!("only trait associated items are prepared"),
+        };
+        let disambiguator = disambiguators.entry(component.clone()).or_default();
+        let ordinal = *disambiguator;
+        *disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+        components.push((component, ordinal));
+    }
+
+    if seen.len() != expected_items {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    Ok(components)
 }
 
 fn prepare_generic_params(
@@ -17573,6 +17778,260 @@ mod tests {
             Err(HirLoweringError::ItemTreeEntryMismatch)
         ));
         assert_eq!(paths.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn lowers_trait_owner_with_generics_supertraits_and_associated_owners() {
+        let file = crate::FileId::new(278);
+        let source = concat!(
+            "@deprecated(\"container\")\n",
+            "pub unsafe trait Container<T: Clone>: Iterable<T> + Send where T: Copy {\n",
+            "    type Item: Clone\n",
+            "    fn get(self: borrow Self, index: USize) -> Option<T>\n",
+            "    fn len(self: borrow Self) -> USize { 1 }\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("trait item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Trait);
+        let name = symbols.intern("Container").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_trait_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("trait lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert!(hir_owner.body.is_none());
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("trait declaration is represented by an item owner");
+        };
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        let ItemKind::Trait {
+            safety,
+            generics,
+            supertraits,
+            items,
+        } = item.kind
+        else {
+            panic!("trait declaration retains its trait item kind");
+        };
+        assert_eq!(safety, Safety::Unsafe);
+        assert_eq!(generics.params.len(), 1);
+        assert_eq!(generics.where_preds.len(), 1);
+        assert_eq!(supertraits.len(), 2);
+        assert_eq!(items.len(), 3);
+        assert!(
+            supertraits
+                .iter()
+                .all(|bound| source_map.syntax_for_node(bound.hir_id).is_some())
+        );
+
+        for (index, (component, disambiguator)) in [
+            (DefPathData::AssocType(symbols.intern("Item").unwrap()), 0),
+            (DefPathData::AssocFn(symbols.intern("get").unwrap()), 0),
+            (DefPathData::AssocFn(symbols.intern("len").unwrap()), 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = paths
+                .resolve(items[index].def_id)
+                .expect("associated owner path resolves")
+                .expect("associated owner path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: component,
+                    disambiguator,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn trait_owner_keeps_duplicate_item_paths_distinct_in_source_order() {
+        let file = crate::FileId::new(279);
+        let source = concat!(
+            "trait Repeated {\n",
+            "    type Same\n",
+            "    type Same\n",
+            "    fn call()\n",
+            "    fn call()\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("trait item entry");
+        let name = symbols.intern("Repeated").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_trait_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("duplicate trait members remain separate owners");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("trait declaration is represented by an item owner");
+        };
+        let ItemKind::Trait { items, .. } = item.kind else {
+            panic!("trait declaration retains its trait item kind");
+        };
+        assert_eq!(items.len(), 4);
+        for (index, (component, disambiguator)) in [
+            (DefPathData::AssocType(symbols.intern("Same").unwrap()), 0),
+            (DefPathData::AssocType(symbols.intern("Same").unwrap()), 1),
+            (DefPathData::AssocFn(symbols.intern("call").unwrap()), 0),
+            (DefPathData::AssocFn(symbols.intern("call").unwrap()), 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = paths
+                .resolve(items[index].def_id)
+                .expect("associated owner path resolves")
+                .expect("associated owner path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: component,
+                    disambiguator,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn trait_owner_rejects_wrong_item_kinds_and_full_paths_atomically() {
+        let file = crate::FileId::new(282);
+        let source = "trait Good { type Item }\ntype Alias = I32\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let trait_entry = item_tree.items.first().expect("trait item entry");
+        let alias_entry = item_tree.items.get(1).expect("alias item entry");
+        let name = symbols.intern("Good").expect("symbol interns");
+        let (packages, paths, owner) = owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        assert!(matches!(
+            lower_trait_owner(
+                owner,
+                &expected_path,
+                &item_tree,
+                alias_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(paths.len().unwrap(), 1);
+
+        let wrong_module = symbols.intern("other").expect("symbol interns");
+        let mismatched_full_path = DefPath::new(
+            owner.def_id.package(),
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Module(wrong_module),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(name),
+                    disambiguator: 0,
+                },
+            ],
+            &packages,
+            &symbols,
+        )
+        .expect("complete path with the same terminal component");
+        assert!(matches!(
+            lower_trait_owner(
+                owner,
+                &mismatched_full_path,
+                &item_tree,
+                trait_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            1,
+            "rejected owner inputs do not intern associated item paths"
+        );
+    }
+
+    #[test]
+    fn trait_owner_distinguishes_empty_from_missing_item_lists() {
+        for (file, source, should_lower) in [
+            (crate::FileId::new(280), "trait Empty {}\n", true),
+            (crate::FileId::new(281), "trait Broken\n", false),
+        ] {
+            let (snapshot, parsed, ast_ids) = parse_file(file, source);
+            assert_eq!(parsed.errors.is_empty(), should_lower);
+            let symbols = Interner::new();
+            let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+                .expect("item tree collects recovered trait");
+            let entry = item_tree.items.first().expect("trait item entry");
+            assert_eq!(entry.kind, ItemTreeKind::Trait);
+            let name = symbols
+                .intern(if should_lower { "Empty" } else { "Broken" })
+                .expect("symbol interns");
+            let (_packages, paths, owner) =
+                owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+            let expected_path = owner_def_path(&paths, owner);
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &ast_ids,
+                &snapshot,
+                &parsed.root,
+                &arena,
+                &symbols,
+                &paths,
+            );
+
+            if should_lower {
+                let (hir_owner, _) =
+                    lower_trait_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                        .expect("an empty trait is valid");
+                let OwnerNode::Item(item) = hir_owner.node else {
+                    panic!("trait declaration is represented by an item owner");
+                };
+                let ItemKind::Trait { items, .. } = item.kind else {
+                    panic!("trait declaration retains its trait item kind");
+                };
+                assert!(items.is_empty());
+            } else {
+                assert!(matches!(
+                    lower_trait_owner(owner, &expected_path, &item_tree, entry.ast_id, &context),
+                    Err(HirLoweringError::MissingRequiredSyntax(
+                        SyntaxKind::ITEM_LIST
+                    ))
+                ));
+                assert_eq!(paths.len().unwrap(), 1);
+            }
+        }
     }
 
     #[test]

@@ -471,6 +471,7 @@ pub enum DefPathInternerError {
     ForeignDefinitionId,
     ParentDefinitionNotFound,
     InvalidNestedComponent,
+    InvalidAssociatedItem,
     WrongPackage,
     TooManyInternerInstances,
     TooManyDefinitions,
@@ -650,6 +651,45 @@ impl DefPathInterner {
                 let mut path = parent_path.clone();
                 path.data.push(DisambiguatedDefPathData {
                     data: DefPathData::Variant(*name),
+                    disambiguator: *disambiguator,
+                });
+                path
+            })
+            .collect();
+        self.intern_paths(paths)
+    }
+
+    /// Intern trait or impl associated items below their declaring definition.
+    ///
+    /// Only `AssocType` and `AssocFn` components are accepted. Disambiguators
+    /// are supplied by the caller as the ordinal among equal sibling
+    /// components in source order. The full batch is validated before mutation.
+    pub fn intern_assoc_items(
+        &self,
+        parent: LocalDefId,
+        items: &[(DefPathData, u32)],
+    ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        let parent_path = self
+            .resolve(parent)?
+            .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if items.iter().any(|(component, _)| {
+            !matches!(
+                component,
+                DefPathData::AssocType(_) | DefPathData::AssocFn(_)
+            )
+        }) {
+            return Err(DefPathInternerError::InvalidAssociatedItem);
+        }
+
+        let paths = items
+            .iter()
+            .map(|(component, disambiguator)| {
+                let mut path = parent_path.clone();
+                path.data.push(DisambiguatedDefPathData {
+                    data: component.clone(),
                     disambiguator: *disambiguator,
                 });
                 path
@@ -1378,6 +1418,88 @@ mod tests {
             paths.len(),
             Ok(6),
             "failed variant and field batches leave the interner unchanged"
+        );
+    }
+
+    #[test]
+    fn definition_path_interner_interns_associated_item_batches_atomically() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let trait_name = symbols.intern("Container").unwrap();
+        let associated_type = symbols.intern("Item").unwrap();
+        let method = symbols.intern("get").unwrap();
+        let parent = paths
+            .intern(
+                DefPath::new(
+                    package,
+                    vec![DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(trait_name),
+                        disambiguator: 0,
+                    }],
+                    &packages,
+                    &symbols,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let associated = paths
+            .intern_assoc_items(
+                parent,
+                &[
+                    (DefPathData::AssocType(associated_type), 0),
+                    (DefPathData::AssocType(associated_type), 1),
+                    (DefPathData::AssocFn(method), 0),
+                    (DefPathData::AssocFn(method), 1),
+                ],
+            )
+            .expect("duplicate associated item declarations receive distinct paths");
+        assert_eq!(associated.len(), 4);
+        for (index, component) in [
+            DefPathData::AssocType(associated_type),
+            DefPathData::AssocType(associated_type),
+            DefPathData::AssocFn(method),
+            DefPathData::AssocFn(method),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = paths
+                .resolve(associated[index])
+                .expect("associated item path resolves")
+                .expect("associated item path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: component,
+                    disambiguator: if index % 2 == 0 { 0 } else { 1 },
+                })
+            );
+        }
+        assert_eq!(paths.len(), Ok(5));
+
+        let foreign_symbols = Interner::new();
+        let foreign_name = foreign_symbols.intern("Foreign").unwrap();
+        assert_eq!(
+            paths.intern_assoc_items(
+                parent,
+                &[
+                    (DefPathData::AssocType(associated_type), 2),
+                    (DefPathData::AssocFn(foreign_name), 0),
+                ],
+            ),
+            Err(DefPathInternerError::InternerSessionMismatch)
+        );
+        assert_eq!(
+            paths.intern_assoc_items(parent, &[(DefPathData::Field(method), 0)]),
+            Err(DefPathInternerError::InvalidAssociatedItem)
+        );
+        assert_eq!(
+            paths.len(),
+            Ok(5),
+            "failed associated item batches leave the interner unchanged"
         );
     }
 
