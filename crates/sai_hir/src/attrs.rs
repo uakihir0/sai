@@ -7,7 +7,7 @@ use sai_diagnostics::{
 };
 use sai_intern::{Interner, Symbol};
 use sai_vfs::{FileId, Span, WorkspaceSnapshot as VfsWorkspaceSnapshot};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
@@ -562,6 +562,100 @@ pub enum TargetPredicate {
     Not(Box<Self>),
     All(Vec<Self>),
     Any(Vec<Self>),
+}
+
+impl TargetPredicate {
+    /// Evaluates this predicate against one build target and its effective
+    /// capability set.
+    pub fn matches(&self, target: &TargetCfg) -> bool {
+        match self {
+            Self::Target(name) => name == target.target_name(),
+            Self::Capability(capability) => target.capabilities().contains(capability),
+            Self::Not(predicate) => !predicate.matches(target),
+            Self::All(predicates) => predicates.iter().all(|predicate| predicate.matches(target)),
+            Self::Any(predicates) => predicates.iter().any(|predicate| predicate.matches(target)),
+        }
+    }
+}
+
+/// The target facts used when filtering one module's items.
+///
+/// The driver supplies the effective capability set for the requested
+/// artifact, including artifact-dependent capabilities such as `host`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetCfg {
+    target_name: String,
+    capabilities: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetCfgError {
+    UnknownTarget,
+    UnknownCapability,
+    CapabilityUnavailable,
+    MissingRequiredCapability,
+}
+
+impl TargetCfg {
+    /// Creates a target configuration and rejects capabilities that contradict
+    /// the target table. Artifact-dependent capabilities such as `host` must
+    /// already reflect the artifact selected by the driver.
+    pub fn new<I, S>(
+        target_name: impl Into<String>,
+        capabilities: I,
+    ) -> Result<Self, TargetCfgError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let target_name = target_name.into();
+        if !known_target(&target_name) {
+            return Err(TargetCfgError::UnknownTarget);
+        }
+
+        let capabilities = capabilities
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
+        if capabilities
+            .iter()
+            .any(|capability| !is_target_capability(capability))
+        {
+            return Err(TargetCfgError::UnknownCapability);
+        }
+        if capabilities.contains("threads") {
+            return Err(TargetCfgError::CapabilityUnavailable);
+        }
+
+        let wasm = target_name.starts_with("wasm");
+        let wasm64 = target_name.starts_with("wasm64-");
+        if wasm
+            && capabilities
+                .iter()
+                .any(|capability| matches!(capability.as_str(), "native_ffi" | "process"))
+        {
+            return Err(TargetCfgError::CapabilityUnavailable);
+        }
+        if capabilities.contains("memory64") && !wasm64 {
+            return Err(TargetCfgError::CapabilityUnavailable);
+        }
+        if wasm64 && !capabilities.contains("memory64") {
+            return Err(TargetCfgError::MissingRequiredCapability);
+        }
+
+        Ok(Self {
+            target_name,
+            capabilities,
+        })
+    }
+
+    pub fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    pub fn capabilities(&self) -> &BTreeSet<String> {
+        &self.capabilities
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2804,6 +2898,58 @@ mod tests {
             Code::InvalidAttributeArgument
         );
         assert!(unknown_capability.target.is_none());
+    }
+
+    #[test]
+    fn target_predicates_evaluate_target_capabilities_and_combinators() {
+        let target = TargetCfg::new("wasm64-core", ["memory64", "host"])
+            .expect("capabilities match the target");
+
+        assert!(TargetPredicate::Target("wasm64-core".to_owned()).matches(&target));
+        assert!(!TargetPredicate::Target("wasm32-core".to_owned()).matches(&target));
+        assert!(TargetPredicate::Capability("memory64".to_owned()).matches(&target));
+        assert!(!TargetPredicate::Capability("threads".to_owned()).matches(&target));
+        assert!(
+            TargetPredicate::All(vec![
+                TargetPredicate::Capability("host".to_owned()),
+                TargetPredicate::Not(Box::new(TargetPredicate::Capability("threads".to_owned(),))),
+            ])
+            .matches(&target)
+        );
+        assert!(
+            TargetPredicate::Any(vec![
+                TargetPredicate::Target("wasm32-core".to_owned()),
+                TargetPredicate::Capability("memory64".to_owned()),
+            ])
+            .matches(&target)
+        );
+        assert!(!TargetPredicate::Any(Vec::new()).matches(&target));
+        assert!(TargetPredicate::All(Vec::new()).matches(&target));
+
+        assert_eq!(
+            TargetCfg::new("wasm32-core", ["memory64"]),
+            Err(TargetCfgError::CapabilityUnavailable)
+        );
+        assert_eq!(
+            TargetCfg::new("wasm64-core", [] as [&str; 0]),
+            Err(TargetCfgError::MissingRequiredCapability)
+        );
+        assert_eq!(
+            TargetCfg::new("wasm32-core", ["threads"]),
+            Err(TargetCfgError::CapabilityUnavailable)
+        );
+        assert_eq!(
+            TargetCfg::new("wasm32-linux", [] as [&str; 0]),
+            Err(TargetCfgError::UnknownTarget)
+        );
+        assert_eq!(
+            TargetCfg::new("wasm32-core", ["alloc"]),
+            Err(TargetCfgError::UnknownCapability)
+        );
+        assert_eq!(
+            TargetCfg::new("wasm32-core", ["process"]),
+            Err(TargetCfgError::CapabilityUnavailable)
+        );
     }
 
     #[test]

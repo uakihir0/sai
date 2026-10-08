@@ -1,10 +1,15 @@
+use crate::attrs::{
+    AttrValidationError, AttributeTarget, TargetCfg, TargetKind, ValidatedAttrs, validate_attrs,
+};
+use sai_diagnostics::Diagnostic;
 use sai_intern::{InternError, Interner, Symbol};
 use sai_stable_hash::StableHasher;
 use sai_syntax::{
     GreenElement, SyntaxElement, SyntaxKind, SyntaxNode,
     ast::{self, AstNode, AstToken},
 };
-use sai_vfs::{FileId, Span, TextRange, WorkspaceSnapshotId};
+use sai_vfs::{FileId, Span, TextRange, WorkspaceSnapshot, WorkspaceSnapshotId};
+use std::collections::BTreeMap;
 
 pub use sai_syntax::ast::ErasedAstId;
 
@@ -284,6 +289,23 @@ impl PartialEq for ItemTree {
 
 impl Eq for ItemTree {}
 
+/// A target-filtered item tree and the validation results used to select it.
+#[derive(Clone, Debug)]
+pub struct TargetFilterResult {
+    pub item_tree: ItemTree,
+    /// Target-only attribute results for retained module-level entries.
+    pub validated_targets: BTreeMap<ErasedAstId, ValidatedAttrs>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetFilterError {
+    StaleItemTree,
+    SnapshotMismatch,
+    ItemTree(ItemTreeError),
+    AttributeValidation(AttrValidationError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ItemTreeError {
     FileMismatch,
@@ -466,6 +488,179 @@ impl ItemTree {
 
         Ok(tree)
     }
+
+    /// Collects and target-filters one module for compiler use.
+    ///
+    /// This is the preferred item-collection entry point before name binding
+    /// and duplicate checks.
+    pub fn collect_for_target(
+        file: FileId,
+        source: &str,
+        root: &SyntaxNode,
+        ast_ids: &ast::AstIdMap,
+        symbols: &Interner,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+    ) -> Result<TargetFilterResult, TargetFilterError> {
+        let current = Self::collect(file, source, root, ast_ids, symbols)
+            .map_err(TargetFilterError::ItemTree)?;
+        if !ast_ids.matches_snapshot(snapshot)
+            || snapshot.id() != current.snapshot_id
+            || snapshot
+                .file(file)
+                .is_none_or(|snapshot_file| snapshot_file.source().text() != source)
+        {
+            return Err(TargetFilterError::SnapshotMismatch);
+        }
+        filter_collected_tree(current, symbols, snapshot, target_cfg)
+    }
+
+    /// Removes module-level entries whose valid `@target` predicate is false.
+    ///
+    /// The item tree is checked against the current AST map, source, and
+    /// workspace snapshot before its attributes are used. Only `@target` is
+    /// validated here: diagnostics on a filtered-out declaration are
+    /// suppressed along with that declaration.
+    pub fn filter_for_target(
+        &self,
+        source: &str,
+        root: &SyntaxNode,
+        ast_ids: &ast::AstIdMap,
+        symbols: &Interner,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+    ) -> Result<TargetFilterResult, TargetFilterError> {
+        if !self.matches_ast_ids(ast_ids) || !ast_ids.matches_root(self.file, root) {
+            return Err(TargetFilterError::StaleItemTree);
+        }
+        if !ast_ids.matches_snapshot(snapshot)
+            || snapshot.id() != self.snapshot_id
+            || snapshot
+                .file(self.file)
+                .is_none_or(|file| file.source().text() != source)
+        {
+            return Err(TargetFilterError::SnapshotMismatch);
+        }
+
+        let current = Self::collect(self.file, source, root, ast_ids, symbols)
+            .map_err(TargetFilterError::ItemTree)?;
+        if self != &current {
+            return Err(TargetFilterError::StaleItemTree);
+        }
+
+        filter_collected_tree(current, symbols, snapshot, target_cfg)
+    }
+}
+
+fn filter_collected_tree(
+    current: ItemTree,
+    symbols: &Interner,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<TargetFilterResult, TargetFilterError> {
+    let mut validated_targets = BTreeMap::new();
+    let mut diagnostics = Vec::new();
+    let mut uses = Vec::with_capacity(current.uses.len());
+    for entry in current.uses.iter().cloned() {
+        let validated =
+            validate_target_attrs(&entry.raw_attrs, TargetKind::Use, symbols, snapshot)?;
+        if target_matches(&validated, target_cfg) {
+            diagnostics.extend(validated.diagnostics.iter().cloned());
+            validated_targets.insert(entry.ast_id, validated);
+            uses.push(entry);
+        }
+    }
+
+    let mut items = Vec::with_capacity(current.items.len());
+    for entry in current.items.iter().cloned() {
+        let kind = module_target_kind(entry.kind).ok_or(TargetFilterError::StaleItemTree)?;
+        let validated = validate_target_attrs(&entry.raw_attrs, kind, symbols, snapshot)?;
+        if target_matches(&validated, target_cfg) {
+            diagnostics.extend(validated.diagnostics.iter().cloned());
+            validated_targets.insert(entry.ast_id, validated);
+            items.push(entry);
+        }
+    }
+    diagnostics.sort_by_key(|diagnostic| {
+        diagnostic
+            .primary()
+            .map(|primary| primary.span.range.start())
+    });
+
+    let mut item_tree = current;
+    item_tree.uses = uses;
+    item_tree.items = items;
+    Ok(TargetFilterResult {
+        item_tree,
+        validated_targets,
+        diagnostics,
+    })
+}
+
+fn validate_target_attrs(
+    raw_attrs: &[RawAttr],
+    kind: TargetKind,
+    symbols: &Interner,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<ValidatedAttrs, TargetFilterError> {
+    let target_attrs = raw_attrs
+        .iter()
+        .filter(|attribute| attribute.name == AttrName::Target)
+        .cloned()
+        .collect::<Vec<_>>();
+    if target_attrs.is_empty() {
+        return Ok(ValidatedAttrs::default());
+    }
+    validate_attrs(
+        &target_attrs,
+        Some(AttributeTarget {
+            module_level: true,
+            ..AttributeTarget::new(kind)
+        }),
+        symbols,
+        snapshot,
+    )
+    .map_err(TargetFilterError::AttributeValidation)
+}
+
+fn target_matches(validated: &ValidatedAttrs, target_cfg: &TargetCfg) -> bool {
+    validated
+        .target
+        .as_ref()
+        .is_none_or(|(predicate, _)| predicate.matches(target_cfg))
+}
+
+fn module_target_kind(kind: ItemTreeKind) -> Option<TargetKind> {
+    Some(match kind {
+        ItemTreeKind::Function => TargetKind::Fn,
+        ItemTreeKind::Struct => TargetKind::Record,
+        ItemTreeKind::Alias => TargetKind::Alias,
+        ItemTreeKind::Refined => TargetKind::Refined,
+        ItemTreeKind::Enum => TargetKind::Enum,
+        ItemTreeKind::Distinct => TargetKind::Distinct,
+        ItemTreeKind::Resource => TargetKind::Resource,
+        ItemTreeKind::Trait => TargetKind::Trait,
+        ItemTreeKind::Impl => TargetKind::Impl,
+        ItemTreeKind::Const => TargetKind::Const,
+        ItemTreeKind::Invariant => TargetKind::Invariant,
+        ItemTreeKind::Effect => TargetKind::Effect,
+        ItemTreeKind::Interface => TargetKind::Interface,
+        ItemTreeKind::World => TargetKind::World,
+        ItemTreeKind::ExternBlock => TargetKind::ExternBlock,
+        ItemTreeKind::Test => TargetKind::Test,
+        ItemTreeKind::Property => TargetKind::Property,
+        ItemTreeKind::TypeParam
+        | ItemTreeKind::ConstParam
+        | ItemTreeKind::Field
+        | ItemTreeKind::Variant
+        | ItemTreeKind::VariantField
+        | ItemTreeKind::AssocType
+        | ItemTreeKind::AssocFn
+        | ItemTreeKind::InterfaceFn
+        | ItemTreeKind::ExternFn
+        | ItemTreeKind::WorldItem { .. }
+        | ItemTreeKind::WorldInclude => return None,
+    })
 }
 
 fn collect_use(
@@ -1540,8 +1735,286 @@ mod tests {
         (parsed, symbols, tree)
     }
 
+    fn collect_with_snapshot(
+        source: &str,
+        file: FileId,
+    ) -> (
+        sai_syntax::Parse,
+        ast::AstIdMap,
+        Interner,
+        ItemTree,
+        WorkspaceSnapshot,
+    ) {
+        let source_file = Arc::new(SourceFile::new(file, source, false).expect("valid source"));
+        let snapshot =
+            WorkspaceSnapshot::new([SnapshotFile::new(source_file, "src/lib.sai", None, None)])
+                .expect("valid workspace snapshot");
+        let parsed = sai_syntax::parse(&snapshot, file).expect("source parses");
+        let ast_ids = ast::AstIdMap::new(file, &parsed.root).expect("snapshot-bound AST IDs");
+        let symbols = Interner::new();
+        let tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        (parsed, ast_ids, symbols, tree, snapshot)
+    }
+
+    fn target_cfg(target_name: &str, capabilities: &[&str]) -> TargetCfg {
+        TargetCfg::new(target_name, capabilities.iter().copied())
+            .expect("capabilities match the target")
+    }
+
     fn child_kinds(entry: &ItemTreeEntry) -> Vec<ItemTreeKind> {
         entry.children.iter().map(|entry| entry.kind).collect()
+    }
+
+    #[test]
+    fn target_filter_selects_duplicate_names_before_later_checks() {
+        let source = concat!(
+            "@target(\"wasm32-core\")\n",
+            "fn choose() {}\n",
+            "@target(\"wasm64-core\")\n",
+            "fn choose() {}\n",
+            "fn common() {}\n",
+        );
+        let file = FileId::new(720);
+        let (parsed, ast_ids, symbols, _, snapshot) = collect_with_snapshot(source, file);
+        assert!(parsed.errors.is_empty());
+
+        let result = ItemTree::collect_for_target(
+            file,
+            source,
+            &parsed.root,
+            &ast_ids,
+            &symbols,
+            &snapshot,
+            &target_cfg("wasm32-core", &[]),
+        )
+        .expect("target filtering succeeds");
+        assert_eq!(result.item_tree.items.len(), 2);
+        assert_eq!(
+            result
+                .item_tree
+                .items
+                .iter()
+                .map(|entry| symbols.resolve(entry.name).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["choose", "common"]
+        );
+        assert_eq!(result.validated_targets.len(), 2);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn target_filter_uses_the_supplied_effective_capability_set() {
+        let source = concat!(
+            "@target(host)\n",
+            "fn host_only() {}\n",
+            "@target(none(host))\n",
+            "fn without_host() {}\n",
+            "@target(any(\"wasm64-core\", memory64))\n",
+            "fn wide_memory() {}\n",
+        );
+        let file = FileId::new(725);
+        let (parsed, ast_ids, symbols, tree, snapshot) = collect_with_snapshot(source, file);
+        assert!(parsed.errors.is_empty());
+
+        let without_host = tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &snapshot,
+                &target_cfg("wasm32-core", &[]),
+            )
+            .expect("target filtering succeeds");
+        assert_eq!(
+            without_host
+                .item_tree
+                .items
+                .iter()
+                .map(|entry| symbols.resolve(entry.name).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["without_host"]
+        );
+
+        let with_host = tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &snapshot,
+                &target_cfg("wasm64-core", &["host", "memory64"]),
+            )
+            .expect("target filtering succeeds");
+        assert_eq!(
+            with_host
+                .item_tree
+                .items
+                .iter()
+                .map(|entry| symbols.resolve(entry.name).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["host_only", "wide_memory"]
+        );
+    }
+
+    #[test]
+    fn target_filter_removes_uses_and_nested_items_with_their_parent() {
+        let source = concat!(
+            "@target(\"wasm64-core\")\n",
+            "use sai:core/fmt.{Debug}\n",
+            "@target(\"wasm64-core\")\n",
+            "impl Copy for Thing { fn hidden(self: Self) {} }\n",
+            "fn visible() {}\n",
+        );
+        let file = FileId::new(721);
+        let (parsed, ast_ids, symbols, tree, snapshot) = collect_with_snapshot(source, file);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+
+        let filtered = tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &snapshot,
+                &target_cfg("wasm32-core", &[]),
+            )
+            .expect("target filtering succeeds");
+        assert!(filtered.item_tree.uses.is_empty());
+        assert_eq!(filtered.item_tree.items.len(), 1);
+        assert_eq!(filtered.item_tree.items[0].kind, ItemTreeKind::Function);
+
+        let retained = tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &snapshot,
+                &target_cfg("wasm64-core", &["memory64"]),
+            )
+            .expect("target filtering succeeds");
+        assert_eq!(retained.item_tree.uses.len(), 1);
+        assert_eq!(retained.item_tree.items.len(), 2);
+        assert_eq!(
+            child_kinds(&retained.item_tree.items[0]),
+            [ItemTreeKind::AssocFn]
+        );
+    }
+
+    #[test]
+    fn target_filter_suppresses_other_attribute_diagnostics_on_removed_items() {
+        let source = concat!(
+            "@target(\"wasm64-core\")\n",
+            "@derive(UnknownTrait)\n",
+            "fn omitted() {}\n",
+            "@target(\"wasm32-linux\")\n",
+            "fn retained() {}\n",
+        );
+        let file = FileId::new(722);
+        let (parsed, ast_ids, symbols, tree, snapshot) = collect_with_snapshot(source, file);
+        assert!(parsed.errors.is_empty());
+
+        let result = tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &snapshot,
+                &target_cfg("wasm32-core", &[]),
+            )
+            .expect("target filtering succeeds");
+        assert_eq!(result.item_tree.items.len(), 1);
+        assert_eq!(
+            symbols
+                .resolve(result.item_tree.items[0].name)
+                .unwrap()
+                .as_ref(),
+            "retained"
+        );
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].code,
+            sai_diagnostics::Code::UnknownTarget
+        );
+    }
+
+    #[test]
+    fn target_filter_reports_disallowed_interface_target_and_keeps_item() {
+        let source = "@target(\"wasm64-core\")\ninterface api {}\n";
+        let file = FileId::new(723);
+        let (parsed, ast_ids, symbols, tree, snapshot) = collect_with_snapshot(source, file);
+        assert!(parsed.errors.is_empty());
+
+        let result = tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &snapshot,
+                &target_cfg("wasm32-core", &[]),
+            )
+            .expect("target filtering succeeds");
+        assert_eq!(result.item_tree.items.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].code,
+            sai_diagnostics::Code::InvalidAttributeTarget
+        );
+    }
+
+    #[test]
+    fn target_filter_rejects_stale_trees_and_foreign_snapshots() {
+        let source = "@target(\"wasm64-core\")\nfn selected() {}\n";
+        let file = FileId::new(724);
+        let (parsed, ast_ids, symbols, tree, snapshot) = collect_with_snapshot(source, file);
+        let mut stale = tree.clone();
+        stale.items.clear();
+        assert_eq!(
+            stale
+                .filter_for_target(
+                    source,
+                    &parsed.root,
+                    &ast_ids,
+                    &symbols,
+                    &snapshot,
+                    &target_cfg("wasm64-core", &["memory64"]),
+                )
+                .unwrap_err(),
+            TargetFilterError::StaleItemTree
+        );
+
+        let other_source = Arc::new(SourceFile::new(file, source, false).expect("valid source"));
+        let other_snapshot =
+            WorkspaceSnapshot::new([SnapshotFile::new(other_source, "src/lib.sai", None, None)])
+                .expect("another valid workspace snapshot");
+        assert_eq!(
+            tree.filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &other_snapshot,
+                &target_cfg("wasm64-core", &["memory64"]),
+            )
+            .unwrap_err(),
+            TargetFilterError::SnapshotMismatch
+        );
+        assert_eq!(
+            ItemTree::collect_for_target(
+                file,
+                source,
+                &parsed.root,
+                &ast_ids,
+                &symbols,
+                &other_snapshot,
+                &target_cfg("wasm64-core", &["memory64"]),
+            )
+            .unwrap_err(),
+            TargetFilterError::SnapshotMismatch
+        );
     }
 
     #[test]
