@@ -581,7 +581,60 @@ impl DefPathInterner {
         parent: LocalDefId,
         fields: &[(Symbol, u32)],
     ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        if fields.is_empty() {
+            self.resolve(parent)?
+                .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+            return Ok(Vec::new());
+        }
+        let fields = fields
+            .iter()
+            .map(|(name, disambiguator)| (parent, *name, *disambiguator))
+            .collect::<Vec<_>>();
+        self.intern_fields_for_parents(&fields)
+    }
+
+    /// Intern a batch of fields below their individual declaring definitions.
+    ///
+    /// This is used for record-variant fields, whose parent path is the
+    /// corresponding enum variant. Symbol sessions and all parent paths are
+    /// validated before the batch mutates the interner.
+    pub fn intern_fields_for_parents(
+        &self,
+        fields: &[(LocalDefId, Symbol, u32)],
+    ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
         if fields
+            .iter()
+            .any(|(_, name, _)| !name.is_error() && name.session_id() != self.symbol_interner)
+        {
+            return Err(DefPathInternerError::InternerSessionMismatch);
+        }
+
+        let paths = fields
+            .iter()
+            .map(|(parent, name, disambiguator)| {
+                let mut path = self
+                    .resolve(*parent)?
+                    .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+                path.data.push(DisambiguatedDefPathData {
+                    data: DefPathData::Field(*name),
+                    disambiguator: *disambiguator,
+                });
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>, DefPathInternerError>>()?;
+        self.intern_paths(paths)
+    }
+
+    /// Intern a batch of variants below their declaring enum.
+    ///
+    /// The disambiguator is the ordinal among sibling variants with the same
+    /// symbol, in source order.
+    pub fn intern_variants(
+        &self,
+        parent: LocalDefId,
+        variants: &[(Symbol, u32)],
+    ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        if variants
             .iter()
             .any(|(name, _)| !name.is_error() && name.session_id() != self.symbol_interner)
         {
@@ -591,12 +644,12 @@ impl DefPathInterner {
         let parent_path = self
             .resolve(parent)?
             .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
-        let paths = fields
+        let paths = variants
             .iter()
             .map(|(name, disambiguator)| {
                 let mut path = parent_path.clone();
                 path.data.push(DisambiguatedDefPathData {
-                    data: DefPathData::Field(*name),
+                    data: DefPathData::Variant(*name),
                     disambiguator: *disambiguator,
                 });
                 path
@@ -1231,6 +1284,7 @@ mod tests {
             );
         }
         assert_eq!(paths.len(), Ok(3));
+        assert_eq!(paths.intern_fields(owner, &[]), Ok(Vec::new()));
 
         let foreign_symbols = Interner::new();
         let foreign_field = foreign_symbols.intern("foreign").unwrap();
@@ -1242,6 +1296,88 @@ mod tests {
             paths.len(),
             Ok(3),
             "a failed field batch leaves the interner unchanged"
+        );
+    }
+
+    #[test]
+    fn definition_path_interner_interns_variant_and_nested_field_batches_atomically() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = DefPathInterner::new(package, &packages, &symbols).unwrap();
+        let owner = paths
+            .intern(def_path(package, &packages, &symbols, "Choice"))
+            .unwrap();
+        let repeated = symbols.intern("Repeated").unwrap();
+        let payload = symbols.intern("payload").unwrap();
+
+        let variants = paths
+            .intern_variants(owner, &[(repeated, 0), (repeated, 1)])
+            .expect("duplicate variant names receive separate paths");
+        assert_eq!(variants.len(), 2);
+        for (disambiguator, variant_id) in variants.iter().enumerate() {
+            let path = paths
+                .resolve(*variant_id)
+                .expect("variant path resolves")
+                .expect("variant path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Variant(repeated),
+                    disambiguator: disambiguator as u32,
+                })
+            );
+        }
+
+        let fields = paths
+            .intern_fields_for_parents(&[
+                (variants[0], payload, 0),
+                (variants[1], payload, 0),
+                (variants[1], payload, 1),
+            ])
+            .expect("variant fields are interned below their variants");
+        assert_eq!(fields.len(), 3);
+        assert_eq!(paths.resolve(fields[0]).unwrap().unwrap().data().len(), 3);
+        assert_eq!(
+            paths.resolve(fields[0]).unwrap().unwrap().data()[1],
+            DisambiguatedDefPathData {
+                data: DefPathData::Variant(repeated),
+                disambiguator: 0,
+            }
+        );
+        assert_eq!(
+            paths.resolve(fields[1]).unwrap().unwrap().data()[1],
+            DisambiguatedDefPathData {
+                data: DefPathData::Variant(repeated),
+                disambiguator: 1,
+            }
+        );
+        assert_eq!(
+            paths.resolve(fields[2]).unwrap().unwrap().data().last(),
+            Some(&DisambiguatedDefPathData {
+                data: DefPathData::Field(payload),
+                disambiguator: 1,
+            })
+        );
+        assert_eq!(paths.len(), Ok(6));
+
+        let foreign_symbols = Interner::new();
+        let foreign_name = foreign_symbols.intern("foreign").unwrap();
+        assert_eq!(
+            paths.intern_fields_for_parents(&[
+                (variants[0], payload, 1),
+                (variants[1], foreign_name, 0),
+            ]),
+            Err(DefPathInternerError::InternerSessionMismatch)
+        );
+        assert_eq!(
+            paths.intern_variants(owner, &[(repeated, 2), (foreign_name, 0)]),
+            Err(DefPathInternerError::InternerSessionMismatch)
+        );
+        assert_eq!(
+            paths.len(),
+            Ok(6),
+            "failed variant and field batches leave the interner unchanged"
         );
     }
 

@@ -7,7 +7,10 @@ use crate::expressions::{
     MatchSource as HirMatchSource, Stmt as HirStmt, StmtKind, UnOp,
 };
 use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
-use crate::items::{FieldDef, HirOwner, Item, ItemKind, OwnerNode};
+use crate::items::{
+    FieldDef, HirOwner, Item, ItemKind, OwnerNode, Variant as HirVariant,
+    VariantShape as HirVariantShape,
+};
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
 use crate::source_map::{HirSourceMap, HirSourceMapBuilder, HirSourceMapError};
@@ -41,6 +44,7 @@ pub enum HirLoweringError {
     DefPathInternerRequired,
     ItemTree(ItemTreeError),
     ItemTreeEntryMismatch,
+    MissingRequiredSyntax(SyntaxKind),
     UnsupportedSyntax(SyntaxKind),
 }
 
@@ -707,6 +711,181 @@ pub fn lower_resource_owner<'hir>(
         vis: visibility,
         kind: ItemKind::Resource {
             fields: context.arena.alloc_field_defs(&fields),
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: None,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
+/// Lower one top-level enum declaration from the current item tree.
+///
+/// Variants and record-variant fields receive source-ordered definition paths.
+/// Only explicit discriminants representable as `i128` are stored here;
+/// implicit discriminants and diagnosed out-of-range values remain for later
+/// enum validation.
+pub fn lower_enum_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) = resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Enum, context)?;
+    let declaration = ast::EnumDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+    let variants = declaration
+        .variants()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::VARIANT_LIST,
+        ))?
+        .variants()
+        .collect::<Vec<_>>();
+    ensure_supported_generic_params(declaration.generic_params())?;
+    if let Some(where_clause) = declaration.where_clause() {
+        ensure_supported_where_clause(&where_clause)?;
+    }
+    for variant in &variants {
+        if let Some(shape) = variant.tuple_shape() {
+            for ty in shape.types() {
+                ensure_supported_type(&ty)?;
+            }
+        }
+        if let Some(shape) = variant.record_shape() {
+            for field in shape.fields() {
+                if let Some(ty) = field.ty() {
+                    ensure_supported_type(&ty)?;
+                }
+            }
+        }
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let pending_generic_params =
+        prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+    let pending_variants = prepare_variant_defs(variants, context.symbols, &source_map)?;
+    let pending_variant_fields =
+        prepare_variant_fields(&pending_variants, context.symbols, &source_map)?;
+    let generic_params = lower_generic_params(
+        pending_generic_params,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let where_preds = declaration
+        .where_clause()
+        .map(|clause| lower_where_clause(&clause, context.arena, context.symbols, &mut source_map))
+        .transpose()?
+        .unwrap_or_default();
+    let variants = pending_variants
+        .into_iter()
+        .zip(pending_variant_fields)
+        .map(|(pending, fields)| {
+            let PendingVariantDef {
+                variant,
+                name,
+                def_id,
+            } = pending;
+            let hir_id = source_map.add_node(variant.syntax())?;
+            let shape = if let Some(tuple_shape) = variant.tuple_shape() {
+                let types = lower_fn_type_params(
+                    tuple_shape.syntax(),
+                    context.arena,
+                    context.symbols,
+                    &mut source_map,
+                )?;
+                HirVariantShape::Tuple(context.arena.alloc_tys(&types))
+            } else if variant.record_shape().is_some() {
+                let fields = fields
+                    .into_iter()
+                    .map(
+                        |PendingVariantField {
+                             field,
+                             name,
+                             def_id,
+                         }| {
+                            let hir_id = source_map.add_node(field.syntax())?;
+                            let ty = match field.ty() {
+                                Some(ty) => lower_type(
+                                    &ty,
+                                    context.arena,
+                                    context.symbols,
+                                    &mut source_map,
+                                )?,
+                                None => {
+                                    let error_syntax = direct_error_child(field.syntax())
+                                        .unwrap_or_else(|| field.syntax().clone());
+                                    lower_error_type(&error_syntax, context.arena, &mut source_map)?
+                                }
+                            };
+                            Ok(FieldDef {
+                                hir_id,
+                                def_id,
+                                vis: visibility,
+                                name,
+                                ty,
+                            })
+                        },
+                    )
+                    .collect::<Result<Vec<_>, HirLoweringError>>()?;
+                HirVariantShape::Record(context.arena.alloc_field_defs(&fields))
+            } else {
+                HirVariantShape::Unit
+            };
+            Ok(HirVariant {
+                hir_id,
+                def_id,
+                name,
+                shape,
+                discriminant: variant.discriminant().and_then(signed_discriminant),
+            })
+        })
+        .collect::<Result<Vec<_>, HirLoweringError>>()?;
+    let generics = context.arena.alloc_generics(HirGenerics {
+        params: context.arena.alloc_generic_params(&generic_params),
+        where_preds: context.arena.alloc_where_preds(&where_preds),
+    });
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Enum {
+            generics: *generics,
+            variants: context.arena.alloc_variants(&variants),
         },
         span,
     });
@@ -1872,6 +2051,18 @@ struct PendingFieldDef {
     def_id: LocalDefId,
 }
 
+struct PendingVariantDef {
+    variant: ast::VariantDecl,
+    name: Name,
+    def_id: LocalDefId,
+}
+
+struct PendingVariantField {
+    field: ast::VariantField,
+    name: Name,
+    def_id: LocalDefId,
+}
+
 fn prepare_generic_params(
     generic_params: Option<ast::GenericParamList>,
     symbols: &Interner,
@@ -1965,6 +2156,100 @@ fn prepare_field_defs(
             def_id,
         })
         .collect())
+}
+
+fn prepare_variant_defs(
+    variants: Vec<ast::VariantDecl>,
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Vec<PendingVariantDef>, HirLoweringError> {
+    if variants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let def_paths = source_map
+        .def_path_interner()
+        .ok_or(HirLoweringError::DefPathInternerRequired)?;
+    let mut disambiguators = HashMap::<Symbol, u32>::new();
+    let mut pending = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let name = lower_item_name(variant.name(), variant.syntax(), symbols, source_map)?;
+        let disambiguator = disambiguators.entry(name.sym).or_default();
+        let ordinal = *disambiguator;
+        *disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+        pending.push((variant, name, ordinal));
+    }
+    let variant_paths = pending
+        .iter()
+        .map(|(_, name, disambiguator)| (name.sym, *disambiguator))
+        .collect::<Vec<_>>();
+    let def_ids = def_paths.intern_variants(source_map.owner().def_id, &variant_paths)?;
+    Ok(pending
+        .into_iter()
+        .zip(def_ids)
+        .map(|((variant, name, _), def_id)| PendingVariantDef {
+            variant,
+            name,
+            def_id,
+        })
+        .collect())
+}
+
+fn prepare_variant_fields(
+    variants: &[PendingVariantDef],
+    symbols: &Interner,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Vec<Vec<PendingVariantField>>, HirLoweringError> {
+    let mut drafts = Vec::<(usize, ast::VariantField, Name)>::new();
+    let mut field_paths = Vec::<(LocalDefId, Symbol, u32)>::new();
+    for (variant_index, variant) in variants.iter().enumerate() {
+        let Some(shape) = variant.variant.record_shape() else {
+            continue;
+        };
+        let mut disambiguators = HashMap::<Symbol, u32>::new();
+        for field in shape.fields() {
+            let name = lower_item_name(field.name(), field.syntax(), symbols, source_map)?;
+            let disambiguator = disambiguators.entry(name.sym).or_default();
+            let ordinal = *disambiguator;
+            *disambiguator = disambiguator
+                .checked_add(1)
+                .ok_or(DefPathInternerError::TooManyDefinitions)?;
+            drafts.push((variant_index, field, name));
+            field_paths.push((variant.def_id, name.sym, ordinal));
+        }
+    }
+    let mut pending_by_variant = std::iter::repeat_with(Vec::new)
+        .take(variants.len())
+        .collect::<Vec<Vec<PendingVariantField>>>();
+    if field_paths.is_empty() {
+        return Ok(pending_by_variant);
+    }
+    let def_paths = source_map
+        .def_path_interner()
+        .ok_or(HirLoweringError::DefPathInternerRequired)?;
+    let def_ids = def_paths.intern_fields_for_parents(&field_paths)?;
+    for ((variant_index, field, name), def_id) in drafts.into_iter().zip(def_ids) {
+        pending_by_variant[variant_index].push(PendingVariantField {
+            field,
+            name,
+            def_id,
+        });
+    }
+    Ok(pending_by_variant)
+}
+
+fn signed_discriminant(discriminant: ast::Discriminant) -> Option<i128> {
+    let value = discriminant.integer()?.value()?;
+    if discriminant.minus_token().is_some() {
+        if value == (1_u128 << 127) {
+            Some(i128::MIN)
+        } else {
+            i128::try_from(value).ok()?.checked_neg()
+        }
+    } else {
+        i128::try_from(value).ok()
+    }
 }
 
 fn lower_field_defs<'hir>(
@@ -16908,6 +17193,381 @@ mod tests {
                 &expected_path,
                 &item_tree,
                 const_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(paths.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn lowers_item_tree_enum_with_generics_variants_and_record_fields() {
+        let file = crate::FileId::new(272);
+        let source = concat!(
+            "@deprecated(\"shape\")\n",
+            "pub enum Shape<T> where T: Copy {\n",
+            "    Circle(T)\n",
+            "    Rect(width: I32, height: I32)\n",
+            "    Empty\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("enum item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Enum);
+        let name = symbols.intern("Shape").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_enum_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("enum lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+        assert!(hir_owner.body.is_none());
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level enum is represented by an item owner");
+        };
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        let ItemKind::Enum { generics, variants } = item.kind else {
+            panic!("enum declaration retains its enum item kind");
+        };
+        assert_eq!(generics.params.len(), 1);
+        assert_eq!(generics.where_preds.len(), 1);
+        assert_eq!(variants.len(), 3);
+        assert!(matches!(
+            variants[0].shape,
+            HirVariantShape::Tuple([HirTy {
+                kind: HirTyKind::Path(_),
+                ..
+            }])
+        ));
+        let HirVariantShape::Record(fields) = variants[1].shape else {
+            panic!("named variant payload lowers as record fields");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].vis, crate::Visibility::Pub);
+        assert_eq!(fields[1].vis, crate::Visibility::Pub);
+        assert_eq!(fields[0].name.sym, symbols.intern("width").unwrap());
+        assert_eq!(fields[1].name.sym, symbols.intern("height").unwrap());
+        assert!(matches!(variants[2].shape, HirVariantShape::Unit));
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.discriminant.is_none())
+        );
+
+        for (index, variant_name) in ["Circle", "Rect", "Empty"].iter().enumerate() {
+            let expected = symbols.intern(variant_name).unwrap();
+            let path = paths
+                .resolve(variants[index].def_id)
+                .expect("variant path resolves")
+                .expect("variant path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Variant(expected),
+                    disambiguator: 0,
+                })
+            );
+            assert!(source_map.syntax_for_node(variants[index].hir_id).is_some());
+        }
+        for (field, field_name) in fields.iter().zip(["width", "height"]) {
+            let path = paths
+                .resolve(field.def_id)
+                .expect("variant field path resolves")
+                .expect("variant field path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Field(symbols.intern(field_name).unwrap()),
+                    disambiguator: 0,
+                })
+            );
+            assert_eq!(
+                path.data()[path.data().len() - 2],
+                DisambiguatedDefPathData {
+                    data: DefPathData::Variant(symbols.intern("Rect").unwrap()),
+                    disambiguator: 0,
+                }
+            );
+            assert!(source_map.syntax_for_node(field.hir_id).is_some());
+        }
+    }
+
+    #[test]
+    fn enum_owner_disambiguates_duplicate_variants_and_record_fields() {
+        let file = crate::FileId::new(273);
+        let source = "enum Repeated {\n    Same\n    Same(value: I32, value: I64)\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("enum item entry");
+        let name = symbols.intern("Repeated").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_enum_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("duplicate variant declarations remain in HIR");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level enum is represented by an item owner");
+        };
+        let ItemKind::Enum { variants, .. } = item.kind else {
+            panic!("enum declaration retains its enum item kind");
+        };
+        assert_eq!(variants.len(), 2);
+        for (disambiguator, variant) in variants.iter().enumerate() {
+            let path = paths
+                .resolve(variant.def_id)
+                .expect("variant path resolves")
+                .expect("variant path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Variant(symbols.intern("Same").unwrap()),
+                    disambiguator: disambiguator as u32,
+                })
+            );
+        }
+        let HirVariantShape::Record(fields) = variants[1].shape else {
+            panic!("second variant retains its record payload");
+        };
+        assert_eq!(fields.len(), 2);
+        for (disambiguator, field) in fields.iter().enumerate() {
+            let path = paths
+                .resolve(field.def_id)
+                .expect("field path resolves")
+                .expect("field path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Field(symbols.intern("value").unwrap()),
+                    disambiguator: disambiguator as u32,
+                })
+            );
+            assert_eq!(
+                path.data()[path.data().len() - 2],
+                DisambiguatedDefPathData {
+                    data: DefPathData::Variant(symbols.intern("Same").unwrap()),
+                    disambiguator: 1,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn enum_owner_rejects_a_missing_variant_list() {
+        let file = crate::FileId::new(277);
+        let source = "enum Broken\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(!parsed.errors.is_empty(), "missing braces are diagnosed");
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the recovered enum");
+        let entry = item_tree.items.first().expect("enum item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Enum);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        assert!(matches!(
+            lower_enum_owner(owner, &expected_path, &item_tree, entry.ast_id, &context),
+            Err(HirLoweringError::MissingRequiredSyntax(
+                SyntaxKind::VARIANT_LIST
+            ))
+        ));
+        // A missing variant list must not turn into a valid, uninhabited enum
+        // or leave any variant definitions interned.
+        assert_eq!(paths.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn enum_owner_lowers_signed_explicit_discriminants() {
+        let file = crate::FileId::new(274);
+        let source = concat!(
+            "enum Level {\n",
+            "    Negative = -1\n",
+            "    Hex = 0xff\n",
+            "    Minimum = -170141183460469231731687303715884105728\n",
+            "    TooLarge = 170141183460469231731687303715884105728\n",
+            "    Next\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("enum item entry");
+        let name = symbols.intern("Level").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_enum_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("unit enum lowers with explicit discriminants");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level enum is represented by an item owner");
+        };
+        let ItemKind::Enum { variants, .. } = item.kind else {
+            panic!("enum declaration retains its enum item kind");
+        };
+        assert_eq!(variants[0].discriminant, Some(-1));
+        assert_eq!(variants[1].discriminant, Some(255));
+        assert_eq!(variants[2].discriminant, Some(i128::MIN));
+        assert_eq!(variants[3].discriminant, None);
+        assert_eq!(variants[4].discriminant, None);
+        assert!(source_map.syntax_for_node(variants[3].hir_id).is_some());
+    }
+
+    #[test]
+    fn enum_owner_recovers_missing_tuple_payload_types() {
+        let file = crate::FileId::new(275);
+        let source = "enum Broken {\n    Pair(, I32)\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing tuple type is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed enum");
+        let entry = item_tree.items.first().expect("enum item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Enum);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_enum_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing tuple type recovers to error HIR");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level enum is represented by an item owner");
+        };
+        let ItemKind::Enum { variants, .. } = item.kind else {
+            panic!("enum declaration retains its enum item kind");
+        };
+        let HirVariantShape::Tuple(types) = variants[0].shape else {
+            panic!("tuple payload retains its tuple shape");
+        };
+        assert_eq!(types.len(), 2);
+        assert!(matches!(types[0].kind, HirTyKind::Err));
+        assert!(matches!(types[1].kind, HirTyKind::Path(_)));
+    }
+
+    #[test]
+    fn enum_owner_recovers_a_missing_record_payload_field_type() {
+        let file = crate::FileId::new(277);
+        let source = "enum Broken {\n    Pair(value:)\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing field type is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed enum");
+        let entry = item_tree.items.first().expect("enum item entry");
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_enum_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing record field type recovers to error HIR");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level enum is represented by an item owner");
+        };
+        let ItemKind::Enum { variants, .. } = item.kind else {
+            panic!("enum declaration retains its enum item kind");
+        };
+        let HirVariantShape::Record(fields) = variants[0].shape else {
+            panic!("variant retains its record payload shape");
+        };
+        assert_eq!(fields.len(), 1);
+        assert!(matches!(fields[0].ty.kind, HirTyKind::Err));
+    }
+
+    #[test]
+    fn enum_owner_rejects_wrong_paths_and_other_item_kinds() {
+        let file = crate::FileId::new(276);
+        let source = "enum Choice { Some }\ntype Alias = I32\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let enum_entry = item_tree.items.first().expect("enum item entry");
+        let alias_entry = item_tree.items.get(1).expect("alias item entry");
+        let wrong_name = symbols.intern("Choice").expect("symbol interns");
+        let (_packages, wrong_paths, wrong_owner) =
+            owner_context_with_data(&symbols, DefPathData::ValueNs(wrong_name));
+        let wrong_expected_path = owner_def_path(&wrong_paths, wrong_owner);
+        let arena = HirArena::new();
+        let wrong_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &wrong_paths,
+        );
+        assert!(matches!(
+            lower_enum_owner(
+                wrong_owner,
+                &wrong_expected_path,
+                &item_tree,
+                enum_entry.ast_id,
+                &wrong_context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(wrong_paths.len().unwrap(), 1);
+
+        let name = symbols.intern("Choice").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        assert!(matches!(
+            lower_enum_owner(
+                owner,
+                &expected_path,
+                &item_tree,
+                alias_entry.ast_id,
                 &context
             ),
             Err(HirLoweringError::ItemTreeEntryMismatch)
