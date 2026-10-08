@@ -31,6 +31,7 @@ pub(crate) enum RootIdentity {
         id: WorkspaceSnapshotId,
     },
     Tree(u64),
+    Query(u64),
 }
 
 impl RootIdentity {
@@ -40,12 +41,13 @@ impl RootIdentity {
                 file: snapshot_file,
                 ..
             } => snapshot_file == file,
-            Self::Tree(_) => true,
+            Self::Tree(_) | Self::Query(_) => true,
         }
     }
 }
 
 static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_QUERY_ROOT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_tree_id() -> u64 {
     let mut current = NEXT_TREE_ID.load(Ordering::Relaxed);
@@ -54,6 +56,24 @@ fn next_tree_id() -> u64 {
             .checked_add(1)
             .expect("syntax tree identity space exhausted");
         match NEXT_TREE_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return current,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn next_query_root_id() -> u64 {
+    let mut current = NEXT_QUERY_ROOT_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("query root identity space exhausted");
+        match NEXT_QUERY_ROOT_ID.compare_exchange_weak(
             current,
             next,
             Ordering::Relaxed,
@@ -247,6 +267,12 @@ impl SyntaxNode {
     /// IDs from this root must not escape the query computation.
     pub(crate) fn new_root_for_query(green: GreenNode) -> Self {
         Self::new_root_with_identity(green, RootIdentity::Tree(u64::MAX))
+    }
+
+    /// Creates a query root with a unique identity so its IDs cannot resolve
+    /// against a root produced by another callback invocation.
+    pub(crate) fn new_root_for_query_callback(green: GreenNode) -> Self {
+        Self::new_root_with_identity(green, RootIdentity::Query(next_query_root_id()))
     }
 
     pub(crate) fn new_root_in_snapshot(

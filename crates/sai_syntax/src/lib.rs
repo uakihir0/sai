@@ -1104,6 +1104,31 @@ impl SyntaxQueries {
         ast::AstIdMap::bind_shape(file_id, &root, shape.as_ref()).map_err(ParseQueryError::AstIdMap)
     }
 
+    /// Computes a stable query value while exposing an ephemeral AST root and ID map.
+    ///
+    /// The root and its pointers use a unique query-local identity. The
+    /// callback result must be snapshot-independent; it must not retain the
+    /// root, AST map, pointers, IDs, or source ranges.
+    pub fn with_query_ast<V>(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+        build: impl FnOnce(&SourceFile, &SyntaxNode, &ast::AstIdMap) -> V,
+    ) -> Result<V, QueryError>
+    where
+        V: Clone + Eq + StableHash + Send + Sync + 'static,
+    {
+        let source = self
+            .vfs
+            .source_text(database, key.clone(), FileId::new(0))?;
+        let parsed = self.parse_query.get(database, key.clone())?;
+        let shape = self.ast_id_map_query.get(database, key)?;
+        let root = SyntaxNode::new_root_for_query_callback(parsed.root().clone());
+        let ast_ids = ast::AstIdMap::bind_query_shape(FileId::new(0), &root, shape.as_ref())
+            .unwrap_or_else(|error| panic!("query AST ID shape invariant failed: {error:?}"));
+        Ok(build(source.source(), &root, &ast_ids))
+    }
+
     fn validate_file(
         &self,
         database: &mut QueryDatabase,
@@ -4437,6 +4462,84 @@ mod tests {
                 .resolve(first_id, &queried.root)
                 .is_some()
         );
+        let mut escaped_function_id = None;
+        let mut escaped_function_ptr = None;
+        let query_ast_kinds = queries
+            .with_query_ast(&mut database, key.clone(), |_source, root, ast_ids| {
+                assert_eq!(ast_ids.len(), 1);
+                let function = ast::SourceFile::cast(root.clone())
+                    .expect("query source file")
+                    .items()
+                    .find_map(|item| match item {
+                        ast::Item::Function(function) => Some(function),
+                        _ => None,
+                    })
+                    .expect("query function declaration");
+                let function_id = ast_ids
+                    .ast_id(&function)
+                    .expect("query function has an AST ID");
+                escaped_function_ptr = Some(ast_ids.get(function_id).expect("pointer resolves"));
+                escaped_function_id = Some(function_id);
+                (0..ast_ids.len())
+                    .map(|index| {
+                        let index = u32::try_from(index).expect("small test AST ID");
+                        let pointer = ast_ids
+                            .pointer(ast::ErasedAstId::new(index))
+                            .expect("query AST pointer exists");
+                        assert!(
+                            pointer.resolve(FileId::new(0), root).is_some(),
+                            "query AST pointer resolves within its temporary root"
+                        );
+                        pointer.kind()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .expect("query-local AST is available");
+        assert_eq!(query_ast_kinds, vec![SyntaxKind::FN_DECL]);
+        let _second_query_ast = queries
+            .with_query_ast(&mut database, key.clone(), |_source, root, ast_ids| {
+                assert!(
+                    ast_ids
+                        .get(escaped_function_id.expect("first query ID was captured"))
+                        .is_none(),
+                    "an AST ID from an earlier query root is rejected"
+                );
+                assert!(
+                    escaped_function_ptr
+                        .as_ref()
+                        .expect("first query pointer was captured")
+                        .resolve(FileId::new(0), root)
+                        .is_none(),
+                    "a pointer from an earlier query root is rejected"
+                );
+                u32::try_from(ast_ids.len()).expect("small test AST ID map")
+            })
+            .expect("second query-local AST is available");
+        let query_shape = queries
+            .ast_id_map_query
+            .get(&mut database, key.clone())
+            .expect("AST ID shape is available");
+        let (_, other_kind_parse) = parse_text("const VALUE: u32 = 0;\n");
+        let other_kind_root =
+            SyntaxNode::new_root_for_query_callback(other_kind_parse.root.green().clone());
+        assert!(matches!(
+            ast::AstIdMap::bind_query_shape(FileId::new(0), &other_kind_root, &query_shape),
+            Err(ast::AstIdMapError::ShapeMismatch)
+        ));
+        let (_, empty_parse) = parse_text("");
+        let empty_root = SyntaxNode::new_root_for_query_callback(empty_parse.root.green().clone());
+        assert!(matches!(
+            ast::AstIdMap::bind_query_shape(FileId::new(0), &empty_root, &query_shape),
+            Err(ast::AstIdMapError::ShapeMismatch)
+        ));
+        let query_green = queries
+            .green_parse(&mut database, key.clone())
+            .expect("green parse is available");
+        let query_root = SyntaxNode::new_root_for_query_callback(query_green.root().clone());
+        assert!(matches!(
+            ast::AstIdMap::new(FileId::new(0), &query_root),
+            Err(ast::AstIdMapError::UnboundRoot)
+        ));
         let memoized_shape = queries
             .ast_id_map_query
             .get(&mut database, key.clone())

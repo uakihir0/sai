@@ -191,7 +191,7 @@ pub struct AstIdMap {
 
 impl AstIdMap {
     pub fn new(file: FileId, root: &SyntaxNode) -> Result<Self, AstIdMapError> {
-        Self::build(file, root, None)
+        Self::build(file, root, None, false)
     }
 
     pub(crate) fn bind_shape(
@@ -199,13 +199,22 @@ impl AstIdMap {
         root: &SyntaxNode,
         shape: &AstIdMapShape,
     ) -> Result<Self, AstIdMapError> {
-        Self::build(file, root, Some(shape))
+        Self::build(file, root, Some(shape), false)
+    }
+
+    pub(crate) fn bind_query_shape(
+        file: FileId,
+        root: &SyntaxNode,
+        shape: &AstIdMapShape,
+    ) -> Result<Self, AstIdMapError> {
+        Self::build(file, root, Some(shape), true)
     }
 
     fn build(
         file: FileId,
         root: &SyntaxNode,
         shape: Option<&AstIdMapShape>,
+        allow_query_root: bool,
     ) -> Result<Self, AstIdMapError> {
         if !root.belongs_to_file(file) {
             return Err(AstIdMapError::FileMismatch);
@@ -213,8 +222,14 @@ impl AstIdMap {
         if root.kind() != SyntaxKind::SOURCE_FILE || root.parent().is_some() {
             return Err(AstIdMapError::NotFileRoot);
         }
-        if matches!(root.root_identity(), crate::red::RootIdentity::Tree(_)) {
-            return Err(AstIdMapError::UnboundRoot);
+        match root.root_identity() {
+            crate::red::RootIdentity::Snapshot { .. } if !allow_query_root => {}
+            crate::red::RootIdentity::Query(_) if allow_query_root => {}
+            crate::red::RootIdentity::Tree(_)
+            | crate::red::RootIdentity::Query(_)
+            | crate::red::RootIdentity::Snapshot { .. } => {
+                return Err(AstIdMapError::UnboundRoot);
+            }
         }
 
         let mut pointers = Vec::new();
@@ -267,12 +282,12 @@ impl AstIdMap {
 
     /// Return the workspace snapshot identity for this map's root.
     ///
-    /// `None` is reserved for maps built from unbound trees; `AstIdMap::new`
-    /// currently rejects those roots.
+    /// `None` means the map is not snapshot-bound. It includes query-local maps;
+    /// `AstIdMap::new` rejects ordinary tree-local roots.
     pub fn snapshot_id(&self) -> Option<WorkspaceSnapshotId> {
         match self.identity {
             RootIdentity::Snapshot { id, .. } => Some(id),
-            RootIdentity::Tree(_) => None,
+            RootIdentity::Tree(_) | RootIdentity::Query(_) => None,
         }
     }
 
