@@ -292,7 +292,7 @@ impl InvalidUtf8Sequence {
 }
 
 /// Maps source byte offsets to one-based lines and UTF-8/UTF-16 columns.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineIndex {
     text: Arc<str>,
     line_starts: Vec<TextSize>,
@@ -623,6 +623,27 @@ impl LineIndex {
             .saturating_add(delta)
             .clamp(0, u32::MAX as i64);
         original as u32
+    }
+}
+
+impl StableHash for LineIndex {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xB4);
+        self.text.stable_hash(hasher);
+        hasher.write_tag(0);
+        hasher.write_len(u64::try_from(self.line_starts.len()).unwrap_or(u64::MAX));
+        for start in &self.line_starts {
+            start.raw().stable_hash(hasher);
+        }
+        self.bom_shift.stable_hash(hasher);
+        hasher.write_tag(1);
+        hasher.write_len(u64::try_from(self.invalid_utf8.len()).unwrap_or(u64::MAX));
+        for sequence in self.invalid_utf8.iter() {
+            sequence.decoded_range.start().raw().stable_hash(hasher);
+            sequence.decoded_range.end().raw().stable_hash(hasher);
+            sequence.raw_len.stable_hash(hasher);
+        }
+        self.invalid_utf8_prefix_delta.stable_hash(hasher);
     }
 }
 
@@ -1254,6 +1275,7 @@ pub enum VfsInputUpdate {
 pub struct VfsInputs {
     inputs: InputQuery<VfsInputKey, VfsInputValue>,
     source_text_query: DerivedQuery<FileKey, SourceText>,
+    line_index_query: DerivedQuery<FileKey, Arc<LineIndex>>,
 }
 
 impl VfsInputs {
@@ -1272,9 +1294,18 @@ impl VfsInputs {
                 Ok(decode_source_text(contents))
             },
         )?;
+        let line_index_source_text_query = source_text_query.clone();
+        let line_index_query = DerivedQuery::<FileKey, Arc<LineIndex>>::new(
+            "line_index",
+            move |database: &mut QueryDatabase, key| {
+                let source_text = line_index_source_text_query.get(database, key.clone())?;
+                Ok(Arc::clone(&source_text.source.line_index))
+            },
+        )?;
         Ok(Self {
             inputs,
             source_text_query,
+            line_index_query,
         })
     }
 
@@ -1436,6 +1467,21 @@ impl VfsInputs {
         self.source_text_query
             .get(database, key)
             .map(|source| source.for_file_id(file_id))
+    }
+
+    /// Returns the memoized line index derived from a file's decoded source.
+    ///
+    /// The query is keyed by stable file identity and shares the `source_text`
+    /// query's decoding dependency. `LineIndex` contains no session-local
+    /// `FileId`, so callers can bind spans to their own session IDs.
+    pub fn line_index(
+        &self,
+        database: &mut QueryDatabase,
+        key: FileKey,
+    ) -> Result<Arc<LineIndex>, QueryError> {
+        self.line_index_query
+            .get(database, key)
+            .map(|line_index| Arc::clone(line_index.as_ref()))
     }
 
     /// Applies a group of file changes in one query revision.
@@ -2741,6 +2787,80 @@ mod tests {
             .expect("changed bytes invalidate source text");
         assert_eq!(changed.source().text(), "changed");
         assert_eq!(changed.status(), &SourceTextStatus::Ready);
+    }
+
+    #[test]
+    fn line_index_query_reuses_decoded_source_and_tracks_content_changes() {
+        let inputs = VfsInputs::new().expect("input queries are available");
+        let mut database = QueryDatabase::new();
+        let key = FileKey::new("acme:app#0.1", "src/main.sai").expect("file key is valid");
+        let raw = b"\xEF\xBB\xBFA\r\nB";
+        inputs
+            .set_file_contents(
+                &mut database,
+                key.clone(),
+                Arc::from(&raw[..]),
+                Durability::Low,
+            )
+            .expect("raw bytes are set");
+
+        let first = inputs
+            .line_index(&mut database, key.clone())
+            .expect("line index query succeeds");
+        assert_eq!(first.line_count(), 2);
+        assert_eq!(first.position(TextSize::new(0)).byte, 3);
+        assert_eq!(first.position(TextSize::new(1)).byte, 4);
+
+        inputs
+            .set_file_contents(
+                &mut database,
+                key.clone(),
+                Arc::from(&raw[..]),
+                Durability::High,
+            )
+            .expect("durability-only update is accepted");
+        let unchanged = inputs
+            .line_index(&mut database, key.clone())
+            .expect("line index remains available");
+        assert!(
+            Arc::ptr_eq(&first, &unchanged),
+            "equal source text keeps the memoized line index"
+        );
+
+        inputs
+            .set_file_contents(
+                &mut database,
+                key.clone(),
+                Arc::from(&b"A\r\nB"[..]),
+                Durability::Low,
+            )
+            .expect("BOM removal changes source bytes");
+        let bom_removed = inputs
+            .line_index(&mut database, key.clone())
+            .expect("line index reflects BOM removal");
+        assert_eq!(bom_removed.line_count(), 2);
+        assert_eq!(bom_removed.position(TextSize::new(0)).byte, 0);
+        assert!(
+            !Arc::ptr_eq(&unchanged, &bom_removed),
+            "BOM metadata participates in line-index equality"
+        );
+
+        inputs
+            .set_file_contents(
+                &mut database,
+                key.clone(),
+                Arc::from(&b"A\r\nB\nC"[..]),
+                Durability::Low,
+            )
+            .expect("changed source bytes are set");
+        let changed = inputs
+            .line_index(&mut database, key)
+            .expect("changed line index is recomputed");
+        assert_eq!(changed.line_count(), 3);
+        assert!(
+            !Arc::ptr_eq(&bom_removed, &changed),
+            "changed source bytes produce a new line index"
+        );
     }
 
     #[test]
