@@ -74,6 +74,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sai_driver"
+version = "0.1.0"
+dependencies = [
+ "sai_diagnostics",
+ "sai_hir",
+ "sai_intern",
+ "sai_query",
+ "sai_stable_hash",
+ "sai_syntax",
+ "sai_vfs",
+]
+
+[[package]]
 name = "sai_hir"
 version = "0.1.0"
 dependencies = [
