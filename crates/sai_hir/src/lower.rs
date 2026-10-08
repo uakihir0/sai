@@ -94,6 +94,13 @@ pub struct WorldItemIds {
     pub item: ast::ErasedAstId,
 }
 
+/// AST identities that locate one extern function within its block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternItemIds {
+    pub block: ast::ErasedAstId,
+    pub item: ast::ErasedAstId,
+}
+
 /// Lower a function declaration's signature and body within its HIR owner.
 ///
 /// The source-map builder must be rooted at `declaration`. An async function
@@ -1306,6 +1313,191 @@ pub fn lower_extern_block_owner<'hir>(
             node: OwnerNode::Item(item),
             body: None,
             raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
+/// Lower one extern function below the exact source-ordered extern block.
+///
+/// The parent owner, ItemTree entries, function syntax, and complete DefPath
+/// must all identify the same declaration.
+pub fn lower_extern_item_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    block_owner: &HirOwner<'hir>,
+    item_ids: ExternItemIds,
+    item_tree: &'hir ItemTree,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let OwnerNode::Item(parent_item) = block_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item.owner_id != block_owner.id {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let ItemKind::ExternBlock {
+        safety: parent_safety,
+        abi: parent_abi,
+        module: parent_module,
+        items: parent_item_owners,
+    } = parent_item.kind
+    else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+
+    let (block_entry, block_syntax) = resolve_item_tree_entry(
+        item_tree,
+        item_ids.block,
+        ItemTreeKind::ExternBlock,
+        context,
+    )?;
+    let block_declaration =
+        ast::ExternBlock::cast(block_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let block_info = extern_block_info(&block_declaration, context.symbols)?;
+    validate_current_item_metadata(
+        block_entry,
+        block_declaration.attrs(),
+        crate::Visibility::Private,
+        context,
+    )?;
+    if parent_item.name.sym != block_entry.name
+        || parent_item.vis != crate::Visibility::Private
+        || parent_safety != block_info.safety
+        || parent_abi != block_info.abi
+        || parent_module != block_info.module
+        || !raw_attrs_match(block_owner.raw_attrs, &block_entry.raw_attrs)
+        || parent_item.span
+            != (Span {
+                file: item_tree.file,
+                range: block_declaration.syntax().text_range(),
+                ctxt: SpanCtxt::Root,
+            })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let block_path = context
+        .def_paths
+        .resolve(block_owner.id.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    validate_owner_def_path(
+        block_owner.id,
+        &block_path,
+        block_info.path.clone(),
+        context,
+    )?;
+    if !matches!(
+        block_path.data().last(),
+        Some(component)
+            if component.disambiguator
+                == extern_block_disambiguator(block_entry, &block_info.path, context)?
+    ) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let item_list = block_declaration
+        .items()
+        .ok_or(HirLoweringError::MissingRequiredSyntax(
+            SyntaxKind::ITEM_LIST,
+        ))?;
+    let item_paths = prepare_extern_item_paths(block_entry, &item_list, context)?;
+    let item_entry = block_entry
+        .children
+        .iter()
+        .find(|child| child.ast_id == item_ids.item)
+        .filter(|child| child.kind == ItemTreeKind::ExternFn)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+
+    let mut child_index = 0;
+    let mut function_syntax = None;
+    for syntax in item_list.syntax().children() {
+        let Some(function) = ast::FnDecl::cast(syntax.clone()) else {
+            continue;
+        };
+        let function_ast_id = context
+            .ast_ids
+            .ast_id(&function)
+            .map(ast::AstId::erase)
+            .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+        if function_ast_id == item_ids.item {
+            function_syntax = Some(syntax);
+            break;
+        }
+        child_index += 1;
+    }
+    let function_syntax = function_syntax.ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if parent_item_owners.get(child_index) != Some(&owner) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let (component, disambiguator) = item_paths
+        .get(child_index)
+        .cloned()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if component != DefPathData::ValueNs(item_entry.name) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    validate_owner_def_path(owner, expected_path, component.clone(), context)?;
+    let item_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    if item_path.data().get(..block_path.data().len()) != Some(block_path.data())
+        || item_path.data().len() != block_path.data().len() + 1
+        || !matches!(
+            item_path.data().last(),
+            Some(path_component)
+                if path_component.data == component
+                    && path_component.disambiguator == disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let function =
+        ast::FnDecl::cast(function_syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    validate_current_item_metadata(
+        item_entry,
+        function.attrs(),
+        item_visibility(function.syntax()),
+        context,
+    )?;
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        function.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        function.name(),
+        function.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != item_entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let (sig, generics, body) =
+        lower_function_with_generics(&function, context.arena, context.symbols, &mut source_map)?;
+    let span = source_map.span_for(function.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_extern_item(crate::items::ExternItem {
+        owner_id: owner,
+        block: block_owner.id.def_id,
+        name,
+        sig,
+        generics: *generics,
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::ExternItem(item),
+            body,
+            raw_attrs: &item_entry.raw_attrs,
             diagnostics,
         },
         source_map,
@@ -22251,6 +22443,336 @@ mod tests {
             panic!("extern block is represented by an item owner");
         };
         assert!(matches!(second_item.kind, ItemKind::ExternBlock { .. }));
+    }
+
+    #[test]
+    fn extern_item_owner_lowers_generics_signatures_and_contracts() {
+        let file = crate::FileId::new(307);
+        let source = concat!(
+            "unsafe extern \"wasm\" module \"env\" {\n",
+            "    fn lookup<T: Clone>(value: T) -> T where T: Copy requires true ensures true\n",
+            "    fn lookup(value: U32) -> U64\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects extern functions");
+        let block_entry = item_tree
+            .items
+            .first()
+            .expect("extern block item-tree entry");
+        assert_eq!(block_entry.children.len(), 2);
+        let abi = symbols.intern("wasm").expect("ABI symbol interns");
+        let module = symbols.intern("env").expect("module symbol interns");
+        let (_packages, paths, block_owner_id) = owner_context_with_data(
+            &symbols,
+            DefPathData::ExternBlock {
+                abi,
+                module: Some(module),
+            },
+        );
+        let block_path = owner_def_path(&paths, block_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (block_owner, _) = lower_extern_block_owner(
+            block_owner_id,
+            &block_path,
+            &item_tree,
+            block_entry.ast_id,
+            &context,
+        )
+        .expect("extern block owner lowers");
+        let OwnerNode::Item(block_item) = block_owner.node else {
+            panic!("extern block is represented by an item owner");
+        };
+        let ItemKind::ExternBlock { items, .. } = block_item.kind else {
+            panic!("extern block retains its item kind");
+        };
+        assert_eq!(items.len(), 2);
+
+        let name = symbols.intern("lookup").expect("function name interns");
+        for (index, disambiguator) in [0, 1].into_iter().enumerate() {
+            let item_owner = items[index];
+            let item_path = owner_def_path(&paths, item_owner);
+            let (hir_owner, source_map) = lower_extern_item_owner(
+                item_owner,
+                &item_path,
+                &block_owner,
+                ExternItemIds {
+                    block: block_entry.ast_id,
+                    item: block_entry.children[index].ast_id,
+                },
+                &item_tree,
+                &context,
+            )
+            .expect("extern function owner lowers");
+            assert_eq!(source_map.owner(), item_owner);
+            let OwnerNode::ExternItem(item) = hir_owner.node else {
+                panic!("extern function has an extern-item owner");
+            };
+            assert_eq!(item.owner_id, item_owner);
+            assert_eq!(item.block, block_owner_id.def_id);
+            assert_eq!(item.name.sym, name);
+            assert!(item.span.range.start() < item.span.range.end());
+            assert!(item_path.data().last().is_some_and(|component| {
+                component.data == DefPathData::ValueNs(name)
+                    && component.disambiguator == disambiguator
+            }));
+
+            if index == 0 {
+                assert_eq!(item.sig.params.len(), 1);
+                assert_eq!(item.sig.requires.len(), 1);
+                assert_eq!(item.sig.ensures.len(), 1);
+                assert_eq!(item.generics.params.len(), 1);
+                assert_eq!(item.generics.where_preds.len(), 1);
+                let body = hir_owner
+                    .body
+                    .expect("contract expressions retain their synthetic body");
+                assert_eq!(body.params.len(), 1);
+                assert!(matches!(body.value.kind, ExprKind::Tuple(_)));
+            } else {
+                assert_eq!(item.sig.params.len(), 1);
+                assert!(item.sig.requires.is_empty());
+                assert!(item.sig.ensures.is_empty());
+                assert!(item.generics.params.is_empty());
+                assert!(item.generics.where_preds.is_empty());
+                assert!(hir_owner.body.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn extern_item_owner_recovers_signature_errors_and_discards_diagnosed_bodies() {
+        let file = crate::FileId::new(309);
+        let source = concat!(
+            "extern \"wasm\" module \"env\" {\n",
+            "    fn diagnosed_body() { true }\n",
+            "    fn malformed(value: ) ->\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::UnexpectedFnBody),
+            "{:?}",
+            parsed.errors
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree retains recovered extern functions");
+        let block_entry = item_tree
+            .items
+            .first()
+            .expect("extern block item-tree entry");
+        assert_eq!(block_entry.children.len(), 2);
+        let abi = symbols.intern("wasm").expect("ABI symbol interns");
+        let module = symbols.intern("env").expect("module symbol interns");
+        let (_packages, paths, block_owner_id) = owner_context_with_data(
+            &symbols,
+            DefPathData::ExternBlock {
+                abi,
+                module: Some(module),
+            },
+        );
+        let block_path = owner_def_path(&paths, block_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (block_owner, _) = lower_extern_block_owner(
+            block_owner_id,
+            &block_path,
+            &item_tree,
+            block_entry.ast_id,
+            &context,
+        )
+        .expect("extern block survives diagnosed member syntax");
+        let OwnerNode::Item(block_item) = block_owner.node else {
+            panic!("extern block is represented by an item owner");
+        };
+        let ItemKind::ExternBlock { items, .. } = block_item.kind else {
+            panic!("extern block retains its item kind");
+        };
+
+        for (index, item_entry) in block_entry.children.iter().enumerate() {
+            let item_owner = items[index];
+            let item_path = owner_def_path(&paths, item_owner);
+            let (hir_owner, _) = lower_extern_item_owner(
+                item_owner,
+                &item_path,
+                &block_owner,
+                ExternItemIds {
+                    block: block_entry.ast_id,
+                    item: item_entry.ast_id,
+                },
+                &item_tree,
+                &context,
+            )
+            .expect("diagnosed extern function remains lowerable");
+            let OwnerNode::ExternItem(item) = hir_owner.node else {
+                panic!("function has an extern-item owner");
+            };
+            assert!(hir_owner.body.is_none());
+            if index == 1 {
+                assert!(matches!(item.sig.params[0].ty.kind, HirTyKind::Err));
+                assert!(matches!(
+                    item.sig.ret.map(|ty| ty.kind),
+                    Some(HirTyKind::Err)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn extern_item_owner_rejects_crosswired_parents_and_stale_child_names() {
+        let file = crate::FileId::new(308);
+        let source = concat!(
+            "extern \"wasm\" module \"env\" { fn call() }\n",
+            "extern \"wasm\" module \"env\" { fn call() }\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects duplicate extern blocks");
+        let block_entries = item_tree
+            .items
+            .iter()
+            .filter(|entry| entry.kind == ItemTreeKind::ExternBlock)
+            .collect::<Vec<_>>();
+        assert_eq!(block_entries.len(), 2);
+        let abi = symbols.intern("wasm").expect("ABI symbol interns");
+        let module = symbols.intern("env").expect("module symbol interns");
+        let (packages, paths, first_block_owner_id) = owner_context_with_data(
+            &symbols,
+            DefPathData::ExternBlock {
+                abi,
+                module: Some(module),
+            },
+        );
+        let first_block_path = owner_def_path(&paths, first_block_owner_id);
+        let mut second_block_path_data = first_block_path.data().to_vec();
+        second_block_path_data.last_mut().unwrap().disambiguator = 1;
+        let second_block_path = DefPath::new(
+            first_block_path.package(),
+            second_block_path_data,
+            &packages,
+            &symbols,
+        )
+        .expect("second duplicate block path is valid");
+        let second_block_owner_id = OwnerId {
+            def_id: paths
+                .intern(second_block_path.clone())
+                .expect("second block path interns"),
+        };
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (first_block_owner, _) = lower_extern_block_owner(
+            first_block_owner_id,
+            &first_block_path,
+            &item_tree,
+            block_entries[0].ast_id,
+            &context,
+        )
+        .expect("first block lowers");
+        let (second_block_owner, _) = lower_extern_block_owner(
+            second_block_owner_id,
+            &second_block_path,
+            &item_tree,
+            block_entries[1].ast_id,
+            &context,
+        )
+        .expect("second block lowers");
+        let first_child_owner = match first_block_owner.node {
+            OwnerNode::Item(item) => match item.kind {
+                ItemKind::ExternBlock { items, .. } => items[0],
+                _ => panic!("first owner retains extern-block kind"),
+            },
+            _ => panic!("first block is an item owner"),
+        };
+        let second_child_owner = match second_block_owner.node {
+            OwnerNode::Item(item) => match item.kind {
+                ItemKind::ExternBlock { items, .. } => items[0],
+                _ => panic!("second owner retains extern-block kind"),
+            },
+            _ => panic!("second block is an item owner"),
+        };
+        let second_child_path = owner_def_path(&paths, second_child_owner);
+        let path_count = paths.len().unwrap();
+
+        assert!(matches!(
+            lower_extern_item_owner(
+                second_child_owner,
+                &second_child_path,
+                &first_block_owner,
+                ExternItemIds {
+                    block: block_entries[1].ast_id,
+                    item: block_entries[1].children[0].ast_id,
+                },
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert!(matches!(
+            lower_extern_item_owner(
+                first_child_owner,
+                &owner_def_path(&paths, first_child_owner),
+                &second_block_owner,
+                ExternItemIds {
+                    block: block_entries[1].ast_id,
+                    item: block_entries[1].children[0].ast_id,
+                },
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+
+        let forged = symbols.intern("forged").expect("forged symbol interns");
+        let mut stale_item_tree = item_tree.clone();
+        stale_item_tree.items[1].children[0].name = forged;
+        assert!(matches!(
+            lower_extern_item_owner(
+                second_child_owner,
+                &second_child_path,
+                &second_block_owner,
+                ExternItemIds {
+                    block: block_entries[1].ast_id,
+                    item: block_entries[1].children[0].ast_id,
+                },
+                &stale_item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            path_count,
+            "rejecting cross-wired or stale extern items does not mutate paths"
+        );
+
+        let (hir_owner, _) = lower_extern_item_owner(
+            second_child_owner,
+            &second_child_path,
+            &second_block_owner,
+            ExternItemIds {
+                block: block_entries[1].ast_id,
+                item: block_entries[1].children[0].ast_id,
+            },
+            &item_tree,
+            &context,
+        )
+        .expect("the correctly parented second extern item lowers");
+        let OwnerNode::ExternItem(item) = hir_owner.node else {
+            panic!("second function has an extern-item owner");
+        };
+        assert_eq!(item.block, second_block_owner_id.def_id);
     }
 
     #[test]
