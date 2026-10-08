@@ -642,6 +642,88 @@ pub fn lower_struct_owner<'hir>(
     ))
 }
 
+/// Lower one top-level resource declaration from the current item tree.
+///
+/// Resource fields use the same visibility, source mapping, and definition-path
+/// rules as record fields. Diagnosed missing field types recover as
+/// `TyKind::Err`; a resource has no body.
+pub fn lower_resource_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    item_id: ast::ErasedAstId,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let (entry, syntax) =
+        resolve_item_tree_entry(item_tree, item_id, ItemTreeKind::Resource, context)?;
+    let declaration =
+        ast::ResourceDecl::cast(syntax).ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let visibility = item_visibility(declaration.syntax());
+    validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
+    validate_owner_def_path(
+        owner,
+        expected_path,
+        DefPathData::TypeNs(entry.name),
+        context,
+    )?;
+    let fields = declaration
+        .fields()
+        .map(|list| list.fields().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for field in &fields {
+        if let Some(ty) = field.ty() {
+            ensure_supported_type(&ty)?;
+        }
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(
+        declaration.name(),
+        declaration.syntax(),
+        context.symbols,
+        &source_map,
+    )?;
+    if name.sym != entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let pending_fields = prepare_field_defs(fields, context.symbols, &source_map)?;
+    let fields = lower_field_defs(
+        pending_fields,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+    )?;
+    let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+    let item = context.arena.alloc_item(Item {
+        owner_id: owner,
+        name,
+        vis: visibility,
+        kind: ItemKind::Resource {
+            fields: context.arena.alloc_field_defs(&fields),
+        },
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::Item(item),
+            body: None,
+            raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
 /// Lower one top-level constant entry from the current item tree.
 ///
 /// A diagnosed missing type or initializer is retained as an error HIR node so
@@ -16670,6 +16752,162 @@ mod tests {
                 &expected_path,
                 &item_tree,
                 alias_entry.ast_id,
+                &context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(paths.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn lowers_item_tree_resource_with_fields_and_field_paths() {
+        let file = crate::FileId::new(269);
+        let source = concat!(
+            "@deprecated(\"legacy handle\")\n",
+            "pub resource File {\n",
+            "    pub handle: U32\n",
+            "    state: String\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let entry = item_tree.items.first().expect("resource item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Resource);
+        assert_eq!(entry.children.len(), 2);
+        let name = symbols.intern("File").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, source_map) =
+            lower_resource_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("resource lowers to a complete owner");
+        assert_eq!(hir_owner.id, owner);
+        assert_eq!(hir_owner.raw_attrs.len(), 1);
+        assert!(hir_owner.diagnostics.is_empty());
+        assert_eq!(source_map.owner(), owner);
+        assert!(hir_owner.body.is_none());
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level resource is represented by an item owner");
+        };
+        assert_eq!(item.vis, crate::Visibility::Pub);
+        let ItemKind::Resource { fields } = item.kind else {
+            panic!("resource declaration retains its resource item kind");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].vis, crate::Visibility::Pub);
+        assert_eq!(fields[1].vis, crate::Visibility::Private);
+        assert_eq!(fields[0].name.sym, symbols.intern("handle").unwrap());
+        assert_eq!(fields[1].name.sym, symbols.intern("state").unwrap());
+        assert!(matches!(fields[0].ty.kind, HirTyKind::Path(_)));
+        assert!(matches!(fields[1].ty.kind, HirTyKind::Path(_)));
+        for (field, expected_name) in fields.iter().zip(["handle", "state"]) {
+            let path = paths
+                .resolve(field.def_id)
+                .expect("field definition path resolves")
+                .expect("field definition path exists");
+            assert_eq!(
+                path.data().last(),
+                Some(&DisambiguatedDefPathData {
+                    data: DefPathData::Field(symbols.intern(expected_name).unwrap()),
+                    disambiguator: 0,
+                })
+            );
+            assert!(source_map.syntax_for_node(field.hir_id).is_some());
+        }
+    }
+
+    #[test]
+    fn resource_owner_recovers_a_missing_field_type() {
+        let file = crate::FileId::new(270);
+        let source = "resource Broken {\n    handle:\n}\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            !parsed.errors.is_empty(),
+            "the missing field type is diagnosed"
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects the diagnosed resource");
+        let entry = item_tree.items.first().expect("resource item entry");
+        assert_eq!(entry.kind, ItemTreeKind::Resource);
+        let name = symbols.intern("Broken").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+
+        let (hir_owner, _) =
+            lower_resource_owner(owner, &expected_path, &item_tree, entry.ast_id, &context)
+                .expect("missing field type recovers to error HIR");
+        let OwnerNode::Item(item) = hir_owner.node else {
+            panic!("top-level resource is represented by an item owner");
+        };
+        let ItemKind::Resource { fields } = item.kind else {
+            panic!("resource declaration retains its resource item kind");
+        };
+        assert_eq!(fields.len(), 1);
+        assert!(matches!(fields[0].ty.kind, HirTyKind::Err));
+    }
+
+    #[test]
+    fn resource_owner_rejects_wrong_paths_and_other_item_kinds() {
+        let file = crate::FileId::new(271);
+        let source = "resource File\nconst VALUE: I32 = 1\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects");
+        let resource_entry = item_tree.items.first().expect("resource item entry");
+        let const_entry = item_tree.items.get(1).expect("constant item entry");
+        assert_eq!(resource_entry.kind, ItemTreeKind::Resource);
+
+        let wrong_name = symbols.intern("File").expect("symbol interns");
+        let (_packages, wrong_paths, wrong_owner) =
+            owner_context_with_data(&symbols, DefPathData::ValueNs(wrong_name));
+        let wrong_expected_path = owner_def_path(&wrong_paths, wrong_owner);
+        let arena = HirArena::new();
+        let wrong_context = HirLoweringContext::new(
+            &ast_ids,
+            &snapshot,
+            &parsed.root,
+            &arena,
+            &symbols,
+            &wrong_paths,
+        );
+        assert!(matches!(
+            lower_resource_owner(
+                wrong_owner,
+                &wrong_expected_path,
+                &item_tree,
+                resource_entry.ast_id,
+                &wrong_context
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(wrong_paths.len().unwrap(), 1);
+
+        let name = symbols.intern("File").expect("symbol interns");
+        let (_packages, paths, owner) =
+            owner_context_with_data(&symbols, DefPathData::TypeNs(name));
+        let expected_path = owner_def_path(&paths, owner);
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        assert!(matches!(
+            lower_resource_owner(
+                owner,
+                &expected_path,
+                &item_tree,
+                const_entry.ast_id,
                 &context
             ),
             Err(HirLoweringError::ItemTreeEntryMismatch)

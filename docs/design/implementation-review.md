@@ -1055,3 +1055,10 @@
 - **Reason:** This follows the distinct-type HIR schema and spec/05 §5.6.3. Constructor visibility is separate from the item's outer visibility; a refinement clause changes the owner by adding a predicate body without changing its distinct type representation.
 - **Review:** Hostile review found no implementation defect but identified that the initial test combined outer and constructor `pub` markers. Added independent cases for a public type with a private constructor and a private type with a public constructor; follow-up review confirmed the coverage and found no other issues. All 685 workspace tests passed, including all 210 HIR tests; workspace Clippy with warnings denied, formatting, and `git diff --check` passed.
 - **Human review:** Confirm that inner `pub` exposes only the distinct constructor while outer visibility remains the type's module visibility, and that `has_predicate` remains true when the parser diagnoses a missing predicate expression.
+
+### IR-165: Assemble top-level resource HIR owners
+
+- **Decision:** Add `lower_resource_owner` for `ItemTreeKind::Resource`. Verify the expected type-namespace owner path, lower resource fields in source order with the existing field identity and visibility rules, and return no body. Recover a parser-diagnosed missing field type as `TyKind::Err`.
+- **Reason:** `ItemKind::Resource` already uses `FieldDef`, and resource declarations reuse `FieldDecl` syntax and ItemTree field entries. Reusing the field lowering path keeps source mapping, field `DefId`s, and visibility consistent with records.
+- **Review:** Hostile review against spec/05 §5.6.6 and resource visibility rules found no actionable issues. Tests cover field order, visibility, definition paths, source mappings, missing-type recovery, and wrong kinds/paths. All 688 workspace tests passed, including all 213 HIR tests; workspace Clippy with warnings denied, formatting, and `git diff --check` passed.
+- **Human review:** Confirm that record-style field visibility and `DefPathData::Field` identities apply unchanged to resource fields; resource-specific ownership and borrow restrictions remain semantic checks.
