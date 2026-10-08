@@ -8,8 +8,8 @@ use crate::expressions::{
 };
 use crate::item_tree::{ItemTree, ItemTreeError, ItemTreeKind, RawAttr, RawAttrArg};
 use crate::items::{
-    FieldDef, HirOwner, ImplItem, ImplItemKind, Item, ItemKind, OwnerNode, TraitItem,
-    TraitItemKind, Variant as HirVariant, VariantShape as HirVariantShape,
+    FieldDef, HirOwner, ImplItem, ImplItemKind, InterfaceItem, InterfaceItemKind, Item, ItemKind,
+    OwnerNode, TraitItem, TraitItemKind, Variant as HirVariant, VariantShape as HirVariantShape,
 };
 use crate::literals::Lit;
 use crate::patterns::{BindingMode as HirBindingMode, Pat, PatArg, PatKind, PatRangeEnd};
@@ -94,7 +94,7 @@ pub fn lower_function<'hir>(
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(FnSig<'hir>, Option<&'hir Body<'hir>>), HirLoweringError> {
     let (signature, _, body) =
-        lower_function_inner(declaration, arena, symbols, source_map, false)?;
+        lower_function_inner(declaration, arena, symbols, source_map, false, true)?;
     Ok((signature, body))
 }
 
@@ -117,7 +117,22 @@ pub fn lower_function_with_generics<'hir>(
     ),
     HirLoweringError,
 > {
-    lower_function_inner(declaration, arena, symbols, source_map, true)
+    lower_function_inner(declaration, arena, symbols, source_map, true, true)
+}
+
+/// Lower a function signature and generics without lowering a body or
+/// contracts. Interface and world function declarations use this entry point:
+/// their grammar diagnoses bodies and contracts, and their HIR owners never
+/// contain a `Body`.
+pub fn lower_function_signature_with_generics<'hir>(
+    declaration: &ast::FnDecl,
+    arena: &'hir HirArena<'hir>,
+    symbols: &Interner,
+    source_map: &mut HirSourceMapBuilder<'_>,
+) -> Result<(FnSig<'hir>, &'hir HirGenerics<'hir>), HirLoweringError> {
+    let (signature, generics, _) =
+        lower_function_inner(declaration, arena, symbols, source_map, true, false)?;
+    Ok((signature, generics))
 }
 
 /// Lower one top-level function entry from the current item tree into a
@@ -1099,6 +1114,536 @@ pub fn lower_interface_owner<'hir>(
             node: OwnerNode::Item(item),
             body: None,
             raw_attrs: &entry.raw_attrs,
+            diagnostics,
+        },
+        source_map,
+    ))
+}
+
+/// Lower one direct type, enum, resource, or function member of an interface.
+///
+/// The HIR parent, ItemTree entry, and source-ordered child owner must all
+/// identify the same interface declaration. Nested resource members receive
+/// their paths here and are lowered as separate owners.
+pub fn lower_interface_item_owner<'hir>(
+    owner: OwnerId,
+    expected_path: &DefPath,
+    interface_owner: &HirOwner<'hir>,
+    interface_item_id: ast::ErasedAstId,
+    item_id: ast::ErasedAstId,
+    item_tree: &'hir ItemTree,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), HirLoweringError> {
+    let OwnerNode::Item(parent_item) = interface_owner.node else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    let ItemKind::Interface {
+        items: parent_item_owners,
+    } = parent_item.kind
+    else {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    };
+    if parent_item.owner_id != interface_owner.id {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let (interface_entry, interface_syntax) = resolve_item_tree_entry(
+        item_tree,
+        interface_item_id,
+        ItemTreeKind::Interface,
+        context,
+    )?;
+    let interface_declaration = ast::InterfaceDecl::cast(interface_syntax)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let interface_visibility = item_visibility(interface_declaration.syntax());
+    validate_current_item_metadata(
+        interface_entry,
+        interface_declaration.attrs(),
+        interface_visibility,
+        context,
+    )?;
+    if parent_item.vis != interface_visibility
+        || !raw_attrs_match(interface_owner.raw_attrs, &interface_entry.raw_attrs)
+        || parent_item.span
+            != (Span {
+                file: item_tree.file,
+                range: interface_declaration.syntax().text_range(),
+                ctxt: SpanCtxt::Root,
+            })
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let interface_path = context
+        .def_paths
+        .resolve(interface_owner.id.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    validate_owner_def_path(
+        interface_owner.id,
+        &interface_path,
+        DefPathData::Interface(interface_entry.name),
+        context,
+    )?;
+    if !matches!(
+        interface_path.data().last(),
+        Some(component)
+            if component.disambiguator
+                == interface_entry_disambiguator(item_tree, interface_entry)?
+    ) || parent_item.name.sym != interface_entry.name
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_list =
+        interface_declaration
+            .items()
+            .ok_or(HirLoweringError::MissingRequiredSyntax(
+                SyntaxKind::ITEM_LIST,
+            ))?;
+    let interface_item_entry = interface_entry
+        .children
+        .iter()
+        .find(|child| child.ast_id == item_id)
+        .filter(|child| {
+            matches!(
+                child.kind,
+                ItemTreeKind::Struct
+                    | ItemTreeKind::Alias
+                    | ItemTreeKind::Refined
+                    | ItemTreeKind::Enum
+                    | ItemTreeKind::Resource
+                    | ItemTreeKind::InterfaceFn
+            )
+        })
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let associated_index = interface_entry
+        .children
+        .iter()
+        .filter(|child| {
+            matches!(
+                child.kind,
+                ItemTreeKind::Struct
+                    | ItemTreeKind::Alias
+                    | ItemTreeKind::Refined
+                    | ItemTreeKind::Enum
+                    | ItemTreeKind::Resource
+                    | ItemTreeKind::InterfaceFn
+            )
+        })
+        .position(|child| child.ast_id == item_id)
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if parent_item_owners.get(associated_index) != Some(&owner) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    let item_syntax = context
+        .ast_ids
+        .pointer(item_id)
+        .and_then(|pointer| pointer.resolve(item_tree.file, context.root))
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    if !item_list.syntax().children().any(|child| {
+        child.kind() == item_syntax.kind() && child.text_range() == item_syntax.text_range()
+    }) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let (item_name_syntax, attrs, visibility, component) = match interface_item_entry.kind {
+        ItemTreeKind::Struct | ItemTreeKind::Alias | ItemTreeKind::Refined => {
+            let declaration = ast::TypeDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let component = DefPathData::TypeNs(interface_item_entry.name);
+            let expected_kind = if declaration.struct_def().is_some() {
+                ItemTreeKind::Struct
+            } else if declaration
+                .alias_def()
+                .is_some_and(|definition| definition.refinement().is_some())
+            {
+                ItemTreeKind::Refined
+            } else {
+                ItemTreeKind::Alias
+            };
+            if expected_kind != interface_item_entry.kind {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            (
+                declaration.name(),
+                declaration.attrs().collect::<Vec<_>>(),
+                item_visibility(declaration.syntax()),
+                component,
+            )
+        }
+        ItemTreeKind::Enum => {
+            let declaration = ast::EnumDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                declaration.name(),
+                declaration.attrs().collect::<Vec<_>>(),
+                item_visibility(declaration.syntax()),
+                DefPathData::TypeNs(interface_item_entry.name),
+            )
+        }
+        ItemTreeKind::Resource => {
+            let declaration = ast::IfaceResource::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                declaration.name(),
+                declaration.attrs().collect::<Vec<_>>(),
+                item_visibility(declaration.syntax()),
+                DefPathData::TypeNs(interface_item_entry.name),
+            )
+        }
+        ItemTreeKind::InterfaceFn => {
+            let declaration = ast::FnDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            (
+                declaration.name(),
+                declaration.attrs().collect::<Vec<_>>(),
+                item_visibility(declaration.syntax()),
+                DefPathData::ValueNs(interface_item_entry.name),
+            )
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    };
+    validate_current_item_metadata(interface_item_entry, attrs.into_iter(), visibility, context)?;
+    validate_owner_def_path(owner, expected_path, component.clone(), context)?;
+    let item_path = context
+        .def_paths
+        .resolve(owner.def_id)?
+        .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
+    let source_disambiguator =
+        interface_child_disambiguator(interface_entry, interface_item_entry, &component)?;
+    if item_path.data().get(..interface_path.data().len()) != Some(interface_path.data())
+        || item_path.data().len() != interface_path.data().len() + 1
+        || !matches!(
+            item_path.data().last(),
+            Some(path_component)
+                if path_component.data == component
+                    && path_component.disambiguator == source_disambiguator
+        )
+    {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        &item_syntax,
+    )?
+    .with_def_path_interner(context.def_paths);
+    let name = lower_item_name(item_name_syntax, &item_syntax, context.symbols, &source_map)?;
+    if name.sym != interface_item_entry.name {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
+    let kind = match interface_item_entry.kind {
+        ItemTreeKind::Struct => {
+            let declaration = ast::TypeDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let definition = declaration
+                .struct_def()
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let fields = definition
+                .fields()
+                .map(|list| list.fields().collect::<Vec<_>>())
+                .unwrap_or_default();
+            ensure_supported_generic_params(declaration.generic_params())?;
+            if let Some(where_clause) = definition.where_clause() {
+                ensure_supported_where_clause(&where_clause)?;
+            }
+            for field in &fields {
+                if let Some(ty) = field.ty() {
+                    ensure_supported_type(&ty)?;
+                }
+            }
+            let pending_generic_params =
+                prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+            let pending_fields = prepare_field_defs(fields, context.symbols, &source_map)?;
+            let generic_params = lower_generic_params(
+                pending_generic_params,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            let where_preds = definition
+                .where_clause()
+                .map(|clause| {
+                    lower_where_clause(&clause, context.arena, context.symbols, &mut source_map)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let fields = lower_field_defs(
+                pending_fields,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?
+            .into_iter()
+            .map(|mut field| {
+                field.vis = crate::Visibility::Pub;
+                field
+            })
+            .collect::<Vec<_>>();
+            let generics = context.arena.alloc_generics(HirGenerics {
+                params: context.arena.alloc_generic_params(&generic_params),
+                where_preds: context.arena.alloc_where_preds(&where_preds),
+            });
+            InterfaceItemKind::Struct {
+                generics: *generics,
+                fields: context.arena.alloc_field_defs(&fields),
+            }
+        }
+        ItemTreeKind::Alias => {
+            let declaration = ast::TypeDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let definition = declaration
+                .alias_def()
+                .filter(|definition| definition.refinement().is_none())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            ensure_supported_generic_params(declaration.generic_params())?;
+            if let Some(ty) = definition.ty() {
+                ensure_supported_type(&ty)?;
+            }
+            let pending_generic_params =
+                prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+            let generic_params = lower_generic_params(
+                pending_generic_params,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            let ty = match definition.ty() {
+                Some(ty) => lower_type(&ty, context.arena, context.symbols, &mut source_map)?,
+                None => {
+                    let error_syntax = direct_error_child(definition.syntax())
+                        .unwrap_or_else(|| definition.syntax().clone());
+                    lower_error_type(&error_syntax, context.arena, &mut source_map)?
+                }
+            };
+            let generics = context.arena.alloc_generics(HirGenerics {
+                params: context.arena.alloc_generic_params(&generic_params),
+                where_preds: &[],
+            });
+            InterfaceItemKind::Alias {
+                generics: *generics,
+                ty,
+            }
+        }
+        ItemTreeKind::Refined => {
+            let declaration = ast::TypeDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let definition = declaration
+                .alias_def()
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let refinement = definition
+                .refinement()
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            ensure_supported_generic_params(declaration.generic_params())?;
+            if let Some(ty) = definition.ty() {
+                ensure_supported_type(&ty)?;
+            }
+            let base = match definition.ty() {
+                Some(ty) => lower_type(&ty, context.arena, context.symbols, &mut source_map)?,
+                None => {
+                    let error_syntax = direct_error_child(definition.syntax())
+                        .unwrap_or_else(|| definition.syntax().clone());
+                    lower_error_type(&error_syntax, context.arena, &mut source_map)?
+                }
+            };
+            let clause = source_map.span_for(refinement.syntax(), SpanCtxt::Root)?;
+            InterfaceItemKind::Refined { base, clause }
+        }
+        ItemTreeKind::Enum => {
+            let declaration = ast::EnumDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let variants = declaration
+                .variants()
+                .ok_or(HirLoweringError::MissingRequiredSyntax(
+                    SyntaxKind::VARIANT_LIST,
+                ))?
+                .variants()
+                .collect::<Vec<_>>();
+            ensure_supported_generic_params(declaration.generic_params())?;
+            if let Some(where_clause) = declaration.where_clause() {
+                ensure_supported_where_clause(&where_clause)?;
+            }
+            for variant in &variants {
+                if let Some(shape) = variant.tuple_shape() {
+                    for ty in shape.types() {
+                        ensure_supported_type(&ty)?;
+                    }
+                }
+                if let Some(shape) = variant.record_shape() {
+                    for field in shape.fields() {
+                        if let Some(ty) = field.ty() {
+                            ensure_supported_type(&ty)?;
+                        }
+                    }
+                }
+            }
+            let pending_generic_params =
+                prepare_generic_params(declaration.generic_params(), context.symbols, &source_map)?;
+            let pending_variants = prepare_variant_defs(variants, context.symbols, &source_map)?;
+            let pending_variant_fields =
+                prepare_variant_fields(&pending_variants, context.symbols, &source_map)?;
+            let generic_params = lower_generic_params(
+                pending_generic_params,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            let where_preds = declaration
+                .where_clause()
+                .map(|clause| {
+                    lower_where_clause(&clause, context.arena, context.symbols, &mut source_map)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let variants = pending_variants
+                .into_iter()
+                .zip(pending_variant_fields)
+                .map(|(pending, fields)| {
+                    let PendingVariantDef {
+                        variant,
+                        name,
+                        def_id,
+                    } = pending;
+                    let hir_id = source_map.add_node(variant.syntax())?;
+                    let shape = if let Some(tuple_shape) = variant.tuple_shape() {
+                        let types = lower_fn_type_params(
+                            tuple_shape.syntax(),
+                            context.arena,
+                            context.symbols,
+                            &mut source_map,
+                        )?;
+                        HirVariantShape::Tuple(context.arena.alloc_tys(&types))
+                    } else if variant.record_shape().is_some() {
+                        let fields = fields
+                            .into_iter()
+                            .map(
+                                |PendingVariantField {
+                                     field,
+                                     name,
+                                     def_id,
+                                 }| {
+                                    let hir_id = source_map.add_node(field.syntax())?;
+                                    let ty = match field.ty() {
+                                        Some(ty) => lower_type(
+                                            &ty,
+                                            context.arena,
+                                            context.symbols,
+                                            &mut source_map,
+                                        )?,
+                                        None => {
+                                            let error_syntax = direct_error_child(field.syntax())
+                                                .unwrap_or_else(|| field.syntax().clone());
+                                            lower_error_type(
+                                                &error_syntax,
+                                                context.arena,
+                                                &mut source_map,
+                                            )?
+                                        }
+                                    };
+                                    Ok(FieldDef {
+                                        hir_id,
+                                        def_id,
+                                        vis: crate::Visibility::Pub,
+                                        name,
+                                        ty,
+                                    })
+                                },
+                            )
+                            .collect::<Result<Vec<_>, HirLoweringError>>()?;
+                        HirVariantShape::Record(context.arena.alloc_field_defs(&fields))
+                    } else {
+                        HirVariantShape::Unit
+                    };
+                    Ok(HirVariant {
+                        hir_id,
+                        def_id,
+                        name,
+                        shape,
+                        discriminant: variant.discriminant().and_then(signed_discriminant),
+                    })
+                })
+                .collect::<Result<Vec<_>, HirLoweringError>>()?;
+            let generics = context.arena.alloc_generics(HirGenerics {
+                params: context.arena.alloc_generic_params(&generic_params),
+                where_preds: context.arena.alloc_where_preds(&where_preds),
+            });
+            InterfaceItemKind::Enum {
+                generics: *generics,
+                variants: context.arena.alloc_variants(&variants),
+            }
+        }
+        ItemTreeKind::Resource => {
+            let declaration = ast::IfaceResource::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let pending_members = prepare_interface_resource_member_paths(
+                interface_item_entry,
+                declaration.items().as_ref(),
+                context,
+                &source_map,
+            )?;
+            let span = source_map.span_for(declaration.syntax(), SpanCtxt::Root)?;
+            let members = context
+                .def_paths
+                .intern_assoc_items(owner.def_id, &pending_members)?
+                .into_iter()
+                .map(|def_id| OwnerId { def_id })
+                .collect::<Vec<_>>();
+            let item = context.arena.alloc_interface_item(InterfaceItem {
+                owner_id: owner,
+                interface: interface_owner.id.def_id,
+                name,
+                kind: InterfaceItemKind::Resource {
+                    members: context.arena.alloc_owner_ids(&members),
+                },
+                span,
+            });
+            let source_map = source_map.finish();
+            let diagnostics = source_map.diagnostics().to_vec();
+            return Ok((
+                HirOwner {
+                    id: owner,
+                    node: OwnerNode::InterfaceItem(item),
+                    body: None,
+                    raw_attrs: &interface_item_entry.raw_attrs,
+                    diagnostics,
+                },
+                source_map,
+            ));
+        }
+        ItemTreeKind::InterfaceFn => {
+            let declaration = ast::FnDecl::cast(item_syntax.clone())
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let (sig, generics) = lower_function_signature_with_generics(
+                &declaration,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            InterfaceItemKind::Fn {
+                sig,
+                generics: *generics,
+            }
+        }
+        _ => return Err(HirLoweringError::ItemTreeEntryMismatch),
+    };
+    let span = source_map.span_for(&item_syntax, SpanCtxt::Root)?;
+    let item = context.arena.alloc_interface_item(InterfaceItem {
+        owner_id: owner,
+        interface: interface_owner.id.def_id,
+        name,
+        kind,
+        span,
+    });
+    let source_map = source_map.finish();
+    let diagnostics = source_map.diagnostics().to_vec();
+    Ok((
+        HirOwner {
+            id: owner,
+            node: OwnerNode::InterfaceItem(item),
+            body: None,
+            raw_attrs: &interface_item_entry.raw_attrs,
             diagnostics,
         },
         source_map,
@@ -2460,6 +3005,125 @@ fn interface_entry_disambiguator(
     Err(HirLoweringError::ItemTreeEntryMismatch)
 }
 
+fn interface_child_disambiguator(
+    interface_entry: &crate::item_tree::ItemTreeEntry,
+    item_entry: &crate::item_tree::ItemTreeEntry,
+    component: &DefPathData,
+) -> Result<u32, HirLoweringError> {
+    let mut disambiguator = 0u32;
+    for candidate in &interface_entry.children {
+        let candidate_component = match candidate.kind {
+            ItemTreeKind::Struct
+            | ItemTreeKind::Alias
+            | ItemTreeKind::Refined
+            | ItemTreeKind::Enum
+            | ItemTreeKind::Resource => DefPathData::TypeNs(candidate.name),
+            ItemTreeKind::InterfaceFn => DefPathData::ValueNs(candidate.name),
+            _ => continue,
+        };
+        if candidate_component != *component {
+            continue;
+        }
+        if candidate.ast_id == item_entry.ast_id {
+            return Ok(disambiguator);
+        }
+        disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(DefPathInternerError::TooManyDefinitions)?;
+    }
+    Err(HirLoweringError::ItemTreeEntryMismatch)
+}
+
+fn prepare_interface_resource_member_paths(
+    resource_entry: &crate::item_tree::ItemTreeEntry,
+    item_list: Option<&ast::ItemList>,
+    context: &HirLoweringContext<'_, '_>,
+    source_map: &HirSourceMapBuilder<'_>,
+) -> Result<Vec<(DefPathData, u32)>, HirLoweringError> {
+    let expected_members = resource_entry
+        .children
+        .iter()
+        .filter(|child| child.kind == ItemTreeKind::AssocFn)
+        .count();
+    let mut seen = HashSet::new();
+    let mut components = Vec::with_capacity(expected_members);
+    let mut disambiguators = HashMap::<DefPathData, u32>::new();
+
+    if let Some(item_list) = item_list {
+        for syntax in item_list.syntax().children() {
+            let Some(function) = ast::FnDecl::cast(syntax) else {
+                continue;
+            };
+            let ast_id = context
+                .ast_ids
+                .ast_id(&function)
+                .map(ast::AstId::erase)
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let item_entry = resource_entry
+                .children
+                .iter()
+                .find(|child| child.ast_id == ast_id && child.kind == ItemTreeKind::AssocFn)
+                .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+            let name = lower_item_name(
+                function.name(),
+                function.syntax(),
+                context.symbols,
+                source_map,
+            )?;
+            if !seen.insert(ast_id) || item_entry.name != name.sym {
+                return Err(HirLoweringError::ItemTreeEntryMismatch);
+            }
+            validate_current_item_metadata(
+                item_entry,
+                function.attrs(),
+                item_visibility(function.syntax()),
+                context,
+            )?;
+            ensure_supported_interface_function(&function)?;
+
+            let component = DefPathData::AssocFn(name.sym);
+            let disambiguator = disambiguators.entry(component.clone()).or_default();
+            let ordinal = *disambiguator;
+            *disambiguator = disambiguator
+                .checked_add(1)
+                .ok_or(DefPathInternerError::TooManyDefinitions)?;
+            components.push((component, ordinal));
+        }
+    }
+
+    if seen.len() != expected_members {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+    Ok(components)
+}
+
+fn ensure_supported_interface_function(declaration: &ast::FnDecl) -> Result<(), HirLoweringError> {
+    ensure_supported_generics(declaration)?;
+    let params = declaration
+        .params()
+        .map(|params| {
+            params
+                .syntax()
+                .children()
+                .filter_map(|child| {
+                    ast::Param::cast(child.clone())
+                        .map(FunctionParamSyntax::Param)
+                        .or_else(|| ast::SelfParam::cast(child).map(FunctionParamSyntax::SelfParam))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for param in params {
+        if let Some(ty) = param.ty() {
+            ensure_supported_type(&ty)?;
+        }
+    }
+    if let Some(ty) = declaration.ret_type().and_then(|ret| ret.ty()) {
+        ensure_supported_type(&ty)?;
+    }
+    Ok(())
+}
+
 fn raw_attrs_match(current: &[RawAttr], item_tree: &[RawAttr]) -> bool {
     current.len() == item_tree.len()
         && current.iter().zip(item_tree).all(|(current, item_tree)| {
@@ -2560,6 +3224,7 @@ fn lower_function_inner<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
     lower_generics: bool,
+    lower_body: bool,
 ) -> Result<
     (
         FnSig<'hir>,
@@ -2592,16 +3257,22 @@ fn lower_function_inner<'hir>(
         })
         .unwrap_or_default();
     let ret_type = declaration.ret_type().and_then(|ret| ret.ty());
-    let contracts = declaration
-        .syntax()
-        .children()
-        .filter_map(|child| {
-            ast::RequiresClause::cast(child.clone())
-                .map(FunctionContractSyntax::Requires)
-                .or_else(|| ast::EnsuresClause::cast(child).map(FunctionContractSyntax::Ensures))
-        })
-        .collect::<Vec<_>>();
-    let body = declaration.body();
+    let contracts = if lower_body {
+        declaration
+            .syntax()
+            .children()
+            .filter_map(|child| {
+                ast::RequiresClause::cast(child.clone())
+                    .map(FunctionContractSyntax::Requires)
+                    .or_else(|| {
+                        ast::EnsuresClause::cast(child).map(FunctionContractSyntax::Ensures)
+                    })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let body = lower_body.then(|| declaration.body()).flatten();
     let has_body_owner = body.is_some() || !contracts.is_empty();
 
     for param in &params {
@@ -2630,17 +3301,21 @@ fn lower_function_inner<'hir>(
     // Assign closure and async-block identities across the complete owner
     // before lowering any child. This also makes contracts and body expressions
     // agree on the same owner-wide preorder.
-    let async_fn_body_syntax = if declaration.async_token().is_some() {
+    let async_fn_body_syntax = if lower_body && declaration.async_token().is_some() {
         body.as_ref().map(|body| body.syntax().clone())
     } else {
         None
     };
-    let async_fn_def_id = prepare_nested_definition_ids_with_async_fn_body(
-        declaration.syntax(),
-        async_fn_body_syntax.as_ref(),
-        source_map,
-        true,
-    )?;
+    let async_fn_def_id = if lower_body {
+        prepare_nested_definition_ids_with_async_fn_body(
+            declaration.syntax(),
+            async_fn_body_syntax.as_ref(),
+            source_map,
+            true,
+        )?
+    } else {
+        None
+    };
 
     let lowered_generic_params =
         lower_generic_params(pending_generic_params, arena, symbols, source_map)?;
@@ -2684,7 +3359,7 @@ fn lower_function_inner<'hir>(
                 effects_seen = true;
                 effects = lower_function_effects(&clause, arena, symbols, source_map)?;
             }
-        } else if let Some(clause) = ast::RequiresClause::cast(child.clone()) {
+        } else if lower_body && let Some(clause) = ast::RequiresClause::cast(child.clone()) {
             let (contract, expression_hir_id) = lower_function_contract(
                 FunctionContractSyntax::Requires(clause),
                 arena,
@@ -2693,7 +3368,7 @@ fn lower_function_inner<'hir>(
             )?;
             requires.push(expression_hir_id);
             lowered_contracts.push(contract);
-        } else if let Some(clause) = ast::EnsuresClause::cast(child) {
+        } else if lower_body && let Some(clause) = ast::EnsuresClause::cast(child) {
             let (contract, expression_hir_id) = lower_function_contract(
                 FunctionContractSyntax::Ensures(clause),
                 arena,
@@ -20360,6 +21035,345 @@ mod tests {
                 .unwrap()
                 .data,
             DefPathData::TypeNs(symbols.intern("Second").unwrap())
+        );
+    }
+
+    #[test]
+    fn lowers_interface_item_kinds_and_nested_resource_paths() {
+        let file = crate::FileId::new(295);
+        let source = concat!(
+            "pub interface storage {\n",
+            "    type Entry { pub key: Str, label: U32 }\n",
+            "    type Alias = Str\n",
+            "    type Positive = U32 where self > 0\n",
+            "    enum Status {\n",
+            "        Ready\n",
+            "        Failed(U32)\n",
+            "        Named(code: U32)\n",
+            "    }\n",
+            "    resource File {\n",
+            "        fn close(self: borrow Self)\n",
+            "        fn size(self: borrow Self) -> U64\n",
+            "        fn size(self: borrow Self) -> U32\n",
+            "    }\n",
+            "    fn open(path: Str) -> File\n",
+            "    fn open(path: U32) -> File\n",
+            "}\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects interface members");
+        let interface_entry = item_tree
+            .items
+            .first()
+            .expect("interface item-tree entry exists");
+        let name = symbols.intern("storage").expect("interface name interns");
+        let (_packages, paths, interface_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::Interface(name));
+        let interface_path = owner_def_path(&paths, interface_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (interface_owner, _) = lower_interface_owner(
+            interface_owner_id,
+            &interface_path,
+            &item_tree,
+            interface_entry.ast_id,
+            &context,
+        )
+        .expect("interface owner lowers before its members");
+        let OwnerNode::Item(parent_item) = interface_owner.node else {
+            panic!("interface is represented by an item owner");
+        };
+        let ItemKind::Interface {
+            items: member_owners,
+        } = parent_item.kind
+        else {
+            panic!("interface owner retains its item kind");
+        };
+        assert_eq!(member_owners.len(), interface_entry.children.len());
+
+        let mut observed = HashSet::new();
+        for (member_owner, member_entry) in
+            member_owners.iter().copied().zip(&interface_entry.children)
+        {
+            let member_path = owner_def_path(&paths, member_owner);
+            let (hir_owner, source_map) = lower_interface_item_owner(
+                member_owner,
+                &member_path,
+                &interface_owner,
+                interface_entry.ast_id,
+                member_entry.ast_id,
+                &item_tree,
+                &context,
+            )
+            .expect("each direct interface item lowers under its parent");
+            assert_eq!(source_map.owner(), member_owner);
+            assert!(hir_owner.body.is_none());
+            let OwnerNode::InterfaceItem(item) = hir_owner.node else {
+                panic!("interface members have interface-item owners");
+            };
+            assert_eq!(item.owner_id, member_owner);
+            assert_eq!(item.interface, interface_owner_id.def_id);
+            assert_eq!(item.name.sym, member_entry.name);
+            let source_syntax = ast_ids
+                .pointer(member_entry.ast_id)
+                .and_then(|pointer| pointer.resolve(file, &parsed.root))
+                .expect("member AST pointer resolves in the source snapshot");
+            assert_eq!(item.span.range, source_syntax.text_range());
+
+            match (member_entry.kind, item.kind) {
+                (ItemTreeKind::Struct, InterfaceItemKind::Struct { fields, .. }) => {
+                    assert_eq!(fields.len(), 2);
+                    assert!(
+                        fields
+                            .iter()
+                            .all(|field| field.vis == crate::Visibility::Pub),
+                        "interface record fields are always public"
+                    );
+                    observed.insert("struct");
+                }
+                (ItemTreeKind::Alias, InterfaceItemKind::Alias { ty, .. }) => {
+                    assert!(matches!(ty.kind, HirTyKind::Path(_)));
+                    observed.insert("alias");
+                }
+                (ItemTreeKind::Refined, InterfaceItemKind::Refined { clause, .. }) => {
+                    assert_eq!(clause.file, file);
+                    assert!(!clause.range.is_empty());
+                    observed.insert("refined");
+                }
+                (ItemTreeKind::Enum, InterfaceItemKind::Enum { variants, .. }) => {
+                    assert_eq!(variants.len(), 3);
+                    assert!(matches!(variants[0].shape, HirVariantShape::Unit));
+                    assert!(matches!(variants[1].shape, HirVariantShape::Tuple([_])));
+                    let HirVariantShape::Record(fields) = variants[2].shape else {
+                        panic!("record enum variants retain their fields");
+                    };
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].vis, crate::Visibility::Pub);
+                    observed.insert("enum");
+                }
+                (ItemTreeKind::Resource, InterfaceItemKind::Resource { members }) => {
+                    assert_eq!(members.len(), 3);
+                    for (index, member) in members.iter().enumerate() {
+                        let path = paths
+                            .resolve(member.def_id)
+                            .expect("resource member path resolves")
+                            .expect("resource member path exists");
+                        let component = path.data().last().expect("member path has a component");
+                        let child_entry = &member_entry.children[index];
+                        let expected_disambiguator = member_entry.children[..index]
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.kind == ItemTreeKind::AssocFn
+                                    && candidate.name == child_entry.name
+                            })
+                            .count() as u32;
+                        assert_eq!(
+                            component,
+                            &crate::DisambiguatedDefPathData {
+                                data: DefPathData::AssocFn(child_entry.name),
+                                disambiguator: expected_disambiguator,
+                            }
+                        );
+                    }
+                    observed.insert("resource");
+                }
+                (ItemTreeKind::InterfaceFn, InterfaceItemKind::Fn { sig, .. }) => {
+                    assert_eq!(sig.params.len(), 1);
+                    assert!(sig.requires.is_empty());
+                    assert!(sig.ensures.is_empty());
+                    observed.insert("function");
+                }
+                _ => panic!("ItemTree kind and interface HIR kind agree"),
+            }
+        }
+        assert_eq!(
+            observed,
+            HashSet::from(["struct", "alias", "refined", "enum", "resource", "function"])
+        );
+        let open_name = symbols.intern("open").unwrap();
+        let open_disambiguators = member_owners
+            .iter()
+            .filter_map(|owner| {
+                let path = paths.resolve(owner.def_id).unwrap().unwrap();
+                path.data().last().and_then(|component| {
+                    (component.data == DefPathData::ValueNs(open_name))
+                        .then_some(component.disambiguator)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            open_disambiguators,
+            [0, 1],
+            "duplicate interface functions use source-order disambiguators"
+        );
+    }
+
+    #[test]
+    fn interface_function_owner_lowers_generics_without_body_or_contract_storage() {
+        let file = crate::FileId::new(296);
+        let source = "interface api { fn lookup<T>(value: T) -> T requires true { value } }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::GenericInterfaceItem)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InterfaceFnBody)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.code == Code::InterfaceFnClause)
+        );
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects diagnosed interface function");
+        let interface_entry = item_tree.items.first().expect("interface entry");
+        let function_entry = interface_entry.children.first().expect("function entry");
+        assert_eq!(function_entry.kind, ItemTreeKind::InterfaceFn);
+        let name = symbols.intern("api").expect("interface name interns");
+        let (_packages, paths, interface_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::Interface(name));
+        let interface_path = owner_def_path(&paths, interface_owner_id);
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (interface_owner, _) = lower_interface_owner(
+            interface_owner_id,
+            &interface_path,
+            &item_tree,
+            interface_entry.ast_id,
+            &context,
+        )
+        .expect("interface parent lowers");
+        let OwnerNode::Item(parent_item) = interface_owner.node else {
+            panic!("interface has an item owner");
+        };
+        let ItemKind::Interface { items } = parent_item.kind else {
+            panic!("parent retains interface kind");
+        };
+        let function_owner = items[0];
+        let function_path = owner_def_path(&paths, function_owner);
+        let (hir_owner, _) = lower_interface_item_owner(
+            function_owner,
+            &function_path,
+            &interface_owner,
+            interface_entry.ast_id,
+            function_entry.ast_id,
+            &item_tree,
+            &context,
+        )
+        .expect("a diagnosed generic function still lowers its signature");
+        assert!(hir_owner.body.is_none());
+        let OwnerNode::InterfaceItem(item) = hir_owner.node else {
+            panic!("function has an interface-item owner");
+        };
+        let InterfaceItemKind::Fn { sig, generics } = item.kind else {
+            panic!("function member retains its function kind");
+        };
+        assert_eq!(generics.params.len(), 1);
+        assert_eq!(generics.params[0].name.sym, symbols.intern("T").unwrap());
+        assert_eq!(sig.params.len(), 1);
+        assert!(sig.requires.is_empty());
+        assert!(sig.ensures.is_empty());
+        assert_eq!(
+            paths
+                .resolve(generics.params[0].def_id)
+                .unwrap()
+                .unwrap()
+                .data()
+                .last()
+                .unwrap()
+                .data,
+            DefPathData::TypeParam(symbols.intern("T").unwrap())
+        );
+    }
+
+    #[test]
+    fn interface_item_owner_rejects_a_sibling_interface_parent() {
+        let file = crate::FileId::new(297);
+        let source = concat!(
+            "interface api { fn lookup() -> U32 }\n",
+            "interface api { fn lookup() -> U32 }\n",
+        );
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let symbols = Interner::new();
+        let item_tree = ItemTree::collect(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("item tree collects sibling interfaces");
+        let interfaces = item_tree
+            .items
+            .iter()
+            .filter(|entry| entry.kind == ItemTreeKind::Interface)
+            .collect::<Vec<_>>();
+        assert_eq!(interfaces.len(), 2);
+        let name = symbols.intern("api").expect("interface name interns");
+        let (packages, paths, first_owner_id) =
+            owner_context_with_data(&symbols, DefPathData::Interface(name));
+        let first_path = owner_def_path(&paths, first_owner_id);
+        let mut second_path_data = first_path.data().to_vec();
+        second_path_data.last_mut().unwrap().disambiguator = 1;
+        let second_path = DefPath::new(first_path.package(), second_path_data, &packages, &symbols)
+            .expect("second interface path is valid");
+        let second_owner_id = OwnerId {
+            def_id: paths
+                .intern(second_path.clone())
+                .expect("second interface path interns"),
+        };
+        let arena = HirArena::new();
+        let context =
+            HirLoweringContext::new(&ast_ids, &snapshot, &parsed.root, &arena, &symbols, &paths);
+        let (first_owner, _) = lower_interface_owner(
+            first_owner_id,
+            &first_path,
+            &item_tree,
+            interfaces[0].ast_id,
+            &context,
+        )
+        .expect("first interface lowers");
+        let (second_owner, _) = lower_interface_owner(
+            second_owner_id,
+            &second_path,
+            &item_tree,
+            interfaces[1].ast_id,
+            &context,
+        )
+        .expect("second interface lowers");
+        let OwnerNode::Item(second_parent_item) = second_owner.node else {
+            panic!("interface parent is an item owner");
+        };
+        let ItemKind::Interface { items } = second_parent_item.kind else {
+            panic!("second interface has member owners");
+        };
+        let child_owner = items[0];
+        let child_path = owner_def_path(&paths, child_owner);
+        let path_count = paths.len().unwrap();
+        assert!(matches!(
+            lower_interface_item_owner(
+                child_owner,
+                &child_path,
+                &first_owner,
+                interfaces[1].ast_id,
+                interfaces[1].children[0].ast_id,
+                &item_tree,
+                &context,
+            ),
+            Err(HirLoweringError::ItemTreeEntryMismatch)
+        ));
+        assert_eq!(
+            paths.len().unwrap(),
+            path_count,
+            "a sibling-parent mismatch must not intern nested definitions"
         );
     }
 
