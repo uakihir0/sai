@@ -7,7 +7,9 @@ use crate::mvs::{
     MvsContract, MvsEdge, MvsNamedEdge, MvsNode, MvsPackageVersion, MvsRequirer, MvsSelectionError,
     MvsSelectionOutput,
 };
-use crate::mvs_graph_validation::{MvsDependencyCycle, MvsVersionConflict};
+use crate::mvs_graph_validation::{
+    MvsDependencyCycle, MvsDuplicatePackageLines, MvsVersionConflict,
+};
 use crate::version::Version;
 use crate::version_req::VersionReq;
 
@@ -58,9 +60,11 @@ pub enum MvsExplanationError {
         span: Range<usize>,
     },
     VersionNotSelected(MvsPackageVersion),
+    VersionNotInSelectedGraph(MvsPackageVersion),
     SelectionReasonNotFound(MvsPackageVersion),
     SelectedVersionNotFound(MvsNode),
     SelectedContractNotFound(MvsPackageVersion),
+    InvalidDuplicatePackageLines(Box<MvsDuplicatePackageLines>),
     ConflictNotInSelection(Box<MvsVersionConflict>),
     MalformedCycle(Box<MvsDependencyCycle>),
     CycleEdgeIndexOutOfBounds(usize),
@@ -150,6 +154,76 @@ impl<'a> MvsExplanationGraph<'a> {
             edge,
         ));
         Ok(MvsRequirementChain { origin, links })
+    }
+
+    /// Returns the shortest chain that reaches a selected package version.
+    ///
+    /// The root's own version has an empty chain rooted at itself. A version
+    /// selected only by a lock floor has an empty chain rooted at that entry.
+    pub fn chain_to_package_version(
+        &self,
+        package_version: &MvsPackageVersion,
+    ) -> Result<MvsRequirementChain, MvsExplanationError> {
+        if !self.selected_graph_nodes.contains(package_version) {
+            return Err(MvsExplanationError::VersionNotInSelectedGraph(
+                package_version.clone(),
+            ));
+        }
+        if package_version == self.selection.root() {
+            return Ok(MvsRequirementChain {
+                origin: MvsChainOrigin::Root(package_version.clone()),
+                links: Vec::new(),
+            });
+        }
+
+        let requirer = MvsRequirer::Package(package_version.clone());
+        let (origin, links) = self.path_to_requirer(&requirer)?;
+        Ok(MvsRequirementChain { origin, links })
+    }
+
+    /// Attaches one shortest provenance chain to every line in a duplicate
+    /// package-line finding.
+    pub fn explain_duplicate_lines(
+        &self,
+        duplicate: &MvsDuplicatePackageLines,
+    ) -> Result<MvsDuplicatePackageLinesExplanation, MvsExplanationError> {
+        let mut versions = duplicate.versions.clone();
+        versions.sort_by_key(MvsPackageVersion::node);
+        let mut selected_versions = self
+            .selected_graph_nodes
+            .iter()
+            .filter(|version| version.package() == duplicate.package.as_ref())
+            .cloned()
+            .collect::<Vec<_>>();
+        selected_versions.sort_by_key(MvsPackageVersion::node);
+        let valid = selected_versions.len() > 1
+            && versions == selected_versions
+            && versions
+                .iter()
+                .all(|version| version.package() == duplicate.package.as_ref())
+            && versions
+                .windows(2)
+                .all(|pair| pair[0].node() != pair[1].node());
+        if !valid {
+            return Err(MvsExplanationError::InvalidDuplicatePackageLines(Box::new(
+                duplicate.clone(),
+            )));
+        }
+
+        let lines = versions
+            .into_iter()
+            .map(|package_version| {
+                Ok(MvsDuplicatePackageLineExplanation {
+                    chain: self.chain_to_package_version(&package_version)?,
+                    package_version,
+                })
+            })
+            .collect::<Result<Vec<_>, MvsExplanationError>>()?;
+
+        Ok(MvsDuplicatePackageLinesExplanation {
+            package: duplicate.package.clone(),
+            lines,
+        })
     }
 
     /// Returns why MVS selected `selected_version` for its node.
@@ -432,6 +506,20 @@ pub struct MvsConflictExplanation {
     pub requirement_chain: MvsRequirementChain,
 }
 
+/// One compatibility line and its shortest provenance chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvsDuplicatePackageLineExplanation {
+    pub package_version: MvsPackageVersion,
+    pub chain: MvsRequirementChain,
+}
+
+/// Explanation chains for all lines in one duplicate package-line finding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvsDuplicatePackageLinesExplanation {
+    pub package: Box<str>,
+    pub lines: Vec<MvsDuplicatePackageLineExplanation>,
+}
+
 fn package_version_for_node(node: &MvsNode, version: &Version) -> MvsPackageVersion {
     MvsPackageVersion::new(node.package().to_owned(), version.clone())
         .expect("floor node identities were validated by MVS input construction")
@@ -487,7 +575,9 @@ mod tests {
 
     use super::{MvsChainOrigin, MvsExplanationError, MvsExplanationGraph, MvsSelectionReason};
     use crate::mvs::{MvsContract, MvsEdge, MvsNode, MvsPackageVersion, MvsRequirer, select};
-    use crate::mvs_graph_validation::{MvsDependencyCycle, check_selected_graph};
+    use crate::mvs_graph_validation::{
+        MvsDependencyCycle, MvsDuplicatePackageLines, check_selected_graph, duplicate_package_lines,
+    };
     use crate::version::Version;
     use crate::version_req::VersionReq;
 
@@ -700,6 +790,131 @@ mod tests {
             MvsChainOrigin::LockFloor(package_version("acme:b", "1.8.0"))
         );
         assert_eq!(chain.links.len(), 1);
+    }
+
+    #[test]
+    fn explains_each_duplicate_line_including_the_root_line() {
+        let root = root(vec![
+            edge("acme:a", "^1", "1.0.0", 0),
+            edge("acme:z", "^1", "1.0.0", 10),
+        ]);
+        let contracts = catalog(vec![
+            contract("acme:a", "1.0.0", vec![edge("acme:app", "^2", "2.0.0", 20)]),
+            contract("acme:app", "2.0.0", vec![]),
+            contract("acme:z", "1.0.0", vec![]),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("valid selection");
+        let graph = check_selected_graph(&root, &selection).expect("selected graph");
+        let duplicates = duplicate_package_lines(&graph);
+        let explanations =
+            MvsExplanationGraph::new(&selection).expect("complete explanation graph");
+        let explanation = explanations
+            .explain_duplicate_lines(&duplicates[0])
+            .expect("duplicate lines have explanation chains");
+
+        assert_eq!(explanation.package.as_ref(), "acme:app");
+        assert_eq!(
+            explanation
+                .lines
+                .iter()
+                .map(|line| line.package_version.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                package_version("acme:app", "1.0.0"),
+                package_version("acme:app", "2.0.0"),
+            ]
+        );
+        assert_eq!(
+            explanation.lines[0].chain,
+            super::MvsRequirementChain {
+                origin: MvsChainOrigin::Root(root.package_version().clone()),
+                links: vec![],
+            }
+        );
+        assert_eq!(
+            explanation.lines[1]
+                .chain
+                .links
+                .iter()
+                .map(|link| link.requirer.package_version().package())
+                .collect::<Vec<_>>(),
+            vec!["acme:app", "acme:a"]
+        );
+    }
+
+    #[test]
+    fn explains_a_floor_only_duplicate_line_from_its_lock_entry() {
+        let root = root(vec![
+            edge("acme:a", "^1", "1.0.0", 0),
+            edge("acme:z", "^1", "1.0.0", 10),
+            edge("acme:t", "^1", "1.0.0", 15),
+        ]);
+        let contracts = catalog(vec![
+            contract("acme:a", "1.0.0", vec![edge("acme:b", "^1", "1.0.0", 20)]),
+            contract("acme:b", "1.0.0", vec![]),
+            contract("acme:b", "1.8.0", vec![]),
+            contract("acme:b", "2.0.0", vec![]),
+            contract("acme:z", "1.0.0", vec![edge("acme:b", "^2", "2.0.0", 30)]),
+            contract("acme:b", "3.0.0", vec![]),
+            contract("acme:t", "1.0.0", vec![edge("acme:b", "^3", "3.0.0", 40)]),
+        ]);
+        let floors = HashMap::from([(package_version("acme:b", "1.0.0").node(), version("1.8.0"))]);
+        let selection =
+            select(&root, &contracts, &floors, &HashMap::new()).expect("valid selection");
+        let graph = check_selected_graph(&root, &selection).expect("selected graph");
+        let duplicate = duplicate_package_lines(&graph)
+            .into_iter()
+            .next()
+            .expect("both compatibility lines are selected");
+        let explanations =
+            MvsExplanationGraph::new(&selection).expect("complete explanation graph");
+        let explanation = explanations
+            .explain_duplicate_lines(&duplicate)
+            .expect("duplicate lines have explanation chains");
+
+        assert_eq!(
+            explanation.lines[0].chain.origin,
+            MvsChainOrigin::LockFloor(package_version("acme:b", "1.8.0"))
+        );
+        assert!(explanation.lines[0].chain.links.is_empty());
+        assert_eq!(
+            explanation.lines[1].chain.origin,
+            MvsChainOrigin::Root(root.package_version().clone())
+        );
+
+        let mut incomplete_duplicate = duplicate.clone();
+        incomplete_duplicate.versions.pop();
+        assert_eq!(
+            explanations.explain_duplicate_lines(&incomplete_duplicate),
+            Err(MvsExplanationError::InvalidDuplicatePackageLines(Box::new(
+                incomplete_duplicate
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_findings_with_unreachable_versions() {
+        let root = root(vec![edge("acme:a", "^1", "1.0.0", 0)]);
+        let contracts = catalog(vec![contract("acme:a", "1.0.0", vec![])]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("valid selection");
+        let explanations =
+            MvsExplanationGraph::new(&selection).expect("complete explanation graph");
+        let duplicate = MvsDuplicatePackageLines {
+            package: "acme:b".into(),
+            versions: vec![
+                package_version("acme:b", "1.0.0"),
+                package_version("acme:b", "2.0.0"),
+            ],
+        };
+
+        assert_eq!(
+            explanations.explain_duplicate_lines(&duplicate),
+            Err(MvsExplanationError::InvalidDuplicatePackageLines(Box::new(
+                duplicate
+            )))
+        );
     }
 
     #[test]
