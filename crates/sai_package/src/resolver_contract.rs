@@ -1,6 +1,7 @@
 //! Adapts validated package manifests into resolver inputs and edge metadata.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -905,6 +906,77 @@ pub enum ResolverContractBuildError {
     },
     MvsInput(MvsInputError),
 }
+
+impl fmt::Display for ResolverContractBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootManifestRoleMismatch(role) => {
+                write!(formatter, "expected a root manifest, found {role:?}")
+            }
+            Self::InvalidManifestSyntax {
+                lexical_errors,
+                syntax_errors,
+            } => write!(
+                formatter,
+                "manifest syntax validation failed: lexical errors {lexical_errors:?}; syntax errors {syntax_errors:?}"
+            ),
+            Self::SemanticValidationErrors(errors) => {
+                write!(formatter, "manifest semantic validation failed: {errors:?}")
+            }
+            Self::MissingPackageHeader => formatter.write_str("manifest has no package header"),
+            Self::MissingRootTargets => {
+                formatter.write_str("root manifest has no targets declaration")
+            }
+            Self::RootManifestMismatch => {
+                formatter.write_str("root manifest differs from the resolver context")
+            }
+            Self::UnexpectedRootPathOverrideVersion(package) => write!(
+                formatter,
+                "unexpected root path-override version for {package}"
+            ),
+            Self::MissingRootPathOverrideVersion { package, span } => write!(
+                formatter,
+                "root path override for {package} has no loaded package version at {}..{}",
+                span.start, span.end
+            ),
+            Self::MissingPathPackageVersion {
+                package,
+                path,
+                requiring_package,
+                span,
+            } => write!(
+                formatter,
+                "path requirement for {package} at {path:?} from {}@{} has no loaded package version at {}..{}",
+                requiring_package.package(),
+                requiring_package.version(),
+                span.start,
+                span.end
+            ),
+            Self::PathPackageIdentityMismatch {
+                expected,
+                found,
+                span,
+            } => write!(
+                formatter,
+                "path requirement at {}..{} expects package {expected}, found {found}",
+                span.start, span.end
+            ),
+            Self::PathVersionMismatch {
+                package,
+                requirement,
+                declared_version,
+                span,
+            } => write!(
+                formatter,
+                "path requirement for {package} at {}..{} declares {declared_version}, which does not satisfy {requirement}",
+                span.start, span.end
+            ),
+            Self::MvsInput(error) => write!(formatter, "invalid MVS input: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolverContractBuildError {}
 
 /// Parses no files and performs no I/O; converts a validated parse result into
 /// an MVS contract plus metadata needed by source selection, locking, and

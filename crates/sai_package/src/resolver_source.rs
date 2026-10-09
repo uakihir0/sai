@@ -108,10 +108,12 @@ impl ResolverSourceSelection {
 /// requiring package's commit, and the normalized repository tree path. Git
 /// paths that leave the repository must be returned as errors. The callback
 /// receives the requirer and source span so it can resolve the correct base.
-pub fn validate_resolver_path_pins<K, E>(
+/// The returned keys are in the same order as the pin sources, allowing a
+/// source loader to consume the exact objects used for validation.
+pub fn canonicalize_resolver_path_pins<K, E>(
     selection: &ResolverSourceSelection,
     mut canonicalize: impl FnMut(&ResolverPathPinSource) -> Result<K, E>,
-) -> Result<(), ResolverPathPinValidationError<K, E>>
+) -> Result<Vec<K>, ResolverPathPinValidationError<K, E>>
 where
     K: Eq,
 {
@@ -122,7 +124,7 @@ where
         return if selection.reason == ResolverSourceReason::PathPin {
             Err(ResolverPathPinValidationError::InconsistentSelection)
         } else {
-            Ok(())
+            Ok(Vec::new())
         };
     };
     if selection.reason != ResolverSourceReason::PathPin
@@ -145,6 +147,7 @@ where
             error: Box::new(error),
         }
     })?;
+    let mut keys = Vec::with_capacity(selection.path_pin_sources.len());
     for pin in &selection.path_pin_sources[1..] {
         let key = canonicalize(pin).map_err(|error| {
             ResolverPathPinValidationError::Canonicalization {
@@ -160,8 +163,23 @@ where
                 conflicting_key: Box::new(key),
             });
         }
+        keys.push(key);
     }
-    Ok(())
+    keys.insert(0, first_key);
+    Ok(keys)
+}
+
+/// Checks that every path pin for a node resolves to the same source.
+///
+/// See [`canonicalize_resolver_path_pins`] for the canonicalizer contract.
+pub fn validate_resolver_path_pins<K, E>(
+    selection: &ResolverSourceSelection,
+    canonicalize: impl FnMut(&ResolverPathPinSource) -> Result<K, E>,
+) -> Result<(), ResolverPathPinValidationError<K, E>>
+where
+    K: Eq,
+{
+    canonicalize_resolver_path_pins(selection, canonicalize).map(|_| ())
 }
 
 fn source_selection_provenance_matches_reason(selection: &ResolverSourceSelection) -> bool {
@@ -601,6 +619,7 @@ mod tests {
         ResolverContract, ResolverContractContext, ResolverRequirementResolution,
         build_resolver_contract,
     };
+    use crate::resolver_source_provider::select_with_source_provider_and_canonicalized_pins;
     use crate::validation::PackageValidationContext;
     use crate::version::Version;
 
@@ -790,6 +809,106 @@ mod tests {
                 .identity
                 .to_string(),
             "acme:dep"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn mvs_source_provider_loads_a_validated_contract_from_the_path_pin_snapshot() {
+        let tree = LocalSourceTestTree::new();
+        let root_directory = tree.path().join("workspace/root");
+        let dependency_directory = tree.path().join("workspace/dependency");
+        fs::create_dir_all(&root_directory).expect("create root package");
+        fs::create_dir_all(&dependency_directory).expect("create dependency package");
+        fs::write(
+            root_directory.join("sai.package"),
+            b"package acme:app @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dep @ ^1 from path \"../dependency\" }\n",
+        )
+        .expect("write root manifest");
+        fs::write(
+            dependency_directory.join("sai.package"),
+            b"package acme:dep @ 1.2.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .expect("write dependency manifest");
+
+        let root_version = package_version("acme:app", "1.0.0");
+        let dependency_version = package_version("acme:dep", "1.2.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let mut directories = LocalPackageDirectoryIndex::default();
+        directories
+            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .expect("index root package");
+
+        let path_packages = BTreeMap::from([(
+            crate::resolver_contract::ResolverPathKey::new(root_version.clone(), "../dependency"),
+            dependency_version.clone(),
+        )]);
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root_manifest, &path_packages, &root_path_overrides);
+        let root_contract = build_root_contract(&root_manifest, &context);
+        let mut replace_manifest_after_canonicalization = true;
+
+        let output = select_with_source_provider_and_canonicalized_pins(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |pin| {
+                let directory = directories
+                    .canonicalize_path_pin(pin)
+                    .map_err(|error| format!("{error:?}"))?;
+                if replace_manifest_after_canonicalization {
+                    replace_manifest_after_canonicalization = false;
+                    fs::write(
+                        dependency_directory.join("sai.package"),
+                        b"package acme:dep @ 2.0.0\n\
+                          source \"src\"\n\
+                          targets { wasm32-core }\n",
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                }
+                Ok::<_, String>(directory)
+            },
+            |request, selection, canonicalized_path_pins| {
+                assert_eq!(
+                    canonicalized_path_pins.len(),
+                    selection.path_pin_sources().len()
+                );
+                let directory = canonicalized_path_pins
+                    .first()
+                    .expect("path-pin source has a local directory");
+                directory
+                    .build_dependency_contract(
+                        &request.package_version,
+                        &context,
+                        PackageValidationContext::default(),
+                    )
+                    .map_err(|error| format!("{error:?}"))
+            },
+        )
+        .expect("the local path dependency loads into MVS");
+
+        assert_eq!(
+            output.dependency_contracts().keys().collect::<Vec<_>>(),
+            [&dependency_version]
+        );
+        assert!(output.selection().is_complete());
+        assert_eq!(
+            output.sources_used()[&dependency_version].source(),
+            &ResolverPackageSource::Path {
+                relative_to: root_version,
+                path: "../dependency".into(),
+            }
         );
     }
 

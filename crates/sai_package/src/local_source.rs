@@ -26,10 +26,15 @@ use crate::manifest::{
 };
 use crate::mvs::MvsPackageVersion;
 use crate::package_path::{DependencyPackagePath, PackagePathError};
+use crate::resolver_contract::{
+    ResolverContract, ResolverContractBuildError, ResolverContractContext,
+    build_resolver_contract as adapt_resolver_contract,
+};
 use crate::resolver_source::{
     ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
     ResolverSourceSelection, validate_resolver_path_pins,
 };
+use crate::validation::PackageValidationContext;
 use crate::version::Version;
 
 /// A local package directory identified after filesystem path resolution.
@@ -130,6 +135,16 @@ pub enum LocalPackagePathPinError {
     MissingRequirerDirectory(MvsPackageVersion),
     InvalidPath(PackagePathError),
     Directory(LocalPackageError),
+}
+
+/// Failure to validate a captured local manifest as an MVS dependency contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageContractLoadError {
+    InvalidContract(ResolverContractBuildError),
+    PackageVersionMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
 }
 
 impl LocalPackageDirectory {
@@ -253,6 +268,32 @@ impl LocalPackageDirectory {
     /// and validating package semantics before resolver use.
     pub fn parse_manifest(&self, role: PackageRole) -> PackageParseOutput {
         parse_for_role(&self.manifest_source, role)
+    }
+
+    /// Parses the captured manifest as a dependency and adapts it to an MVS
+    /// contract after syntax and semantic validation.
+    ///
+    /// The expected version is checked against the validated contract before
+    /// it can be returned to the source provider. This reads the bytes
+    /// captured when this directory was opened; it does not reopen
+    /// `sai.package`.
+    pub fn build_dependency_contract(
+        &self,
+        expected: &MvsPackageVersion,
+        context: &ResolverContractContext<'_>,
+        validation_context: PackageValidationContext<'_>,
+    ) -> Result<ResolverContract, LocalPackageContractLoadError> {
+        let parsed = self.parse_manifest(PackageRole::Dependency);
+        let contract = adapt_resolver_contract(&parsed, context, validation_context)
+            .map_err(LocalPackageContractLoadError::InvalidContract)?;
+        let found = contract.mvs.package_version();
+        if found != expected {
+            return Err(LocalPackageContractLoadError::PackageVersionMismatch {
+                expected: Box::new(expected.clone()),
+                found: Box::new(found.clone()),
+            });
+        }
+        Ok(contract)
     }
 }
 
@@ -434,6 +475,24 @@ impl fmt::Display for LocalPackagePathPinError {
     }
 }
 
+impl fmt::Display for LocalPackageContractLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidContract(error) => {
+                write!(formatter, "local dependency contract is invalid: {error}")
+            }
+            Self::PackageVersionMismatch { expected, found } => write!(
+                formatter,
+                "expected local package {}@{}, found {}@{}",
+                expected.package(),
+                expected.version(),
+                found.package(),
+                found.version()
+            ),
+        }
+    }
+}
+
 impl fmt::Display for LocalPackageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -490,6 +549,14 @@ impl fmt::Debug for LocalPackageDirectory {
 impl std::error::Error for LocalPackageError {}
 impl std::error::Error for LocalPackageDirectoryIndexError {}
 impl std::error::Error for LocalPackagePathPinError {}
+impl std::error::Error for LocalPackageContractLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidContract(error) => Some(error),
+            Self::PackageVersionMismatch { .. } => None,
+        }
+    }
+}
 
 #[cfg(all(
     unix,
@@ -652,19 +719,22 @@ fn open_manifest(path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::manifest::PackageRole;
+    use crate::manifest::{PackageRole, parse};
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::package_path::DependencyPackagePath;
+    use crate::resolver_contract::{ResolverContractBuildError, ResolverContractContext};
     use crate::resolver_source::{ResolverPackageSource, ResolverPathPinSource};
+    use crate::validation::PackageValidationContext;
     use crate::version::Version;
 
     use super::{
-        LocalPackageDirectory, LocalPackageDirectoryIndex, LocalPackageDirectoryIndexError,
-        LocalPackageError, LocalPackagePathPinError,
+        LocalPackageContractLoadError, LocalPackageDirectory, LocalPackageDirectoryIndex,
+        LocalPackageDirectoryIndexError, LocalPackageError, LocalPackagePathPinError,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -789,6 +859,75 @@ mod tests {
                 .to_string(),
             "2.0.0"
         );
+    }
+
+    #[test]
+    fn dependency_contract_uses_the_captured_manifest_and_checks_its_version() {
+        let tree = TempTree::new();
+        let root = parse(ROOT_MANIFEST);
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("valid root context");
+        let directory = tree.package("dependency", DEPENDENCY_MANIFEST);
+        let dependency =
+            LocalPackageDirectory::open(&directory).expect("open dependency directory");
+        fs::write(
+            directory.join("sai.package"),
+            b"package acme:dependency @ 2.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .expect("replace manifest after opening directory");
+
+        let expected = package_version("acme:dependency", "1.2.0");
+        let contract = dependency
+            .build_dependency_contract(&expected, &context, PackageValidationContext::default())
+            .expect("captured manifest builds a valid dependency contract");
+        assert_eq!(contract.role(), PackageRole::Dependency);
+        assert_eq!(contract.mvs.package_version(), &expected);
+
+        assert_eq!(
+            dependency.build_dependency_contract(
+                &package_version("acme:dependency", "2.0.0"),
+                &context,
+                PackageValidationContext::default(),
+            ),
+            Err(LocalPackageContractLoadError::PackageVersionMismatch {
+                expected: Box::new(package_version("acme:dependency", "2.0.0")),
+                found: Box::new(expected),
+            })
+        );
+
+        let invalid = tree.package(
+            "invalid",
+            b"package acme:invalid @ 1.0.0\ntargets { wasm32-core }\n",
+        );
+        let invalid = LocalPackageDirectory::open(invalid).expect("open invalid dependency");
+        let error = invalid
+            .build_dependency_contract(
+                &package_version("acme:invalid", "1.0.0"),
+                &context,
+                PackageValidationContext::default(),
+            )
+            .expect_err("semantic validation rejects a package without source");
+        assert!(matches!(
+            &error,
+            LocalPackageContractLoadError::InvalidContract(
+                ResolverContractBuildError::SemanticValidationErrors(_)
+            )
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("manifest semantic validation failed")
+        );
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]

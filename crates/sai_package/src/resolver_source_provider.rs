@@ -22,7 +22,7 @@ use crate::resolver_contract::{
 use crate::resolver_source::{
     ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
     ResolverSourceProvenance, ResolverSourceSelection, ResolverSourceSelectionError,
-    select_resolver_source, source_for_edge, validate_resolver_path_pins,
+    canonicalize_resolver_path_pins, select_resolver_source, source_for_edge,
 };
 use crate::version::Version;
 
@@ -665,6 +665,9 @@ pub enum ResolverSourceProviderError<E, K, C> {
 /// source and candidates after that check; it is responsible for reading,
 /// parsing, and semantically validating the source, then returning a
 /// dependency-role contract bound to `root_context`.
+/// This convenience form discards the canonical keys after validation. Use
+/// [`select_with_source_provider_and_canonicalized_pins`] when loading must
+/// consume the exact resolved source snapshot, especially for local paths.
 ///
 /// Root path pins come from `root_context`; `lock_floors` and `locked_sources`
 /// must come from a validated lock. The result retains the source used for
@@ -678,10 +681,44 @@ pub fn select_with_source_provider<E, K, C>(
     root_context: &ResolverContractContext<'_>,
     lock_floors: &HashMap<MvsNode, Version>,
     locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
+    canonicalize_path_pin: impl FnMut(&ResolverPathPinSource) -> Result<K, C>,
+    mut load_contract: impl FnMut(
+        &MvsContractRequest,
+        &ResolverSourceSelection,
+    ) -> Result<ResolverContract, E>,
+) -> Result<ResolverSourceProviderOutput, ResolverSourceProviderError<E, K, C>>
+where
+    K: Eq + Clone,
+{
+    select_with_source_provider_and_canonicalized_pins(
+        root_contract,
+        root_context,
+        lock_floors,
+        locked_sources,
+        canonicalize_path_pin,
+        |request, source, _| load_contract(request, source),
+    )
+}
+
+/// Drives MVS source selection while passing the exact canonical keys used to
+/// validate path pins into the contract loader.
+///
+/// For a `PathPin` selection, `canonicalized_path_pins` has one entry per
+/// source pin in `selection.path_pin_sources()` order. Its first entry is the
+/// selected source's key. A local loader can use that key as the already
+/// opened directory snapshot, avoiding a second path lookup between source
+/// validation and manifest parsing. Other source reasons receive an empty
+/// slice.
+pub fn select_with_source_provider_and_canonicalized_pins<E, K, C>(
+    root_contract: &ResolverContract,
+    root_context: &ResolverContractContext<'_>,
+    lock_floors: &HashMap<MvsNode, Version>,
+    locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
     mut canonicalize_path_pin: impl FnMut(&ResolverPathPinSource) -> Result<K, C>,
     mut load_contract: impl FnMut(
         &MvsContractRequest,
         &ResolverSourceSelection,
+        &[K],
     ) -> Result<ResolverContract, E>,
 ) -> Result<ResolverSourceProviderOutput, ResolverSourceProviderError<E, K, C>>
 where
@@ -719,20 +756,25 @@ where
             locked_sources,
         )
         .map_err(ResolverPackageLoadError::SourceSelection)?;
-        if let Err(error) = validate_resolver_path_pins(&source, |pin| {
+        let canonicalized_path_pins = match canonicalize_resolver_path_pins(&source, |pin| {
             canonicalize_path_pin_with_cache(pin, &mut path_pin_cache, &mut canonicalize_path_pin)
         }) {
-            if let ResolverPathPinValidationError::ConflictingSources {
-                first, conflicting, ..
-            } = &error
-            {
-                path_pin_cache
-                    .reported_conflicts
-                    .push((first.as_ref().clone(), conflicting.as_ref().clone()));
+            Ok(keys) => keys,
+            Err(error) => {
+                if let ResolverPathPinValidationError::ConflictingSources {
+                    first,
+                    conflicting,
+                    ..
+                } = &error
+                {
+                    path_pin_cache
+                        .reported_conflicts
+                        .push((first.as_ref().clone(), conflicting.as_ref().clone()));
+                }
+                return Err(ResolverPackageLoadError::PathPinValidation(Box::new(error)));
             }
-            return Err(ResolverPackageLoadError::PathPinValidation(Box::new(error)));
-        }
-        let contract = load_contract(request, &source)
+        };
+        let contract = load_contract(request, &source, &canonicalized_path_pins)
             .map_err(|error| ResolverPackageLoadError::Provider(Box::new(error)))?;
         let found = contract.mvs.package_version();
         if found != &request.package_version {
@@ -840,16 +882,48 @@ pub fn select_with_source_provider_and_identities<E, K, C, I>(
 where
     K: Eq + Clone,
 {
+    select_with_source_provider_and_canonicalized_pins_and_identities(
+        root,
+        root_context,
+        lock_floors,
+        locked_sources,
+        canonicalize_path_pin,
+        |request, source, _| load_contract(request, source),
+    )
+}
+
+/// Loads contracts with the canonicalized path-pin keys and captures each
+/// read source identity in the same result.
+///
+/// A local-path loader should use the selected key from
+/// `canonicalized_path_pins` as both its manifest directory snapshot and the
+/// corresponding source identity. This keeps the later source audit paired
+/// with the tree that was actually validated and read.
+pub fn select_with_source_provider_and_canonicalized_pins_and_identities<E, K, C, I>(
+    root: ResolverLoadedRootContract<I>,
+    root_context: &ResolverContractContext<'_>,
+    lock_floors: &HashMap<MvsNode, Version>,
+    locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
+    canonicalize_path_pin: impl FnMut(&ResolverPathPinSource) -> Result<K, C>,
+    mut load_contract: impl FnMut(
+        &MvsContractRequest,
+        &ResolverSourceSelection,
+        &[K],
+    ) -> Result<ResolverLoadedContract<I>, E>,
+) -> ResolverSourceProviderIdentifiedResult<E, K, C, I>
+where
+    K: Eq + Clone,
+{
     let root_package = root.contract.mvs.package_version().clone();
     let mut package_identities = BTreeMap::new();
-    let result = select_with_source_provider(
+    let result = select_with_source_provider_and_canonicalized_pins(
         &root.contract,
         root_context,
         lock_floors,
         locked_sources,
         canonicalize_path_pin,
-        |request, source| {
-            let loaded = load_contract(request, source)?;
+        |request, source, canonicalized_path_pins| {
+            let loaded = load_contract(request, source, canonicalized_path_pins)?;
             package_identities.insert(request.package_version.clone(), loaded.source_identity);
             Ok(loaded.contract)
         },
@@ -2253,6 +2327,7 @@ mod tests {
         ResolverSourceProviderIdentifiedOutput, ResolverSourceProviderOutput,
         audit_resolver_reloaded_contracts, plan_resolver_final_sources,
         plan_resolver_source_reloads, select_with_source_provider,
+        select_with_source_provider_and_canonicalized_pins_and_identities,
         select_with_source_provider_and_identities,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
@@ -3437,13 +3512,18 @@ requires { acme:dep @ ^1 from git "https://example.test/read-dep" }
         let root_contract =
             build_resolver_contract(&root, &context, PackageValidationContext::default())
                 .expect("root resolver contract is valid");
-        let output = select_with_source_provider_and_identities(
+        let output = select_with_source_provider_and_canonicalized_pins_and_identities(
             ResolverLoadedRootContract::new(root_contract, "root-tree"),
             &context,
             &HashMap::new(),
             &HashMap::new(),
             |_| Ok::<_, ()>("child-tree"),
-            |request, _| {
+            |request, _, canonicalized_path_pins| {
+                if request.package_version == dep_version {
+                    assert!(canonicalized_path_pins.is_empty());
+                } else {
+                    assert_eq!(canonicalized_path_pins, ["child-tree"]);
+                }
                 let manifest = match request.package_version.package() {
                     "acme:dep" => parse_for_role(
                         br#"package acme:dep @ 1.0.0
