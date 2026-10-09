@@ -222,7 +222,7 @@ pub struct ResolverContract {
     role: PackageRole,
     /// Root requirements include test edges. Dependency test requirements are
     /// omitted as required by resolver §2.5.1.
-    pub requirements: Vec<ResolverRequirement>,
+    pub(crate) requirements: Vec<ResolverRequirement>,
     pub parse_warnings: Vec<PackageParseWarning>,
     pub validation_warnings: Vec<PackageValidationWarning>,
     context_binding: Option<Arc<u8>>,
@@ -231,6 +231,14 @@ pub struct ResolverContract {
 impl ResolverContract {
     pub const fn role(&self) -> PackageRole {
         self.role
+    }
+
+    pub fn requirements(&self) -> &[ResolverRequirement] {
+        &self.requirements
+    }
+
+    pub(crate) fn mvs_metadata_is_consistent(&self) -> bool {
+        contract_edges_match_mvs(self)
     }
 }
 

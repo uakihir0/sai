@@ -9,7 +9,7 @@ use std::ops::Range;
 
 use crate::mvs::{
     MvsContract, MvsEdge, MvsNode, MvsPackageVersion, MvsRequirer, MvsSelectionError,
-    MvsSelectionOutput,
+    MvsSelectionErrorKind, MvsSelectionOutput,
 };
 use crate::version::Version;
 use crate::version_req::VersionReq;
@@ -177,7 +177,47 @@ pub fn check_selected_graph(
     root: &MvsContract,
     selection: &MvsSelectionOutput,
 ) -> Result<MvsSelectedGraph, MvsSelectedGraphInputError> {
-    if !selection.is_complete() {
+    check_selected_graph_internal(root, selection, false).map(|(graph, _)| graph)
+}
+
+/// Builds the resolved graph while retaining selection-time edges back to the
+/// root separately from dependency-to-dependency cycles.
+///
+/// This accepts only selections whose errors are root-cycle findings. Those
+/// edges cannot be represented in `MvsSelectedGraph` because MVS deliberately
+/// does not select the root as a dependency version; callers receive the
+/// findings alongside the graph instead. Missing contracts, conflicting
+/// pins, and all other selection errors remain fatal.
+pub fn check_selected_graph_with_root_cycles(
+    root: &MvsContract,
+    selection: &MvsSelectionOutput,
+) -> Result<(MvsSelectedGraph, Vec<MvsSelectionError>), MvsSelectedGraphInputError> {
+    check_selected_graph_internal(root, selection, true)
+}
+
+fn check_selected_graph_internal(
+    root: &MvsContract,
+    selection: &MvsSelectionOutput,
+    allow_root_cycles: bool,
+) -> Result<(MvsSelectedGraph, Vec<MvsSelectionError>), MvsSelectedGraphInputError> {
+    let root_version = root.package_version();
+    let root_cycles = if allow_root_cycles {
+        selection
+            .errors()
+            .iter()
+            .filter(|error| {
+                matches!(
+                    &error.kind,
+                    MvsSelectionErrorKind::DependencyCycleToRoot { root: cycle_root, .. }
+                        if cycle_root == root_version
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if selection.errors().len() != root_cycles.len() {
         return Err(MvsSelectedGraphInputError::SelectionIncomplete(
             selection.errors().to_vec(),
         ));
@@ -208,6 +248,7 @@ pub fn check_selected_graph(
         &mut graph,
         &mut edges_by_source,
         &mut pending,
+        allow_root_cycles,
     )?;
 
     while let Some(package_version) = pending.pop_first() {
@@ -225,6 +266,7 @@ pub fn check_selected_graph(
             &mut graph,
             &mut edges_by_source,
             &mut pending,
+            allow_root_cycles,
         )?;
     }
 
@@ -245,7 +287,7 @@ pub fn check_selected_graph(
             .then_with(|| left.span.end.cmp(&right.span.end))
     });
     graph.cycle = find_cycle(&graph.root, &graph.dependencies, &edges_by_source);
-    Ok(graph)
+    Ok((graph, root_cycles))
 }
 
 fn collect_selected_edges(
@@ -255,6 +297,7 @@ fn collect_selected_edges(
     graph: &mut MvsSelectedGraph,
     edges_by_source: &mut BTreeMap<MvsPackageVersion, Vec<MvsSelectedEdge>>,
     pending: &mut BTreeSet<MvsPackageVersion>,
+    skip_root_cycles: bool,
 ) -> Result<(), MvsSelectedGraphInputError> {
     let requirer = if source == &graph.root {
         MvsRequirer::Root(source.clone())
@@ -263,6 +306,7 @@ fn collect_selected_edges(
     };
     let selected_edges = edges
         .iter()
+        .filter(|edge| !skip_root_cycles || edge.target().node() != graph.root.node())
         .map(|edge| MvsSelectedEdge::from_edge(requirer.clone(), edge, selection))
         .collect::<Result<Vec<_>, _>>()?;
 

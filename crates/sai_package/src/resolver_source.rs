@@ -56,6 +56,7 @@ pub struct ResolverPathPinSource {
 /// The chosen source and the provenance required by later loading checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverSourceSelection {
+    package_version: MvsPackageVersion,
     source: ResolverPackageSource,
     reason: ResolverSourceReason,
     provenance: ResolverSourceProvenance,
@@ -65,6 +66,10 @@ pub struct ResolverSourceSelection {
 }
 
 impl ResolverSourceSelection {
+    pub const fn package_version(&self) -> &MvsPackageVersion {
+        &self.package_version
+    }
+
     pub const fn source(&self) -> &ResolverPackageSource {
         &self.source
     }
@@ -298,6 +303,7 @@ pub fn select_resolver_source(
         match &item.value.source {
             OverrideSource::Git { url, directory } => {
                 return Ok(ResolverSourceSelection {
+                    package_version: request.package_version.clone(),
                     source: ResolverPackageSource::Git {
                         url: url.clone(),
                         directory: directory.clone(),
@@ -313,6 +319,7 @@ pub fn select_resolver_source(
                 if root_path_pins.get(&node) == Some(request.package_version.version()) =>
             {
                 return Ok(ResolverSourceSelection {
+                    package_version: request.package_version.clone(),
                     source: ResolverPackageSource::Path {
                         relative_to: root_version.clone(),
                         path: path.clone(),
@@ -364,6 +371,7 @@ pub fn select_resolver_source(
     }
     if let Some(first) = path_pin_sources.first() {
         return Ok(ResolverSourceSelection {
+            package_version: request.package_version.clone(),
             source: first.source.clone(),
             reason: ResolverSourceReason::PathPin,
             provenance: ResolverSourceProvenance::PathPin { pin: first.clone() },
@@ -380,6 +388,7 @@ pub fn select_resolver_source(
             dependency_contracts,
         )?;
         return Ok(ResolverSourceSelection {
+            package_version: request.package_version.clone(),
             source,
             reason: ResolverSourceReason::NamedRequirement,
             provenance: ResolverSourceProvenance::NamedRequirement {
@@ -397,6 +406,7 @@ pub fn select_resolver_source(
                 ResolverSourceSelectionError::MissingLockSource(request.package_version.clone())
             })?;
         return Ok(ResolverSourceSelection {
+            package_version: request.package_version.clone(),
             source,
             reason: ResolverSourceReason::LockFloor,
             provenance: ResolverSourceProvenance::LockFloor {
@@ -506,7 +516,7 @@ fn requirement_for_edge<'a>(
         ));
     }
 
-    let mut matches = contract.requirements.iter().filter(|requirement| {
+    let mut matches = contract.requirements().iter().filter(|requirement| {
         requirement.package.as_ref() == target_package
             && requirement.span == edge.span
             && matches!(
@@ -609,7 +619,7 @@ mod tests {
         requirer: MvsRequirer,
     ) -> MvsNamedEdge {
         let requirement = contract
-            .requirements
+            .requirements()
             .iter()
             .find(|requirement| requirement.package.as_ref() == package)
             .expect("requirement metadata exists");
@@ -644,6 +654,7 @@ mod tests {
     fn path_pin_selection(pins: Vec<ResolverPathPinSource>) -> ResolverSourceSelection {
         let pin = pins[0].clone();
         ResolverSourceSelection {
+            package_version: package_version("acme:dep", "1.0.0"),
             source: pin.source.clone(),
             reason: ResolverSourceReason::PathPin,
             provenance: ResolverSourceProvenance::PathPin { pin },
@@ -740,6 +751,7 @@ mod tests {
     #[test]
     fn rejects_path_pin_selections_without_pin_provenance() {
         let selection = ResolverSourceSelection {
+            package_version: package_version("acme:dep", "1.0.0"),
             source: ResolverPackageSource::Path {
                 relative_to: package_version("acme:app", "1.0.0"),
                 path: "../dep".into(),
@@ -760,6 +772,7 @@ mod tests {
     #[test]
     fn selections_without_path_pins_need_no_canonicalization() {
         let selection = ResolverSourceSelection {
+            package_version: package_version("acme:dep", "1.0.0"),
             source: ResolverPackageSource::Git {
                 url: "https://example.test/dep".into(),
                 directory: None,
