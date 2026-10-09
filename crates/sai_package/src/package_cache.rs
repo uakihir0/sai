@@ -233,7 +233,7 @@ impl PackageCache {
         &self.temporary_directory
     }
 
-    fn cleanup_stale_temporary_directories(&self) {
+    pub(crate) fn cleanup_stale_temporary_directories(&self) {
         if !staging_activity_lock_supported() {
             return;
         }
@@ -250,7 +250,7 @@ impl PackageCache {
                 continue;
             };
 
-            if metadata.is_dir() && name.starts_with("source-") {
+            if metadata.is_dir() && is_cache_temporary_directory_name(name) {
                 if !is_stale_temporary_path(&path, now) {
                     continue;
                 }
@@ -296,7 +296,7 @@ impl PackageCache {
                 continue;
             };
             if !metadata.is_file()
-                || !staging_name.starts_with("source-")
+                || !is_cache_temporary_directory_name(staging_name)
                 || !is_stale_temporary_path(&path, now)
             {
                 continue;
@@ -435,7 +435,7 @@ fn create_staging_directory(path: &Path) -> Result<(), PackageCacheError> {
     Ok(())
 }
 
-fn create_staging_activity_lock(path: &Path) -> Result<File, PackageCacheError> {
+pub(crate) fn create_staging_activity_lock(path: &Path) -> Result<File, PackageCacheError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     set_new_file_mode(&mut options);
@@ -581,13 +581,13 @@ fn is_platform_lock_busy(error: &io::Error) -> bool {
     }
 }
 
-fn staging_activity_lock_path(staging_path: &Path) -> PathBuf {
+pub(crate) fn staging_activity_lock_path(staging_path: &Path) -> PathBuf {
     let mut path = staging_path.as_os_str().to_os_string();
     path.push(".lock");
     PathBuf::from(path)
 }
 
-fn release_staging_activity_lock(path: &Path, lock: File, remove_marker: bool) {
+pub(crate) fn release_staging_activity_lock(path: &Path, lock: File, remove_marker: bool) {
     #[cfg(unix)]
     if remove_marker {
         let _ = fs::remove_file(path);
@@ -618,6 +618,7 @@ fn legacy_staging_owner_is_gone(name: &str) -> bool {
     {
         let Some(pid) = name
             .strip_prefix("source-")
+            .or_else(|| name.strip_prefix("sai-git-remote-"))
             .and_then(|suffix| suffix.split_once('-').map(|(pid, _)| pid))
             .and_then(|pid| pid.parse::<i32>().ok())
         else {
@@ -652,6 +653,10 @@ fn legacy_staging_owner_is_gone(name: &str) -> bool {
         let _ = name;
         false
     }
+}
+
+fn is_cache_temporary_directory_name(name: &str) -> bool {
+    name.starts_with("source-") || name.starts_with("sai-git-remote-")
 }
 
 fn is_stale_temporary_path(path: &Path, now: SystemTime) -> bool {
@@ -1676,6 +1681,37 @@ mod tests {
         let activity_lock = super::staging_activity_lock_path(&staging);
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("partial"), b"incomplete").unwrap();
+        fs::write(&activity_lock, b"").unwrap();
+        super::make_tree_read_only(&staging).unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        for path in [&staging, &activity_lock] {
+            File::open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+
+        let source = TestRepository::new().verified_source();
+        cache.materialize_source(source).unwrap();
+
+        assert!(!staging.exists());
+        assert!(!activity_lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_git_temporary_repositories_are_removed_by_the_next_writer() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("stale-git-temp");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let staging = cache
+            .temporary_directory
+            .join(format!("sai-git-remote-{}-0-deadbeef", i32::MAX));
+        let activity_lock = super::staging_activity_lock_path(&staging);
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("objects"), b"incomplete Git scratch").unwrap();
         fs::write(&activity_lock, b"").unwrap();
         super::make_tree_read_only(&staging).unwrap();
         let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);

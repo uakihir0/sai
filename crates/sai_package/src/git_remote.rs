@@ -3,7 +3,7 @@
 use std::error::Error as StdError;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +18,12 @@ use crate::git_tree::{GitPackageFile, GitPackageSourceTree, GitTreeReadError, Gi
 use crate::lock_validation::canonical_git_url;
 use crate::manifest::PackageParseOutput;
 use crate::mvs::MvsPackageVersion;
+#[cfg(not(test))]
+use crate::package_cache::cache_directory_from_environment;
+use crate::package_cache::{
+    PackageCache, PackageCacheError, create_staging_activity_lock, release_staging_activity_lock,
+    staging_activity_lock_path,
+};
 use crate::package_path::DependencyPackagePath;
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, build_resolver_contract,
@@ -1116,23 +1122,63 @@ fn credential_key(subsection: Option<&BStr>, value_name: &[u8]) -> BString {
 
 struct TemporaryGitDirectory {
     path: PathBuf,
+    activity_lock_path: PathBuf,
+    activity_lock: Option<File>,
 }
 
 impl TemporaryGitDirectory {
     fn create() -> Result<Self, ()> {
+        #[cfg(test)]
+        {
+            Self::create_in(&std::env::temp_dir())
+        }
+        #[cfg(not(test))]
+        {
+            let cache_root = cache_directory_from_environment().map_err(|_| ())?;
+            let cache = PackageCache::open(cache_root).map_err(|_| ())?;
+            Self::create_with_cache(&cache)
+        }
+    }
+
+    fn create_with_cache(cache: &PackageCache) -> Result<Self, ()> {
+        cache.cleanup_stale_temporary_directories();
+        Self::create_in(cache.temporary_directory())
+    }
+
+    fn create_in(parent: &Path) -> Result<Self, ()> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        let base = std::env::temp_dir();
         for _ in 0..128 {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let nonce = RandomState::new().hash_one((std::process::id(), id));
-            let path = base.join(format!(
+            let path = parent.join(format!(
                 "sai-git-remote-{}-{id}-{nonce:016x}",
                 std::process::id()
             ));
-            match create_temporary_directory(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            let activity_lock_path = staging_activity_lock_path(&path);
+            let activity_lock = match create_staging_activity_lock(&activity_lock_path) {
+                Ok(lock) => lock,
+                Err(PackageCacheError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
                 Err(_) => return Err(()),
+            };
+            match create_temporary_directory(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        activity_lock_path,
+                        activity_lock: Some(activity_lock),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    release_staging_activity_lock(&activity_lock_path, activity_lock, true);
+                }
+                Err(_) => {
+                    release_staging_activity_lock(&activity_lock_path, activity_lock, true);
+                    return Err(());
+                }
             }
         }
         Err(())
@@ -1155,7 +1201,14 @@ fn create_temporary_directory(path: &Path) -> std::io::Result<()> {
 
 impl Drop for TemporaryGitDirectory {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let removed = match fs::remove_dir_all(&self.path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if let Some(lock) = self.activity_lock.take() {
+            release_staging_activity_lock(&self.activity_lock_path, lock, removed);
+        }
     }
 }
 
@@ -1164,6 +1217,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicU64;
 
     use super::{
         GitRemoteReleaseContractError, GitRemoteReleaseFetchError, GitRemoteTagListError,
@@ -1175,10 +1229,32 @@ mod tests {
     use crate::git_tree::GitTreeReadError;
     use crate::manifest::{PackageRole, parse_for_role};
     use crate::mvs::MvsPackageVersion;
+    use crate::package_cache::PackageCache;
     use crate::package_path::DependencyPackagePath;
     use crate::resolver_contract::ResolverContractContext;
     use crate::validation::PackageValidationContext;
     use gix::objs::tree::{Entry, EntryKind};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(prefix: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sai-git-remote-test-{}-{prefix}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct TestRemote {
         directory: TemporaryGitDirectory,
@@ -1993,6 +2069,50 @@ mod tests {
             super::exact_release_tag_refspec(&remote.tag, Some(&directory)),
             Err(GitRemoteReleaseFetchError::InvalidPackageDirectory)
         );
+    }
+
+    #[test]
+    fn temporary_repository_uses_the_global_cache_tmp_directory() {
+        let temp = TestDirectory::new("cache");
+        let cache = PackageCache::open(temp.0.join("cache")).unwrap();
+        let temporary = TemporaryGitDirectory::create_with_cache(&cache).unwrap();
+        let path = temporary.path.clone();
+        let activity_lock_path = temporary.activity_lock_path.clone();
+
+        assert_eq!(path.parent(), Some(cache.temporary_directory()));
+        assert!(activity_lock_path.is_file());
+
+        drop(temporary);
+        assert!(!path.exists());
+        assert!(!activity_lock_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_git_temporary_repository_is_preserved_while_its_lock_is_held() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("active-cache");
+        let cache = PackageCache::open(temp.0.join("cache")).unwrap();
+        let temporary = TemporaryGitDirectory::create_with_cache(&cache).unwrap();
+        let path = temporary.path.clone();
+        let activity_lock_path = temporary.activity_lock_path.clone();
+        let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        for path in [&path, &activity_lock_path] {
+            File::open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+
+        cache.cleanup_stale_temporary_directories();
+        assert!(path.is_dir());
+        assert!(activity_lock_path.is_file());
+
+        drop(temporary);
+        assert!(!path.exists());
+        assert!(!activity_lock_path.exists());
     }
 
     #[cfg(unix)]
