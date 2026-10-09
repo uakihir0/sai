@@ -110,6 +110,7 @@ name = "sai_package"
 version = "0.1.0"
 dependencies = [
  "sai_diagnostics",
+ "sai_vfs",
  "spdx",
 ]
 

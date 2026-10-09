@@ -820,7 +820,7 @@ mod tests {
         assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
         let source_ref = sai_diagnostics::SourceRef {
             path: "sai.package".into(),
-            package: Some("acme:app".into()),
+            package: Some("acme:app@1.0.0".into()),
             snapshot: Some(1),
         };
         let file_id = sai_diagnostics::FileId::new(7);
@@ -879,8 +879,8 @@ mod tests {
         let policies = resolve_lint_policies(
             &parsed,
             sai_diagnostics::SourceRef {
-                path: "deps/acme-dep/sai.package".into(),
-                package: Some("acme:dep".into()),
+                path: "dep:acme:dep@1.0.0/sai.package".into(),
+                package: Some("acme:dep@1.0.0".into()),
                 snapshot: Some(1),
             },
             sai_diagnostics::FileId::new(8),
