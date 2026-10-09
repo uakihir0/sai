@@ -209,7 +209,7 @@ These rules guarantee that the content can be materialized identically on every 
 
 ### 3.4.4 Collisions
 
-Two selected paths that are different byte strings but become equal after Unicode 16.0.0 normalization form NFC followed by Unicode 16.0.0 default full case folding are the error `PATH_COLLISION`, naming both paths. The implementation uses the Unicode Character Database 16.0.0 `CaseFolding.txt` C and F mappings (excluding Turkic-only mappings), with unmapped code points mapping to themselves. File systems that normalize or ignore case (the defaults on macOS and Windows) would merge them, and the materialized package would differ between hosts.
+Two selected paths that are different byte strings but become equal after Unicode 16.0.0 normalization form NFC followed by Unicode 16.0.0 default full case folding are the error `PATH_COLLISION`, naming both paths. The same comparison applies to every component prefix: a file path cannot collide with a differently spelled directory prefix of another selected path, and a file cannot occupy a path another selected file needs as a directory. The implementation uses the Unicode Character Database 16.0.0 `CaseFolding.txt` C and F mappings (excluding Turkic-only mappings), with unmapped code points mapping to themselves. File systems that normalize or ignore case (the defaults on macOS and Windows) would merge them, and the materialized package would differ between hosts.
 
 ### 3.4.5 Order
 
