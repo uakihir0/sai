@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::manifest::{
     Override, OverrideSource, PackageDeclaration, PackageParseError, PackageParseOutput,
@@ -42,6 +43,7 @@ impl ResolverPathKey {
 #[derive(Clone, Debug)]
 pub struct ResolverContractContext<'a> {
     root_manifest: PackageParseOutput,
+    root_context_binding: Arc<u8>,
     root_package: MvsPackageVersion,
     root_targets: BTreeSet<Box<str>>,
     path_packages: &'a BTreeMap<ResolverPathKey, MvsPackageVersion>,
@@ -143,6 +145,7 @@ impl<'a> ResolverContractContext<'a> {
 
         Ok(Self {
             root_manifest: root_manifest.clone(),
+            root_context_binding: Arc::new(0),
             root_package,
             root_targets,
             path_packages,
@@ -162,6 +165,13 @@ impl<'a> ResolverContractContext<'a> {
 
     pub fn root_overrides(&self) -> &[Spanned<Override>] {
         &self.root_overrides
+    }
+
+    pub(crate) fn is_bound_to_root_contract(&self, contract: &ResolverContract) -> bool {
+        contract
+            .context_binding
+            .as_ref()
+            .is_some_and(|binding| Arc::ptr_eq(binding, &self.root_context_binding))
     }
 
     /// Returns the root path pins in the form consumed by [`crate::mvs::select`].
@@ -213,6 +223,7 @@ pub struct ResolverContract {
     pub requirements: Vec<ResolverRequirement>,
     pub parse_warnings: Vec<PackageParseWarning>,
     pub validation_warnings: Vec<PackageValidationWarning>,
+    context_binding: Option<Arc<u8>>,
 }
 
 /// Errors produced before a resolver contract can be constructed.
@@ -331,6 +342,7 @@ pub fn build_resolver_contract(
         requirements,
         parse_warnings: parsed.warnings().to_vec(),
         validation_warnings: validation.warnings,
+        context_binding: Some(context.root_context_binding.clone()),
     })
 }
 
