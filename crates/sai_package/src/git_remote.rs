@@ -14,9 +14,9 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use crate::git_tags::{
     GitReleaseTag, GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs,
 };
-use crate::git_tree::{GitTreeReadError, GitTreeReader};
+use crate::git_tree::{GitPackageFile, GitTreeReadError, GitTreeReader};
 use crate::lock_validation::canonical_git_url;
-use crate::manifest::{PackageParseOutput, PackageRole, parse_for_role};
+use crate::manifest::PackageParseOutput;
 use crate::mvs::MvsPackageVersion;
 use crate::package_path::DependencyPackagePath;
 use crate::resolver_contract::{
@@ -98,7 +98,7 @@ impl StdError for GitRemoteTagListError {
 }
 
 /// A release selected by its Git release tag and verified against its source tree.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FetchedGitRelease {
     tag_name: Box<str>,
     version: Version,
@@ -107,6 +107,7 @@ pub struct FetchedGitRelease {
     commit_id: gix::ObjectId,
     source_tree: TreeHash,
     package_manifest: PackageParseOutput,
+    source_files: Vec<GitPackageFile>,
 }
 
 impl FetchedGitRelease {
@@ -150,6 +151,11 @@ impl FetchedGitRelease {
     /// dependency resolution.
     pub const fn package_manifest(&self) -> &PackageParseOutput {
         &self.package_manifest
+    }
+
+    /// The exact selected source files, sorted by their package-relative paths.
+    pub fn source_files(&self) -> &[GitPackageFile] {
+        &self.source_files
     }
 
     /// Validate the fetched manifest and build its resolver contract.
@@ -660,9 +666,10 @@ fn fetch_release_tree_in_repository(
         }
         Some(directory) => directory.as_bytes(),
     };
-    let (source_tree, manifest_bytes) = reader
-        .hash_commit_tree_and_read_manifest(&commit_id, package_directory)
+    let package_source_tree = reader
+        .read_commit_package_source_tree(&commit_id, package_directory)
         .map_err(GitRemoteReleaseFetchError::SourceTree)?;
+    let (source_tree, package_manifest, source_files) = package_source_tree.into_parts();
     if let Some(expected_source_checksum) = expected_source_checksum
         && source_tree.checksum != expected_source_checksum
     {
@@ -671,7 +678,6 @@ fn fetch_release_tree_in_repository(
             actual: source_tree.checksum.clone().into(),
         });
     }
-    let package_manifest = parse_for_role(&manifest_bytes, PackageRole::Dependency);
 
     Ok(FetchedGitRelease {
         tag_name: tag_name.into(),
@@ -681,6 +687,7 @@ fn fetch_release_tree_in_repository(
         commit_id,
         source_tree,
         package_manifest,
+        source_files,
     })
 }
 
@@ -1595,6 +1602,21 @@ mod tests {
         assert!(fetched.source_tree().warnings.is_empty());
         assert!(fetched.package_manifest().is_syntax_valid());
         assert_eq!(fetched.package_manifest().role(), PackageRole::Dependency);
+        assert_eq!(
+            fetched
+                .source_files()
+                .iter()
+                .map(crate::git_tree::GitPackageFile::path)
+                .collect::<Vec<_>>(),
+            ["lib.sai", "sai.package"]
+        );
+        assert_eq!(fetched.source_files()[0].content(), b"package source");
+        assert_eq!(
+            fetched.source_files()[1].content(),
+            b"package acme:sample @ 1.2.3\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n"
+        );
     }
 
     fn root_contract_context() -> ResolverContractContext<'static> {

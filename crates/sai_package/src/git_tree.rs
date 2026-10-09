@@ -9,7 +9,9 @@ use std::path::Path;
 
 use gix::prelude::{FindExt, HeaderExt};
 
-use crate::manifest::MAX_PACKAGE_MANIFEST_BYTES;
+use crate::manifest::{
+    MAX_PACKAGE_MANIFEST_BYTES, PackageParseOutput, PackageRole, parse_for_role,
+};
 use crate::tree_hash::{
     GitTreeEntry, TreeHash, TreeHashError, TreeHashPurpose, hash_git_tree, should_skip_path,
     validate_tree_path,
@@ -216,6 +218,60 @@ enum OwnedTreeEntry {
     },
 }
 
+struct HashedTreeContents {
+    source_tree: TreeHash,
+    package_manifest: Option<Vec<u8>>,
+    entries: Vec<OwnedTreeEntry>,
+}
+
+/// One regular package file selected for the source checksum and cache.
+#[derive(Debug, Eq, PartialEq)]
+pub struct GitPackageFile {
+    path: Box<str>,
+    content: Vec<u8>,
+}
+
+impl GitPackageFile {
+    /// The validated UTF-8 path relative to the package directory.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The exact blob bytes stored in the Git commit.
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+}
+
+/// A validated source-tree snapshot ready for contract resolution or caching.
+#[derive(Debug, Eq, PartialEq)]
+pub struct GitPackageSourceTree {
+    source_tree: TreeHash,
+    package_manifest: PackageParseOutput,
+    files: Vec<GitPackageFile>,
+}
+
+impl GitPackageSourceTree {
+    /// The source checksum and warnings computed from this snapshot.
+    pub const fn source_tree(&self) -> &TreeHash {
+        &self.source_tree
+    }
+
+    /// The dependency-role parse result from the root `sai.package`.
+    pub const fn package_manifest(&self) -> &PackageParseOutput {
+        &self.package_manifest
+    }
+
+    /// The selected regular files, sorted by their UTF-8 path bytes.
+    pub fn files(&self) -> &[GitPackageFile] {
+        &self.files
+    }
+
+    pub(crate) fn into_parts(self) -> (TreeHash, PackageParseOutput, Vec<GitPackageFile>) {
+        (self.source_tree, self.package_manifest, self.files)
+    }
+}
+
 /// A reader over a Git object directory.
 ///
 /// The reader takes an explicit object hash kind, reads only that object
@@ -294,7 +350,7 @@ impl GitTreeReader {
         purpose: TreeHashPurpose,
     ) -> Result<TreeHash, GitTreeReadError> {
         self.hash_commit_tree_internal(commit_id, package_directory, purpose, false)
-            .map(|(tree_hash, _)| tree_hash)
+            .map(|contents| contents.source_tree)
     }
 
     /// Hash a package's source tree and read its root `sai.package` manifest
@@ -308,15 +364,64 @@ impl GitTreeReader {
         commit_id: &gix::ObjectId,
         package_directory: &[u8],
     ) -> Result<(TreeHash, Vec<u8>), GitTreeReadError> {
-        let (tree_hash, manifest) = self.hash_commit_tree_internal(
+        let mut contents = self.hash_commit_tree_internal(
             commit_id,
             package_directory,
             TreeHashPurpose::Source,
             true,
         )?;
-        manifest
-            .map(|manifest| (tree_hash, manifest))
+        let source_tree = contents.source_tree;
+        contents
+            .package_manifest
+            .take()
+            .map(|manifest| (source_tree, manifest))
             .ok_or(GitTreeReadError::MissingPackageManifest)
+    }
+
+    /// Read the selected source files and validate the root package manifest
+    /// while computing the source checksum in one bounded tree walk.
+    pub fn read_commit_package_source_tree(
+        &self,
+        commit_id: &gix::ObjectId,
+        package_directory: &[u8],
+    ) -> Result<GitPackageSourceTree, GitTreeReadError> {
+        let mut contents = self.hash_commit_tree_internal(
+            commit_id,
+            package_directory,
+            TreeHashPurpose::Source,
+            true,
+        )?;
+        let mut manifest_bytes = contents
+            .package_manifest
+            .take()
+            .ok_or(GitTreeReadError::MissingPackageManifest)?;
+        let package_manifest = parse_for_role(&manifest_bytes, PackageRole::Dependency);
+        let mut files = Vec::with_capacity(contents.entries.len());
+        for entry in contents.entries {
+            if let OwnedTreeEntry::File { path, content, .. } = entry {
+                let content = if path == b"sai.package" {
+                    std::mem::take(&mut manifest_bytes)
+                } else {
+                    content
+                };
+                let path = String::from_utf8(path)
+                    .map_err(|error| {
+                        GitTreeReadError::Hash(TreeHashError::InvalidPath {
+                            path: error.into_bytes(),
+                            reason: crate::tree_hash::InvalidPathReason::InvalidUtf8,
+                        })
+                    })?
+                    .into_boxed_str();
+                files.push(GitPackageFile { path, content });
+            }
+        }
+        files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+
+        Ok(GitPackageSourceTree {
+            source_tree: contents.source_tree,
+            package_manifest,
+            files,
+        })
     }
 
     fn hash_commit_tree_internal(
@@ -325,7 +430,7 @@ impl GitTreeReader {
         package_directory: &[u8],
         purpose: TreeHashPurpose,
         read_manifest: bool,
-    ) -> Result<(TreeHash, Option<Vec<u8>>), GitTreeReadError> {
+    ) -> Result<HashedTreeContents, GitTreeReadError> {
         self.ensure_no_alternates()?;
         if !package_directory.is_empty() {
             validate_tree_path(package_directory)?;
@@ -520,7 +625,7 @@ impl GitTreeReader {
         purpose: TreeHashPurpose,
         tree_entry_count: &mut u64,
         read_manifest: bool,
-    ) -> Result<(TreeHash, Option<Vec<u8>>), GitTreeReadError> {
+    ) -> Result<HashedTreeContents, GitTreeReadError> {
         let mut pending = vec![(*root_tree_id, Vec::<u8>::new())];
         let mut owned_entries = Vec::<OwnedTreeEntry>::new();
         let mut package_manifest_seen = false;
@@ -634,7 +739,11 @@ impl GitTreeReader {
         } else {
             None
         };
-        Ok((tree_hash, package_manifest))
+        Ok(HashedTreeContents {
+            source_tree: tree_hash,
+            package_manifest,
+            entries: owned_entries,
+        })
     }
 
     fn read_tree_entries(
@@ -998,6 +1107,45 @@ mod tests {
         assert_eq!(manifest, b"package acme:sample @ 1.0.0\n");
         assert!(tree_hash.checksum.starts_with("sai1:"));
         assert_eq!(tree_hash.warnings.len(), 2);
+    }
+
+    #[test]
+    fn reads_selected_files_and_manifest_from_one_source_tree_snapshot() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+
+        let source_tree = standard_reader(&repository)
+            .read_commit_package_source_tree(&commit, b"packages/acme")
+            .unwrap();
+
+        assert_eq!(
+            source_tree
+                .files()
+                .iter()
+                .map(super::GitPackageFile::path)
+                .collect::<Vec<_>>(),
+            ["sai.package", "src/main.sai"]
+        );
+        assert_eq!(
+            source_tree.files()[0].content(),
+            b"package acme:sample @ 1.0.0\n"
+        );
+        assert_eq!(
+            source_tree.files()[1].content(),
+            b"pub fn answer() -> i32 { 42 }\n"
+        );
+        assert_eq!(
+            source_tree.package_manifest().role(),
+            crate::manifest::PackageRole::Dependency
+        );
+        assert!(source_tree.package_manifest().is_syntax_valid());
+        assert_eq!(
+            source_tree.source_tree().checksum,
+            standard_reader(&repository)
+                .hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source)
+                .unwrap()
+                .checksum
+        );
     }
 
     #[test]
