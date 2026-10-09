@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::manifest::{OverrideSource, RequirementSource};
+use crate::manifest::{OverrideSource, PackageRole, RequirementSource};
 use crate::mvs::{MvsContractRequest, MvsNamedEdge, MvsPackageVersion, MvsRequirer};
 use crate::resolver_contract::{
     ResolverContract, ResolverContractContext, ResolverRequirementResolution,
@@ -56,6 +56,7 @@ pub struct ResolverSourceSelection {
 /// Failure to map MVS edge provenance back to validated manifest metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolverSourceSelectionError {
+    RootContractRoleMismatch(PackageRole),
     RootContractMismatch {
         contract: Box<MvsPackageVersion>,
         context: Box<MvsPackageVersion>,
@@ -65,6 +66,11 @@ pub enum ResolverSourceSelectionError {
     RequirerContractMismatch {
         expected: Box<MvsPackageVersion>,
         found: Box<MvsPackageVersion>,
+    },
+    RequirerContractRoleMismatch {
+        requirer: MvsPackageVersion,
+        expected: PackageRole,
+        found: PackageRole,
     },
     StaleRequirerContractContext(MvsPackageVersion),
     MissingRequirement {
@@ -123,6 +129,11 @@ pub fn select_resolver_source(
     dependency_contracts: &HashMap<MvsPackageVersion, ResolverContract>,
     locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
 ) -> Result<ResolverSourceSelection, ResolverSourceSelectionError> {
+    if root_contract.role() != PackageRole::Root {
+        return Err(ResolverSourceSelectionError::RootContractRoleMismatch(
+            root_contract.role(),
+        ));
+    }
     let root_version = root_context.root_package();
     if root_contract.mvs.package_version() != root_version {
         return Err(ResolverSourceSelectionError::RootContractMismatch {
@@ -307,6 +318,13 @@ fn requirement_for_edge<'a>(
     let requiring_package = edge.requirer.package_version();
     let contract = match &edge.requirer {
         MvsRequirer::Root(package_version) => {
+            if root_contract.role() != PackageRole::Root {
+                return Err(ResolverSourceSelectionError::RequirerContractRoleMismatch {
+                    requirer: package_version.clone(),
+                    expected: PackageRole::Root,
+                    found: root_contract.role(),
+                });
+            }
             if root_contract.mvs.package_version() != package_version {
                 return Err(ResolverSourceSelectionError::MissingRequirerContract(
                     package_version.clone(),
@@ -315,9 +333,17 @@ fn requirement_for_edge<'a>(
             root_contract
         }
         MvsRequirer::Package(package_version) => {
-            dependency_contracts.get(package_version).ok_or_else(|| {
+            let contract = dependency_contracts.get(package_version).ok_or_else(|| {
                 ResolverSourceSelectionError::MissingRequirerContract(package_version.clone())
-            })?
+            })?;
+            if contract.role() != PackageRole::Dependency {
+                return Err(ResolverSourceSelectionError::RequirerContractRoleMismatch {
+                    requirer: package_version.clone(),
+                    expected: PackageRole::Dependency,
+                    found: contract.role(),
+                });
+            }
+            contract
         }
     };
     let found_package_version = contract.mvs.package_version();

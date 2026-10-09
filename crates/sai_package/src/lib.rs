@@ -15,6 +15,7 @@ pub mod mvs_graph_validation;
 pub mod package_path;
 pub mod resolver_contract;
 pub mod resolver_source;
+pub mod resolver_source_provider;
 pub mod validation;
 pub mod version;
 pub mod version_req;

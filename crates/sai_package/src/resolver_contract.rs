@@ -218,12 +218,19 @@ pub struct ResolverRequirement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverContract {
     pub mvs: MvsContract,
+    role: PackageRole,
     /// Root requirements include test edges. Dependency test requirements are
     /// omitted as required by resolver §2.5.1.
     pub requirements: Vec<ResolverRequirement>,
     pub parse_warnings: Vec<PackageParseWarning>,
     pub validation_warnings: Vec<PackageValidationWarning>,
     context_binding: Option<Arc<u8>>,
+}
+
+impl ResolverContract {
+    pub const fn role(&self) -> PackageRole {
+        self.role
+    }
 }
 
 /// Errors produced before a resolver contract can be constructed.
@@ -339,6 +346,7 @@ pub fn build_resolver_contract(
 
     Ok(ResolverContract {
         mvs,
+        role: parsed.role(),
         requirements,
         parse_warnings: parsed.warnings().to_vec(),
         validation_warnings: validation.warnings,
