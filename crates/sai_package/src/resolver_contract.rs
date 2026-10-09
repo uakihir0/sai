@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 
 use crate::lock_validation::canonical_git_url;
@@ -48,10 +48,27 @@ pub struct ResolverContractContext<'a> {
     root_context_binding: Arc<u8>,
     root_package: MvsPackageVersion,
     root_targets: BTreeSet<Box<str>>,
-    path_packages: &'a BTreeMap<ResolverPathKey, MvsPackageVersion>,
+    path_packages: ResolverPathPackages<'a>,
     root_path_overrides: &'a BTreeMap<Box<str>, MvsPackageVersion>,
     root_git_override_ids: BTreeSet<Box<str>>,
     root_overrides: Vec<Spanned<Override>>,
+}
+
+#[derive(Clone, Debug)]
+enum ResolverPathPackages<'a> {
+    Borrowed(&'a BTreeMap<ResolverPathKey, MvsPackageVersion>),
+    Owned(Arc<BTreeMap<ResolverPathKey, MvsPackageVersion>>),
+}
+
+impl Deref for ResolverPathPackages<'_> {
+    type Target = BTreeMap<ResolverPathKey, MvsPackageVersion>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(path_packages) => path_packages,
+            Self::Owned(path_packages) => path_packages,
+        }
+    }
 }
 
 impl<'a> ResolverContractContext<'a> {
@@ -150,10 +167,47 @@ impl<'a> ResolverContractContext<'a> {
             root_context_binding: Arc::new(0),
             root_package,
             root_targets,
-            path_packages,
+            path_packages: ResolverPathPackages::Borrowed(path_packages),
             root_path_overrides,
             root_git_override_ids,
             root_overrides,
+        })
+    }
+
+    /// Extends the dependency path map while preserving this root context's
+    /// identity. Conflicting versions for an existing key are rejected.
+    ///
+    /// A resolver discovers dependency manifests as MVS visits them, so their
+    /// path requirements are not all available when the root context is first
+    /// built. The derived context lets each loaded contract use the additional
+    /// snapshots without becoming detached from its root contract.
+    pub fn with_path_packages(
+        &self,
+        additions: &BTreeMap<ResolverPathKey, MvsPackageVersion>,
+    ) -> Result<Self, ResolverContractBuildError> {
+        let mut path_packages = self.path_packages.deref().clone();
+        for (key, discovered) in additions {
+            if let Some(existing) = path_packages.get(key) {
+                if existing != discovered {
+                    return Err(ResolverContractBuildError::ConflictingPathPackageVersion {
+                        key: key.clone(),
+                        existing: Box::new(existing.clone()),
+                        discovered: Box::new(discovered.clone()),
+                    });
+                }
+            } else {
+                path_packages.insert(key.clone(), discovered.clone());
+            }
+        }
+        Ok(Self {
+            root_manifest: self.root_manifest.clone(),
+            root_context_binding: self.root_context_binding.clone(),
+            root_package: self.root_package.clone(),
+            root_targets: self.root_targets.clone(),
+            path_packages: ResolverPathPackages::Owned(Arc::new(path_packages)),
+            root_path_overrides: self.root_path_overrides,
+            root_git_override_ids: self.root_git_override_ids.clone(),
+            root_overrides: self.root_overrides.clone(),
         })
     }
 
@@ -167,6 +221,18 @@ impl<'a> ResolverContractContext<'a> {
 
     pub fn root_overrides(&self) -> &[Spanned<Override>] {
         &self.root_overrides
+    }
+
+    pub fn path_packages(&self) -> &BTreeMap<ResolverPathKey, MvsPackageVersion> {
+        &self.path_packages
+    }
+
+    pub(crate) fn root_path_override(&self, package: &str) -> Option<&MvsPackageVersion> {
+        self.root_path_overrides.get(package)
+    }
+
+    pub(crate) fn has_root_git_override(&self, package: &str) -> bool {
+        self.root_git_override_ids.contains(package)
     }
 
     pub(crate) fn is_bound_to_root_contract(&self, contract: &ResolverContract) -> bool {
@@ -893,6 +959,11 @@ pub enum ResolverContractBuildError {
         requiring_package: MvsPackageVersion,
         span: Range<usize>,
     },
+    ConflictingPathPackageVersion {
+        key: ResolverPathKey,
+        existing: Box<MvsPackageVersion>,
+        discovered: Box<MvsPackageVersion>,
+    },
     PathPackageIdentityMismatch {
         expected: Box<str>,
         found: Box<str>,
@@ -951,6 +1022,21 @@ impl fmt::Display for ResolverContractBuildError {
                 requiring_package.version(),
                 span.start,
                 span.end
+            ),
+            Self::ConflictingPathPackageVersion {
+                key,
+                existing,
+                discovered,
+            } => write!(
+                formatter,
+                "path `{}` from {}@{} was indexed as both {}@{} and {}@{}",
+                key.path,
+                key.requiring_package.package(),
+                key.requiring_package.version(),
+                existing.package(),
+                existing.version(),
+                discovered.package(),
+                discovered.version()
             ),
             Self::PathPackageIdentityMismatch {
                 expected,
@@ -1203,6 +1289,81 @@ mod tests {
             PackageValidationContext::default(),
         )
         .expect("root manifest is valid")
+    }
+
+    #[test]
+    fn derived_context_adds_dependency_paths_and_keeps_root_binding() {
+        let root = parse(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("build root contract");
+
+        let dependency = parse_for_role(
+            b"package acme:dependency @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:sibling @ ^1 from path \"../sibling\" }\n",
+            PackageRole::Dependency,
+        );
+        let dependency_version = package_version("acme:dependency", "1.0.0");
+        let sibling_version = package_version("acme:sibling", "1.2.0");
+        let key = ResolverPathKey::new(dependency_version, "../sibling");
+        let additions = BTreeMap::from([(key.clone(), sibling_version.clone())]);
+        let derived_context = context
+            .with_path_packages(&additions)
+            .expect("extend dependency path packages");
+
+        assert_eq!(derived_context.path_packages(), &additions);
+        assert!(
+            derived_context.is_bound_to_root_contract(&root_contract),
+            "adding dependency paths preserves the shared root binding"
+        );
+        let dependency_contract = build_resolver_contract(
+            &dependency,
+            &derived_context,
+            PackageValidationContext::default(),
+        )
+        .expect("build dependency contract with discovered path package");
+        assert_eq!(
+            dependency_contract.mvs.edges()[0].named_version(),
+            sibling_version.version()
+        );
+        assert!(context.path_packages().is_empty());
+    }
+
+    #[test]
+    fn derived_context_rejects_conflicting_path_package_versions() {
+        let root = parse(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let key = ResolverPathKey::new(package_version("acme:root", "1.0.0"), "../local");
+        let indexed_version = package_version("acme:local", "1.1.0");
+        let path_packages = BTreeMap::from([(key.clone(), indexed_version.clone())]);
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let conflicting_version = package_version("acme:local", "1.2.0");
+        let additions = BTreeMap::from([(key.clone(), conflicting_version.clone())]);
+
+        assert!(matches!(
+            context.with_path_packages(&additions),
+            Err(ResolverContractBuildError::ConflictingPathPackageVersion {
+                key: found_key,
+                existing,
+                discovered,
+            }) if found_key == key
+                && *existing == indexed_version
+                && *discovered == conflicting_version
+        ));
+        assert_eq!(context.path_packages()[&key], indexed_version);
     }
 
     #[test]

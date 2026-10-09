@@ -147,6 +147,7 @@ pub enum LocalPackagePathIndexError {
     MissingRootDirectory(MvsPackageVersion),
     RootManifestSnapshotMismatch(MvsPackageVersion),
     MissingRootTargets(Box<PackageParseOutput>),
+    DependencyPathRequirementBaseIsRoot(MvsPackageVersion),
     DuplicateRootPathOverride {
         package: Box<str>,
         span: Range<usize>,
@@ -161,9 +162,10 @@ pub enum LocalPackagePathIndexError {
         span: Range<usize>,
         error: Box<LocalPackagePathIndexError>,
     },
-    RootPathRequirementDiscovery {
+    PathRequirementDiscovery {
         package: Box<str>,
         path: Box<str>,
+        requiring_package: MvsPackageVersion,
         span: Range<usize>,
         error: Box<LocalPackagePathIndexError>,
     },
@@ -179,8 +181,9 @@ impl LocalPackagePathIndexError {
             | Self::InvalidRootManifest(parsed)
             | Self::MissingRootPackageHeader(parsed)
             | Self::MissingRootTargets(parsed) => Some(parsed),
-            Self::PathDiscovery { error, .. }
-            | Self::RootPathRequirementDiscovery { error, .. } => error.manifest_parse_output(),
+            Self::PathDiscovery { error, .. } | Self::PathRequirementDiscovery { error, .. } => {
+                error.manifest_parse_output()
+            }
             _ => None,
         }
     }
@@ -628,14 +631,115 @@ impl LocalPackageDirectoryIndex {
                 let package_version =
                     staged
                         .index_dependency_path(&root_package, path)
-                        .map_err(|error| {
-                            LocalPackagePathIndexError::RootPathRequirementDiscovery {
+                        .map_err(
+                            |error| LocalPackagePathIndexError::PathRequirementDiscovery {
                                 package: requirement.package.clone(),
                                 path: path.clone(),
+                                requiring_package: root_package.clone(),
                                 span: item.span.clone(),
                                 error: Box::new(error),
-                            }
-                        })?;
+                            },
+                        )?;
+                path_packages.insert(key, package_version);
+            }
+        }
+        *self = staged;
+        Ok(path_packages)
+    }
+
+    /// Discovers the target-included local path requirements of one indexed
+    /// dependency package.
+    ///
+    /// Dependency test requirements are omitted. Root target filtering and
+    /// root source overrides are applied from `root_context`, matching the
+    /// rules used when the dependency contract is built.
+    pub fn index_dependency_path_requirements(
+        &mut self,
+        requiring_package: &MvsPackageVersion,
+        root_context: &ResolverContractContext<'_>,
+    ) -> Result<BTreeMap<ResolverPathKey, MvsPackageVersion>, LocalPackagePathIndexError> {
+        if requiring_package == root_context.root_package() {
+            return Err(
+                LocalPackagePathIndexError::DependencyPathRequirementBaseIsRoot(
+                    requiring_package.clone(),
+                ),
+            );
+        }
+        let base = self.entries.get(requiring_package).ok_or_else(|| {
+            LocalPackagePathIndexError::MissingBaseDirectory(requiring_package.clone())
+        })?;
+        let parsed = base.parse_manifest(PackageRole::Dependency);
+        if !parsed.is_syntax_valid() {
+            return Err(LocalPackagePathIndexError::InvalidManifest(Box::new(
+                parsed,
+            )));
+        }
+        let header = parsed.file().header.as_ref().ok_or_else(|| {
+            LocalPackagePathIndexError::MissingPackageHeader(Box::new(parsed.clone()))
+        })?;
+        let package = header.value.identity.to_string();
+        let found = MvsPackageVersion::new(package.clone(), header.value.version.clone())
+            .map_err(|_| LocalPackagePathIndexError::InvalidPackageIdentity(package.into()))?;
+        if &found != requiring_package {
+            return Err(LocalPackagePathIndexError::Index(
+                LocalPackageDirectoryIndexError::PackageVersionMismatch {
+                    expected: Box::new(requiring_package.clone()),
+                    found_package: found.package().into(),
+                    found_version: Box::new(found.version().clone()),
+                },
+            ));
+        }
+
+        let mut staged = self.clone();
+        let mut path_packages = BTreeMap::new();
+        for declaration in &parsed.file().declarations {
+            let PackageDeclaration::Requires { test, entries } = &declaration.value else {
+                continue;
+            };
+            if *test {
+                continue;
+            }
+            for item in entries {
+                let requirement = &item.value;
+                let included = requirement.only.as_ref().is_none_or(|only| {
+                    only.value
+                        .iter()
+                        .any(|target| root_context.root_targets().contains(&target.value))
+                });
+                let path_override_applies = root_context
+                    .root_path_override(&requirement.package)
+                    .is_some_and(|package_version| {
+                        package_version.version().compatibility_line()
+                            == requirement.version.compatibility_line()
+                    });
+                if !included
+                    || root_context.has_root_git_override(&requirement.package)
+                    || path_override_applies
+                {
+                    continue;
+                }
+                let Some(Spanned {
+                    value: RequirementSource::Path(path),
+                    ..
+                }) = &requirement.source
+                else {
+                    continue;
+                };
+                let key = ResolverPathKey::new(requiring_package.clone(), path.clone());
+                if path_packages.contains_key(&key) {
+                    continue;
+                }
+                let package_version = staged
+                    .index_dependency_path(requiring_package, path)
+                    .map_err(
+                        |error| LocalPackagePathIndexError::PathRequirementDiscovery {
+                            package: requirement.package.clone(),
+                            path: path.clone(),
+                            requiring_package: requiring_package.clone(),
+                            span: item.span.clone(),
+                            error: Box::new(error),
+                        },
+                    )?;
                 path_packages.insert(key, package_version);
             }
         }
@@ -972,6 +1076,12 @@ impl fmt::Display for LocalPackagePathIndexError {
             Self::MissingRootTargets(_) => {
                 formatter.write_str("root package manifest has no targets declaration")
             }
+            Self::DependencyPathRequirementBaseIsRoot(package_version) => write!(
+                formatter,
+                "cannot discover dependency path requirements for root package {}@{}",
+                package_version.package(),
+                package_version.version()
+            ),
             Self::InvalidRootPackageIdentity(package) => {
                 write!(formatter, "root package has invalid identity `{package}`")
             }
@@ -1010,15 +1120,19 @@ impl fmt::Display for LocalPackagePathIndexError {
                 "root path override for `{package}` at bytes {}..{}: {error}",
                 span.start, span.end
             ),
-            Self::RootPathRequirementDiscovery {
+            Self::PathRequirementDiscovery {
                 package,
                 path,
+                requiring_package,
                 span,
                 error,
             } => write!(
                 formatter,
-                "root path requirement for `{package}` at {path:?} at bytes {}..{}: {error}",
-                span.start, span.end
+                "path requirement for `{package}` at {path:?} from {}@{} at bytes {}..{}: {error}",
+                requiring_package.package(),
+                requiring_package.version(),
+                span.start,
+                span.end,
             ),
         }
     }
@@ -1177,8 +1291,9 @@ impl std::error::Error for LocalPackagePathIndexError {
             Self::InvalidPath(error) => Some(error),
             Self::Directory(error) => Some(error),
             Self::Index(error) => Some(error),
-            Self::PathDiscovery { error, .. }
-            | Self::RootPathRequirementDiscovery { error, .. } => Some(error),
+            Self::PathDiscovery { error, .. } | Self::PathRequirementDiscovery { error, .. } => {
+                Some(error)
+            }
             _ => None,
         }
     }
@@ -2274,13 +2389,15 @@ mod tests {
             .expect_err("missing path should fail");
         assert!(matches!(
             &error,
-            LocalPackagePathIndexError::RootPathRequirementDiscovery {
+            LocalPackagePathIndexError::PathRequirementDiscovery {
                 package,
                 path,
+                requiring_package,
                 span,
                 error: source_error,
             } if package.as_ref() == "acme:missing"
                 && path.as_ref() == "../missing"
+                && requiring_package == &root_version
                 && *span == expected_span
                 && matches!(
                     source_error.as_ref(),
@@ -2298,6 +2415,248 @@ mod tests {
             index.entries.keys().collect::<Vec<_>>(),
             [&root_version],
             "failed root requirement discovery commits no partial paths"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn dependency_path_requirement_discovery_filters_targets_and_test_edges() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        let dependency_directory = tree.package(
+            "workspace/dependency",
+            b"package acme:dependency @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core, wasm32-wasi }\n\
+              requires {\n\
+                acme:active @ ^1 from path \"../active\"\n\
+                acme:inactive @ ^1 from path \"../inactive\" only { wasm32-wasi }\n\
+              }\n\
+              requires test { acme:test-only @ ^1 from path \"../test-only\" }\n",
+        );
+        tree.package(
+            "workspace/active",
+            b"package acme:active @ 1.3.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_version = package_version("acme:root", "1.0.0");
+        let dependency_version = package_version("acme:dependency", "1.0.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let root_path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let root_context = ResolverContractContext::from_root_manifest(
+            &root_manifest,
+            &root_path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("build root resolver context");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .expect("index root package");
+        index
+            .index_dependency_path(&root_version, "../dependency")
+            .expect("index requiring dependency");
+
+        let path_packages = index
+            .index_dependency_path_requirements(&dependency_version, &root_context)
+            .expect("discover dependency path requirements");
+        assert_eq!(
+            path_packages,
+            BTreeMap::from([(
+                ResolverPathKey::new(dependency_version.clone(), "../active"),
+                package_version("acme:active", "1.3.0"),
+            )])
+        );
+        assert!(
+            !index
+                .entries
+                .contains_key(&package_version("acme:inactive", "1.0.0")),
+            "dependency paths excluded by root targets are not opened"
+        );
+        assert!(
+            !index
+                .entries
+                .contains_key(&package_version("acme:test-only", "1.0.0")),
+            "dependency test requirements are not part of resolution"
+        );
+        assert!(dependency_directory.is_dir());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn dependency_source_overrides_replace_path_requirement_sources() {
+        let tree = TempTree::new();
+        let root_directory = tree.package(
+            "workspace/root",
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              overrides {\n\
+                acme:patched use path \"../patch\"\n\
+                acme:git use git \"https://example.test/acme/git\"\n\
+              }\n",
+        );
+        tree.package(
+            "workspace/patch",
+            b"package acme:patched @ 1.4.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        tree.package(
+            "workspace/dependency",
+            b"package acme:dependency @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires {\n\
+                acme:patched @ ^1 from path \"../missing-patched\"\n\
+                acme:git @ ^2 from path \"../missing-git\"\n\
+                acme:other @ ^1 from path \"../other\"\n\
+              }\n",
+        );
+        tree.package(
+            "workspace/other",
+            b"package acme:other @ 1.2.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_version = package_version("acme:root", "1.0.0");
+        let dependency_version = package_version("acme:dependency", "1.0.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                root_directory.clone(),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        let root_path_overrides = index
+            .index_root_path_overrides(&root_directory)
+            .expect("index root path override");
+        let root_path_packages = BTreeMap::new();
+        let root_context = ResolverContractContext::from_root_manifest(
+            &root_manifest,
+            &root_path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("build root resolver context");
+        index
+            .index_dependency_path(&root_version, "../dependency")
+            .expect("index requiring dependency");
+
+        let path_packages = index
+            .index_dependency_path_requirements(&dependency_version, &root_context)
+            .expect("discover non-overridden dependency paths");
+        assert_eq!(
+            path_packages,
+            BTreeMap::from([(
+                ResolverPathKey::new(dependency_version, "../other"),
+                package_version("acme:other", "1.2.0"),
+            )])
+        );
+        assert_eq!(index.entries.len(), 4);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn dependency_path_requirement_discovery_is_atomic_and_source_located() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        tree.package(
+            "workspace/dependency",
+            b"package acme:dependency @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires {\n\
+                acme:first @ ^1 from path \"../first\"\n\
+                acme:missing @ ^1 from path \"../missing\"\n\
+              }\n",
+        );
+        tree.package(
+            "workspace/first",
+            b"package acme:first @ 1.1.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_version = package_version("acme:root", "1.0.0");
+        let dependency_version = package_version("acme:dependency", "1.0.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let root_path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let root_context = ResolverContractContext::from_root_manifest(
+            &root_manifest,
+            &root_path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("build root resolver context");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .expect("index root package");
+        index
+            .index_dependency_path(&root_version, "../dependency")
+            .expect("index requiring dependency");
+        let dependency_directory = &index.entries[&dependency_version];
+        let dependency_manifest = dependency_directory.parse_manifest(PackageRole::Dependency);
+        let expected_span = dependency_manifest
+            .file()
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let PackageDeclaration::Requires { entries, .. } = &declaration.value else {
+                    return None;
+                };
+                entries
+                    .iter()
+                    .find(|item| item.value.package.as_ref() == "acme:missing")
+                    .map(|item| item.span.clone())
+            })
+            .expect("missing path requirement span");
+
+        let error = index
+            .index_dependency_path_requirements(&dependency_version, &root_context)
+            .expect_err("missing dependency path should fail");
+        assert!(matches!(
+            &error,
+            LocalPackagePathIndexError::PathRequirementDiscovery {
+                package,
+                path,
+                requiring_package,
+                span,
+                error: source_error,
+            } if package.as_ref() == "acme:missing"
+                && path.as_ref() == "../missing"
+                && requiring_package == &dependency_version
+                && *span == expected_span
+                && matches!(
+                    source_error.as_ref(),
+                    LocalPackagePathIndexError::Directory(_)
+                )
+        ));
+        assert_eq!(
+            index.entries.keys().cloned().collect::<Vec<_>>(),
+            [dependency_version, root_version],
+            "failed discovery does not retain the first path snapshot"
         );
     }
 
