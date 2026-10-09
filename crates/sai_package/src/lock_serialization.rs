@@ -19,6 +19,18 @@ pub enum LockSerializationError {
     InvalidSemantics(Vec<LockValidationError>),
 }
 
+/// Reports whether a lock's bytes match their canonical serialization.
+///
+/// Returns an error for syntax or lock-local semantic failures. Callers must
+/// validate graph-dependent capability names in the original parsed lock
+/// before calling this function, since canonicalization may remove covered
+/// capabilities.
+pub fn is_canonical(source: &[u8]) -> Result<bool, LockSerializationError> {
+    let parsed = crate::lock::parse(source);
+    let canonical = serialize_canonical(&parsed)?;
+    Ok(canonical.as_bytes() == source)
+}
+
 /// Serializes a syntactically and lock-locally semantically valid lock.
 ///
 /// The serializer sorts blocks and fields, normalizes set-valued lists, and
@@ -306,7 +318,7 @@ fn write_quoted(output: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LockSerializationError, serialize_canonical};
+    use super::{LockSerializationError, is_canonical, serialize_canonical};
     use crate::lock::parse;
 
     #[test]
@@ -412,6 +424,32 @@ package acme:dep @ 1.2.0
         let serialized = serialize_canonical(&parse(source.as_bytes())).unwrap();
         assert!(serialized.contains("    capabilities { }\n"));
         assert!(!serialized.contains("{  }"));
+    }
+
+    #[test]
+    fn identifies_canonical_and_valid_noncanonical_locks() {
+        let canonical = b"lock 1\n\nroot acme:app @ 1.0.0\n    targets { wasm32-wasi }\n";
+        assert!(is_canonical(canonical).unwrap());
+
+        let noncanonical = [
+            b"lock 1\nroot acme:app @ 1.0.0\ntargets { wasm32-wasi }\n".as_slice(),
+            b"lock 1\n\nroot acme:app @ 1.0.0\n    targets { wasm32-wasi, wasm32-wasi }\n",
+            b"lock 1\n\nroot acme:app @ 1.0.0\n    targets { wasm32-wasi }\n// comment\n",
+        ];
+        for source in noncanonical {
+            assert!(
+                !is_canonical(source).unwrap(),
+                "expected noncanonical: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicality_rejects_invalid_input() {
+        assert!(matches!(
+            is_canonical(b"lock 1\n"),
+            Err(LockSerializationError::InvalidSyntax { .. })
+        ));
     }
 
     #[test]
