@@ -623,7 +623,7 @@ fn is_capability_package(value: &str) -> bool {
     crate::identity::is_valid_identity_spelling(value)
 }
 
-fn capability_covers(grant: &str, required: &str) -> bool {
+pub(crate) fn capability_covers(grant: &str, required: &str) -> bool {
     if grant == required {
         return true;
     }

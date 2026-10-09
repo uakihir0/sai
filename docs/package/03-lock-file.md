@@ -166,6 +166,7 @@ Consistency between entries (for example an edge whose recorded version has no e
 2. **Requirements** are written as the package author wrote them, normalized by rule 1 and by the spacing of §3.2.3. Two requirements with the same comparators in the same order are the same requirement; the resolver compares requirements in this canonical form ([02 §2.10.2](02-resolver.md) rule 3).
 3. **Strings.** No string in a lock contains a control character (U+0000–U+001F, U+007F–U+009F) or a bidirectional control character (U+202A–U+202E, U+2066–U+2069). URLs are ASCII ([04 §4.2](04-distribution-and-security.md)); paths satisfy [01 §1.6.1](01-package-contract.md); digests and commits are lowercase hexadecimal. A lock string that violates this is `LOCK_CORRUPT`.
 4. **Names** in lists (targets, `only` sets, capabilities, and each `imports` capability set) are written as `WORD` or `PKG_PATH` tokens exactly as in `sai.package`, sorted by their bytes, without duplicates. These lists have set semantics: a reader treats a repeated member as one value, and canonical serialization removes repetitions. Repeated `artifact` or `imports` fields for the same target remain corrupt because each target has at most one field of each kind.
+5. **Repository directory.** `dir "."` is accepted as a noncanonical spelling of the repository root; canonical serialization omits the `dir` field for that entry.
 
 ---
 
