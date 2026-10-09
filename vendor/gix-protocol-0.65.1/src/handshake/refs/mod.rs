@@ -6,6 +6,42 @@ use super::Ref;
 pub mod parse {
     use bstr::BString;
 
+    /// The kind of a Git ref advertisement limit.
+    #[doc(hidden)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum AdvertisementLimit {
+        /// Maximum number of advertised refs.
+        RefCount,
+        /// Maximum cumulative number of bytes in ref names.
+        RefNameBytes,
+    }
+
+    /// A ref advertisement exceeded a parser resource limit.
+    #[doc(hidden)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct AdvertisementLimitExceeded {
+        /// The exceeded limit.
+        pub limit: AdvertisementLimit,
+        /// The value reached when the limit was exceeded.
+        pub actual: u64,
+    }
+
+    impl std::fmt::Display for AdvertisementLimitExceeded {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let limit = match self.limit {
+                AdvertisementLimit::RefCount => "ref count",
+                AdvertisementLimit::RefNameBytes => "cumulative ref-name bytes",
+            };
+            write!(
+                formatter,
+                "Git ref advertisement exceeded the {limit} limit (reached {})",
+                self.actual
+            )
+        }
+    }
+
+    impl std::error::Error for AdvertisementLimitExceeded {}
+
     /// The error returned when parsing References/refs from the server response.
     #[derive(Debug, thiserror::Error)]
     #[expect(missing_docs)]

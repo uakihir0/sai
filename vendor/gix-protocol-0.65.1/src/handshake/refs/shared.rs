@@ -2,7 +2,10 @@ use bstr::{BStr, BString, ByteSlice};
 
 use crate::{
     fetch::response::ShallowUpdate,
-    handshake::{Ref, refs::parse::Error},
+    handshake::{
+        Ref,
+        refs::parse::{AdvertisementLimit, AdvertisementLimitExceeded, Error},
+    },
 };
 
 const MAX_ADVERTISED_REFS: u64 = 1_000_000;
@@ -40,7 +43,10 @@ impl AdvertisementBudget {
     pub(in crate::handshake::refs) fn accept_ref_name(&mut self, name: &[u8]) -> Result<(), Error> {
         let refs = self.refs.saturating_add(1);
         if refs > self.max_refs {
-            return Err(advertisement_limit_error("ref count", refs));
+            return Err(advertisement_limit_error(
+                AdvertisementLimit::RefCount,
+                refs,
+            ));
         }
         self.refs = refs;
         self.accept_ref_name_bytes(name.len())
@@ -54,7 +60,7 @@ impl AdvertisementBudget {
         let total = self.name_bytes.saturating_add(name_bytes);
         if total > self.max_name_bytes {
             return Err(advertisement_limit_error(
-                "cumulative ref-name bytes",
+                AdvertisementLimit::RefNameBytes,
                 total,
             ));
         }
@@ -63,10 +69,10 @@ impl AdvertisementBudget {
     }
 }
 
-fn advertisement_limit_error(limit: &str, actual: u64) -> Error {
+fn advertisement_limit_error(limit: AdvertisementLimit, actual: u64) -> Error {
     Error::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("Git ref advertisement exceeded the {limit} limit (reached {actual})"),
+        AdvertisementLimitExceeded { limit, actual },
     ))
 }
 
@@ -470,6 +476,7 @@ mod tests {
         assert_eq!(out_refs.len(), 1);
     }
 
+    #[allow(clippy::assert_is_empty)]
     #[test]
     fn v1_cumulative_ref_name_bytes_are_rejected_before_growing_the_output() {
         let mut out_refs = Vec::new();
@@ -515,6 +522,7 @@ mod tests {
         assert_eq!(out_refs.len(), 1);
     }
 
+    #[allow(clippy::assert_is_empty)]
     #[test]
     fn v2_ref_name_bytes_are_rejected_before_growing_the_output() {
         let mut out_refs = Vec::new();
@@ -535,6 +543,7 @@ mod tests {
         assert!(out_refs.is_empty());
     }
 
+    #[allow(clippy::assert_is_empty)]
     #[test]
     fn v2_symbolic_target_bytes_are_included_in_the_name_budget() {
         let mut out_refs = Vec::new();
@@ -652,6 +661,22 @@ mod tests {
                 assert_eq!(
                     error.to_string(),
                     format!("Git ref advertisement exceeded the {limit} limit (reached {actual})")
+                );
+                let typed = error
+                    .get_ref()
+                    .and_then(|source| {
+                        source.downcast_ref::<refs::parse::AdvertisementLimitExceeded>()
+                    })
+                    .expect("limit errors retain a typed source");
+                assert_eq!(typed.actual, actual);
+                assert_eq!(
+                    typed.limit,
+                    match limit {
+                        "ref count" => refs::parse::AdvertisementLimit::RefCount,
+                        "cumulative ref-name bytes" =>
+                            refs::parse::AdvertisementLimit::RefNameBytes,
+                        _ => panic!("unexpected limit name"),
+                    }
                 );
             }
             other => panic!("expected an invalid-data limit error, got {other:?}"),

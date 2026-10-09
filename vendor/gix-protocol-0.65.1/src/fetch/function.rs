@@ -157,6 +157,7 @@ where
                 }
             };
             // This needs drop if tracing is compiled in. We just don't know it.
+            #[allow(clippy::drop_non_drop)]
             drop(negotiate_span);
 
             let mut previous_response =
