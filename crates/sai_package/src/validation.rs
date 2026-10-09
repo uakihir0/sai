@@ -10,10 +10,79 @@ use crate::version::Version;
 
 pub use crate::manifest::PackageRole;
 
+/// A package manifest cannot supply lint policy data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackageLintPolicyError {
+    PackageSyntaxInvalid,
+    SourceSpanOutOfRange(Range<usize>),
+}
+
+/// Extracts validated lint-denying policy locations from a syntax-valid
+/// package manifest.
+///
+/// Call this only after semantic validation succeeds. Package-local
+/// `ambient_imports` and `runtime_contracts` apply to dependencies as well.
+/// `duplicate_lines` is retained only for a root package because that policy
+/// applies to the whole graph and dependency declarations are ignored.
+pub fn resolve_lint_policies(
+    parsed: &PackageParseOutput,
+    source: sai_diagnostics::SourceRef,
+    file_id: sai_diagnostics::FileId,
+) -> Result<sai_diagnostics::LintPolicies, PackageLintPolicyError> {
+    if !parsed.is_syntax_valid() {
+        return Err(PackageLintPolicyError::PackageSyntaxInvalid);
+    }
+
+    let mut policies = sai_diagnostics::LintPolicies::default();
+    for declaration in &parsed.file.declarations {
+        let PackageDeclaration::Policy(items) = &declaration.value else {
+            continue;
+        };
+        for item in items {
+            let destination = match item.value.as_ref() {
+                "ambient_imports" => &mut policies.deny_ambient_imports,
+                "runtime_contracts" => &mut policies.deny_runtime_contracts,
+                "duplicate_lines" if parsed.role() == PackageRole::Root => {
+                    &mut policies.deny_duplicate_package_lines
+                }
+                _ => continue,
+            };
+            if destination.is_none() {
+                *destination = Some(package_policy_location(
+                    &source,
+                    file_id,
+                    item.span.clone(),
+                )?);
+            }
+        }
+    }
+
+    Ok(policies)
+}
+
+fn package_policy_location(
+    source: &sai_diagnostics::SourceRef,
+    file_id: sai_diagnostics::FileId,
+    range: Range<usize>,
+) -> Result<sai_diagnostics::Location, PackageLintPolicyError> {
+    let Some(start) = sai_diagnostics::TextSize::from_usize(range.start) else {
+        return Err(PackageLintPolicyError::SourceSpanOutOfRange(range));
+    };
+    let Some(end) = sai_diagnostics::TextSize::from_usize(range.end) else {
+        return Err(PackageLintPolicyError::SourceSpanOutOfRange(range));
+    };
+    let Some(range_value) = sai_diagnostics::TextRange::new(start, end) else {
+        return Err(PackageLintPolicyError::SourceSpanOutOfRange(range));
+    };
+    Ok(sai_diagnostics::Location {
+        file: source.clone(),
+        span: sai_diagnostics::Span::new(file_id, range_value),
+    })
+}
+
 /// Inputs that affect manifest validation but are not part of the manifest.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PackageValidationContext<'a> {
-    pub role: PackageRole,
     /// The language version of the toolchain, when checking `compiler`.
     pub compiler_version: Option<&'a Version>,
 }
@@ -189,7 +258,7 @@ pub fn validate(
                 }
             }
             PackageDeclaration::Requires { test, entries } => {
-                if *test && context.role == PackageRole::Dependency {
+                if *test && parsed.role() == PackageRole::Dependency {
                     continue;
                 }
                 for entry in entries {
@@ -214,7 +283,7 @@ pub fn validate(
                     validate_policy_item(item, &mut output);
                 }
             }
-            PackageDeclaration::Lints(items) if context.role == PackageRole::Root => {
+            PackageDeclaration::Lints(items) if parsed.role() == PackageRole::Root => {
                 for item in items {
                     match sai_diagnostics::lookup_lint_name(&item.value.code) {
                         sai_diagnostics::LintNameLookup::Lint(_) => {}
@@ -235,7 +304,7 @@ pub fn validate(
                     }
                 }
             }
-            PackageDeclaration::Profile { name, items } if context.role == PackageRole::Root => {
+            PackageDeclaration::Profile { name, items } if parsed.role() == PackageRole::Root => {
                 if !matches!(name.as_ref(), "dev" | "release" | "tiny") {
                     output.errors.push(PackageValidationError {
                         kind: PackageValidationErrorKind::UnknownProfile(name.clone()),
@@ -268,7 +337,7 @@ pub fn validate(
                     }
                 }
             }
-            PackageDeclaration::Allocator(identity) if context.role == PackageRole::Root => {
+            PackageDeclaration::Allocator(identity) if parsed.role() == PackageRole::Root => {
                 if !crate::identity::is_valid_identity_spelling(identity) {
                     output.errors.push(PackageValidationError {
                         kind: PackageValidationErrorKind::InvalidPackageName(identity.clone()),
@@ -288,7 +357,7 @@ pub fn validate(
                     });
                 }
             }
-            PackageDeclaration::Overrides(items) if context.role == PackageRole::Root => {
+            PackageDeclaration::Overrides(items) if parsed.role() == PackageRole::Root => {
                 for item in items {
                     if !crate::identity::is_valid_identity_spelling(&item.value.package) {
                         output.errors.push(PackageValidationError {
@@ -405,7 +474,7 @@ pub fn validate(
         }
     }
 
-    if complete && context.role == PackageRole::Root {
+    if complete && parsed.role() == PackageRole::Root {
         for declaration in &file.declarations {
             let PackageDeclaration::Profile { items, .. } = &declaration.value else {
                 continue;
@@ -475,7 +544,7 @@ pub fn validate(
         if let Some(target_items) = targets {
             for declaration in &file.declarations {
                 if let PackageDeclaration::Requires { test, entries } = &declaration.value {
-                    if *test && context.role == PackageRole::Dependency {
+                    if *test && parsed.role() == PackageRole::Dependency {
                         continue;
                     }
                     for entry in entries {
@@ -721,12 +790,14 @@ fn requirement_spans_lines(requirement: &crate::version_req::VersionReq) -> bool
 
 #[cfg(test)]
 mod tests {
-    use crate::manifest::{PackageDeclaration, PackageParseOutput, PackageRole, parse};
+    use crate::manifest::{
+        PackageDeclaration, PackageParseOutput, PackageRole, parse, parse_for_role,
+    };
     use crate::version::Version;
 
     use super::{
-        PackageValidationContext, PackageValidationErrorKind, PackageValidationWarningKind,
-        validate,
+        PackageLintPolicyError, PackageValidationContext, PackageValidationErrorKind,
+        PackageValidationWarningKind, resolve_lint_policies, validate,
     };
 
     fn parse_text(source: &str) -> PackageParseOutput {
@@ -739,6 +810,103 @@ mod tests {
             .into_iter()
             .map(|error| error.kind)
             .collect()
+    }
+
+    #[test]
+    fn resolves_root_lint_policies_with_manifest_locations() {
+        let source = "package acme:app @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n\
+             policy { deny duplicate_lines, deny ambient_imports, deny runtime_contracts }\n";
+        let parsed = parse(source.as_bytes());
+        assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
+        let source_ref = sai_diagnostics::SourceRef {
+            path: "sai.package".into(),
+            package: Some("acme:app".into()),
+            snapshot: Some(1),
+        };
+        let file_id = sai_diagnostics::FileId::new(7);
+        let policies =
+            resolve_lint_policies(&parsed, source_ref.clone(), file_id).expect("valid policies");
+        let duplicate_location = policies
+            .deny_duplicate_package_lines
+            .as_ref()
+            .expect("root graph policy");
+        let duplicate_start = source
+            .find("deny duplicate_lines")
+            .expect("policy item is in source");
+
+        assert_eq!(duplicate_location.file, source_ref);
+        assert_eq!(duplicate_location.span.file, file_id);
+        assert_eq!(
+            duplicate_location.span.range.start().to_usize(),
+            duplicate_start
+        );
+        assert!(policies.deny_ambient_imports.is_some());
+        assert!(policies.deny_runtime_contracts.is_some());
+
+        let empty = sai_diagnostics::LintPolicies::default();
+        let resolved = sai_diagnostics::resolve_lint_occurrence(
+            "DUPLICATE_PACKAGE_LINE",
+            &sai_diagnostics::LintResolutionContext {
+                primary: None,
+                attributes: &[],
+                cli: None,
+                manifest: None,
+                package_policy: &empty,
+                root_policy: &policies,
+                is_root_or_workspace_member: false,
+                deny_warnings: false,
+            },
+        )
+        .expect("registered package lint");
+        let sai_diagnostics::LintResolution::Emitted { severity, level } = resolved else {
+            panic!("root policy must emit the graph-wide lint");
+        };
+        assert_eq!(severity, sai_diagnostics::Severity::Error);
+        assert_eq!(level.source, sai_diagnostics::LevelSource::Policy);
+        assert_eq!(level.location.as_ref(), Some(duplicate_location));
+    }
+
+    #[test]
+    fn ignores_duplicate_line_policy_in_dependency_manifests() {
+        let parsed = parse_for_role(
+            b"package acme:dep @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              policy { deny duplicate_lines, deny ambient_imports }\n",
+            PackageRole::Dependency,
+        );
+        assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
+        let policies = resolve_lint_policies(
+            &parsed,
+            sai_diagnostics::SourceRef {
+                path: "deps/acme-dep/sai.package".into(),
+                package: Some("acme:dep".into()),
+                snapshot: Some(1),
+            },
+            sai_diagnostics::FileId::new(8),
+        )
+        .expect("valid dependency policy");
+
+        assert!(policies.deny_duplicate_package_lines.is_none());
+        assert!(policies.deny_ambient_imports.is_some());
+    }
+
+    #[test]
+    fn rejects_lint_policy_extraction_from_incomplete_syntax() {
+        let parsed = parse(b"package acme:broken @ 1.0.0\npolicy { deny duplicate_lines\n");
+
+        assert_eq!(
+            resolve_lint_policies(
+                &parsed,
+                sai_diagnostics::SourceRef {
+                    path: "sai.package".into(),
+                    package: Some("acme:broken".into()),
+                    snapshot: Some(1),
+                },
+                sai_diagnostics::FileId::new(9),
+            ),
+            Err(PackageLintPolicyError::PackageSyntaxInvalid)
+        );
     }
 
     #[test]
@@ -1050,8 +1218,8 @@ mod tests {
 
     #[test]
     fn root_only_validation_is_ignored_for_dependency_manifests() {
-        let parsed = parse_text(
-            "package acme:dep @ 1.0.0\n\
+        let parsed = parse_for_role(
+            b"package acme:dep @ 1.0.0\n\
              source \"src\"\n\
              targets { wasm32-core }\n\
              lints { allow UNKNOWN_LINT_NAME }\n\
@@ -1059,14 +1227,9 @@ mod tests {
              profile experimental { allow { host } budget { unknown <= 0 B } }\n\
              allocator acme:missing\n\
              overrides { sai:core use artifact }\n",
+            PackageRole::Dependency,
         );
-        let output = validate(
-            &parsed,
-            PackageValidationContext {
-                role: PackageRole::Dependency,
-                compiler_version: None,
-            },
-        );
+        let output = validate(&parsed, PackageValidationContext::default());
         assert!(output.errors.is_empty(), "{:?}", output.errors);
     }
 
@@ -1146,7 +1309,6 @@ mod tests {
         let output = validate(
             &parsed,
             PackageValidationContext {
-                role: PackageRole::Root,
                 compiler_version: Some(&current),
             },
         );
@@ -1179,11 +1341,12 @@ mod tests {
 
     #[test]
     fn root_only_declarations_remain_in_the_syntax_tree_for_dependencies() {
-        let parsed = parse_text(
-            "package acme:dep @ 1.0.0\n\
+        let parsed = parse_for_role(
+            b"package acme:dep @ 1.0.0\n\
              source \"src\"\n\
              targets { wasm32-core }\n\
              profile tiny { budget { wasm <= 1 B } }\n",
+            PackageRole::Dependency,
         );
         assert!(
             parsed
@@ -1192,13 +1355,7 @@ mod tests {
                 .iter()
                 .any(|declaration| matches!(declaration.value, PackageDeclaration::Profile { .. }))
         );
-        let output = validate(
-            &parsed,
-            PackageValidationContext {
-                role: PackageRole::Dependency,
-                compiler_version: None,
-            },
-        );
+        let output = validate(&parsed, PackageValidationContext::default());
         assert!(output.warnings.is_empty());
         assert!(output.errors.is_empty());
     }

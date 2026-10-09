@@ -115,13 +115,7 @@ pub fn compare(
             syntax_errors: package.errors.clone(),
         });
     }
-    let package_validation = validate_package(
-        package,
-        PackageValidationContext {
-            role: PackageRole::Root,
-            compiler_version: None,
-        },
-    );
+    let package_validation = validate_package(package, PackageValidationContext::default());
     if !package_validation.is_valid() {
         return Err(LockRootContractInputError::InvalidPackageSemantics(
             package_validation,
