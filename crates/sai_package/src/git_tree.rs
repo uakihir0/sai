@@ -20,8 +20,10 @@ pub const MAX_PACKAGE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_CONTENT_BYTES: u64 = 1024 * 1024 * 1024;
 /// Maximum number of regular files selected from one package directory.
 pub const MAX_PACKAGE_FILE_COUNT: u64 = 100_000;
-/// Maximum size of an individual commit or tree object read while hashing.
+/// Maximum size of an individual commit, tag, or tree object read while hashing.
 pub const MAX_GIT_METADATA_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum number of annotated tag objects followed while peeling one release tag.
+pub const MAX_TAG_CHAIN_DEPTH: u64 = 64;
 /// Maximum number of entries inspected while walking one package tree.
 pub const MAX_PACKAGE_TREE_ENTRIES: u64 = 1_000_000;
 /// Maximum cumulative byte length of paths retained while walking one package tree.
@@ -39,8 +41,10 @@ pub enum GitTreeLimit {
     FileBytes,
     /// Maximum total bytes in selected regular files.
     PackageBytes,
-    /// Maximum commit or tree object size.
+    /// Maximum commit, tag, or tree object size.
     MetadataObjectBytes,
+    /// Maximum number of annotated tags in one release-tag chain.
+    TagChainDepth,
     /// Maximum entries inspected across the package tree.
     TreeEntryCount,
     /// Maximum cumulative bytes in paths retained while walking the package tree.
@@ -54,6 +58,7 @@ impl GitTreeLimit {
             Self::FileBytes => "one selected file size",
             Self::PackageBytes => "selected package content size",
             Self::MetadataObjectBytes => "Git metadata object size",
+            Self::TagChainDepth => "annotated tag chain depth",
             Self::TreeEntryCount => "inspected Git tree entry count",
             Self::PathBytes => "cumulative Git tree path bytes",
         }
@@ -71,6 +76,20 @@ pub enum GitTreeReadError {
     ObjectIdMismatch,
     /// A tree object is malformed or unreadable.
     InvalidTreeObject,
+    /// A tag object is malformed or unreadable.
+    InvalidTagObject,
+    /// The release tag ultimately points to a non-commit object.
+    InvalidTagTarget {
+        /// The actual kind of the terminal target object.
+        kind: gix::objs::Kind,
+    },
+    /// A tag's declared target kind differs from the actual target object kind.
+    InvalidTagTargetKind {
+        /// The kind declared by the tag object.
+        declared: gix::objs::Kind,
+        /// The actual kind of the target object.
+        actual: gix::objs::Kind,
+    },
     /// A tree contains an unsupported entry mode or invalid component.
     InvalidTreeEntry,
     /// The requested package directory is not a normalized relative path.
@@ -102,6 +121,16 @@ impl Display for GitTreeReadError {
             }
             Self::InvalidTreeObject => {
                 formatter.write_str("Git tree object is malformed or missing")
+            }
+            Self::InvalidTagObject => formatter.write_str("Git tag object is malformed or missing"),
+            Self::InvalidTagTarget { kind } => {
+                write!(formatter, "Git tag points to a {kind}, not a commit")
+            }
+            Self::InvalidTagTargetKind { declared, actual } => {
+                write!(
+                    formatter,
+                    "Git tag declares a {declared} target but points to a {actual}"
+                )
             }
             Self::InvalidTreeEntry => formatter.write_str("Git tree contains an invalid entry"),
             Self::InvalidPackageDirectory => {
@@ -287,6 +316,72 @@ impl GitTreeReader {
         let package_tree_id =
             self.resolve_package_tree(&root_tree_id, package_directory, &mut inspected_entries)?;
         self.hash_tree(&package_tree_id, purpose, &mut inspected_entries)
+    }
+
+    /// Follow a lightweight or annotated tag to its terminal commit object.
+    ///
+    /// Annotated tags may refer to other annotated tags. The object's own
+    /// content is checked against its ID at every step, and the declared
+    /// target kind must match the actual target object kind.
+    pub fn peel_tag_to_commit(
+        &self,
+        tag_or_commit_id: &gix::ObjectId,
+    ) -> Result<gix::ObjectId, GitTreeReadError> {
+        if tag_or_commit_id.kind() != self.object_hash {
+            return Err(GitTreeReadError::InvalidTagObject);
+        }
+
+        self.ensure_no_alternates()?;
+        let mut current_id = *tag_or_commit_id;
+        let mut seen = BTreeSet::new();
+        let mut tag_depth = 0u64;
+        let mut expected_target_kind = None;
+
+        loop {
+            if !seen.insert(current_id) {
+                return Err(GitTreeReadError::InvalidTagObject);
+            }
+            let header =
+                self.read_object_header(&current_id, GitTreeReadError::InvalidTagObject)?;
+            if let Some(declared) = expected_target_kind
+                && declared != header.kind()
+            {
+                return Err(GitTreeReadError::InvalidTagTargetKind {
+                    declared,
+                    actual: header.kind(),
+                });
+            }
+            ensure_limit(
+                GitTreeLimit::MetadataObjectBytes,
+                header.size(),
+                self.limits.metadata_object_bytes,
+            )?;
+
+            match header.kind() {
+                gix::objs::Kind::Commit => {
+                    let (kind, _) =
+                        self.find_verified_object(&current_id, GitTreeReadError::InvalidTagObject)?;
+                    if kind != gix::objs::Kind::Commit {
+                        return Err(GitTreeReadError::InvalidTagObject);
+                    }
+                    return Ok(current_id);
+                }
+                gix::objs::Kind::Tag => {
+                    tag_depth = tag_depth.saturating_add(1);
+                    ensure_limit(GitTreeLimit::TagChainDepth, tag_depth, MAX_TAG_CHAIN_DEPTH)?;
+                    let (kind, data) =
+                        self.find_verified_object(&current_id, GitTreeReadError::InvalidTagObject)?;
+                    if kind != gix::objs::Kind::Tag {
+                        return Err(GitTreeReadError::InvalidTagObject);
+                    }
+                    let tag = gix::objs::TagRef::from_bytes(&data, self.object_hash)
+                        .map_err(|_| GitTreeReadError::InvalidTagObject)?;
+                    current_id = tag.target();
+                    expected_target_kind = Some(tag.target_kind);
+                }
+                kind => return Err(GitTreeReadError::InvalidTagTarget { kind }),
+            }
+        }
     }
 
     fn ensure_no_alternates(&self) -> Result<(), GitTreeReadError> {
@@ -537,9 +632,10 @@ mod tests {
     use super::{
         GitTreeLimit, GitTreeReadError, GitTreeReader, Limits, MAX_GIT_METADATA_OBJECT_BYTES,
         MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILE_COUNT,
-        MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES,
+        MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES, MAX_TAG_CHAIN_DEPTH,
     };
     use crate::tree_hash::{GitTreeEntry, TreeHashError, TreeHashPurpose, hash_git_tree};
+    use gix::objs::Write as _;
     use gix::objs::tree::{Entry, EntryKind};
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -628,6 +724,26 @@ mod tests {
                 encoding: None,
                 message: message.into(),
                 extra_headers: Vec::new(),
+            })
+            .unwrap()
+            .detach()
+    }
+
+    fn write_tag(
+        repository: &gix::Repository,
+        target: gix::ObjectId,
+        target_kind: gix::objs::Kind,
+        name: &str,
+        message: &str,
+    ) -> gix::ObjectId {
+        repository
+            .write_object(gix::objs::Tag {
+                target,
+                target_kind,
+                name: name.into(),
+                tagger: None,
+                message: message.into(),
+                signature: None,
             })
             .unwrap()
             .detach()
@@ -986,6 +1102,153 @@ mod tests {
     }
 
     #[test]
+    fn peels_lightweight_and_nested_annotated_tags_to_a_verified_commit() {
+        let repository = BareTestRepository::new();
+        let tree = write_tree(&repository.repository, []);
+        let commit = write_commit(&repository.repository, tree);
+        let inner_tag = write_tag(
+            &repository.repository,
+            commit,
+            gix::objs::Kind::Commit,
+            "inner",
+            "inner tag",
+        );
+        let outer_tag = write_tag(
+            &repository.repository,
+            inner_tag,
+            gix::objs::Kind::Tag,
+            "outer",
+            "outer tag",
+        );
+        let reader = standard_reader(&repository);
+
+        assert_eq!(reader.peel_tag_to_commit(&commit), Ok(commit));
+        assert_eq!(reader.peel_tag_to_commit(&outer_tag), Ok(commit));
+    }
+
+    #[test]
+    fn rejects_tag_targets_that_are_not_commits_or_mismatch_their_declared_kind() {
+        let repository = BareTestRepository::new();
+        let tree = write_tree(&repository.repository, []);
+        let tree_tag = write_tag(
+            &repository.repository,
+            tree,
+            gix::objs::Kind::Tree,
+            "tree-tag",
+            "not a commit",
+        );
+        let mismatched_tag = write_tag(
+            &repository.repository,
+            tree,
+            gix::objs::Kind::Commit,
+            "mismatched-tag",
+            "declared commit but targets tree",
+        );
+        let commit = write_commit(&repository.repository, tree);
+        let mismatched_commit_tag = write_tag(
+            &repository.repository,
+            commit,
+            gix::objs::Kind::Tree,
+            "mismatched-commit-tag",
+            "declared tree but targets commit",
+        );
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.peel_tag_to_commit(&tree_tag),
+            Err(GitTreeReadError::InvalidTagTarget {
+                kind: gix::objs::Kind::Tree
+            })
+        );
+        assert_eq!(
+            reader.peel_tag_to_commit(&mismatched_tag),
+            Err(GitTreeReadError::InvalidTagTargetKind {
+                declared: gix::objs::Kind::Commit,
+                actual: gix::objs::Kind::Tree,
+            })
+        );
+        assert_eq!(
+            reader.peel_tag_to_commit(&mismatched_commit_tag),
+            Err(GitTreeReadError::InvalidTagTargetKind {
+                declared: gix::objs::Kind::Tree,
+                actual: gix::objs::Kind::Commit,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_annotated_tag_objects() {
+        let repository = BareTestRepository::new();
+        let tag = repository
+            .repository
+            .objects
+            .write_buf(gix::objs::Kind::Tag, b"not a valid tag object")
+            .unwrap();
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.peel_tag_to_commit(&tag),
+            Err(GitTreeReadError::InvalidTagObject)
+        );
+    }
+
+    #[test]
+    fn enforces_the_annotated_tag_chain_depth_limit() {
+        let repository = BareTestRepository::new();
+        let tree = write_tree(&repository.repository, []);
+        let commit = write_commit(&repository.repository, tree);
+        let mut tag = commit;
+        let mut target_kind = gix::objs::Kind::Commit;
+        for index in 0..=MAX_TAG_CHAIN_DEPTH {
+            tag = write_tag(
+                &repository.repository,
+                tag,
+                target_kind,
+                &format!("tag-{index}"),
+                "nested tag",
+            );
+            target_kind = gix::objs::Kind::Tag;
+        }
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.peel_tag_to_commit(&tag),
+            Err(GitTreeReadError::PackageTooLarge {
+                limit: GitTreeLimit::TagChainDepth,
+                actual: MAX_TAG_CHAIN_DEPTH + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn verifies_annotated_tag_object_ids() {
+        let repository = BareTestRepository::new();
+        let tree = write_tree(&repository.repository, []);
+        let commit = write_commit(&repository.repository, tree);
+        let expected_tag = write_tag(
+            &repository.repository,
+            commit,
+            gix::objs::Kind::Commit,
+            "v1.0.0",
+            "original message",
+        );
+        let replacement_tag = write_tag(
+            &repository.repository,
+            commit,
+            gix::objs::Kind::Commit,
+            "v1.0.0",
+            "replaced message",
+        );
+        overwrite_loose_object(&repository, &expected_tag, &replacement_tag);
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.peel_tag_to_commit(&expected_tag),
+            Err(GitTreeReadError::ObjectIdMismatch)
+        );
+    }
+
+    #[test]
     fn verifies_commit_object_ids() {
         let repository = BareTestRepository::new();
         let tree = write_tree(&repository.repository, []);
@@ -1185,6 +1448,7 @@ mod tests {
         assert_eq!(MAX_PACKAGE_FILE_BYTES, 256 * 1024 * 1024);
         assert_eq!(MAX_PACKAGE_CONTENT_BYTES, 1024 * 1024 * 1024);
         assert_eq!(MAX_GIT_METADATA_OBJECT_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_TAG_CHAIN_DEPTH, 64);
         assert_eq!(MAX_PACKAGE_TREE_ENTRIES, 1_000_000);
         assert_eq!(MAX_PACKAGE_TREE_PATH_BYTES, 64 * 1024 * 1024);
     }
