@@ -186,13 +186,36 @@ pub enum PackageParseWarningKind {
 /// The syntax tree and diagnostics from parsing one `sai.package` file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageParseOutput {
-    pub file: PackageFile,
-    pub lexical_errors: Vec<PackageLexError>,
-    pub errors: Vec<PackageParseError>,
-    pub warnings: Vec<PackageParseWarning>,
+    pub(crate) file: PackageFile,
+    /// Package-graph role used while parsing, which affects root-only
+    /// duplicate diagnostics.
+    role: PackageRole,
+    pub(crate) lexical_errors: Vec<PackageLexError>,
+    pub(crate) errors: Vec<PackageParseError>,
+    pub(crate) warnings: Vec<PackageParseWarning>,
 }
 
 impl PackageParseOutput {
+    pub const fn file(&self) -> &PackageFile {
+        &self.file
+    }
+
+    pub const fn role(&self) -> PackageRole {
+        self.role
+    }
+
+    pub fn lexical_errors(&self) -> &[PackageLexError] {
+        &self.lexical_errors
+    }
+
+    pub fn errors(&self) -> &[PackageParseError] {
+        &self.errors
+    }
+
+    pub fn warnings(&self) -> &[PackageParseWarning] {
+        &self.warnings
+    }
+
     /// Reports whether lexing and syntax parsing succeeded.
     ///
     /// Package-wide semantic checks such as target and capability validation
@@ -232,6 +255,7 @@ pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
     {
         return PackageParseOutput {
             file,
+            role,
             lexical_errors,
             errors: Vec::new(),
             warnings: Vec::new(),
@@ -244,6 +268,7 @@ pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
     collect_list_diagnostics(&file, role, &mut parser.warnings, &mut parser.errors);
     PackageParseOutput {
         file,
+        role,
         lexical_errors,
         errors: parser.errors,
         warnings: parser.warnings,

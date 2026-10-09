@@ -13,12 +13,24 @@ use crate::version_req::{VersionReq, VersionReqParseError};
 /// A parsed `sai.lock` file and its lexical or syntax diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockParseOutput {
-    pub file: LockFile,
-    pub lexical_errors: Vec<PackageLexError>,
-    pub errors: Vec<LockParseError>,
+    pub(crate) file: LockFile,
+    pub(crate) lexical_errors: Vec<PackageLexError>,
+    pub(crate) errors: Vec<LockParseError>,
 }
 
 impl LockParseOutput {
+    pub const fn file(&self) -> &LockFile {
+        &self.file
+    }
+
+    pub fn lexical_errors(&self) -> &[PackageLexError] {
+        &self.lexical_errors
+    }
+
+    pub fn errors(&self) -> &[LockParseError] {
+        &self.errors
+    }
+
     pub fn is_syntax_valid(&self) -> bool {
         self.lexical_errors.is_empty() && self.errors.is_empty()
     }
