@@ -8,13 +8,14 @@ use std::io;
 use std::path::Path;
 
 use gix::prelude::{FindExt, HeaderExt};
+use sha2::{Digest, Sha256};
 
 use crate::manifest::{
-    MAX_PACKAGE_MANIFEST_BYTES, PackageParseOutput, PackageRole, parse_for_role,
+    MAX_PACKAGE_MANIFEST_BYTES, PackageDeclaration, PackageParseOutput, PackageRole, parse_for_role,
 };
 use crate::tree_hash::{
-    GitTreeEntry, TreeHash, TreeHashError, TreeHashPurpose, hash_git_tree, should_skip_path,
-    validate_tree_path,
+    GitTreeDigestEntry, TreeHash, TreeHashError, TreeHashPurpose, artifact_checksum,
+    hash_git_tree_digests, should_skip_path, validate_tree_path,
 };
 
 /// Maximum size of a blob selected from one package directory.
@@ -100,6 +101,16 @@ pub enum GitTreeReadError {
     InvalidTreeEntry,
     /// The selected package tree has no regular `sai.package` file.
     MissingPackageManifest,
+    /// A declared WIT directory does not resolve to a Git tree.
+    WitDirectoryNotFound {
+        /// The package-relative WIT directory path.
+        path: Box<str>,
+    },
+    /// A declared artifact path does not resolve to a regular package file.
+    ArtifactNotFound {
+        /// The package-relative artifact file path.
+        path: Box<str>,
+    },
     /// The requested package directory is not a normalized relative path.
     InvalidPackageDirectory,
     /// A component of the requested package directory does not exist.
@@ -143,6 +154,12 @@ impl Display for GitTreeReadError {
             Self::InvalidTreeEntry => formatter.write_str("Git tree contains an invalid entry"),
             Self::MissingPackageManifest => {
                 formatter.write_str("package directory has no regular sai.package file")
+            }
+            Self::WitDirectoryNotFound { path } => {
+                write!(formatter, "WIT directory `{path}` does not exist")
+            }
+            Self::ArtifactNotFound { path } => {
+                write!(formatter, "artifact `{path}` is not a regular package file")
             }
             Self::InvalidPackageDirectory => {
                 formatter.write_str("package directory is not a normalized relative path")
@@ -208,7 +225,16 @@ enum OwnedTreeEntry {
     File {
         path: Vec<u8>,
         content: Vec<u8>,
+        content_digest: [u8; 32],
         executable: bool,
+    },
+    HashedFile {
+        path: Vec<u8>,
+        content_digest: [u8; 32],
+        executable: bool,
+    },
+    Directory {
+        path: Vec<u8>,
     },
     Symlink {
         path: Vec<u8>,
@@ -247,14 +273,51 @@ impl GitPackageFile {
 #[derive(Debug, Eq, PartialEq)]
 pub struct GitPackageSourceTree {
     source_tree: TreeHash,
+    wit_tree: Option<TreeHash>,
+    artifact_checksums: Vec<GitPackageArtifactChecksum>,
     package_manifest: PackageParseOutput,
     files: Vec<GitPackageFile>,
+}
+
+/// The checked checksum for one component artifact in a Git package.
+#[derive(Debug, Eq, PartialEq)]
+pub struct GitPackageArtifactChecksum {
+    target: Box<str>,
+    path: Box<str>,
+    checksum: Box<str>,
+}
+
+impl GitPackageArtifactChecksum {
+    /// The target that selects this artifact.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// The package-relative artifact file path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The `sai1:` SHA-256 checksum of the exact Git blob bytes.
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
 }
 
 impl GitPackageSourceTree {
     /// The source checksum and warnings computed from this snapshot.
     pub const fn source_tree(&self) -> &TreeHash {
         &self.source_tree
+    }
+
+    /// The WIT checksum and warnings, when the manifest declares a WIT directory.
+    pub const fn wit_tree(&self) -> Option<&TreeHash> {
+        self.wit_tree.as_ref()
+    }
+
+    /// The artifact checksums, sorted by target bytes.
+    pub fn artifact_checksums(&self) -> &[GitPackageArtifactChecksum] {
+        &self.artifact_checksums
     }
 
     /// The dependency-role parse result from the root `sai.package`.
@@ -267,8 +330,22 @@ impl GitPackageSourceTree {
         &self.files
     }
 
-    pub(crate) fn into_parts(self) -> (TreeHash, PackageParseOutput, Vec<GitPackageFile>) {
-        (self.source_tree, self.package_manifest, self.files)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        TreeHash,
+        Option<TreeHash>,
+        Vec<GitPackageArtifactChecksum>,
+        PackageParseOutput,
+        Vec<GitPackageFile>,
+    ) {
+        (
+            self.source_tree,
+            self.wit_tree,
+            self.artifact_checksums,
+            self.package_manifest,
+            self.files,
+        )
     }
 }
 
@@ -349,7 +426,7 @@ impl GitTreeReader {
         package_directory: &[u8],
         purpose: TreeHashPurpose,
     ) -> Result<TreeHash, GitTreeReadError> {
-        self.hash_commit_tree_internal(commit_id, package_directory, purpose, false)
+        self.hash_commit_tree_internal(commit_id, package_directory, purpose, false, false)
             .map(|contents| contents.source_tree)
     }
 
@@ -369,6 +446,7 @@ impl GitTreeReader {
             package_directory,
             TreeHashPurpose::Source,
             true,
+            false,
         )?;
         let source_tree = contents.source_tree;
         contents
@@ -390,12 +468,23 @@ impl GitTreeReader {
             package_directory,
             TreeHashPurpose::Source,
             true,
+            true,
         )?;
         let mut manifest_bytes = contents
             .package_manifest
             .take()
             .ok_or(GitTreeReadError::MissingPackageManifest)?;
         let package_manifest = parse_for_role(&manifest_bytes, PackageRole::Dependency);
+        let wit_tree = package_manifest
+            .file()
+            .declarations
+            .iter()
+            .find_map(|declaration| match &declaration.value {
+                PackageDeclaration::Wit(path) => Some(path.as_ref()),
+                _ => None,
+            })
+            .map(|path| self.hash_commit_wit_tree(commit_id, package_directory, path))
+            .transpose()?;
         let mut files = Vec::with_capacity(contents.entries.len());
         for entry in contents.entries {
             if let OwnedTreeEntry::File { path, content, .. } = entry {
@@ -416,9 +505,12 @@ impl GitTreeReader {
             }
         }
         files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+        let artifact_checksums = collect_artifact_checksums(&package_manifest, &files)?;
 
         Ok(GitPackageSourceTree {
             source_tree: contents.source_tree,
+            wit_tree,
+            artifact_checksums,
             package_manifest,
             files,
         })
@@ -430,7 +522,64 @@ impl GitTreeReader {
         package_directory: &[u8],
         purpose: TreeHashPurpose,
         read_manifest: bool,
+        retain_files: bool,
     ) -> Result<HashedTreeContents, GitTreeReadError> {
+        let mut inspected_entries = 0;
+        let package_tree_id =
+            self.resolve_commit_package_tree(commit_id, package_directory, &mut inspected_entries)?;
+        self.hash_tree(
+            &package_tree_id,
+            purpose,
+            &mut inspected_entries,
+            read_manifest,
+            retain_files,
+        )
+    }
+
+    fn hash_commit_wit_tree(
+        &self,
+        commit_id: &gix::ObjectId,
+        package_directory: &[u8],
+        wit_directory: &str,
+    ) -> Result<TreeHash, GitTreeReadError> {
+        let mut inspected_entries = 0;
+        let package_tree_id =
+            self.resolve_commit_package_tree(commit_id, package_directory, &mut inspected_entries)?;
+        let wit_tree_id = if wit_directory == "." {
+            package_tree_id
+        } else {
+            validate_tree_path(wit_directory.as_bytes())?;
+            self.resolve_package_tree(
+                &package_tree_id,
+                wit_directory.as_bytes(),
+                &mut inspected_entries,
+            )
+            .map_err(|error| match error {
+                GitTreeReadError::MissingPackageDirectory
+                | GitTreeReadError::PackagePathNotDirectory => {
+                    GitTreeReadError::WitDirectoryNotFound {
+                        path: wit_directory.into(),
+                    }
+                }
+                error => error,
+            })?
+        };
+        self.hash_tree(
+            &wit_tree_id,
+            TreeHashPurpose::Wit,
+            &mut inspected_entries,
+            false,
+            false,
+        )
+        .map(|contents| contents.source_tree)
+    }
+
+    fn resolve_commit_package_tree(
+        &self,
+        commit_id: &gix::ObjectId,
+        package_directory: &[u8],
+        inspected_entries: &mut u64,
+    ) -> Result<gix::ObjectId, GitTreeReadError> {
         self.ensure_no_alternates()?;
         if !package_directory.is_empty() {
             validate_tree_path(package_directory)?;
@@ -460,15 +609,7 @@ impl GitTreeReader {
         let root_tree_id = gix::objs::CommitRefIter::from_bytes(&commit_data, self.object_hash)
             .tree_id()
             .map_err(|_| GitTreeReadError::InvalidCommitObject)?;
-        let mut inspected_entries = 0;
-        let package_tree_id =
-            self.resolve_package_tree(&root_tree_id, package_directory, &mut inspected_entries)?;
-        self.hash_tree(
-            &package_tree_id,
-            purpose,
-            &mut inspected_entries,
-            read_manifest,
-        )
+        self.resolve_package_tree(&root_tree_id, package_directory, inspected_entries)
     }
 
     /// Follow a lightweight or annotated tag to its terminal commit object.
@@ -625,10 +766,11 @@ impl GitTreeReader {
         purpose: TreeHashPurpose,
         tree_entry_count: &mut u64,
         read_manifest: bool,
+        retain_files: bool,
     ) -> Result<HashedTreeContents, GitTreeReadError> {
         let mut pending = vec![(*root_tree_id, Vec::<u8>::new())];
         let mut owned_entries = Vec::<OwnedTreeEntry>::new();
-        let mut package_manifest_seen = false;
+        let mut package_manifest = None;
         let mut file_count = 0u64;
         let mut package_bytes = 0u64;
         let mut path_bytes = 0u64;
@@ -654,6 +796,7 @@ impl GitTreeReader {
                         if path.len() > 4096 {
                             validate_tree_path(&path)?;
                         }
+                        owned_entries.push(OwnedTreeEntry::Directory { path: path.clone() });
                         pending.push((entry.object_id, path.clone()));
                     }
                     0o100644 | 0o100755 => {
@@ -697,12 +840,24 @@ impl GitTreeReader {
                         {
                             return Err(GitTreeReadError::InvalidTreeEntry);
                         }
-                        package_manifest_seen |= is_package_manifest;
-                        owned_entries.push(OwnedTreeEntry::File {
-                            path,
-                            content,
-                            executable: entry.mode == 0o100755,
-                        });
+                        let content_digest = Sha256::digest(&content).into();
+                        if retain_files {
+                            owned_entries.push(OwnedTreeEntry::File {
+                                path,
+                                content,
+                                content_digest,
+                                executable: entry.mode == 0o100755,
+                            });
+                        } else {
+                            if is_package_manifest {
+                                package_manifest = Some(content);
+                            }
+                            owned_entries.push(OwnedTreeEntry::HashedFile {
+                                path,
+                                content_digest,
+                                executable: entry.mode == 0o100755,
+                            });
+                        }
                     }
                     0o120000 => owned_entries.push(OwnedTreeEntry::Symlink { path }),
                     0o160000 => owned_entries.push(OwnedTreeEntry::Gitlink { path }),
@@ -713,32 +868,51 @@ impl GitTreeReader {
 
         let hash_entries = owned_entries
             .iter()
-            .map(|entry| match entry {
-                OwnedTreeEntry::File {
-                    path,
-                    content,
-                    executable: false,
-                } => GitTreeEntry::RegularFile { path, content },
-                OwnedTreeEntry::File {
-                    path,
-                    content,
-                    executable: true,
-                } => GitTreeEntry::ExecutableFile { path, content },
-                OwnedTreeEntry::Symlink { path } => GitTreeEntry::Symlink { path },
-                OwnedTreeEntry::Gitlink { path } => GitTreeEntry::Gitlink { path },
+            .map(|entry| -> GitTreeDigestEntry<'_> {
+                match entry {
+                    OwnedTreeEntry::File {
+                        path,
+                        content_digest,
+                        executable: false,
+                        ..
+                    }
+                    | OwnedTreeEntry::HashedFile {
+                        path,
+                        content_digest,
+                        executable: false,
+                    } => GitTreeDigestEntry::RegularFile {
+                        path,
+                        content_digest: *content_digest,
+                    },
+                    OwnedTreeEntry::File {
+                        path,
+                        content_digest,
+                        executable: true,
+                        ..
+                    }
+                    | OwnedTreeEntry::HashedFile {
+                        path,
+                        content_digest,
+                        executable: true,
+                    } => GitTreeDigestEntry::ExecutableFile {
+                        path,
+                        content_digest: *content_digest,
+                    },
+                    OwnedTreeEntry::Directory { path } => GitTreeDigestEntry::Directory { path },
+                    OwnedTreeEntry::Symlink { path } => GitTreeDigestEntry::Symlink { path },
+                    OwnedTreeEntry::Gitlink { path } => GitTreeDigestEntry::Gitlink { path },
+                }
             })
             .collect::<Vec<_>>();
-        let tree_hash = hash_git_tree(hash_entries, purpose)?;
-        let package_manifest = if package_manifest_seen {
-            owned_entries.iter_mut().find_map(|entry| match entry {
+        let tree_hash = hash_git_tree_digests(hash_entries, purpose)?;
+        if read_manifest && retain_files && package_manifest.is_none() {
+            package_manifest = owned_entries.iter_mut().find_map(|entry| match entry {
                 OwnedTreeEntry::File { path, content, .. } if path == b"sai.package" => {
                     Some(std::mem::take(content))
                 }
                 _ => None,
-            })
-        } else {
-            None
-        };
+            });
+        }
         Ok(HashedTreeContents {
             source_tree: tree_hash,
             package_manifest,
@@ -792,6 +966,55 @@ impl GitTreeReader {
     }
 }
 
+fn collect_artifact_checksums(
+    manifest: &PackageParseOutput,
+    files: &[GitPackageFile],
+) -> Result<Vec<GitPackageArtifactChecksum>, GitTreeReadError> {
+    collect_artifact_checksums_with(manifest, files, artifact_checksum)
+}
+
+fn collect_artifact_checksums_with(
+    manifest: &PackageParseOutput,
+    files: &[GitPackageFile],
+    mut checksum: impl FnMut(&[u8]) -> String,
+) -> Result<Vec<GitPackageArtifactChecksum>, GitTreeReadError> {
+    let mut checksums = Vec::new();
+    let mut checksums_by_file = Vec::new();
+    checksums_by_file.resize_with(files.len(), || None::<Box<str>>);
+    let mut seen_targets = BTreeSet::new();
+    for declaration in &manifest.file().declarations {
+        let PackageDeclaration::ArtifactComponents(entries) = &declaration.value else {
+            continue;
+        };
+        for entry in entries {
+            let target = entry.value.target.as_ref();
+            if !crate::manifest::is_target_name(target)
+                || !crate::validation::is_component_target(target)
+                || !seen_targets.insert(target)
+            {
+                continue;
+            }
+            let path = entry.value.path.as_ref();
+            let Ok(index) =
+                files.binary_search_by(|file| file.path().as_bytes().cmp(path.as_bytes()))
+            else {
+                return Err(GitTreeReadError::ArtifactNotFound { path: path.into() });
+            };
+            let file = &files[index];
+            let file_checksum = checksums_by_file[index]
+                .get_or_insert_with(|| checksum(file.content()).into())
+                .clone();
+            checksums.push(GitPackageArtifactChecksum {
+                target: entry.value.target.clone(),
+                path: entry.value.path.clone(),
+                checksum: file_checksum,
+            });
+        }
+    }
+    checksums.sort_by(|left, right| left.target.as_bytes().cmp(right.target.as_bytes()));
+    Ok(checksums)
+}
+
 fn ensure_limit(limit: GitTreeLimit, actual: u64, maximum: u64) -> Result<(), GitTreeReadError> {
     if actual > maximum {
         Err(GitTreeReadError::PackageTooLarge { limit, actual })
@@ -809,12 +1032,14 @@ impl Display for GitTreeLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitTreeLimit, GitTreeReadError, GitTreeReader, Limits, MAX_GIT_METADATA_OBJECT_BYTES,
-        MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILE_COUNT,
-        MAX_PACKAGE_MANIFEST_BYTES, MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES,
-        MAX_TAG_CHAIN_DEPTH,
+        GitPackageFile, GitTreeLimit, GitTreeReadError, GitTreeReader, Limits,
+        MAX_GIT_METADATA_OBJECT_BYTES, MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_BYTES,
+        MAX_PACKAGE_FILE_COUNT, MAX_PACKAGE_MANIFEST_BYTES, MAX_PACKAGE_TREE_ENTRIES,
+        MAX_PACKAGE_TREE_PATH_BYTES, MAX_TAG_CHAIN_DEPTH, collect_artifact_checksums_with,
     };
-    use crate::tree_hash::{GitTreeEntry, TreeHashError, TreeHashPurpose, hash_git_tree};
+    use crate::tree_hash::{
+        GitTreeEntry, TreeHashError, TreeHashPurpose, artifact_checksum, hash_git_tree,
+    };
     use gix::objs::Write as _;
     use gix::objs::tree::{Entry, EntryKind};
     use std::io::Cursor;
@@ -1145,6 +1370,283 @@ mod tests {
                 .hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source)
                 .unwrap()
                 .checksum
+        );
+    }
+
+    #[test]
+    fn reads_wit_and_artifact_checksums_with_their_declared_hash_rules() {
+        let repository = BareTestRepository::new();
+        let manifest = write_blob(
+            &repository.repository,
+            b"package acme:sample @ 1.0.0\nwit \".\"\nartifact component {\n    wasm64-wasi \"dist/large.wasm\"\n    wasm32-wasi \"dist/small.wasm\"\n}\n",
+        );
+        let state = write_blob(&repository.repository, b"cache state\n");
+        let output = write_blob(&repository.repository, b"generated output\n");
+        let git_metadata = write_blob(&repository.repository, b"git metadata\n");
+        let small_artifact = write_blob(&repository.repository, b"small component");
+        let large_artifact = write_blob(&repository.repository, b"large component");
+        let link_target = write_blob(&repository.repository, b"ignored link target\n");
+        let submodule_id = write_blob(&repository.repository, b"placeholder oid\n");
+        let sai_tree = write_tree(
+            &repository.repository,
+            [(b"state.json".as_slice(), EntryKind::Blob, state)],
+        );
+        let output_tree = write_tree(
+            &repository.repository,
+            [(b"build.wasm".as_slice(), EntryKind::Blob, output)],
+        );
+        let git_tree = write_tree(
+            &repository.repository,
+            [(b"config".as_slice(), EntryKind::Blob, git_metadata)],
+        );
+        let dist_tree = write_tree(
+            &repository.repository,
+            [
+                (b"large.wasm".as_slice(), EntryKind::Blob, large_artifact),
+                (b"small.wasm".as_slice(), EntryKind::Blob, small_artifact),
+            ],
+        );
+        let package_tree = write_tree(
+            &repository.repository,
+            [
+                (b"sai.package".as_slice(), EntryKind::Blob, manifest),
+                (b".sai".as_slice(), EntryKind::Tree, sai_tree),
+                (b".git".as_slice(), EntryKind::Tree, git_tree),
+                (b"out".as_slice(), EntryKind::Tree, output_tree),
+                (b"dist".as_slice(), EntryKind::Tree, dist_tree),
+                (b"link".as_slice(), EntryKind::Link, link_target),
+                (b"dependency".as_slice(), EntryKind::Commit, submodule_id),
+            ],
+        );
+        let commit = write_commit(&repository.repository, package_tree);
+
+        let source = standard_reader(&repository)
+            .read_commit_package_source_tree(&commit, b"")
+            .unwrap();
+
+        let expected_wit = hash_git_tree(
+            [
+                GitTreeEntry::RegularFile {
+                    path: b"sai.package",
+                    content: b"package acme:sample @ 1.0.0\nwit \".\"\nartifact component {\n    wasm64-wasi \"dist/large.wasm\"\n    wasm32-wasi \"dist/small.wasm\"\n}\n",
+                },
+                GitTreeEntry::RegularFile {
+                    path: b".sai/state.json",
+                    content: b"cache state\n",
+                },
+                GitTreeEntry::RegularFile {
+                    path: b"out/build.wasm",
+                    content: b"generated output\n",
+                },
+                GitTreeEntry::RegularFile {
+                    path: b"dist/large.wasm",
+                    content: b"large component",
+                },
+                GitTreeEntry::RegularFile {
+                    path: b"dist/small.wasm",
+                    content: b"small component",
+                },
+                GitTreeEntry::Symlink { path: b"link" },
+                GitTreeEntry::Gitlink {
+                    path: b"dependency",
+                },
+                GitTreeEntry::Directory { path: b".sai" },
+                GitTreeEntry::Directory { path: b"out" },
+                GitTreeEntry::Directory { path: b"dist" },
+            ],
+            TreeHashPurpose::Wit,
+        )
+        .unwrap();
+        assert_eq!(source.wit_tree(), Some(&expected_wit));
+        assert_eq!(
+            source
+                .wit_tree()
+                .unwrap()
+                .warnings
+                .iter()
+                .map(|warning| warning.display_path())
+                .collect::<Vec<_>>(),
+            ["dependency", "link"]
+        );
+        assert_eq!(
+            source
+                .artifact_checksums()
+                .iter()
+                .map(|artifact| (artifact.target(), artifact.path(), artifact.checksum()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "wasm32-wasi",
+                    "dist/small.wasm",
+                    artifact_checksum(b"small component").as_str()
+                ),
+                (
+                    "wasm64-wasi",
+                    "dist/large.wasm",
+                    artifact_checksum(b"large component").as_str()
+                ),
+            ]
+        );
+        assert!(
+            !source
+                .files()
+                .iter()
+                .any(|file| file.path().starts_with(".sai/") || file.path().starts_with("out/"))
+        );
+        assert!(source.package_manifest().is_syntax_valid());
+    }
+
+    #[test]
+    fn hashes_a_shared_artifact_file_once_and_ignores_duplicate_targets() {
+        let manifest = crate::manifest::parse_for_role(
+            b"package acme:sample @ 1.0.0\nartifact component {\n    wasm32-wasi \"dist/app.wasm\"\n    wasm64-wasi \"dist/app.wasm\"\n    wasm32-wasi \"dist/app.wasm\"\n}\n",
+            crate::manifest::PackageRole::Dependency,
+        );
+        assert!(!manifest.is_syntax_valid());
+
+        let files = [GitPackageFile {
+            path: "dist/app.wasm".into(),
+            content: vec![7; 4096],
+        }];
+        let mut hash_count = 0;
+        let checksums = collect_artifact_checksums_with(&manifest, &files, |_| {
+            hash_count += 1;
+            "sai1:test".to_owned()
+        })
+        .unwrap();
+
+        assert_eq!(hash_count, 1);
+        assert_eq!(checksums.len(), 2);
+        assert_eq!(checksums[0].checksum(), "sai1:test");
+        assert_eq!(checksums[1].checksum(), "sai1:test");
+        assert_eq!(
+            checksums
+                .iter()
+                .map(|checksum| checksum.target())
+                .collect::<Vec<_>>(),
+            ["wasm32-wasi", "wasm64-wasi"]
+        );
+    }
+
+    #[test]
+    fn does_not_retain_artifact_checksums_for_unknown_targets() {
+        let mut source = String::from("package acme:sample @ 1.0.0\nartifact component {\n");
+        for index in 0..10_000 {
+            use std::fmt::Write as _;
+            writeln!(source, "    unknown{index} \"dist/app.wasm\"").unwrap();
+        }
+        source.push_str("}\n");
+        let manifest = crate::manifest::parse_for_role(
+            source.as_bytes(),
+            crate::manifest::PackageRole::Dependency,
+        );
+        assert!(manifest.is_syntax_valid());
+
+        let files = [GitPackageFile {
+            path: "dist/app.wasm".into(),
+            content: vec![7; 4096],
+        }];
+        let mut hash_count = 0;
+        let checksums = collect_artifact_checksums_with(&manifest, &files, |_| {
+            hash_count += 1;
+            "sai1:test".to_owned()
+        })
+        .unwrap();
+
+        assert!(checksums.is_empty());
+        assert_eq!(hash_count, 0);
+    }
+
+    #[test]
+    fn computes_wit_checksums_relative_to_the_declared_directory() {
+        let repository = BareTestRepository::new();
+        let manifest = write_blob(
+            &repository.repository,
+            b"package acme:sample @ 1.0.0\nwit \"wit\"\n",
+        );
+        let interface = write_blob(&repository.repository, b"package acme:sample;\n");
+        let link_target = write_blob(&repository.repository, b"ignored link target\n");
+        let wit_tree = write_tree(
+            &repository.repository,
+            [
+                (b"api.wit".as_slice(), EntryKind::Blob, interface),
+                (b"link".as_slice(), EntryKind::Link, link_target),
+            ],
+        );
+        let package_tree = write_tree(
+            &repository.repository,
+            [
+                (b"sai.package".as_slice(), EntryKind::Blob, manifest),
+                (b"wit".as_slice(), EntryKind::Tree, wit_tree),
+            ],
+        );
+        let commit = write_commit(&repository.repository, package_tree);
+
+        let source = standard_reader(&repository)
+            .read_commit_package_source_tree(&commit, b"")
+            .unwrap();
+        let expected = hash_git_tree(
+            [
+                GitTreeEntry::RegularFile {
+                    path: b"api.wit",
+                    content: b"package acme:sample;\n",
+                },
+                GitTreeEntry::Symlink { path: b"link" },
+            ],
+            TreeHashPurpose::Wit,
+        )
+        .unwrap();
+
+        assert_eq!(source.wit_tree(), Some(&expected));
+        assert_eq!(
+            source.wit_tree().unwrap().warnings[0].display_path(),
+            "link"
+        );
+    }
+
+    #[test]
+    fn reports_missing_wit_directories_and_non_regular_artifacts() {
+        let repository = BareTestRepository::new();
+        let manifest = write_blob(
+            &repository.repository,
+            b"package acme:sample @ 1.0.0\nwit \"missing\"\n",
+        );
+        let package_tree = write_tree(
+            &repository.repository,
+            [(b"sai.package".as_slice(), EntryKind::Blob, manifest)],
+        );
+        let commit = write_commit(&repository.repository, package_tree);
+
+        assert_eq!(
+            standard_reader(&repository)
+                .read_commit_package_source_tree(&commit, b"")
+                .unwrap_err(),
+            GitTreeReadError::WitDirectoryNotFound {
+                path: "missing".into(),
+            }
+        );
+
+        let manifest = write_blob(
+            &repository.repository,
+            b"package acme:sample @ 1.0.0\nartifact component {\n    wasm32-wasi \"component.wasm\"\n}\n",
+        );
+        let link_target = write_blob(&repository.repository, b"component target\n");
+        let package_tree = write_tree(
+            &repository.repository,
+            [
+                (b"sai.package".as_slice(), EntryKind::Blob, manifest),
+                (b"component.wasm".as_slice(), EntryKind::Link, link_target),
+            ],
+        );
+        let commit = write_commit(&repository.repository, package_tree);
+
+        assert_eq!(
+            standard_reader(&repository)
+                .read_commit_package_source_tree(&commit, b"")
+                .unwrap_err(),
+            GitTreeReadError::ArtifactNotFound {
+                path: "component.wasm".into(),
+            }
         );
     }
 

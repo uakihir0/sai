@@ -34,16 +34,26 @@ pub enum GitTreeEntry<'a> {
     Gitlink { path: &'a [u8] },
 }
 
-impl GitTreeEntry<'_> {
-    fn path_bytes(&self) -> &[u8] {
-        match self {
-            Self::RegularFile { path, .. }
-            | Self::ExecutableFile { path, .. }
-            | Self::Directory { path }
-            | Self::Symlink { path }
-            | Self::Gitlink { path } => path,
-        }
-    }
+/// A flattened tree entry whose regular-file content digest has already been
+/// computed from its Git blob.
+pub(crate) enum GitTreeDigestEntry<'a> {
+    RegularFile {
+        path: &'a [u8],
+        content_digest: [u8; 32],
+    },
+    ExecutableFile {
+        path: &'a [u8],
+        content_digest: [u8; 32],
+    },
+    Directory {
+        path: &'a [u8],
+    },
+    Symlink {
+        path: &'a [u8],
+    },
+    Gitlink {
+        path: &'a [u8],
+    },
 }
 
 /// A skipped entry that the lock-file specification requires reporting.
@@ -177,34 +187,82 @@ pub fn hash_git_tree<'a>(
     entries: impl IntoIterator<Item = GitTreeEntry<'a>>,
     purpose: TreeHashPurpose,
 ) -> Result<TreeHash, TreeHashError> {
+    hash_git_tree_digests(
+        entries.into_iter().filter_map(|entry| {
+            let path = match entry {
+                GitTreeEntry::RegularFile { path, .. }
+                | GitTreeEntry::ExecutableFile { path, .. }
+                | GitTreeEntry::Directory { path }
+                | GitTreeEntry::Symlink { path }
+                | GitTreeEntry::Gitlink { path } => path,
+            };
+            if should_skip_path(path, purpose) {
+                return None;
+            }
+            Some(match entry {
+                GitTreeEntry::RegularFile { path, content } => GitTreeDigestEntry::RegularFile {
+                    path,
+                    content_digest: Sha256::digest(content).into(),
+                },
+                GitTreeEntry::ExecutableFile { path, content } => {
+                    GitTreeDigestEntry::ExecutableFile {
+                        path,
+                        content_digest: Sha256::digest(content).into(),
+                    }
+                }
+                GitTreeEntry::Directory { path } => GitTreeDigestEntry::Directory { path },
+                GitTreeEntry::Symlink { path } => GitTreeDigestEntry::Symlink { path },
+                GitTreeEntry::Gitlink { path } => GitTreeDigestEntry::Gitlink { path },
+            })
+        }),
+        purpose,
+    )
+}
+
+pub(crate) fn hash_git_tree_digests<'a>(
+    entries: impl IntoIterator<Item = GitTreeDigestEntry<'a>>,
+    purpose: TreeHashPurpose,
+) -> Result<TreeHash, TreeHashError> {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
     let mut seen_paths = BTreeMap::<Vec<u8>, ()>::new();
 
     for entry in entries {
-        let path = entry.path_bytes();
+        let path = match &entry {
+            GitTreeDigestEntry::RegularFile { path, .. }
+            | GitTreeDigestEntry::ExecutableFile { path, .. }
+            | GitTreeDigestEntry::Directory { path }
+            | GitTreeDigestEntry::Symlink { path }
+            | GitTreeDigestEntry::Gitlink { path } => *path,
+        };
         if should_skip_path(path, purpose) {
             continue;
         }
 
         match entry {
-            GitTreeEntry::Directory { path } => {
+            GitTreeDigestEntry::Directory { path } => {
                 ensure_unique_path(&mut seen_paths, path)?;
             }
-            GitTreeEntry::RegularFile { path, content }
-            | GitTreeEntry::ExecutableFile { path, content } => {
+            GitTreeDigestEntry::RegularFile {
+                path,
+                content_digest,
+            }
+            | GitTreeDigestEntry::ExecutableFile {
+                path,
+                content_digest,
+            } => {
                 validate_tree_path(path)?;
                 ensure_unique_path(&mut seen_paths, path)?;
-                files.push((path, content));
+                files.push((path, content_digest));
             }
-            GitTreeEntry::Symlink { path } => {
+            GitTreeDigestEntry::Symlink { path } => {
                 ensure_unique_path(&mut seen_paths, path)?;
                 warnings.push(TreeHashWarning {
                     kind: TreeHashWarningKind::SymlinkIgnored,
                     path: path.to_vec(),
                 });
             }
-            GitTreeEntry::Gitlink { path } => {
+            GitTreeDigestEntry::Gitlink { path } => {
                 ensure_unique_path(&mut seen_paths, path)?;
                 warnings.push(TreeHashWarning {
                     kind: TreeHashWarningKind::SubmoduleIgnored,
@@ -220,8 +278,7 @@ pub fn hash_git_tree<'a>(
     reject_tree_path_collisions(&paths)?;
 
     let mut tree_hasher = Sha256::new();
-    for (path, content) in files {
-        let content_digest = Sha256::digest(content);
+    for (path, content_digest) in files {
         let digest_hex = lowercase_hex(&content_digest);
         tree_hasher.update(digest_hex.as_bytes());
         tree_hasher.update(b"  ");

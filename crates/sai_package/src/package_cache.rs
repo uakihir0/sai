@@ -424,7 +424,7 @@ impl PackageCache {
         &self,
         source: GitPackageSourceTree,
     ) -> Result<CachedPackageSource, PackageCacheError> {
-        let (tree_hash, manifest, files) = source.into_parts();
+        let (tree_hash, _wit_tree, _artifact_checksums, manifest, files) = source.into_parts();
         drop(manifest);
 
         let checksum = tree_hash.checksum.into_boxed_str();

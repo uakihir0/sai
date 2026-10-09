@@ -14,7 +14,11 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use crate::git_tags::{
     GitReleaseTag, GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs,
 };
-use crate::git_tree::{GitPackageFile, GitPackageSourceTree, GitTreeReadError, GitTreeReader};
+use crate::git_tree::{
+    GitPackageArtifactChecksum, GitPackageFile, GitPackageSourceTree, GitTreeReadError,
+    GitTreeReader,
+};
+use crate::lock::{LockPackage, LockPackageField};
 use crate::lock_validation::canonical_git_url;
 use crate::manifest::PackageParseOutput;
 use crate::mvs::MvsPackageVersion;
@@ -34,6 +38,79 @@ use crate::version::Version;
 
 const SSH_TAG_LIST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_GIT_FETCH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// An artifact checksum expected from the lock file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectedArtifactChecksum {
+    /// The component target that selects this artifact.
+    pub target: Box<str>,
+    /// The expected `sai1:` checksum of the artifact bytes.
+    pub checksum: Box<str>,
+}
+
+/// All checksums that a locked Git package must match before caching.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectedPackageChecksums {
+    /// The expected package source tree checksum.
+    pub source_checksum: Box<str>,
+    /// The expected WIT tree checksum, if the lock records one.
+    pub wit_checksum: Option<Box<str>>,
+    /// Expected artifact checksums, one per target.
+    pub artifact_checksums: Vec<ExpectedArtifactChecksum>,
+}
+
+impl ExpectedPackageChecksums {
+    /// Collect checksum fields from a lock package after lock validation.
+    ///
+    /// Returns `None` when the package has no source checksum.
+    pub fn from_lock_package(package: &LockPackage) -> Option<Self> {
+        let mut source_checksum = None;
+        let mut wit_checksum = None;
+        let mut artifact_checksums = Vec::new();
+        for field in &package.fields {
+            match &field.value {
+                LockPackageField::Checksum(value) => source_checksum = Some(value.clone()),
+                LockPackageField::WitChecksum(value) => wit_checksum = Some(value.clone()),
+                LockPackageField::Artifact { target, checksum } => {
+                    artifact_checksums.push(ExpectedArtifactChecksum {
+                        target: target.clone(),
+                        checksum: checksum.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Some(Self {
+            source_checksum: source_checksum?,
+            wit_checksum,
+            artifact_checksums,
+        })
+    }
+}
+
+/// The checksum kind named by a locked-content mismatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitPackageChecksumKind {
+    /// The complete selected package source tree.
+    Source,
+    /// The separately declared WIT directory.
+    Wit,
+    /// The component artifact for this target.
+    Artifact {
+        /// Target associated with the artifact checksum.
+        target: Box<str>,
+    },
+}
+
+impl fmt::Display for GitPackageChecksumKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source => formatter.write_str("source"),
+            Self::Wit => formatter.write_str("wit"),
+            Self::Artifact { target } => write!(formatter, "artifact {target}"),
+        }
+    }
+}
 
 /// Errors while listing package release tags from a Git remote.
 ///
@@ -146,6 +223,16 @@ impl FetchedGitRelease {
     /// The checksum and warnings for the selected package source tree.
     pub const fn source_tree(&self) -> &TreeHash {
         self.source.source_tree()
+    }
+
+    /// The WIT checksum and warnings, when the fetched manifest declares WIT.
+    pub const fn wit_tree(&self) -> Option<&TreeHash> {
+        self.source.wit_tree()
+    }
+
+    /// The verified artifact checksums, sorted by target bytes.
+    pub fn artifact_checksums(&self) -> &[GitPackageArtifactChecksum] {
+        self.source.artifact_checksums()
     }
 
     /// The dependency-role parse result for the fetched `sai.package`.
@@ -319,11 +406,13 @@ pub enum GitRemoteReleaseFetchError {
     },
     /// The selected package source tree could not be read or validated.
     SourceTree(GitTreeReadError),
-    /// The source checksum differs from the lock.
+    /// A source, WIT, or artifact checksum differs from the lock.
     ChecksumMismatch {
-        /// The checksum recorded in the lock.
+        /// Kind of checksum that differs.
+        kind: GitPackageChecksumKind,
+        /// The checksum recorded in the lock, or `<missing>`.
         expected: Box<str>,
-        /// The checksum computed from the fetched commit.
+        /// The checksum computed from the fetched commit, or `<missing>`.
         actual: Box<str>,
     },
 }
@@ -366,6 +455,12 @@ impl GitRemoteReleaseFetchError {
             | Self::SourceTree(GitTreeReadError::MissingPackageManifest)
             | Self::SourceTree(GitTreeReadError::PackagePathNotDirectory) => {
                 sai_diagnostics::Code::MissingPackageFile
+            }
+            Self::SourceTree(GitTreeReadError::WitDirectoryNotFound { .. }) => {
+                sai_diagnostics::Code::WitDirNotFound
+            }
+            Self::SourceTree(GitTreeReadError::ArtifactNotFound { .. }) => {
+                sai_diagnostics::Code::ArtifactNotFound
             }
             Self::SourceTree(GitTreeReadError::Hash(_))
             | Self::SourceTree(GitTreeReadError::InvalidTreeEntry) => {
@@ -411,9 +506,13 @@ impl fmt::Display for GitRemoteReleaseFetchError {
             Self::SourceTree(error) => {
                 write!(formatter, "could not read Git package tree: {error}")
             }
-            Self::ChecksumMismatch { expected, actual } => write!(
+            Self::ChecksumMismatch {
+                kind,
+                expected,
+                actual,
+            } => write!(
                 formatter,
-                "Git package source checksum mismatch (expected {expected}, got {actual})"
+                "Git package {kind} checksum mismatch (expected {expected}, got {actual})"
             ),
         }
     }
@@ -503,6 +602,7 @@ pub fn fetch_remote_release_tree(
             directory,
             expected_commit,
             expected_source_checksum,
+            expected_locked_checksums: None,
             transfer_limit: &transfer_limit,
         },
     )
@@ -512,14 +612,14 @@ pub fn fetch_remote_release_tree(
 ///
 /// The release ref is derived from the locked version and package directory,
 /// and the temporary repository uses the locked commit's object-hash kind.
-/// The commit and source checksum are mandatory so both the tag path and the
-/// deleted-tag fallback are verified against the lock.
+/// The commit and all lock-recorded checksums are mandatory so both the tag
+/// path and the deleted-tag fallback are verified before the release is returned.
 pub fn fetch_locked_release_tree(
     url: &str,
     version: &Version,
     directory: Option<&DependencyPackagePath>,
     locked_commit: &gix::ObjectId,
-    locked_source_checksum: &str,
+    expected_checksums: &ExpectedPackageChecksums,
 ) -> Result<FetchedGitRelease, GitRemoteReleaseFetchError> {
     let canonical_url =
         canonical_git_url(url).map_err(|()| GitRemoteReleaseFetchError::InvalidGitUrl)?;
@@ -546,7 +646,7 @@ pub fn fetch_locked_release_tree(
         version,
         directory,
         locked_commit,
-        locked_source_checksum,
+        expected_checksums,
         &transfer_limit,
     )
 }
@@ -557,7 +657,7 @@ fn fetch_locked_release_tree_in_repository(
     version: &Version,
     directory: Option<&DependencyPackagePath>,
     locked_commit: &gix::ObjectId,
-    locked_source_checksum: &str,
+    expected_checksums: &ExpectedPackageChecksums,
     transfer_limit: &gix_transport::client::blocking_io::FetchTransferLimit,
 ) -> Result<FetchedGitRelease, GitRemoteReleaseFetchError> {
     let tag_name = release_tag_name(version, directory)?;
@@ -571,7 +671,8 @@ fn fetch_locked_release_tree_in_repository(
             version,
             directory,
             expected_commit: Some(locked_commit),
-            expected_source_checksum: Some(locked_source_checksum),
+            expected_source_checksum: None,
+            expected_locked_checksums: Some(expected_checksums),
             transfer_limit,
         },
     )
@@ -585,6 +686,7 @@ struct ReleaseFetchRequest<'a> {
     directory: Option<&'a DependencyPackagePath>,
     expected_commit: Option<&'a gix::ObjectId>,
     expected_source_checksum: Option<&'a str>,
+    expected_locked_checksums: Option<&'a ExpectedPackageChecksums>,
     transfer_limit: &'a gix_transport::client::blocking_io::FetchTransferLimit,
 }
 
@@ -600,6 +702,7 @@ fn fetch_release_tree_in_repository(
         directory,
         expected_commit,
         expected_source_checksum,
+        expected_locked_checksums,
         transfer_limit,
     } = request;
     let remote = repository
@@ -687,9 +790,13 @@ fn fetch_release_tree_in_repository(
         && package_source_tree.source_tree().checksum != expected_source_checksum
     {
         return Err(GitRemoteReleaseFetchError::ChecksumMismatch {
+            kind: GitPackageChecksumKind::Source,
             expected: expected_source_checksum.into(),
             actual: package_source_tree.source_tree().checksum.clone().into(),
         });
+    }
+    if let Some(expected_checksums) = expected_locked_checksums {
+        verify_locked_package_checksums(expected_checksums, &package_source_tree)?;
     }
 
     Ok(FetchedGitRelease {
@@ -700,6 +807,110 @@ fn fetch_release_tree_in_repository(
         commit_id,
         source: package_source_tree,
     })
+}
+
+fn verify_locked_package_checksums(
+    expected: &ExpectedPackageChecksums,
+    actual: &GitPackageSourceTree,
+) -> Result<(), GitRemoteReleaseFetchError> {
+    if expected.source_checksum.as_ref() != actual.source_tree().checksum {
+        return Err(checksum_mismatch(
+            GitPackageChecksumKind::Source,
+            &expected.source_checksum,
+            &actual.source_tree().checksum,
+        ));
+    }
+
+    let expected_wit = expected.wit_checksum.as_deref().unwrap_or("<missing>");
+    let actual_wit = actual
+        .wit_tree()
+        .map_or("<missing>", |tree| tree.checksum.as_str());
+    if expected_wit != actual_wit {
+        return Err(checksum_mismatch(
+            GitPackageChecksumKind::Wit,
+            expected_wit,
+            actual_wit,
+        ));
+    }
+
+    let mut expected_artifacts = expected.artifact_checksums.iter().collect::<Vec<_>>();
+    expected_artifacts.sort_by(|left, right| left.target.as_bytes().cmp(right.target.as_bytes()));
+    let actual_artifacts = actual.artifact_checksums();
+    let (mut expected_index, mut actual_index) = (0, 0);
+    while expected_index < expected_artifacts.len() || actual_index < actual_artifacts.len() {
+        match (
+            expected_artifacts.get(expected_index),
+            actual_artifacts.get(actual_index),
+        ) {
+            (Some(expected), Some(actual)) => {
+                match expected.target.as_bytes().cmp(actual.target().as_bytes()) {
+                    std::cmp::Ordering::Less => {
+                        return Err(checksum_mismatch(
+                            GitPackageChecksumKind::Artifact {
+                                target: expected.target.clone(),
+                            },
+                            &expected.checksum,
+                            "<missing>",
+                        ));
+                    }
+                    std::cmp::Ordering::Greater => {
+                        return Err(checksum_mismatch(
+                            GitPackageChecksumKind::Artifact {
+                                target: actual.target().into(),
+                            },
+                            "<missing>",
+                            actual.checksum(),
+                        ));
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if expected.checksum.as_ref() != actual.checksum() {
+                            return Err(checksum_mismatch(
+                                GitPackageChecksumKind::Artifact {
+                                    target: expected.target.clone(),
+                                },
+                                &expected.checksum,
+                                actual.checksum(),
+                            ));
+                        }
+                        expected_index += 1;
+                        actual_index += 1;
+                    }
+                }
+            }
+            (Some(expected), None) => {
+                return Err(checksum_mismatch(
+                    GitPackageChecksumKind::Artifact {
+                        target: expected.target.clone(),
+                    },
+                    &expected.checksum,
+                    "<missing>",
+                ));
+            }
+            (None, Some(actual)) => {
+                return Err(checksum_mismatch(
+                    GitPackageChecksumKind::Artifact {
+                        target: actual.target().into(),
+                    },
+                    "<missing>",
+                    actual.checksum(),
+                ));
+            }
+            (None, None) => unreachable!("loop ends when both checksum lists are exhausted"),
+        }
+    }
+    Ok(())
+}
+
+fn checksum_mismatch(
+    kind: GitPackageChecksumKind,
+    expected: &str,
+    actual: &str,
+) -> GitRemoteReleaseFetchError {
+    GitRemoteReleaseFetchError::ChecksumMismatch {
+        kind,
+        expected: expected.into(),
+        actual: actual.into(),
+    }
 }
 
 fn fetch_locked_commit(
@@ -1311,7 +1522,46 @@ mod tests {
                     filename: b"sai.package".to_vec().into(),
                     oid: manifest_id,
                 });
+                if manifest
+                    .windows(b"wit \"wit\"".len())
+                    .any(|window| window == b"wit \"wit\"")
+                {
+                    let interface_id = repository
+                        .write_blob(b"package acme:sample;\n")
+                        .unwrap()
+                        .detach();
+                    let wit_tree = repository
+                        .write_object(gix::objs::Tree {
+                            entries: vec![Entry {
+                                mode: EntryKind::Blob.into(),
+                                filename: b"api.wit".to_vec().into(),
+                                oid: interface_id,
+                            }],
+                        })
+                        .unwrap()
+                        .detach();
+                    entries.push(Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: b"wit".to_vec().into(),
+                        oid: wit_tree,
+                    });
+                }
+                if manifest
+                    .windows(b"component.wasm".len())
+                    .any(|window| window == b"component.wasm")
+                {
+                    let artifact_id = repository
+                        .write_blob(b"verified component bytes")
+                        .unwrap()
+                        .detach();
+                    entries.push(Entry {
+                        mode: EntryKind::Blob.into(),
+                        filename: b"component.wasm".to_vec().into(),
+                        oid: artifact_id,
+                    });
+                }
             }
+            entries.sort();
             let tree_id = repository
                 .write_object(gix::objs::Tree { entries })
                 .unwrap()
@@ -1428,6 +1678,7 @@ mod tests {
                 directory: None,
                 expected_commit,
                 expected_source_checksum: expected_checksum,
+                expected_locked_checksums: None,
                 transfer_limit: &transfer_limit,
             },
         )
@@ -1897,6 +2148,7 @@ mod tests {
                 directory: None,
                 expected_commit: None,
                 expected_source_checksum: None,
+                expected_locked_checksums: None,
                 transfer_limit: &transfer_limit,
             },
         )
@@ -1932,6 +2184,7 @@ mod tests {
                 directory: None,
                 expected_commit: None,
                 expected_source_checksum: None,
+                expected_locked_checksums: None,
                 transfer_limit: &transfer_limit,
             },
         )
@@ -2004,6 +2257,11 @@ mod tests {
         let repository = init_bare_repository(&scratch.path, Some(remote.commit_id.kind()));
         let transfer_limit =
             gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
+        let expected_checksums = super::ExpectedPackageChecksums {
+            source_checksum: checksum.clone().into(),
+            wit_checksum: None,
+            artifact_checksums: Vec::new(),
+        };
 
         let fetched = super::fetch_locked_release_tree_in_repository(
             &repository,
@@ -2011,7 +2269,7 @@ mod tests {
             &version,
             None,
             &remote.commit_id,
-            &checksum,
+            &expected_checksums,
             &transfer_limit,
         )
         .unwrap();
@@ -2058,6 +2316,108 @@ mod tests {
             error.diagnostic_code(),
             sai_diagnostics::Code::ChecksumMismatch
         );
+    }
+
+    #[test]
+    fn locked_fetch_verifies_source_wit_and_artifact_checksums() {
+        let remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.2.3",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(
+                b"package acme:sample @ 1.2.3\n\
+                  wit \"wit\"\n\
+                  artifact component {\n\
+                      wasm32-wasi \"component.wasm\"\n\
+                  }\n",
+            ),
+        );
+        let fetched = fetch_fixture(&remote, Some(&remote.commit_id), None).unwrap();
+        let expected = super::ExpectedPackageChecksums {
+            source_checksum: fetched.source_tree().checksum.clone().into(),
+            wit_checksum: Some(fetched.wit_tree().unwrap().checksum.clone().into()),
+            artifact_checksums: fetched
+                .artifact_checksums()
+                .iter()
+                .map(|artifact| super::ExpectedArtifactChecksum {
+                    target: artifact.target().into(),
+                    checksum: artifact.checksum().into(),
+                })
+                .collect(),
+        };
+
+        let fetch_locked = |expected: &super::ExpectedPackageChecksums| {
+            let scratch = TemporaryGitDirectory::create().unwrap();
+            let repository = init_bare_repository(&scratch.path, Some(remote.commit_id.kind()));
+            let transfer_limit = gix_transport::client::blocking_io::FetchTransferLimit::new(
+                super::MAX_GIT_FETCH_BYTES,
+            );
+            super::fetch_locked_release_tree_in_repository(
+                &repository,
+                &remote.url(),
+                remote.tag.version(),
+                None,
+                &remote.commit_id,
+                expected,
+                &transfer_limit,
+            )
+        };
+
+        let locked = fetch_locked(&expected).unwrap();
+        assert_eq!(
+            locked.source_tree().checksum,
+            expected.source_checksum.as_ref()
+        );
+        assert_eq!(
+            locked.wit_tree().unwrap().checksum,
+            expected.wit_checksum.as_deref().unwrap()
+        );
+        assert_eq!(
+            locked.artifact_checksums()[0].checksum(),
+            expected.artifact_checksums[0].checksum.as_ref()
+        );
+
+        let mut wrong_wit = expected.clone();
+        wrong_wit.wit_checksum = Some(format!("sai1:{}", "0".repeat(64)).into());
+        assert!(matches!(
+            fetch_locked(&wrong_wit),
+            Err(GitRemoteReleaseFetchError::ChecksumMismatch {
+                kind: super::GitPackageChecksumKind::Wit,
+                ..
+            })
+        ));
+
+        let mut wrong_artifact = expected.clone();
+        wrong_artifact.artifact_checksums[0].checksum = format!("sai1:{}", "0".repeat(64)).into();
+        assert!(matches!(
+            fetch_locked(&wrong_artifact),
+            Err(GitRemoteReleaseFetchError::ChecksumMismatch {
+                kind: super::GitPackageChecksumKind::Artifact { target },
+                ..
+            }) if target.as_ref() == "wasm32-wasi"
+        ));
+
+        let mut missing_wit = expected.clone();
+        missing_wit.wit_checksum = None;
+        assert!(matches!(
+            fetch_locked(&missing_wit),
+            Err(GitRemoteReleaseFetchError::ChecksumMismatch {
+                kind: super::GitPackageChecksumKind::Wit,
+                expected,
+                ..
+            }) if expected.as_ref() == "<missing>"
+        ));
+
+        let mut missing_artifact = expected;
+        missing_artifact.artifact_checksums.clear();
+        assert!(matches!(
+            fetch_locked(&missing_artifact),
+            Err(GitRemoteReleaseFetchError::ChecksumMismatch {
+                kind: super::GitPackageChecksumKind::Artifact { target },
+                expected,
+                ..
+            }) if target.as_ref() == "wasm32-wasi" && expected.as_ref() == "<missing>"
+        ));
     }
 
     #[test]
