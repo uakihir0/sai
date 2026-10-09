@@ -10,14 +10,22 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use sha2::{Digest, Sha256};
+
 use crate::git_tree::{
     GitPackageFile, GitPackageSourceTree, MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_COUNT,
     MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES,
 };
+use crate::lock_validation::canonical_git_url;
+use crate::package_path::ContentPackagePath;
 
 const CACHE_LAYOUT_VERSION: &str = "v1";
 const SOURCE_CHECKSUM_PREFIX: &str = "sai1:";
 const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_CACHE_RECORD_BYTES: u64 = 16 * 1024;
+const TAG_RECORD_MAGIC: &[u8] = b"SAI-CACHE-TAG-v1\0";
+const SOURCE_RECORD_MAGIC: &[u8] = b"SAI-CACHE-SOURCE-v1\0";
+const RECORD_DIGEST_BYTES: usize = 32;
 #[cfg(windows)]
 const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 #[cfg(windows)]
@@ -34,6 +42,18 @@ pub enum PackageCacheError {
     CacheDirectoryUnavailable,
     /// A source checksum was not in the canonical `sai1:<sha256>` form.
     InvalidSourceChecksum(Box<str>),
+    /// A Git URL was not in canonical form.
+    InvalidGitUrl,
+    /// A Git tag name was not a bounded full `refs/tags/` name.
+    InvalidGitTag,
+    /// A Git commit was not a canonical SHA-1 or SHA-256 object ID.
+    InvalidGitCommit,
+    /// A package directory was not a normalized content path.
+    InvalidPackageDirectory,
+    /// A cache record was malformed, mismatched, or too large.
+    CorruptRecord(PathBuf),
+    /// A commit and package directory already have a different recorded checksum.
+    ConflictingGitSourceRecord(Box<str>),
     /// A supposedly verified source file had an unsafe relative path.
     InvalidSourcePath(Box<str>),
     /// A cache filesystem operation failed.
@@ -61,6 +81,21 @@ impl fmt::Display for PackageCacheError {
             Self::InvalidSourceChecksum(checksum) => {
                 write!(formatter, "invalid package source checksum `{checksum}`")
             }
+            Self::InvalidGitUrl => formatter.write_str("invalid canonical Git URL"),
+            Self::InvalidGitTag => formatter.write_str("invalid Git release tag"),
+            Self::InvalidGitCommit => formatter.write_str("invalid Git commit object ID"),
+            Self::InvalidPackageDirectory => formatter.write_str("invalid Git package directory"),
+            Self::CorruptRecord(path) => {
+                write!(
+                    formatter,
+                    "package cache record is corrupt at `{}`",
+                    path.display()
+                )
+            }
+            Self::ConflictingGitSourceRecord(checksum) => write!(
+                formatter,
+                "Git commit and package directory already have a different cached checksum than `{checksum}`"
+            ),
             Self::InvalidSourcePath(path) => {
                 write!(formatter, "invalid verified package source path `{path}`")
             }
@@ -91,7 +126,9 @@ impl Error for PackageCacheError {
 pub struct PackageCache {
     root: PathBuf,
     versioned_root: PathBuf,
+    git_directory: PathBuf,
     source_directory: PathBuf,
+    tag_directory: PathBuf,
     temporary_directory: PathBuf,
     lock_path: PathBuf,
 }
@@ -110,7 +147,9 @@ impl PackageCache {
         }
 
         let versioned_root = root.join(CACHE_LAYOUT_VERSION);
+        let git_directory = versioned_root.join("git");
         let source_directory = versioned_root.join("src");
+        let tag_directory = versioned_root.join("tags");
         let temporary_directory = versioned_root.join("tmp");
         fs::create_dir_all(root).map_err(|source| PackageCacheError::Io {
             operation: "create package cache root",
@@ -119,9 +158,9 @@ impl PackageCache {
         })?;
         ensure_cache_directory(&versioned_root)?;
         for directory in [
-            versioned_root.join("git"),
+            git_directory.clone(),
             source_directory.clone(),
-            versioned_root.join("tags"),
+            tag_directory.clone(),
             temporary_directory.clone(),
         ] {
             ensure_cache_directory(&directory)?;
@@ -134,7 +173,9 @@ impl PackageCache {
         Ok(Self {
             root: root.to_path_buf(),
             versioned_root,
+            git_directory,
             source_directory,
+            tag_directory,
             temporary_directory,
             lock_path,
         })
@@ -143,6 +184,227 @@ impl PackageCache {
     /// The configured cache root, before the `v1/` layout directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Return the normative SHA-256 key for a canonical Git URL.
+    pub fn repository_key(canonical_url: &str) -> Result<String, PackageCacheError> {
+        validate_canonical_git_url(canonical_url)?;
+        Ok(lowercase_hex(&Sha256::digest(canonical_url.as_bytes())))
+    }
+
+    /// Return the cache location for a canonical Git repository.
+    ///
+    /// The directory is not created by this method.
+    pub fn git_repository_directory(
+        &self,
+        canonical_url: &str,
+    ) -> Result<PathBuf, PackageCacheError> {
+        Ok(self
+            .git_directory
+            .join(Self::repository_key(canonical_url)?))
+    }
+
+    /// Record the commit reached by a successfully fetched release tag.
+    ///
+    /// Callers must perform the lock comparison and any required review before
+    /// replacing a previously recorded tag with a different commit.
+    pub fn record_git_tag(
+        &self,
+        canonical_url: &str,
+        tag_name: &str,
+        commit: &str,
+    ) -> Result<(), PackageCacheError> {
+        validate_canonical_git_url(canonical_url)?;
+        validate_git_tag_name(tag_name)?;
+        validate_git_commit(commit)?;
+
+        let key = cache_record_key(b"tag", &[canonical_url.as_bytes(), tag_name.as_bytes()]);
+        let target = self.tag_directory.join(format!("tag-{key}.record"));
+        self.replace_cache_record(
+            &target,
+            TAG_RECORD_MAGIC,
+            &[
+                canonical_url.as_bytes(),
+                tag_name.as_bytes(),
+                commit.as_bytes(),
+            ],
+        )
+    }
+
+    /// Read the cached commit for a canonical URL and full release-tag name.
+    pub fn cached_git_tag_commit(
+        &self,
+        canonical_url: &str,
+        tag_name: &str,
+    ) -> Result<Option<String>, PackageCacheError> {
+        validate_canonical_git_url(canonical_url)?;
+        validate_git_tag_name(tag_name)?;
+
+        let key = cache_record_key(b"tag", &[canonical_url.as_bytes(), tag_name.as_bytes()]);
+        let target = self.tag_directory.join(format!("tag-{key}.record"));
+        let Some(record) = read_latest_cache_record(&target, TAG_RECORD_MAGIC, 3)? else {
+            return Ok(None);
+        };
+        let fields = decode_cache_record(TAG_RECORD_MAGIC, &record.bytes, 3)
+            .map(|(_, fields)| fields)
+            .ok_or_else(|| PackageCacheError::CorruptRecord(target.clone()))?;
+        if fields[0] != canonical_url.as_bytes() || fields[1] != tag_name.as_bytes() {
+            return Err(PackageCacheError::CorruptRecord(target));
+        }
+        let commit = std::str::from_utf8(fields[2])
+            .map_err(|_| PackageCacheError::CorruptRecord(target.clone()))?;
+        validate_git_commit(commit).map_err(|_| PackageCacheError::CorruptRecord(target))?;
+        Ok(Some(commit.to_owned()))
+    }
+
+    /// Record a verified checksum for one repository commit and package directory.
+    pub fn record_git_source_checksum(
+        &self,
+        canonical_url: &str,
+        commit: &str,
+        directory: Option<&str>,
+        checksum: &str,
+    ) -> Result<(), PackageCacheError> {
+        validate_canonical_git_url(canonical_url)?;
+        validate_git_commit(commit)?;
+        let directory = canonical_package_directory(directory)?;
+        source_digest(checksum)?;
+
+        let key = cache_record_key(
+            b"source",
+            &[
+                canonical_url.as_bytes(),
+                commit.as_bytes(),
+                directory.as_bytes(),
+            ],
+        );
+        let target = self.tag_directory.join(format!("source-{key}.record"));
+        self.replace_cache_record(
+            &target,
+            SOURCE_RECORD_MAGIC,
+            &[
+                canonical_url.as_bytes(),
+                commit.as_bytes(),
+                directory.as_bytes(),
+                checksum.as_bytes(),
+            ],
+        )
+    }
+
+    /// Read a previously recorded source checksum for one repository commit.
+    pub fn cached_git_source_checksum(
+        &self,
+        canonical_url: &str,
+        commit: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<String>, PackageCacheError> {
+        validate_canonical_git_url(canonical_url)?;
+        validate_git_commit(commit)?;
+        let directory = canonical_package_directory(directory)?;
+
+        let key = cache_record_key(
+            b"source",
+            &[
+                canonical_url.as_bytes(),
+                commit.as_bytes(),
+                directory.as_bytes(),
+            ],
+        );
+        let target = self.tag_directory.join(format!("source-{key}.record"));
+        let Some(record) = read_latest_cache_record(&target, SOURCE_RECORD_MAGIC, 4)? else {
+            return Ok(None);
+        };
+        let fields = decode_cache_record(SOURCE_RECORD_MAGIC, &record.bytes, 4)
+            .map(|(_, fields)| fields)
+            .ok_or_else(|| PackageCacheError::CorruptRecord(target.clone()))?;
+        if fields[0] != canonical_url.as_bytes()
+            || fields[1] != commit.as_bytes()
+            || fields[2] != directory.as_bytes()
+        {
+            return Err(PackageCacheError::CorruptRecord(target));
+        }
+        let checksum = std::str::from_utf8(fields[3])
+            .map_err(|_| PackageCacheError::CorruptRecord(target.clone()))?;
+        source_digest(checksum).map_err(|_| PackageCacheError::CorruptRecord(target))?;
+        Ok(Some(checksum.to_owned()))
+    }
+
+    fn replace_cache_record(
+        &self,
+        target: &Path,
+        magic: &[u8],
+        fields: &[&[u8]],
+    ) -> Result<(), PackageCacheError> {
+        self.cleanup_stale_temporary_directories();
+        let _lock = CachePublicationLock::acquire(&self.lock_path)?;
+        let existing = read_latest_cache_record(target, magic, fields.len())?;
+        let next_generation = if let Some(existing) = &existing {
+            let (_, old_fields) = decode_cache_record(magic, &existing.bytes, fields.len())
+                .ok_or_else(|| PackageCacheError::CorruptRecord(target.to_path_buf()))?;
+            let identity_field_count = fields.len().saturating_sub(1);
+            if old_fields[..identity_field_count] != fields[..identity_field_count] {
+                return Err(PackageCacheError::CorruptRecord(target.to_path_buf()));
+            }
+            if old_fields == fields {
+                return Ok(());
+            }
+            if magic == SOURCE_RECORD_MAGIC {
+                let new_checksum = std::str::from_utf8(fields[3])
+                    .map_err(|_| PackageCacheError::CorruptRecord(target.to_path_buf()))?;
+                let existing_checksum = std::str::from_utf8(old_fields[3])
+                    .map_err(|_| PackageCacheError::CorruptRecord(target.to_path_buf()))?;
+                if source_digest(existing_checksum).is_ok() && existing_checksum != new_checksum {
+                    return Err(PackageCacheError::ConflictingGitSourceRecord(
+                        new_checksum.into(),
+                    ));
+                }
+            }
+            existing
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| PackageCacheError::CorruptRecord(target.to_path_buf()))?
+        } else {
+            1
+        };
+        let destination_slot = existing.map_or(0, |record| 1 - record.slot);
+        let destination = cache_record_slot_path(target, destination_slot);
+        let bytes = encode_cache_record(magic, next_generation, fields);
+
+        let staging = StagingDirectory::create(&self.temporary_directory)?;
+        let staged_record = staging.path().join("record");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        set_new_file_mode(&mut options);
+        let mut file = options
+            .open(&staged_record)
+            .map_err(|source| PackageCacheError::Io {
+                operation: "create package cache record",
+                path: staged_record.clone(),
+                source,
+            })?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|source| PackageCacheError::Io {
+                operation: "write package cache record",
+                path: staged_record.clone(),
+                source,
+            })?;
+        drop(file);
+        staging.refresh_activity_age()?;
+
+        if path_exists_without_following(&destination)? {
+            #[cfg(windows)]
+            fs::remove_file(&destination).map_err(|source| PackageCacheError::Io {
+                operation: "replace inactive package cache record slot",
+                path: destination.clone(),
+                source,
+            })?;
+        }
+        fs::rename(&staged_record, &destination).map_err(|source| PackageCacheError::Io {
+            operation: "publish package cache record",
+            path: destination,
+            source,
+        })
     }
 
     /// Install a verified source snapshot and return its immutable cache path.
@@ -362,6 +624,280 @@ fn source_digest(checksum: &str) -> Result<&str, PackageCacheError> {
         return Err(invalid());
     }
     Ok(digest)
+}
+
+fn validate_canonical_git_url(value: &str) -> Result<(), PackageCacheError> {
+    match canonical_git_url(value) {
+        Ok(canonical) if canonical == value => Ok(()),
+        _ => Err(PackageCacheError::InvalidGitUrl),
+    }
+}
+
+fn validate_git_tag_name(value: &str) -> Result<(), PackageCacheError> {
+    let components = value.strip_prefix("refs/tags/").map(|name| name.split('/'));
+    let valid = value.len() <= 8192
+        && value.is_ascii()
+        && components.is_some_and(|mut components| {
+            let mut saw_component = false;
+            for component in &mut components {
+                saw_component = true;
+                if component.is_empty()
+                    || component.starts_with('.')
+                    || component.ends_with('.')
+                    || component.ends_with(".lock")
+                    || component.contains("..")
+                    || component.contains("@{")
+                    || !component
+                        .bytes()
+                        .all(|byte| (b'!'..=b'~').contains(&byte) && !b"~^:?*[\\".contains(&byte))
+                {
+                    return false;
+                }
+            }
+            saw_component
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(PackageCacheError::InvalidGitTag)
+    }
+}
+
+fn validate_git_commit(value: &str) -> Result<(), PackageCacheError> {
+    if matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(PackageCacheError::InvalidGitCommit)
+    }
+}
+
+fn canonical_package_directory(value: Option<&str>) -> Result<&str, PackageCacheError> {
+    let Some(value) = value else {
+        return Ok("");
+    };
+    if value == "." {
+        return Ok("");
+    }
+    ContentPackagePath::parse(value)
+        .map(|_| value)
+        .map_err(|_| PackageCacheError::InvalidPackageDirectory)
+}
+
+fn cache_record_key(domain: &[u8], fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SAI-CACHE-KEY-v1\0");
+    hash_length_prefixed_field(&mut hasher, domain);
+    for field in fields {
+        hash_length_prefixed_field(&mut hasher, field);
+    }
+    lowercase_hex(&hasher.finalize())
+}
+
+fn hash_length_prefixed_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+struct CacheRecordSlot {
+    generation: u64,
+    bytes: Vec<u8>,
+    slot: usize,
+}
+
+fn cache_record_slot_path(base: &Path, slot: usize) -> PathBuf {
+    let mut path = base.as_os_str().to_os_string();
+    path.push(format!(".{slot}"));
+    PathBuf::from(path)
+}
+
+fn read_latest_cache_record(
+    base: &Path,
+    magic: &[u8],
+    field_count: usize,
+) -> Result<Option<CacheRecordSlot>, PackageCacheError> {
+    let mut records = Vec::with_capacity(2);
+    let mut corrupt_slots = Vec::with_capacity(2);
+    for slot in 0..2 {
+        let path = cache_record_slot_path(base, slot);
+        let bytes = match read_cache_record(&path) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(PackageCacheError::CorruptRecord(_)) => {
+                corrupt_slots.push((path, None));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match decode_cache_record(magic, &bytes, field_count) {
+            Some((generation, _)) => records.push(CacheRecordSlot {
+                generation,
+                bytes,
+                slot,
+            }),
+            None => corrupt_slots.push((path, cache_record_generation(magic, &bytes))),
+        }
+    }
+    let newest = match records.as_slice() {
+        [] => None,
+        [record] => Some(record),
+        [first, second] if first.generation != second.generation => {
+            Some(if first.generation > second.generation {
+                first
+            } else {
+                second
+            })
+        }
+        _ => return Err(PackageCacheError::CorruptRecord(base.to_path_buf())),
+    };
+    if let Some(newest) = newest {
+        if corrupt_slots.iter().any(|(_, generation)| {
+            generation.is_none_or(|generation| generation >= newest.generation)
+        }) {
+            return Err(PackageCacheError::CorruptRecord(base.to_path_buf()));
+        }
+        return Ok(Some(CacheRecordSlot {
+            generation: newest.generation,
+            bytes: newest.bytes.clone(),
+            slot: newest.slot,
+        }));
+    }
+    if let Some((path, _)) = corrupt_slots.first() {
+        return Err(PackageCacheError::CorruptRecord(path.clone()));
+    }
+    Ok(None)
+}
+
+fn encode_cache_record(magic: &[u8], generation: u64, fields: &[&[u8]]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(
+        magic.len()
+            + 2 * std::mem::size_of::<u64>()
+            + fields
+                .iter()
+                .map(|field| std::mem::size_of::<u32>() + field.len())
+                .sum::<usize>()
+            + RECORD_DIGEST_BYTES,
+    );
+    record.extend_from_slice(magic);
+    record.extend_from_slice(&generation.to_be_bytes());
+    record.extend_from_slice(&(!generation).to_be_bytes());
+    for field in fields {
+        record.extend_from_slice(
+            &u32::try_from(field.len())
+                .expect("cache record fields are bounded")
+                .to_be_bytes(),
+        );
+        record.extend_from_slice(field);
+    }
+    let digest = Sha256::digest(&record);
+    record.extend_from_slice(&digest);
+    record
+}
+
+fn decode_cache_record<'a>(
+    magic: &[u8],
+    record: &'a [u8],
+    field_count: usize,
+) -> Option<(u64, Vec<&'a [u8]>)> {
+    if record.len() as u64 > MAX_CACHE_RECORD_BYTES || !record.starts_with(magic) {
+        return None;
+    }
+    let payload_end = record.len().checked_sub(RECORD_DIGEST_BYTES)?;
+    let (payload, digest) = record.split_at(payload_end);
+    if Sha256::digest(payload).as_slice() != digest {
+        return None;
+    }
+    let generation = cache_record_generation(magic, record)?;
+    let generation_end = magic.len().checked_add(2 * std::mem::size_of::<u64>())?;
+    let mut offset = generation_end;
+    let mut fields = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let length_end = offset.checked_add(std::mem::size_of::<u32>())?;
+        let length = u32::from_be_bytes(payload.get(offset..length_end)?.try_into().ok()?) as usize;
+        offset = length_end;
+        let field_end = offset.checked_add(length)?;
+        fields.push(payload.get(offset..field_end)?);
+        offset = field_end;
+    }
+    (offset == payload.len()).then_some((generation, fields))
+}
+
+fn cache_record_generation(magic: &[u8], record: &[u8]) -> Option<u64> {
+    if record.len() as u64 > MAX_CACHE_RECORD_BYTES || !record.starts_with(magic) {
+        return None;
+    }
+    let generation_start = magic.len();
+    let complement_start = generation_start.checked_add(std::mem::size_of::<u64>())?;
+    let fields_start = complement_start.checked_add(std::mem::size_of::<u64>())?;
+    let generation = u64::from_be_bytes(
+        record
+            .get(generation_start..complement_start)?
+            .try_into()
+            .ok()?,
+    );
+    let complement = u64::from_be_bytes(
+        record
+            .get(complement_start..fields_start)?
+            .try_into()
+            .ok()?,
+    );
+    (generation != 0 && complement == !generation).then_some(generation)
+}
+
+fn read_cache_record(path: &Path) -> Result<Option<Vec<u8>>, PackageCacheError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "inspect package cache record",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_CACHE_RECORD_BYTES
+    {
+        return Err(PackageCacheError::CorruptRecord(path.to_path_buf()));
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "open package cache record",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_CACHE_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| PackageCacheError::Io {
+            operation: "read package cache record",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_CACHE_RECORD_BYTES {
+        return Err(PackageCacheError::CorruptRecord(path.to_path_buf()));
+    }
+    Ok(Some(bytes))
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(result, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    result
 }
 
 fn ensure_cache_directory(path: &Path) -> Result<(), PackageCacheError> {
@@ -1638,6 +2174,302 @@ mod tests {
         assert!(cache.versioned_root().join("tags").is_dir());
         assert!(cache.temporary_directory().is_dir());
         assert!(cache.versioned_root().join("lock").is_file());
+    }
+
+    #[test]
+    fn repository_keys_and_directories_follow_the_cache_specification() {
+        let temp = TestDirectory::new("repository-key");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let url = "https://example.com/acme/repo";
+
+        assert_eq!(
+            PackageCache::repository_key(url).unwrap(),
+            "fb7118253e93c2fc4455ee42d54bf19dd7fff74426e8e6b8c24b9b731dc530cc"
+        );
+        assert_eq!(
+            cache.git_repository_directory(url).unwrap(),
+            cache
+                .versioned_root()
+                .join("git")
+                .join("fb7118253e93c2fc4455ee42d54bf19dd7fff74426e8e6b8c24b9b731dc530cc")
+        );
+        assert!(!cache.git_repository_directory(url).unwrap().exists());
+        assert!(matches!(
+            PackageCache::repository_key("HTTPS://EXAMPLE.COM/acme/repo"),
+            Err(PackageCacheError::InvalidGitUrl)
+        ));
+    }
+
+    #[test]
+    fn persists_release_tag_and_source_records_across_cache_handles() {
+        let temp = TestDirectory::new("records");
+        let root = temp.path().join("cache");
+        let cache = PackageCache::open(&root).unwrap();
+        let url = "https://example.com/acme/repo";
+        let tag = "refs/tags/packages/json/v1.2.3";
+        let commit = "a".repeat(40);
+        let checksum = format!("sai1:{}", "b".repeat(64));
+
+        assert_eq!(cache.cached_git_tag_commit(url, tag).unwrap(), None);
+        cache.record_git_tag(url, tag, &commit).unwrap();
+        assert_eq!(
+            cache.cached_git_tag_commit(url, tag).unwrap(),
+            Some(commit.clone())
+        );
+
+        cache
+            .record_git_source_checksum(url, &commit, Some("packages/json"), &checksum)
+            .unwrap();
+        let reopened = PackageCache::open(&root).unwrap();
+        assert_eq!(
+            reopened.cached_git_tag_commit(url, tag).unwrap().as_deref(),
+            Some(commit.as_str())
+        );
+        assert_eq!(
+            reopened
+                .cached_git_source_checksum(url, &commit, Some("packages/json"))
+                .unwrap(),
+            Some(checksum)
+        );
+        assert_eq!(
+            reopened
+                .cached_git_source_checksum(url, &commit, None)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened
+                .cached_git_source_checksum(url, &commit, Some("."))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read_dir(cache.temporary_directory()).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn release_tag_updates_allow_moved_tags_but_source_records_are_immutable() {
+        let temp = TestDirectory::new("record-updates");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let url = "ssh://git@example.com/acme/repo";
+        let tag = "refs/tags/v1.2.3";
+        let first_commit = "a".repeat(40);
+        let next_commit = "c".repeat(64);
+        let first_checksum = format!("sai1:{}", "b".repeat(64));
+        let next_checksum = format!("sai1:{}", "d".repeat(64));
+
+        cache.record_git_tag(url, tag, &first_commit).unwrap();
+        cache.record_git_tag(url, tag, &next_commit).unwrap();
+        assert_eq!(
+            cache.cached_git_tag_commit(url, tag).unwrap(),
+            Some(next_commit.clone())
+        );
+
+        cache
+            .record_git_source_checksum(url, &first_commit, None, &first_checksum)
+            .unwrap();
+        assert!(matches!(
+            cache.record_git_source_checksum(url, &first_commit, Some("."), &next_checksum),
+            Err(PackageCacheError::ConflictingGitSourceRecord(_))
+        ));
+        assert_eq!(
+            cache
+                .cached_git_source_checksum(url, &first_commit, None)
+                .unwrap(),
+            Some(first_checksum)
+        );
+    }
+
+    #[test]
+    fn validates_cache_record_inputs_and_rejects_corruption() {
+        let temp = TestDirectory::new("record-corruption");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let url = "https://example.com/acme/repo";
+        let tag = "refs/tags/v1.2.3";
+        let commit = "a".repeat(40);
+        assert!(matches!(
+            cache.record_git_tag(url, "refs/tags/v1..2", &commit),
+            Err(PackageCacheError::InvalidGitTag)
+        ));
+        assert!(matches!(
+            cache.record_git_tag(url, tag, &commit.to_ascii_uppercase()),
+            Err(PackageCacheError::InvalidGitCommit)
+        ));
+        assert!(matches!(
+            cache.record_git_source_checksum(
+                url,
+                &commit,
+                Some("../outside"),
+                &format!("sai1:{}", "b".repeat(64))
+            ),
+            Err(PackageCacheError::InvalidPackageDirectory)
+        ));
+        assert!(matches!(
+            cache.record_git_source_checksum(url, &commit, None, "sai1:bad"),
+            Err(PackageCacheError::InvalidSourceChecksum(_))
+        ));
+
+        cache.record_git_tag(url, tag, &commit).unwrap();
+        let key = super::cache_record_key(b"tag", &[url.as_bytes(), tag.as_bytes()]);
+        let record = super::cache_record_slot_path(
+            &cache.tag_directory.join(format!("tag-{key}.record")),
+            0,
+        );
+        fs::write(&record, b"truncated record").unwrap();
+        assert!(matches!(
+            cache.cached_git_tag_commit(url, tag),
+            Err(PackageCacheError::CorruptRecord(_))
+        ));
+    }
+
+    #[test]
+    fn readers_keep_the_latest_record_while_the_inactive_slot_is_missing() {
+        let temp = TestDirectory::new("record-slot-gap");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let url = "https://example.com/acme/repo";
+        let tag = "refs/tags/v1.2.3";
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        let third = "c".repeat(40);
+
+        cache.record_git_tag(url, tag, &first).unwrap();
+        cache.record_git_tag(url, tag, &second).unwrap();
+        let key = super::cache_record_key(b"tag", &[url.as_bytes(), tag.as_bytes()]);
+        let base = cache.tag_directory.join(format!("tag-{key}.record"));
+        let older_slot = super::cache_record_slot_path(&base, 0);
+        fs::remove_file(older_slot).unwrap();
+
+        assert_eq!(
+            cache.cached_git_tag_commit(url, tag).unwrap(),
+            Some(second.clone())
+        );
+        cache.record_git_tag(url, tag, &third).unwrap();
+        assert_eq!(cache.cached_git_tag_commit(url, tag).unwrap(), Some(third));
+    }
+
+    #[test]
+    fn cache_record_reads_recover_only_from_a_verifiably_older_corrupt_slot() {
+        let url = "https://example.com/acme/repo";
+        let tag = "refs/tags/v1.2.3";
+
+        let stale_temp = TestDirectory::new("stale-corrupt-record");
+        let stale_cache = PackageCache::open(stale_temp.path().join("cache")).unwrap();
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        stale_cache.record_git_tag(url, tag, &first).unwrap();
+        stale_cache.record_git_tag(url, tag, &second).unwrap();
+        let key = super::cache_record_key(b"tag", &[url.as_bytes(), tag.as_bytes()]);
+        let base = stale_cache.tag_directory.join(format!("tag-{key}.record"));
+        let stale_slot = super::cache_record_slot_path(&base, 0);
+        let mut stale_bytes = fs::read(&stale_slot).unwrap();
+        *stale_bytes.last_mut().unwrap() ^= 1;
+        fs::write(&stale_slot, stale_bytes).unwrap();
+        assert_eq!(
+            stale_cache.cached_git_tag_commit(url, tag).unwrap(),
+            Some(second.clone())
+        );
+        stale_cache
+            .record_git_tag(url, tag, &"c".repeat(40))
+            .unwrap();
+
+        let newest_temp = TestDirectory::new("newest-corrupt-record");
+        let newest_cache = PackageCache::open(newest_temp.path().join("cache")).unwrap();
+        newest_cache.record_git_tag(url, tag, &first).unwrap();
+        newest_cache.record_git_tag(url, tag, &second).unwrap();
+        let newest_base = newest_cache.tag_directory.join(format!("tag-{key}.record"));
+        let newest_slot = super::cache_record_slot_path(&newest_base, 1);
+        let mut newest_bytes = fs::read(&newest_slot).unwrap();
+        *newest_bytes.last_mut().unwrap() ^= 1;
+        fs::write(&newest_slot, newest_bytes).unwrap();
+        assert!(matches!(
+            newest_cache.cached_git_tag_commit(url, tag),
+            Err(PackageCacheError::CorruptRecord(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_tag_record_updates_publish_complete_values() {
+        use std::sync::{Arc, Barrier};
+
+        const WORKERS: usize = 8;
+        let temp = TestDirectory::new("concurrent-records");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let commits = (0..WORKERS)
+            .map(|index| format!("{index:040x}"))
+            .collect::<Vec<_>>();
+        let workers = commits
+            .iter()
+            .map(|commit| {
+                let cache = cache.clone();
+                let barrier = Arc::clone(&barrier);
+                let commit = commit.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .record_git_tag(
+                            "https://example.com/acme/repo",
+                            "refs/tags/v1.2.3",
+                            &commit,
+                        )
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let recorded = cache
+            .cached_git_tag_commit("https://example.com/acme/repo", "refs/tags/v1.2.3")
+            .unwrap()
+            .unwrap();
+        assert!(commits.contains(&recorded));
+    }
+
+    #[test]
+    fn concurrent_readers_keep_tag_records_available_during_updates() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const READERS: usize = 3;
+        const UPDATES: usize = 500;
+        let temp = TestDirectory::new("record-readers");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let url = "https://example.com/acme/repo";
+        let tag = "refs/tags/v1.2.3";
+        cache.record_git_tag(url, tag, &"0".repeat(40)).unwrap();
+
+        let start = Arc::new(Barrier::new(READERS + 1));
+        let done = Arc::new(AtomicBool::new(false));
+        let readers = (0..READERS)
+            .map(|_| {
+                let cache = cache.clone();
+                let start = Arc::clone(&start);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    start.wait();
+                    loop {
+                        assert!(cache.cached_git_tag_commit(url, tag).unwrap().is_some());
+                        if done.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for index in 1..=UPDATES {
+            cache
+                .record_git_tag(url, tag, &format!("{index:040x}"))
+                .unwrap();
+        }
+        done.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 
     #[test]
