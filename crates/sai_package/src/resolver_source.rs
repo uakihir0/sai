@@ -53,6 +53,80 @@ pub struct ResolverSourceSelection {
     pub path_pin_sources: Vec<ResolverPathPinSource>,
 }
 
+/// Checks that every path pin for a node resolves to the same source.
+///
+/// `canonicalize` owns source-specific resolution and must return a key for
+/// the complete resolved source. For local paths the key should identify the
+/// joined path after lexical normalization and symlink resolution. For a path
+/// inside a Git package it should include the canonical repository URL, the
+/// requiring package's commit, and the normalized repository tree path. Git
+/// paths that leave the repository must be returned as errors. The callback
+/// receives the requirer and source span so it can resolve the correct base.
+pub fn validate_resolver_path_pins<K, E>(
+    selection: &ResolverSourceSelection,
+    mut canonicalize: impl FnMut(&ResolverPathPinSource) -> Result<K, E>,
+) -> Result<(), ResolverPathPinValidationError<K, E>>
+where
+    K: Eq,
+{
+    let Some(first_pin) = selection.path_pin_sources.first() else {
+        return if selection.reason == ResolverSourceReason::PathPin {
+            Err(ResolverPathPinValidationError::InconsistentSelection)
+        } else {
+            Ok(())
+        };
+    };
+    if selection.reason != ResolverSourceReason::PathPin
+        || selection.source != first_pin.source
+        || selection
+            .path_pin_sources
+            .iter()
+            .any(|pin| !matches!(pin.source, ResolverPackageSource::Path { .. }))
+    {
+        return Err(ResolverPathPinValidationError::InconsistentSelection);
+    }
+
+    let first_key = canonicalize(first_pin).map_err(|error| {
+        ResolverPathPinValidationError::Canonicalization {
+            pin: Box::new(first_pin.clone()),
+            error: Box::new(error),
+        }
+    })?;
+    for pin in &selection.path_pin_sources[1..] {
+        let key = canonicalize(pin).map_err(|error| {
+            ResolverPathPinValidationError::Canonicalization {
+                pin: Box::new(pin.clone()),
+                error: Box::new(error),
+            }
+        })?;
+        if key != first_key {
+            return Err(ResolverPathPinValidationError::ConflictingSources {
+                first: Box::new(first_pin.clone()),
+                conflicting: Box::new(pin.clone()),
+                first_key: Box::new(first_key),
+                conflicting_key: Box::new(key),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A path pin could not be resolved consistently with the other pins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolverPathPinValidationError<K, E> {
+    InconsistentSelection,
+    Canonicalization {
+        pin: Box<ResolverPathPinSource>,
+        error: Box<E>,
+    },
+    ConflictingSources {
+        first: Box<ResolverPathPinSource>,
+        conflicting: Box<ResolverPathPinSource>,
+        first_key: Box<K>,
+        conflicting_key: Box<K>,
+    },
+}
+
 /// Failure to map MVS edge provenance back to validated manifest metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolverSourceSelectionError {
@@ -272,7 +346,7 @@ fn compare_named_edges(left: &MvsNamedEdge, right: &MvsNamedEdge) -> std::cmp::O
         .then_with(|| left.span.end.cmp(&right.span.end))
 }
 
-fn source_for_edge(
+pub(crate) fn source_for_edge(
     edge: &MvsNamedEdge,
     target_package_version: &MvsPackageVersion,
     root_contract: &ResolverContract,
@@ -413,8 +487,13 @@ fn requirement_for_edge<'a>(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::ops::Range;
 
-    use super::{ResolverPackageSource, ResolverSourceReason, select_resolver_source};
+    use super::{
+        ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
+        ResolverSourceReason, ResolverSourceSelection, select_resolver_source,
+        validate_resolver_path_pins,
+    };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{MvsContractRequest, MvsNamedEdge, MvsPackageVersion, MvsRequirer};
     use crate::resolver_contract::{
@@ -476,6 +555,145 @@ mod tests {
             path_pin,
             root_override_pin,
         }
+    }
+
+    fn path_pin(path: &str, span: Range<usize>) -> ResolverPathPinSource {
+        ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: package_version("acme:app", "1.0.0"),
+                path: path.into(),
+            },
+            requirer: MvsRequirer::Root(package_version("acme:app", "1.0.0")),
+            span,
+        }
+    }
+
+    fn path_pin_selection(pins: Vec<ResolverPathPinSource>) -> ResolverSourceSelection {
+        ResolverSourceSelection {
+            source: pins[0].source.clone(),
+            reason: ResolverSourceReason::PathPin,
+            path_pin_sources: pins,
+        }
+    }
+
+    #[test]
+    fn path_pins_with_different_spellings_can_resolve_to_the_same_source() {
+        let selection = path_pin_selection(vec![
+            path_pin("../packages/dep/.", 2..12),
+            path_pin("../dep", 20..25),
+        ]);
+
+        validate_resolver_path_pins(&selection, |_| Ok::<_, ()>("/workspace/dep"))
+            .expect("canonicalized path pins agree");
+    }
+
+    #[test]
+    fn conflicting_path_pins_retain_both_provenances_and_canonical_keys() {
+        let first = path_pin("../packages/dep", 4..18);
+        let conflicting = path_pin("../other/dep", 30..42);
+        let selection = path_pin_selection(vec![first.clone(), conflicting.clone()]);
+
+        assert_eq!(
+            validate_resolver_path_pins(&selection, |pin| {
+                Ok::<_, ()>(match pin.span.start {
+                    4 => "/workspace/packages/dep",
+                    _ => "/workspace/other/dep",
+                })
+            }),
+            Err(ResolverPathPinValidationError::ConflictingSources {
+                first: Box::new(first),
+                conflicting: Box::new(conflicting),
+                first_key: Box::new("/workspace/packages/dep"),
+                conflicting_key: Box::new("/workspace/other/dep"),
+            })
+        );
+    }
+
+    #[test]
+    fn path_pin_canonicalization_errors_identify_the_failing_pin() {
+        let first = path_pin("../packages/dep", 4..18);
+        let failing = path_pin("../missing/dep", 30..43);
+        let selection = path_pin_selection(vec![first, failing.clone()]);
+
+        assert_eq!(
+            validate_resolver_path_pins(&selection, |pin| {
+                if pin.span == failing.span {
+                    Err("missing path")
+                } else {
+                    Ok("/workspace/packages/dep")
+                }
+            }),
+            Err(ResolverPathPinValidationError::Canonicalization {
+                pin: Box::new(failing),
+                error: Box::new("missing path"),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_path_or_mismatched_path_pin_selections() {
+        let pin = path_pin("../dep", 2..9);
+        let mut selection = path_pin_selection(vec![pin.clone()]);
+        selection.reason = ResolverSourceReason::NamedRequirement;
+
+        assert_eq!(
+            validate_resolver_path_pins(&selection, |_| Ok::<_, ()>("unused")),
+            Err(ResolverPathPinValidationError::InconsistentSelection)
+        );
+
+        let mut selection = path_pin_selection(vec![pin.clone()]);
+        selection.source = ResolverPackageSource::Path {
+            relative_to: package_version("acme:app", "1.0.0"),
+            path: "../different".into(),
+        };
+        assert_eq!(
+            validate_resolver_path_pins(&selection, |_| Ok::<_, ()>("unused")),
+            Err(ResolverPathPinValidationError::InconsistentSelection)
+        );
+
+        let mut selection = path_pin_selection(vec![pin.clone(), path_pin("../another", 12..22)]);
+        selection.path_pin_sources[1].source = ResolverPackageSource::Git {
+            url: "https://example.test/dep".into(),
+            directory: None,
+        };
+        assert_eq!(
+            validate_resolver_path_pins(&selection, |_| Ok::<_, ()>("unused")),
+            Err(ResolverPathPinValidationError::InconsistentSelection)
+        );
+    }
+
+    #[test]
+    fn rejects_path_pin_selections_without_pin_provenance() {
+        let selection = ResolverSourceSelection {
+            source: ResolverPackageSource::Path {
+                relative_to: package_version("acme:app", "1.0.0"),
+                path: "../dep".into(),
+            },
+            reason: ResolverSourceReason::PathPin,
+            path_pin_sources: Vec::new(),
+        };
+
+        assert_eq!(
+            validate_resolver_path_pins(&selection, |_| Ok::<_, ()>("unused")),
+            Err(ResolverPathPinValidationError::InconsistentSelection)
+        );
+    }
+
+    #[test]
+    fn selections_without_path_pins_need_no_canonicalization() {
+        let selection = ResolverSourceSelection {
+            source: ResolverPackageSource::Git {
+                url: "https://example.test/dep".into(),
+                directory: None,
+            },
+            reason: ResolverSourceReason::NamedRequirement,
+            path_pin_sources: Vec::new(),
+        };
+
+        validate_resolver_path_pins(&selection, |_| -> Result<&str, ()> {
+            panic!("the canonicalizer must not run without path pins")
+        })
+        .expect("selection has no path pins to compare");
     }
 
     #[test]
