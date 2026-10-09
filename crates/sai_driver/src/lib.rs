@@ -1,9 +1,17 @@
 #![forbid(unsafe_code)]
 
-use sai_diagnostics::{Diagnostic, SourceRef, source_text_status_diagnostic};
+use sai_diagnostics::{Diagnostic, OverrideLintLevel, SourceRef, source_text_status_diagnostic};
 use sai_hir::item_tree::ItemTree;
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
+use sai_package::manifest::PackageRole;
+use sai_package::mvs::{MvsPackageVersion, MvsSelectionOutput};
+use sai_package::mvs_diagnostics::{
+    MvsDuplicatePackageLineDiagnosticContext, MvsDuplicatePackageLineDiagnosticError,
+    MvsManifestLocation, MvsManifestLocations, dependency_cycle_diagnostics,
+    duplicate_package_line_diagnostics, root_dependency_cycle_diagnostics,
+    version_conflict_diagnostics,
+};
 use sai_query::{Durability, QueryDatabase, QueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
@@ -12,6 +20,7 @@ use sai_vfs::{
     PackageSourcePath, SourceText, VfsInputSnapshot, VfsInputUpdate, VfsInputs, WitFilesSnapshot,
     WorkspaceSnapshot,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Owns the query runtime and the session state for the implemented frontend.
@@ -20,9 +29,10 @@ use std::sync::Arc;
 /// item-tree queries. Snapshot-bound results are always rebound to the
 /// [`WorkspaceSnapshot`] passed by the caller.
 ///
-/// Callers must pass `FileId`s created by this database. `FileId` contains
-/// only a numeric index, so an in-range ID from another database cannot be
-/// distinguished from the local ID with the same index.
+/// APIs that access the file interner require `FileId`s created by this
+/// database. MVS dependency candidate manifests instead use distinct IDs from
+/// their supplied snapshot because multiple versions on one compatibility
+/// line share a stable package/file key.
 pub struct RootDatabase {
     query_database: QueryDatabase,
     vfs: VfsInputs,
@@ -41,6 +51,15 @@ pub enum RootDatabaseError {
     FileInterner(FileInternerError),
     /// The numeric file index is outside this database's file interner.
     FileNotInterned,
+    PackageDiagnostics(MvsDuplicatePackageLineDiagnosticError),
+    MissingPackageManifest(MvsPackageVersion),
+    UnexpectedPackageManifest(MvsPackageVersion),
+    PackageManifestFileKeyMismatch {
+        file_id: FileId,
+        expected_package_key: String,
+        found_package_key: String,
+        found_path: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +142,12 @@ impl From<PackageKeyError> for RootDatabaseError {
 impl From<FileInternerError> for RootDatabaseError {
     fn from(error: FileInternerError) -> Self {
         Self::FileInterner(error)
+    }
+}
+
+impl From<MvsDuplicatePackageLineDiagnosticError> for RootDatabaseError {
+    fn from(error: MvsDuplicatePackageLineDiagnosticError) -> Self {
+        Self::PackageDiagnostics(error)
     }
 }
 
@@ -434,12 +459,127 @@ impl RootDatabase {
             &self.symbols,
         )
     }
+
+    /// Builds source-bound diagnostics for the MVS package graph.
+    ///
+    /// The manifest map must cover every contract visited by selection,
+    /// including unselected candidates. The root manifest ID must be interned
+    /// by this database. Dependency manifest IDs must identify distinct files
+    /// in `snapshot`; they need not be present in this database's file
+    /// interner because that interner keys files by compatibility line, not
+    /// exact candidate version. Complete selections produce version conflicts,
+    /// selected cycles, and duplicate-line lints. Root-cycle findings are also
+    /// produced from incomplete selections; other selection errors remain the
+    /// caller's responsibility.
+    pub fn mvs_graph_diagnostics(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        selection: &MvsSelectionOutput,
+        root_manifest_file: FileId,
+        dependency_manifest_files: &BTreeMap<MvsPackageVersion, FileId>,
+        duplicate_line_cli: Option<OverrideLintLevel>,
+        deny_warnings: bool,
+    ) -> Result<Vec<Diagnostic>, RootDatabaseError> {
+        let manifests = self.mvs_manifest_locations(
+            snapshot,
+            selection,
+            root_manifest_file,
+            dependency_manifest_files,
+        )?;
+        let mut diagnostics = Vec::new();
+
+        if selection.is_complete() {
+            diagnostics.extend(version_conflict_diagnostics(selection, &manifests)?);
+            diagnostics.extend(dependency_cycle_diagnostics(selection, &manifests)?);
+            diagnostics.extend(duplicate_package_line_diagnostics(
+                selection,
+                &MvsDuplicatePackageLineDiagnosticContext {
+                    manifests: &manifests,
+                    cli: duplicate_line_cli,
+                    deny_warnings,
+                },
+            )?);
+        }
+        diagnostics.extend(root_dependency_cycle_diagnostics(selection, &manifests)?);
+        Ok(diagnostics)
+    }
+
+    fn mvs_manifest_locations(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        selection: &MvsSelectionOutput,
+        root_manifest_file: FileId,
+        dependency_manifest_files: &BTreeMap<MvsPackageVersion, FileId>,
+    ) -> Result<MvsManifestLocations, RootDatabaseError> {
+        self.validate_package_manifest_file_key(root_manifest_file, selection.root())?;
+        let root = MvsManifestLocation::from_snapshot(
+            snapshot,
+            root_manifest_file,
+            selection.root(),
+            PackageRole::Root,
+        )?;
+        let mut manifests = MvsManifestLocations::default();
+        manifests.set_root(root)?;
+
+        for package_version in selection.read_contracts().keys() {
+            let Some(file_id) = dependency_manifest_files.get(package_version).copied() else {
+                return Err(RootDatabaseError::MissingPackageManifest(
+                    package_version.clone(),
+                ));
+            };
+            manifests.insert_package(MvsManifestLocation::from_snapshot(
+                snapshot,
+                file_id,
+                package_version,
+                PackageRole::Dependency,
+            )?)?;
+        }
+        if let Some(package_version) = dependency_manifest_files
+            .keys()
+            .find(|package_version| !selection.read_contracts().contains_key(*package_version))
+        {
+            return Err(RootDatabaseError::UnexpectedPackageManifest(
+                package_version.clone(),
+            ));
+        }
+        Ok(manifests)
+    }
+
+    fn validate_package_manifest_file_key(
+        &self,
+        file_id: FileId,
+        package_version: &MvsPackageVersion,
+    ) -> Result<(), RootDatabaseError> {
+        let file_key = self
+            .files
+            .file_key(file_id)
+            .ok_or(RootDatabaseError::FileNotInterned)?;
+        let expected_package_key = format!(
+            "{}#{}",
+            package_version.package(),
+            package_version.node().line()
+        );
+        if file_key.package_key() != expected_package_key || file_key.path() != "sai.package" {
+            return Err(RootDatabaseError::PackageManifestFileKeyMismatch {
+                file_id,
+                expected_package_key,
+                found_package_key: file_key.package_key().to_owned(),
+                found_path: file_key.path().to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
+    use sai_package::mvs::{MvsContract, MvsEdge, MvsPackageVersion, select};
+    use sai_package::version::Version;
+    use sai_package::version_req::VersionReq;
+    use sai_vfs::{PackageRelativePath, SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     fn snapshot(file_id: FileId, contents: &[u8], version: u64) -> WorkspaceSnapshot {
         WorkspaceSnapshot::new([SnapshotFile::new(
@@ -582,6 +722,609 @@ mod tests {
             .source_text_and_diagnostic(file_id, source_ref)
             .expect("ready source is returned");
         assert!(diagnostic.is_none());
+    }
+
+    #[test]
+    fn root_database_collects_source_bound_root_cycle_diagnostics() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let root_version = MvsPackageVersion::new(
+            "acme:app",
+            Version::parse("1.0.0").expect("version is valid"),
+        )
+        .expect("root identity is valid");
+        let dependency_version =
+            MvsPackageVersion::new("acme:a", Version::parse("1.0.0").expect("version is valid"))
+                .expect("dependency identity is valid");
+        let root_package_id = database
+            .intern_package("acme:app#1")
+            .expect("root package is interned");
+        let dependency_package_id = database
+            .intern_package("acme:a#1")
+            .expect("dependency package is interned");
+        let root_file = database
+            .intern_package_file(
+                root_package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("root manifest is interned");
+        let dependency_file = database
+            .intern_package_file(
+                dependency_package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("dependency manifest is interned");
+
+        let root_source = "package acme:app @ 1.0.0\nrequires {\n    acme:a @ ^1\n}\n";
+        let dependency_source = "package acme:a @ 1.0.0\nrequires {\n    acme:app @ ^1\n}\n";
+        let root_span = root_source.find("acme:a @ ^1").expect("root edge exists")
+            ..root_source.find("acme:a @ ^1").expect("root edge exists") + "acme:a @ ^1".len();
+        let dependency_span = dependency_source
+            .find("acme:app @ ^1")
+            .expect("cycle edge exists")
+            ..dependency_source
+                .find("acme:app @ ^1")
+                .expect("cycle edge exists")
+                + "acme:app @ ^1".len();
+        let root_contract = MvsContract::new(
+            root_version.clone(),
+            vec![
+                MvsEdge::new(
+                    "acme:a",
+                    VersionReq::parse("^1").expect("requirement is valid"),
+                    Version::parse("1.0.0").expect("version is valid"),
+                    root_span,
+                )
+                .expect("root requirement is valid"),
+            ],
+        )
+        .expect("root contract is valid");
+        let dependency_contract = MvsContract::new(
+            dependency_version.clone(),
+            vec![
+                MvsEdge::new(
+                    "acme:app",
+                    VersionReq::parse("^1").expect("requirement is valid"),
+                    Version::parse("1.0.0").expect("version is valid"),
+                    dependency_span,
+                )
+                .expect("cycle requirement is valid"),
+            ],
+        )
+        .expect("dependency contract is valid");
+        let selection = select(
+            &root_contract,
+            &HashMap::from([(dependency_version.clone(), dependency_contract)]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("MVS selection records the root cycle");
+
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(root_file, root_source.as_bytes())
+                        .expect("root manifest decodes"),
+                ),
+                "sai.package",
+                Some("acme:app@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(dependency_file, dependency_source.as_bytes())
+                        .expect("dependency manifest decodes"),
+                ),
+                "dep:acme:a@1.0.0/sai.package",
+                Some("acme:a@1.0.0".to_owned()),
+                Some(1),
+            ),
+        ])
+        .expect("manifest snapshot is valid");
+
+        let diagnostics = database
+            .mvs_graph_diagnostics(
+                &snapshot,
+                &selection,
+                root_file,
+                &BTreeMap::from([(dependency_version.clone(), dependency_file)]),
+                None,
+                false,
+            )
+            .expect("source-bound MVS diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_str(), "DEPENDENCY_CYCLE");
+        assert_eq!(
+            diagnostics[0].primary().expect("closing edge").file.path,
+            "dep:acme:a@1.0.0/sai.package"
+        );
+
+        assert_eq!(
+            database.mvs_graph_diagnostics(
+                &snapshot,
+                &selection,
+                root_file,
+                &BTreeMap::new(),
+                None,
+                false,
+            ),
+            Err(RootDatabaseError::MissingPackageManifest(
+                dependency_version.clone()
+            ))
+        );
+        assert!(matches!(
+            database.mvs_graph_diagnostics(
+                &snapshot,
+                &selection,
+                dependency_file,
+                &BTreeMap::from([(dependency_version, dependency_file)]),
+                None,
+                false,
+            ),
+            Err(RootDatabaseError::PackageManifestFileKeyMismatch {
+                expected_package_key,
+                found_package_key,
+                ..
+            }) if expected_package_key == "acme:app#1" && found_package_key == "acme:a#1"
+        ));
+    }
+
+    #[test]
+    fn root_database_collects_selected_cycle_and_its_root_chain() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let root_version = MvsPackageVersion::new(
+            "acme:app",
+            Version::parse("1.0.0").expect("version is valid"),
+        )
+        .expect("root identity is valid");
+        let a_version =
+            MvsPackageVersion::new("acme:a", Version::parse("1.0.0").expect("version is valid"))
+                .expect("package identity is valid");
+        let b_version =
+            MvsPackageVersion::new("acme:b", Version::parse("1.0.0").expect("version is valid"))
+                .expect("package identity is valid");
+        let root_package_id = database
+            .intern_package("acme:app#1")
+            .expect("root package is interned");
+        let a_package_id = database
+            .intern_package("acme:a#1")
+            .expect("package is interned");
+        let b_package_id = database
+            .intern_package("acme:b#1")
+            .expect("package is interned");
+        let root_file = database
+            .intern_package_file(
+                root_package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("root manifest is interned");
+        let a_file = database
+            .intern_package_file(
+                a_package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("manifest is interned");
+        let b_file = database
+            .intern_package_file(
+                b_package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("manifest is interned");
+
+        let root_source = "package acme:app @ 1.0.0\nrequires {\n    acme:a @ ^1\n}\n";
+        let a_source = "package acme:a @ 1.0.0\nrequires {\n    acme:b @ ^1\n}\n";
+        let b_source = "package acme:b @ 1.0.0\nrequires {\n    acme:a @ ^1\n}\n";
+        let root_edge_start = root_source.find("acme:a @ ^1").expect("edge exists");
+        let a_edge_start = a_source.find("acme:b @ ^1").expect("edge exists");
+        let b_edge_start = b_source.find("acme:a @ ^1").expect("edge exists");
+        let edge_length = "acme:a @ ^1".len();
+        let root_contract = MvsContract::new(
+            root_version,
+            vec![
+                MvsEdge::new(
+                    "acme:a",
+                    VersionReq::parse("^1").expect("requirement is valid"),
+                    Version::parse("1.0.0").expect("version is valid"),
+                    root_edge_start..root_edge_start + edge_length,
+                )
+                .expect("edge is valid"),
+            ],
+        )
+        .expect("root contract is valid");
+        let a_contract = MvsContract::new(
+            a_version.clone(),
+            vec![
+                MvsEdge::new(
+                    "acme:b",
+                    VersionReq::parse("^1").expect("requirement is valid"),
+                    Version::parse("1.0.0").expect("version is valid"),
+                    a_edge_start..a_edge_start + "acme:b @ ^1".len(),
+                )
+                .expect("edge is valid"),
+            ],
+        )
+        .expect("contract is valid");
+        let b_contract = MvsContract::new(
+            b_version.clone(),
+            vec![
+                MvsEdge::new(
+                    "acme:a",
+                    VersionReq::parse("^1").expect("requirement is valid"),
+                    Version::parse("1.0.0").expect("version is valid"),
+                    b_edge_start..b_edge_start + edge_length,
+                )
+                .expect("edge is valid"),
+            ],
+        )
+        .expect("contract is valid");
+        let selection = select(
+            &root_contract,
+            &HashMap::from([
+                (a_version.clone(), a_contract),
+                (b_version.clone(), b_contract),
+            ]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("selected graph contains a cycle");
+        assert!(selection.is_complete());
+
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(root_file, root_source.as_bytes())
+                        .expect("root manifest decodes"),
+                ),
+                "sai.package",
+                Some("acme:app@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(a_file, a_source.as_bytes()).expect("manifest decodes"),
+                ),
+                "dep:acme:a@1.0.0/sai.package",
+                Some("acme:a@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(b_file, b_source.as_bytes()).expect("manifest decodes"),
+                ),
+                "dep:acme:b@1.0.0/sai.package",
+                Some("acme:b@1.0.0".to_owned()),
+                Some(1),
+            ),
+        ])
+        .expect("manifest snapshot is valid");
+
+        let diagnostics = database
+            .mvs_graph_diagnostics(
+                &snapshot,
+                &selection,
+                root_file,
+                &BTreeMap::from([(a_version, a_file), (b_version, b_file)]),
+                None,
+                false,
+            )
+            .expect("source-bound MVS diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_str(), "DEPENDENCY_CYCLE");
+        let sai_diagnostics::Value::Object(chain) = diagnostics[0]
+            .data
+            .get("requirement_chain")
+            .expect("root chain")
+        else {
+            panic!("cycle diagnostic has a requirement chain");
+        };
+        let sai_diagnostics::Value::Array(steps) = chain.get("steps").expect("chain steps") else {
+            panic!("requirement-chain steps are an array");
+        };
+        assert_eq!(steps.len(), 3);
+    }
+
+    #[test]
+    fn root_database_maps_same_line_candidates_to_distinct_snapshot_files() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let root_version = MvsPackageVersion::new(
+            "acme:app",
+            Version::parse("1.0.0").expect("version is valid"),
+        )
+        .expect("root identity is valid");
+        let named_candidate =
+            MvsPackageVersion::new("acme:a", Version::parse("1.0.0").expect("version is valid"))
+                .expect("candidate identity is valid");
+        let floor_candidate =
+            MvsPackageVersion::new("acme:a", Version::parse("1.5.0").expect("version is valid"))
+                .expect("candidate identity is valid");
+        let root_package_id = database
+            .intern_package("acme:app#1")
+            .expect("root package is interned");
+        let root_file = database
+            .intern_package_file(
+                root_package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("root manifest is interned");
+        let named_file = FileId::new(10_001);
+        let floor_file = FileId::new(10_002);
+
+        let root_source = "package acme:app @ 1.0.0\nrequires {\n    acme:a @ ^1\n}\n";
+        let named_source = "package acme:a @ 1.0.0\n";
+        let floor_source = "package acme:a @ 1.5.0\n";
+        let edge_start = root_source.find("acme:a @ ^1").expect("root edge exists");
+        let root_contract = MvsContract::new(
+            root_version,
+            vec![
+                MvsEdge::new(
+                    "acme:a",
+                    VersionReq::parse("^1").expect("requirement is valid"),
+                    Version::parse("1.0.0").expect("version is valid"),
+                    edge_start..edge_start + "acme:a @ ^1".len(),
+                )
+                .expect("root requirement is valid"),
+            ],
+        )
+        .expect("root contract is valid");
+        let contracts = HashMap::from([
+            (
+                named_candidate.clone(),
+                MvsContract::new(named_candidate.clone(), vec![])
+                    .expect("named candidate contract is valid"),
+            ),
+            (
+                floor_candidate.clone(),
+                MvsContract::new(floor_candidate.clone(), vec![])
+                    .expect("floor candidate contract is valid"),
+            ),
+        ]);
+        let floors = HashMap::from([(
+            named_candidate.node(),
+            Version::parse("1.5.0").expect("floor version is valid"),
+        )]);
+        let selection = select(&root_contract, &contracts, &floors, &HashMap::new())
+            .expect("MVS selection visits both same-line candidates");
+        assert!(selection.is_complete());
+        assert_eq!(selection.read_contracts().len(), 2);
+
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(root_file, root_source.as_bytes())
+                        .expect("root manifest decodes"),
+                ),
+                "sai.package",
+                Some("acme:app@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(named_file, named_source.as_bytes())
+                        .expect("named manifest decodes"),
+                ),
+                "dep:acme:a@1.0.0/sai.package",
+                Some("acme:a@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(floor_file, floor_source.as_bytes())
+                        .expect("floor manifest decodes"),
+                ),
+                "dep:acme:a@1.5.0/sai.package",
+                Some("acme:a@1.5.0".to_owned()),
+                Some(1),
+            ),
+        ])
+        .expect("candidate manifests have distinct snapshot IDs");
+
+        let diagnostics = database
+            .mvs_graph_diagnostics(
+                &snapshot,
+                &selection,
+                root_file,
+                &BTreeMap::from([(named_candidate, named_file), (floor_candidate, floor_file)]),
+                None,
+                false,
+            )
+            .expect("same-line candidate manifests map independently");
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn mvs_diagnostic_chains_resolve_unselected_candidate_manifests() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let root_version = MvsPackageVersion::new(
+            "acme:app",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package is valid");
+        let root_package_id = database
+            .intern_package("acme:app#1")
+            .expect("root package is interned");
+        let root_file = database
+            .intern_package_file(
+                root_package_id,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("root manifest is interned");
+
+        let root_source = "package acme:app @ 1.0.0\nrequires {\n    acme:a @ ^1\n    acme:c @ ^1\n    acme:lib @ ^1\n}\n";
+        let manifest = |package: &str, version: &str, requirements: &[(&str, &str, &str)]| {
+            let mut source = format!("package {package} @ {version}\n");
+            if !requirements.is_empty() {
+                source.push_str("requires {\n");
+                for (target, requirement, _) in requirements {
+                    source.push_str(&format!("    {target} @ {requirement}\n"));
+                }
+                source.push_str("}\n");
+            }
+            source
+        };
+        let root_requirements = [
+            ("acme:a", "^1", "1.0.0"),
+            ("acme:c", "^1", "1.0.0"),
+            ("acme:lib", "^1", "1.0.0"),
+        ];
+        let root_contract = MvsContract::new(
+            root_version,
+            root_requirements
+                .iter()
+                .map(|(target, requirement, named_version)| {
+                    let text = format!("{target} @ {requirement}");
+                    let start = root_source.find(&text).expect("root requirement exists");
+                    MvsEdge::new(
+                        *target,
+                        VersionReq::parse(requirement).expect("requirement is valid"),
+                        Version::parse(named_version).expect("named version is valid"),
+                        start..start + text.len(),
+                    )
+                    .expect("root edge is valid")
+                })
+                .collect(),
+        )
+        .expect("root contract is valid");
+
+        let dependency_specs = [
+            ("acme:a", "1.0.0", vec![("acme:b", "^1", "1.0.0")]),
+            ("acme:b", "1.0.0", vec![("acme:lib", "^2", "2.0.0")]),
+            ("acme:b", "1.4.0", vec![]),
+            (
+                "acme:c",
+                "1.0.0",
+                vec![("acme:b", ">=1.4", "1.4.0"), ("acme:d", "^1", "1.0.0")],
+            ),
+            ("acme:d", "1.0.0", vec![("acme:e", "^1", "1.0.0")]),
+            ("acme:e", "1.0.0", vec![("acme:lib", "^2", "2.0.0")]),
+            ("acme:lib", "1.0.0", vec![]),
+            ("acme:lib", "2.0.0", vec![]),
+        ];
+        let mut contracts = HashMap::new();
+        let mut manifest_files = BTreeMap::new();
+        let mut snapshot_files = vec![SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(root_file, root_source.as_bytes())
+                    .expect("root manifest decodes"),
+            ),
+            "sai.package",
+            Some("acme:app@1.0.0".to_owned()),
+            Some(1),
+        )];
+
+        for (index, (package, version, requirements)) in dependency_specs.into_iter().enumerate() {
+            let package_version = MvsPackageVersion::new(
+                package,
+                Version::parse(version).expect("dependency version is valid"),
+            )
+            .expect("dependency package is valid");
+            let source = manifest(package, version, &requirements);
+            let edges = requirements
+                .iter()
+                .map(|(target, requirement, named_version)| {
+                    let text = format!("{target} @ {requirement}");
+                    let start = source.find(&text).expect("dependency requirement exists");
+                    MvsEdge::new(
+                        *target,
+                        VersionReq::parse(requirement).expect("requirement is valid"),
+                        Version::parse(named_version).expect("named version is valid"),
+                        start..start + text.len(),
+                    )
+                    .expect("dependency edge is valid")
+                })
+                .collect();
+            let contract = MvsContract::new(package_version.clone(), edges)
+                .expect("dependency contract is valid");
+            let file_id = FileId::new(20_001 + index as u32);
+            contracts.insert(package_version.clone(), contract);
+            manifest_files.insert(package_version.clone(), file_id);
+            snapshot_files.push(SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(file_id, source.as_bytes())
+                        .expect("dependency manifest decodes"),
+                ),
+                format!("dep:{package}@{version}/sai.package"),
+                Some(format!("{package}@{version}")),
+                Some(index as u64 + 2),
+            ));
+        }
+        let selection = select(&root_contract, &contracts, &HashMap::new(), &HashMap::new())
+            .expect("MVS selection succeeds");
+        assert!(selection.is_complete());
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("all manifests share one snapshot");
+
+        let diagnostics = database
+            .mvs_graph_diagnostics(
+                &snapshot,
+                &selection,
+                root_file,
+                &manifest_files,
+                None,
+                false,
+            )
+            .expect("driver maps candidate manifests into diagnostics");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_str() == "DUPLICATE_PACKAGE_LINE")
+            .expect("the selected graph has duplicate lib lines");
+        let sai_diagnostics::Value::Array(lines) = diagnostic
+            .data
+            .get("lines")
+            .expect("duplicate lines are recorded")
+        else {
+            panic!("duplicate line data is an array");
+        };
+        let sai_diagnostics::Value::Object(lib_v2) = lines
+            .iter()
+            .find(|line| {
+                matches!(
+                    line,
+                    sai_diagnostics::Value::Object(fields)
+                        if fields.get("version")
+                            == Some(&sai_diagnostics::Value::String("2.0.0".to_owned()))
+                )
+            })
+            .expect("second lib line is present")
+        else {
+            panic!("duplicate line entry is an object");
+        };
+        let sai_diagnostics::Value::Array(chain) =
+            lib_v2.get("chain").expect("line provenance is recorded")
+        else {
+            panic!("line provenance is an array");
+        };
+        let b_candidate_link = chain
+            .iter()
+            .find_map(|link| {
+                let sai_diagnostics::Value::Object(fields) = link else {
+                    return None;
+                };
+                (fields.get("requirer")
+                    == Some(&sai_diagnostics::Value::String("acme:b".to_owned()))
+                    && fields.get("requirer_version")
+                        == Some(&sai_diagnostics::Value::String("1.0.0".to_owned())))
+                .then_some(fields)
+            })
+            .expect("the shortest provenance chain uses the unselected b candidate");
+        assert_eq!(
+            b_candidate_link.get("requirer_selected"),
+            Some(&sai_diagnostics::Value::Bool(false))
+        );
+        let sai_diagnostics::Value::Object(location) = b_candidate_link
+            .get("location")
+            .expect("candidate requirement has a source location")
+        else {
+            panic!("candidate source location is an object");
+        };
+        assert_eq!(
+            location.get("path"),
+            Some(&sai_diagnostics::Value::String(
+                "dep:acme:b@1.0.0/sai.package".to_owned()
+            ))
+        );
+        assert_eq!(
+            location.get("snapshot"),
+            Some(&sai_diagnostics::Value::Integer(3))
+        );
     }
 
     #[test]
