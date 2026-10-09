@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::unicode_casefold_16::FULL_CASE_FOLD;
+use crate::unicode_data_16::{DEFAULT_IGNORABLE_RANGES, FULL_CASE_FOLD};
 
 /// Whether the tree is a package source tree or a separately declared WIT tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,13 @@ pub struct TreeHashWarning {
     pub kind: TreeHashWarningKind,
     /// The original Git path bytes.
     pub path: Vec<u8>,
+}
+
+impl TreeHashWarning {
+    /// Return a terminal-safe, unambiguous rendering of the raw Git path.
+    pub fn display_path(&self) -> String {
+        diagnostic_path(&self.path)
+    }
 }
 
 /// Kind of non-fatal entry excluded from a tree checksum.
@@ -388,13 +395,21 @@ fn append_escaped_text(rendered: &mut String, text: &str) {
         match character {
             '\\' => rendered.push_str("\\\\"),
             '`' => rendered.push_str("\\`"),
-            _ if matches!(
-                get_general_category(character),
-                GeneralCategory::Control
-                    | GeneralCategory::Format
-                    | GeneralCategory::LineSeparator
-                    | GeneralCategory::ParagraphSeparator
-            ) =>
+            _ if character.is_whitespace()
+                || matches!(
+                    get_general_category(character),
+                    GeneralCategory::Control
+                        | GeneralCategory::EnclosingMark
+                        | GeneralCategory::Format
+                        | GeneralCategory::LineSeparator
+                        | GeneralCategory::NonspacingMark
+                        | GeneralCategory::ParagraphSeparator
+                        | GeneralCategory::SpaceSeparator
+                        | GeneralCategory::SpacingMark
+                )
+                || DEFAULT_IGNORABLE_RANGES
+                    .iter()
+                    .any(|(start, end)| (*start..=*end).contains(&(character as u32))) =>
             {
                 write!(rendered, "\\u{{{:x}}}", character as u32)
                     .expect("writing to a String cannot fail");
@@ -707,6 +722,42 @@ mod tests {
             assert!(!rendered.contains('\u{202e}'));
             assert!(!rendered.as_bytes().contains(&0xff));
         }
+    }
+
+    #[test]
+    fn warning_paths_have_a_terminal_safe_display() {
+        let result = hash_git_tree(
+            [
+                GitTreeEntry::Symlink {
+                    path: b"link\x1b]52;c;payload",
+                },
+                GitTreeEntry::Symlink { path: b"link" },
+                GitTreeEntry::Symlink { path: b"link " },
+                GitTreeEntry::Symlink {
+                    path: "a\u{034f}".as_bytes(),
+                },
+                GitTreeEntry::Symlink {
+                    path: "\u{115f}x".as_bytes(),
+                },
+            ],
+            TreeHashPurpose::Source,
+        )
+        .unwrap();
+        let display_for = |path: &[u8]| {
+            result
+                .warnings
+                .iter()
+                .find(|warning| warning.path == path)
+                .unwrap()
+                .display_path()
+        };
+        assert_eq!(display_for(b"link"), "link");
+        assert_eq!(display_for(b"link "), "link\\u{20}");
+        assert_eq!(display_for("a\u{034f}".as_bytes()), "a\\u{34f}");
+        assert_eq!(display_for("\u{115f}x".as_bytes()), "\\u{115f}x");
+        let rendered = display_for(b"link\x1b]52;c;payload");
+        assert_eq!(rendered, "link\\u{1b}]52;c;payload");
+        assert!(!rendered.as_bytes().contains(&0x1b));
     }
 
     #[test]
