@@ -216,7 +216,8 @@ pub fn hash_git_tree<'a>(
 
     files.sort_by_key(|(path, _)| *path);
     warnings.sort_by(|left, right| left.path.cmp(&right.path));
-    reject_casefold_collisions(&files)?;
+    let paths = files.iter().map(|(path, _)| *path).collect::<Vec<_>>();
+    reject_tree_path_collisions(&paths)?;
 
     let mut tree_hasher = Sha256::new();
     for (path, content) in files {
@@ -319,7 +320,13 @@ fn is_reserved_device_name(component: &str) -> bool {
         })
 }
 
-fn reject_casefold_collisions(files: &[(&[u8], &[u8])]) -> Result<(), TreeHashError> {
+pub(crate) fn reject_tree_path_collisions(paths: &[&[u8]]) -> Result<(), TreeHashError> {
+    let mut sorted_paths = paths.to_vec();
+    sorted_paths.sort_unstable();
+    reject_casefold_collisions(&sorted_paths)
+}
+
+fn reject_casefold_collisions(paths: &[&[u8]]) -> Result<(), TreeHashError> {
     struct FoldedPath<'a> {
         node_id: usize,
         raw_component: &'a [u8],
@@ -329,7 +336,7 @@ fn reject_casefold_collisions(files: &[(&[u8], &[u8])]) -> Result<(), TreeHashEr
 
     let mut folded_paths = BTreeMap::<(usize, String), FoldedPath<'_>>::new();
     let mut next_node_id = 1;
-    for (path, _) in files {
+    for path in paths {
         let text = std::str::from_utf8(path)
             .expect("file paths were validated before collision detection");
         let mut parent_id = 0;

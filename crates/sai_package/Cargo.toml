@@ -6,14 +6,20 @@ rust-version.workspace = true
 
 [dependencies]
 sai_diagnostics = { path = "../sai_diagnostics" }
+cap-std = "=4.0.3"
 libc.workspace = true
 gix.workspace = true
 gix-transport.workspace = true
 rustix.workspace = true
 sha2.workspace = true
+same-file = "=1.0.6"
+sai_windows_fs = { path = "../sai_windows_fs" }
 spdx.workspace = true
 unicode-general-category.workspace = true
 unicode-normalization.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 gix-pack.workspace = true

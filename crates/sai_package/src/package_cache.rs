@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Read, Write};
@@ -10,14 +10,19 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir as CapabilityDir, Permissions as CapabilityPermissions};
+use same_file::Handle as SameFileHandle;
 use sha2::{Digest, Sha256};
 
 use crate::git_tree::{
-    GitPackageFile, GitPackageSourceTree, MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_COUNT,
-    MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES,
+    GitPackageFile, GitPackageSourceTree, MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_BYTES,
+    MAX_PACKAGE_FILE_COUNT, MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES,
 };
 use crate::lock_validation::canonical_git_url;
+use crate::manifest::MAX_PACKAGE_MANIFEST_BYTES;
 use crate::package_path::ContentPackagePath;
+use crate::tree_hash::{reject_tree_path_collisions, should_skip_path, validate_tree_path};
 
 const CACHE_LAYOUT_VERSION: &str = "v1";
 const SOURCE_CHECKSUM_PREFIX: &str = "sai1:";
@@ -30,6 +35,10 @@ const RECORD_DIGEST_BYTES: usize = 32;
 const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 #[cfg(windows)]
 const WINDOWS_ERROR_SHARING_VIOLATION: i32 = 32;
+#[cfg(windows)]
+const CACHE_ENTRY_REMOVE_RETRY_LIMIT: usize = 500;
+#[cfg(windows)]
+const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 static NEXT_TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -422,7 +431,7 @@ impl PackageCache {
         let digest = source_digest(&checksum)?;
         let target = self.source_directory.join(digest);
         self.cleanup_stale_temporary_directories();
-        if path_exists_without_following(&target)? && cached_source_matches(&target, &files) {
+        if path_exists_without_following(&target)? && cached_source_matches(&target, &checksum)? {
             return Ok(CachedPackageSource {
                 checksum,
                 path: target,
@@ -439,7 +448,7 @@ impl PackageCache {
         prepare_source_directory_rename(staging.path())?;
 
         let _lock = CachePublicationLock::acquire(&self.lock_path)?;
-        if path_exists_without_following(&target)? && cached_source_matches(&target, &files) {
+        if path_exists_without_following(&target)? && cached_source_matches(&target, &checksum)? {
             return Ok(CachedPackageSource {
                 checksum,
                 path: target,
@@ -452,7 +461,8 @@ impl PackageCache {
         }
 
         if let Err(source) = fs::rename(staging.path(), &target) {
-            if path_exists_without_following(&target)? && cached_source_matches(&target, &files) {
+            if path_exists_without_following(&target)? && cached_source_matches(&target, &checksum)?
+            {
                 return Ok(CachedPackageSource {
                     checksum,
                     path: target,
@@ -466,8 +476,7 @@ impl PackageCache {
             });
         }
         if let Err(error) = seal_published_source_directory(&target) {
-            make_tree_removable(&target);
-            let _ = fs::remove_dir_all(&target);
+            let _ = remove_tree_at_path(&target);
             return Err(error);
         }
         staging.mark_published();
@@ -477,6 +486,92 @@ impl PackageCache {
             path: target,
             disposition: CacheDisposition::Installed,
         })
+    }
+
+    /// Re-hash and validate one content-addressed source directory.
+    ///
+    /// This is intended for `sai fetch`, which verifies every locked source.
+    /// Other commands should use their locked cache path without re-hashing.
+    /// A corrupt result includes the computed checksum when the tree could be
+    /// hashed; `None` means its structure or paths prevented hashing.
+    pub fn verify_source(
+        &self,
+        checksum: &str,
+    ) -> Result<CachedSourceVerification, PackageCacheError> {
+        let digest = source_digest(checksum)?;
+        self.ensure_source_cache_directories()?;
+        let target = self.source_directory.join(digest);
+        match inspect_cached_source(&target)? {
+            SourceTreeInspection::Missing => Ok(CachedSourceVerification::Missing),
+            SourceTreeInspection::Corrupt { actual_checksum } => {
+                Ok(CachedSourceVerification::Corrupt {
+                    expected_checksum: checksum.into(),
+                    actual_checksum: actual_checksum.map(Into::into),
+                })
+            }
+            SourceTreeInspection::Hashed {
+                actual_checksum,
+                immutable,
+            } if immutable && actual_checksum == checksum => {
+                Ok(CachedSourceVerification::Verified(CachedPackageSource {
+                    checksum: checksum.into(),
+                    path: target,
+                    disposition: CacheDisposition::AlreadyPresent,
+                }))
+            }
+            SourceTreeInspection::Hashed {
+                actual_checksum, ..
+            } => Ok(CachedSourceVerification::Corrupt {
+                expected_checksum: checksum.into(),
+                actual_checksum: Some(actual_checksum.into()),
+            }),
+        }
+    }
+
+    /// Remove a source entry only when a fresh locked scan confirms corruption.
+    ///
+    /// The global cache lock is held for the scan and removal so a concurrent
+    /// materializer cannot publish a valid replacement that gets removed.
+    pub fn remove_corrupt_source(
+        &self,
+        checksum: &str,
+    ) -> Result<SourceCacheRemoval, PackageCacheError> {
+        let digest = source_digest(checksum)?;
+        self.ensure_source_cache_directories()?;
+        let _lock = CachePublicationLock::acquire(&self.lock_path)?;
+        let target = self.source_directory.join(digest);
+        match inspect_cached_source(&target)? {
+            SourceTreeInspection::Missing => Ok(SourceCacheRemoval::Missing),
+            SourceTreeInspection::Hashed {
+                actual_checksum,
+                immutable: true,
+            } if actual_checksum == checksum => Ok(SourceCacheRemoval::Valid),
+            SourceTreeInspection::Corrupt { .. } | SourceTreeInspection::Hashed { .. } => {
+                remove_cache_entry(&target)?;
+                Ok(SourceCacheRemoval::Removed)
+            }
+        }
+    }
+
+    fn ensure_source_cache_directories(&self) -> Result<(), PackageCacheError> {
+        for path in [&self.versioned_root, &self.source_directory] {
+            let metadata = fs::symlink_metadata(path).map_err(|source| PackageCacheError::Io {
+                operation: "inspect package source cache directory",
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(PackageCacheError::Io {
+                    operation: "validate package source cache directory",
+                    path: path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cache layout entry is not a directory",
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Return the content-addressed path for a canonical source checksum.
@@ -548,8 +643,7 @@ impl PackageCache {
                 {
                     continue;
                 }
-                make_tree_removable(&path);
-                let removed = fs::remove_dir_all(&path).is_ok();
+                let removed = remove_tree_at_path(&path);
                 release_staging_activity_lock(&activity_path, activity_lock, removed);
                 continue;
             }
@@ -609,6 +703,34 @@ pub enum CacheDisposition {
     Installed,
     /// A directory with this content address already existed.
     AlreadyPresent,
+}
+
+/// Result of re-hashing one source cache entry.
+#[derive(Debug, Eq, PartialEq)]
+pub enum CachedSourceVerification {
+    /// No entry exists at the requested checksum.
+    Missing,
+    /// The immutable tree matched the requested checksum and cache shape.
+    Verified(CachedPackageSource),
+    /// The entry failed validation; a checksum is present when its contents
+    /// could still be hashed.
+    Corrupt {
+        /// The checksum used to locate the entry.
+        expected_checksum: Box<str>,
+        /// The checksum computed from its current regular files, if hashable.
+        actual_checksum: Option<Box<str>>,
+    },
+}
+
+/// Outcome after rechecking a source entry before removing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceCacheRemoval {
+    /// No entry existed at the requested checksum.
+    Missing,
+    /// The entry still matched its checksum and immutable cache shape.
+    Valid,
+    /// The corrupt entry was removed.
+    Removed,
 }
 
 fn source_digest(checksum: &str) -> Result<&str, PackageCacheError> {
@@ -1352,115 +1474,735 @@ fn path_exists_without_following(path: &Path) -> Result<bool, PackageCacheError>
     }
 }
 
-struct CachedFileEntry {
+struct CachedHashFileEntry {
     relative_path: String,
     absolute_path: PathBuf,
+    parent_directory: CapabilityDir,
+    name: OsString,
+    file: File,
     size: u64,
+    read_only: bool,
 }
 
-fn cached_source_matches(root: &Path, expected_files: &[GitPackageFile]) -> bool {
-    let Ok(root_metadata) = fs::symlink_metadata(root) else {
-        return false;
+struct CachedHashDirectoryEntry {
+    parent_directory: CapabilityDir,
+    name: OsString,
+    directory: CapabilityDir,
+    relative_path: String,
+}
+
+enum CachedSourceRoot {
+    Missing,
+    Corrupt,
+    Opened {
+        source_directory: CapabilityDir,
+        root_name: OsString,
+        root_directory: CapabilityDir,
+    },
+}
+
+enum SourceTreeInspection {
+    Missing,
+    Corrupt {
+        actual_checksum: Option<String>,
+    },
+    Hashed {
+        actual_checksum: String,
+        immutable: bool,
+    },
+}
+
+fn inspect_cached_source(root: &Path) -> Result<SourceTreeInspection, PackageCacheError> {
+    let (source_directory, root_name, root_directory) = match open_cached_source_root(root)? {
+        CachedSourceRoot::Missing => return Ok(SourceTreeInspection::Missing),
+        CachedSourceRoot::Corrupt => {
+            return Ok(SourceTreeInspection::Corrupt {
+                actual_checksum: None,
+            });
+        }
+        CachedSourceRoot::Opened {
+            source_directory,
+            root_name,
+            root_directory,
+        } => (source_directory, root_name, root_directory),
     };
+    let root_metadata =
+        capability_directory_metadata(&root_directory).map_err(|source| PackageCacheError::Io {
+            operation: "inspect opened cached package source",
+            path: root.to_path_buf(),
+            source,
+        })?;
     if !root_metadata.is_dir()
-        || root_metadata.file_type().is_symlink()
-        || !is_read_only_directory(&root_metadata)
+        || !cached_directory_entry_matches(&source_directory, &root_name, &root_directory)?
     {
-        return false;
+        return Ok(SourceTreeInspection::Corrupt {
+            actual_checksum: None,
+        });
     }
 
+    let mut immutable = is_read_only_directory(&root_metadata);
     let mut files = Vec::new();
     let mut directories = BTreeSet::new();
-    let mut pending = vec![(root.to_path_buf(), String::new())];
+    let mut pending = vec![(root_directory, root_name, source_directory, String::new())];
+    let mut directory_entries = Vec::new();
     let mut entry_count = 0u64;
     let mut path_bytes = 0u64;
     let mut content_bytes = 0u64;
+    let mut saw_manifest = false;
 
-    while let Some((directory, parent_relative_path)) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            return false;
+    while let Some((directory, directory_name, parent_directory, parent_relative_path)) =
+        pending.pop()
+    {
+        let directory_metadata =
+            capability_directory_metadata(&directory).map_err(|source| PackageCacheError::Io {
+                operation: "inspect opened cached package source directory",
+                path: root.join(&parent_relative_path),
+                source,
+            })?;
+        if !directory_metadata.is_dir() || !is_traversable_directory(&directory_metadata) {
+            return Ok(SourceTreeInspection::Corrupt {
+                actual_checksum: None,
+            });
+        }
+        let entries = match directory.entries() {
+            Ok(entries) => entries,
+            Err(source) if cached_entry_error_is_corruption(&source) => {
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
+            }
+            Err(source) => {
+                return Err(PackageCacheError::Io {
+                    operation: "read cached package source directory",
+                    path: root.join(&parent_relative_path),
+                    source,
+                });
+            }
         };
         for entry in entries {
-            let Ok(entry) = entry else {
-                return false;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) if cached_entry_error_is_corruption(&source) => {
+                    return Ok(SourceTreeInspection::Corrupt {
+                        actual_checksum: None,
+                    });
+                }
+                Err(source) => {
+                    return Err(PackageCacheError::Io {
+                        operation: "read cached package source entry",
+                        path: root.join(&parent_relative_path),
+                        source,
+                    });
+                }
             };
             entry_count = entry_count.saturating_add(1);
             if entry_count > MAX_PACKAGE_TREE_ENTRIES {
-                return false;
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
             }
 
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                return false;
+            let name = entry.file_name();
+            let Some(name_string) = name.to_str().map(str::to_owned) else {
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
             };
             let relative_path = if parent_relative_path.is_empty() {
-                name
+                name_string
             } else {
-                format!("{parent_relative_path}/{name}")
+                format!("{parent_relative_path}/{name_string}")
             };
             path_bytes = path_bytes.saturating_add(relative_path.len() as u64);
             if path_bytes > MAX_PACKAGE_TREE_PATH_BYTES
                 || safe_relative_path(&relative_path).is_err()
+                || validate_tree_path(relative_path.as_bytes()).is_err()
+                || should_skip_path(
+                    relative_path.as_bytes(),
+                    crate::tree_hash::TreeHashPurpose::Source,
+                )
             {
-                return false;
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
             }
 
-            let path = entry.path();
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                return false;
-            };
-            if metadata.file_type().is_symlink() {
-                return false;
-            }
-            if metadata.is_dir() {
-                if !is_read_only_directory(&metadata) {
-                    return false;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(source) if cached_entry_error_is_corruption(&source) => {
+                    return Ok(SourceTreeInspection::Corrupt {
+                        actual_checksum: None,
+                    });
                 }
+                Err(source) => {
+                    return Err(PackageCacheError::Io {
+                        operation: "inspect cached package source entry type",
+                        path: root.join(&relative_path),
+                        source,
+                    });
+                }
+            };
+            if file_type.is_symlink() {
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
+            }
+
+            if file_type.is_dir() {
+                let child_directory = match entry.open_dir() {
+                    Ok(directory) => directory,
+                    Err(source) if cached_entry_error_is_corruption(&source) => {
+                        return Ok(SourceTreeInspection::Corrupt {
+                            actual_checksum: None,
+                        });
+                    }
+                    Err(source) => {
+                        return Err(PackageCacheError::Io {
+                            operation: "open cached package source directory",
+                            path: root.join(&relative_path),
+                            source,
+                        });
+                    }
+                };
+                let child_metadata =
+                    capability_directory_metadata(&child_directory).map_err(|source| {
+                        PackageCacheError::Io {
+                            operation: "inspect opened cached package source directory",
+                            path: root.join(&relative_path),
+                            source,
+                        }
+                    })?;
+                if !child_metadata.is_dir()
+                    || !cached_directory_entry_matches(&directory, &name, &child_directory)?
+                {
+                    return Ok(SourceTreeInspection::Corrupt {
+                        actual_checksum: None,
+                    });
+                }
+                immutable &= is_read_only_directory(&child_metadata);
                 directories.insert(relative_path.clone());
-                pending.push((path, relative_path));
+                let parent_clone = CapabilityDir::reopen_dir(&directory).map_err(|source| {
+                    PackageCacheError::Io {
+                        operation: "retain cached package source directory handle",
+                        path: root.join(&relative_path),
+                        source,
+                    }
+                })?;
+                pending.push((child_directory, name, parent_clone, relative_path));
                 continue;
             }
+            if !file_type.is_file() || files.len() as u64 >= MAX_PACKAGE_FILE_COUNT {
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
+            }
+            let file = match open_cached_source_file(&directory, &name) {
+                Ok(file) => file,
+                Err(source) if cached_entry_error_is_corruption(&source) => {
+                    return Ok(SourceTreeInspection::Corrupt {
+                        actual_checksum: None,
+                    });
+                }
+                Err(source) => {
+                    return Err(PackageCacheError::Io {
+                        operation: "open cached package source file",
+                        path: root.join(&relative_path),
+                        source,
+                    });
+                }
+            };
+            let metadata = file.metadata().map_err(|source| PackageCacheError::Io {
+                operation: "inspect opened cached package source file",
+                path: root.join(&relative_path),
+                source,
+            })?;
             if !metadata.is_file()
-                || !is_read_only_file(&metadata)
+                || !cached_file_entry_matches(&directory, &name, &file)?
                 || files.len() as u64 >= MAX_PACKAGE_FILE_COUNT
             {
-                return false;
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
+            }
+            if metadata.len() > MAX_PACKAGE_FILE_BYTES {
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
             }
             content_bytes = content_bytes.saturating_add(metadata.len());
             if content_bytes > MAX_PACKAGE_CONTENT_BYTES {
-                return false;
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
             }
-            files.push(CachedFileEntry {
+            if relative_path == "sai.package" {
+                saw_manifest = true;
+                if metadata.len() > MAX_PACKAGE_MANIFEST_BYTES as u64 {
+                    return Ok(SourceTreeInspection::Corrupt {
+                        actual_checksum: None,
+                    });
+                }
+            }
+            let read_only = is_read_only_file(Some(&file), &metadata);
+            immutable &= read_only;
+            files.push(CachedHashFileEntry {
+                absolute_path: root.join(&relative_path),
+                parent_directory: CapabilityDir::reopen_dir(&directory).map_err(|source| {
+                    PackageCacheError::Io {
+                        operation: "retain cached package source directory handle",
+                        path: root.join(&relative_path),
+                        source,
+                    }
+                })?,
                 relative_path,
-                absolute_path: path,
+                name,
+                file,
                 size: metadata.len(),
+                read_only,
             });
         }
+        directory_entries.push(CachedHashDirectoryEntry {
+            parent_directory,
+            name: directory_name,
+            directory,
+            relative_path: parent_relative_path,
+        });
     }
 
-    if files.len() != expected_files.len() {
-        return false;
+    if !saw_manifest {
+        return Ok(SourceTreeInspection::Corrupt {
+            actual_checksum: None,
+        });
     }
     files.sort_by(|left, right| {
         left.relative_path
             .as_bytes()
             .cmp(right.relative_path.as_bytes())
     });
-
     let mut expected_directories = BTreeSet::new();
-    for source_file in expected_files {
-        for (separator, _) in source_file.path().match_indices('/') {
-            expected_directories.insert(source_file.path()[..separator].to_owned());
+    for file in &files {
+        for (separator, _) in file.relative_path.match_indices('/') {
+            expected_directories.insert(file.relative_path[..separator].to_owned());
         }
     }
-    if directories != expected_directories {
-        return false;
+    immutable &= directories == expected_directories;
+
+    let paths = files
+        .iter()
+        .map(|file| file.relative_path.as_bytes())
+        .collect::<Vec<_>>();
+    if reject_tree_path_collisions(&paths).is_err() {
+        return Ok(SourceTreeInspection::Corrupt {
+            actual_checksum: None,
+        });
     }
 
-    files.iter().zip(expected_files).all(|(cached, expected)| {
-        cached.relative_path == expected.path()
-            && cached.size == expected.content().len() as u64
-            && cached_file_matches_content(&cached.absolute_path, expected.content())
+    for entry in &directory_entries {
+        if !cached_directory_entry_matches(&entry.parent_directory, &entry.name, &entry.directory)?
+        {
+            return Ok(SourceTreeInspection::Corrupt {
+                actual_checksum: None,
+            });
+        }
+        let metadata = capability_directory_metadata(&entry.directory).map_err(|source| {
+            PackageCacheError::Io {
+                operation: "recheck cached package source directory permissions",
+                path: root.join(&entry.relative_path),
+                source,
+            }
+        })?;
+        immutable &= is_read_only_directory(&metadata);
+    }
+
+    let mut tree_hasher = Sha256::new();
+    for file in &files {
+        let Some((content_digest, file_immutable)) = hash_cached_source_file(file)? else {
+            return Ok(SourceTreeInspection::Corrupt {
+                actual_checksum: None,
+            });
+        };
+        immutable &= file_immutable && file.read_only;
+        tree_hasher.update(lowercase_hex(&content_digest).as_bytes());
+        tree_hasher.update(b"  ");
+        tree_hasher.update(file.relative_path.as_bytes());
+        tree_hasher.update(b"\n");
+    }
+    let actual_checksum = format!("sai1:{}", lowercase_hex(&tree_hasher.finalize()));
+    Ok(SourceTreeInspection::Hashed {
+        actual_checksum,
+        immutable,
     })
+}
+
+fn open_cached_source_root(root: &Path) -> Result<CachedSourceRoot, PackageCacheError> {
+    let (source_directory, root_name) = open_cached_source_parent(root)?;
+    let metadata = match source_directory.symlink_metadata(&root_name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CachedSourceRoot::Missing);
+        }
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "inspect cached package source entry",
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(CachedSourceRoot::Corrupt);
+    }
+    let root_directory = match source_directory.open_dir(&root_name) {
+        Ok(directory) => directory,
+        Err(source) if cached_entry_error_is_corruption(&source) => {
+            return Ok(CachedSourceRoot::Corrupt);
+        }
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "open cached package source directory",
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !cached_directory_entry_matches(&source_directory, &root_name, &root_directory)? {
+        return Ok(CachedSourceRoot::Corrupt);
+    }
+    Ok(CachedSourceRoot::Opened {
+        source_directory,
+        root_name,
+        root_directory,
+    })
+}
+
+fn open_cached_source_parent(root: &Path) -> Result<(CapabilityDir, OsString), PackageCacheError> {
+    let Some(source_directory_path) = root.parent() else {
+        return Err(invalid_cached_source_path(root));
+    };
+    let Some(versioned_root_path) = source_directory_path.parent() else {
+        return Err(invalid_cached_source_path(root));
+    };
+    let Some(cache_root_path) = versioned_root_path.parent() else {
+        return Err(invalid_cached_source_path(root));
+    };
+    if source_directory_path.file_name() != Some(OsStr::new("src"))
+        || versioned_root_path.file_name() != Some(OsStr::new(CACHE_LAYOUT_VERSION))
+    {
+        return Err(invalid_cached_source_path(root));
+    }
+
+    let cache_root = CapabilityDir::open_ambient_dir(cache_root_path, ambient_authority())
+        .map_err(|source| PackageCacheError::Io {
+            operation: "open package source cache root",
+            path: cache_root_path.to_path_buf(),
+            source,
+        })?;
+    let versioned_root = open_cache_layout_directory(
+        &cache_root,
+        OsStr::new(CACHE_LAYOUT_VERSION),
+        versioned_root_path,
+    )?;
+    let source_directory =
+        open_cache_layout_directory(&versioned_root, OsStr::new("src"), source_directory_path)?;
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| invalid_cached_source_path(root))?
+        .to_os_string();
+
+    Ok((source_directory, root_name))
+}
+
+fn invalid_cached_source_path(path: &Path) -> PackageCacheError {
+    PackageCacheError::InvalidSourceChecksum(path.display().to_string().into())
+}
+
+fn open_cache_layout_directory(
+    parent: &CapabilityDir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<CapabilityDir, PackageCacheError> {
+    let metadata = parent
+        .symlink_metadata(name)
+        .map_err(|source| PackageCacheError::Io {
+            operation: "inspect package source cache directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(PackageCacheError::Io {
+            operation: "validate package source cache directory",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache layout entry is not a directory",
+            ),
+        });
+    }
+    let directory = parent
+        .open_dir(name)
+        .map_err(|source| PackageCacheError::Io {
+            operation: "open package source cache directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !directory
+        .dir_metadata()
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Err(PackageCacheError::Io {
+            operation: "validate opened package source cache directory",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache layout entry is not a directory",
+            ),
+        });
+    }
+    if !cached_directory_entry_matches(parent, name, &directory)? {
+        return Err(PackageCacheError::Io {
+            operation: "recheck package source cache directory",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache layout entry changed while opening",
+            ),
+        });
+    }
+    Ok(directory)
+}
+
+fn hash_cached_source_file(
+    cached: &CachedHashFileEntry,
+) -> Result<Option<([u8; 32], bool)>, PackageCacheError> {
+    let opened_metadata = cached
+        .file
+        .metadata()
+        .map_err(|source| PackageCacheError::Io {
+            operation: "inspect opened cached package source file",
+            path: cached.absolute_path.clone(),
+            source,
+        })?;
+    if !opened_metadata.is_file()
+        || opened_metadata.len() != cached.size
+        || opened_metadata.len() > MAX_PACKAGE_FILE_BYTES
+        || !cached_file_entry_matches(&cached.parent_directory, &cached.name, &cached.file)?
+    {
+        return Ok(None);
+    }
+
+    let mut file = cached
+        .file
+        .try_clone()
+        .map_err(|source| PackageCacheError::Io {
+            operation: "clone cached package source file handle",
+            path: cached.absolute_path.clone(),
+            source,
+        })?;
+    let mut content_hasher = Sha256::new();
+    let mut bytes_read = 0u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|source| PackageCacheError::Io {
+                operation: "read cached package source file",
+                path: cached.absolute_path.clone(),
+                source,
+            })?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(count as u64);
+        if bytes_read > cached.size || bytes_read > MAX_PACKAGE_FILE_BYTES {
+            return Ok(None);
+        }
+        content_hasher.update(&buffer[..count]);
+    }
+    let final_metadata = cached
+        .file
+        .metadata()
+        .map_err(|source| PackageCacheError::Io {
+            operation: "recheck opened package source file",
+            path: cached.absolute_path.clone(),
+            source,
+        })?;
+    if bytes_read != cached.size
+        || !cached_file_metadata_unchanged(&opened_metadata, &final_metadata)
+    {
+        return Ok(None);
+    }
+    if !cached_file_entry_matches(&cached.parent_directory, &cached.name, &cached.file)? {
+        return Ok(None);
+    }
+    let immutable = cached.read_only && is_read_only_file(Some(&cached.file), &final_metadata);
+    Ok(Some((content_hasher.finalize().into(), immutable)))
+}
+
+fn capability_directory_metadata(directory: &CapabilityDir) -> io::Result<fs::Metadata> {
+    CapabilityDir::reopen_dir(directory)?
+        .into_std_file()
+        .metadata()
+}
+
+fn cached_directory_entry_matches(
+    parent_directory: &CapabilityDir,
+    name: &OsStr,
+    directory: &CapabilityDir,
+) -> Result<bool, PackageCacheError> {
+    let metadata = match parent_directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(source) if cached_entry_error_is_corruption(&source) => return Ok(false),
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "recheck cached package source directory",
+                path: PathBuf::from(name),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
+    }
+    let current = match parent_directory.open_dir(name) {
+        Ok(directory) => directory,
+        Err(source) if cached_entry_error_is_corruption(&source) => return Ok(false),
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "reopen cached package source directory",
+                path: PathBuf::from(name),
+                source,
+            });
+        }
+    };
+    same_cached_directories(directory, &current).map_err(|source| PackageCacheError::Io {
+        operation: "compare cached package source directories",
+        path: PathBuf::from(name),
+        source,
+    })
+}
+
+fn cached_file_entry_matches(
+    parent_directory: &CapabilityDir,
+    name: &OsStr,
+    file: &File,
+) -> Result<bool, PackageCacheError> {
+    let metadata = match parent_directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(source) if cached_entry_error_is_corruption(&source) => return Ok(false),
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "inspect cached package source file entry",
+                path: PathBuf::from(name),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    let current = match open_cached_source_file(parent_directory, name) {
+        Ok(file) => file,
+        Err(source) if cached_entry_error_is_corruption(&source) => return Ok(false),
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "reopen cached package source file entry",
+                path: PathBuf::from(name),
+                source,
+            });
+        }
+    };
+    same_cached_file(file, &current).map_err(|source| PackageCacheError::Io {
+        operation: "compare cached package source files",
+        path: PathBuf::from(name),
+        source,
+    })
+}
+
+fn same_cached_file(first: &File, second: &File) -> io::Result<bool> {
+    let first = SameFileHandle::from_file(first.try_clone()?)?;
+    let second = SameFileHandle::from_file(second.try_clone()?)?;
+    Ok(first == second)
+}
+
+fn same_cached_directories(first: &CapabilityDir, second: &CapabilityDir) -> io::Result<bool> {
+    let first = CapabilityDir::reopen_dir(first)?.into_std_file();
+    let second = CapabilityDir::reopen_dir(second)?.into_std_file();
+    same_cached_file(&first, &second)
+}
+
+fn cached_file_metadata_unchanged(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    let unchanged = first.is_file()
+        && second.is_file()
+        && first.len() == second.len()
+        && first.modified().ok() == second.modified().ok()
+        && first.permissions().readonly() == second.permissions().readonly();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        unchanged && first.ctime() == second.ctime() && first.ctime_nsec() == second.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        unchanged
+    }
+}
+
+fn cached_entry_error_is_corruption(error: &io::Error) -> bool {
+    let common = matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::InvalidInput
+    );
+    #[cfg(unix)]
+    {
+        common || error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        common
+    }
+}
+
+fn is_windows_directory_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        let attributes = metadata.file_attributes();
+        attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn is_traversable_directory(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o500 == 0o500
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+fn cached_source_matches(root: &Path, expected_checksum: &str) -> Result<bool, PackageCacheError> {
+    Ok(matches!(
+        inspect_cached_source(root)?,
+        SourceTreeInspection::Hashed {
+            actual_checksum,
+            immutable: true,
+        } if actual_checksum == expected_checksum
+    ))
 }
 
 fn is_read_only_directory(metadata: &fs::Metadata) -> bool {
@@ -1475,60 +2217,406 @@ fn is_read_only_directory(metadata: &fs::Metadata) -> bool {
     }
 }
 
-fn is_read_only_file(metadata: &fs::Metadata) -> bool {
+fn is_read_only_file(file: Option<&File>, metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
+        let _ = file;
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode() & 0o777 == 0o444 && metadata.nlink() == 1
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        metadata.permissions().readonly() && is_single_link_file(file, metadata)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
         metadata.permissions().readonly()
     }
 }
 
-fn cached_file_matches_content(path: &Path, expected: &[u8]) -> bool {
-    let Ok(mut file) = File::open(path) else {
-        return false;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() || metadata.len() != expected.len() as u64 {
-        return false;
+fn open_cached_source_file(directory: &CapabilityDir, name: &OsStr) -> io::Result<File> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
     }
-
-    let mut buffer = [0; 16 * 1024];
-    for chunk in expected.chunks(buffer.len()) {
-        if file.read_exact(&mut buffer[..chunk.len()]).is_err() || buffer[..chunk.len()] != *chunk {
-            return false;
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        };
+        // Keep the opened snapshot stable against writes while allowing a
+        // corrupt entry to be renamed or removed by another cache operation.
+        // Open reparse points themselves so a replacement symlink cannot make
+        // this handle read or modify its target.
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+        options.custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = directory
+        .open_with(name, &options)
+        .map(|file| file.into_std())?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache entry is a Windows reparse point",
+            ));
         }
     }
-    let mut extra = [0];
-    matches!(file.read(&mut extra), Ok(0))
+    Ok(file)
 }
 
+#[cfg(windows)]
 fn remove_cache_entry(path: &Path) -> Result<(), PackageCacheError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| PackageCacheError::Io {
-        operation: "inspect inconsistent package cache entry",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        make_tree_removable(path);
-        fs::remove_dir_all(path)
-    } else {
-        if metadata.is_file() && is_single_link_file(&metadata) {
-            set_writable_path_permissions(path)?;
+    retry_cache_entry_removal(|| remove_cache_entry_once(path))
+}
+
+#[cfg(windows)]
+fn retry_cache_entry_removal(
+    mut remove_once: impl FnMut() -> Result<(), PackageCacheError>,
+) -> Result<(), PackageCacheError> {
+    let mut retries = 0;
+    loop {
+        match remove_once() {
+            Err(error) if cache_entry_removal_is_busy(&error) => {
+                if retries < CACHE_ENTRY_REMOVE_RETRY_LIMIT {
+                    retries += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                return Err(error);
+            }
+            result => return result,
         }
-        fs::remove_file(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_cache_entry(path: &Path) -> Result<(), PackageCacheError> {
+    remove_cache_entry_once(path)
+}
+
+fn remove_cache_entry_once(path: &Path) -> Result<(), PackageCacheError> {
+    let (parent_directory, name) = open_cached_source_parent(path)?;
+    let metadata = match parent_directory.symlink_metadata(&name) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "inspect inconsistent package cache entry",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        make_capability_tree_removable(&parent_directory, &name, path)?;
+        parent_directory.remove_dir_all(&name)
+    } else if is_windows_directory_reparse_point(&metadata) {
+        parent_directory.remove_dir(&name)
+    } else {
+        if metadata.is_file() {
+            let file = match open_cached_source_file(&parent_directory, &name) {
+                Ok(file) => Some(file),
+                Err(source) if cached_entry_error_is_corruption(&source) => None,
+                Err(source) => {
+                    return Err(PackageCacheError::Io {
+                        operation: "open inconsistent package cache file",
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            };
+            if let Some(file) = file {
+                let opened_metadata = file.metadata().map_err(|source| PackageCacheError::Io {
+                    operation: "inspect inconsistent package cache file",
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                if cached_file_entry_matches(&parent_directory, &name, &file)?
+                    && is_single_link_file(Some(&file), &opened_metadata)
+                {
+                    set_writable_file_handle(&file, &opened_metadata, path)?;
+                }
+            }
+        }
+        if metadata.is_dir() {
+            parent_directory.remove_dir(&name)
+        } else {
+            parent_directory.remove_file(&name)
+        }
     }
     .map_err(|source| PackageCacheError::Io {
         operation: "remove inconsistent package cache entry",
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(windows)]
+fn cache_entry_removal_is_busy(error: &PackageCacheError) -> bool {
+    matches!(
+        error,
+        PackageCacheError::Io { source, .. }
+            if matches!(
+                source.raw_os_error(),
+                Some(WINDOWS_ERROR_LOCK_VIOLATION)
+                    | Some(WINDOWS_ERROR_SHARING_VIOLATION)
+            )
+    )
+}
+
+fn make_capability_tree_removable(
+    parent_directory: &CapabilityDir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(), PackageCacheError> {
+    let metadata =
+        parent_directory
+            .symlink_metadata(name)
+            .map_err(|source| PackageCacheError::Io {
+                operation: "inspect inconsistent package cache directory",
+                path: path.to_path_buf(),
+                source,
+            })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    set_capability_directory_writable(parent_directory, name, &metadata, path)?;
+    let directory = parent_directory
+        .open_dir(name)
+        .map_err(|source| PackageCacheError::Io {
+            operation: "open inconsistent package cache directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    for entry in directory
+        .entries()
+        .map_err(|source| PackageCacheError::Io {
+            operation: "read inconsistent package cache directory",
+            path: path.to_path_buf(),
+            source,
+        })?
+    {
+        let entry = entry.map_err(|source| PackageCacheError::Io {
+            operation: "read inconsistent package cache entry",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let child_name = entry.file_name();
+        let child_path = path.join(&child_name);
+        let file_type = entry.file_type().map_err(|source| PackageCacheError::Io {
+            operation: "inspect inconsistent package cache entry type",
+            path: child_path.clone(),
+            source,
+        })?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            make_capability_tree_removable(&directory, &child_name, &child_path)?;
+            continue;
+        }
+        if file_type.is_file() {
+            let file = match open_cached_source_file(&directory, &child_name) {
+                Ok(file) => file,
+                Err(source) if cached_entry_error_is_corruption(&source) => continue,
+                Err(source) => {
+                    return Err(PackageCacheError::Io {
+                        operation: "open inconsistent package cache file",
+                        path: child_path.clone(),
+                        source,
+                    });
+                }
+            };
+            let metadata = file.metadata().map_err(|source| PackageCacheError::Io {
+                operation: "open inconsistent package cache file",
+                path: child_path.clone(),
+                source,
+            })?;
+            if cached_file_entry_matches(&directory, &child_name, &file)?
+                && is_single_link_file(Some(&file), &metadata)
+            {
+                set_writable_file_handle(&file, &metadata, &child_path)?;
+            }
+        }
+    }
+
+    let directory_file = CapabilityDir::reopen_dir(&directory)
+        .map_err(|source| PackageCacheError::Io {
+            operation: "retain inconsistent package cache directory handle",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .into_std_file();
+    let directory_metadata = directory_file
+        .metadata()
+        .map_err(|source| PackageCacheError::Io {
+            operation: "inspect inconsistent package cache directory permissions",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    set_writable_file_handle(&directory_file, &directory_metadata, path)
+}
+
+fn set_writable_file_handle(
+    file: &File,
+    metadata: &fs::Metadata,
+    path: &Path,
+) -> Result<(), PackageCacheError> {
+    let result = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+            file.set_permissions(fs::Permissions::from_mode(mode))
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            file.set_permissions(permissions)
+        }
+    };
+    result.map_err(|source| PackageCacheError::Io {
+        operation: "make inconsistent package cache entry removable",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn set_capability_directory_writable(
+    parent_directory: &CapabilityDir,
+    name: &OsStr,
+    metadata: &cap_std::fs::Metadata,
+    path: &Path,
+) -> Result<(), PackageCacheError> {
+    match parent_directory.set_permissions(name, writable_capability_permissions(metadata, true)) {
+        Ok(()) => Ok(()),
+        Err(source) if permission_change_needs_path_fallback(&source) => {
+            // Some Unix filesystems cannot open an unreadable directory for
+            // handle-based chmod. Retry relative to the opened parent and ask
+            // the OS not to follow a replacement symlink; if unsupported, fail
+            // closed rather than changing an ambient path.
+            let current = parent_directory.symlink_metadata(name).map_err(|source| {
+                PackageCacheError::Io {
+                    operation: "recheck inconsistent package cache directory",
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            if current.file_type().is_symlink() || !current.is_dir() {
+                return Err(PackageCacheError::Io {
+                    operation: "validate inconsistent package cache directory",
+                    path: path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cache entry changed while preparing removal",
+                    ),
+                });
+            }
+            set_capability_directory_writable_nofollow(parent_directory, name, path)
+        }
+        Err(source) => Err(PackageCacheError::Io {
+            operation: "make inconsistent package cache directory readable",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn permission_change_needs_path_fallback(error: &io::Error) -> bool {
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "wasi", target_os = "redox"))
+    ))]
+    {
+        error.raw_os_error() == Some(libc::ENOTSUP)
+    }
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "wasi", target_os = "redox"))
+    )))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+#[cfg(unix)]
+fn set_capability_directory_writable_nofollow(
+    parent_directory: &CapabilityDir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(), PackageCacheError> {
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "wasi", target_os = "redox"))
+    ))]
+    {
+        let parent = CapabilityDir::reopen_dir(parent_directory)
+            .map_err(|source| PackageCacheError::Io {
+                operation: "retain package cache parent while changing permissions",
+                path: path.to_path_buf(),
+                source,
+            })?
+            .into_std_file();
+        rustix::fs::chmodat(
+            &parent,
+            name,
+            rustix::fs::Mode::from_bits_truncate(0o700),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|source| PackageCacheError::Io {
+            operation: "make inconsistent package cache directory readable",
+            path: path.to_path_buf(),
+            source: source.into(),
+        })
+    }
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "wasi", target_os = "redox"))
+    )))]
+    {
+        let _ = (parent_directory, name);
+        Err(PackageCacheError::Io {
+            operation: "make inconsistent package cache directory readable",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no-follow directory permission changes are unavailable",
+            ),
+        })
+    }
+}
+
+fn writable_capability_permissions(
+    _metadata: &cap_std::fs::Metadata,
+    directory: bool,
+) -> CapabilityPermissions {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt;
+        CapabilityPermissions::from_mode(if directory { 0o700 } else { 0o600 })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        let mut permissions = _metadata.permissions();
+        permissions.set_readonly(false);
+        permissions
+    }
 }
 
 struct StagingDirectory {
@@ -1627,12 +2715,7 @@ impl Drop for StagingDirectory {
         if self.published {
             return;
         }
-        make_tree_removable(&self.path);
-        let removed = match fs::remove_dir_all(&self.path) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
+        let removed = remove_tree_at_path(&self.path);
         self.release_activity_lock(removed);
     }
 }
@@ -1716,22 +2799,58 @@ fn make_tree_read_only(root: &Path) -> Result<(), PackageCacheError> {
     set_read_only_directory_permissions(root)
 }
 
-fn make_tree_removable(root: &Path) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
+fn remove_tree_at_path(root: &Path) -> bool {
+    let (Some(parent_path), Some(name)) = (root.parent(), root.file_name()) else {
+        return false;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                make_tree_removable(&path);
-                let _ = set_writable_directory_permissions(&path);
-            } else if metadata.is_file() && is_single_link_file(&metadata) {
-                let _ = set_writable_path_permissions(&path);
+    match fs::symlink_metadata(parent_path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let Ok(parent) = CapabilityDir::open_ambient_dir(parent_path, ambient_authority()) else {
+        return false;
+    };
+    match fs::symlink_metadata(parent_path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let current_parent = match CapabilityDir::open_ambient_dir(parent_path, ambient_authority()) {
+        Ok(parent) => parent,
+        Err(_) => return false,
+    };
+    if !same_cached_directories(&parent, &current_parent).unwrap_or(false) {
+        return false;
+    }
+
+    let metadata = match parent.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        if make_capability_tree_removable(&parent, name, root).is_err() {
+            return false;
+        }
+        parent.remove_dir_all(name).is_ok()
+    } else if is_windows_directory_reparse_point(&metadata) {
+        parent.remove_dir(name).is_ok()
+    } else if metadata.is_file() {
+        if let Ok(file) = open_cached_source_file(&parent, name) {
+            if let Ok(opened_metadata) = file.metadata()
+                && cached_file_entry_matches(&parent, name, &file).unwrap_or(false)
+                && is_single_link_file(Some(&file), &opened_metadata)
+            {
+                let _ = set_writable_file_handle(&file, &opened_metadata, root);
             }
         }
+        if metadata.is_dir() {
+            parent.remove_dir(name).is_ok()
+        } else {
+            parent.remove_file(name).is_ok()
+        }
+    } else {
+        parent.remove_file(name).is_ok()
     }
-    let _ = set_writable_directory_permissions(root);
 }
 
 fn set_private_directory_permissions(path: &Path) -> Result<(), PackageCacheError> {
@@ -1759,29 +2878,28 @@ fn seal_published_source_directory(path: &Path) -> Result<(), PackageCacheError>
     set_read_only_directory_permissions(path)
 }
 
-fn is_single_link_file(metadata: &fs::Metadata) -> bool {
+fn is_single_link_file(file: Option<&File>, metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
+        let _ = file;
         use std::os::unix::fs::MetadataExt;
         metadata.nlink() == 1
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = metadata;
-        true
+        file.and_then(|file| sai_windows_fs::number_of_links(file).ok()) == Some(1)
     }
-}
-
-fn set_writable_directory_permissions(path: &Path) -> Result<(), PackageCacheError> {
-    set_directory_mode(path, 0o700, false)
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        let _ = metadata;
+        false
+    }
 }
 
 fn set_read_only_path_permissions(path: &Path) -> Result<(), PackageCacheError> {
     set_path_mode(path, 0o444, true)
-}
-
-fn set_writable_path_permissions(path: &Path) -> Result<(), PackageCacheError> {
-    set_path_mode(path, 0o600, false)
 }
 
 #[cfg(unix)]
@@ -2041,7 +3159,8 @@ fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheDisposition, CacheHost, PackageCache, PackageCacheError, resolve_cache_directory,
+        CacheDisposition, CacheHost, CachedSourceVerification, PackageCache, PackageCacheError,
+        SourceCacheRemoval, resolve_cache_directory,
     };
     use crate::git_tree::GitTreeReader;
     use gix::objs::tree::{Entry, EntryKind};
@@ -2071,8 +3190,7 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            super::make_tree_removable(&self.0);
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = super::remove_tree_at_path(&self.0);
         }
     }
 
@@ -2803,6 +3921,515 @@ mod tests {
     }
 
     #[test]
+    fn verifies_a_cached_tree_by_streaming_its_contents() {
+        let temp = TestDirectory::new("verify-source");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let installed = cache.materialize_source(source).unwrap();
+
+        let verification = cache.verify_source(&checksum).unwrap();
+
+        let CachedSourceVerification::Verified(verified) = verification else {
+            panic!("expected a verified cache entry, got {verification:?}");
+        };
+        assert_eq!(verified.checksum(), checksum);
+        assert_eq!(verified.path(), installed.path());
+        assert_eq!(verified.disposition(), CacheDisposition::AlreadyPresent);
+    }
+
+    #[test]
+    fn cached_file_identity_compares_open_file_handles() {
+        use std::fs::File;
+
+        let temp = TestDirectory::new("cached-file-identity");
+        let first_path = temp.path().join("first");
+        let second_path = temp.path().join("second");
+        fs::write(&first_path, b"same bytes").unwrap();
+        fs::write(&second_path, b"same bytes").unwrap();
+        let first = File::open(first_path).unwrap();
+        let same_file = first.try_clone().unwrap();
+        let second = File::open(second_path).unwrap();
+
+        assert!(super::same_cached_file(&first, &same_file).unwrap());
+        assert!(!super::same_cached_file(&first, &second).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_is_detected_by_change_time() {
+        use std::fs::{FileTimes, OpenOptions};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TestDirectory::new("verify-source-change-time");
+        let path = temp.path().join("cached-file");
+        fs::write(&path, b"before").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let original_modified = before.modified().unwrap();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"after!").unwrap();
+        file.set_times(FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        let after = file.metadata().unwrap();
+
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert!(!super::cached_file_metadata_unchanged(&before, &after));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_permission_fallback_cannot_change_a_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TestDirectory::new("verify-source-chmodat-nofollow");
+        let parent_path = temp.path().join("cache");
+        fs::create_dir(&parent_path).unwrap();
+        let parent =
+            super::CapabilityDir::open_ambient_dir(&parent_path, super::ambient_authority())
+                .unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let link = parent_path.join("entry");
+        symlink(&outside, &link).unwrap();
+
+        let _result = super::set_capability_directory_writable_nofollow(
+            &parent,
+            super::OsStr::new("entry"),
+            &link,
+        );
+
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_source_file_open_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDirectory::new("verify-source-open-nofollow");
+        let parent_path = temp.path().join("cache");
+        fs::create_dir(&parent_path).unwrap();
+        let parent =
+            super::CapabilityDir::open_ambient_dir(&parent_path, super::ambient_authority())
+                .unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, parent_path.join("entry")).unwrap();
+
+        assert!(super::open_cached_source_file(&parent, super::OsStr::new("entry")).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cached_readonly_file_with_external_hardlink_is_not_immutable() {
+        let temp = TestDirectory::new("verify-source-windows-hardlink");
+        let cache_file = temp.path().join("cached-file");
+        let external_file = temp.path().join("external-file");
+        fs::write(&cache_file, b"cached content").unwrap();
+        let mut permissions = fs::metadata(&cache_file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&cache_file, permissions).unwrap();
+        fs::hard_link(&cache_file, &external_file).unwrap();
+        let cache_handle = File::open(&cache_file).unwrap();
+        let external_handle = File::open(&external_file).unwrap();
+
+        assert!(!super::is_read_only_file(
+            Some(&cache_handle),
+            &fs::metadata(&cache_file).unwrap()
+        ));
+        assert!(!super::is_single_link_file(
+            Some(&external_handle),
+            &fs::metadata(&external_file).unwrap()
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_removal_retries_transient_sharing_violations() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0);
+        let result = super::retry_cache_entry_removal(|| {
+            let current_attempt = attempts.get() + 1;
+            attempts.set(current_attempt);
+            if current_attempt < 3 {
+                Err(PackageCacheError::Io {
+                    operation: "test removal retry",
+                    path: PathBuf::from("cache-entry"),
+                    source: std::io::Error::from_raw_os_error(
+                        super::WINDOWS_ERROR_SHARING_VIOLATION,
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn corrupt_source_removal_retries_while_a_reader_holds_a_directory_handle() {
+        use std::time::Duration;
+
+        let temp = TestDirectory::new("verify-source-windows-reader-removal");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let source_path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let source_file = source_path.join("main.sai");
+        let mut permissions = fs::metadata(&source_file).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&source_file, permissions).unwrap();
+        fs::write(&source_file, b"corrupt package content").unwrap();
+        let mut permissions = fs::metadata(&source_file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source_file, permissions).unwrap();
+
+        let reader =
+            super::CapabilityDir::open_ambient_dir(&source_path, super::ambient_authority())
+                .unwrap();
+        let cache_root = cache.root.clone();
+        let worker_checksum = checksum.clone();
+        let worker = std::thread::spawn(move || {
+            PackageCache::open(cache_root)
+                .unwrap()
+                .remove_corrupt_source(&worker_checksum)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        drop(reader);
+
+        assert_eq!(worker.join().unwrap().unwrap(), SourceCacheRemoval::Removed);
+    }
+
+    #[test]
+    fn reports_a_missing_cached_tree_without_creating_it() {
+        let temp = TestDirectory::new("verify-source-missing");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let checksum = crate::tree_hash::artifact_checksum(b"missing");
+
+        assert_eq!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Missing
+        );
+        assert!(!cache.source_path(&checksum).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_the_actual_checksum_when_cached_file_contents_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDirectory::new("verify-source-content");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let source_file = path.join("main.sai");
+        fs::set_permissions(&source_file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&source_file, b"pub fn answer() -> i32 { 43 }\n").unwrap();
+        fs::set_permissions(&source_file, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let verification = cache.verify_source(&checksum).unwrap();
+
+        let CachedSourceVerification::Corrupt {
+            expected_checksum,
+            actual_checksum: Some(actual_checksum),
+        } = verification
+        else {
+            panic!("expected a content checksum mismatch, got {verification:?}");
+        };
+        assert_eq!(&*expected_checksum, checksum);
+        assert_ne!(&*actual_checksum, checksum.as_str());
+        assert_eq!(
+            cache.remove_corrupt_source(&checksum).unwrap(),
+            SourceCacheRemoval::Removed
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_extra_excluded_paths_even_when_the_source_hash_would_ignore_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDirectory::new("verify-source-excluded");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(path.join(".git")).unwrap();
+        fs::set_permissions(path.join(".git"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(matches!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Corrupt {
+                actual_checksum: None,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_cached_files_that_are_executable_even_when_the_hash_matches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDirectory::new("verify-source-executable");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let source_file = path.join("main.sai");
+        fs::set_permissions(&source_file, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(matches!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Corrupt {
+                actual_checksum: Some(actual),
+                ..
+            } if actual.as_ref() == checksum
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifies_an_unreadable_cached_directory_as_corrupt_and_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDirectory::new("verify-source-unreadable-directory");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let unreadable = path.join("private");
+        fs::create_dir(&unreadable).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(matches!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Corrupt {
+                actual_checksum: None,
+                ..
+            }
+        ));
+        match cache.remove_corrupt_source(&checksum) {
+            Ok(SourceCacheRemoval::Removed) => {}
+            Err(PackageCacheError::Io { source, .. })
+                if source
+                    .raw_os_error()
+                    .is_some_and(|code| code == libc::ENOTSUP || code == libc::EOPNOTSUPP) =>
+            {
+                // Some Unix systems do not implement no-follow chmodat.
+                // Restore access so the capability-handle path can remove it.
+                fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+                assert_eq!(
+                    cache.remove_corrupt_source(&checksum).unwrap(),
+                    SourceCacheRemoval::Removed
+                );
+            }
+            other => panic!("unexpected corrupt-cache removal result: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_replaced_source_cache_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDirectory::new("verify-source-parent-symlink");
+        let cache_root = temp.path().join("cache");
+        let cache = PackageCache::open(&cache_root).unwrap();
+        let source_directory = cache.versioned_root().join("src");
+        let moved_source_directory = cache.versioned_root().join("src-original");
+        fs::rename(&source_directory, &moved_source_directory).unwrap();
+        symlink(&moved_source_directory, &source_directory).unwrap();
+        let checksum = crate::tree_hash::artifact_checksum(b"missing");
+
+        assert!(matches!(
+            cache.verify_source(&checksum),
+            Err(PackageCacheError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn corrupt_source_removal_preserves_valid_and_missing_entries() {
+        let temp = TestDirectory::new("remove-corrupt-source");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        cache.materialize_source(source).unwrap();
+
+        assert_eq!(
+            cache.remove_corrupt_source(&checksum).unwrap(),
+            SourceCacheRemoval::Valid
+        );
+        assert_eq!(
+            cache
+                .remove_corrupt_source(&crate::tree_hash::artifact_checksum(b"missing"))
+                .unwrap(),
+            SourceCacheRemoval::Missing
+        );
+        assert!(matches!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Verified(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_verification_rejects_symlinks_and_removal_does_not_follow_them() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TestDirectory::new("verify-source-symlink");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let outside_file = temp.path().join("outside");
+        fs::write(&outside_file, b"keep this file").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside_file, path.join("escape")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(matches!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Corrupt {
+                actual_checksum: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            cache.remove_corrupt_source(&checksum).unwrap(),
+            SourceCacheRemoval::Removed
+        );
+        assert_eq!(fs::read(&outside_file).unwrap(), b"keep this file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_verification_does_not_traverse_a_symlinked_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TestDirectory::new("verify-source-symlink-directory");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let outside_directory = temp.path().join("outside");
+        fs::create_dir(&outside_directory).unwrap();
+        fs::write(outside_directory.join("secret"), b"outside the cache").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside_directory, path.join("vendor")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(matches!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Corrupt {
+                actual_checksum: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            cache.remove_corrupt_source(&checksum).unwrap(),
+            SourceCacheRemoval::Removed
+        );
+        assert_eq!(
+            fs::read(outside_directory.join("secret")).unwrap(),
+            b"outside the cache"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_verification_rejects_hard_links_and_removal_preserves_the_external_link() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TestDirectory::new("verify-source-hardlink");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let cached_file = path.join("main.sai");
+        let outside_file = temp.path().join("outside");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::hard_link(&cached_file, &outside_file).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(matches!(
+            cache.verify_source(&checksum).unwrap(),
+            CachedSourceVerification::Corrupt {
+                actual_checksum: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            cache.remove_corrupt_source(&checksum).unwrap(),
+            SourceCacheRemoval::Removed
+        );
+        assert_eq!(
+            fs::read(&outside_file).unwrap(),
+            b"pub fn answer() -> i32 { 42 }\n"
+        );
+        assert_eq!(fs::metadata(&outside_file).unwrap().nlink(), 1);
+    }
+
+    #[test]
     fn an_existing_entry_is_reused_without_replacing_its_contents() {
         let temp = TestDirectory::new("existing");
         let cache = PackageCache::open(temp.path().join("cache")).unwrap();
@@ -2946,6 +4573,36 @@ mod tests {
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_symlink_at_a_source_address_is_removed_without_following_it() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = TestDirectory::new("repair-directory-symlink");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let existing_path = cache.source_path(&checksum).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"keep").unwrap();
+        match symlink_dir(&outside, &existing_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("could not create directory symlink for test: {error}"),
+        }
+
+        assert_eq!(
+            cache.remove_corrupt_source(&checksum).unwrap(),
+            SourceCacheRemoval::Removed
+        );
+        assert!(
+            fs::symlink_metadata(&existing_path).unwrap_err().kind()
+                == std::io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_hard_linked_cached_file_is_not_reused_or_made_writable() {
@@ -3013,9 +4670,35 @@ mod tests {
         super::set_read_only_path_permissions(&file).unwrap();
         super::set_read_only_directory_permissions(&root).unwrap();
 
-        super::make_tree_removable(&root);
-        fs::remove_dir_all(&root).unwrap();
+        assert!(super::remove_tree_at_path(&root));
         assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_a_symlinked_parent_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TestDirectory::new("readonly-cleanup-parent-symlink");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let outside_entry = outside.join("entry");
+        fs::create_dir(&outside_entry).unwrap();
+        let outside_file = outside_entry.join("keep");
+        fs::write(&outside_file, b"outside").unwrap();
+        fs::set_permissions(&outside_file, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let cache_parent_link = temp.path().join("cache-parent");
+        symlink(&outside, &cache_parent_link).unwrap();
+
+        assert!(!super::remove_tree_at_path(
+            &cache_parent_link.join("entry")
+        ));
+        assert!(outside_entry.is_dir());
+        assert_eq!(
+            fs::metadata(outside_file).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
     }
 
     #[cfg(target_os = "macos")]
