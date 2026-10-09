@@ -1,0 +1,1191 @@
+//! Reads and hashes Git trees from an object database without a checkout.
+
+use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::fs;
+use std::io;
+use std::path::Path;
+
+use gix::prelude::{FindExt, HeaderExt};
+
+use crate::tree_hash::{
+    GitTreeEntry, TreeHash, TreeHashError, TreeHashPurpose, hash_git_tree, should_skip_path,
+    validate_tree_path,
+};
+
+/// Maximum size of a blob selected from one package directory.
+pub const MAX_PACKAGE_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum combined size of selected blobs in one package directory.
+pub const MAX_PACKAGE_CONTENT_BYTES: u64 = 1024 * 1024 * 1024;
+/// Maximum number of regular files selected from one package directory.
+pub const MAX_PACKAGE_FILE_COUNT: u64 = 100_000;
+/// Maximum size of an individual commit or tree object read while hashing.
+pub const MAX_GIT_METADATA_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum number of entries inspected while walking one package tree.
+pub const MAX_PACKAGE_TREE_ENTRIES: u64 = 1_000_000;
+/// Maximum cumulative byte length of paths retained while walking one package tree.
+pub const MAX_PACKAGE_TREE_PATH_BYTES: u64 = 64 * 1024 * 1024;
+
+const MAX_OBJECT_ALLOCATION_BYTES: usize = MAX_PACKAGE_FILE_BYTES as usize;
+const MAX_GIX_INDEX_SLOTS: u16 = (1 << 15) - 1;
+
+/// A limit enforced while reading a package tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitTreeLimit {
+    /// Maximum selected regular files.
+    FileCount,
+    /// Maximum bytes in one selected regular file.
+    FileBytes,
+    /// Maximum total bytes in selected regular files.
+    PackageBytes,
+    /// Maximum commit or tree object size.
+    MetadataObjectBytes,
+    /// Maximum entries inspected across the package tree.
+    TreeEntryCount,
+    /// Maximum cumulative bytes in paths retained while walking the package tree.
+    PathBytes,
+}
+
+impl GitTreeLimit {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FileCount => "selected file count",
+            Self::FileBytes => "one selected file size",
+            Self::PackageBytes => "selected package content size",
+            Self::MetadataObjectBytes => "Git metadata object size",
+            Self::TreeEntryCount => "inspected Git tree entry count",
+            Self::PathBytes => "cumulative Git tree path bytes",
+        }
+    }
+}
+
+/// A failure while opening or traversing a Git object database.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitTreeReadError {
+    /// The object database could not be opened or an object could not be read.
+    ObjectDatabase,
+    /// The object named by the commit id is not a readable commit.
+    InvalidCommitObject,
+    /// Object contents do not match the object id used to look them up.
+    ObjectIdMismatch,
+    /// A tree object is malformed or unreadable.
+    InvalidTreeObject,
+    /// A tree contains an unsupported entry mode or invalid component.
+    InvalidTreeEntry,
+    /// The requested package directory is not a normalized relative path.
+    InvalidPackageDirectory,
+    /// A component of the requested package directory does not exist.
+    MissingPackageDirectory,
+    /// A component of the requested package directory is not a directory.
+    PackagePathNotDirectory,
+    /// The object database uses alternates, which could expose objects outside it.
+    AlternatesUnsupported,
+    /// A fixed package resource limit was exceeded.
+    PackageTooLarge {
+        /// The exceeded limit.
+        limit: GitTreeLimit,
+        /// The value reached when the limit was exceeded.
+        actual: u64,
+    },
+    /// A path or tree-hash check failed.
+    Hash(TreeHashError),
+}
+
+impl Display for GitTreeReadError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ObjectDatabase => formatter.write_str("could not read the Git object database"),
+            Self::InvalidCommitObject => formatter.write_str("Git object is not a valid commit"),
+            Self::ObjectIdMismatch => {
+                formatter.write_str("Git object contents do not match their object id")
+            }
+            Self::InvalidTreeObject => {
+                formatter.write_str("Git tree object is malformed or missing")
+            }
+            Self::InvalidTreeEntry => formatter.write_str("Git tree contains an invalid entry"),
+            Self::InvalidPackageDirectory => {
+                formatter.write_str("package directory is not a normalized relative path")
+            }
+            Self::MissingPackageDirectory => {
+                formatter.write_str("package directory does not exist in the commit")
+            }
+            Self::PackagePathNotDirectory => {
+                formatter.write_str("package directory path crosses a non-directory entry")
+            }
+            Self::AlternatesUnsupported => {
+                formatter.write_str("Git object database alternates are not supported")
+            }
+            Self::PackageTooLarge { limit, actual } => {
+                write!(
+                    formatter,
+                    "{} exceeded (reached {actual} bytes or entries)",
+                    limit.name()
+                )
+            }
+            Self::Hash(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl Error for GitTreeReadError {}
+
+impl From<TreeHashError> for GitTreeReadError {
+    fn from(error: TreeHashError) -> Self {
+        Self::Hash(error)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Limits {
+    file_count: u64,
+    file_bytes: u64,
+    package_bytes: u64,
+    metadata_object_bytes: u64,
+    tree_entry_count: u64,
+    path_bytes: u64,
+}
+
+impl Limits {
+    const SPEC: Self = Self {
+        file_count: MAX_PACKAGE_FILE_COUNT,
+        file_bytes: MAX_PACKAGE_FILE_BYTES,
+        package_bytes: MAX_PACKAGE_CONTENT_BYTES,
+        metadata_object_bytes: MAX_GIT_METADATA_OBJECT_BYTES,
+        tree_entry_count: MAX_PACKAGE_TREE_ENTRIES,
+        path_bytes: MAX_PACKAGE_TREE_PATH_BYTES,
+    };
+}
+
+#[derive(Clone, Debug)]
+struct RawTreeEntry {
+    mode: u16,
+    name: Vec<u8>,
+    object_id: gix::ObjectId,
+}
+
+enum OwnedTreeEntry {
+    File {
+        path: Vec<u8>,
+        content: Vec<u8>,
+        executable: bool,
+    },
+    Symlink {
+        path: Vec<u8>,
+    },
+    Gitlink {
+        path: Vec<u8>,
+    },
+}
+
+/// A reader over a Git object directory.
+///
+/// The reader takes an explicit object hash kind, reads only that object
+/// directory, ignores Git configuration and refs, applies no attributes or
+/// filters, and never checks out files or follows Git symlinks.
+pub struct GitTreeReader {
+    objects: gix::odb::Handle,
+    object_hash: gix::hash::Kind,
+    limits: Limits,
+}
+
+impl GitTreeReader {
+    /// Open the `objects/` directory of a bare Git repository.
+    ///
+    /// The caller must keep the object directory stable for the reader's
+    /// lifetime. Package fetching satisfies this by hashing a private,
+    /// uniquely named staging repository before publishing it to the
+    /// immutable cache. Concurrent hostile mutation of the host filesystem is
+    /// outside the package system's trust model.
+    pub fn open(
+        objects_directory: impl AsRef<Path>,
+        object_hash: gix::hash::Kind,
+    ) -> Result<Self, GitTreeReadError> {
+        Self::open_with_limits(objects_directory, object_hash, Limits::SPEC)
+    }
+
+    fn open_with_limits(
+        objects_directory: impl AsRef<Path>,
+        object_hash: gix::hash::Kind,
+        limits: Limits,
+    ) -> Result<Self, GitTreeReadError> {
+        let objects_directory = objects_directory.as_ref();
+        let alternates = objects_directory.join("info").join("alternates");
+        match fs::symlink_metadata(alternates) {
+            Ok(_) => return Err(GitTreeReadError::AlternatesUnsupported),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(GitTreeReadError::ObjectDatabase),
+        }
+
+        let options = gix::odb::store::init::Options {
+            // Avoid resolving alternates while determining the initial slot count.
+            // This also leaves room for every pack index supported by gix.
+            slots: gix::odb::store::init::Slots::Given(MAX_GIX_INDEX_SLOTS),
+            alloc_limit_bytes: Some(MAX_OBJECT_ALLOCATION_BYTES),
+            ..Default::default()
+        };
+        let mut objects = gix::odb::at_opts(
+            objects_directory.to_path_buf(),
+            object_hash,
+            std::iter::empty(),
+            options,
+        )
+        .map_err(|_| GitTreeReadError::ObjectDatabase)?;
+        // The ODB resolves alternates on its first disk refresh. Initialize it
+        // below, reject any resolved paths, and then keep that path list fixed.
+        objects.refresh_never();
+
+        let reader = Self {
+            objects,
+            object_hash,
+            limits,
+        };
+        reader.ensure_no_alternates()?;
+        Ok(reader)
+    }
+
+    /// Hash the package directory at `package_directory` in `commit_id`.
+    ///
+    /// `package_directory` is empty for the repository root and otherwise
+    /// consists of slash-separated Git path bytes.
+    pub fn hash_commit_tree(
+        &self,
+        commit_id: &gix::ObjectId,
+        package_directory: &[u8],
+        purpose: TreeHashPurpose,
+    ) -> Result<TreeHash, GitTreeReadError> {
+        self.ensure_no_alternates()?;
+        if !package_directory.is_empty() {
+            validate_tree_path(package_directory)?;
+        }
+
+        if commit_id.kind() != self.object_hash {
+            return Err(GitTreeReadError::InvalidCommitObject);
+        }
+        let header = self.read_object_header(commit_id, GitTreeReadError::InvalidCommitObject)?;
+        if header.kind() != gix::objs::Kind::Commit
+            || header.size() > self.limits.metadata_object_bytes
+        {
+            if header.size() > self.limits.metadata_object_bytes {
+                return Err(GitTreeReadError::PackageTooLarge {
+                    limit: GitTreeLimit::MetadataObjectBytes,
+                    actual: header.size(),
+                });
+            }
+            return Err(GitTreeReadError::InvalidCommitObject);
+        }
+
+        let (commit_kind, commit_data) =
+            self.find_verified_object(commit_id, GitTreeReadError::InvalidCommitObject)?;
+        if commit_kind != gix::objs::Kind::Commit {
+            return Err(GitTreeReadError::InvalidCommitObject);
+        }
+        let root_tree_id = gix::objs::CommitRefIter::from_bytes(&commit_data, self.object_hash)
+            .tree_id()
+            .map_err(|_| GitTreeReadError::InvalidCommitObject)?;
+        let mut inspected_entries = 0;
+        let package_tree_id =
+            self.resolve_package_tree(&root_tree_id, package_directory, &mut inspected_entries)?;
+        self.hash_tree(&package_tree_id, purpose, &mut inspected_entries)
+    }
+
+    fn ensure_no_alternates(&self) -> Result<(), GitTreeReadError> {
+        let alternate_paths = self
+            .objects
+            .store_ref()
+            .alternate_db_paths()
+            .map_err(|_| GitTreeReadError::ObjectDatabase)?;
+        if alternate_paths.is_empty() {
+            Ok(())
+        } else {
+            Err(GitTreeReadError::AlternatesUnsupported)
+        }
+    }
+
+    fn read_object_header(
+        &self,
+        object_id: &gix::ObjectId,
+        read_error: GitTreeReadError,
+    ) -> Result<gix::odb::find::Header, GitTreeReadError> {
+        self.ensure_no_alternates()?;
+        let header = self
+            .objects
+            .header(object_id.as_ref())
+            .map_err(|_| read_error)?;
+        self.ensure_no_alternates()?;
+        Ok(header)
+    }
+
+    fn find_verified_object(
+        &self,
+        object_id: &gix::ObjectId,
+        read_error: GitTreeReadError,
+    ) -> Result<(gix::objs::Kind, Vec<u8>), GitTreeReadError> {
+        self.ensure_no_alternates()?;
+        let mut buffer = Vec::new();
+        let object = self
+            .objects
+            .find(object_id.as_ref(), &mut buffer)
+            .map_err(|_| read_error)?;
+        let kind = object.kind;
+        if gix::objs::compute_hash(self.object_hash, kind, object.data)
+            .map_err(|_| GitTreeReadError::ObjectIdMismatch)?
+            != *object_id
+        {
+            return Err(GitTreeReadError::ObjectIdMismatch);
+        }
+        self.ensure_no_alternates()?;
+        Ok((kind, buffer))
+    }
+
+    fn resolve_package_tree(
+        &self,
+        root_tree_id: &gix::ObjectId,
+        package_directory: &[u8],
+        inspected_entries: &mut u64,
+    ) -> Result<gix::ObjectId, GitTreeReadError> {
+        if package_directory.is_empty() {
+            return Ok(*root_tree_id);
+        }
+
+        let mut current_tree_id = *root_tree_id;
+        for component in package_directory.split(|byte| *byte == b'/') {
+            let entries = self.read_tree_entries(&current_tree_id, inspected_entries)?;
+            let mut matching_entry = None;
+            for entry in entries {
+                if entry.name == component {
+                    if matching_entry.is_some() {
+                        return Err(GitTreeReadError::InvalidTreeEntry);
+                    }
+                    matching_entry = Some(entry);
+                }
+            }
+            let Some(entry) = matching_entry else {
+                return Err(GitTreeReadError::MissingPackageDirectory);
+            };
+            if entry.mode != 0o040000 {
+                return Err(GitTreeReadError::PackagePathNotDirectory);
+            }
+            current_tree_id = entry.object_id;
+        }
+        Ok(current_tree_id)
+    }
+
+    fn hash_tree(
+        &self,
+        root_tree_id: &gix::ObjectId,
+        purpose: TreeHashPurpose,
+        tree_entry_count: &mut u64,
+    ) -> Result<TreeHash, GitTreeReadError> {
+        let mut pending = vec![(*root_tree_id, Vec::<u8>::new())];
+        let mut owned_entries = Vec::<OwnedTreeEntry>::new();
+        let mut file_count = 0u64;
+        let mut package_bytes = 0u64;
+        let mut path_bytes = 0u64;
+
+        while let Some((tree_id, parent_path)) = pending.pop() {
+            for entry in self.read_tree_entries(&tree_id, tree_entry_count)? {
+                if entry.name.is_empty() || entry.name.contains(&b'/') {
+                    return Err(GitTreeReadError::InvalidTreeEntry);
+                }
+                let mut path = parent_path.clone();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(&entry.name);
+                if should_skip_path(&path, purpose) {
+                    continue;
+                }
+                path_bytes = path_bytes.saturating_add(path.len() as u64);
+                ensure_limit(GitTreeLimit::PathBytes, path_bytes, self.limits.path_bytes)?;
+
+                match entry.mode {
+                    0o040000 => {
+                        if path.len() > 4096 {
+                            validate_tree_path(&path)?;
+                        }
+                        pending.push((entry.object_id, path.clone()));
+                    }
+                    0o100644 | 0o100755 => {
+                        validate_tree_path(&path)?;
+                        file_count = file_count.saturating_add(1);
+                        ensure_limit(GitTreeLimit::FileCount, file_count, self.limits.file_count)?;
+
+                        let header = self.read_object_header(
+                            &entry.object_id,
+                            GitTreeReadError::InvalidTreeObject,
+                        )?;
+                        if header.kind() != gix::objs::Kind::Blob {
+                            return Err(GitTreeReadError::InvalidTreeEntry);
+                        }
+                        ensure_limit(
+                            GitTreeLimit::FileBytes,
+                            header.size(),
+                            self.limits.file_bytes,
+                        )?;
+                        package_bytes = package_bytes.saturating_add(header.size());
+                        ensure_limit(
+                            GitTreeLimit::PackageBytes,
+                            package_bytes,
+                            self.limits.package_bytes,
+                        )?;
+
+                        let (blob_kind, content) = self.find_verified_object(
+                            &entry.object_id,
+                            GitTreeReadError::InvalidTreeObject,
+                        )?;
+                        if blob_kind != gix::objs::Kind::Blob
+                            || content.len() as u64 != header.size()
+                        {
+                            return Err(GitTreeReadError::InvalidTreeEntry);
+                        }
+                        owned_entries.push(OwnedTreeEntry::File {
+                            path,
+                            content,
+                            executable: entry.mode == 0o100755,
+                        });
+                    }
+                    0o120000 => owned_entries.push(OwnedTreeEntry::Symlink { path }),
+                    0o160000 => owned_entries.push(OwnedTreeEntry::Gitlink { path }),
+                    _ => return Err(GitTreeReadError::InvalidTreeEntry),
+                }
+            }
+        }
+
+        let hash_entries = owned_entries
+            .iter()
+            .map(|entry| match entry {
+                OwnedTreeEntry::File {
+                    path,
+                    content,
+                    executable: false,
+                } => GitTreeEntry::RegularFile { path, content },
+                OwnedTreeEntry::File {
+                    path,
+                    content,
+                    executable: true,
+                } => GitTreeEntry::ExecutableFile { path, content },
+                OwnedTreeEntry::Symlink { path } => GitTreeEntry::Symlink { path },
+                OwnedTreeEntry::Gitlink { path } => GitTreeEntry::Gitlink { path },
+            })
+            .collect::<Vec<_>>();
+        Ok(hash_git_tree(hash_entries, purpose)?)
+    }
+
+    fn read_tree_entries(
+        &self,
+        tree_id: &gix::ObjectId,
+        inspected_entries: &mut u64,
+    ) -> Result<Vec<RawTreeEntry>, GitTreeReadError> {
+        let header = self.read_object_header(tree_id, GitTreeReadError::InvalidTreeObject)?;
+        if header.kind() != gix::objs::Kind::Tree {
+            return Err(GitTreeReadError::InvalidTreeObject);
+        }
+        ensure_limit(
+            GitTreeLimit::MetadataObjectBytes,
+            header.size(),
+            self.limits.metadata_object_bytes,
+        )?;
+
+        let (tree_kind, tree_data) =
+            self.find_verified_object(tree_id, GitTreeReadError::InvalidTreeObject)?;
+        if tree_kind != gix::objs::Kind::Tree || tree_data.len() as u64 != header.size() {
+            return Err(GitTreeReadError::InvalidTreeObject);
+        }
+
+        let mut seen_names = BTreeSet::<Vec<u8>>::new();
+        let mut result = Vec::new();
+        for entry in gix::objs::TreeRefIter::from_bytes(&tree_data, self.object_hash) {
+            let entry = entry.map_err(|_| GitTreeReadError::InvalidTreeObject)?;
+            *inspected_entries = inspected_entries.saturating_add(1);
+            ensure_limit(
+                GitTreeLimit::TreeEntryCount,
+                *inspected_entries,
+                self.limits.tree_entry_count,
+            )?;
+
+            let name = entry.filename.to_vec();
+            if name.is_empty() || name.contains(&b'/') || !seen_names.insert(name.clone()) {
+                return Err(GitTreeReadError::InvalidTreeEntry);
+            }
+            result.push(RawTreeEntry {
+                mode: entry.mode.value(),
+                name,
+                object_id: entry.oid.to_owned(),
+            });
+        }
+        Ok(result)
+    }
+}
+
+fn ensure_limit(limit: GitTreeLimit, actual: u64, maximum: u64) -> Result<(), GitTreeReadError> {
+    if actual > maximum {
+        Err(GitTreeReadError::PackageTooLarge { limit, actual })
+    } else {
+        Ok(())
+    }
+}
+
+impl Display for GitTreeLimit {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GitTreeLimit, GitTreeReadError, GitTreeReader, Limits, MAX_GIT_METADATA_OBJECT_BYTES,
+        MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILE_COUNT,
+        MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES,
+    };
+    use crate::tree_hash::{GitTreeEntry, TreeHashError, TreeHashPurpose, hash_git_tree};
+    use gix::objs::tree::{Entry, EntryKind};
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct BareTestRepository {
+        path: PathBuf,
+        repository: gix::Repository,
+    }
+
+    impl BareTestRepository {
+        fn new() -> Self {
+            Self::new_with_object_hash(None)
+        }
+
+        fn new_sha256() -> Self {
+            Self::new_with_object_hash(Some(gix::hash::Kind::Sha256))
+        }
+
+        fn new_with_object_hash(object_hash: Option<gix::hash::Kind>) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("sai-package-git-tree-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            let options = gix::create::Options {
+                object_hash,
+                ..Default::default()
+            };
+            let repository =
+                gix::ThreadSafeRepository::init(&path, gix::create::Kind::Bare, options)
+                    .unwrap()
+                    .into();
+            Self { path, repository }
+        }
+
+        fn objects_directory(&self) -> PathBuf {
+            self.path.join("objects")
+        }
+    }
+
+    impl Drop for BareTestRepository {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_blob(repository: &gix::Repository, content: &[u8]) -> gix::ObjectId {
+        repository.write_blob(content).unwrap().detach()
+    }
+
+    fn write_tree(
+        repository: &gix::Repository,
+        entries: impl IntoIterator<Item = (&'static [u8], EntryKind, gix::ObjectId)>,
+    ) -> gix::ObjectId {
+        let mut entries: Vec<Entry> = entries
+            .into_iter()
+            .map(|(name, kind, object_id)| Entry {
+                mode: kind.into(),
+                filename: name.to_vec().into(),
+                oid: object_id,
+            })
+            .collect();
+        entries.sort();
+        repository
+            .write_object(gix::objs::Tree { entries })
+            .unwrap()
+            .detach()
+    }
+
+    fn write_commit(repository: &gix::Repository, tree: gix::ObjectId) -> gix::ObjectId {
+        write_commit_with_message(repository, tree, "test commit")
+    }
+
+    fn write_commit_with_message(
+        repository: &gix::Repository,
+        tree: gix::ObjectId,
+        message: &str,
+    ) -> gix::ObjectId {
+        repository
+            .write_object(gix::objs::Commit {
+                tree,
+                parents: Default::default(),
+                author: gix::actor::Signature::default(),
+                committer: gix::actor::Signature::default(),
+                encoding: None,
+                message: message.into(),
+                extra_headers: Vec::new(),
+            })
+            .unwrap()
+            .detach()
+    }
+
+    fn write_pack(repository: &BareTestRepository, object_ids: &[gix::ObjectId]) {
+        let object_hash = repository.repository.object_hash();
+        let mut entries = object_ids
+            .iter()
+            .map(|id| {
+                let object = repository.repository.find_object(*id).unwrap();
+                let data = gix::objs::Data {
+                    kind: object.kind,
+                    object_hash,
+                    data: &object.data,
+                };
+                let count = gix_pack::data::output::Count::from_data(*id, None);
+                gix_pack::data::output::Entry::from_data(
+                    &count,
+                    &data,
+                    gix::zlib::Compression::DEFAULT,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.id);
+
+        let mut pack_writer = gix_pack::data::output::bytes::FromEntriesIter::new(
+            std::iter::once(Ok::<_, std::io::Error>(entries)),
+            Vec::new(),
+            object_ids.len().try_into().unwrap(),
+            gix_pack::data::Version::V2,
+            object_hash,
+        );
+        for result in pack_writer.by_ref() {
+            result.unwrap();
+        }
+        let pack_bytes = pack_writer.into_write();
+        let pack_directory = repository.objects_directory().join("pack");
+        std::fs::create_dir_all(&pack_directory).unwrap();
+        let mut input = Cursor::new(pack_bytes);
+        let outcome = gix_pack::Bundle::write_to_directory(
+            &mut input,
+            Some(&pack_directory),
+            &mut gix::progress::Discard,
+            &std::sync::atomic::AtomicBool::new(false),
+            None::<gix::odb::Handle>,
+            object_hash,
+            gix_pack::bundle::write::Options::default(),
+        )
+        .unwrap();
+        if let Some(keep_path) = outcome.keep_path {
+            std::fs::remove_file(keep_path).unwrap();
+        }
+    }
+
+    fn loose_object_path(repository: &BareTestRepository, id: &gix::ObjectId) -> PathBuf {
+        let hex = id.to_hex().to_string();
+        repository
+            .objects_directory()
+            .join(&hex[..2])
+            .join(&hex[2..])
+    }
+
+    fn overwrite_loose_object(
+        repository: &BareTestRepository,
+        expected_id: &gix::ObjectId,
+        replacement_id: &gix::ObjectId,
+    ) {
+        let replacement_path = loose_object_path(repository, replacement_id);
+        let expected_path = loose_object_path(repository, expected_id);
+        std::fs::remove_file(&expected_path).unwrap();
+        std::fs::copy(replacement_path, expected_path).unwrap();
+    }
+
+    fn standard_reader(repository: &BareTestRepository) -> GitTreeReader {
+        GitTreeReader::open(repository.objects_directory(), gix::hash::Kind::Sha1).unwrap()
+    }
+
+    fn full_test_tree(repository: &gix::Repository) -> (gix::ObjectId, gix::ObjectId) {
+        let manifest = write_blob(repository, b"package acme:sample @ 1.0.0\n");
+        let source = write_blob(repository, b"pub fn answer() -> i32 { 42 }\n");
+        let state = write_blob(repository, b"private state\n");
+        let output = write_blob(repository, b"wasm output\n");
+        let git_metadata = write_blob(repository, b"unselected\n");
+        let link_target = write_blob(repository, b"../../outside\n");
+        let submodule_id = write_blob(repository, b"placeholder oid\n");
+
+        let source_tree = write_tree(
+            repository,
+            [(b"main.sai".as_slice(), EntryKind::Blob, source)],
+        );
+        let sai_tree = write_tree(
+            repository,
+            [(b"state.json".as_slice(), EntryKind::Blob, state)],
+        );
+        let output_tree = write_tree(
+            repository,
+            [(b"build.wasm".as_slice(), EntryKind::Blob, output)],
+        );
+        let git_tree = write_tree(
+            repository,
+            [(b"config".as_slice(), EntryKind::Blob, git_metadata)],
+        );
+        let package_tree = write_tree(
+            repository,
+            [
+                (b"sai.package".as_slice(), EntryKind::Blob, manifest),
+                (b"src".as_slice(), EntryKind::Tree, source_tree),
+                (b".sai".as_slice(), EntryKind::Tree, sai_tree),
+                (b"out".as_slice(), EntryKind::Tree, output_tree),
+                (b".git".as_slice(), EntryKind::Tree, git_tree),
+                (b"link".as_slice(), EntryKind::Link, link_target),
+                (b"dependency".as_slice(), EntryKind::Commit, submodule_id),
+            ],
+        );
+        let root_tree = write_tree(
+            repository,
+            [(
+                b"packages".as_slice(),
+                EntryKind::Tree,
+                write_tree(
+                    repository,
+                    [(b"acme".as_slice(), EntryKind::Tree, package_tree)],
+                ),
+            )],
+        );
+        (root_tree, write_commit(repository, root_tree))
+    }
+
+    #[test]
+    fn hashes_the_package_subtree_without_checkout_or_git_config() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+        let sentinel = repository.path.join("should-not-run");
+        std::fs::write(
+            repository.path.join("config"),
+            format!(
+                "[core]\n    useReplaceRefs = true\n[filter \"evil\"]\n    smudge = \"touch {}\"\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+
+        let actual = standard_reader(&repository)
+            .hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source)
+            .unwrap();
+        let expected = hash_git_tree(
+            [
+                GitTreeEntry::RegularFile {
+                    path: b"sai.package",
+                    content: b"package acme:sample @ 1.0.0\n",
+                },
+                GitTreeEntry::RegularFile {
+                    path: b"src/main.sai",
+                    content: b"pub fn answer() -> i32 { 42 }\n",
+                },
+                GitTreeEntry::Symlink { path: b"link" },
+                GitTreeEntry::Gitlink {
+                    path: b"dependency",
+                },
+                GitTreeEntry::Directory { path: b"src" },
+            ],
+            TreeHashPurpose::Source,
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn reads_sha256_object_databases() {
+        let repository = BareTestRepository::new_sha256();
+        let (_, commit) = full_test_tree(&repository.repository);
+        let reader =
+            GitTreeReader::open(repository.objects_directory(), gix::hash::Kind::Sha256).unwrap();
+
+        let actual = reader
+            .hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source)
+            .unwrap();
+
+        assert!(actual.checksum.starts_with("sai1:"));
+        assert_eq!(actual.warnings.len(), 2);
+    }
+
+    #[test]
+    fn wit_hash_keeps_source_excluded_directories() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+        let reader = standard_reader(&repository);
+
+        let source = reader
+            .hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source)
+            .unwrap();
+        let wit = reader
+            .hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Wit)
+            .unwrap();
+
+        assert_ne!(source.checksum, wit.checksum);
+        assert_eq!(wit.warnings.len(), 2);
+    }
+
+    #[test]
+    fn rejects_invalid_or_non_directory_package_paths() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.hash_commit_tree(&commit, b"packages/missing", TreeHashPurpose::Source),
+            Err(GitTreeReadError::MissingPackageDirectory)
+        );
+        assert_eq!(
+            reader.hash_commit_tree(
+                &commit,
+                b"packages/acme/sai.package",
+                TreeHashPurpose::Source
+            ),
+            Err(GitTreeReadError::PackagePathNotDirectory)
+        );
+        assert!(matches!(
+            reader.hash_commit_tree(&commit, b"packages/../acme", TreeHashPurpose::Source),
+            Err(GitTreeReadError::Hash(TreeHashError::InvalidPath { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_tree_names_and_duplicate_entries() {
+        let repository = BareTestRepository::new();
+        let blob = write_blob(&repository.repository, b"content\n");
+        let duplicate_tree = write_tree(
+            &repository.repository,
+            [
+                (b"same".as_slice(), EntryKind::Blob, blob),
+                (b"same".as_slice(), EntryKind::Blob, blob),
+            ],
+        );
+        let duplicate_commit = write_commit(&repository.repository, duplicate_tree);
+        let slash_tree = write_tree(
+            &repository.repository,
+            [(b"folder/file".as_slice(), EntryKind::Blob, blob)],
+        );
+        let slash_commit = write_commit(&repository.repository, slash_tree);
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.hash_commit_tree(&duplicate_commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::InvalidTreeEntry)
+        );
+        assert_eq!(
+            reader.hash_commit_tree(&slash_commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::InvalidTreeEntry)
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_regular_file_modes() {
+        let repository = BareTestRepository::new();
+        let blob = write_blob(&repository.repository, b"content\n");
+        let tree = repository
+            .repository
+            .write_object(gix::objs::Tree {
+                entries: vec![Entry {
+                    mode: gix::objs::tree::EntryMode::try_from(0o100664).unwrap(),
+                    filename: b"file".to_vec().into(),
+                    oid: blob,
+                }],
+            })
+            .unwrap()
+            .detach();
+        let commit = write_commit(&repository.repository, tree);
+
+        assert_eq!(
+            standard_reader(&repository).hash_commit_tree(&commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::InvalidTreeEntry)
+        );
+    }
+
+    #[test]
+    fn rejects_object_databases_with_alternates() {
+        let repository = BareTestRepository::new();
+        let alternates = repository.objects_directory().join("info/alternates");
+        std::fs::create_dir_all(alternates.parent().unwrap()).unwrap();
+        std::fs::write(&alternates, "/outside/objects\n").unwrap();
+
+        assert_eq!(
+            GitTreeReader::open(repository.objects_directory(), gix::hash::Kind::Sha1)
+                .err()
+                .unwrap(),
+            GitTreeReadError::AlternatesUnsupported
+        );
+    }
+
+    #[test]
+    fn does_not_resolve_alternates_added_after_open() {
+        let repository = BareTestRepository::new();
+        let alternate_repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&alternate_repository.repository);
+        let reader = standard_reader(&repository);
+        let alternates = repository.objects_directory().join("info/alternates");
+        std::fs::create_dir_all(alternates.parent().unwrap()).unwrap();
+        std::fs::write(
+            alternates,
+            format!("{}\n", alternate_repository.objects_directory().display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reader.hash_commit_tree(&commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::InvalidCommitObject)
+        );
+    }
+
+    #[test]
+    fn reads_objects_from_multiple_pack_indexes_without_a_multi_pack_index() {
+        let repository = BareTestRepository::new();
+        let blob = write_blob(&repository.repository, b"packed package data\n");
+        let tree = write_tree(
+            &repository.repository,
+            [(b"file.sai".as_slice(), EntryKind::Blob, blob)],
+        );
+        let commit = write_commit(&repository.repository, tree);
+
+        write_pack(&repository, &[commit, tree]);
+        write_pack(&repository, &[blob]);
+        for object_id in [commit, tree, blob] {
+            std::fs::remove_file(loose_object_path(&repository, &object_id)).unwrap();
+        }
+
+        let packed_indices = std::fs::read_dir(repository.objects_directory().join("pack"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "idx"))
+            .count();
+        assert_eq!(packed_indices, 2);
+        assert!(
+            !repository
+                .objects_directory()
+                .join("pack/multi-pack-index")
+                .exists()
+        );
+
+        let actual = standard_reader(&repository)
+            .hash_commit_tree(&commit, b"", TreeHashPurpose::Source)
+            .unwrap();
+        let expected = hash_git_tree(
+            [GitTreeEntry::RegularFile {
+                path: b"file.sai",
+                content: b"packed package data\n",
+            }],
+            TreeHashPurpose::Source,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn verifies_commit_object_ids() {
+        let repository = BareTestRepository::new();
+        let tree = write_tree(&repository.repository, []);
+        let expected_commit =
+            write_commit_with_message(&repository.repository, tree, "original commit");
+        let replacement_commit =
+            write_commit_with_message(&repository.repository, tree, "tampered commit");
+        overwrite_loose_object(&repository, &expected_commit, &replacement_commit);
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.hash_commit_tree(&expected_commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::ObjectIdMismatch)
+        );
+    }
+
+    #[test]
+    fn verifies_tree_object_ids() {
+        let repository = BareTestRepository::new();
+        let original_blob = write_blob(&repository.repository, b"left");
+        let replacement_blob = write_blob(&repository.repository, b"rght");
+        let expected_tree = write_tree(
+            &repository.repository,
+            [(b"file".as_slice(), EntryKind::Blob, original_blob)],
+        );
+        let replacement_tree = write_tree(
+            &repository.repository,
+            [(b"file".as_slice(), EntryKind::Blob, replacement_blob)],
+        );
+        let commit = write_commit(&repository.repository, expected_tree);
+        overwrite_loose_object(&repository, &expected_tree, &replacement_tree);
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.hash_commit_tree(&commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::ObjectIdMismatch)
+        );
+    }
+
+    #[test]
+    fn verifies_blob_object_ids() {
+        let repository = BareTestRepository::new();
+        let expected_blob = write_blob(&repository.repository, b"left");
+        let replacement_blob = write_blob(&repository.repository, b"rght");
+        let tree = write_tree(
+            &repository.repository,
+            [(b"file".as_slice(), EntryKind::Blob, expected_blob)],
+        );
+        let commit = write_commit(&repository.repository, tree);
+        overwrite_loose_object(&repository, &expected_blob, &replacement_blob);
+        let reader = standard_reader(&repository);
+
+        assert_eq!(
+            reader.hash_commit_tree(&commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::ObjectIdMismatch)
+        );
+    }
+
+    #[test]
+    fn applies_each_package_tree_limit() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+        let limits = Limits {
+            file_count: 1,
+            file_bytes: 4,
+            package_bytes: 4,
+            metadata_object_bytes: MAX_GIT_METADATA_OBJECT_BYTES,
+            tree_entry_count: MAX_PACKAGE_TREE_ENTRIES,
+            path_bytes: MAX_PACKAGE_TREE_PATH_BYTES,
+        };
+        let reader = GitTreeReader::open_with_limits(
+            repository.objects_directory(),
+            gix::hash::Kind::Sha1,
+            limits,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            reader.hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source),
+            Err(GitTreeReadError::PackageTooLarge {
+                limit: GitTreeLimit::FileBytes,
+                actual,
+            }) if actual > 4
+        ));
+
+        let limits = Limits {
+            file_count: 1,
+            file_bytes: MAX_PACKAGE_FILE_BYTES,
+            package_bytes: MAX_PACKAGE_CONTENT_BYTES,
+            metadata_object_bytes: MAX_GIT_METADATA_OBJECT_BYTES,
+            tree_entry_count: MAX_PACKAGE_TREE_ENTRIES,
+            path_bytes: MAX_PACKAGE_TREE_PATH_BYTES,
+        };
+        let reader = GitTreeReader::open_with_limits(
+            repository.objects_directory(),
+            gix::hash::Kind::Sha1,
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source),
+            Err(GitTreeReadError::PackageTooLarge {
+                limit: GitTreeLimit::FileCount,
+                actual: 2,
+            })
+        ));
+
+        let limits = Limits {
+            file_count: 1,
+            file_bytes: MAX_PACKAGE_FILE_BYTES,
+            package_bytes: MAX_PACKAGE_CONTENT_BYTES,
+            metadata_object_bytes: MAX_GIT_METADATA_OBJECT_BYTES,
+            tree_entry_count: 5,
+            path_bytes: MAX_PACKAGE_TREE_PATH_BYTES,
+        };
+        let reader = GitTreeReader::open_with_limits(
+            repository.objects_directory(),
+            gix::hash::Kind::Sha1,
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source),
+            Err(GitTreeReadError::PackageTooLarge {
+                limit: GitTreeLimit::TreeEntryCount,
+                ..
+            })
+        ));
+
+        let limits = Limits {
+            file_count: MAX_PACKAGE_FILE_COUNT,
+            file_bytes: MAX_PACKAGE_FILE_BYTES,
+            package_bytes: MAX_PACKAGE_CONTENT_BYTES,
+            metadata_object_bytes: MAX_GIT_METADATA_OBJECT_BYTES,
+            tree_entry_count: MAX_PACKAGE_TREE_ENTRIES,
+            path_bytes: 4,
+        };
+        let reader = GitTreeReader::open_with_limits(
+            repository.objects_directory(),
+            gix::hash::Kind::Sha1,
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source),
+            Err(GitTreeReadError::PackageTooLarge {
+                limit: GitTreeLimit::PathBytes,
+                actual,
+            }) if actual > 4
+        ));
+    }
+
+    #[test]
+    fn stops_decoding_when_tree_entry_budget_is_exhausted() {
+        let repository = BareTestRepository::new();
+        let blob = write_blob(&repository.repository, b"x");
+        let entries = (0..100)
+            .map(|index| Entry {
+                mode: EntryKind::Blob.into(),
+                filename: format!("file-{index:03}").into_bytes().into(),
+                oid: blob,
+            })
+            .collect();
+        let tree = repository
+            .repository
+            .write_object(gix::objs::Tree { entries })
+            .unwrap()
+            .detach();
+        let commit = write_commit(&repository.repository, tree);
+        let limits = Limits {
+            file_count: MAX_PACKAGE_FILE_COUNT,
+            file_bytes: MAX_PACKAGE_FILE_BYTES,
+            package_bytes: MAX_PACKAGE_CONTENT_BYTES,
+            metadata_object_bytes: MAX_GIT_METADATA_OBJECT_BYTES,
+            tree_entry_count: 3,
+            path_bytes: MAX_PACKAGE_TREE_PATH_BYTES,
+        };
+        let reader = GitTreeReader::open_with_limits(
+            repository.objects_directory(),
+            gix::hash::Kind::Sha1,
+            limits,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            reader.hash_commit_tree(&commit, b"", TreeHashPurpose::Source),
+            Err(GitTreeReadError::PackageTooLarge {
+                limit: GitTreeLimit::TreeEntryCount,
+                actual: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn uses_fixed_limits_documented_for_package_sources() {
+        assert_eq!(MAX_PACKAGE_FILE_COUNT, 100_000);
+        assert_eq!(MAX_PACKAGE_FILE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MAX_PACKAGE_CONTENT_BYTES, 1024 * 1024 * 1024);
+        assert_eq!(MAX_GIT_METADATA_OBJECT_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_PACKAGE_TREE_ENTRIES, 1_000_000);
+        assert_eq!(MAX_PACKAGE_TREE_PATH_BYTES, 64 * 1024 * 1024);
+    }
+}

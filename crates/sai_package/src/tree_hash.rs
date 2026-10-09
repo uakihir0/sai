@@ -284,7 +284,7 @@ pub fn validate_tree_path(path: &[u8]) -> Result<(), TreeHashError> {
     Ok(())
 }
 
-fn should_skip_path(path: &[u8], purpose: TreeHashPurpose) -> bool {
+pub(crate) fn should_skip_path(path: &[u8], purpose: TreeHashPurpose) -> bool {
     let components = path.split(|byte| *byte == b'/');
     if components.clone().any(|component| component == b".git") {
         return true;
@@ -320,21 +320,46 @@ fn is_reserved_device_name(component: &str) -> bool {
 }
 
 fn reject_casefold_collisions(files: &[(&[u8], &[u8])]) -> Result<(), TreeHashError> {
-    let mut folded_paths = BTreeMap::<String, &[u8]>::new();
+    struct FoldedPath<'a> {
+        node_id: usize,
+        raw_component: &'a [u8],
+        representative_path: &'a [u8],
+        is_file: bool,
+    }
+
+    let mut folded_paths = BTreeMap::<(usize, String), FoldedPath<'_>>::new();
+    let mut next_node_id = 1;
     for (path, _) in files {
         let text = std::str::from_utf8(path)
             .expect("file paths were validated before collision detection");
-        let normalized: String = text.nfc().collect();
-        let folded = full_case_fold(&normalized);
-        if let Some(first) = folded_paths.get(&folded) {
-            if *first != *path {
-                return Err(TreeHashError::PathCollision {
-                    first: first.to_vec(),
-                    second: path.to_vec(),
-                });
+        let mut parent_id = 0;
+        let mut components = text.split('/').peekable();
+        while let Some(component) = components.next() {
+            let normalized: String = component.nfc().collect();
+            let key = (parent_id, full_case_fold(&normalized));
+            let is_file = components.peek().is_none();
+            if let Some(first) = folded_paths.get(&key) {
+                if first.raw_component != component.as_bytes() || first.is_file != is_file {
+                    return Err(TreeHashError::PathCollision {
+                        first: first.representative_path.to_vec(),
+                        second: path.to_vec(),
+                    });
+                }
+                parent_id = first.node_id;
+            } else {
+                let node_id = next_node_id;
+                next_node_id += 1;
+                folded_paths.insert(
+                    key,
+                    FoldedPath {
+                        node_id,
+                        raw_component: component.as_bytes(),
+                        representative_path: path,
+                        is_file,
+                    },
+                );
+                parent_id = node_id;
             }
-        } else {
-            folded_paths.insert(folded, path);
         }
     }
     Ok(())
@@ -572,6 +597,34 @@ mod tests {
                     },
                     GitTreeEntry::RegularFile {
                         path: second.as_bytes(),
+                        content: b"two",
+                    },
+                ],
+                TreeHashPurpose::Source,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, TreeHashError::PathCollision { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_collisions_between_file_and_directory_components() {
+        for (first, second) in [
+            (b"Name".as_slice(), b"name/child".as_slice()),
+            (b"same".as_slice(), b"same/child".as_slice()),
+            ("\u{00e9}".as_bytes(), "e\u{0301}/child".as_bytes()),
+        ] {
+            let error = hash_git_tree(
+                [
+                    GitTreeEntry::RegularFile {
+                        path: first,
+                        content: b"one",
+                    },
+                    GitTreeEntry::RegularFile {
+                        path: second,
                         content: b"two",
                     },
                 ],

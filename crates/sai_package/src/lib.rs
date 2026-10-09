@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod git_tree;
 pub mod identity;
 pub mod lexer;
 pub mod local_source;

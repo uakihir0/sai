@@ -696,14 +696,18 @@ checksum = "3d199d515cbdcf05f531f3859be9771fc12acac7b7fe0f5b581b2c1ab1c3a61e"
 dependencies = [
  "clru",
  "gix-chunk",
+ "gix-diff",
  "gix-error",
  "gix-features",
  "gix-hash",
  "gix-hashtable",
  "gix-object",
  "gix-path",
+ "gix-tempfile",
+ "gix-traverse",
  "gix-zlib",
  "memmap2",
+ "parking_lot",
  "smallvec",
  "thiserror",
 ]
@@ -1283,6 +1287,7 @@ name = "sai_package"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "gix-pack",
  "libc",
  "rustix",
  "sai_diagnostics",
