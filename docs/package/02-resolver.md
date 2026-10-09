@@ -175,7 +175,7 @@ The row `>=1.2, <1.8` shows that `1.8.0-rc.1` lies below `1.8.0` and is admitted
    - for a `from path` edge, the version declared by the path package (§2.7.1);
    - otherwise `min(e.req)`.
 4. **Floors** `F` map nodes to versions. In Mode B they are the versions of the lock entries (§2.10.3), adjusted by `sai update` (§2.10.5).
-5. **Pins** `P` map nodes to a path source and its declared version (§2.7). Pins from root overrides are known before selection; pins from `from path` edges are added when the edge is processed.
+5. **Pins** `P` map nodes to a path source and its declared version (§2.7). Root-override pins `P₀` are known before selection; pins from `from path` edges are added when the edge is processed.
 
 ### 2.4.2 Phase 1: selection
 
@@ -192,9 +192,11 @@ procedure Select(root, F, P):
         n := (id, line(v))
         if n = (root.id, line(root.version)):
             report DEPENDENCY_CYCLE (requirer reaches the root)        -- §2.4.4
+        if e is a path edge:
+            add its pin to P[n]                                        -- §2.7
         if n not in touched:
             add n to touched
-            if n in F and n not in P:
+            if n in F and n not in P₀:
                 Name(id, F[n], LOCK, none)                             -- lock floor, N-G-24
         if requirer != LOCK:
             add (requirer, e) to named[(id, v)]
@@ -212,14 +214,16 @@ procedure Select(root, F, P):
         read[(id, v)] := (s, c)
         for e in Edges((id, v), c):
             Name(e.id, NamedVersion(e), (id, v), e)
+    for n in nodes pinned by a from-path edge:
+        sel[n] := P[n].version                                    -- exclude its floor
     return sel, named, read
 ```
 
-1. Selection visits every package version that is named by an edge of a visited version, starting at the root, including versions that will not be selected (Go's MVS, D-PKG-02). The set of visited versions is the closure of the root under "named by a visited version", so it does not depend on the order of the queue.
-2. `sel[n]` is the maximum of the named versions of the node, including its floor: "the maximum of the minimums" of D-PKG-02.
+1. Selection visits every package version that is named by an edge of a visited version, starting at the root, including versions that will not be selected (Go's MVS, D-PKG-02). It also visits the floor version of each reached node that is not pinned by a root override. A `from path` pin discovered later does not remove an already queued or read floor version from this candidate closure; its edges can therefore name versions of other nodes. This rule makes the closure independent of queue order.
+2. For an unpinned node, `sel[n]` is the maximum of its named versions and floor: "the maximum of the minimums" of D-PKG-02. For a node pinned by a `from path` edge, `sel[n]` is exactly the declared path version; the floor version can still contribute edges to the candidate closure but does not select that node.
 3. Each package version is read at most once. The queue order fixes which edges are already known when a version is read, which matters only for the choice of the source to read it from (§2.8.2).
-4. A floor applies only when its node is reached by an edge (N-G-24). This refines "lock entries are additional root requirements" of D-PKG-02: entries for nodes that nothing requires any more are dropped instead of being kept alive forever.
-5. Floors are not applied to pinned nodes: a path package always has exactly its declared version.
+4. A floor is added only when its node is reached by an edge (N-G-24). This refines "lock entries are additional root requirements" of D-PKG-02: entries for nodes that nothing requires any more are dropped instead of being kept alive forever. A root-override pin suppresses the floor before traversal begins; a `from path` pin overrides the node's final selected version after candidate traversal.
+5. A path package always has exactly its declared version. If another edge's minimum is above that version or an upper bound excludes it, phase 2 reports `VERSION_CONFLICT` (§2.7.1, §2.4.3). Floors of reached candidate versions are still visited as specified above.
 
 ### 2.4.3 Phase 2: the selected graph and the range check
 
@@ -260,10 +264,10 @@ procedure Check(root, sel, read, P):
 
 ### 2.4.5 Properties
 
-1. **Existence and uniqueness.** `Select` always terminates with a unique `sel`: every visited version is read once, the number of visited versions is bounded by the versions named in the fetched contracts, and the maximum is unique because precedence is a total order (§2.2.2).
-2. **Minimality.** `sel[n]` is the least version that is at least every version named for `n` by a visited package version or a floor, and it is one of those named versions. Selection never invents a version (§2.3.3 rule 2).
+1. **Existence and uniqueness.** `Select` always terminates with a unique `sel`: every visited version is read once, the number of visited versions is bounded by the versions named in fetched contracts plus the floor version of each reached node, and the maximum for an unpinned node is unique because precedence is a total order (§2.2.2).
+2. **Minimality.** For an unpinned node, `sel[n]` is the least version that is at least every version named for `n` by a visited package version or a floor, and it is one of those named versions. For a path-pinned node, `sel[n]` is exactly the declared path version. Selection never invents a version (§2.3.3 rule 2).
 3. **Reproducibility.** For the same inputs (§2.14.1), `Select` and `Check` produce the same `G`. When a newer release of a dependency is published, the result does not change until a requirement or the lock names it (high-fidelity builds).
-4. **Failure is explained, not searched around.** A conflict means that some upper bound of an edge in `G` is below the maximum of the minimums of its node. That maximum may come from a version that was visited but not selected (Go's MVS counts every visited version); the explanation then marks the requirer as "not selected" (§2.13.1). A different assignment might satisfy every edge of `G`, but finding it would need search, which D-PKG-02 excludes. The fix is a change of requirements, an update of the package that sets the upper bound, or an override (§2.13.3).
+4. **Failure is explained, not searched around.** For an unpinned node, a conflict means that some upper bound of an edge in `G` is below the maximum of the minimums of its node. That maximum may come from a version that was visited but not selected (Go's MVS counts every visited version); the explanation then marks the requirer as "not selected" (§2.13.1). For a pinned node, a conflict means that the pin's version fails any requirement of an edge in `G`. A different assignment might satisfy every edge of `G`, but finding it would need search, which D-PKG-02 excludes. The fix is a change of requirements, an update of the package that sets the upper bound, or an override (§2.13.3).
 
 ---
 
@@ -354,7 +358,7 @@ A package fetched from Git may use `from path` to refer to another package in th
 
 Overrides are root-only ([01 §1.16](01-package-contract.md)). Their effect on resolution:
 
-1. `<id> use path "<dir>"`: the package at `<dir>` (relative to the root) is read; let `pv` be its declared version and `n = (<id>, line(pv))`. Every edge to `n` has its source replaced by the path and names `pv` (§2.4.1 rule 3); `n` is pinned. Edges to other lines of `<id>` are not affected (N-G-17). Each edge's requirement is still checked against `pv`; a violation is `VERSION_CONFLICT` with the override as one side.
+1. `<id> use path "<dir>"`: the package at `<dir>` (relative to the root) is read; let `pv` be its declared version and `n = (<id>, line(pv))`. Every edge to `n` has its source replaced by the path and names `pv` (§2.4.1 rule 3); `n` is pinned. Edges to other lines of `<id>` are not affected (N-G-17). Each edge's requirement is still checked against `pv` in phase 2; a violation is `VERSION_CONFLICT` with the override as one side.
 2. `<id> use git "<url>" [dir "<d>"]`: every edge to any line of `<id>` has its source replaced by the override's source. Versions are selected normally and fetched from the override's release tags.
 3. `<id> use artifact`: no effect on resolution. It selects the artifact form in the cases of [04 §4.5.1](04-distribution-and-security.md).
 4. An override that matches no edge of `G` is the warning `UNUSED_OVERRIDE`. An override of a package that is a node only through edges that are not included (§2.5.2) is also unused.

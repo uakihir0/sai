@@ -8,6 +8,7 @@ pub mod lock_root_contract;
 pub mod lock_serialization;
 pub mod lock_validation;
 pub mod manifest;
+pub mod mvs;
 pub mod package_path;
 pub mod validation;
 pub mod version;
