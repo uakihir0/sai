@@ -388,6 +388,25 @@ pub struct MvsSelectionOutput {
     errors: Vec<MvsSelectionError>,
 }
 
+/// Failure to select with a contract provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvsSelectionProviderError<E> {
+    Input(Vec<MvsInputError>),
+    ContractProvider {
+        failures: Vec<MvsContractProviderFailure<E>>,
+        /// Partial selection retains graph errors found on independent
+        /// branches, including a known cycle back to the root.
+        partial_selection: Box<MvsSelectionOutput>,
+    },
+}
+
+/// One package contract that a provider could not load.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvsContractProviderFailure<E> {
+    pub request: MvsContractRequest,
+    pub error: E,
+}
+
 impl MvsSelectionOutput {
     fn new(root_contract: MvsContract) -> Self {
         Self {
@@ -479,6 +498,58 @@ pub fn select(
     floors: &HashMap<MvsNode, Version>,
     pins: &HashMap<MvsNode, Version>,
 ) -> Result<MvsSelectionOutput, Vec<MvsInputError>> {
+    select_impl(root, floors, pins, |request| {
+        contracts.get(&request.package_version).cloned()
+    })
+}
+
+/// Runs deterministic MVS selection while loading each contract when its
+/// concrete package version leaves the queue.
+///
+/// The provider receives the exact `named_by` snapshot at that dequeue point,
+/// including when only a lock floor introduced the version. It can use the
+/// requiring package versions and spans to find source clauses in the
+/// corresponding manifests. Before returning a contract, it is responsible
+/// for verifying the source identity and version and parsing and semantically
+/// validating the manifest. Each concrete version is requested at most once.
+/// The result contains the selection and every loaded contract. Provider
+/// failures are collected while other branches continue, so the partial
+/// selection retains independent errors such as a known cycle to the root.
+/// Graph range checks and selected-version cycle checks remain separate.
+pub fn select_with_provider<E>(
+    root: &MvsContract,
+    floors: &HashMap<MvsNode, Version>,
+    pins: &HashMap<MvsNode, Version>,
+    mut load_contract: impl FnMut(&MvsContractRequest) -> Result<MvsContract, E>,
+) -> Result<MvsSelectionOutput, MvsSelectionProviderError<E>> {
+    let mut failures = Vec::new();
+    let selection = select_impl(root, floors, pins, |request| match load_contract(request) {
+        Ok(contract) => Some(contract),
+        Err(error) => {
+            failures.push(MvsContractProviderFailure {
+                request: request.clone(),
+                error,
+            });
+            None
+        }
+    })
+    .map_err(MvsSelectionProviderError::Input)?;
+    if failures.is_empty() {
+        Ok(selection)
+    } else {
+        Err(MvsSelectionProviderError::ContractProvider {
+            failures,
+            partial_selection: Box::new(selection),
+        })
+    }
+}
+
+fn select_impl(
+    root: &MvsContract,
+    floors: &HashMap<MvsNode, Version>,
+    pins: &HashMap<MvsNode, Version>,
+    mut load_contract: impl FnMut(&MvsContractRequest) -> Option<MvsContract>,
+) -> Result<MvsSelectionOutput, Vec<MvsInputError>> {
     let mut state = MvsSelectionState::new(root.clone(), floors, pins);
 
     for edge in &root.edges {
@@ -491,20 +562,23 @@ pub fn select(
         if !state.read.insert(package_version.clone()) {
             continue;
         }
-        let named_by = state
+        let mut named_by = state
             .output
             .named_by
             .get(&package_version)
             .cloned()
             .unwrap_or_default();
+        sort_named_edge_list(&mut named_by);
         let node = package_version.node();
         let lock_floor = state.output.reached_floors.get(&node) == Some(package_version.version());
-        state.output.contract_requests.push(MvsContractRequest {
+        let request = MvsContractRequest {
             package_version: package_version.clone(),
             named_by: named_by.clone(),
             lock_floor,
-        });
-        let Some(contract) = contracts.get(&package_version) else {
+        };
+        state.output.contract_requests.push(request.clone());
+        let contract = load_contract(&request);
+        let Some(contract) = contract else {
             state.output.errors.push(MvsSelectionError {
                 kind: MvsSelectionErrorKind::ContractNotProvided(package_version),
                 span: None,
@@ -730,7 +804,8 @@ mod tests {
 
     use super::{
         MvsContract, MvsEdge, MvsInputErrorKind, MvsNamedEdge, MvsNode, MvsPackageVersion,
-        MvsRequirer, MvsSelectionErrorKind, select,
+        MvsRequirer, MvsSelectionErrorKind, MvsSelectionProviderError, select,
+        select_with_provider,
     };
     use crate::version::Version;
     use crate::version_req::VersionReq;
@@ -922,6 +997,114 @@ mod tests {
 
         assert!(request.named_by.is_empty());
         assert!(request.lock_floor);
+    }
+
+    #[test]
+    fn provider_loads_contracts_in_queue_order_and_keeps_dequeue_source_snapshot() {
+        let root = contract(
+            "acme:app",
+            "1.0.0",
+            vec![
+                edge("acme:a", "^1", "1.0.0", 0),
+                edge("acme:zz", "^1", "1.0.0", 1),
+            ],
+        );
+        let mut requests = Vec::new();
+        let output = select_with_provider(&root, &HashMap::new(), &HashMap::new(), |request| {
+            requests.push(request.clone());
+            Ok::<_, &'static str>(match request.package_version.package() {
+                "acme:a" => contract("acme:a", "1.0.0", vec![edge("acme:z", "^1", "1.0.0", 10)]),
+                "acme:z" => contract("acme:z", "1.0.0", vec![]),
+                "acme:zz" => contract("acme:zz", "1.0.0", vec![edge("acme:z", "^1", "1.0.0", 20)]),
+                other => panic!("unexpected package request: {other}"),
+            })
+        })
+        .expect("provider supplies every contract");
+
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.package_version.package())
+                .collect::<Vec<_>>(),
+            ["acme:a", "acme:z", "acme:zz"]
+        );
+        let z_request = requests
+            .iter()
+            .find(|request| request.package_version.package() == "acme:z")
+            .expect("z was requested");
+        assert_eq!(
+            z_request
+                .named_by
+                .iter()
+                .map(|edge| edge.requirer.package_version().package())
+                .collect::<Vec<_>>(),
+            ["acme:a"]
+        );
+        let z = package_version("acme:z", "1.0.0");
+        assert_eq!(output.named_by()[&z].len(), 2);
+        assert_eq!(output.read_named_by()[&z].len(), 1);
+        assert!(output.is_complete());
+    }
+
+    #[test]
+    fn provider_failures_preserve_independent_root_cycles() {
+        let root = contract(
+            "acme:app",
+            "1.0.0",
+            vec![
+                edge("acme:a", "^1", "1.0.0", 0),
+                edge("acme:b", "^1", "1.0.0", 1),
+            ],
+        );
+        let error =
+            select_with_provider(
+                &root,
+                &HashMap::new(),
+                &HashMap::new(),
+                |request| match request.package_version.package() {
+                    "acme:a" => Err("offline"),
+                    "acme:b" => Ok(contract(
+                        "acme:b",
+                        "1.0.0",
+                        vec![edge("acme:app", "^1", "1.0.0", 10)],
+                    )),
+                    other => panic!("unexpected package request: {other}"),
+                },
+            )
+            .expect_err("provider failure is returned");
+
+        assert!(matches!(
+            error,
+            MvsSelectionProviderError::ContractProvider {
+                failures,
+                partial_selection,
+            } if failures.len() == 1
+                && failures[0].request.package_version == package_version("acme:a", "1.0.0")
+                && failures[0].request.named_by.len() == 1
+                && failures[0].error == "offline"
+                && partial_selection.errors().iter().any(|error| matches!(
+                    error.kind,
+                    MvsSelectionErrorKind::DependencyCycleToRoot { .. }
+                ))
+        ));
+    }
+
+    #[test]
+    fn provider_cannot_supply_a_contract_for_another_package_version() {
+        let root = contract("acme:app", "1.0.0", vec![edge("acme:a", "^1", "1.0.0", 0)]);
+        let error = select_with_provider(&root, &HashMap::new(), &HashMap::new(), |_| {
+            Ok::<_, &'static str>(contract("acme:b", "1.0.0", vec![]))
+        })
+        .expect_err("mismatched provider result is rejected");
+
+        assert!(matches!(
+            error,
+            MvsSelectionProviderError::Input(errors)
+                if matches!(
+                    errors[0].kind.as_ref(),
+                    MvsInputErrorKind::ContractKeyMismatch { .. }
+                )
+        ));
     }
 
     #[test]
