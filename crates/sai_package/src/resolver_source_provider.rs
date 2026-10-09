@@ -1,6 +1,6 @@
 //! Drives MVS contract loading through manifest-aware source selection.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::manifest::PackageRole;
 use crate::mvs::{
@@ -75,33 +75,152 @@ pub struct ResolverSourceProviderOutput {
 /// One resolved dependency's read-time and post-Check source choices.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverFinalSourcePlanEntry {
-    pub package_version: MvsPackageVersion,
-    pub read_request: MvsContractRequest,
-    pub final_request: MvsContractRequest,
-    pub read_source: ResolverSourceSelection,
-    pub final_source: ResolverSourceSelection,
+    package_version: MvsPackageVersion,
+    read_request: MvsContractRequest,
+    final_request: MvsContractRequest,
+    read_source: ResolverSourceSelection,
+    final_source: ResolverSourceSelection,
+}
+
+impl ResolverFinalSourcePlanEntry {
+    pub const fn package_version(&self) -> &MvsPackageVersion {
+        &self.package_version
+    }
+
+    pub const fn read_request(&self) -> &MvsContractRequest {
+        &self.read_request
+    }
+
+    pub const fn final_request(&self) -> &MvsContractRequest {
+        &self.final_request
+    }
+
+    pub const fn read_source(&self) -> &ResolverSourceSelection {
+        &self.read_source
+    }
+
+    pub const fn final_source(&self) -> &ResolverSourceSelection {
+        &self.final_source
+    }
 }
 
 /// A selected node whose final source could not be selected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverFinalSourcePlanFailure {
+    package_version: MvsPackageVersion,
+    read_request: MvsContractRequest,
+    read_source: ResolverSourceSelection,
+    error: ResolverSourceSelectionError,
+}
+
+impl ResolverFinalSourcePlanFailure {
+    pub const fn package_version(&self) -> &MvsPackageVersion {
+        &self.package_version
+    }
+
+    pub const fn read_request(&self) -> &MvsContractRequest {
+        &self.read_request
+    }
+
+    pub const fn read_source(&self) -> &ResolverSourceSelection {
+        &self.read_source
+    }
+
+    pub const fn error(&self) -> &ResolverSourceSelectionError {
+        &self.error
+    }
+}
+
+/// Which retained source needed identity resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolverSourceIdentitySide {
+    ReadTime,
+    Final,
+}
+
+/// Why a source identity could not be recorded for a plan entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolverSourceIdentityFailureKind<E> {
+    MissingReadTimeIdentity(Box<MvsPackageVersion>),
+    MissingBaseSourceIdentity(Box<MvsPackageVersion>),
+    FinalBaseSourceIdentityUnavailable(Box<MvsPackageVersion>),
+    FinalSourceSelection(Box<ResolverSourceSelectionError>),
+    PackageVersionMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    Canonicalization(Box<E>),
+}
+
+/// A read-time or final source whose complete identity could not be resolved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverSourceIdentityFailure<E> {
     pub package_version: MvsPackageVersion,
-    pub read_request: MvsContractRequest,
+    pub side: ResolverSourceIdentitySide,
+    /// Present when an actual source selection exists for this side.
+    pub source: Option<ResolverSourceSelection>,
+    pub error: ResolverSourceIdentityFailureKind<E>,
+}
+
+/// A package version whose two source selections resolve to one identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverSameSourceIdentity<K> {
+    pub package_version: MvsPackageVersion,
     pub read_source: ResolverSourceSelection,
-    pub error: ResolverSourceSelectionError,
+    pub final_source: ResolverSourceSelection,
+    pub identity: K,
+}
+
+/// A package version that must be reloaded from its final source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverSourceReload<K> {
+    pub package_version: MvsPackageVersion,
+    pub read_source: ResolverSourceSelection,
+    pub final_source: ResolverSourceSelection,
+    pub read_identity: K,
+    pub final_identity: K,
+}
+
+/// Per-node identity results for the post-`Check` source audit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverSourceIdentityPlan<K, E> {
+    /// Nodes whose read-time and final sources identify the same source tree.
+    pub same_identity: Vec<ResolverSameSourceIdentity<K>>,
+    /// Nodes that must be fetched and revalidated from the final source.
+    pub reloads: Vec<ResolverSourceReload<K>>,
+    /// Final-source selection and identity errors, in package-version/side order.
+    pub failures: Vec<ResolverSourceIdentityFailure<E>>,
 }
 
 /// Read-time and final-source selections for the selected graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverFinalSourcePlan {
     /// Includes range conflicts and dependency-to-dependency cycles.
-    pub graph: MvsSelectedGraph,
+    graph: MvsSelectedGraph,
     /// Selection-time edges back to the root, which are not dependency nodes.
-    pub root_cycles: Vec<MvsSelectionError>,
+    root_cycles: Vec<MvsSelectionError>,
     /// Entries are sorted by package identity and version.
-    pub entries: Vec<ResolverFinalSourcePlanEntry>,
+    entries: Vec<ResolverFinalSourcePlanEntry>,
     /// Independent final-source selection errors, in package-version order.
-    pub failures: Vec<ResolverFinalSourcePlanFailure>,
+    failures: Vec<ResolverFinalSourcePlanFailure>,
+}
+
+impl ResolverFinalSourcePlan {
+    pub const fn graph(&self) -> &MvsSelectedGraph {
+        &self.graph
+    }
+
+    pub fn root_cycles(&self) -> &[MvsSelectionError] {
+        &self.root_cycles
+    }
+
+    pub fn entries(&self) -> &[ResolverFinalSourcePlanEntry] {
+        &self.entries
+    }
+
+    pub fn failures(&self) -> &[ResolverFinalSourcePlanFailure] {
+        &self.failures
+    }
 }
 
 /// A provider result could not be safely paired with its MVS selection.
@@ -547,6 +666,297 @@ pub fn plan_resolver_final_sources(
     })
 }
 
+/// Resolves final source identities and plans conditional reloads.
+///
+/// `read_source_identities` must contain the identities captured when each
+/// source was actually read, including the root and any unselected packages
+/// whose contracts contributed source clauses. The callback resolves only
+/// the final selection. For a Git source its `base_identity` is `None`; for
+/// a path source relative to a selected dependency, it is that dependency's
+/// final identity. For a path source relative to the root or an unselected
+/// package, it is the captured read-time identity of `relative_to`.
+///
+/// The caller owns source identity resolution because it depends on the host
+/// filesystem and Git backend. The returned identity must be complete: local
+/// paths should include lexical normalization and symlink resolution; Git
+/// sources should include the canonical repository URL, resolved commit, and
+/// normalized directory; a Git-relative path should include the requiring
+/// package's source identity and normalized tree path. If a path is relative
+/// to another selected dependency, that dependency's final identity is
+/// resolved first. A failed or cyclic selected base is an error, never a
+/// reason to fall back to its read-time identity. Both the captured read
+/// identity and final identity are checked for every entry so independent
+/// missing-identity and canonicalization errors are retained. Final-source
+/// selection failures from the input plan are included in the returned
+/// failures so a caller receives a complete audit result.
+pub fn plan_resolver_source_reloads<K, E>(
+    plan: &ResolverFinalSourcePlan,
+    read_source_identities: &BTreeMap<MvsPackageVersion, K>,
+    mut resolve_final_identity: impl FnMut(
+        &MvsPackageVersion,
+        &ResolverSourceSelection,
+        Option<&K>,
+    ) -> Result<K, E>,
+) -> ResolverSourceIdentityPlan<K, E>
+where
+    K: Clone + Eq,
+{
+    let mut same_identity = Vec::new();
+    let mut reloads = Vec::new();
+    let mut failures = Vec::new();
+
+    let entries_by_version = plan
+        .entries
+        .iter()
+        .map(|entry| (entry.package_version.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let selected_versions = plan
+        .graph
+        .dependencies
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut dependents = BTreeMap::<MvsPackageVersion, Vec<MvsPackageVersion>>::new();
+    let mut base_dependencies = BTreeMap::<MvsPackageVersion, MvsPackageVersion>::new();
+    let mut dependency_counts = BTreeMap::new();
+    let mut ready = BTreeSet::new();
+    let mut final_identities = BTreeMap::new();
+    let mut final_identity_failures = BTreeMap::new();
+
+    for entry in &plan.entries {
+        dependency_counts.insert(entry.package_version.clone(), 0);
+        match entry.final_source.source() {
+            ResolverPackageSource::Git { .. } => {
+                ready.insert(entry.package_version.clone());
+            }
+            ResolverPackageSource::Path { relative_to, .. } => {
+                if selected_versions.contains(relative_to) {
+                    if entries_by_version.contains_key(relative_to) {
+                        base_dependencies
+                            .insert(entry.package_version.clone(), relative_to.clone());
+                        dependents
+                            .entry(relative_to.clone())
+                            .or_default()
+                            .push(entry.package_version.clone());
+                        dependency_counts.insert(entry.package_version.clone(), 1);
+                    } else {
+                        final_identity_failures.insert(
+                            entry.package_version.clone(),
+                            ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(
+                                Box::new(relative_to.clone()),
+                            ),
+                        );
+                        ready.insert(entry.package_version.clone());
+                    }
+                } else if !read_source_identities.contains_key(relative_to) {
+                    final_identity_failures.insert(
+                        entry.package_version.clone(),
+                        ResolverSourceIdentityFailureKind::MissingBaseSourceIdentity(Box::new(
+                            relative_to.clone(),
+                        )),
+                    );
+                    ready.insert(entry.package_version.clone());
+                } else {
+                    ready.insert(entry.package_version.clone());
+                }
+            }
+        }
+    }
+
+    while let Some(package_version) = ready.pop_first() {
+        let entry = entries_by_version
+            .get(&package_version)
+            .expect("every ready identity has a source-plan entry");
+        if !final_identity_failures.contains_key(&package_version) {
+            let result = if entry.final_source.package_version() != &entry.package_version {
+                Err(ResolverSourceIdentityFailureKind::PackageVersionMismatch {
+                    expected: Box::new(entry.package_version.clone()),
+                    found: Box::new(entry.final_source.package_version().clone()),
+                })
+            } else {
+                match entry.final_source.source() {
+                    ResolverPackageSource::Git { .. } => {
+                        resolve_final_identity(&entry.package_version, &entry.final_source, None)
+                            .map_err(|error| {
+                                ResolverSourceIdentityFailureKind::Canonicalization(Box::new(error))
+                            })
+                    }
+                    ResolverPackageSource::Path { relative_to, .. } => {
+                        let base_identity = if selected_versions.contains(relative_to) {
+                            final_identities.get(relative_to)
+                        } else {
+                            read_source_identities.get(relative_to)
+                        };
+                        match base_identity {
+                            Some(identity) => resolve_final_identity(
+                                &entry.package_version,
+                                &entry.final_source,
+                                Some(identity),
+                            )
+                            .map_err(|error| {
+                                ResolverSourceIdentityFailureKind::Canonicalization(Box::new(
+                                    error,
+                                ))
+                            }),
+                            None if selected_versions.contains(relative_to) => Err(
+                                ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(
+                                    Box::new(relative_to.clone()),
+                                ),
+                            ),
+                            None => Err(
+                                ResolverSourceIdentityFailureKind::MissingBaseSourceIdentity(
+                                    Box::new(relative_to.clone()),
+                                ),
+                            ),
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(identity) => {
+                    final_identities.insert(package_version.clone(), identity);
+                }
+                Err(error) => {
+                    final_identity_failures.insert(package_version.clone(), error);
+                }
+            }
+        }
+
+        if let Some(dependent_versions) = dependents.get(&package_version) {
+            for dependent_version in dependent_versions {
+                let count = dependency_counts
+                    .get_mut(dependent_version)
+                    .expect("every selected path dependent has a count");
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(dependent_version.clone());
+                }
+            }
+        }
+    }
+
+    for (package_version, dependency_count) in dependency_counts {
+        if dependency_count > 0 {
+            let relative_to = base_dependencies
+                .get(&package_version)
+                .expect("every unresolved identity depends on a selected base");
+            final_identity_failures.insert(
+                package_version,
+                ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(Box::new(
+                    relative_to.clone(),
+                )),
+            );
+        }
+    }
+
+    let selection_failures = plan
+        .failures
+        .iter()
+        .map(|failure| (failure.package_version.clone(), failure))
+        .collect::<BTreeMap<_, _>>();
+    for package_version in &plan.graph.dependencies {
+        if let Some(selection_failure) = selection_failures.get(package_version) {
+            let read_source = &selection_failure.read_source;
+            if read_source.package_version() != package_version {
+                failures.push(ResolverSourceIdentityFailure {
+                    package_version: package_version.clone(),
+                    side: ResolverSourceIdentitySide::ReadTime,
+                    source: Some(read_source.clone()),
+                    error: ResolverSourceIdentityFailureKind::PackageVersionMismatch {
+                        expected: Box::new(package_version.clone()),
+                        found: Box::new(read_source.package_version().clone()),
+                    },
+                });
+            } else if !read_source_identities.contains_key(package_version) {
+                failures.push(ResolverSourceIdentityFailure {
+                    package_version: package_version.clone(),
+                    side: ResolverSourceIdentitySide::ReadTime,
+                    source: Some(read_source.clone()),
+                    error: ResolverSourceIdentityFailureKind::MissingReadTimeIdentity(Box::new(
+                        package_version.clone(),
+                    )),
+                });
+            }
+            failures.push(ResolverSourceIdentityFailure {
+                package_version: package_version.clone(),
+                side: ResolverSourceIdentitySide::Final,
+                source: None,
+                error: ResolverSourceIdentityFailureKind::FinalSourceSelection(Box::new(
+                    selection_failure.error.clone(),
+                )),
+            });
+            continue;
+        }
+
+        let entry = entries_by_version
+            .get(package_version)
+            .expect("every selected node has a source entry or a source-selection failure");
+        let read_identity = if entry.read_source.package_version() != package_version {
+            failures.push(ResolverSourceIdentityFailure {
+                package_version: package_version.clone(),
+                side: ResolverSourceIdentitySide::ReadTime,
+                source: Some(entry.read_source.clone()),
+                error: ResolverSourceIdentityFailureKind::PackageVersionMismatch {
+                    expected: Box::new(package_version.clone()),
+                    found: Box::new(entry.read_source.package_version().clone()),
+                },
+            });
+            None
+        } else if let Some(identity) = read_source_identities.get(package_version) {
+            Some(identity.clone())
+        } else {
+            failures.push(ResolverSourceIdentityFailure {
+                package_version: package_version.clone(),
+                side: ResolverSourceIdentitySide::ReadTime,
+                source: Some(entry.read_source.clone()),
+                error: ResolverSourceIdentityFailureKind::MissingReadTimeIdentity(Box::new(
+                    package_version.clone(),
+                )),
+            });
+            None
+        };
+        let final_identity = if let Some(identity) = final_identities.remove(package_version) {
+            Some(identity)
+        } else {
+            if let Some(error) = final_identity_failures.remove(package_version) {
+                failures.push(ResolverSourceIdentityFailure {
+                    package_version: package_version.clone(),
+                    side: ResolverSourceIdentitySide::Final,
+                    source: Some(entry.final_source.clone()),
+                    error,
+                });
+            }
+            None
+        };
+
+        let (Some(read_identity), Some(final_identity)) = (read_identity, final_identity) else {
+            continue;
+        };
+        if read_identity == final_identity {
+            same_identity.push(ResolverSameSourceIdentity {
+                package_version: package_version.clone(),
+                read_source: entry.read_source.clone(),
+                final_source: entry.final_source.clone(),
+                identity: read_identity,
+            });
+        } else {
+            reloads.push(ResolverSourceReload {
+                package_version: package_version.clone(),
+                read_source: entry.read_source.clone(),
+                final_source: entry.final_source.clone(),
+                read_identity,
+                final_identity,
+            });
+        }
+    }
+
+    ResolverSourceIdentityPlan {
+        same_identity,
+        reloads,
+        failures,
+    }
+}
+
 fn collect_final_path_pin_failures<K, C>(
     selection: &MvsSelectionOutput,
     root_contract: &ResolverContract,
@@ -660,8 +1070,9 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::{
-        ResolverPackageLoadError, ResolverPathPinProviderFailureKind, ResolverSourceProviderError,
-        plan_resolver_final_sources, select_with_source_provider,
+        ResolverPackageLoadError, ResolverPathPinProviderFailureKind, ResolverSourceIdentitySide,
+        ResolverSourceProviderError, plan_resolver_final_sources, plan_resolver_source_reloads,
+        select_with_source_provider,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{MvsContractRequest, MvsNamedEdge, MvsPackageVersion, MvsRequirer};
@@ -1331,6 +1742,66 @@ requires { acme:dep @ ^1 from git "https://example.test/late-dep" }
         );
         assert!(plan.failures.is_empty());
 
+        let read_source_identities = BTreeMap::from([
+            (dep_version.clone(), "canonical-dep-tree"),
+            (package_version("z:late", "1.0.0"), "late-package-tree"),
+        ]);
+        let same_identity_plan = plan_resolver_source_reloads(
+            &plan,
+            &read_source_identities,
+            |package_version, _source, _base| {
+                Ok::<_, ()>(if package_version.package() == "acme:dep" {
+                    "canonical-dep-tree"
+                } else {
+                    "late-package-tree"
+                })
+            },
+        );
+        assert_eq!(same_identity_plan.same_identity.len(), 2);
+        assert!(same_identity_plan.reloads.is_empty());
+        assert!(same_identity_plan.failures.is_empty());
+
+        let changed_identity_plan = plan_resolver_source_reloads(
+            &plan,
+            &read_source_identities,
+            |package_version, source, _base| {
+                if package_version.package() == "z:late" {
+                    return Err("source identity is unavailable");
+                }
+                let ResolverPackageSource::Git { url, .. } = source.source() else {
+                    panic!("test sources are Git sources")
+                };
+                Ok(if url.as_ref() == "https://example.test/root-dep" {
+                    "root-dep-tree"
+                } else {
+                    "late-dep-tree"
+                })
+            },
+        );
+        assert_eq!(changed_identity_plan.same_identity.len(), 0);
+        assert_eq!(changed_identity_plan.reloads.len(), 1);
+        assert_eq!(
+            changed_identity_plan.reloads[0].package_version,
+            dep_version
+        );
+        assert_eq!(changed_identity_plan.failures.len(), 1);
+        assert_eq!(
+            changed_identity_plan.failures[0].side,
+            ResolverSourceIdentitySide::Final
+        );
+        let missing_read_identities =
+            plan_resolver_source_reloads(&plan, &BTreeMap::new(), |_, _, _| {
+                Ok::<_, ()>("final-tree")
+            });
+        assert!(missing_read_identities.reloads.is_empty());
+        assert_eq!(missing_read_identities.failures.len(), 2);
+        assert!(
+            missing_read_identities
+                .failures
+                .iter()
+                .all(|failure| failure.side == ResolverSourceIdentitySide::ReadTime)
+        );
+
         let alternative_root = parse(
             br#"package zz:root @ 1.0.0
 source "src"
@@ -1376,6 +1847,317 @@ requires { acme:dep @ ^1 from git "https://example.test/other-dep" }
             plan_resolver_final_sources(&output, &context, &HashMap::new()),
             Err(super::ResolverFinalSourcePlanError::ProviderOutputMismatch(version))
                 if *version == dep_version
+        ));
+    }
+
+    #[test]
+    fn final_path_identity_uses_the_captured_source_of_its_requirer() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from path "../dep" }
+"#,
+        );
+        let root_version = package_version("acme:app", "1.0.0");
+        let dep_version = package_version("acme:dep", "1.0.0");
+        let path_packages = BTreeMap::from([(
+            ResolverPathKey::new(root_version.clone(), "../dep"),
+            dep_version.clone(),
+        )]);
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let output = select_with_source_provider(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |_| Ok::<_, ()>("canonical-dependency-path"),
+            |_, _| {
+                let manifest = parse_for_role(
+                    br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                    PackageRole::Dependency,
+                );
+                build_resolver_contract(&manifest, &context, PackageValidationContext::default())
+                    .map_err(|_| "loaded manifest failed validation")
+            },
+        )
+        .expect("all MVS contracts load");
+        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
+            .expect("final source plan is consistent");
+        let read_source_identities = BTreeMap::from([
+            (root_version.clone(), "root-read-tree"),
+            (dep_version.clone(), "dependency-read-tree"),
+        ]);
+
+        let identity_plan = plan_resolver_source_reloads(
+            &plan,
+            &read_source_identities,
+            |package_version, source, base_identity| {
+                assert_eq!(package_version, &dep_version);
+                let ResolverPackageSource::Path { relative_to, path } = source.source() else {
+                    panic!("fixture's final source must be a path")
+                };
+                assert_eq!(relative_to, &root_version);
+                assert_eq!(path.as_ref(), "../dep");
+                assert_eq!(base_identity, Some(&"root-read-tree"));
+                Ok::<_, ()>("dependency-from-final-path")
+            },
+        );
+        assert!(identity_plan.same_identity.is_empty());
+        assert_eq!(identity_plan.reloads.len(), 1);
+        assert_eq!(
+            identity_plan.reloads[0].read_identity,
+            "dependency-read-tree"
+        );
+        assert_eq!(
+            identity_plan.reloads[0].final_identity,
+            "dependency-from-final-path"
+        );
+        assert!(identity_plan.failures.is_empty());
+
+        let missing_base_plan = plan_resolver_source_reloads(
+            &plan,
+            &BTreeMap::from([(dep_version.clone(), "dependency-read-tree")]),
+            |_, _, _| -> Result<&str, ()> {
+                panic!("a path with no captured base identity must not be resolved")
+            },
+        );
+        assert!(missing_base_plan.reloads.is_empty());
+        assert_eq!(missing_base_plan.failures.len(), 1);
+        assert_eq!(
+            missing_base_plan.failures[0].side,
+            ResolverSourceIdentitySide::Final
+        );
+        assert!(matches!(
+            &missing_base_plan.failures[0].error,
+            super::ResolverSourceIdentityFailureKind::MissingBaseSourceIdentity(package)
+                if **package == root_version
+        ));
+    }
+
+    #[test]
+    fn selected_path_base_uses_its_final_identity_before_resolving_dependents() {
+        let root = parse(
+            br#"package zz:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires {
+    zz:base @ ^1 from git "https://example.test/root-base"
+    zz:late @ ^1 from git "https://example.test/late"
+}
+"#,
+        );
+        let root_version = package_version("zz:root", "1.0.0");
+        let base_version = package_version("zz:base", "1.0.0");
+        let dep_version = package_version("acme:dep", "1.0.0");
+        let late_version = package_version("zz:late", "1.0.0");
+        let path_packages = BTreeMap::from([(
+            ResolverPathKey::new(base_version.clone(), "../dep"),
+            dep_version.clone(),
+        )]);
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let output = select_with_source_provider(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |_| Ok::<_, ()>("canonical-dependency-path"),
+            |request, _| {
+                let manifest = match request.package_version.package() {
+                    "zz:base" => parse_for_role(
+                        br#"package zz:base @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from path "../dep" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    "acme:dep" => parse_for_role(
+                        br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    "zz:late" => parse_for_role(
+                        br#"package zz:late @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { zz:base @ ^1 from git "https://example.test/late-base" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    package => panic!("unexpected package request: {package}"),
+                };
+                build_resolver_contract(&manifest, &context, PackageValidationContext::default())
+                    .map_err(|_| "loaded manifest failed validation")
+            },
+        )
+        .expect("all MVS contracts load");
+        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
+            .expect("final source plan is consistent");
+        let read_source_identities = BTreeMap::from([
+            (root_version, "root-tree"),
+            (base_version.clone(), "base-read"),
+            (dep_version.clone(), "dep-read"),
+            (late_version, "late-read"),
+        ]);
+        let mut final_path_base = None;
+
+        let identity_plan = plan_resolver_source_reloads(
+            &plan,
+            &read_source_identities,
+            |package_version, source, base_identity| match package_version.package() {
+                "acme:dep" => {
+                    assert_eq!(base_identity, Some(&"base-final"));
+                    final_path_base = base_identity.copied().map(str::to_owned);
+                    Ok::<_, ()>("dep-final")
+                }
+                "zz:base" => {
+                    assert_eq!(base_identity, None);
+                    assert_eq!(
+                        source.source(),
+                        &ResolverPackageSource::Git {
+                            url: "https://example.test/late-base".into(),
+                            directory: None,
+                        }
+                    );
+                    Ok("base-final")
+                }
+                "zz:late" => Ok("late-read"),
+                package => panic!("unexpected selected package {package}"),
+            },
+        );
+        assert_eq!(final_path_base.as_deref(), Some("base-final"));
+        assert_eq!(identity_plan.reloads.len(), 2);
+        assert_eq!(identity_plan.reloads[0].package_version, dep_version);
+        assert_eq!(identity_plan.reloads[0].read_identity, "dep-read");
+        assert_eq!(identity_plan.reloads[0].final_identity, "dep-final");
+        assert_eq!(identity_plan.reloads[1].package_version, base_version);
+        assert_eq!(identity_plan.reloads[1].read_identity, "base-read");
+        assert_eq!(identity_plan.reloads[1].final_identity, "base-final");
+        assert_eq!(identity_plan.same_identity.len(), 1);
+        assert!(identity_plan.failures.is_empty());
+    }
+
+    #[test]
+    fn cyclic_selected_path_bases_fail_without_read_time_fallback() {
+        let root = parse(
+            br#"package zz:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:a @ ^1 from git "https://example.test/a" }
+"#,
+        );
+        let root_version = package_version("zz:root", "1.0.0");
+        let a_version = package_version("acme:a", "1.0.0");
+        let b_version = package_version("acme:b", "1.0.0");
+        let path_packages = BTreeMap::from([
+            (
+                ResolverPathKey::new(a_version.clone(), "../b"),
+                b_version.clone(),
+            ),
+            (
+                ResolverPathKey::new(b_version.clone(), "../a"),
+                a_version.clone(),
+            ),
+        ]);
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let output = select_with_source_provider(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |_| Ok::<_, ()>("canonical-path"),
+            |request, _| {
+                let manifest = match request.package_version.package() {
+                    "acme:a" => parse_for_role(
+                        br#"package acme:a @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:b @ ^1 from path "../b" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    "acme:b" => parse_for_role(
+                        br#"package acme:b @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:a @ ^1 from path "../a" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    package => panic!("unexpected package request: {package}"),
+                };
+                build_resolver_contract(&manifest, &context, PackageValidationContext::default())
+                    .map_err(|_| "loaded manifest failed validation")
+            },
+        )
+        .expect("the path cycle is retained for graph validation");
+        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
+            .expect("final source plan retains dependency cycles");
+        let read_source_identities = BTreeMap::from([
+            (root_version, "root-read"),
+            (a_version.clone(), "a-read"),
+            (b_version.clone(), "b-read"),
+        ]);
+        let identity_plan = plan_resolver_source_reloads(
+            &plan,
+            &read_source_identities,
+            |_, _, _| -> Result<&str, ()> {
+                panic!("cyclic final path bases must not be resolved")
+            },
+        );
+
+        assert!(identity_plan.same_identity.is_empty());
+        assert!(identity_plan.reloads.is_empty());
+        assert_eq!(identity_plan.failures.len(), 2);
+        assert!(
+            identity_plan
+                .failures
+                .iter()
+                .all(|failure| failure.side == ResolverSourceIdentitySide::Final)
+        );
+        assert!(matches!(
+            &identity_plan.failures[0].error,
+            super::ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(_)
+        ));
+        assert!(matches!(
+            &identity_plan.failures[1].error,
+            super::ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(_)
         ));
     }
 
@@ -1570,6 +2352,42 @@ requires { acme:b @ ^1 from git "https://example.test/b-from-late" }
                 .collect::<Vec<_>>(),
             ["acme:alpha", "z:late"]
         );
+
+        let root_version = package_version("zz:root", "1.0.0");
+        let alpha_version = package_version("acme:alpha", "1.0.0");
+        let b_version = package_version("acme:b", "1.0.0");
+        let late_version = package_version("z:late", "1.0.0");
+        let read_source_identities = BTreeMap::from([
+            (root_version, "root".to_owned()),
+            (alpha_version, "acme:alpha".to_owned()),
+            (b_version.clone(), "acme:b".to_owned()),
+            (late_version, "z:late".to_owned()),
+        ]);
+        let identity_plan = plan_resolver_source_reloads(
+            &plan,
+            &read_source_identities,
+            |package_version, _, base_identity| {
+                assert_eq!(base_identity, None);
+                Ok::<_, ()>(package_version.package().to_owned())
+            },
+        );
+        assert_eq!(identity_plan.same_identity.len(), 2);
+        assert!(identity_plan.reloads.is_empty());
+        assert_eq!(identity_plan.failures.len(), 1);
+        assert_eq!(identity_plan.failures[0].package_version, b_version);
+        assert_eq!(
+            identity_plan.failures[0].side,
+            ResolverSourceIdentitySide::Final
+        );
+        assert!(identity_plan.failures[0].source.is_none());
+        assert!(matches!(
+            &identity_plan.failures[0].error,
+            super::ResolverSourceIdentityFailureKind::FinalSourceSelection(error)
+                if matches!(
+                    &**error,
+                    ResolverSourceSelectionError::MissingRequirementSource { .. }
+                )
+        ));
     }
 
     #[test]
