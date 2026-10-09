@@ -556,15 +556,15 @@ When a command would write a lock that differs from the existing one, the resolv
 
 ### 2.13.1 Explanation chains
 
-Every resolution error about a node carries one or more **requirement chains** (N-G-33). A chain is a path of edges from the root to the edge in question:
+Every resolution error about a node carries one or more **requirement chains** (N-G-33). A chain is a path of edges from the root to the edge in question, or from a lock-floor entry when the exact candidate version is reachable only through that floor:
 
 ```text
 root -> (p1, v1) -> (p2, v2) -> ... -> edge e
 ```
 
-1. Chains are taken in the **visited graph**: the package versions visited by `Select` and their edges (in Mode A, the lock graph). A package version on a chain that is not selected is marked `(not selected)`.
-2. The chain of an edge `e` with requirer `u` is a **shortest** path from the root to `u` (fewest edges), followed by `e`. Among shortest paths, the one whose sequence of package versions is least is used, comparing elementwise by identity bytes and then by version precedence. It is found by breadth-first search from the root that expands edges in `Edges` order and keeps the first predecessor found.
-3. A floor is explained as `lock entry acme:json 1.9.0 (sai.lock)`. A pin is explained by the chain of the edge or override that created it.
+1. Chains are taken in the **visited graph**: the package versions visited by `Select` and their edges (in Mode A, the lock graph). Root-reachable paths take precedence. A candidate branch reached only through a lock floor starts at that floor. A package version on a chain that is not selected is marked `(not selected)`.
+2. The chain of an edge `e` with requirer `u` is a **shortest** path from the root, or from the applicable lock-floor entry, to `u` (fewest edges), followed by `e`. Among shortest paths, the one whose sequence of package versions is least is used, comparing elementwise by identity bytes and then by version precedence. It is found by breadth-first search from each origin that expands edges in `Edges` order and keeps the first predecessor found; root-origin chains win when both origins reach the same version.
+3. A floor-only chain is explained as `lock entry acme:json 1.9.0 (sai.lock)`. A pin is explained by the chain of the edge or override that created it.
 
 A `VERSION_CONFLICT` on node `n` with selected version `s` and violated edge `e` shows:
 
@@ -593,19 +593,23 @@ Locations refer to the `sai.package` of each requirer; for fetched packages, the
 
 The chains are part of the diagnostic's structured data ([impl/11](../impl/11-diagnostics.md)): each link records the requirer's identity and version, whether it is selected, the edge's requirement, and the source location. Diagnostics caused by a failed node (for example uses of its modules) are suppressed in favour of the resolution error (impl/11, cascade class C6).
 
+For `VERSION_CONFLICT`, `data.selected_reason` is `root_override_pin`, `path_pin`, `requirement`, or `lock_floor`. `data.selected_chain` and `data.requirement_chain` each contain an `origin` (`root` or `lock_floor`, with package and version) and `steps`. Each step records the requirer identity and version, whether it is the root and selected, the named target identity and version, the requirement, and its `sai.package` location. A lock-floor selection has an empty `selected_chain.steps`.
+
+For `DEPENDENCY_CYCLE`, `data.nodes` lists the package versions in cycle order and repeats the first node at the end. `data.edges[i]` records the requiring package version, selected target version, version named by the requirement, requirement, and source location. In a selection-time cycle to the root, the visited candidate path can differ from the selected target versions; both are recorded. `data.requirement_chain` gives the shortest provenance chain to the cycle-closing edge. Its origin is the root or a lock-floor entry, following §2.13.1. A cycle that reaches the root's own line starts and ends at the selected root package version; the closing edge separately records the version named in its requirement.
+
 ### 2.13.3 Help
 
 The resolver offers only help that does not need network access or search:
 
 1. If the conflicting upper bound comes from a dependency, suggest `sai update <that dependency>`.
-2. If the selected version comes from a root requirement, suggest lowering it to the highest version that the conflicting requirement allows.
-3. Suggest an override (`use path` or `use git`) for a patched copy.
+2. If an ordinary root requirement named the selected version and a conflicting upper bound rejects it, suggest lowering that root requirement to a version accepted by the conflicting dependency.
+3. Suggest an override (`use path` or `use git`) for a patched copy. When the selected version exceeds a dependency's upper bound, patch the requiring dependency; when a pin is below a requirement's minimum, patch the selected target package.
 
 No structured fix is applied automatically: which side should change is a decision of the user (P1).
 
 ### 2.13.4 Other resolution errors
 
-`VERSION_NOT_FOUND`, `FETCH_FAILED`, `PACKAGE_IDENTITY_MISMATCH`, `MISSING_PACKAGE_FILE`, `PATH_PACKAGE_NOT_FOUND`, `PATH_VERSION_MISMATCH`, `CONFLICTING_PATH_SOURCES`, `PATH_ESCAPES_REPOSITORY`, `DIVERGENT_SOURCES`, and `DEPENDENCY_CYCLE` carry the chain of the edge that caused them (§2.13.1). All errors found in one resolution are reported, sorted by node, as long as they are independent; an error that prevents reading a contract stops the traversal below that version only.
+`VERSION_NOT_FOUND`, `FETCH_FAILED`, `PACKAGE_IDENTITY_MISMATCH`, `MISSING_PACKAGE_FILE`, `PATH_PACKAGE_NOT_FOUND`, `PATH_VERSION_MISMATCH`, `CONFLICTING_PATH_SOURCES`, `PATH_ESCAPES_REPOSITORY`, `DIVERGENT_SOURCES`, and `DEPENDENCY_CYCLE` carry the chain of the edge that caused them (§2.13.1). A known root cycle remains reportable when an independent branch fails to provide its contract; that branch stops traversal, while the cycle chain must still consist entirely of visited, source-backed edges. All errors found in one resolution are reported, sorted by node, as long as they are independent.
 
 ---
 
