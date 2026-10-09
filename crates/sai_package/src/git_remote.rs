@@ -16,8 +16,14 @@ use crate::git_tags::{
 };
 use crate::git_tree::{GitTreeReadError, GitTreeReader};
 use crate::lock_validation::canonical_git_url;
+use crate::manifest::{PackageParseOutput, PackageRole, parse_for_role};
+use crate::mvs::MvsPackageVersion;
 use crate::package_path::DependencyPackagePath;
-use crate::tree_hash::{TreeHash, TreeHashError, TreeHashPurpose};
+use crate::resolver_contract::{
+    ResolverContract, ResolverContractBuildError, ResolverContractContext, build_resolver_contract,
+};
+use crate::tree_hash::{TreeHash, TreeHashError};
+use crate::validation::PackageValidationContext;
 use crate::version::Version;
 
 const SSH_TAG_LIST_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -100,6 +106,7 @@ pub struct FetchedGitRelease {
     tag_missing: bool,
     commit_id: gix::ObjectId,
     source_tree: TreeHash,
+    package_manifest: PackageParseOutput,
 }
 
 impl FetchedGitRelease {
@@ -134,6 +141,116 @@ impl FetchedGitRelease {
     /// The checksum and warnings for the selected package source tree.
     pub const fn source_tree(&self) -> &TreeHash {
         &self.source_tree
+    }
+
+    /// The dependency-role parse result for the fetched `sai.package`.
+    ///
+    /// Syntax diagnostics remain available here. Call
+    /// [`Self::build_dependency_contract`] before using this release in
+    /// dependency resolution.
+    pub const fn package_manifest(&self) -> &PackageParseOutput {
+        &self.package_manifest
+    }
+
+    /// Validate the fetched manifest and build its resolver contract.
+    ///
+    /// The declared package identity and version must equal `expected`.
+    pub fn build_dependency_contract(
+        &self,
+        expected: &MvsPackageVersion,
+        context: &ResolverContractContext<'_>,
+        validation_context: PackageValidationContext<'_>,
+    ) -> Result<ResolverContract, GitRemoteReleaseContractError> {
+        if self.version != *expected.version() {
+            return Err(GitRemoteReleaseContractError::ReleaseTagVersionMismatch {
+                expected: expected.clone(),
+                tag_version: self.version.clone(),
+            });
+        }
+        let contract = build_resolver_contract(&self.package_manifest, context, validation_context)
+            .map_err(GitRemoteReleaseContractError::InvalidContract)?;
+        let found = contract.mvs.package_version();
+        if found != expected {
+            return Err(GitRemoteReleaseContractError::PackageVersionMismatch {
+                expected: Box::new(expected.clone()),
+                found: Box::new(found.clone()),
+            });
+        }
+        Ok(contract)
+    }
+}
+
+/// A fetched `sai.package` could not become the requested dependency contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitRemoteReleaseContractError {
+    /// Parsing or semantic validation rejected the manifest.
+    InvalidContract(ResolverContractBuildError),
+    /// The fetched release tag encodes a different version than the resolver selected.
+    ReleaseTagVersionMismatch {
+        /// The package version selected by the resolver.
+        expected: MvsPackageVersion,
+        /// The version encoded by the fetched release tag.
+        tag_version: Version,
+    },
+    /// The manifest declares a different identity or version than requested.
+    PackageVersionMismatch {
+        /// The package version requested by the resolver.
+        expected: Box<MvsPackageVersion>,
+        /// The identity and version declared by the fetched manifest.
+        found: Box<MvsPackageVersion>,
+    },
+}
+
+impl GitRemoteReleaseContractError {
+    /// Return the stable diagnostic code when the failure has one direct code.
+    ///
+    /// Manifest syntax and semantic validation failures return `None` because
+    /// callers should report the preserved, source-located diagnostics from
+    /// [`Self::InvalidContract`] instead.
+    pub const fn diagnostic_code(&self) -> Option<sai_diagnostics::Code> {
+        match self {
+            Self::InvalidContract(_) => None,
+            Self::ReleaseTagVersionMismatch { .. } | Self::PackageVersionMismatch { .. } => {
+                Some(sai_diagnostics::Code::PackageIdentityMismatch)
+            }
+        }
+    }
+}
+
+impl fmt::Display for GitRemoteReleaseContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidContract(error) => fmt::Display::fmt(error, formatter),
+            Self::ReleaseTagVersionMismatch {
+                expected,
+                tag_version,
+            } => write!(
+                formatter,
+                "Git release tag selects {}@{tag_version}, but the resolver requested {}@{}",
+                expected.package(),
+                expected.package(),
+                expected.version()
+            ),
+            Self::PackageVersionMismatch { expected, found } => {
+                write!(
+                    formatter,
+                    "Git package manifest declares {}@{}, expected {}@{}",
+                    found.package(),
+                    found.version(),
+                    expected.package(),
+                    expected.version()
+                )
+            }
+        }
+    }
+}
+
+impl StdError for GitRemoteReleaseContractError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::InvalidContract(error) => Some(error),
+            Self::ReleaseTagVersionMismatch { .. } | Self::PackageVersionMismatch { .. } => None,
+        }
     }
 }
 
@@ -226,6 +343,7 @@ impl GitRemoteReleaseFetchError {
                 sai_diagnostics::Code::PathCollision
             }
             Self::SourceTree(GitTreeReadError::MissingPackageDirectory)
+            | Self::SourceTree(GitTreeReadError::MissingPackageManifest)
             | Self::SourceTree(GitTreeReadError::PackagePathNotDirectory) => {
                 sai_diagnostics::Code::MissingPackageFile
             }
@@ -542,8 +660,8 @@ fn fetch_release_tree_in_repository(
         }
         Some(directory) => directory.as_bytes(),
     };
-    let source_tree = reader
-        .hash_commit_tree(&commit_id, package_directory, TreeHashPurpose::Source)
+    let (source_tree, manifest_bytes) = reader
+        .hash_commit_tree_and_read_manifest(&commit_id, package_directory)
         .map_err(GitRemoteReleaseFetchError::SourceTree)?;
     if let Some(expected_source_checksum) = expected_source_checksum
         && source_tree.checksum != expected_source_checksum
@@ -553,6 +671,7 @@ fn fetch_release_tree_in_repository(
             actual: source_tree.checksum.clone().into(),
         });
     }
+    let package_manifest = parse_for_role(&manifest_bytes, PackageRole::Dependency);
 
     Ok(FetchedGitRelease {
         tag_name: tag_name.into(),
@@ -561,6 +680,7 @@ fn fetch_release_tree_in_repository(
         tag_missing,
         commit_id,
         source_tree,
+        package_manifest,
     })
 }
 
@@ -1029,17 +1149,23 @@ impl Drop for TemporaryGitDirectory {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
     use super::{
-        GitRemoteReleaseFetchError, GitRemoteTagListError, TemporaryGitDirectory,
-        credential_overrides_from_file, credential_overrides_from_path,
+        GitRemoteReleaseContractError, GitRemoteReleaseFetchError, GitRemoteTagListError,
+        TemporaryGitDirectory, credential_overrides_from_file, credential_overrides_from_path,
         fetch_release_tree_in_repository, list_release_tags_in_repository, map_transport_error,
         proxy_environment_overrides, release_tag_refspec, user_credential_config_paths,
     };
     use crate::git_tags::{GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs};
+    use crate::git_tree::GitTreeReadError;
+    use crate::manifest::{PackageRole, parse_for_role};
+    use crate::mvs::MvsPackageVersion;
     use crate::package_path::DependencyPackagePath;
+    use crate::resolver_contract::ResolverContractContext;
+    use crate::validation::PackageValidationContext;
     use gix::objs::tree::{Entry, EntryKind};
 
     struct TestRemote {
@@ -1060,17 +1186,46 @@ mod tests {
             nested_tags: bool,
             object_hash: gix::hash::Kind,
         ) -> Self {
+            Self::new_with_package_manifest(
+                tag_name,
+                nested_tags,
+                object_hash,
+                Some(
+                    b"package acme:sample @ 1.2.3\n\
+                      source \"src\"\n\
+                      targets { wasm32-core }\n",
+                ),
+            )
+        }
+
+        fn new_without_package_manifest(tag_name: &str, nested_tags: bool) -> Self {
+            Self::new_with_package_manifest(tag_name, nested_tags, gix::hash::Kind::Sha1, None)
+        }
+
+        fn new_with_package_manifest(
+            tag_name: &str,
+            nested_tags: bool,
+            object_hash: gix::hash::Kind,
+            manifest: Option<&[u8]>,
+        ) -> Self {
             let directory = TemporaryGitDirectory::create().unwrap();
             let repository = init_bare_repository(&directory.path, Some(object_hash));
             let blob_id = repository.write_blob(b"package source").unwrap().detach();
+            let mut entries = vec![Entry {
+                mode: EntryKind::Blob.into(),
+                filename: b"lib.sai".to_vec().into(),
+                oid: blob_id,
+            }];
+            if let Some(manifest) = manifest {
+                let manifest_id = repository.write_blob(manifest).unwrap().detach();
+                entries.push(Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: b"sai.package".to_vec().into(),
+                    oid: manifest_id,
+                });
+            }
             let tree_id = repository
-                .write_object(gix::objs::Tree {
-                    entries: vec![Entry {
-                        mode: EntryKind::Blob.into(),
-                        filename: b"lib.sai".to_vec().into(),
-                        oid: blob_id,
-                    }],
-                })
+                .write_object(gix::objs::Tree { entries })
                 .unwrap()
                 .detach();
             let parent_commit_id = repository
@@ -1438,6 +1593,187 @@ mod tests {
         assert_eq!(fetched.commit_id(), &remote.commit_id);
         assert!(fetched.source_tree().checksum.starts_with("sai1:"));
         assert!(fetched.source_tree().warnings.is_empty());
+        assert!(fetched.package_manifest().is_syntax_valid());
+        assert_eq!(fetched.package_manifest().role(), PackageRole::Dependency);
+    }
+
+    fn root_contract_context() -> ResolverContractContext<'static> {
+        let root = parse_for_role(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+            PackageRole::Root,
+        );
+        ResolverContractContext::from_root_manifest(
+            &root,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("valid root context")
+        .into_owned()
+    }
+
+    fn expected_package_version(package: &str, version: &str) -> MvsPackageVersion {
+        MvsPackageVersion::new(
+            package,
+            crate::version::Version::parse(version).expect("valid package version"),
+        )
+        .expect("valid package identity")
+    }
+
+    #[test]
+    fn fetched_release_builds_a_validated_dependency_contract() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let fetched = fetch_fixture(&remote, None, None).unwrap();
+        let context = root_contract_context();
+
+        let contract = fetched
+            .build_dependency_contract(
+                &expected_package_version("acme:sample", "1.2.3"),
+                &context,
+                PackageValidationContext::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.mvs.package_version(),
+            &expected_package_version("acme:sample", "1.2.3")
+        );
+        assert_eq!(contract.role(), PackageRole::Dependency);
+    }
+
+    #[test]
+    fn fetched_release_rejects_a_manifest_with_another_identity_or_version() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let fetched = fetch_fixture(&remote, None, None).unwrap();
+        let context = root_contract_context();
+
+        let error = fetched
+            .build_dependency_contract(
+                &expected_package_version("acme:other", "1.2.3"),
+                &context,
+                PackageValidationContext::default(),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            GitRemoteReleaseContractError::PackageVersionMismatch {
+                expected: Box::new(expected_package_version("acme:other", "1.2.3")),
+                found: Box::new(expected_package_version("acme:sample", "1.2.3")),
+            }
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            Some(sai_diagnostics::Code::PackageIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn fetched_release_rejects_a_manifest_version_that_differs_from_its_tag() {
+        let remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.2.3",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(
+                b"package acme:sample @ 1.2.4\n\
+                  source \"src\"\n\
+                  targets { wasm32-core }\n",
+            ),
+        );
+        let fetched = fetch_fixture(&remote, None, None).unwrap();
+        let context = root_contract_context();
+
+        let error = fetched
+            .build_dependency_contract(
+                &expected_package_version("acme:sample", "1.2.3"),
+                &context,
+                PackageValidationContext::default(),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            GitRemoteReleaseContractError::PackageVersionMismatch {
+                expected: Box::new(expected_package_version("acme:sample", "1.2.3")),
+                found: Box::new(expected_package_version("acme:sample", "1.2.4")),
+            }
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            Some(sai_diagnostics::Code::PackageIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn fetched_release_rejects_a_tag_version_that_differs_from_the_resolver_selection() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let mut fetched = fetch_fixture(&remote, None, None).unwrap();
+        fetched.version = crate::version::Version::parse("1.2.4").unwrap();
+        let context = root_contract_context();
+
+        let error = fetched
+            .build_dependency_contract(
+                &expected_package_version("acme:sample", "1.2.3"),
+                &context,
+                PackageValidationContext::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            GitRemoteReleaseContractError::ReleaseTagVersionMismatch {
+                expected: expected_package_version("acme:sample", "1.2.3"),
+                tag_version: crate::version::Version::parse("1.2.4").unwrap(),
+            }
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            Some(sai_diagnostics::Code::PackageIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn fetched_release_preserves_source_located_manifest_validation_errors() {
+        let remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.2.3",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(b"package acme:sample @\n"),
+        );
+        let fetched = fetch_fixture(&remote, None, None).unwrap();
+        let context = root_contract_context();
+
+        assert!(!fetched.package_manifest().is_syntax_valid());
+        let error = fetched
+            .build_dependency_contract(
+                &expected_package_version("acme:sample", "1.2.3"),
+                &context,
+                PackageValidationContext::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GitRemoteReleaseContractError::InvalidContract(_)
+        ));
+        assert_eq!(error.diagnostic_code(), None);
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn fetch_requires_a_regular_package_manifest_file() {
+        let remote = TestRemote::new_without_package_manifest("refs/tags/v1.2.3", false);
+
+        let error = fetch_fixture(&remote, None, None).unwrap_err();
+
+        assert_eq!(
+            error,
+            GitRemoteReleaseFetchError::SourceTree(GitTreeReadError::MissingPackageManifest)
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            sai_diagnostics::Code::MissingPackageFile
+        );
     }
 
     #[test]

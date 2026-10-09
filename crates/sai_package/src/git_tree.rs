@@ -9,6 +9,7 @@ use std::path::Path;
 
 use gix::prelude::{FindExt, HeaderExt};
 
+use crate::manifest::MAX_PACKAGE_MANIFEST_BYTES;
 use crate::tree_hash::{
     GitTreeEntry, TreeHash, TreeHashError, TreeHashPurpose, hash_git_tree, should_skip_path,
     validate_tree_path,
@@ -49,6 +50,8 @@ pub enum GitTreeLimit {
     TreeEntryCount,
     /// Maximum cumulative bytes in paths retained while walking the package tree.
     PathBytes,
+    /// Maximum size of the `sai.package` manifest.
+    ManifestBytes,
 }
 
 impl GitTreeLimit {
@@ -61,6 +64,7 @@ impl GitTreeLimit {
             Self::TagChainDepth => "annotated tag chain depth",
             Self::TreeEntryCount => "inspected Git tree entry count",
             Self::PathBytes => "cumulative Git tree path bytes",
+            Self::ManifestBytes => "package manifest size",
         }
     }
 }
@@ -92,6 +96,8 @@ pub enum GitTreeReadError {
     },
     /// A tree contains an unsupported entry mode or invalid component.
     InvalidTreeEntry,
+    /// The selected package tree has no regular `sai.package` file.
+    MissingPackageManifest,
     /// The requested package directory is not a normalized relative path.
     InvalidPackageDirectory,
     /// A component of the requested package directory does not exist.
@@ -133,6 +139,9 @@ impl Display for GitTreeReadError {
                 )
             }
             Self::InvalidTreeEntry => formatter.write_str("Git tree contains an invalid entry"),
+            Self::MissingPackageManifest => {
+                formatter.write_str("package directory has no regular sai.package file")
+            }
             Self::InvalidPackageDirectory => {
                 formatter.write_str("package directory is not a normalized relative path")
             }
@@ -284,6 +293,39 @@ impl GitTreeReader {
         package_directory: &[u8],
         purpose: TreeHashPurpose,
     ) -> Result<TreeHash, GitTreeReadError> {
+        self.hash_commit_tree_internal(commit_id, package_directory, purpose, false)
+            .map(|(tree_hash, _)| tree_hash)
+    }
+
+    /// Hash a package's source tree and read its root `sai.package` manifest
+    /// during the same bounded tree walk.
+    ///
+    /// The manifest blob is checked against the 16 MiB package-contract limit
+    /// before its contents are loaded, and its Git object ID is verified with
+    /// the same object reader used for the source checksum.
+    pub fn hash_commit_tree_and_read_manifest(
+        &self,
+        commit_id: &gix::ObjectId,
+        package_directory: &[u8],
+    ) -> Result<(TreeHash, Vec<u8>), GitTreeReadError> {
+        let (tree_hash, manifest) = self.hash_commit_tree_internal(
+            commit_id,
+            package_directory,
+            TreeHashPurpose::Source,
+            true,
+        )?;
+        manifest
+            .map(|manifest| (tree_hash, manifest))
+            .ok_or(GitTreeReadError::MissingPackageManifest)
+    }
+
+    fn hash_commit_tree_internal(
+        &self,
+        commit_id: &gix::ObjectId,
+        package_directory: &[u8],
+        purpose: TreeHashPurpose,
+        read_manifest: bool,
+    ) -> Result<(TreeHash, Option<Vec<u8>>), GitTreeReadError> {
         self.ensure_no_alternates()?;
         if !package_directory.is_empty() {
             validate_tree_path(package_directory)?;
@@ -316,7 +358,12 @@ impl GitTreeReader {
         let mut inspected_entries = 0;
         let package_tree_id =
             self.resolve_package_tree(&root_tree_id, package_directory, &mut inspected_entries)?;
-        self.hash_tree(&package_tree_id, purpose, &mut inspected_entries)
+        self.hash_tree(
+            &package_tree_id,
+            purpose,
+            &mut inspected_entries,
+            read_manifest,
+        )
     }
 
     /// Follow a lightweight or annotated tag to its terminal commit object.
@@ -472,9 +519,11 @@ impl GitTreeReader {
         root_tree_id: &gix::ObjectId,
         purpose: TreeHashPurpose,
         tree_entry_count: &mut u64,
-    ) -> Result<TreeHash, GitTreeReadError> {
+        read_manifest: bool,
+    ) -> Result<(TreeHash, Option<Vec<u8>>), GitTreeReadError> {
         let mut pending = vec![(*root_tree_id, Vec::<u8>::new())];
         let mut owned_entries = Vec::<OwnedTreeEntry>::new();
+        let mut package_manifest_seen = false;
         let mut file_count = 0u64;
         let mut package_bytes = 0u64;
         let mut path_bytes = 0u64;
@@ -519,6 +568,14 @@ impl GitTreeReader {
                             header.size(),
                             self.limits.file_bytes,
                         )?;
+                        let is_package_manifest = read_manifest && path == b"sai.package";
+                        if is_package_manifest {
+                            ensure_limit(
+                                GitTreeLimit::ManifestBytes,
+                                header.size(),
+                                MAX_PACKAGE_MANIFEST_BYTES as u64,
+                            )?;
+                        }
                         package_bytes = package_bytes.saturating_add(header.size());
                         ensure_limit(
                             GitTreeLimit::PackageBytes,
@@ -535,6 +592,7 @@ impl GitTreeReader {
                         {
                             return Err(GitTreeReadError::InvalidTreeEntry);
                         }
+                        package_manifest_seen |= is_package_manifest;
                         owned_entries.push(OwnedTreeEntry::File {
                             path,
                             content,
@@ -565,7 +623,18 @@ impl GitTreeReader {
                 OwnedTreeEntry::Gitlink { path } => GitTreeEntry::Gitlink { path },
             })
             .collect::<Vec<_>>();
-        Ok(hash_git_tree(hash_entries, purpose)?)
+        let tree_hash = hash_git_tree(hash_entries, purpose)?;
+        let package_manifest = if package_manifest_seen {
+            owned_entries.iter_mut().find_map(|entry| match entry {
+                OwnedTreeEntry::File { path, content, .. } if path == b"sai.package" => {
+                    Some(std::mem::take(content))
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        Ok((tree_hash, package_manifest))
     }
 
     fn read_tree_entries(
@@ -633,7 +702,8 @@ mod tests {
     use super::{
         GitTreeLimit, GitTreeReadError, GitTreeReader, Limits, MAX_GIT_METADATA_OBJECT_BYTES,
         MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILE_COUNT,
-        MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES, MAX_TAG_CHAIN_DEPTH,
+        MAX_PACKAGE_MANIFEST_BYTES, MAX_PACKAGE_TREE_ENTRIES, MAX_PACKAGE_TREE_PATH_BYTES,
+        MAX_TAG_CHAIN_DEPTH,
     };
     use crate::tree_hash::{GitTreeEntry, TreeHashError, TreeHashPurpose, hash_git_tree};
     use gix::objs::Write as _;
@@ -914,6 +984,60 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn hashes_and_reads_the_manifest_during_one_package_tree_walk() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+
+        let (tree_hash, manifest) = standard_reader(&repository)
+            .hash_commit_tree_and_read_manifest(&commit, b"packages/acme")
+            .unwrap();
+
+        assert_eq!(manifest, b"package acme:sample @ 1.0.0\n");
+        assert!(tree_hash.checksum.starts_with("sai1:"));
+        assert_eq!(tree_hash.warnings.len(), 2);
+    }
+
+    #[test]
+    fn requires_a_regular_package_manifest_file() {
+        let repository = BareTestRepository::new();
+        let source = write_blob(&repository.repository, b"source\n");
+        let tree = write_tree(
+            &repository.repository,
+            [(b"lib.sai".as_slice(), EntryKind::Blob, source)],
+        );
+        let commit = write_commit(&repository.repository, tree);
+
+        assert_eq!(
+            standard_reader(&repository).hash_commit_tree_and_read_manifest(&commit, b""),
+            Err(GitTreeReadError::MissingPackageManifest)
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_package_manifests_before_loading_the_blob() {
+        let repository = BareTestRepository::new();
+        let manifest = vec![b'x'; MAX_PACKAGE_MANIFEST_BYTES + 1];
+        let manifest_id = write_blob(&repository.repository, &manifest);
+        let source = write_blob(&repository.repository, b"source\n");
+        let tree = write_tree(
+            &repository.repository,
+            [
+                (b"lib.sai".as_slice(), EntryKind::Blob, source),
+                (b"sai.package".as_slice(), EntryKind::Blob, manifest_id),
+            ],
+        );
+        let commit = write_commit(&repository.repository, tree);
+
+        assert_eq!(
+            standard_reader(&repository).hash_commit_tree_and_read_manifest(&commit, b""),
+            Err(GitTreeReadError::PackageTooLarge {
+                limit: GitTreeLimit::ManifestBytes,
+                actual: (MAX_PACKAGE_MANIFEST_BYTES + 1) as u64,
+            })
+        );
     }
 
     #[test]
