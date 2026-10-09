@@ -304,7 +304,7 @@ Resolution produces one graph for all targets. A build for one target `t` and on
 
 ### 2.6.1 Release tags
 
-1. For a package with the source `from git "<url>"`, the **release tag** of version `v` is the Git ref `refs/tags/v<v>`, where `<v>` is the canonical form of `v` (§2.2.1). With `dir "<d>"`, it is `refs/tags/<d>/v<v>`, where `<d>` is the normalized directory path ([01 §1.6.1](01-package-contract.md)) (D-PKG-02, N-G-34).
+1. For a package with the source `from git "<url>"`, the **release tag** of version `v` is the Git ref `refs/tags/v<v>`, where `<v>` is the canonical form of `v` (§2.2.1). With `dir "<d>"`, it is `refs/tags/<d>/v<v>`, where `<d>` is the normalized directory path ([01 §1.6.1](01-package-contract.md)) (D-PKG-02, N-G-34). The spelling `dir "."` denotes the repository root and is normalized to an empty directory, so it selects the same `v<v>` tag as an omitted `dir`.
 2. When the resolver needs version `v`, it requests exactly that tag. It never derives a version from a tag name in any other way.
 3. When tags are listed (`sai update`, `sai add`), a ref is a release tag of the package only if its name is exactly `v` (or `<d>/v`) followed by a canonical version. Other refs are ignored silently: `v1.2` (incomplete), `v01.2.3` (leading zero), `1.2.3` (no `v`), `v1.2.3+build` (build metadata), `V1.2.3`, and tags of other directories.
 4. A tag may be lightweight or annotated. An annotated tag is peeled to the commit it points to. A tag that does not point to a commit is `INVALID_TAG` ([04 §4.3](04-distribution-and-security.md)).
@@ -315,7 +315,7 @@ Resolution produces one graph for all targets. A build for one target `t` and on
 
 1. Fetch the release tag of `v` from `url` as described in [04 §4.3](04-distribution-and-security.md). If the repository has no such tag, the error is `VERSION_NOT_FOUND`, naming the URL, the tag name, and the chain of the edge that named `v` (§2.13.4). Network and protocol failures are `FETCH_FAILED`.
 2. If the lock has an entry for `(id, v)` with the same source, the commit of the tag MUST equal the locked commit; otherwise see `TAG_MOVED` ([04 §4.3.3](04-distribution-and-security.md)). The fetched tree MUST match the locked checksum (`CHECKSUM_MISMATCH`, [03 §3.4](03-lock-file.md)).
-3. The package directory is `<d>` in the tree of the commit (the repository root without `dir`). It MUST contain a file `sai.package`; otherwise the error is `MISSING_PACKAGE_FILE`.
+3. The package directory is `<d>` in the tree of the commit (the repository root when `dir` is omitted or `"."`). It MUST contain a file `sai.package`; otherwise the error is `MISSING_PACKAGE_FILE`.
 4. The contract is parsed and validated as a dependency contract ([01](01-package-contract.md); root-only declarations are ignored, N-G-16). Errors in it are reported against that package; the dependent's diagnostics about uses of it are suppressed ([impl/11](../impl/11-diagnostics.md)).
 5. The declared identity and version MUST equal `(id, v)` exactly. Otherwise the error is `PACKAGE_IDENTITY_MISMATCH`, which shows the requested and the declared identity and version (D-PKG-02). This catches repositories that were renamed, tags that point at the wrong commit, and URLs that point at a different package.
 

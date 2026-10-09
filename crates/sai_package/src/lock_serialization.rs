@@ -1,4 +1,4 @@
-//! Canonical serialization for validated `sai.lock` files.
+//! Canonical serialization for lock-locally valid `sai.lock` files.
 
 use crate::lexer::PackageLexError;
 use crate::lock::{
@@ -26,8 +26,10 @@ pub enum LockSerializationError {
 /// Invalid parsed input is rejected so callers cannot accidentally serialize
 /// a corrupt or unsupported lock. Checks that require the resolved package
 /// graph, such as whether a WIT capability is known, remain the resolver's
-/// responsibility; callers must complete those checks before persisting or
-/// using the serialized lock.
+/// responsibility. The resolver must validate capability names in the
+/// original parsed lock before calling this function, since normalization can
+/// remove a covered but unknown capability; callers must complete those
+/// checks before persisting or using the serialized lock.
 pub fn serialize_canonical(parsed: &LockParseOutput) -> Result<String, LockSerializationError> {
     let validation = validate(parsed);
     if !validation.is_valid() {
