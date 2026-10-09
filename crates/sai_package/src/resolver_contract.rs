@@ -267,9 +267,9 @@ pub struct ResolverContractEdge {
 /// Field-by-field comparison of two contracts for the same package version.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverContractEdgeComparison {
-    pub package_version: MvsPackageVersion,
-    pub expected_edges: Vec<ResolverContractEdge>,
-    pub actual_edges: Vec<ResolverContractEdge>,
+    package_version: MvsPackageVersion,
+    expected_edges: Vec<ResolverContractEdge>,
+    actual_edges: Vec<ResolverContractEdge>,
 }
 
 /// Whether the edge comparison is conclusive for every source clause.
@@ -278,9 +278,62 @@ pub enum ResolverContractComparisonStatus {
     Equivalent,
     Different,
     RequiresSourceBoundPathResolution,
+    PathResolutionFailed,
+}
+
+/// Which contract supplied a path clause during source comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolverContractSourceSide {
+    Expected,
+    Actual,
+}
+
+/// Input needed to resolve one dependency-relative path clause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverContractPathSourceRequest {
+    pub side: ResolverContractSourceSide,
+    pub requiring_package: MvsPackageVersion,
+    pub package: Box<str>,
+    pub path: Box<str>,
+}
+
+/// A path clause could not be resolved against its supplying source tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverContractPathResolutionFailure<E> {
+    pub request: ResolverContractPathSourceRequest,
+    pub error: Box<E>,
+}
+
+/// The result after attempting every source-bound path in both contracts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverContractResolvedPathComparison<E> {
+    status: ResolverContractComparisonStatus,
+    failures: Vec<ResolverContractPathResolutionFailure<E>>,
+}
+
+impl<E> ResolverContractResolvedPathComparison<E> {
+    pub const fn status(&self) -> ResolverContractComparisonStatus {
+        self.status
+    }
+
+    pub fn failures(&self) -> &[ResolverContractPathResolutionFailure<E>] {
+        &self.failures
+    }
 }
 
 impl ResolverContractEdgeComparison {
+    pub const fn package_version(&self) -> &MvsPackageVersion {
+        &self.package_version
+    }
+
+    pub fn expected_edges(&self) -> &[ResolverContractEdge] {
+        &self.expected_edges
+    }
+
+    pub fn actual_edges(&self) -> &[ResolverContractEdge] {
+        &self.actual_edges
+    }
+
     pub fn status(&self) -> ResolverContractComparisonStatus {
         if !same_except_source_bound_path(&self.expected_edges, &self.actual_edges) {
             return ResolverContractComparisonStatus::Different;
@@ -294,6 +347,104 @@ impl ResolverContractEdgeComparison {
     pub fn equivalent(&self) -> bool {
         self.status() == ResolverContractComparisonStatus::Equivalent
     }
+
+    /// Completes comparison after resolving every path clause in both trees.
+    ///
+    /// The callback must return a stable identity for the complete resolved
+    /// source: local paths after lexical and symlink resolution, or paths
+    /// inside Git sources with the canonical repository, requiring commit,
+    /// and normalized tree path. The `side` identifies which source supplied
+    /// the requiring package, so equal manifest spellings cannot accidentally
+    /// reuse an identity from the other contract. The callback runs for every
+    /// path on both sides, even after an identity mismatch or another lookup
+    /// failure, so independent path errors are retained.
+    pub fn compare_with_resolved_paths<K, E>(
+        &self,
+        mut resolve_path: impl FnMut(&ResolverContractPathSourceRequest) -> Result<K, E>,
+    ) -> ResolverContractResolvedPathComparison<E>
+    where
+        K: Eq,
+    {
+        let mut failures = Vec::new();
+        let expected_keys = resolve_path_edges(
+            &self.expected_edges,
+            ResolverContractSourceSide::Expected,
+            &mut resolve_path,
+            &mut failures,
+        );
+        let actual_keys = resolve_path_edges(
+            &self.actual_edges,
+            ResolverContractSourceSide::Actual,
+            &mut resolve_path,
+            &mut failures,
+        );
+        let mut different =
+            !same_except_source_bound_path(&self.expected_edges, &self.actual_edges);
+        for (index, (expected, actual)) in self
+            .expected_edges
+            .iter()
+            .zip(&self.actual_edges)
+            .enumerate()
+        {
+            if expected.package != actual.package
+                || !matches!(
+                    (&expected.source, &actual.source),
+                    (
+                        Some(ResolverContractSourceClause::Path { .. }),
+                        Some(ResolverContractSourceClause::Path { .. })
+                    )
+                )
+            {
+                continue;
+            }
+            if let (Some(expected_key), Some(actual_key)) =
+                (&expected_keys[index], &actual_keys[index])
+            {
+                different |= expected_key != actual_key;
+            }
+        }
+        let status = if different {
+            ResolverContractComparisonStatus::Different
+        } else if !failures.is_empty() {
+            ResolverContractComparisonStatus::PathResolutionFailed
+        } else {
+            ResolverContractComparisonStatus::Equivalent
+        };
+        ResolverContractResolvedPathComparison { status, failures }
+    }
+}
+
+fn resolve_path_edges<K, E>(
+    edges: &[ResolverContractEdge],
+    side: ResolverContractSourceSide,
+    resolve_path: &mut impl FnMut(&ResolverContractPathSourceRequest) -> Result<K, E>,
+    failures: &mut Vec<ResolverContractPathResolutionFailure<E>>,
+) -> Vec<Option<K>> {
+    edges
+        .iter()
+        .map(|edge| {
+            let Some(ResolverContractSourceClause::Path { relative_to, path }) = &edge.source
+            else {
+                return None;
+            };
+            let request = ResolverContractPathSourceRequest {
+                side,
+                requiring_package: relative_to.clone(),
+                package: edge.package.clone(),
+                path: path.clone(),
+            };
+            match resolve_path(&request) {
+                Ok(key) => Some(key),
+                Err(error) => {
+                    failures.push(ResolverContractPathResolutionFailure {
+                        request,
+                        error: Box::new(error),
+                    });
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 fn same_except_source_bound_path(
@@ -826,7 +977,8 @@ mod tests {
 
     use super::{
         ResolverContractBuildError, ResolverContractComparisonError,
-        ResolverContractComparisonStatus, ResolverContractContext, ResolverPathKey,
+        ResolverContractComparisonStatus, ResolverContractContext,
+        ResolverContractPathSourceRequest, ResolverContractSourceSide, ResolverPathKey,
         ResolverPinKind, ResolverRequirementResolution, build_resolver_contract,
         compare_resolver_contract_edges,
     };
@@ -1568,11 +1720,11 @@ requires { acme:local @ ^1 from path "../local" }
 
         assert!(!comparison.equivalent());
         assert_eq!(
-            comparison.expected_edges[0].named_version,
+            comparison.expected_edges()[0].named_version,
             Version::parse("1.1.0").expect("version is valid")
         );
         assert_eq!(
-            comparison.actual_edges[0].named_version,
+            comparison.actual_edges()[0].named_version,
             Version::parse("1.2.0").expect("version is valid")
         );
         assert_eq!(
@@ -1627,6 +1779,35 @@ requires { acme:local @ ^1 from path "../local" }
             ResolverContractComparisonStatus::RequiresSourceBoundPathResolution
         );
         assert!(!comparison.equivalent());
+        let mut resolved_requests = Vec::new();
+        let resolved = comparison.compare_with_resolved_paths(|request| {
+            resolved_requests.push(request.clone());
+            Ok::<_, &'static str>(match request.side {
+                ResolverContractSourceSide::Expected => "expected tree",
+                ResolverContractSourceSide::Actual => "actual tree",
+            })
+        });
+        assert_eq!(
+            resolved.status(),
+            ResolverContractComparisonStatus::Different
+        );
+        assert!(resolved.failures().is_empty());
+        assert_eq!(
+            resolved_requests
+                .iter()
+                .map(|request| request.side)
+                .collect::<Vec<_>>(),
+            [
+                ResolverContractSourceSide::Expected,
+                ResolverContractSourceSide::Actual
+            ]
+        );
+        assert_eq!(resolved_requests[0].package.as_ref(), "acme:local");
+        assert_eq!(
+            resolved_requests[0].requiring_package,
+            package_version("acme:dep", "1.0.0")
+        );
+        assert_eq!(resolved_requests[0].path.as_ref(), "../local");
     }
 
     #[test]
@@ -1639,21 +1820,26 @@ targets { wasm32-core }
         );
         let requiring_version = package_version("acme:dep", "1.0.0");
         let local_version = package_version("acme:local", "1.1.0");
+        let other_version = package_version("acme:other", "1.0.0");
         let path_packages = BTreeMap::from([
             (
                 ResolverPathKey::new(requiring_version.clone(), "../child"),
                 local_version.clone(),
             ),
             (
-                ResolverPathKey::new(requiring_version, "../tmp/../child"),
+                ResolverPathKey::new(requiring_version.clone(), "../tmp/../child"),
                 local_version,
+            ),
+            (
+                ResolverPathKey::new(requiring_version, "../other"),
+                other_version,
             ),
         ]);
         let root_path_overrides = BTreeMap::new();
         let context = root_context(&root, &path_packages, &root_path_overrides);
         let build = |path: &str| {
             let source = format!(
-                "package acme:dep @ 1.0.0\nsource \"src\"\ntargets {{ wasm32-core }}\nrequires {{ acme:local @ ^1 from path \"{path}\" }}\n"
+                "package acme:dep @ 1.0.0\nsource \"src\"\ntargets {{ wasm32-core }}\nrequires {{\n    acme:local @ ^1 from path \"{path}\"\n    acme:other @ ^1 from path \"../other\"\n}}\n"
             );
             let parsed = parse_for_role(source.as_bytes(), PackageRole::Dependency);
             build_resolver_contract(&parsed, &context, PackageValidationContext::default())
@@ -1670,6 +1856,76 @@ targets { wasm32-core }
             ResolverContractComparisonStatus::RequiresSourceBoundPathResolution
         );
         assert!(!comparison.equivalent());
+        assert_eq!(
+            comparison
+                .compare_with_resolved_paths(|request| {
+                    Ok::<_, &'static str>(match request.package.as_ref() {
+                        "acme:local" => "same resolved child",
+                        "acme:other" => "same resolved other",
+                        _ => "unexpected path",
+                    })
+                })
+                .status(),
+            ResolverContractComparisonStatus::Equivalent
+        );
+        let mut resolved_requests = Vec::new();
+        let resolved = comparison.compare_with_resolved_paths(|request| {
+            resolved_requests.push(request.clone());
+            Ok::<_, &'static str>(match (request.package.as_ref(), request.side) {
+                ("acme:local", ResolverContractSourceSide::Expected) => "expected child",
+                ("acme:local", ResolverContractSourceSide::Actual) => "actual child",
+                ("acme:other", _) => return Err("other path lookup failed"),
+                _ => "unexpected path",
+            })
+        });
+        assert_eq!(
+            resolved.status(),
+            ResolverContractComparisonStatus::Different
+        );
+        assert_eq!(resolved.failures().len(), 2);
+        assert_eq!(resolved_requests.len(), 4);
+        assert_eq!(resolved_requests[0].path.as_ref(), "../child");
+        assert_eq!(resolved_requests[2].path.as_ref(), "../tmp/../child");
+        assert_eq!(
+            resolved.failures()[0].request.package.as_ref(),
+            "acme:other"
+        );
+        assert_eq!(
+            resolved.failures()[0].request.side,
+            ResolverContractSourceSide::Expected
+        );
+
+        let unresolved = comparison.compare_with_resolved_paths(
+            |_request: &ResolverContractPathSourceRequest| {
+                Err::<(), _>("path is missing in the source tree")
+            },
+        );
+        assert_eq!(
+            unresolved.status(),
+            ResolverContractComparisonStatus::PathResolutionFailed
+        );
+        assert_eq!(unresolved.failures().len(), 4);
+        assert_eq!(
+            unresolved
+                .failures()
+                .iter()
+                .map(|failure| failure.request.side)
+                .collect::<Vec<_>>(),
+            [
+                ResolverContractSourceSide::Expected,
+                ResolverContractSourceSide::Expected,
+                ResolverContractSourceSide::Actual,
+                ResolverContractSourceSide::Actual
+            ]
+        );
+        assert_eq!(
+            unresolved.failures()[0].request.package.as_ref(),
+            "acme:local"
+        );
+        assert_eq!(
+            unresolved.failures()[0].error.as_ref(),
+            &"path is missing in the source tree"
+        );
     }
 
     #[test]
