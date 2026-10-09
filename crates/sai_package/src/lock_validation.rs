@@ -508,7 +508,7 @@ fn normalized_source_path(path: &str) -> bool {
     true
 }
 
-fn canonical_git_url(value: &str) -> Result<String, ()> {
+pub(crate) fn canonical_git_url(value: &str) -> Result<String, ()> {
     if value.len() > 2048 || !value.is_ascii() || value.contains(['?', '#']) {
         return Err(());
     }

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::lock_validation::canonical_git_url;
 use crate::manifest::{
     Override, OverrideSource, PackageDeclaration, PackageParseError, PackageParseOutput,
     PackageParseWarning, PackageRole, Requirement, RequirementSource, Spanned,
@@ -230,6 +231,363 @@ pub struct ResolverContract {
 impl ResolverContract {
     pub const fn role(&self) -> PackageRole {
         self.role
+    }
+}
+
+/// A source clause after the normalization required for contract comparison.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolverContractSourceClause {
+    Git {
+        /// The canonical URL defined by distribution §4.2.2.
+        canonical_url: Box<str>,
+        /// `None` and `Some(".")` both identify the repository root.
+        directory: Option<Box<str>>,
+    },
+    /// A path clause retains its validated manifest spelling. Its resolved
+    /// filesystem or Git-tree identity is checked by source loading.
+    Path {
+        relative_to: MvsPackageVersion,
+        path: Box<str>,
+    },
+}
+
+/// One target-included dependency edge retained for divergent-source checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverContractEdge {
+    pub package: Box<str>,
+    pub requirement: crate::version_req::VersionReq,
+    /// Captures the concrete version named by a path pin. For ordinary
+    /// requirements this equals `requirement.minimum()`.
+    pub named_version: Version,
+    pub source: Option<ResolverContractSourceClause>,
+    pub only: Option<BTreeSet<Box<str>>>,
+    pub grant: Option<BTreeSet<Box<str>>>,
+}
+
+/// Field-by-field comparison of two contracts for the same package version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverContractEdgeComparison {
+    pub package_version: MvsPackageVersion,
+    pub expected_edges: Vec<ResolverContractEdge>,
+    pub actual_edges: Vec<ResolverContractEdge>,
+}
+
+/// Whether the edge comparison is conclusive for every source clause.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolverContractComparisonStatus {
+    Equivalent,
+    Different,
+    RequiresSourceBoundPathResolution,
+}
+
+impl ResolverContractEdgeComparison {
+    pub fn status(&self) -> ResolverContractComparisonStatus {
+        if !same_except_source_bound_path(&self.expected_edges, &self.actual_edges) {
+            return ResolverContractComparisonStatus::Different;
+        }
+        if has_path_source(&self.expected_edges) || has_path_source(&self.actual_edges) {
+            return ResolverContractComparisonStatus::RequiresSourceBoundPathResolution;
+        }
+        ResolverContractComparisonStatus::Equivalent
+    }
+
+    pub fn equivalent(&self) -> bool {
+        self.status() == ResolverContractComparisonStatus::Equivalent
+    }
+}
+
+fn same_except_source_bound_path(
+    expected: &[ResolverContractEdge],
+    actual: &[ResolverContractEdge],
+) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            expected.package == actual.package
+                && expected.requirement == actual.requirement
+                && expected.named_version == actual.named_version
+                && expected.only == actual.only
+                && expected.grant == actual.grant
+                && match (&expected.source, &actual.source) {
+                    (
+                        Some(ResolverContractSourceClause::Path { .. }),
+                        Some(ResolverContractSourceClause::Path { .. }),
+                    ) => true,
+                    (expected, actual) => expected == actual,
+                }
+        })
+}
+
+fn has_path_source(edges: &[ResolverContractEdge]) -> bool {
+    edges.iter().any(|edge| {
+        matches!(
+            &edge.source,
+            Some(ResolverContractSourceClause::Path { .. })
+        )
+    })
+}
+
+/// The contracts could not be compared because their inputs were inconsistent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolverContractComparisonError {
+    DependencyRoleMismatch {
+        expected: PackageRole,
+        actual: PackageRole,
+    },
+    PackageVersionMismatch {
+        expected: Box<MvsPackageVersion>,
+        actual: Box<MvsPackageVersion>,
+    },
+    ContractContextMismatch(Box<MvsPackageVersion>),
+    ContractMetadataMismatch(Box<MvsPackageVersion>),
+    RootContextMismatch,
+    InvalidGitUrl {
+        package: Box<str>,
+        url: Box<str>,
+        span: Range<usize>,
+    },
+    InvalidGitDirectory {
+        package: Box<str>,
+        directory: Box<str>,
+        span: Range<usize>,
+    },
+}
+
+/// Compares the resolver-relevant included edges of two source-bound contracts.
+///
+/// This deliberately ignores declaration order, source spans, and parse
+/// warnings. Dependency test requirements are absent from resolver contracts,
+/// and requirements filtered by the root's targets are excluded. Git URLs are
+/// compared in canonical form; path clauses retain their manifest spelling
+/// because this pure comparison has no filesystem or Git-tree access. The
+/// result reports `RequiresSourceBoundPathResolution` when any path clause
+/// remains, so callers cannot accept it as fully equivalent before resolving
+/// that path against the relevant source tree.
+pub fn compare_resolver_contract_edges(
+    expected: &ResolverContract,
+    expected_context: &ResolverContractContext<'_>,
+    actual: &ResolverContract,
+    actual_context: &ResolverContractContext<'_>,
+) -> Result<ResolverContractEdgeComparison, ResolverContractComparisonError> {
+    if expected.role != PackageRole::Dependency || actual.role != PackageRole::Dependency {
+        return Err(ResolverContractComparisonError::DependencyRoleMismatch {
+            expected: expected.role,
+            actual: actual.role,
+        });
+    }
+    if expected.mvs.package_version() != actual.mvs.package_version() {
+        return Err(ResolverContractComparisonError::PackageVersionMismatch {
+            expected: Box::new(expected.mvs.package_version().clone()),
+            actual: Box::new(actual.mvs.package_version().clone()),
+        });
+    }
+    let package_version = expected.mvs.package_version().clone();
+    if !expected_context.is_bound_to_root_contract(expected)
+        || !actual_context.is_bound_to_root_contract(actual)
+    {
+        return Err(ResolverContractComparisonError::ContractContextMismatch(
+            Box::new(package_version),
+        ));
+    }
+    if !same_root_resolution_context(expected_context, actual_context) {
+        return Err(ResolverContractComparisonError::RootContextMismatch);
+    }
+    if !contract_edges_match_mvs(expected) || !contract_edges_match_mvs(actual) {
+        return Err(ResolverContractComparisonError::ContractMetadataMismatch(
+            Box::new(package_version),
+        ));
+    }
+
+    let expected_edges = comparable_contract_edges(expected, expected_context)?;
+    let actual_edges = comparable_contract_edges(actual, actual_context)?;
+    Ok(ResolverContractEdgeComparison {
+        package_version,
+        expected_edges,
+        actual_edges,
+    })
+}
+
+fn contract_edges_match_mvs(contract: &ResolverContract) -> bool {
+    let mut included_requirements = contract
+        .requirements
+        .iter()
+        .filter(|requirement| {
+            matches!(
+                requirement.resolution,
+                ResolverRequirementResolution::Included { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    included_requirements
+        .sort_by(|left, right| left.package.as_bytes().cmp(right.package.as_bytes()));
+    if included_requirements.len() != contract.mvs.edges().len() {
+        return false;
+    }
+    included_requirements
+        .into_iter()
+        .zip(contract.mvs.edges())
+        .all(|(requirement, edge)| {
+            let ResolverRequirementResolution::Included { named_version, .. } =
+                &requirement.resolution
+            else {
+                return false;
+            };
+            requirement.package.as_ref() == edge.package()
+                && requirement.version == *edge.requirement()
+                && requirement.span == edge.span()
+                && named_version == edge.named_version()
+        })
+}
+
+fn same_root_resolution_context(
+    left: &ResolverContractContext<'_>,
+    right: &ResolverContractContext<'_>,
+) -> bool {
+    left.root_manifest == right.root_manifest
+        && left.root_package == right.root_package
+        && left.root_targets == right.root_targets
+        && left.root_path_overrides == right.root_path_overrides
+        && left.root_overrides == right.root_overrides
+        && root_path_packages(left) == root_path_packages(right)
+}
+
+fn root_path_packages(
+    context: &ResolverContractContext<'_>,
+) -> BTreeMap<ResolverPathKey, MvsPackageVersion> {
+    context
+        .path_packages
+        .iter()
+        .filter_map(|(key, package_version)| {
+            (key.requiring_package == context.root_package)
+                .then_some((key.clone(), package_version.clone()))
+        })
+        .collect()
+}
+
+fn comparable_contract_edges(
+    contract: &ResolverContract,
+    context: &ResolverContractContext<'_>,
+) -> Result<Vec<ResolverContractEdge>, ResolverContractComparisonError> {
+    let requiring_package = contract.mvs.package_version();
+    let mut edges = Vec::new();
+    for requirement in &contract.requirements {
+        let ResolverRequirementResolution::Included { named_version, .. } = &requirement.resolution
+        else {
+            continue;
+        };
+        let source =
+            canonical_requirement_source(requirement, named_version, requiring_package, context)?;
+        edges.push(ResolverContractEdge {
+            package: requirement.package.clone(),
+            requirement: requirement.version.clone(),
+            named_version: named_version.clone(),
+            source,
+            only: requirement.only.clone(),
+            grant: requirement.grant.clone(),
+        });
+    }
+    edges.sort_by(|left, right| left.package.as_bytes().cmp(right.package.as_bytes()));
+    Ok(edges)
+}
+
+fn canonical_requirement_source(
+    requirement: &ResolverRequirement,
+    named_version: &Version,
+    requiring_package: &MvsPackageVersion,
+    context: &ResolverContractContext<'_>,
+) -> Result<Option<ResolverContractSourceClause>, ResolverContractComparisonError> {
+    for item in &context.root_overrides {
+        if item.value.package.as_ref() != requirement.package.as_ref() {
+            continue;
+        }
+        match &item.value.source {
+            OverrideSource::Git { url, directory } => {
+                return canonical_source_clause(
+                    requirement,
+                    RequirementSource::Git {
+                        url: url.clone(),
+                        directory: directory.clone(),
+                    },
+                    item.span.clone(),
+                    context.root_package.clone(),
+                )
+                .map(Some);
+            }
+            OverrideSource::Path(path)
+                if context
+                    .root_path_overrides
+                    .get(requirement.package.as_ref())
+                    .is_some_and(|package_version| {
+                        package_version.version().compatibility_line()
+                            == named_version.compatibility_line()
+                    }) =>
+            {
+                return canonical_source_clause(
+                    requirement,
+                    RequirementSource::Path(path.clone()),
+                    item.span.clone(),
+                    context.root_package.clone(),
+                )
+                .map(Some);
+            }
+            OverrideSource::Artifact | OverrideSource::Path(_) => {}
+        }
+    }
+
+    requirement
+        .source
+        .as_ref()
+        .map(|spanned| {
+            canonical_source_clause(
+                requirement,
+                spanned.value.clone(),
+                spanned.span.clone(),
+                requiring_package.clone(),
+            )
+        })
+        .transpose()
+}
+
+fn canonical_source_clause(
+    requirement: &ResolverRequirement,
+    source: RequirementSource,
+    span: Range<usize>,
+    path_base: MvsPackageVersion,
+) -> Result<ResolverContractSourceClause, ResolverContractComparisonError> {
+    match source {
+        RequirementSource::Git { url, directory } => {
+            let canonical_url = canonical_git_url(&url).map_err(|()| {
+                ResolverContractComparisonError::InvalidGitUrl {
+                    package: requirement.package.clone(),
+                    url: url.clone(),
+                    span: span.clone(),
+                }
+            })?;
+            let directory = canonical_git_directory(directory.as_deref()).map_err(|()| {
+                ResolverContractComparisonError::InvalidGitDirectory {
+                    package: requirement.package.clone(),
+                    directory: directory.clone().unwrap_or_default(),
+                    span,
+                }
+            })?;
+            Ok(ResolverContractSourceClause::Git {
+                canonical_url: canonical_url.into(),
+                directory,
+            })
+        }
+        RequirementSource::Path(path) => Ok(ResolverContractSourceClause::Path {
+            relative_to: path_base,
+            path,
+        }),
+    }
+}
+
+fn canonical_git_directory(directory: Option<&str>) -> Result<Option<Box<str>>, ()> {
+    match directory {
+        None | Some(".") => Ok(None),
+        Some(directory) => {
+            crate::package_path::ContentPackagePath::parse(directory).map_err(|_| ())?;
+            Ok(Some(directory.into()))
+        }
     }
 }
 
@@ -467,10 +825,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ResolverContractBuildError, ResolverContractContext, ResolverPathKey, ResolverPinKind,
-        ResolverRequirementResolution, build_resolver_contract,
+        ResolverContractBuildError, ResolverContractComparisonError,
+        ResolverContractComparisonStatus, ResolverContractContext, ResolverPathKey,
+        ResolverPinKind, ResolverRequirementResolution, build_resolver_contract,
+        compare_resolver_contract_edges,
     };
-    use crate::manifest::{PackageRole, parse, parse_for_role};
+    use crate::manifest::{PackageRole, RequirementSource, parse, parse_for_role};
     use crate::mvs::{MvsPackageVersion, select};
     use crate::validation::PackageValidationContext;
     use crate::version::Version;
@@ -998,5 +1358,426 @@ requires { acme:local @ ^1 from path "../local" }
             }) if package.as_ref() == "acme:local"
                 && *declared_version == Version::parse("2.0.0").expect("version is valid")
         ));
+    }
+
+    #[test]
+    fn contract_edge_comparison_ignores_order_spans_and_filtered_requirements() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+        );
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let expected = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core, wasm32-wasi }
+requires {
+    acme:a @ ^1 from git "https://example.test/a"
+    acme:z @ ^1 from git "HTTPS://EXAMPLE.TEST:443/repo/" dir "z" only { wasm32-core, wasm32-wasi } grant { alloc, wasi:filesystem/types }
+    acme:ignored @ ^1 from git "https://example.test/ignored" only { wasm32-wasi }
+}
+requires test { acme:test @ ^1 from git "https://example.test/test" }
+"#,
+            PackageRole::Dependency,
+        );
+        let actual = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core, wasm32-wasi }
+requires {
+    acme:z @ ^1 from git "https://example.test/repo" dir "z" only { wasm32-wasi, wasm32-core } grant { wasi:filesystem/types, alloc }
+    acme:a @ ^1 from git "HTTPS://EXAMPLE.TEST:443/a/" dir "."
+    acme:ignored @ ^2 from path "../not-loaded" only { wasm32-wasi }
+}
+requires test { acme:other-test @ ^1 from git "https://example.test/other-test" }
+"#,
+            PackageRole::Dependency,
+        );
+        let expected =
+            build_resolver_contract(&expected, &context, PackageValidationContext::default())
+                .expect("expected dependency contract is valid");
+        let actual =
+            build_resolver_contract(&actual, &context, PackageValidationContext::default())
+                .expect("actual dependency contract is valid");
+
+        let comparison = compare_resolver_contract_edges(&expected, &context, &actual, &context)
+            .expect("the contracts have comparable source clauses");
+
+        assert!(comparison.equivalent());
+        assert_eq!(
+            comparison
+                .expected_edges
+                .iter()
+                .map(|edge| edge.package.as_ref())
+                .collect::<Vec<_>>(),
+            ["acme:a", "acme:z"]
+        );
+    }
+
+    #[test]
+    fn contract_edge_comparison_detects_every_resolver_edge_field() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+        );
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let build = |requirement: &str| {
+            let source = format!(
+                "package acme:dep @ 1.0.0\nsource \"src\"\ntargets {{ wasm32-core, wasm32-wasi }}\nrequires {{ {requirement} }}\n"
+            );
+            let parsed = parse_for_role(source.as_bytes(), PackageRole::Dependency);
+            build_resolver_contract(&parsed, &context, PackageValidationContext::default())
+                .expect("dependency contract is valid")
+        };
+        let expected = build(
+            "acme:edge @ ^1 from git \"https://example.test/edge\" only { wasm32-core } grant { alloc }",
+        );
+
+        for requirement in [
+            "acme:other @ ^1 from git \"https://example.test/edge\" only { wasm32-core } grant { alloc }",
+            "acme:edge @ ^2 from git \"https://example.test/edge\" only { wasm32-core } grant { alloc }",
+            "acme:edge @ ^1 from git \"https://mirror.test/edge\" only { wasm32-core } grant { alloc }",
+            "acme:edge @ ^1 from git \"https://example.test/edge\" only { wasm32-core, wasm32-wasi } grant { alloc }",
+            "acme:edge @ ^1 from git \"https://example.test/edge\" only { wasm32-core }",
+        ] {
+            let actual = build(requirement);
+            let comparison =
+                compare_resolver_contract_edges(&expected, &context, &actual, &context)
+                    .expect("both source clauses are valid");
+            assert!(
+                !comparison.equivalent(),
+                "expected edge difference for {requirement}"
+            );
+        }
+
+        let mut inconsistent = expected.clone();
+        inconsistent.requirements[0].version =
+            crate::version_req::VersionReq::parse("^2").expect("version requirement is valid");
+        assert_eq!(
+            compare_resolver_contract_edges(&expected, &context, &inconsistent, &context),
+            Err(ResolverContractComparisonError::ContractMetadataMismatch(
+                Box::new(package_version("acme:dep", "1.0.0"))
+            ))
+        );
+    }
+
+    #[test]
+    fn contract_edge_comparison_applies_root_git_and_path_overrides() {
+        let root_git = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+overrides { acme:edge use git "HTTPS://EXAMPLE.TEST:443/override/" }
+"#,
+        );
+        let empty_paths = BTreeMap::new();
+        let empty_overrides = BTreeMap::new();
+        let git_context = root_context(&root_git, &empty_paths, &empty_overrides);
+        let source_contract = |source: &str, context: &ResolverContractContext<'_>| {
+            let bytes = format!(
+                "package acme:dep @ 1.0.0\nsource \"src\"\ntargets {{ wasm32-core }}\nrequires {{ acme:edge @ ^1 from git \"{source}\" }}\n"
+            );
+            let parsed = parse_for_role(bytes.as_bytes(), PackageRole::Dependency);
+            build_resolver_contract(&parsed, context, PackageValidationContext::default())
+                .expect("dependency contract is valid")
+        };
+        let original_git = source_contract("https://original.test/edge", &git_context);
+        let mirror_git = source_contract("https://mirror.test/edge", &git_context);
+        let git_comparison =
+            compare_resolver_contract_edges(&original_git, &git_context, &mirror_git, &git_context)
+                .expect("root Git override supplies the effective source");
+        assert!(git_comparison.equivalent());
+
+        let root_path = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+overrides { acme:edge use path "../override-edge" }
+"#,
+        );
+        let root_edge_version = package_version("acme:edge", "1.5.0");
+        let path_overrides = BTreeMap::from([("acme:edge".into(), root_edge_version)]);
+        let path_context = root_context(&root_path, &empty_paths, &path_overrides);
+        let original_path_source = source_contract("https://original.test/edge", &path_context);
+        let mirror_path_source = source_contract("https://mirror.test/edge", &path_context);
+        let path_comparison = compare_resolver_contract_edges(
+            &original_path_source,
+            &path_context,
+            &mirror_path_source,
+            &path_context,
+        )
+        .expect("root path override supplies the effective source");
+        assert_eq!(
+            path_comparison.status(),
+            ResolverContractComparisonStatus::RequiresSourceBoundPathResolution
+        );
+    }
+
+    #[test]
+    fn contract_edge_comparison_includes_source_specific_path_pin_versions() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+        );
+        let requiring_version = package_version("acme:dep", "1.0.0");
+        let expected_paths = BTreeMap::from([(
+            ResolverPathKey::new(requiring_version.clone(), "../local"),
+            package_version("acme:local", "1.1.0"),
+        )]);
+        let actual_paths = BTreeMap::from([(
+            ResolverPathKey::new(requiring_version, "../local"),
+            package_version("acme:local", "1.2.0"),
+        )]);
+        let root_path_overrides = BTreeMap::new();
+        let expected_context = root_context(&root, &expected_paths, &root_path_overrides);
+        let actual_context = root_context(&root, &actual_paths, &root_path_overrides);
+        let manifest = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:local @ ^1 from path "../local" }
+"#,
+            PackageRole::Dependency,
+        );
+        let expected = build_resolver_contract(
+            &manifest,
+            &expected_context,
+            PackageValidationContext::default(),
+        )
+        .expect("expected source-specific path package is valid");
+        let actual = build_resolver_contract(
+            &manifest,
+            &actual_context,
+            PackageValidationContext::default(),
+        )
+        .expect("actual source-specific path package is valid");
+
+        let comparison =
+            compare_resolver_contract_edges(&expected, &expected_context, &actual, &actual_context)
+                .expect("both contracts use compatible root resolution contexts");
+
+        assert!(!comparison.equivalent());
+        assert_eq!(
+            comparison.expected_edges[0].named_version,
+            Version::parse("1.1.0").expect("version is valid")
+        );
+        assert_eq!(
+            comparison.actual_edges[0].named_version,
+            Version::parse("1.2.0").expect("version is valid")
+        );
+        assert_eq!(
+            comparison.status(),
+            ResolverContractComparisonStatus::Different
+        );
+    }
+
+    #[test]
+    fn contract_edge_comparison_defers_dependency_relative_path_identity() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+        );
+        let requiring_version = package_version("acme:dep", "1.0.0");
+        let path_packages = BTreeMap::from([(
+            ResolverPathKey::new(requiring_version, "../local"),
+            package_version("acme:local", "1.1.0"),
+        )]);
+        let empty_root_overrides = BTreeMap::new();
+        let expected_context = root_context(&root, &path_packages, &empty_root_overrides);
+        let actual_context = root_context(&root, &path_packages, &empty_root_overrides);
+        let manifest = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:local @ ^1 from path "../local" }
+"#,
+            PackageRole::Dependency,
+        );
+        let expected = build_resolver_contract(
+            &manifest,
+            &expected_context,
+            PackageValidationContext::default(),
+        )
+        .expect("expected dependency contract is valid");
+        let actual = build_resolver_contract(
+            &manifest,
+            &actual_context,
+            PackageValidationContext::default(),
+        )
+        .expect("actual dependency contract is valid");
+
+        let comparison =
+            compare_resolver_contract_edges(&expected, &expected_context, &actual, &actual_context)
+                .expect("both contracts have compatible root settings");
+
+        assert_eq!(
+            comparison.status(),
+            ResolverContractComparisonStatus::RequiresSourceBoundPathResolution
+        );
+        assert!(!comparison.equivalent());
+    }
+
+    #[test]
+    fn path_spelling_differences_wait_for_source_bound_resolution() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+        );
+        let requiring_version = package_version("acme:dep", "1.0.0");
+        let local_version = package_version("acme:local", "1.1.0");
+        let path_packages = BTreeMap::from([
+            (
+                ResolverPathKey::new(requiring_version.clone(), "../child"),
+                local_version.clone(),
+            ),
+            (
+                ResolverPathKey::new(requiring_version, "../tmp/../child"),
+                local_version,
+            ),
+        ]);
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let build = |path: &str| {
+            let source = format!(
+                "package acme:dep @ 1.0.0\nsource \"src\"\ntargets {{ wasm32-core }}\nrequires {{ acme:local @ ^1 from path \"{path}\" }}\n"
+            );
+            let parsed = parse_for_role(source.as_bytes(), PackageRole::Dependency);
+            build_resolver_contract(&parsed, &context, PackageValidationContext::default())
+                .expect("path source is valid")
+        };
+        let expected = build("../child");
+        let actual = build("../tmp/../child");
+
+        let comparison = compare_resolver_contract_edges(&expected, &context, &actual, &context)
+            .expect("both contracts use the same root settings");
+
+        assert_eq!(
+            comparison.status(),
+            ResolverContractComparisonStatus::RequiresSourceBoundPathResolution
+        );
+        assert!(!comparison.equivalent());
+    }
+
+    #[test]
+    fn contract_edge_comparison_rejects_invalid_git_source_urls() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+        );
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let invalid = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:edge @ ^1 from git "http://example.test/edge" }
+"#,
+            PackageRole::Dependency,
+        );
+        let contract =
+            build_resolver_contract(&invalid, &context, PackageValidationContext::default())
+                .expect("resolver adapter retains the source for canonicalization");
+
+        assert!(matches!(
+            compare_resolver_contract_edges(&contract, &context, &contract, &context),
+            Err(ResolverContractComparisonError::InvalidGitUrl { package, .. })
+                if package.as_ref() == "acme:edge"
+        ));
+
+        let valid_directory = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:edge @ ^1 from git "https://example.test/repo" dir "edge" }
+"#,
+            PackageRole::Dependency,
+        );
+        let valid_directory_contract = build_resolver_contract(
+            &valid_directory,
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("source directory is retained for normalization");
+        for invalid_directory in ["../edge", "group/../edge"] {
+            let mut contract = valid_directory_contract.clone();
+            let RequirementSource::Git { directory, .. } = &mut contract.requirements[0]
+                .source
+                .as_mut()
+                .expect("Git source is retained")
+                .value
+            else {
+                panic!("expected a Git source");
+            };
+            *directory = Some(invalid_directory.into());
+            assert!(matches!(
+                compare_resolver_contract_edges(&contract, &context, &contract, &context),
+                Err(ResolverContractComparisonError::InvalidGitDirectory { package, .. })
+                    if package.as_ref() == "acme:edge"
+            ));
+        }
+    }
+
+    #[test]
+    fn contract_edge_comparison_rejects_changed_root_path_packages() {
+        let root = parse(
+            br#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:local @ ^1 from path "../local" }
+"#,
+        );
+        let root_version = package_version("acme:app", "1.0.0");
+        let root_path_overrides = BTreeMap::new();
+        let expected_paths = BTreeMap::from([(
+            ResolverPathKey::new(root_version.clone(), "../local"),
+            package_version("acme:local", "1.0.0"),
+        )]);
+        let actual_paths = BTreeMap::from([(
+            ResolverPathKey::new(root_version, "../local"),
+            package_version("acme:local", "1.1.0"),
+        )]);
+        let expected_context = root_context(&root, &expected_paths, &root_path_overrides);
+        let actual_context = root_context(&root, &actual_paths, &root_path_overrides);
+        let manifest = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+            PackageRole::Dependency,
+        );
+        let expected = build_resolver_contract(
+            &manifest,
+            &expected_context,
+            PackageValidationContext::default(),
+        )
+        .expect("expected dependency contract is valid");
+        let actual = build_resolver_contract(
+            &manifest,
+            &actual_context,
+            PackageValidationContext::default(),
+        )
+        .expect("actual dependency contract is valid");
+
+        assert_eq!(
+            compare_resolver_contract_edges(&expected, &expected_context, &actual, &actual_context),
+            Err(ResolverContractComparisonError::RootContextMismatch)
+        );
     }
 }
