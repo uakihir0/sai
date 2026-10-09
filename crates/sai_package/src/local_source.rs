@@ -3,7 +3,8 @@
 //! Git-backed package trees are resolved by a separate provider. This module
 //! handles local package directories without invoking external tools.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -26,7 +27,7 @@ use crate::manifest::{
     MAX_PACKAGE_MANIFEST_BYTES, OverrideSource, PackageDeclaration, PackageParseOutput,
     PackageRole, RequirementSource, Spanned, parse_for_role,
 };
-use crate::mvs::MvsPackageVersion;
+use crate::mvs::{MvsNode, MvsPackageVersion};
 use crate::package_path::{DependencyPackagePath, PackagePathError};
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, ResolverPathKey,
@@ -36,6 +37,11 @@ use crate::resolver_source::{
     ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
     ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
     validate_resolver_path_pins,
+};
+use crate::resolver_source_provider::{
+    ResolverLoadedContract, ResolverLoadedRootContract, ResolverSourceProviderError,
+    ResolverSourceProviderIdentifiedOutput, ResolverSourceProviderIdentityLoadError,
+    plan_resolver_final_sources, select_with_source_provider_and_canonicalized_pins_and_identities,
 };
 use crate::validation::PackageValidationContext;
 use crate::version::Version;
@@ -216,6 +222,7 @@ pub enum LocalPackageSourceResolveError {
     },
     MissingSelectedDirectory(MvsPackageVersion),
     SelectedDirectoryMismatch(MvsPackageVersion),
+    SelectedManifestChanged(MvsPackageVersion),
     PathLockFloorUnsupported(MvsPackageVersion),
     MissingBaseDirectory(MvsPackageVersion),
     InvalidPath(PackagePathError),
@@ -230,6 +237,109 @@ pub enum LocalPackageContractLoadError {
         expected: Box<MvsPackageVersion>,
         found: Box<MvsPackageVersion>,
     },
+}
+
+/// A source-aware MVS candidate could not be loaded by the local filesystem
+/// provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageMvsLoadError {
+    UnsupportedSource {
+        package_version: Box<MvsPackageVersion>,
+        package_source: Box<ResolverPackageSource>,
+    },
+    SourceResolve(LocalPackageSourceResolveError),
+    PathRequirements(LocalPackagePathIndexError),
+    ResolverContext(ResolverContractBuildError),
+    Contract(LocalPackageContractLoadError),
+}
+
+type LocalPackageMvsProviderError = ResolverSourceProviderIdentityLoadError<
+    LocalPackageMvsLoadError,
+    LocalPackageDirectory,
+    LocalPackagePathPinError,
+    LocalPackageDirectory,
+>;
+
+/// A source-aware local path resolution could not load every MVS candidate.
+///
+/// The partial provider result, evolving resolver context, and per-run
+/// directory index are retained so diagnostics and independent successful
+/// branches remain inspectable.
+#[derive(Debug)]
+pub struct LocalPackageMvsProviderFailure {
+    error: Box<LocalPackageMvsProviderError>,
+    context: ResolverContractContext<'static>,
+    directory_index: LocalPackageDirectoryIndex,
+}
+
+impl LocalPackageMvsProviderFailure {
+    pub const fn error(
+        &self,
+    ) -> &ResolverSourceProviderError<
+        LocalPackageMvsLoadError,
+        LocalPackageDirectory,
+        LocalPackagePathPinError,
+    > {
+        self.error.error()
+    }
+
+    pub const fn context(&self) -> &ResolverContractContext<'static> {
+        &self.context
+    }
+
+    pub const fn directory_index(&self) -> &LocalPackageDirectoryIndex {
+        &self.directory_index
+    }
+
+    pub const fn source_identities(
+        &self,
+    ) -> &crate::resolver_source_provider::ResolverSourceIdentitySnapshot<LocalPackageDirectory>
+    {
+        self.error.source_identities()
+    }
+}
+
+/// Failure to prepare or run local path-only package resolution.
+#[derive(Debug)]
+pub enum LocalPackageMvsError {
+    RootDiscovery(Box<LocalPackagePathIndexError>),
+    RootContract(Box<ResolverContractBuildError>),
+    Provider(Box<LocalPackageMvsProviderFailure>),
+}
+
+/// A complete source-aware MVS load using local path package snapshots.
+#[derive(Clone, Debug)]
+pub struct LocalPackageMvsOutput {
+    provider: ResolverSourceProviderIdentifiedOutput<LocalPackageDirectory>,
+    context: ResolverContractContext<'static>,
+    directory_index: LocalPackageDirectoryIndex,
+}
+
+impl LocalPackageMvsOutput {
+    pub const fn provider(&self) -> &ResolverSourceProviderIdentifiedOutput<LocalPackageDirectory> {
+        &self.provider
+    }
+
+    /// Context extended with path packages discovered in loaded dependencies.
+    pub const fn context(&self) -> &ResolverContractContext<'static> {
+        &self.context
+    }
+
+    /// Per-resolution snapshot index used by the provider and source audit.
+    pub const fn directory_index(&self) -> &LocalPackageDirectoryIndex {
+        &self.directory_index
+    }
+
+    /// Plans post-selection source choices using the accumulated path map.
+    pub fn plan_final_sources(
+        &self,
+        locked_sources: &std::collections::HashMap<MvsPackageVersion, ResolverPackageSource>,
+    ) -> Result<
+        crate::resolver_source_provider::ResolverFinalSourcePlan,
+        crate::resolver_source_provider::ResolverFinalSourcePlanError,
+    > {
+        plan_resolver_final_sources(self.provider.output(), &self.context, locked_sources)
+    }
 }
 
 impl LocalPackageDirectory {
@@ -383,6 +493,33 @@ impl LocalPackageDirectory {
 }
 
 impl LocalPackageDirectoryIndex {
+    /// Adds the root directory under the package version in its captured
+    /// manifest and returns that concrete version.
+    pub fn index_root_directory(
+        &mut self,
+        directory: &LocalPackageDirectory,
+    ) -> Result<MvsPackageVersion, LocalPackagePathIndexError> {
+        let parsed = directory.parse_manifest(PackageRole::Root);
+        if !parsed.is_syntax_valid() {
+            return Err(LocalPackagePathIndexError::InvalidRootManifest(Box::new(
+                parsed,
+            )));
+        }
+        let header = parsed.file().header.as_ref().ok_or_else(|| {
+            LocalPackagePathIndexError::MissingRootPackageHeader(Box::new(parsed.clone()))
+        })?;
+        let package = header.value.identity.to_string();
+        let package_version = MvsPackageVersion::new(package.clone(), header.value.version.clone())
+            .map_err(|_| LocalPackagePathIndexError::InvalidRootPackageIdentity(package.into()))?;
+        self.insert(
+            package_version.clone(),
+            directory.clone(),
+            PackageRole::Root,
+        )
+        .map_err(LocalPackagePathIndexError::Index)?;
+        Ok(package_version)
+    }
+
     /// Adds a directory after confirming its parsed header matches the version.
     ///
     /// This verifies syntax and header identity only; the caller remains
@@ -847,12 +984,14 @@ impl LocalPackageDirectoryIndex {
 
     /// Returns the captured local directory for a selected path source.
     ///
-    /// `PathPin` selections use the exact keys returned to the loader by
-    /// `select_with_source_provider_and_canonicalized_pins`. Root path
-    /// overrides are resolved from the indexed root directory and matched
-    /// against the snapshot indexed for the selected package version. Path
-    /// lock floors are rejected because the lock format excludes path entries
-    /// from floors. Git selections return `None` for a separate Git provider.
+    /// `PathPin` selections compare the exact keys returned to the loader by
+    /// `select_with_source_provider_and_canonicalized_pins` with the directory
+    /// and manifest snapshot indexed for the selected package version, then
+    /// return that indexed snapshot. Root path overrides are resolved from
+    /// the indexed root directory and matched against the selected snapshot.
+    /// Path lock floors are rejected because the lock format excludes path
+    /// entries from floors. Git selections return `None` for a separate Git
+    /// provider.
     pub fn resolve_selected_path_source(
         &self,
         selection: &ResolverSourceSelection,
@@ -893,6 +1032,19 @@ impl LocalPackageDirectoryIndex {
                     .any(|directory| directory != winner)
                 {
                     return Err(LocalPackageSourceResolveError::InconsistentSelection);
+                }
+                if let Some(indexed) = self.entries.get(selection.package_version()) {
+                    if winner != indexed {
+                        return Err(LocalPackageSourceResolveError::SelectedDirectoryMismatch(
+                            selection.package_version().clone(),
+                        ));
+                    }
+                    if winner.manifest_source.as_ref() != indexed.manifest_source.as_ref() {
+                        return Err(LocalPackageSourceResolveError::SelectedManifestChanged(
+                            selection.package_version().clone(),
+                        ));
+                    }
+                    return Ok(Some(indexed.clone()));
                 }
                 Ok(Some(winner.clone()))
             }
@@ -971,6 +1123,101 @@ impl LocalPackageDirectoryIndex {
             .map_err(LocalPackageSourceResolveError::InvalidPath)?;
         base.resolve_dependency(&path)
             .map_err(LocalPackageSourceResolveError::Directory)
+    }
+}
+
+/// Resolves a root package using local path sources and source-aware MVS.
+///
+/// The root and every reachable path dependency are read from captured
+/// `LocalPackageDirectory` snapshots. Git sources fail with an explicit
+/// provider error so callers can dispatch them to a Git-backed resolver.
+pub fn resolve_local_path_packages(
+    root_directory: LocalPackageDirectory,
+    lock_floors: &HashMap<MvsNode, Version>,
+    locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
+    validation_context: PackageValidationContext<'_>,
+) -> Result<LocalPackageMvsOutput, LocalPackageMvsError> {
+    let mut directory_index = LocalPackageDirectoryIndex::default();
+    directory_index
+        .index_root_directory(&root_directory)
+        .map_err(|error| LocalPackageMvsError::RootDiscovery(Box::new(error)))?;
+
+    let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+    let root_path_overrides = directory_index
+        .index_root_path_overrides(&root_directory)
+        .map_err(|error| LocalPackageMvsError::RootDiscovery(Box::new(error)))?;
+    let root_path_packages = directory_index
+        .index_root_path_requirements(&root_directory, &root_path_overrides)
+        .map_err(|error| LocalPackageMvsError::RootDiscovery(Box::new(error)))?;
+    let root_context = ResolverContractContext::from_root_manifest(
+        &root_manifest,
+        &root_path_packages,
+        &root_path_overrides,
+        validation_context,
+    )
+    .map_err(|error| LocalPackageMvsError::RootContract(Box::new(error)))?
+    .into_owned();
+    let root_contract = adapt_resolver_contract(&root_manifest, &root_context, validation_context)
+        .map_err(|error| LocalPackageMvsError::RootContract(Box::new(error)))?;
+
+    let directory_index = RefCell::new(directory_index);
+    let context = RefCell::new(root_context.clone());
+    let result = select_with_source_provider_and_canonicalized_pins_and_identities(
+        ResolverLoadedRootContract::new(root_contract, root_directory),
+        &root_context,
+        lock_floors,
+        locked_sources,
+        |pin| directory_index.borrow().canonicalize_path_pin(pin),
+        |request, selection, canonicalized_path_pins| {
+            let directory = directory_index
+                .borrow()
+                .resolve_selected_path_source(
+                    selection,
+                    root_context.root_package(),
+                    canonicalized_path_pins,
+                )
+                .map_err(LocalPackageMvsLoadError::SourceResolve)?
+                .ok_or_else(|| LocalPackageMvsLoadError::UnsupportedSource {
+                    package_version: Box::new(request.package_version.clone()),
+                    package_source: Box::new(selection.source().clone()),
+                })?;
+
+            let current_context = context.borrow().clone();
+            let mut staged_index = directory_index.borrow().clone();
+            let additions = staged_index
+                .index_dependency_path_requirements(&request.package_version, &current_context)
+                .map_err(LocalPackageMvsLoadError::PathRequirements)?;
+            let next_context = current_context
+                .with_path_packages(&additions)
+                .map_err(LocalPackageMvsLoadError::ResolverContext)?;
+            let contract = directory
+                .build_dependency_contract(
+                    &request.package_version,
+                    &next_context,
+                    validation_context,
+                )
+                .map_err(LocalPackageMvsLoadError::Contract)?;
+            *directory_index.borrow_mut() = staged_index;
+            *context.borrow_mut() = next_context;
+            Ok(ResolverLoadedContract::new(contract, directory))
+        },
+    );
+
+    let context = context.into_inner();
+    let directory_index = directory_index.into_inner();
+    match result {
+        Ok(provider) => Ok(LocalPackageMvsOutput {
+            provider,
+            context,
+            directory_index,
+        }),
+        Err(error) => Err(LocalPackageMvsError::Provider(Box::new(
+            LocalPackageMvsProviderFailure {
+                error,
+                context,
+                directory_index,
+            },
+        ))),
     }
 }
 
@@ -1208,7 +1455,13 @@ impl fmt::Display for LocalPackageSourceResolveError {
             ),
             Self::SelectedDirectoryMismatch(package_version) => write!(
                 formatter,
-                "root path override for {}@{} no longer resolves to its indexed directory",
+                "selected path source for {}@{} no longer resolves to its indexed directory",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::SelectedManifestChanged(package_version) => write!(
+                formatter,
+                "manifest for local package {}@{} changed after path discovery",
                 package_version.package(),
                 package_version.version()
             ),
@@ -1226,6 +1479,50 @@ impl fmt::Display for LocalPackageSourceResolveError {
             ),
             Self::InvalidPath(error) => fmt::Display::fmt(error, formatter),
             Self::Directory(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl fmt::Display for LocalPackageMvsLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSource {
+                package_version,
+                package_source,
+            } => write!(
+                formatter,
+                "local path resolver cannot load {}@{} from {package_source:?}",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::SourceResolve(error) => fmt::Display::fmt(error, formatter),
+            Self::PathRequirements(error) => fmt::Display::fmt(error, formatter),
+            Self::ResolverContext(error) => {
+                write!(formatter, "dependency resolver context is invalid: {error}")
+            }
+            Self::Contract(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl fmt::Display for LocalPackageMvsProviderFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "source-aware package loading failed: {:?}",
+            self.error.error()
+        )
+    }
+}
+
+impl fmt::Display for LocalPackageMvsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootDiscovery(error) => fmt::Display::fmt(error, formatter),
+            Self::RootContract(error) => {
+                write!(formatter, "root package contract is invalid: {error}")
+            }
+            Self::Provider(error) => fmt::Display::fmt(error, formatter),
         }
     }
 }
@@ -1313,6 +1610,30 @@ impl std::error::Error for LocalPackageContractLoadError {
         match self {
             Self::InvalidContract(error) => Some(error),
             Self::PackageVersionMismatch { .. } => None,
+        }
+    }
+}
+
+impl std::error::Error for LocalPackageMvsLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedSource { .. } => None,
+            Self::SourceResolve(error) => Some(error),
+            Self::PathRequirements(error) => Some(error),
+            Self::ResolverContext(error) => Some(error),
+            Self::Contract(error) => Some(error),
+        }
+    }
+}
+
+impl std::error::Error for LocalPackageMvsProviderFailure {}
+
+impl std::error::Error for LocalPackageMvsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RootDiscovery(error) => Some(error),
+            Self::RootContract(error) => Some(error),
+            Self::Provider(error) => Some(error),
         }
     }
 }
@@ -1478,7 +1799,7 @@ fn open_manifest(path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1488,15 +1809,20 @@ mod tests {
     use crate::package_path::{DependencyPackagePath, PackagePathError};
     use crate::resolver_contract::{
         ResolverContractBuildError, ResolverContractContext, ResolverPathKey,
+        build_resolver_contract,
     };
-    use crate::resolver_source::{ResolverPackageSource, ResolverPathPinSource};
+    use crate::resolver_source::{
+        ResolverPackageSource, ResolverPathPinSource, select_resolver_source,
+    };
+    use crate::resolver_source_provider::{ResolverPackageLoadError, ResolverSourceProviderError};
     use crate::validation::PackageValidationContext;
     use crate::version::Version;
 
     use super::{
         LocalPackageContractLoadError, LocalPackageDirectory, LocalPackageDirectoryIndex,
-        LocalPackageDirectoryIndexError, LocalPackageError, LocalPackagePathIndexError,
-        LocalPackagePathPinError,
+        LocalPackageDirectoryIndexError, LocalPackageError, LocalPackageMvsError,
+        LocalPackageMvsLoadError, LocalPackagePathIndexError, LocalPackagePathPinError,
+        LocalPackageSourceResolveError, resolve_local_path_packages,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -2941,6 +3267,382 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(2)),
             Ok(Err(LocalPackageError::ManifestNotFile)),
             "opening a FIFO manifest must return without waiting for a writer"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn resolves_transitive_local_paths_through_source_aware_mvs() {
+        let tree = TempTree::new();
+        let root_path = tree.package(
+            "workspace/root",
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dependency @ ^1 from path \"../dependency\" }\n",
+        );
+        let dependency_path = tree.package(
+            "workspace/dependency",
+            b"package acme:dependency @ 1.2.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:sibling @ ^1 from path \"../sibling\" }\n",
+        );
+        let sibling_path = tree.package(
+            "workspace/sibling",
+            b"package acme:sibling @ 1.4.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_directory = LocalPackageDirectory::open(root_path).expect("open root");
+        let expected_root_path =
+            fs::canonicalize(root_directory.path()).expect("canonical root path");
+
+        let output = resolve_local_path_packages(
+            root_directory,
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("resolve local path packages");
+
+        let dependency = package_version("acme:dependency", "1.2.0");
+        let sibling = package_version("acme:sibling", "1.4.0");
+        let selected = output.provider().output().selection().selected();
+        assert_eq!(selected.get(&dependency.node()), Some(dependency.version()));
+        assert_eq!(selected.get(&sibling.node()), Some(sibling.version()));
+        assert_eq!(
+            output
+                .context()
+                .path_packages()
+                .get(&ResolverPathKey::new(dependency.clone(), "../sibling")),
+            Some(&sibling)
+        );
+
+        let root_identity = output
+            .provider()
+            .source_identities()
+            .root_identity()
+            .expect("root source identity");
+        assert_eq!(root_identity.path(), expected_root_path);
+        let package_identities = output.provider().source_identities().package_identities();
+        assert_eq!(
+            package_identities[&dependency].path(),
+            fs::canonicalize(dependency_path).expect("canonical dependency path")
+        );
+        assert_eq!(
+            package_identities[&sibling].path(),
+            fs::canonicalize(sibling_path).expect("canonical sibling path")
+        );
+
+        let plan = output
+            .plan_final_sources(&HashMap::new())
+            .expect("plan final sources from accumulated path context");
+        assert_eq!(plan.entries().len(), 2);
+        assert!(plan.failures().is_empty());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn rejects_a_path_manifest_changed_after_version_discovery() {
+        let tree = TempTree::new();
+        let root_path = tree.package(
+            "workspace/root",
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dependency @ ^1 from path \"../dependency\" }\n",
+        );
+        let dependency_path = tree.package(
+            "workspace/dependency",
+            b"package acme:dependency @ 1.2.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_directory = LocalPackageDirectory::open(root_path).expect("open root");
+        let root_version = package_version("acme:root", "1.0.0");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .index_root_directory(&root_directory)
+            .expect("index root");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let root_path_overrides = index
+            .index_root_path_overrides(&root_directory)
+            .expect("index root path overrides");
+        let root_path_packages = index
+            .index_root_path_requirements(&root_directory, &root_path_overrides)
+            .expect("discover root path requirements");
+        let context = ResolverContractContext::from_root_manifest(
+            &root_manifest,
+            &root_path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("build root resolver context");
+        let root_contract = build_resolver_contract(
+            &root_manifest,
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("build root resolver contract");
+        let selection = crate::mvs::select(
+            &root_contract.mvs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &context.root_override_pins(),
+        )
+        .expect("select path dependency");
+        let request = selection
+            .contract_requests()
+            .first()
+            .expect("root names one dependency");
+        let source_selection = select_resolver_source(
+            request,
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("select dependency path source");
+
+        fs::write(
+            dependency_path.join("sai.package"),
+            b"package acme:dependency @ 1.2.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:late @ ^1 from git \"https://example.test/late\" }\n",
+        )
+        .expect("change the dependency manifest in place");
+        let canonicalized = index
+            .canonicalize_selection_path_pins(&source_selection)
+            .expect("canonicalize the path pin")
+            .expect("path pin has a directory");
+
+        assert_eq!(
+            index.resolve_selected_path_source(&source_selection, &root_version, &[canonicalized],),
+            Err(LocalPackageSourceResolveError::SelectedManifestChanged(
+                package_version("acme:dependency", "1.2.0")
+            ))
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn local_path_resolver_uses_a_root_path_override_for_git_requirement() {
+        let tree = TempTree::new();
+        let root_path = tree.package(
+            "workspace/root",
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dependency @ ^1 from git \"https://example.test/dependency\" }\n\
+              overrides { acme:dependency use path \"../dependency\" }\n",
+        );
+        tree.package(
+            "workspace/dependency",
+            b"package acme:dependency @ 1.3.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_directory = LocalPackageDirectory::open(root_path).expect("open root");
+
+        let output = resolve_local_path_packages(
+            root_directory,
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("resolve dependency through root path override");
+
+        let dependency = package_version("acme:dependency", "1.3.0");
+        assert_eq!(
+            output
+                .provider()
+                .output()
+                .selection()
+                .selected()
+                .get(&dependency.node()),
+            Some(dependency.version())
+        );
+        let source = output
+            .provider()
+            .output()
+            .sources_used()
+            .get(&dependency)
+            .expect("selected source");
+        assert_eq!(
+            source.reason(),
+            crate::resolver_source::ResolverSourceReason::RootPathOverride
+        );
+        assert_eq!(
+            source.source(),
+            &ResolverPackageSource::Path {
+                relative_to: package_version("acme:root", "1.0.0"),
+                path: "../dependency".into(),
+            }
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn local_path_resolver_reports_git_source_as_unsupported_with_partial_selection() {
+        let tree = TempTree::new();
+        let root_path = tree.package(
+            "workspace/root",
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dependency @ ^1 from git \"https://example.test/dependency\" }\n",
+        );
+        let root_directory = LocalPackageDirectory::open(root_path).expect("open root");
+
+        let error = resolve_local_path_packages(
+            root_directory,
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect_err("a Git source must not be treated as a local directory");
+        let LocalPackageMvsError::Provider(failure) = error else {
+            panic!("expected source-provider failure");
+        };
+        let ResolverSourceProviderError::Resolution {
+            failures, output, ..
+        } = failure.error()
+        else {
+            panic!("expected a partial MVS resolution result");
+        };
+        assert_eq!(failures.len(), 1);
+        assert!(matches!(
+            &failures[0].error,
+            ResolverPackageLoadError::Provider(error)
+                if matches!(
+                    **error,
+                    LocalPackageMvsLoadError::UnsupportedSource {
+                        package_version: ref found_version,
+                        ..
+                    } if found_version.as_ref()
+                        == &package_version("acme:dependency", "1.0.0")
+                )
+        ));
+        assert!(
+            output
+                .selection()
+                .selected()
+                .contains_key(&package_version("acme:dependency", "1.0.0").node()),
+            "failed source loading preserves the partial selected node"
+        );
+        assert!(
+            failure.context().root_targets().contains("wasm32-core"),
+            "the accumulated root context remains available with partial results"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn failed_dependency_contract_does_not_commit_its_discovered_paths() {
+        let tree = TempTree::new();
+        let root_path = tree.package(
+            "workspace/root",
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires {\n\
+                acme:bad @ ^1 from path \"../bad\"\n\
+                acme:valid @ ^1 from path \"../valid\"\n\
+              }\n",
+        );
+        tree.package(
+            "workspace/bad",
+            b"package acme:bad @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:expected @ ^1 from path \"../bad-common\" }\n",
+        );
+        tree.package(
+            "workspace/bad-common",
+            b"package acme:actual @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        tree.package(
+            "workspace/valid",
+            b"package acme:valid @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:actual @ ^1 from path \"../valid-common\" }\n",
+        );
+        let valid_common_path = tree.package(
+            "workspace/valid-common",
+            b"package acme:actual @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_directory = LocalPackageDirectory::open(root_path).expect("open root");
+
+        let LocalPackageMvsError::Provider(failure) = resolve_local_path_packages(
+            root_directory,
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect_err("the bad dependency contract is invalid") else {
+            panic!("expected provider failure");
+        };
+        let ResolverSourceProviderError::Resolution {
+            failures, output, ..
+        } = failure.error()
+        else {
+            panic!("expected partial MVS state");
+        };
+        assert_eq!(
+            failures.len(),
+            1,
+            "the valid independent dependency must not fail due to the bad branch"
+        );
+        let valid = package_version("acme:valid", "1.0.0");
+        let actual = package_version("acme:actual", "1.0.0");
+        assert!(
+            output.dependency_contracts().contains_key(&valid),
+            "the valid dependency contract should load"
+        );
+        assert!(
+            output.dependency_contracts().contains_key(&actual),
+            "the valid branch's path dependency should load"
+        );
+        assert_eq!(
+            failure.directory_index().entries[&actual].path(),
+            fs::canonicalize(valid_common_path).expect("canonical valid path")
+        );
+        assert_eq!(
+            failure
+                .context()
+                .path_packages()
+                .get(&ResolverPathKey::new(valid.clone(), "../valid-common")),
+            Some(&actual)
+        );
+        assert!(
+            !failure
+                .directory_index()
+                .entries
+                .values()
+                .any(|directory| directory.path().ends_with("workspace/bad-common")),
+            "path discoveries from an invalid contract must be rolled back"
         );
     }
 
