@@ -484,12 +484,12 @@ targets { wasm32-core }
         );
         let dep = package_version("acme:dep", "1.0.0");
         assert_eq!(
-            output.sources_used[&dep].reason,
+            output.sources_used[&dep].reason(),
             ResolverSourceReason::NamedRequirement
         );
         assert_eq!(
-            output.sources_used[&dep].source,
-            ResolverPackageSource::Git {
+            output.sources_used[&dep].source(),
+            &ResolverPackageSource::Git {
                 url: "https://example.test/alpha-dep".into(),
                 directory: None,
             }

@@ -34,6 +34,16 @@ pub enum ResolverSourceReason {
     LockFloor,
 }
 
+/// The manifest or lock entry that caused a source to be selected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolverSourceProvenance {
+    RootPathOverride { span: Range<usize> },
+    RootGitOverride { span: Range<usize> },
+    PathPin { pin: ResolverPathPinSource },
+    NamedRequirement { edge: MvsNamedEdge },
+    LockFloor { package_version: MvsPackageVersion },
+}
+
 /// One path-pin source that the filesystem layer must canonicalize and
 /// compare with every other pin source for the same node.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,11 +56,30 @@ pub struct ResolverPathPinSource {
 /// The chosen source and the provenance required by later loading checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverSourceSelection {
-    pub source: ResolverPackageSource,
-    pub reason: ResolverSourceReason,
+    source: ResolverPackageSource,
+    reason: ResolverSourceReason,
+    provenance: ResolverSourceProvenance,
     /// Non-empty for `PathPin`; includes every path pin visible at dequeue.
     /// The caller resolves and compares these paths, including symlinks.
-    pub path_pin_sources: Vec<ResolverPathPinSource>,
+    path_pin_sources: Vec<ResolverPathPinSource>,
+}
+
+impl ResolverSourceSelection {
+    pub const fn source(&self) -> &ResolverPackageSource {
+        &self.source
+    }
+
+    pub const fn reason(&self) -> ResolverSourceReason {
+        self.reason
+    }
+
+    pub const fn provenance(&self) -> &ResolverSourceProvenance {
+        &self.provenance
+    }
+
+    pub fn path_pin_sources(&self) -> &[ResolverPathPinSource] {
+        &self.path_pin_sources
+    }
 }
 
 /// Checks that every path pin for a node resolves to the same source.
@@ -69,6 +98,9 @@ pub fn validate_resolver_path_pins<K, E>(
 where
     K: Eq,
 {
+    if !source_selection_provenance_matches_reason(selection) {
+        return Err(ResolverPathPinValidationError::InconsistentSelection);
+    }
     let Some(first_pin) = selection.path_pin_sources.first() else {
         return if selection.reason == ResolverSourceReason::PathPin {
             Err(ResolverPathPinValidationError::InconsistentSelection)
@@ -77,6 +109,10 @@ where
         };
     };
     if selection.reason != ResolverSourceReason::PathPin
+        || !matches!(
+            &selection.provenance,
+            ResolverSourceProvenance::PathPin { pin } if pin == first_pin
+        )
         || selection.source != first_pin.source
         || selection
             .path_pin_sources
@@ -109,6 +145,30 @@ where
         }
     }
     Ok(())
+}
+
+fn source_selection_provenance_matches_reason(selection: &ResolverSourceSelection) -> bool {
+    match (&selection.reason, &selection.provenance) {
+        (
+            ResolverSourceReason::RootPathOverride,
+            ResolverSourceProvenance::RootPathOverride { .. },
+        )
+        | (
+            ResolverSourceReason::RootGitOverride,
+            ResolverSourceProvenance::RootGitOverride { .. },
+        )
+        | (
+            ResolverSourceReason::NamedRequirement,
+            ResolverSourceProvenance::NamedRequirement { .. },
+        )
+        | (ResolverSourceReason::LockFloor, ResolverSourceProvenance::LockFloor { .. }) => {
+            selection.path_pin_sources.is_empty()
+        }
+        (ResolverSourceReason::PathPin, ResolverSourceProvenance::PathPin { pin }) => {
+            selection.path_pin_sources.first() == Some(pin)
+        }
+        _ => false,
+    }
 }
 
 /// A path pin could not be resolved consistently with the other pins.
@@ -243,6 +303,9 @@ pub fn select_resolver_source(
                         directory: directory.clone(),
                     },
                     reason: ResolverSourceReason::RootGitOverride,
+                    provenance: ResolverSourceProvenance::RootGitOverride {
+                        span: item.span.clone(),
+                    },
                     path_pin_sources: Vec::new(),
                 });
             }
@@ -255,6 +318,9 @@ pub fn select_resolver_source(
                         path: path.clone(),
                     },
                     reason: ResolverSourceReason::RootPathOverride,
+                    provenance: ResolverSourceProvenance::RootPathOverride {
+                        span: item.span.clone(),
+                    },
                     path_pin_sources: Vec::new(),
                 });
             }
@@ -300,6 +366,7 @@ pub fn select_resolver_source(
         return Ok(ResolverSourceSelection {
             source: first.source.clone(),
             reason: ResolverSourceReason::PathPin,
+            provenance: ResolverSourceProvenance::PathPin { pin: first.clone() },
             path_pin_sources,
         });
     }
@@ -315,6 +382,9 @@ pub fn select_resolver_source(
         return Ok(ResolverSourceSelection {
             source,
             reason: ResolverSourceReason::NamedRequirement,
+            provenance: ResolverSourceProvenance::NamedRequirement {
+                edge: (**edge).clone(),
+            },
             path_pin_sources: Vec::new(),
         });
     }
@@ -329,6 +399,9 @@ pub fn select_resolver_source(
         return Ok(ResolverSourceSelection {
             source,
             reason: ResolverSourceReason::LockFloor,
+            provenance: ResolverSourceProvenance::LockFloor {
+                package_version: request.package_version.clone(),
+            },
             path_pin_sources: Vec::new(),
         });
     }
@@ -491,8 +564,8 @@ mod tests {
 
     use super::{
         ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
-        ResolverSourceReason, ResolverSourceSelection, select_resolver_source,
-        validate_resolver_path_pins,
+        ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
+        select_resolver_source, validate_resolver_path_pins,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{MvsContractRequest, MvsNamedEdge, MvsPackageVersion, MvsRequirer};
@@ -569,9 +642,11 @@ mod tests {
     }
 
     fn path_pin_selection(pins: Vec<ResolverPathPinSource>) -> ResolverSourceSelection {
+        let pin = pins[0].clone();
         ResolverSourceSelection {
-            source: pins[0].source.clone(),
+            source: pin.source.clone(),
             reason: ResolverSourceReason::PathPin,
+            provenance: ResolverSourceProvenance::PathPin { pin },
             path_pin_sources: pins,
         }
     }
@@ -670,6 +745,9 @@ mod tests {
                 path: "../dep".into(),
             },
             reason: ResolverSourceReason::PathPin,
+            provenance: ResolverSourceProvenance::PathPin {
+                pin: path_pin("../dep", 2..9),
+            },
             path_pin_sources: Vec::new(),
         };
 
@@ -687,6 +765,14 @@ mod tests {
                 directory: None,
             },
             reason: ResolverSourceReason::NamedRequirement,
+            provenance: ResolverSourceProvenance::NamedRequirement {
+                edge: MvsNamedEdge {
+                    requirer: MvsRequirer::Root(package_version("acme:app", "1.0.0")),
+                    span: 0..0,
+                    path_pin: false,
+                    root_override_pin: false,
+                },
+            },
             path_pin_sources: Vec::new(),
         };
 
@@ -727,6 +813,11 @@ requires { acme:dep @ ^1 from git "https://example.test/alpha-dep" }
         )
         .expect("dependency resolver contract is valid");
         let alpha_version = alpha_contract.mvs.package_version().clone();
+        let alpha_edge = named_edge(
+            &alpha_contract,
+            "acme:dep",
+            MvsRequirer::Package(alpha_version.clone()),
+        );
         let request = MvsContractRequest {
             package_version: package_version("acme:dep", "1.0.0"),
             named_by: vec![
@@ -735,11 +826,7 @@ requires { acme:dep @ ^1 from git "https://example.test/alpha-dep" }
                     "acme:dep",
                     MvsRequirer::Root(root_contract.mvs.package_version().clone()),
                 ),
-                named_edge(
-                    &alpha_contract,
-                    "acme:dep",
-                    MvsRequirer::Package(alpha_version.clone()),
-                ),
+                alpha_edge.clone(),
             ],
             lock_floor: false,
         };
@@ -755,6 +842,10 @@ requires { acme:dep @ ^1 from git "https://example.test/alpha-dep" }
         .expect("named requirement source is available");
 
         assert_eq!(selection.reason, ResolverSourceReason::NamedRequirement);
+        assert_eq!(
+            selection.provenance,
+            ResolverSourceProvenance::NamedRequirement { edge: alpha_edge }
+        );
         assert_eq!(
             selection.source,
             ResolverPackageSource::Git {
@@ -1027,6 +1118,19 @@ overrides { acme:dep use git "https://example.test/fork" dir "packages/dep" }
         .expect("root Git override is available");
 
         assert_eq!(selection.reason, ResolverSourceReason::RootGitOverride);
+        let override_span = context
+            .root_overrides()
+            .iter()
+            .find(|item| item.value.package.as_ref() == "acme:dep")
+            .expect("root override is retained")
+            .span
+            .clone();
+        assert_eq!(
+            selection.provenance,
+            ResolverSourceProvenance::RootGitOverride {
+                span: override_span
+            }
+        );
         assert_eq!(
             selection.source,
             ResolverPackageSource::Git {
@@ -1091,6 +1195,19 @@ overrides { acme:dep use path "../patched" }
         .expect("root path override is available");
 
         assert_eq!(selection.reason, ResolverSourceReason::RootPathOverride);
+        let override_span = context
+            .root_overrides()
+            .iter()
+            .find(|item| item.value.package.as_ref() == "acme:dep")
+            .expect("root override is retained")
+            .span
+            .clone();
+        assert_eq!(
+            selection.provenance,
+            ResolverSourceProvenance::RootPathOverride {
+                span: override_span
+            }
+        );
         assert_eq!(
             selection.source,
             ResolverPackageSource::Path {
@@ -1180,6 +1297,12 @@ requires { acme:dep @ ^1 from path "../dep" }
 
         assert_eq!(selection.reason, ResolverSourceReason::PathPin);
         assert_eq!(selection.path_pin_sources.len(), 1);
+        assert_eq!(
+            selection.provenance,
+            ResolverSourceProvenance::PathPin {
+                pin: selection.path_pin_sources[0].clone()
+            }
+        );
         assert_eq!(
             selection.source,
             ResolverPackageSource::Path {
@@ -1291,6 +1414,12 @@ targets { wasm32-core }
         .expect("lock source is available");
 
         assert_eq!(selection.reason, ResolverSourceReason::LockFloor);
+        assert_eq!(
+            selection.provenance,
+            ResolverSourceProvenance::LockFloor {
+                package_version: package_version("acme:dep", "1.8.0")
+            }
+        );
         assert_eq!(
             selection.source,
             ResolverPackageSource::Git {
