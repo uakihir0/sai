@@ -105,7 +105,7 @@ The reference implementation is a Rust workspace (D-TOOL-05). Each crate has one
 | `sai_runtime` | the runtime functions and their bodies | [10](10-runtime.md) | `sai_mir` |
 | `sai_codegen_wasm` | layout, calling convention, MIR to Wasm, the Wasm passes, identical code folding, final dead-code elimination, module assembly (`wasm-encoder`), filling the attribution table | [06](06-wasm-lowering-and-layout.md), [09](09-optimization-and-size.md) §9.1.1, §9.5–§9.7 | `sai_mir`, `sai_runtime`, `sai_opt` |
 | `sai_component` | Canonical ABI glue, components (`wit-component`); it reads WIT through `sai_wit` | [07](07-component-lowering.md), [spec/13](../spec/13-components-and-wit.md) | `sai_codegen_wasm`, `sai_ty`, `sai_wit` |
-| `sai_package` | `sai.package`, MVS, `sai.lock`, Git fetching (`gix`), local package sources, the global cache | [package/01](../package/01-package-contract.md) to [package/04](../package/04-distribution-and-security.md) | `sai_syntax`, `sai_diagnostics`, `libc`, `rustix`, `sha2`, `unicode-general-category`, `unicode-normalization` |
+| `sai_package` | `sai.package`, MVS, `sai.lock`, Git fetching (`gix`), local package sources, the global cache | [package/01](../package/01-package-contract.md) to [package/04](../package/04-distribution-and-security.md) | `sai_syntax`, `sai_diagnostics`, `gix`, `libc`, `rustix`, `sha2`, `unicode-general-category`, `unicode-normalization` |
 | `sai_fmt` | the formatter | [14](14-formatter.md) | `sai_syntax` |
 | `sai_library` | the embedded source and metadata of `sai:core` and `sai:alloc` (§1.12) | §1.12 | `sai_query`, `sai_vfs` |
 | `sai_semantic` | symbol identity, semantic graphs, semantic operations, semantic diff | [12](12-semantic-tooling.md) | `sai_ty`, `sai_mir`, `sai_effects` |
