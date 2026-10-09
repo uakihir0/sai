@@ -4,12 +4,11 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(windows)]
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::git_tree::{
     GitPackageFile, GitPackageSourceTree, MAX_PACKAGE_CONTENT_BYTES, MAX_PACKAGE_FILE_COUNT,
@@ -18,6 +17,7 @@ use crate::git_tree::{
 
 const CACHE_LAYOUT_VERSION: &str = "v1";
 const SOURCE_CHECKSUM_PREFIX: &str = "sai1:";
+const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(windows)]
 const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 #[cfg(windows)]
@@ -159,6 +159,7 @@ impl PackageCache {
         let checksum = tree_hash.checksum.into_boxed_str();
         let digest = source_digest(&checksum)?;
         let target = self.source_directory.join(digest);
+        self.cleanup_stale_temporary_directories();
         if path_exists_without_following(&target)? && cached_source_matches(&target, &files) {
             return Ok(CachedPackageSource {
                 checksum,
@@ -171,6 +172,7 @@ impl PackageCache {
         for source_file in &files {
             write_source_file(staging.path(), source_file)?;
         }
+        staging.refresh_activity_age()?;
         make_tree_read_only(staging.path())?;
         prepare_source_directory_rename(staging.path())?;
 
@@ -229,6 +231,87 @@ impl PackageCache {
     /// The `v1/tmp/` directory used for in-progress writes.
     pub fn temporary_directory(&self) -> &Path {
         &self.temporary_directory
+    }
+
+    fn cleanup_stale_temporary_directories(&self) {
+        if !staging_activity_lock_supported() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&self.temporary_directory) else {
+            return;
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+
+            if metadata.is_dir() && name.starts_with("source-") {
+                if !is_stale_temporary_path(&path, now) {
+                    continue;
+                }
+                let activity_path = staging_activity_lock_path(&path);
+                let (activity_lock, marker_is_new_claim) =
+                    match try_open_staging_activity_lock(&activity_path) {
+                        Ok(Some(lock)) if is_stale_temporary_path(&activity_path, now) => {
+                            (lock, false)
+                        }
+                        Ok(None)
+                            if matches!(
+                                path_exists_without_following(&activity_path),
+                                Ok(false)
+                            ) && legacy_staging_owner_is_gone(name) =>
+                        {
+                            // Claim the marker name atomically before removing a
+                            // legacy directory whose old writer is no longer
+                            // running. This coordinates cleaners and new writers.
+                            match create_staging_activity_lock(&activity_path) {
+                                Ok(lock) => (lock, true),
+                                Err(PackageCacheError::Io { source, .. })
+                                    if source.kind() == io::ErrorKind::AlreadyExists =>
+                                {
+                                    continue;
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                        _ => continue,
+                    };
+                if !is_stale_temporary_path(&path, now)
+                    || (!marker_is_new_claim && !is_stale_temporary_path(&activity_path, now))
+                {
+                    continue;
+                }
+                make_tree_removable(&path);
+                let removed = fs::remove_dir_all(&path).is_ok();
+                release_staging_activity_lock(&activity_path, activity_lock, removed);
+                continue;
+            }
+
+            let Some(staging_name) = name.strip_suffix(".lock") else {
+                continue;
+            };
+            if !metadata.is_file()
+                || !staging_name.starts_with("source-")
+                || !is_stale_temporary_path(&path, now)
+            {
+                continue;
+            }
+            let staging_path = self.temporary_directory.join(staging_name);
+            if !matches!(path_exists_without_following(&staging_path), Ok(false)) {
+                continue;
+            }
+            let Ok(Some(activity_lock)) = try_open_staging_activity_lock(&path) else {
+                continue;
+            };
+            let orphaned = matches!(path_exists_without_following(&staging_path), Ok(false))
+                && is_stale_temporary_path(&path, now);
+            release_staging_activity_lock(&path, activity_lock, orphaned);
+        }
     }
 }
 
@@ -350,6 +433,236 @@ fn create_staging_directory(path: &Path) -> Result<(), PackageCacheError> {
         return Err(error);
     }
     Ok(())
+}
+
+fn create_staging_activity_lock(path: &Path) -> Result<File, PackageCacheError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    set_new_file_mode(&mut options);
+    set_exclusive_file_sharing(&mut options);
+    let file = options.open(path).map_err(|source| PackageCacheError::Io {
+        operation: "create package cache staging activity lock",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if let Err(source) = acquire_platform_lock(&file) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(PackageCacheError::Io {
+            operation: "lock package cache staging directory",
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(file)
+}
+
+fn try_open_staging_activity_lock(path: &Path) -> Result<Option<File>, PackageCacheError> {
+    let file = match open_lock_file(path) {
+        Ok(file) => file,
+        Err(PackageCacheError::Io { source, .. })
+            if source.kind() == io::ErrorKind::NotFound || is_platform_lock_busy(&source) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    match try_acquire_platform_lock(&file) {
+        Ok(true) => Ok(Some(file)),
+        Ok(false) => Ok(None),
+        Err(source) => Err(PackageCacheError::Io {
+            operation: "check package cache staging activity",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn staging_activity_lock_supported() -> bool {
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    {
+        true
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(not(any(
+        all(
+            unix,
+            not(any(
+                target_os = "espidf",
+                target_os = "horizon",
+                target_os = "solaris",
+                target_os = "vita",
+                target_os = "wasi"
+            ))
+        ),
+        windows
+    )))]
+    {
+        false
+    }
+}
+
+fn try_acquire_platform_lock(file: &File) -> io::Result<bool> {
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    {
+        rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .map(|()| true)
+            .map_err(Into::into)
+            .or_else(|error: io::Error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            })
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = file;
+        // The open handle already has share_mode(0), which excludes another
+        // process from opening the activity marker until this handle closes.
+        return Ok(true);
+    }
+
+    #[cfg(not(any(
+        all(
+            unix,
+            not(any(
+                target_os = "espidf",
+                target_os = "horizon",
+                target_os = "solaris",
+                target_os = "vita",
+                target_os = "wasi"
+            ))
+        ),
+        windows
+    )))]
+    {
+        let _ = file;
+        Ok(false)
+    }
+}
+
+fn is_platform_lock_busy(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.raw_os_error().is_some_and(|code| {
+            matches!(
+                code,
+                WINDOWS_ERROR_SHARING_VIOLATION | WINDOWS_ERROR_LOCK_VIOLATION
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        error.kind() == io::ErrorKind::WouldBlock
+    }
+}
+
+fn staging_activity_lock_path(staging_path: &Path) -> PathBuf {
+    let mut path = staging_path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+fn release_staging_activity_lock(path: &Path, lock: File, remove_marker: bool) {
+    #[cfg(unix)]
+    if remove_marker {
+        let _ = fs::remove_file(path);
+    }
+
+    drop(lock);
+
+    #[cfg(not(unix))]
+    if remove_marker {
+        // Windows does not allow unlinking an open marker. The path remains
+        // present until after the exclusive handle is released, so a new
+        // writer cannot claim this staging name in the gap.
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn legacy_staging_owner_is_gone(name: &str) -> bool {
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    {
+        let Some(pid) = name
+            .strip_prefix("source-")
+            .and_then(|suffix| suffix.split_once('-').map(|(pid, _)| pid))
+            .and_then(|pid| pid.parse::<i32>().ok())
+        else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            return false;
+        };
+
+        // A recycled PID can conservatively keep an abandoned legacy tree;
+        // treating an unknown/live process as active avoids deleting an old
+        // writer's staging directory during a toolchain upgrade.
+        matches!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        )
+    }
+    #[cfg(not(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    )))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+fn is_stale_temporary_path(path: &Path, now: SystemTime) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= STALE_TEMPORARY_AGE)
 }
 
 fn ensure_lock_file(path: &Path) -> Result<(), PackageCacheError> {
@@ -679,6 +992,8 @@ fn remove_cache_entry(path: &Path) -> Result<(), PackageCacheError> {
 
 struct StagingDirectory {
     path: PathBuf,
+    activity_lock_path: PathBuf,
+    activity_lock: Option<File>,
     published: bool,
 }
 
@@ -687,16 +1002,36 @@ impl StagingDirectory {
         for _ in 0..32 {
             let id = NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!("source-{}-{id}", std::process::id()));
+            let activity_lock_path = staging_activity_lock_path(&path);
+            let activity_lock = match create_staging_activity_lock(&activity_lock_path) {
+                Ok(file) => file,
+                Err(PackageCacheError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match create_staging_directory(&path) {
                 Ok(()) => {
                     return Ok(Self {
                         path,
+                        activity_lock_path,
+                        activity_lock: Some(activity_lock),
                         published: false,
                     });
                 }
                 Err(PackageCacheError::Io { source, .. })
-                    if source.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
+                    if source.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    drop(activity_lock);
+                    let _ = fs::remove_file(activity_lock_path);
+                }
+                Err(error) => {
+                    drop(activity_lock);
+                    let _ = fs::remove_file(activity_lock_path);
+                    return Err(error);
+                }
             }
         }
         Err(PackageCacheError::Io {
@@ -713,8 +1048,36 @@ impl StagingDirectory {
         &self.path
     }
 
+    fn refresh_activity_age(&self) -> Result<(), PackageCacheError> {
+        let marker = &self.activity_lock_path;
+        let lock = self
+            .activity_lock
+            .as_ref()
+            .ok_or_else(|| PackageCacheError::Io {
+                operation: "refresh package cache staging age",
+                path: marker.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "staging activity lock was released before publication",
+                ),
+            })?;
+        lock.set_times(FileTimes::new().set_modified(SystemTime::now()))
+            .map_err(|source| PackageCacheError::Io {
+                operation: "refresh package cache staging age",
+                path: marker.clone(),
+                source,
+            })
+    }
+
+    fn release_activity_lock(&mut self, remove_marker: bool) {
+        if let Some(lock) = self.activity_lock.take() {
+            release_staging_activity_lock(&self.activity_lock_path, lock, remove_marker);
+        }
+    }
+
     fn mark_published(&mut self) {
         self.published = true;
+        self.release_activity_lock(true);
     }
 }
 
@@ -724,7 +1087,12 @@ impl Drop for StagingDirectory {
             return;
         }
         make_tree_removable(&self.path);
-        let _ = fs::remove_dir_all(&self.path);
+        let removed = match fs::remove_dir_all(&self.path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        self.release_activity_lock(removed);
     }
 }
 
@@ -1191,6 +1559,11 @@ mod tests {
                 .write_blob(b"package acme:sample @ 1.0.0\n")
                 .unwrap()
                 .detach();
+            let touch = self
+                .repository
+                .write_blob(b"package-owned staging-name sentinel\n")
+                .unwrap()
+                .detach();
             let source = self
                 .repository
                 .write_blob(b"pub fn answer() -> i32 { 42 }\n")
@@ -1200,6 +1573,11 @@ mod tests {
                 .repository
                 .write_object(gix::objs::Tree {
                     entries: vec![
+                        Entry {
+                            mode: EntryKind::Blob.into(),
+                            filename: b".sai-staging-touch".to_vec().into(),
+                            oid: touch,
+                        },
                         Entry {
                             mode: EntryKind::Blob.into(),
                             filename: b"main.sai".to_vec().into(),
@@ -1288,6 +1666,177 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stale_unlocked_staging_directories_are_removed_by_the_next_writer() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("stale-temp");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let staging = cache.temporary_directory.join("source-abandoned-0");
+        let activity_lock = super::staging_activity_lock_path(&staging);
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"incomplete").unwrap();
+        fs::write(&activity_lock, b"").unwrap();
+        super::make_tree_read_only(&staging).unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        for path in [&staging, &activity_lock] {
+            File::open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+
+        let source = TestRepository::new().verified_source();
+        cache.materialize_source(source).unwrap();
+
+        assert!(!staging.exists());
+        assert!(!activity_lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_staging_with_a_recent_activity_marker_is_preserved() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("recent-marker-temp");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let staging = cache.temporary_directory.join("source-abandoned-recent");
+        let activity_lock = super::staging_activity_lock_path(&staging);
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"incomplete").unwrap();
+        fs::write(&activity_lock, b"").unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        File::open(&staging)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old_time))
+            .unwrap();
+        File::open(&activity_lock)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now()))
+            .unwrap();
+
+        cache.cleanup_stale_temporary_directories();
+
+        assert!(staging.is_dir());
+        assert!(activity_lock.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_legacy_staging_directories_with_dead_writers_are_removed() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("legacy-stale-temp");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let staging = cache
+            .temporary_directory
+            .join(format!("source-{}-0", i32::MAX));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"incomplete legacy staging").unwrap();
+        super::make_tree_read_only(&staging).unwrap();
+        File::open(&staging)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(25 * 60 * 60)),
+            )
+            .unwrap();
+
+        let source = TestRepository::new().verified_source();
+        cache.materialize_source(source).unwrap();
+
+        assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_markerless_staging_from_a_live_legacy_writer_is_preserved() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("live-legacy-temp");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let staging = cache
+            .temporary_directory
+            .join(format!("source-{}-0", std::process::id()));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"incomplete legacy staging").unwrap();
+        super::make_tree_read_only(&staging).unwrap();
+        File::open(&staging)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(25 * 60 * 60)),
+            )
+            .unwrap();
+
+        let source = TestRepository::new().verified_source();
+        cache.materialize_source(source).unwrap();
+
+        assert!(staging.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_staging_cleanup_skips_a_directory_claimed_by_another_cleaner() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("claimed-legacy-temp");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let staging = cache
+            .temporary_directory
+            .join(format!("source-{}-claimed", i32::MAX));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"incomplete legacy staging").unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        File::open(&staging)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old_time))
+            .unwrap();
+
+        let activity_path = super::staging_activity_lock_path(&staging);
+        let activity_lock = super::create_staging_activity_lock(&activity_path).unwrap();
+        cache.cleanup_stale_temporary_directories();
+
+        assert!(staging.is_dir());
+        drop(activity_lock);
+        fs::remove_file(&activity_path).unwrap();
+        cache.cleanup_stale_temporary_directories();
+        assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_staging_directory_with_a_live_activity_lock_is_preserved() {
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        let temp = TestDirectory::new("active-stale-temp");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let staging = super::StagingDirectory::create(&cache.temporary_directory).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let activity_path = staging.activity_lock_path.clone();
+        let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        for path in [&staging_path, &activity_path] {
+            File::open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+
+        cache.cleanup_stale_temporary_directories();
+
+        assert!(staging_path.is_dir());
+        drop(staging);
+        assert!(!staging_path.exists());
+        assert!(!activity_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn refuses_symlinks_in_managed_cache_directories() {
         use std::os::unix::fs::symlink;
 
@@ -1356,6 +1905,10 @@ mod tests {
         assert_eq!(
             fs::read(expected_path.join("main.sai")).unwrap(),
             b"pub fn answer() -> i32 { 42 }\n"
+        );
+        assert_eq!(
+            fs::read(expected_path.join(".sai-staging-touch")).unwrap(),
+            b"package-owned staging-name sentinel\n"
         );
         assert_eq!(
             fs::read_dir(cache.temporary_directory()).unwrap().count(),
