@@ -325,6 +325,8 @@ impl MvsRequirer {
 pub struct MvsNamedEdge {
     pub requirer: MvsRequirer,
     pub span: Range<usize>,
+    pub path_pin: bool,
+    pub root_override_pin: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,6 +364,8 @@ pub struct MvsSelectionOutput {
     read_named_by: BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>>,
     /// Pin versions from root overrides and path edges that were reached.
     reached_pins: BTreeMap<MvsNode, BTreeSet<Version>>,
+    /// Lock floor versions added for reached nodes.
+    reached_floors: BTreeMap<MvsNode, Version>,
     errors: Vec<MvsSelectionError>,
 }
 
@@ -375,6 +379,7 @@ impl MvsSelectionOutput {
             named_by: BTreeMap::new(),
             read_named_by: BTreeMap::new(),
             reached_pins: BTreeMap::new(),
+            reached_floors: BTreeMap::new(),
             errors: Vec::new(),
         }
     }
@@ -409,6 +414,10 @@ impl MvsSelectionOutput {
 
     pub fn reached_pins(&self) -> &BTreeMap<MvsNode, BTreeSet<Version>> {
         &self.reached_pins
+    }
+
+    pub fn reached_floors(&self) -> &BTreeMap<MvsNode, Version> {
+        &self.reached_floors
     }
 
     pub fn errors(&self) -> &[MvsSelectionError] {
@@ -615,6 +624,9 @@ impl<'a> MvsSelectionState<'a> {
                     },
                     None,
                 );
+                self.output
+                    .reached_floors
+                    .insert(node.clone(), floor.clone());
             }
         }
 
@@ -623,6 +635,8 @@ impl<'a> MvsSelectionState<'a> {
             Some(MvsNamedEdge {
                 requirer,
                 span: edge.span.clone(),
+                path_pin: edge.is_path_pin(),
+                root_override_pin: edge.is_root_override_pin(),
             }),
         );
         Ok(())
@@ -665,6 +679,7 @@ fn sort_named_edges(named_by: &mut BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>
                 .package_version()
                 .cmp(right.requirer.package_version())
                 .then_with(|| left.span.start.cmp(&right.span.start))
+                .then_with(|| left.span.end.cmp(&right.span.end))
         });
     }
 }
@@ -1114,6 +1129,8 @@ mod tests {
             [MvsNamedEdge {
                 requirer: MvsRequirer::Root(package_version("acme:app", "1.0.0")),
                 span: 1..2,
+                path_pin: false,
+                root_override_pin: false,
             }]
         );
         assert_eq!(
@@ -1121,6 +1138,8 @@ mod tests {
             [MvsNamedEdge {
                 requirer: MvsRequirer::Root(package_version("acme:app", "1.0.0")),
                 span: 0..1,
+                path_pin: false,
+                root_override_pin: false,
             }]
         );
     }

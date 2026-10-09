@@ -9,6 +9,7 @@ pub mod lock_serialization;
 pub mod lock_validation;
 pub mod manifest;
 pub mod mvs;
+pub mod mvs_explanations;
 pub mod mvs_graph_validation;
 pub mod package_path;
 pub mod validation;

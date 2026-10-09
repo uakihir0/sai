@@ -18,6 +18,9 @@ use crate::version_req::VersionReq;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvsSelectedEdge {
     pub requirer: MvsRequirer,
+    /// Version named by the source edge before MVS selection.
+    pub named_target: MvsPackageVersion,
+    /// Version selected for the target node.
     pub target: MvsPackageVersion,
     pub requirement: VersionReq,
     pub span: Range<usize>,
@@ -29,7 +32,8 @@ impl MvsSelectedEdge {
         edge: &MvsEdge,
         selection: &MvsSelectionOutput,
     ) -> Result<Self, MvsSelectedGraphInputError> {
-        let node = edge.target().node();
+        let named_target = edge.target();
+        let node = named_target.node();
         let Some(version) = selection.selected().get(&node) else {
             return Err(MvsSelectedGraphInputError::MissingSelectedVersion {
                 node: Box::new(node),
@@ -48,6 +52,7 @@ impl MvsSelectedEdge {
             .expect("selected node identities were validated by MVS input construction");
         Ok(Self {
             requirer,
+            named_target,
             target,
             requirement: edge.requirement().clone(),
             span: edge.span(),
@@ -63,6 +68,8 @@ impl MvsSelectedEdge {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvsVersionConflict {
     pub requirer: MvsRequirer,
+    /// Version named by the conflicting edge before selection.
+    pub named_target: MvsPackageVersion,
     pub target: MvsPackageVersion,
     pub requirement: VersionReq,
     pub span: Range<usize>,
@@ -267,6 +274,7 @@ fn collect_selected_edges(
         {
             graph.conflicts.push(MvsVersionConflict {
                 requirer: selected_edge.requirer.clone(),
+                named_target: selected_edge.named_target.clone(),
                 target: selected_edge.target.clone(),
                 requirement: selected_edge.requirement.clone(),
                 span: selected_edge.span.clone(),
@@ -492,6 +500,7 @@ mod tests {
             graph.conflicts[0],
             MvsVersionConflict {
                 requirer: MvsRequirer::Root(root.package_version().clone()),
+                named_target: package_version("acme:b", "1.0.0"),
                 target: package_version("acme:b", "1.4.0"),
                 requirement: VersionReq::parse(">=1, <1.4").expect("valid requirement"),
                 span: 10..11,
