@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,7 +23,8 @@ use rustix::fs::{CWD, Mode, OFlags, openat};
 use std::os::unix::fs::MetadataExt;
 
 use crate::manifest::{
-    MAX_PACKAGE_MANIFEST_BYTES, PackageParseOutput, PackageRole, parse_for_role,
+    MAX_PACKAGE_MANIFEST_BYTES, OverrideSource, PackageDeclaration, PackageParseOutput,
+    PackageRole, parse_for_role,
 };
 use crate::mvs::MvsPackageVersion;
 use crate::package_path::{DependencyPackagePath, PackagePathError};
@@ -139,6 +141,25 @@ pub enum LocalPackagePathIndexError {
     MissingPackageHeader(Box<PackageParseOutput>),
     InvalidPackageIdentity(Box<str>),
     Index(LocalPackageDirectoryIndexError),
+    InvalidRootManifest(Box<PackageParseOutput>),
+    MissingRootPackageHeader(Box<PackageParseOutput>),
+    InvalidRootPackageIdentity(Box<str>),
+    MissingRootDirectory(MvsPackageVersion),
+    RootManifestSnapshotMismatch(MvsPackageVersion),
+    DuplicateRootPathOverride {
+        package: Box<str>,
+        span: Range<usize>,
+    },
+    RootPathOverrideIdentityMismatch {
+        expected: Box<str>,
+        found: Box<str>,
+        span: Range<usize>,
+    },
+    PathDiscovery {
+        package: Box<str>,
+        span: Range<usize>,
+        error: Box<LocalPackagePathIndexError>,
+    },
 }
 
 impl LocalPackagePathIndexError {
@@ -146,7 +167,11 @@ impl LocalPackagePathIndexError {
     /// syntax or a missing package header.
     pub fn manifest_parse_output(&self) -> Option<&PackageParseOutput> {
         match self {
-            Self::InvalidManifest(parsed) | Self::MissingPackageHeader(parsed) => Some(parsed),
+            Self::InvalidManifest(parsed)
+            | Self::MissingPackageHeader(parsed)
+            | Self::InvalidRootManifest(parsed)
+            | Self::MissingRootPackageHeader(parsed) => Some(parsed),
+            Self::PathDiscovery { error, .. } => error.manifest_parse_output(),
             _ => None,
         }
     }
@@ -402,6 +427,87 @@ impl LocalPackageDirectoryIndex {
         self.insert_parsed(package_version.clone(), directory, &parsed)
             .map_err(LocalPackagePathIndexError::Index)?;
         Ok(package_version)
+    }
+
+    /// Discovers and indexes every root `use path` override from the captured
+    /// root manifest, returning the version map required by resolver context.
+    ///
+    /// The root directory must be the indexed directory and its parsed
+    /// manifest must match the indexed parse snapshot. Each override is
+    /// resolved relative to that directory, and its declared identity must
+    /// match the overridden package identity.
+    pub fn index_root_path_overrides(
+        &mut self,
+        root_directory: &LocalPackageDirectory,
+    ) -> Result<BTreeMap<Box<str>, MvsPackageVersion>, LocalPackagePathIndexError> {
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        if !root_manifest.is_syntax_valid() {
+            return Err(LocalPackagePathIndexError::InvalidRootManifest(Box::new(
+                root_manifest,
+            )));
+        }
+        let header = match root_manifest.file().header.as_ref() {
+            Some(header) => header,
+            None => {
+                return Err(LocalPackagePathIndexError::MissingRootPackageHeader(
+                    Box::new(root_manifest),
+                ));
+            }
+        };
+        let root_name = header.value.identity.to_string();
+        let root_package = MvsPackageVersion::new(root_name.clone(), header.value.version.clone())
+            .map_err(|_| {
+                LocalPackagePathIndexError::InvalidRootPackageIdentity(root_name.into())
+            })?;
+        let indexed_root = self.entries.get(&root_package).ok_or_else(|| {
+            LocalPackagePathIndexError::MissingRootDirectory(root_package.clone())
+        })?;
+        if indexed_root != root_directory
+            || indexed_root.parse_manifest(PackageRole::Root) != root_manifest
+        {
+            return Err(LocalPackagePathIndexError::RootManifestSnapshotMismatch(
+                root_package,
+            ));
+        }
+
+        let mut staged = self.clone();
+        let mut path_overrides = BTreeMap::new();
+        for declaration in &root_manifest.file().declarations {
+            let PackageDeclaration::Overrides(overrides) = &declaration.value else {
+                continue;
+            };
+            for item in overrides {
+                let OverrideSource::Path(path) = &item.value.source else {
+                    continue;
+                };
+                if path_overrides.contains_key(&item.value.package) {
+                    return Err(LocalPackagePathIndexError::DuplicateRootPathOverride {
+                        package: item.value.package.clone(),
+                        span: item.span.clone(),
+                    });
+                }
+                let package_version =
+                    staged
+                        .index_dependency_path(&root_package, path)
+                        .map_err(|error| LocalPackagePathIndexError::PathDiscovery {
+                            package: item.value.package.clone(),
+                            span: item.span.clone(),
+                            error: Box::new(error),
+                        })?;
+                if package_version.package() != item.value.package.as_ref() {
+                    return Err(
+                        LocalPackagePathIndexError::RootPathOverrideIdentityMismatch {
+                            expected: item.value.package.clone(),
+                            found: package_version.package().into(),
+                            span: item.span.clone(),
+                        },
+                    );
+                }
+                path_overrides.insert(item.value.package.clone(), package_version);
+            }
+        }
+        *self = staged;
+        Ok(path_overrides)
     }
 
     fn insert_parsed(
@@ -724,6 +830,50 @@ impl fmt::Display for LocalPackagePathIndexError {
                 )
             }
             Self::Index(error) => fmt::Display::fmt(error, formatter),
+            Self::InvalidRootManifest(_) => {
+                formatter.write_str("root package manifest is not syntactically valid")
+            }
+            Self::MissingRootPackageHeader(_) => {
+                formatter.write_str("root package manifest has no package header")
+            }
+            Self::InvalidRootPackageIdentity(package) => {
+                write!(formatter, "root package has invalid identity `{package}`")
+            }
+            Self::MissingRootDirectory(package_version) => write!(
+                formatter,
+                "no indexed local directory exists for root package {}@{}",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::RootManifestSnapshotMismatch(package_version) => write!(
+                formatter,
+                "root manifest snapshot for {}@{} does not match its indexed directory",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::DuplicateRootPathOverride { package, span } => write!(
+                formatter,
+                "root package has duplicate path overrides for `{package}` at bytes {}..{}",
+                span.start, span.end
+            ),
+            Self::RootPathOverrideIdentityMismatch {
+                expected,
+                found,
+                span,
+            } => write!(
+                formatter,
+                "root path override for `{expected}` at bytes {}..{} resolved to package `{found}`",
+                span.start, span.end
+            ),
+            Self::PathDiscovery {
+                package,
+                span,
+                error,
+            } => write!(
+                formatter,
+                "root path override for `{package}` at bytes {}..{}: {error}",
+                span.start, span.end
+            ),
         }
     }
 }
@@ -881,6 +1031,7 @@ impl std::error::Error for LocalPackagePathIndexError {
             Self::InvalidPath(error) => Some(error),
             Self::Directory(error) => Some(error),
             Self::Index(error) => Some(error),
+            Self::PathDiscovery { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -1070,7 +1221,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::manifest::{PackageRole, parse};
+    use crate::manifest::{PackageDeclaration, PackageRole, parse};
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::package_path::{DependencyPackagePath, PackagePathError};
     use crate::resolver_contract::{ResolverContractBuildError, ResolverContractContext};
@@ -1578,6 +1729,258 @@ mod tests {
                 .expect("syntax failure retains its parse output")
                 .errors()
                 .is_empty()
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn root_path_override_discovery_rolls_back_on_identity_mismatch() {
+        let tree = TempTree::new();
+        let root_manifest_bytes = b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              overrides {\n\
+                acme:first use path \"../first\"\n\
+                acme:expected use path \"../second\"\n\
+              }\n";
+        let root_directory = tree.package("workspace/root", root_manifest_bytes);
+        tree.package(
+            "workspace/first",
+            b"package acme:first @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        tree.package(
+            "workspace/second",
+            b"package acme:actual @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_version = package_version("acme:root", "1.0.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                root_directory.clone(),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let expected_span = root_manifest
+            .file()
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let PackageDeclaration::Overrides(overrides) = &declaration.value else {
+                    return None;
+                };
+                overrides
+                    .iter()
+                    .find(|item| item.value.package.as_ref() == "acme:expected")
+                    .map(|item| item.span.clone())
+            })
+            .expect("expected path override span");
+        let error = index
+            .index_root_path_overrides(&root_directory)
+            .expect_err("mismatched override identity should fail");
+        let display = error.to_string();
+        assert!(display.contains("acme:expected"));
+        assert!(display.contains(&format!(
+            "bytes {}..{}",
+            expected_span.start, expected_span.end
+        )));
+        assert!(matches!(
+            error,
+            LocalPackagePathIndexError::RootPathOverrideIdentityMismatch {
+                expected,
+                found,
+                span,
+            } if expected.as_ref() == "acme:expected"
+                && found.as_ref() == "acme:actual"
+                && span == expected_span
+        ));
+        assert_eq!(
+            index.entries.keys().collect::<Vec<_>>(),
+            [&root_version],
+            "failed discovery does not retain the first override snapshot"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn root_path_override_discovery_retains_source_span_for_path_errors() {
+        let tree = TempTree::new();
+        let root_manifest_bytes = b"package acme:root @ 1.0.0\n\
+            source \"src\"\n\
+            targets { wasm32-core }\n\
+            overrides { acme:missing use path \"../missing\" }\n";
+        let root_directory = tree.package("workspace/root", root_manifest_bytes);
+        let root_version = package_version("acme:root", "1.0.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(root_version, root_directory.clone(), PackageRole::Root)
+            .expect("index root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let expected_span = root_manifest
+            .file()
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let PackageDeclaration::Overrides(overrides) = &declaration.value else {
+                    return None;
+                };
+                overrides
+                    .iter()
+                    .find(|item| item.value.package.as_ref() == "acme:missing")
+                    .map(|item| item.span.clone())
+            })
+            .expect("missing path override span");
+
+        let error = index
+            .index_root_path_overrides(&root_directory)
+            .expect_err("missing override path should fail");
+        let display = error.to_string();
+        assert!(display.contains("acme:missing"));
+        assert!(display.contains(&format!(
+            "bytes {}..{}",
+            expected_span.start, expected_span.end
+        )));
+        assert!(matches!(
+            error,
+            LocalPackagePathIndexError::PathDiscovery {
+                package,
+                span,
+                error: source_error,
+            } if package.as_ref() == "acme:missing"
+                && span == expected_span
+                && matches!(
+                    *source_error,
+                    LocalPackagePathIndexError::Directory(_)
+                )
+        ));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn duplicate_root_path_override_error_displays_its_span() {
+        let tree = TempTree::new();
+        let root_manifest_bytes = b"package acme:root @ 1.0.0\n\
+            source \"src\"\n\
+            targets { wasm32-core }\n\
+            overrides {\n\
+              acme:dependency use path \"../dependency\"\n\
+              acme:dependency use path \"../other\"\n\
+            }\n";
+        let root_directory = tree.package("workspace/root", root_manifest_bytes);
+        tree.package(
+            "workspace/dependency",
+            b"package acme:dependency @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_version = package_version("acme:root", "1.0.0");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(root_version, root_directory.clone(), PackageRole::Root)
+            .expect("index root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let expected_span = root_manifest
+            .file()
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let PackageDeclaration::Overrides(overrides) = &declaration.value else {
+                    return None;
+                };
+                overrides
+                    .iter()
+                    .filter(|item| item.value.package.as_ref() == "acme:dependency")
+                    .nth(1)
+                    .map(|item| item.span.clone())
+            })
+            .expect("second duplicate override span");
+
+        let error = index
+            .index_root_path_overrides(&root_directory)
+            .expect_err("duplicate override should fail");
+        assert!(matches!(
+            &error,
+            LocalPackagePathIndexError::DuplicateRootPathOverride { package, span }
+                if package.as_ref() == "acme:dependency" && *span == expected_span
+        ));
+        let display = error.to_string();
+        assert!(display.contains("acme:dependency"));
+        assert!(display.contains(&format!(
+            "bytes {}..{}",
+            expected_span.start, expected_span.end
+        )));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn root_path_override_discovery_requires_the_indexed_root_directory_and_snapshot() {
+        let tree = TempTree::new();
+        let root_manifest_bytes = b"package acme:root @ 1.0.0\n\
+            source \"src\"\n\
+            targets { wasm32-core }\n\
+            overrides { acme:dependency use path \"../dependency\" }\n";
+        let root_directory = tree.package("workspace/root", root_manifest_bytes);
+        let identical_root_directory =
+            tree.package("workspace/identical-root", root_manifest_bytes);
+        let root_version = package_version("acme:root", "1.0.0");
+        let root_snapshot =
+            LocalPackageDirectory::open(&root_directory).expect("open root package");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                root_snapshot.clone(),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        let identical_root = LocalPackageDirectory::open(identical_root_directory)
+            .expect("open identical root manifest from another directory");
+        assert_eq!(
+            index.index_root_path_overrides(&identical_root),
+            Err(LocalPackagePathIndexError::RootManifestSnapshotMismatch(
+                root_version.clone()
+            ))
+        );
+        fs::write(
+            root_directory.join("sai.package"),
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              overrides { acme:dependency use path \"../replacement\" }\n",
+        )
+        .expect("replace root manifest");
+        let changed_root =
+            LocalPackageDirectory::open(&root_directory).expect("reopen root package");
+
+        assert_eq!(
+            index.index_root_path_overrides(&changed_root),
+            Err(LocalPackagePathIndexError::RootManifestSnapshotMismatch(
+                root_version
+            ))
         );
     }
 

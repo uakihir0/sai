@@ -948,14 +948,16 @@ mod tests {
         let root_manifest = root_directory.parse_manifest(PackageRole::Root);
         let mut directories = LocalPackageDirectoryIndex::default();
         directories
-            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .insert(
+                root_version.clone(),
+                root_directory.clone(),
+                PackageRole::Root,
+            )
             .expect("index root package");
-        assert_eq!(
-            directories
-                .index_dependency_path(&root_version, "../patched")
-                .expect("discover and index path override"),
-            dependency_version
-        );
+        let root_path_overrides = directories
+            .index_root_path_overrides(&root_directory)
+            .expect("discover root path overrides");
+        assert_eq!(root_path_overrides["acme:dep"], dependency_version);
         fs::write(
             patched_directory.join("sai.package"),
             b"package acme:dep @ 1.5.0\n\
@@ -965,7 +967,6 @@ mod tests {
         )
         .expect("replace override manifest after indexing");
         let path_packages = BTreeMap::new();
-        let root_path_overrides = BTreeMap::from([("acme:dep".into(), dependency_version.clone())]);
         let context = root_context(&root_manifest, &path_packages, &root_path_overrides);
         let root_contract = build_root_contract(&root_manifest, &context);
 
@@ -1057,20 +1058,21 @@ mod tests {
         let root_manifest = root_directory.parse_manifest(PackageRole::Root);
         let mut directories = LocalPackageDirectoryIndex::default();
         directories
-            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .insert(
+                root_version.clone(),
+                root_directory.clone(),
+                PackageRole::Root,
+            )
             .expect("index root package");
-        assert_eq!(
-            directories
-                .index_dependency_path(&root_version, "../override-link")
-                .expect("discover and index original override"),
-            dependency_version
-        );
+        let root_path_overrides = directories
+            .index_root_path_overrides(&root_directory)
+            .expect("discover original root path override");
+        assert_eq!(root_path_overrides["acme:dep"], dependency_version);
 
         fs::remove_file(&override_link).expect("remove original link");
         symlink(&replacement_directory, &override_link).expect("link replacement override");
 
         let path_packages = BTreeMap::new();
-        let root_path_overrides = BTreeMap::from([("acme:dep".into(), dependency_version)]);
         let context = root_context(&root_manifest, &path_packages, &root_path_overrides);
         let root_contract = build_root_contract(&root_manifest, &context);
         let error = select_with_source_provider_and_canonicalized_pins(
