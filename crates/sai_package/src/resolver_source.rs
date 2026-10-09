@@ -880,12 +880,13 @@ mod tests {
                 Ok::<_, String>(directory)
             },
             |request, selection, canonicalized_path_pins| {
-                assert_eq!(
-                    canonicalized_path_pins.len(),
-                    selection.path_pin_sources().len()
-                );
-                let directory = canonicalized_path_pins
-                    .first()
+                let directory = directories
+                    .resolve_selected_path_source(
+                        selection,
+                        context.root_package(),
+                        canonicalized_path_pins,
+                    )
+                    .map_err(|error| format!("{error:?}"))?
                     .expect("path-pin source has a local directory");
                 directory
                     .build_dependency_contract(
@@ -910,6 +911,302 @@ mod tests {
                 path: "../dependency".into(),
             }
         );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn mvs_source_provider_resolves_root_path_overrides_from_the_root_directory() {
+        let tree = LocalSourceTestTree::new();
+        let root_directory = tree.path().join("workspace/root");
+        let patched_directory = tree.path().join("workspace/patched");
+        fs::create_dir_all(&root_directory).expect("create root package");
+        fs::create_dir_all(&patched_directory).expect("create patched dependency");
+        fs::write(
+            root_directory.join("sai.package"),
+            b"package acme:app @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dep @ ^1 from git \"https://example.test/dep\" }\n\
+              overrides { acme:dep use path \"../patched\" }\n",
+        )
+        .expect("write root manifest");
+        fs::write(
+            patched_directory.join("sai.package"),
+            b"package acme:dep @ 1.5.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .expect("write patched dependency manifest");
+
+        let root_version = package_version("acme:app", "1.0.0");
+        let dependency_version = package_version("acme:dep", "1.5.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let mut directories = LocalPackageDirectoryIndex::default();
+        directories
+            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .expect("index root package");
+        let selected_directory =
+            LocalPackageDirectory::open(patched_directory.clone()).expect("open override");
+        directories
+            .insert(
+                dependency_version.clone(),
+                selected_directory,
+                PackageRole::Dependency,
+            )
+            .expect("index path override");
+        fs::write(
+            patched_directory.join("sai.package"),
+            b"package acme:dep @ 1.5.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:late @ ^1 from git \"https://example.test/late\" }\n",
+        )
+        .expect("replace override manifest after indexing");
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::from([("acme:dep".into(), dependency_version.clone())]);
+        let context = root_context(&root_manifest, &path_packages, &root_path_overrides);
+        let root_contract = build_root_contract(&root_manifest, &context);
+
+        let output = select_with_source_provider_and_canonicalized_pins(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |pin| {
+                directories
+                    .canonicalize_path_pin(pin)
+                    .map_err(|error| format!("{error:?}"))
+            },
+            |request, selection, canonicalized_path_pins| {
+                assert!(canonicalized_path_pins.is_empty());
+                let directory = directories
+                    .resolve_selected_path_source(
+                        selection,
+                        context.root_package(),
+                        canonicalized_path_pins,
+                    )
+                    .map_err(|error| format!("{error:?}"))?
+                    .expect("root path override is local");
+                directory
+                    .build_dependency_contract(
+                        &request.package_version,
+                        &context,
+                        PackageValidationContext::default(),
+                    )
+                    .map_err(|error| format!("{error:?}"))
+            },
+        )
+        .expect("the root override loads into MVS");
+
+        assert_eq!(
+            output.sources_used()[&dependency_version].reason(),
+            ResolverSourceReason::RootPathOverride
+        );
+        assert!(
+            !output
+                .dependency_contracts()
+                .keys()
+                .any(|package_version| package_version.package() == "acme:late")
+        );
+        assert!(output.selection().is_complete());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn mvs_source_provider_rejects_retargeted_root_path_overrides() {
+        use std::os::unix::fs::symlink;
+
+        let tree = LocalSourceTestTree::new();
+        let root_directory = tree.path().join("workspace/root");
+        let original_directory = tree.path().join("workspace/original");
+        let replacement_directory = tree.path().join("workspace/replacement");
+        let override_link = tree.path().join("workspace/override-link");
+        fs::create_dir_all(&root_directory).expect("create root package");
+        fs::create_dir_all(&original_directory).expect("create original override");
+        fs::create_dir_all(&replacement_directory).expect("create replacement override");
+        fs::write(
+            root_directory.join("sai.package"),
+            b"package acme:app @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dep @ ^1 from git \"https://example.test/dep\" }\n\
+              overrides { acme:dep use path \"../override-link\" }\n",
+        )
+        .expect("write root manifest");
+        let dependency_manifest = b"package acme:dep @ 1.5.0\n\
+            source \"src\"\n\
+            targets { wasm32-core }\n";
+        fs::write(original_directory.join("sai.package"), dependency_manifest)
+            .expect("write original override manifest");
+        fs::write(
+            replacement_directory.join("sai.package"),
+            dependency_manifest,
+        )
+        .expect("write replacement override manifest");
+        symlink(&original_directory, &override_link).expect("link original override");
+
+        let root_version = package_version("acme:app", "1.0.0");
+        let dependency_version = package_version("acme:dep", "1.5.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let mut directories = LocalPackageDirectoryIndex::default();
+        directories
+            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .expect("index root package");
+        let selected_directory =
+            LocalPackageDirectory::open(override_link.clone()).expect("open original override");
+        directories
+            .insert(
+                dependency_version.clone(),
+                selected_directory,
+                PackageRole::Dependency,
+            )
+            .expect("index original override");
+
+        fs::remove_file(&override_link).expect("remove original link");
+        symlink(&replacement_directory, &override_link).expect("link replacement override");
+
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::from([("acme:dep".into(), dependency_version)]);
+        let context = root_context(&root_manifest, &path_packages, &root_path_overrides);
+        let root_contract = build_root_contract(&root_manifest, &context);
+        let error = select_with_source_provider_and_canonicalized_pins(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |pin| {
+                directories
+                    .canonicalize_path_pin(pin)
+                    .map_err(|error| format!("{error:?}"))
+            },
+            |request, selection, canonicalized_path_pins| {
+                let directory = directories
+                    .resolve_selected_path_source(
+                        selection,
+                        context.root_package(),
+                        canonicalized_path_pins,
+                    )
+                    .map_err(|error| format!("{error:?}"))?
+                    .expect("root path override is local");
+                directory
+                    .build_dependency_contract(
+                        &request.package_version,
+                        &context,
+                        PackageValidationContext::default(),
+                    )
+                    .map_err(|error| format!("{error:?}"))
+            },
+        )
+        .expect_err("the replacement directory does not match the indexed snapshot");
+
+        assert!(format!("{error:?}").contains("SelectedDirectoryMismatch"));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn mvs_source_provider_rejects_synthetic_path_valued_lock_floors() {
+        // Lock format 1 excludes path entries from floors. Reject an invalid
+        // caller-supplied source map rather than loading it as a floor.
+        let tree = LocalSourceTestTree::new();
+        let root_directory = tree.path().join("workspace/root");
+        let locked_directory = tree.path().join("workspace/locked");
+        fs::create_dir_all(&root_directory).expect("create root package");
+        fs::create_dir_all(&locked_directory).expect("create locked dependency");
+        fs::write(
+            root_directory.join("sai.package"),
+            b"package acme:app @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dep @ ^1 from git \"https://example.test/dep\" }\n",
+        )
+        .expect("write root manifest");
+        fs::write(
+            locked_directory.join("sai.package"),
+            b"package acme:dep @ 1.5.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .expect("write locked dependency manifest");
+
+        let root_version = package_version("acme:app", "1.0.0");
+        let named_version = package_version("acme:dep", "1.0.0");
+        let locked_version = package_version("acme:dep", "1.5.0");
+        let root_directory =
+            LocalPackageDirectory::open(root_directory).expect("open root package");
+        let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+        let mut directories = LocalPackageDirectoryIndex::default();
+        directories
+            .insert(root_version.clone(), root_directory, PackageRole::Root)
+            .expect("index root package");
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root_manifest, &path_packages, &root_path_overrides);
+        let root_contract = build_root_contract(&root_manifest, &context);
+        let lock_floors =
+            HashMap::from([(locked_version.node(), locked_version.version().clone())]);
+        let locked_sources = HashMap::from([(
+            locked_version.clone(),
+            ResolverPackageSource::Path {
+                relative_to: root_version,
+                path: "../locked".into(),
+            },
+        )]);
+
+        let error = select_with_source_provider_and_canonicalized_pins(
+            &root_contract,
+            &context,
+            &lock_floors,
+            &locked_sources,
+            |pin| {
+                directories
+                    .canonicalize_path_pin(pin)
+                    .map_err(|error| format!("{error:?}"))
+            },
+            |request, selection, canonicalized_path_pins| {
+                let contract = if request.package_version == named_version {
+                    parse_for_role(
+                        b"package acme:dep @ 1.0.0\n\
+                          source \"src\"\n\
+                          targets { wasm32-core }\n",
+                        PackageRole::Dependency,
+                    )
+                } else {
+                    assert_eq!(request.package_version, locked_version);
+                    let directory = directories
+                        .resolve_selected_path_source(
+                            selection,
+                            context.root_package(),
+                            canonicalized_path_pins,
+                        )
+                        .map_err(|error| format!("{error:?}"))?
+                        .expect("path lock floor is local");
+                    return directory
+                        .build_dependency_contract(
+                            &request.package_version,
+                            &context,
+                            PackageValidationContext::default(),
+                        )
+                        .map_err(|error| format!("{error:?}"));
+                };
+                build_resolver_contract(&contract, &context, PackageValidationContext::default())
+                    .map_err(|error| format!("{error:?}"))
+            },
+        )
+        .expect_err("a path lock entry cannot be used as a floor");
+        assert!(format!("{error:?}").contains("PathLockFloorUnsupported"));
     }
 
     #[test]

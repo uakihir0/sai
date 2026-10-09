@@ -32,7 +32,8 @@ use crate::resolver_contract::{
 };
 use crate::resolver_source::{
     ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
-    ResolverSourceSelection, validate_resolver_path_pins,
+    ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
+    validate_resolver_path_pins,
 };
 use crate::validation::PackageValidationContext;
 use crate::version::Version;
@@ -133,6 +134,26 @@ pub enum LocalPackagePathPinError {
         found: Box<MvsPackageVersion>,
     },
     MissingRequirerDirectory(MvsPackageVersion),
+    InvalidPath(PackagePathError),
+    Directory(LocalPackageError),
+}
+
+/// Failure to map a selected local path source to its opened directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageSourceResolveError {
+    InconsistentSelection,
+    PathPinCountMismatch {
+        expected: usize,
+        found: usize,
+    },
+    SourceBaseMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    MissingSelectedDirectory(MvsPackageVersion),
+    SelectedDirectoryMismatch(MvsPackageVersion),
+    PathLockFloorUnsupported(MvsPackageVersion),
+    MissingBaseDirectory(MvsPackageVersion),
     InvalidPath(PackagePathError),
     Directory(LocalPackageError),
 }
@@ -389,6 +410,134 @@ impl LocalPackageDirectoryIndex {
         })?;
         Ok(winner)
     }
+
+    /// Returns the captured local directory for a selected path source.
+    ///
+    /// `PathPin` selections use the exact keys returned to the loader by
+    /// `select_with_source_provider_and_canonicalized_pins`. Root path
+    /// overrides are resolved from the indexed root directory and matched
+    /// against the snapshot indexed for the selected package version. Path
+    /// lock floors are rejected because the lock format excludes path entries
+    /// from floors. Git selections return `None` for a separate Git provider.
+    pub fn resolve_selected_path_source(
+        &self,
+        selection: &ResolverSourceSelection,
+        root_package: &MvsPackageVersion,
+        canonicalized_path_pins: &[LocalPackageDirectory],
+    ) -> Result<Option<LocalPackageDirectory>, LocalPackageSourceResolveError> {
+        if selection.reason() != ResolverSourceReason::PathPin
+            && (!selection.path_pin_sources().is_empty() || !canonicalized_path_pins.is_empty())
+        {
+            return Err(LocalPackageSourceResolveError::InconsistentSelection);
+        }
+        match (selection.reason(), selection.source()) {
+            (ResolverSourceReason::PathPin, ResolverPackageSource::Path { .. }) => {
+                let pins = selection.path_pin_sources();
+                if pins.is_empty()
+                    || selection.source() != &pins[0].source
+                    || !matches!(
+                        selection.provenance(),
+                        ResolverSourceProvenance::PathPin { pin } if pin == &pins[0]
+                    )
+                    || pins
+                        .iter()
+                        .any(|pin| !matches!(pin.source, ResolverPackageSource::Path { .. }))
+                {
+                    return Err(LocalPackageSourceResolveError::InconsistentSelection);
+                }
+                if pins.len() != canonicalized_path_pins.len() {
+                    return Err(LocalPackageSourceResolveError::PathPinCountMismatch {
+                        expected: pins.len(),
+                        found: canonicalized_path_pins.len(),
+                    });
+                }
+                let Some(winner) = canonicalized_path_pins.first() else {
+                    return Err(LocalPackageSourceResolveError::InconsistentSelection);
+                };
+                if canonicalized_path_pins
+                    .iter()
+                    .any(|directory| directory != winner)
+                {
+                    return Err(LocalPackageSourceResolveError::InconsistentSelection);
+                }
+                Ok(Some(winner.clone()))
+            }
+            (
+                ResolverSourceReason::RootPathOverride,
+                ResolverPackageSource::Path { relative_to, path },
+            ) => {
+                let ResolverSourceProvenance::RootPathOverride {
+                    root_package: provenance_root,
+                    ..
+                } = selection.provenance()
+                else {
+                    return Err(LocalPackageSourceResolveError::InconsistentSelection);
+                };
+                if provenance_root != root_package {
+                    return Err(LocalPackageSourceResolveError::SourceBaseMismatch {
+                        expected: Box::new(root_package.clone()),
+                        found: Box::new(provenance_root.clone()),
+                    });
+                }
+                let selected = self
+                    .entries
+                    .get(selection.package_version())
+                    .ok_or_else(|| {
+                        LocalPackageSourceResolveError::MissingSelectedDirectory(
+                            selection.package_version().clone(),
+                        )
+                    })?;
+                let current = self.resolve_path_from_package(relative_to, path, root_package)?;
+                if &current != selected {
+                    return Err(LocalPackageSourceResolveError::SelectedDirectoryMismatch(
+                        selection.package_version().clone(),
+                    ));
+                }
+                Ok(Some(selected.clone()))
+            }
+            (ResolverSourceReason::LockFloor, ResolverPackageSource::Path { .. }) => {
+                let ResolverSourceProvenance::LockFloor { package_version } =
+                    selection.provenance()
+                else {
+                    return Err(LocalPackageSourceResolveError::InconsistentSelection);
+                };
+                if package_version != selection.package_version() {
+                    return Err(LocalPackageSourceResolveError::InconsistentSelection);
+                }
+                Err(LocalPackageSourceResolveError::PathLockFloorUnsupported(
+                    package_version.clone(),
+                ))
+            }
+            (ResolverSourceReason::PathPin, _) => {
+                Err(LocalPackageSourceResolveError::InconsistentSelection)
+            }
+            (_, ResolverPackageSource::Git { .. }) => Ok(None),
+            (_, ResolverPackageSource::Path { .. }) => {
+                Err(LocalPackageSourceResolveError::InconsistentSelection)
+            }
+        }
+    }
+
+    fn resolve_path_from_package(
+        &self,
+        relative_to: &MvsPackageVersion,
+        path: &str,
+        expected_base: &MvsPackageVersion,
+    ) -> Result<LocalPackageDirectory, LocalPackageSourceResolveError> {
+        if relative_to != expected_base {
+            return Err(LocalPackageSourceResolveError::SourceBaseMismatch {
+                expected: Box::new(expected_base.clone()),
+                found: Box::new(relative_to.clone()),
+            });
+        }
+        let base = self.entries.get(relative_to).ok_or_else(|| {
+            LocalPackageSourceResolveError::MissingBaseDirectory(relative_to.clone())
+        })?;
+        let path = DependencyPackagePath::parse(path)
+            .map_err(LocalPackageSourceResolveError::InvalidPath)?;
+        base.resolve_dependency(&path)
+            .map_err(LocalPackageSourceResolveError::Directory)
+    }
 }
 
 impl PartialEq for LocalPackageDirectory {
@@ -493,6 +642,54 @@ impl fmt::Display for LocalPackageContractLoadError {
     }
 }
 
+impl fmt::Display for LocalPackageSourceResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InconsistentSelection => {
+                formatter.write_str("selected local package source has inconsistent provenance")
+            }
+            Self::PathPinCountMismatch { expected, found } => write!(
+                formatter,
+                "path-pin selection has {expected} source pins but {found} captured directories"
+            ),
+            Self::SourceBaseMismatch { expected, found } => write!(
+                formatter,
+                "expected path source relative to {}@{}, found {}@{}",
+                expected.package(),
+                expected.version(),
+                found.package(),
+                found.version()
+            ),
+            Self::MissingSelectedDirectory(package_version) => write!(
+                formatter,
+                "selected local package directory for {}@{} is not indexed",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::SelectedDirectoryMismatch(package_version) => write!(
+                formatter,
+                "root path override for {}@{} no longer resolves to its indexed directory",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::PathLockFloorUnsupported(package_version) => write!(
+                formatter,
+                "path source for {}@{} cannot be used as a lock floor",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::MissingBaseDirectory(package_version) => write!(
+                formatter,
+                "root package directory for {}@{} is not indexed",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::InvalidPath(error) => fmt::Display::fmt(error, formatter),
+            Self::Directory(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
 impl fmt::Display for LocalPackageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -549,6 +746,15 @@ impl fmt::Debug for LocalPackageDirectory {
 impl std::error::Error for LocalPackageError {}
 impl std::error::Error for LocalPackageDirectoryIndexError {}
 impl std::error::Error for LocalPackagePathPinError {}
+impl std::error::Error for LocalPackageSourceResolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPath(error) => Some(error),
+            Self::Directory(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 impl std::error::Error for LocalPackageContractLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
