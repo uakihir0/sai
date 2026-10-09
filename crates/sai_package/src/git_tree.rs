@@ -222,9 +222,10 @@ impl GitTreeReader {
     /// Open the `objects/` directory of a bare Git repository.
     ///
     /// The caller must keep the object directory stable for the reader's
-    /// lifetime. Package fetching satisfies this by hashing a private,
-    /// uniquely named staging repository before publishing it to the
-    /// immutable cache. Concurrent hostile mutation of the host filesystem is
+    /// lifetime. On Unix, package fetching hashes a uniquely named staging
+    /// repository whose permission mode denies group and other access before
+    /// publishing it to the immutable cache. Inherited filesystem ACLs are
+    /// not cleared. Concurrent hostile mutation of the host filesystem is
     /// outside the package system's trust model.
     pub fn open(
         objects_directory: impl AsRef<Path>,
