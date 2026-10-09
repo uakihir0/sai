@@ -78,6 +78,14 @@ pub struct MvsDependencyCycle {
     pub spans: Vec<Range<usize>>,
 }
 
+/// One identity that appears on multiple compatibility lines in the graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvsDuplicatePackageLines {
+    pub package: Box<str>,
+    /// One selected version for each line, sorted by compatibility line.
+    pub versions: Vec<MvsPackageVersion>,
+}
+
 /// The graph reachable from the root through selected versions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvsSelectedGraph {
@@ -99,6 +107,33 @@ impl MvsSelectedGraph {
     pub fn is_valid(&self) -> bool {
         self.conflicts.is_empty() && self.cycle.is_none()
     }
+}
+
+/// Finds identities selected on more than one compatibility line.
+///
+/// The root counts as a package on its own line. The returned data is a lint
+/// finding; the caller applies the root's lint level (`warn` by default, or
+/// `deny` for `duplicate_lines`) and attaches requirement-chain explanations.
+pub fn duplicate_package_lines(graph: &MvsSelectedGraph) -> Vec<MvsDuplicatePackageLines> {
+    let mut versions_by_package = BTreeMap::<Box<str>, BTreeMap<MvsNode, MvsPackageVersion>>::new();
+    for package_version in std::iter::once(&graph.root).chain(graph.dependencies.iter()) {
+        let node = package_version.node();
+        versions_by_package
+            .entry(node.package().into())
+            .or_default()
+            .entry(node)
+            .or_insert_with(|| package_version.clone());
+    }
+
+    versions_by_package
+        .into_iter()
+        .filter_map(|(package, versions)| {
+            (versions.len() > 1).then(|| MvsDuplicatePackageLines {
+                package,
+                versions: versions.into_values().collect(),
+            })
+        })
+        .collect()
 }
 
 /// Invalid or incomplete input to selected-graph construction.
@@ -348,7 +383,10 @@ fn finish_dfs_frame(
 mod tests {
     use std::collections::HashMap;
 
-    use super::{MvsSelectedGraphInputError, MvsVersionConflict, check_selected_graph};
+    use super::{
+        MvsSelectedGraphInputError, MvsVersionConflict, check_selected_graph,
+        duplicate_package_lines,
+    };
     use crate::mvs::{
         MvsContract, MvsEdge, MvsNode, MvsPackageVersion, MvsRequirer, MvsSelectionErrorKind,
         select,
@@ -585,5 +623,78 @@ mod tests {
                     if missing_package == &package_version("acme:a", "1.0.0")
                 )
         ));
+    }
+
+    #[test]
+    fn reports_duplicate_lines_including_the_root_identity_in_order() {
+        let root = root(vec![
+            edge("acme:a", "^1", "1.0.0", 0),
+            edge("acme:z", "^1", "1.0.0", 10),
+        ]);
+        let contracts = catalog(vec![
+            contract(
+                "acme:a",
+                "1.0.0",
+                vec![
+                    edge("acme:app", "^2", "2.0.0", 20),
+                    edge("acme:b", "^1", "1.0.0", 30),
+                ],
+            ),
+            contract("acme:z", "1.0.0", vec![edge("acme:b", "^2", "2.0.0", 40)]),
+            contract("acme:app", "2.0.0", vec![]),
+            contract("acme:b", "1.0.0", vec![]),
+            contract("acme:b", "2.0.0", vec![]),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("valid MVS input");
+        let graph = check_selected_graph(&root, &selection).expect("valid graph input");
+        let duplicates = duplicate_package_lines(&graph);
+
+        assert_eq!(
+            duplicates
+                .iter()
+                .map(|duplicate| duplicate.package.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["acme:app", "acme:b"]
+        );
+        assert_eq!(
+            duplicates[0].versions,
+            vec![
+                package_version("acme:app", "1.0.0"),
+                package_version("acme:app", "2.0.0"),
+            ]
+        );
+        assert_eq!(
+            duplicates[1].versions,
+            vec![
+                package_version("acme:b", "1.0.0"),
+                package_version("acme:b", "2.0.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_a_line_reached_only_from_an_unselected_candidate() {
+        let root = root(vec![
+            edge("acme:a", "^1", "1.0.0", 0),
+            edge("acme:z", "^1", "1.0.0", 5),
+        ]);
+        let contracts = catalog(vec![
+            contract("acme:a", "1.0.0", vec![edge("acme:c", "^1", "1.0.0", 10)]),
+            contract("acme:c", "1.0.0", vec![edge("acme:a", "^2", "2.0.0", 20)]),
+            contract("acme:a", "1.8.0", vec![]),
+            contract("acme:z", "1.0.0", vec![edge("acme:a", "^1.8", "1.8.0", 30)]),
+            contract("acme:a", "2.0.0", vec![]),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("valid MVS input");
+        let graph = check_selected_graph(&root, &selection).expect("valid graph input");
+
+        assert!(
+            selection
+                .selected()
+                .contains_key(&package_version("acme:a", "2.0.0").node())
+        );
+        assert!(duplicate_package_lines(&graph).is_empty());
     }
 }
