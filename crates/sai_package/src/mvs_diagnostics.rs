@@ -4,18 +4,24 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::manifest::{PackageDeclaration, PackageParseError, PackageRole, parse_for_role};
-use crate::mvs::{MvsPackageVersion, MvsRequirer, MvsSelectionOutput};
-use crate::mvs_explanations::{MvsChainOrigin, MvsExplanationError, MvsExplanationGraph};
+use crate::mvs::{
+    MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionErrorKind, MvsSelectionOutput,
+};
+use crate::mvs_explanations::{
+    MvsChainLink, MvsChainOrigin, MvsConflictExplanation, MvsExplanationError, MvsExplanationGraph,
+    MvsRequirementChain, MvsSelectionReason,
+};
 use crate::mvs_graph_validation::{
-    MvsDuplicatePackageLines, MvsSelectedGraphInputError, check_selected_graph,
-    duplicate_package_lines,
+    MvsDependencyCycle, MvsDuplicatePackageLines, MvsSelectedGraphInputError, MvsVersionConflict,
+    check_selected_graph, duplicate_package_lines,
 };
 use crate::validation::resolve_package_lint_settings_from_parsed;
 use crate::version_req::VersionReq;
 use sai_diagnostics::{
-    Child, ChildKind, Code, Diagnostic, LintPolicies, LintResolution, LintResolutionContext,
-    LintResolutionError, ManifestLintLevel, OverrideLintLevel, SourceRef, TextRange, TextSize,
-    Value, ValueObject, resolve_lint_occurrence,
+    ChainStep, Child, ChildKind, Code, Diagnostic, LintPolicies, LintResolution,
+    LintResolutionContext, LintResolutionError, ManifestLintLevel, OverrideLintLevel, Related,
+    Relation, Severity, SourceRef, TextRange, TextSize, Value, ValueObject,
+    resolve_lint_occurrence,
 };
 
 /// Source identity for one parsed package manifest.
@@ -278,6 +284,8 @@ pub struct MvsDuplicatePackageLineDiagnosticContext<'a> {
 pub enum MvsDuplicatePackageLineDiagnosticError {
     InvalidExplanation(Box<MvsExplanationError>),
     InvalidSelectedGraph(Box<MvsSelectedGraphInputError>),
+    CycleNotInSelectedGraph(Box<MvsDependencyCycle>),
+    RootCycleNotInSelection(Box<MvsSelectionError>),
     LintResolution(LintResolutionError),
     LintConfiguration(Box<crate::validation::PackageLintPolicyError>),
     MissingRootManifest,
@@ -338,6 +346,919 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
         requirer: Box<MvsRequirer>,
         span: Range<usize>,
     },
+}
+
+/// Builds the hard `VERSION_CONFLICT` diagnostic and its provenance chains.
+pub fn version_conflict_diagnostic(
+    explanations: &MvsExplanationGraph<'_>,
+    conflict: &MvsVersionConflict,
+    manifests: &MvsManifestLocations,
+) -> Result<Diagnostic, MvsDuplicatePackageLineDiagnosticError> {
+    validate_root_manifest(explanations, manifests)?;
+    let explanation = explanations.explain_conflict(conflict).map_err(|error| {
+        MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+    })?;
+    let primary_link = explanation
+        .requirement_chain
+        .links
+        .last()
+        .expect("a validated conflict explanation ends with its rejecting requirement");
+    let primary = chain_link_location(
+        manifests,
+        &primary_link.requirer,
+        &primary_link.named_target,
+        &primary_link.requirement,
+        &primary_link.span,
+    )?;
+    let node = conflict.target.node();
+    let message = format!(
+        "{}#{} is selected at {}, but {} requires `{}`",
+        node.package(),
+        node.line(),
+        conflict.target.version(),
+        requirer_display(&conflict.requirer),
+        conflict.requirement
+    );
+    let mut diagnostic = Diagnostic::new(
+        Code::from_name("VERSION_CONFLICT")
+            .expect("VERSION_CONFLICT is a registered hard diagnostic"),
+        Severity::Error,
+        message,
+        Some(primary),
+    );
+    diagnostic.primary_label = format!(
+        "this requirement rejects selected version {}",
+        conflict.target.version()
+    );
+    diagnostic.data = version_conflict_data(conflict, &explanation, manifests)?;
+    add_selection_reason_children(&mut diagnostic, &explanation.selected_reason, manifests)?;
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Note,
+            message: "the conflicting requirement is reached through:".to_owned(),
+            location: None,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+    add_requirement_chain_children(&mut diagnostic, &explanation.requirement_chain, manifests)?;
+
+    let selected_exceeds_conflicting_minimum =
+        conflict.target.version() >= conflict.requirement.minimum();
+    if let MvsRequirer::Package(requirer) = &conflict.requirer
+        && selected_exceeds_conflicting_minimum
+    {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!(
+                    "a newer release of {} may accept {} {}; try `sai update {}`",
+                    requirer.package(),
+                    conflict.target.package(),
+                    conflict.target.version(),
+                    requirer.package()
+                ),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    let root_named_selected_version = explanations
+        .is_named_by_root_requirement(&conflict.target)
+        .map_err(|error| {
+            MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+        })?;
+    if root_named_selected_version && selected_exceeds_conflicting_minimum {
+        let conflicting_package = conflict.requirer.package_version().package();
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!(
+                    "lower the root requirement for {} to a version accepted by {} ({})",
+                    conflict.target.package(),
+                    conflicting_package,
+                    conflict.requirement
+                ),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    let package_to_override = if selected_exceeds_conflicting_minimum {
+        match &conflict.requirer {
+            MvsRequirer::Root(_) => conflict.target.package(),
+            MvsRequirer::Package(requirer) => requirer.package(),
+        }
+    } else {
+        conflict.target.package()
+    };
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Help,
+            message: format!(
+                "or override {} with a patched copy using `use path` or `use git`",
+                package_to_override
+            ),
+            location: None,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+
+    diagnostic
+        .push_related(Related::RequirementChain {
+            steps: requirement_chain_steps(&explanation.requirement_chain, manifests)?,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+    Ok(diagnostic)
+}
+
+/// Builds every `VERSION_CONFLICT` diagnostic in selected-graph order.
+pub fn version_conflict_diagnostics(
+    selection: &MvsSelectionOutput,
+    manifests: &MvsManifestLocations,
+) -> Result<Vec<Diagnostic>, MvsDuplicatePackageLineDiagnosticError> {
+    let selected_graph =
+        check_selected_graph(selection.root_contract(), selection).map_err(|error| {
+            MvsDuplicatePackageLineDiagnosticError::InvalidSelectedGraph(Box::new(error))
+        })?;
+    if selected_graph.conflicts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let explanations = MvsExplanationGraph::new(selection).map_err(|error| {
+        MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+    })?;
+    selected_graph
+        .conflicts
+        .iter()
+        .map(|conflict| version_conflict_diagnostic(&explanations, conflict, manifests))
+        .collect()
+}
+
+/// Builds the hard `DEPENDENCY_CYCLE` diagnostic for one selected-graph cycle.
+pub fn dependency_cycle_diagnostic(
+    selection: &MvsSelectionOutput,
+    cycle: &MvsDependencyCycle,
+    manifests: &MvsManifestLocations,
+) -> Result<Diagnostic, MvsDuplicatePackageLineDiagnosticError> {
+    let selected_graph =
+        check_selected_graph(selection.root_contract(), selection).map_err(|error| {
+            MvsDuplicatePackageLineDiagnosticError::InvalidSelectedGraph(Box::new(error))
+        })?;
+    if selected_graph.cycle.as_ref() != Some(cycle) {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::CycleNotInSelectedGraph(Box::new(
+                cycle.clone(),
+            )),
+        );
+    }
+    let explanations = MvsExplanationGraph::new(selection).map_err(|error| {
+        MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+    })?;
+    validate_root_manifest(&explanations, manifests)?;
+
+    let mut edges = Vec::with_capacity(cycle.spans.len());
+    let mut closing_chain = None;
+    for edge_index in 0..cycle.spans.len() {
+        let chain = explanations
+            .chain_for_cycle_edge(cycle, edge_index)
+            .map_err(|error| {
+                MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+            })?;
+        let link = chain
+            .links
+            .last()
+            .expect("a validated cycle edge explanation ends with its edge")
+            .clone();
+        let location = chain_link_location(
+            manifests,
+            &link.requirer,
+            &link.named_target,
+            &link.requirement,
+            &link.span,
+        )?;
+        edges.push((link, location));
+        if edge_index + 1 == cycle.spans.len() {
+            closing_chain = Some(chain);
+        }
+    }
+    let closing_chain = closing_chain.expect("a selected dependency cycle has a closing edge");
+
+    let message = format!(
+        "selected package versions form a dependency cycle: {}",
+        cycle
+            .nodes
+            .iter()
+            .map(|package_version| format!(
+                "{} {}",
+                package_version.package(),
+                package_version.version()
+            ))
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    );
+    let primary = edges
+        .first()
+        .expect("a selected dependency cycle contains at least one edge")
+        .1
+        .clone();
+    let mut diagnostic = Diagnostic::new(
+        Code::from_name("DEPENDENCY_CYCLE")
+            .expect("DEPENDENCY_CYCLE is a registered hard diagnostic"),
+        Severity::Error,
+        message,
+        Some(primary),
+    );
+    diagnostic.primary_label = "this requirement is part of the dependency cycle".to_owned();
+    diagnostic.data = dependency_cycle_data(selection, cycle, &edges);
+    diagnostic.data.insert(
+        "requirement_chain".to_owned(),
+        requirement_chain_data(&closing_chain, manifests)?,
+    );
+    for (link, location) in &edges {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: format!(
+                    "{} requires {} @ {} (selected {})",
+                    requirer_display(&link.requirer),
+                    link.named_target.package(),
+                    link.requirement,
+                    cycle_target_for_edge(cycle, link).version()
+                ),
+                location: Some(location.clone()),
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Note,
+            message: "the cycle-closing requirement is reached from the root through:".to_owned(),
+            location: None,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+    add_requirement_chain_children(&mut diagnostic, &closing_chain, manifests)?;
+    diagnostic
+        .push_related(Related::RequirementChain {
+            steps: requirement_chain_steps(&closing_chain, manifests)?,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+    Ok(diagnostic)
+}
+
+/// Builds the selected graph's deterministic cycle diagnostic, if one exists.
+pub fn dependency_cycle_diagnostics(
+    selection: &MvsSelectionOutput,
+    manifests: &MvsManifestLocations,
+) -> Result<Vec<Diagnostic>, MvsDuplicatePackageLineDiagnosticError> {
+    let selected_graph =
+        check_selected_graph(selection.root_contract(), selection).map_err(|error| {
+            MvsDuplicatePackageLineDiagnosticError::InvalidSelectedGraph(Box::new(error))
+        })?;
+    let Some(cycle) = selected_graph.cycle.as_ref() else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![dependency_cycle_diagnostic(
+        selection, cycle, manifests,
+    )?])
+}
+
+/// Builds `DEPENDENCY_CYCLE` for an indirect dependency on the root's line.
+pub fn root_dependency_cycle_diagnostic(
+    selection: &MvsSelectionOutput,
+    selection_error: &MvsSelectionError,
+    manifests: &MvsManifestLocations,
+) -> Result<Diagnostic, MvsDuplicatePackageLineDiagnosticError> {
+    if !selection.errors().contains(selection_error) {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::RootCycleNotInSelection(Box::new(
+                selection_error.clone(),
+            )),
+        );
+    }
+    let MvsSelectionErrorKind::DependencyCycleToRoot { requirer, root } = &selection_error.kind
+    else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::RootCycleNotInSelection(Box::new(
+                selection_error.clone(),
+            )),
+        );
+    };
+    let Some(span) = selection_error.span.clone() else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::RootCycleNotInSelection(Box::new(
+                selection_error.clone(),
+            )),
+        );
+    };
+    if root != selection.root() {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::RootCycleNotInSelection(Box::new(
+                selection_error.clone(),
+            )),
+        );
+    }
+    let explanations =
+        MvsExplanationGraph::new_for_root_cycle_errors(selection).map_err(|error| {
+            MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+        })?;
+    validate_root_manifest(&explanations, manifests)?;
+    let edge_contracts = match requirer {
+        MvsRequirer::Root(_) => Some(selection.root_contract()),
+        MvsRequirer::Package(package_version) => selection.read_contracts().get(package_version),
+    };
+    let Some(named_target) = edge_contracts
+        .into_iter()
+        .flat_map(|contract| contract.edges())
+        .find(|edge| edge.span() == span && edge.target().node() == root.node())
+        .map(|edge| edge.target())
+    else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::RootCycleNotInSelection(Box::new(
+                selection_error.clone(),
+            )),
+        );
+    };
+    let chain = explanations
+        .chain_to_edge(requirer, &named_target, span)
+        .map_err(|error| {
+            MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+        })?;
+    let mut edges = Vec::with_capacity(chain.links.len());
+    for link in &chain.links {
+        let location = chain_link_location(
+            manifests,
+            &link.requirer,
+            &link.named_target,
+            &link.requirement,
+            &link.span,
+        )?;
+        edges.push((link.clone(), location));
+    }
+    let mut nodes = Vec::with_capacity(edges.len() + 1);
+    nodes.push(root.clone());
+    nodes.extend(
+        edges
+            .iter()
+            .take(edges.len().saturating_sub(1))
+            .map(|(link, _)| link.named_target.clone()),
+    );
+    nodes.push(root.clone());
+    let cycle = MvsDependencyCycle {
+        spans: edges.iter().map(|(link, _)| link.span.clone()).collect(),
+        nodes,
+    };
+    let message = format!(
+        "dependency cycle reaches the root package: {}",
+        cycle
+            .nodes
+            .iter()
+            .map(|package_version| format!(
+                "{} {}",
+                package_version.package(),
+                package_version.version()
+            ))
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    );
+    let primary = edges
+        .last()
+        .expect("a root cycle error includes its requiring edge")
+        .1
+        .clone();
+    let mut diagnostic = Diagnostic::new(
+        Code::from_name("DEPENDENCY_CYCLE")
+            .expect("DEPENDENCY_CYCLE is a registered hard diagnostic"),
+        Severity::Error,
+        message,
+        Some(primary),
+    );
+    diagnostic.primary_label = "this requirement reaches the root package line".to_owned();
+    diagnostic.data = dependency_cycle_data(selection, &cycle, &edges);
+    diagnostic.data.insert(
+        "requirement_chain".to_owned(),
+        requirement_chain_data(&chain, manifests)?,
+    );
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Note,
+            message: "the dependency path reaches the root through:".to_owned(),
+            location: None,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+    add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
+    diagnostic
+        .push_related(Related::RequirementChain {
+            steps: requirement_chain_steps(&chain, manifests)?,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+    Ok(diagnostic)
+}
+
+/// Builds diagnostics for indirect selected-candidate edges back to the root.
+pub fn root_dependency_cycle_diagnostics(
+    selection: &MvsSelectionOutput,
+    manifests: &MvsManifestLocations,
+) -> Result<Vec<Diagnostic>, MvsDuplicatePackageLineDiagnosticError> {
+    selection
+        .errors()
+        .iter()
+        .filter(|error| {
+            matches!(
+                &error.kind,
+                MvsSelectionErrorKind::DependencyCycleToRoot { .. }
+            )
+        })
+        .map(|error| root_dependency_cycle_diagnostic(selection, error, manifests))
+        .collect()
+}
+
+fn validate_root_manifest(
+    explanations: &MvsExplanationGraph<'_>,
+    manifests: &MvsManifestLocations,
+) -> Result<(), MvsDuplicatePackageLineDiagnosticError> {
+    let root_manifest = manifests
+        .root
+        .as_ref()
+        .ok_or(MvsDuplicatePackageLineDiagnosticError::MissingRootManifest)?;
+    let selection_root = explanations.root_package_version();
+    if root_manifest.package_version != *selection_root {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::ManifestVersionMismatch {
+                requirer: Box::new(MvsRequirer::Root(selection_root.clone())),
+                expected: Box::new(selection_root.clone()),
+                found: Box::new(root_manifest.package_version.clone()),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn cycle_target_for_edge<'a>(
+    cycle: &'a MvsDependencyCycle,
+    link: &MvsChainLink,
+) -> &'a MvsPackageVersion {
+    cycle
+        .nodes
+        .windows(2)
+        .find_map(|pair| {
+            (pair[0] == *link.requirer.package_version()
+                && pair[1].node() == link.named_target.node())
+            .then_some(&pair[1])
+        })
+        .expect("cycle edge explanations match one selected cycle edge")
+}
+
+fn selected_target_for_edge(
+    selection: &MvsSelectionOutput,
+    link: &MvsChainLink,
+) -> MvsPackageVersion {
+    let node = link.named_target.node();
+    if node == selection.root().node() {
+        return selection.root().clone();
+    }
+    let version = selection
+        .selected()
+        .get(&node)
+        .expect("a reported cycle edge has a selected target version");
+    MvsPackageVersion::new(node.package().to_owned(), version.clone())
+        .expect("selected package identities were validated by MVS input construction")
+}
+
+fn dependency_cycle_data(
+    selection: &MvsSelectionOutput,
+    cycle: &MvsDependencyCycle,
+    edges: &[(MvsChainLink, sai_diagnostics::Location)],
+) -> ValueObject {
+    let nodes = cycle
+        .nodes
+        .iter()
+        .map(|package_version| {
+            let mut fields = ValueObject::new();
+            fields.insert(
+                "package".to_owned(),
+                Value::String(package_version.package().to_owned()),
+            );
+            fields.insert(
+                "version".to_owned(),
+                Value::String(package_version.version().to_string()),
+            );
+            Value::Object(fields)
+        })
+        .collect();
+    let edge_values = edges
+        .iter()
+        .map(|(link, location)| {
+            let target = selected_target_for_edge(selection, link);
+            let mut fields = ValueObject::new();
+            fields.insert(
+                "requirer".to_owned(),
+                Value::String(link.requirer.package_version().package().to_owned()),
+            );
+            fields.insert(
+                "requirer_version".to_owned(),
+                Value::String(link.requirer.package_version().version().to_string()),
+            );
+            fields.insert(
+                "requirer_is_root".to_owned(),
+                Value::Bool(matches!(&link.requirer, MvsRequirer::Root(_))),
+            );
+            fields.insert(
+                "target".to_owned(),
+                Value::String(target.package().to_owned()),
+            );
+            fields.insert(
+                "target_version".to_owned(),
+                Value::String(target.version().to_string()),
+            );
+            fields.insert(
+                "named_target_version".to_owned(),
+                Value::String(link.named_target.version().to_string()),
+            );
+            fields.insert(
+                "requirement".to_owned(),
+                Value::String(link.requirement.to_string()),
+            );
+            fields.insert("location".to_owned(), location_data(location));
+            Value::Object(fields)
+        })
+        .collect();
+    let mut data = ValueObject::new();
+    data.insert("nodes".to_owned(), Value::Array(nodes));
+    data.insert("edges".to_owned(), Value::Array(edge_values));
+    data
+}
+
+fn version_conflict_data(
+    conflict: &MvsVersionConflict,
+    explanation: &MvsConflictExplanation,
+    manifests: &MvsManifestLocations,
+) -> Result<ValueObject, MvsDuplicatePackageLineDiagnosticError> {
+    let node = conflict.target.node();
+    let (selected_reason, selected_chain) = match &explanation.selected_reason {
+        MvsSelectionReason::RootOverridePin { chain } => (
+            "root_override_pin",
+            requirement_chain_data(chain, manifests)?,
+        ),
+        MvsSelectionReason::PathPin { chain } => {
+            ("path_pin", requirement_chain_data(chain, manifests)?)
+        }
+        MvsSelectionReason::RequirementEdge { chain } => {
+            ("requirement", requirement_chain_data(chain, manifests)?)
+        }
+        MvsSelectionReason::LockFloor { package_version } => {
+            ("lock_floor", lock_floor_chain_data(package_version))
+        }
+    };
+    let mut data = ValueObject::new();
+    data.insert(
+        "package".to_owned(),
+        Value::String(node.package().to_owned()),
+    );
+    data.insert(
+        "compatibility_line".to_owned(),
+        Value::String(node.line().to_string()),
+    );
+    data.insert(
+        "selected_version".to_owned(),
+        Value::String(conflict.target.version().to_string()),
+    );
+    data.insert(
+        "named_version".to_owned(),
+        Value::String(conflict.named_target.version().to_string()),
+    );
+    data.insert(
+        "requirement".to_owned(),
+        Value::String(conflict.requirement.to_string()),
+    );
+    data.insert(
+        "requirer".to_owned(),
+        Value::String(conflict.requirer.package_version().package().to_owned()),
+    );
+    data.insert(
+        "requirer_version".to_owned(),
+        Value::String(conflict.requirer.package_version().version().to_string()),
+    );
+    data.insert(
+        "requirer_is_root".to_owned(),
+        Value::Bool(matches!(&conflict.requirer, MvsRequirer::Root(_))),
+    );
+    data.insert(
+        "selected_reason".to_owned(),
+        Value::String(selected_reason.to_owned()),
+    );
+    data.insert("selected_chain".to_owned(), selected_chain);
+    data.insert(
+        "requirement_chain".to_owned(),
+        requirement_chain_data(&explanation.requirement_chain, manifests)?,
+    );
+    Ok(data)
+}
+
+fn lock_floor_chain_data(package_version: &MvsPackageVersion) -> Value {
+    let mut origin = ValueObject::new();
+    origin.insert("kind".to_owned(), Value::String("lock_floor".to_owned()));
+    origin.insert(
+        "package".to_owned(),
+        Value::String(package_version.package().to_owned()),
+    );
+    origin.insert(
+        "version".to_owned(),
+        Value::String(package_version.version().to_string()),
+    );
+    let mut chain = ValueObject::new();
+    chain.insert("origin".to_owned(), Value::Object(origin));
+    chain.insert("steps".to_owned(), Value::Array(Vec::new()));
+    Value::Object(chain)
+}
+
+fn requirement_chain_data(
+    chain: &MvsRequirementChain,
+    manifests: &MvsManifestLocations,
+) -> Result<Value, MvsDuplicatePackageLineDiagnosticError> {
+    let mut origin = ValueObject::new();
+    match &chain.origin {
+        MvsChainOrigin::Root(package_version) => {
+            origin.insert("kind".to_owned(), Value::String("root".to_owned()));
+            origin.insert(
+                "package".to_owned(),
+                Value::String(package_version.package().to_owned()),
+            );
+            origin.insert(
+                "version".to_owned(),
+                Value::String(package_version.version().to_string()),
+            );
+        }
+        MvsChainOrigin::LockFloor(package_version) => {
+            origin.insert("kind".to_owned(), Value::String("lock_floor".to_owned()));
+            origin.insert(
+                "package".to_owned(),
+                Value::String(package_version.package().to_owned()),
+            );
+            origin.insert(
+                "version".to_owned(),
+                Value::String(package_version.version().to_string()),
+            );
+        }
+    }
+    let steps = requirement_chain_indexes(chain.links.len())
+        .into_iter()
+        .map(|index| {
+            let Some(index) = index else {
+                let mut omitted = ValueObject::new();
+                omitted.insert("kind".to_owned(), Value::String("omitted".to_owned()));
+                return Ok(Value::Object(omitted));
+            };
+            let link = &chain.links[index];
+            let location = chain_link_location(
+                manifests,
+                &link.requirer,
+                &link.named_target,
+                &link.requirement,
+                &link.span,
+            )?;
+            let mut fields = ValueObject::new();
+            fields.insert("kind".to_owned(), Value::String("requirement".to_owned()));
+            fields.insert(
+                "requirer".to_owned(),
+                Value::String(link.requirer.package_version().package().to_owned()),
+            );
+            fields.insert(
+                "requirer_version".to_owned(),
+                Value::String(link.requirer.package_version().version().to_string()),
+            );
+            fields.insert(
+                "requirer_is_root".to_owned(),
+                Value::Bool(matches!(&link.requirer, MvsRequirer::Root(_))),
+            );
+            fields.insert(
+                "requirer_selected".to_owned(),
+                Value::Bool(link.requirer_selected),
+            );
+            fields.insert(
+                "target".to_owned(),
+                Value::String(link.named_target.package().to_owned()),
+            );
+            fields.insert(
+                "target_version".to_owned(),
+                Value::String(link.named_target.version().to_string()),
+            );
+            fields.insert(
+                "requirement".to_owned(),
+                Value::String(link.requirement.to_string()),
+            );
+            fields.insert("location".to_owned(), location_data(&location));
+            Ok(Value::Object(fields))
+        })
+        .collect::<Result<Vec<_>, MvsDuplicatePackageLineDiagnosticError>>()?;
+    let mut fields = ValueObject::new();
+    fields.insert("origin".to_owned(), Value::Object(origin));
+    fields.insert("steps".to_owned(), Value::Array(steps));
+    Ok(Value::Object(fields))
+}
+
+fn requirer_display(requirer: &MvsRequirer) -> String {
+    let package_version = requirer.package_version();
+    format!(
+        "{} {}{}",
+        package_version.package(),
+        package_version.version(),
+        if matches!(requirer, MvsRequirer::Root(_)) {
+            " (root)"
+        } else {
+            ""
+        }
+    )
+}
+
+fn add_selection_reason_children(
+    diagnostic: &mut Diagnostic,
+    reason: &MvsSelectionReason,
+    manifests: &MvsManifestLocations,
+) -> Result<(), MvsDuplicatePackageLineDiagnosticError> {
+    match reason {
+        MvsSelectionReason::RootOverridePin { chain } => {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: "the selected version is pinned by a root path override:".to_owned(),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+            add_requirement_chain_children(diagnostic, chain, manifests)?;
+        }
+        MvsSelectionReason::PathPin { chain } => {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: "the selected version is pinned by this path requirement:".to_owned(),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+            add_requirement_chain_children(diagnostic, chain, manifests)?;
+        }
+        MvsSelectionReason::RequirementEdge { chain } => {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: "the selected version is the highest minimum named by:".to_owned(),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+            add_requirement_chain_children(diagnostic, chain, manifests)?;
+        }
+        MvsSelectionReason::LockFloor { package_version } => {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: format!(
+                        "the selected version comes from lock entry {} {} (`sai.lock`)",
+                        package_version.package(),
+                        package_version.version()
+                    ),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+        }
+    }
+    Ok(())
+}
+
+fn add_requirement_chain_children(
+    diagnostic: &mut Diagnostic,
+    chain: &MvsRequirementChain,
+    manifests: &MvsManifestLocations,
+) -> Result<(), MvsDuplicatePackageLineDiagnosticError> {
+    match &chain.origin {
+        MvsChainOrigin::Root(root) => diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: format!(
+                    "chain starts at {} {} (root)",
+                    root.package(),
+                    root.version()
+                ),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations"),
+        MvsChainOrigin::LockFloor(floor) => diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: format!(
+                    "chain starts at lock entry {} {} (`sai.lock`)",
+                    floor.package(),
+                    floor.version()
+                ),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations"),
+    }
+    let indexes = requirement_chain_indexes(chain.links.len());
+    for index in indexes {
+        let Some(index) = index else {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: "…".to_owned(),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+            continue;
+        };
+        let link = &chain.links[index];
+        let location = chain_link_location(
+            manifests,
+            &link.requirer,
+            &link.named_target,
+            &link.requirement,
+            &link.span,
+        )?;
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: format!(
+                    "{}{} requires {} @ {} (names {})",
+                    requirer_display(&link.requirer),
+                    if link.requirer_selected {
+                        ""
+                    } else {
+                        " (not selected)"
+                    },
+                    link.named_target.package(),
+                    link.requirement,
+                    link.named_target.version()
+                ),
+                location: Some(location),
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    Ok(())
+}
+
+fn requirement_chain_steps(
+    chain: &MvsRequirementChain,
+    manifests: &MvsManifestLocations,
+) -> Result<Vec<ChainStep>, MvsDuplicatePackageLineDiagnosticError> {
+    let mut steps = Vec::with_capacity(chain.links.len() + 1);
+    for (index, link) in chain.links.iter().enumerate() {
+        let location = chain_link_location(
+            manifests,
+            &link.requirer,
+            &link.named_target,
+            &link.requirement,
+            &link.span,
+        )?;
+        let name = if link.requirer_selected {
+            requirer_display(&link.requirer)
+        } else {
+            format!("{} (not selected)", requirer_display(&link.requirer))
+        };
+        steps.push(ChainStep {
+            name,
+            symbol: None,
+            location: Some(location),
+            relation: Relation::Requires,
+        });
+        if index + 1 < chain.links.len() {
+            debug_assert_eq!(
+                link.named_target,
+                *chain.links[index + 1].requirer.package_version()
+            );
+        }
+    }
+    let final_link = chain
+        .links
+        .last()
+        .expect("a validated requirement chain ends with an edge");
+    steps.push(ChainStep {
+        name: format!(
+            "{} @ {} (names {})",
+            final_link.named_target.package(),
+            final_link.requirement,
+            final_link.named_target.version()
+        ),
+        symbol: None,
+        location: None,
+        relation: Relation::Requires,
+    });
+
+    if steps.len() <= 32 {
+        return Ok(steps);
+    }
+    let mut bounded = steps[..16].to_vec();
+    bounded.push(ChainStep {
+        name: "…".to_owned(),
+        symbol: None,
+        location: None,
+        relation: Relation::Calls,
+    });
+    bounded.extend_from_slice(&steps[steps.len() - 15..]);
+    Ok(bounded)
+}
+
+fn requirement_chain_indexes(len: usize) -> Vec<Option<usize>> {
+    if len <= 32 {
+        return (0..len).map(Some).collect();
+    }
+    (0..16)
+        .map(Some)
+        .chain(std::iter::once(None))
+        .chain((len - 15..len).map(Some))
+        .collect()
 }
 
 /// Builds the graph-wide `DUPLICATE_PACKAGE_LINE` lint and its MVS chains.
@@ -795,13 +1716,15 @@ mod tests {
     use std::sync::Arc;
 
     use sai_diagnostics::{
-        LevelSource, LintLevel, Severity, TextRange, TextSize, Value, ValueObject,
+        ChildKind, LevelSource, LintLevel, Related, Relation, Severity, TextRange, TextSize, Value,
+        ValueObject,
     };
     use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     use super::{
         MvsDuplicatePackageLineDiagnosticContext, MvsManifestLocation, MvsManifestLocations,
         duplicate_package_line_diagnostic, duplicate_package_line_diagnostics,
+        version_conflict_diagnostic, version_conflict_diagnostics,
     };
     use crate::manifest::parse;
     use crate::mvs::{
@@ -1071,6 +1994,359 @@ mod tests {
             ],
         );
         (selection, duplicate, manifests)
+    }
+
+    fn version_conflict_fixture() -> (MvsSelectionOutput, MvsManifestLocations) {
+        let (root_source, root_spans) = manifest_source(
+            "acme:app",
+            "1.0.0",
+            &[("acme:lib", "^1.9"), ("acme:a", "^1"), ("acme:b", "^1")],
+        );
+        let (a_source, a_spans) = manifest_source("acme:a", "1.0.0", &[("acme:lib", "^1.9")]);
+        let (b_source, b_spans) =
+            manifest_source("acme:b", "1.0.0", &[("acme:lib", ">=1.4, <1.8")]);
+        let (lib_v1_source, _) = manifest_source("acme:lib", "1.4.0", &[]);
+        let (lib_source, _) = manifest_source("acme:lib", "1.9.0", &[]);
+        let root = MvsContract::new(
+            package_version("acme:app", "1.0.0"),
+            vec![
+                edge_with_span("acme:lib", "^1.9", "1.9.0", root_spans[0].clone()),
+                edge_with_span("acme:a", "^1", "1.0.0", root_spans[1].clone()),
+                edge_with_span("acme:b", "^1", "1.0.0", root_spans[2].clone()),
+            ],
+        )
+        .expect("valid root contract");
+        let a = MvsContract::new(
+            package_version("acme:a", "1.0.0"),
+            vec![edge_with_span(
+                "acme:lib",
+                "^1.9",
+                "1.9.0",
+                a_spans[0].clone(),
+            )],
+        )
+        .expect("valid selected-version requirer");
+        let b = MvsContract::new(
+            package_version("acme:b", "1.0.0"),
+            vec![edge_with_span(
+                "acme:lib",
+                ">=1.4, <1.8",
+                "1.4.0",
+                b_spans[0].clone(),
+            )],
+        )
+        .expect("valid conflicting requirer");
+        let lib = MvsContract::new(package_version("acme:lib", "1.9.0"), vec![])
+            .expect("valid selected target");
+        let lib_v1 = MvsContract::new(package_version("acme:lib", "1.4.0"), vec![])
+            .expect("valid candidate target");
+        let contracts = HashMap::from([
+            (a.package_version().clone(), a),
+            (b.package_version().clone(), b),
+            (lib_v1.package_version().clone(), lib_v1),
+            (lib.package_version().clone(), lib),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("MVS selection");
+        let manifests = manifests_for(
+            (package_version("acme:app", "1.0.0"), root_source),
+            vec![
+                (package_version("acme:a", "1.0.0"), a_source),
+                (package_version("acme:b", "1.0.0"), b_source),
+                (package_version("acme:lib", "1.4.0"), lib_v1_source),
+                (package_version("acme:lib", "1.9.0"), lib_source),
+            ],
+        );
+        (selection, manifests)
+    }
+
+    fn root_selected_version_conflict_fixture() -> (MvsSelectionOutput, MvsManifestLocations) {
+        let (root_source, root_spans) = manifest_source(
+            "acme:app",
+            "1.0.0",
+            &[("acme:lib", "^1.9"), ("acme:b", "^1")],
+        );
+        let (b_source, b_spans) =
+            manifest_source("acme:b", "1.0.0", &[("acme:lib", ">=1.4, <1.8")]);
+        let (lib_v1_source, _) = manifest_source("acme:lib", "1.4.0", &[]);
+        let (lib_source, _) = manifest_source("acme:lib", "1.9.0", &[]);
+        let root = MvsContract::new(
+            package_version("acme:app", "1.0.0"),
+            vec![
+                edge_with_span("acme:lib", "^1.9", "1.9.0", root_spans[0].clone()),
+                edge_with_span("acme:b", "^1", "1.0.0", root_spans[1].clone()),
+            ],
+        )
+        .expect("valid root contract");
+        let b = MvsContract::new(
+            package_version("acme:b", "1.0.0"),
+            vec![edge_with_span(
+                "acme:lib",
+                ">=1.4, <1.8",
+                "1.4.0",
+                b_spans[0].clone(),
+            )],
+        )
+        .expect("valid conflicting requirer");
+        let lib = MvsContract::new(package_version("acme:lib", "1.9.0"), vec![])
+            .expect("valid selected target");
+        let lib_v1 = MvsContract::new(package_version("acme:lib", "1.4.0"), vec![])
+            .expect("valid candidate target");
+        let contracts = HashMap::from([
+            (b.package_version().clone(), b),
+            (lib_v1.package_version().clone(), lib_v1),
+            (lib.package_version().clone(), lib),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("MVS selection");
+        let manifests = manifests_for(
+            (package_version("acme:app", "1.0.0"), root_source),
+            vec![
+                (package_version("acme:b", "1.0.0"), b_source),
+                (package_version("acme:lib", "1.4.0"), lib_v1_source),
+                (package_version("acme:lib", "1.9.0"), lib_source),
+            ],
+        );
+        (selection, manifests)
+    }
+
+    fn path_pinned_lower_bound_conflict_fixture() -> (MvsSelectionOutput, MvsManifestLocations) {
+        let root_requirement = "acme:lib @ ^1.5 from path \"../lib\"";
+        let root_source = format!(
+            "package acme:app @ 1.0.0\nrequires {{\n    {root_requirement}\n    acme:b @ ^1\n}}\n"
+        );
+        let root_span = source_span(&root_source, root_requirement);
+        let (b_source, b_spans) = manifest_source("acme:b", "1.0.0", &[("acme:lib", "^1.8")]);
+        let (lib_pin_source, _) = manifest_source("acme:lib", "1.5.0", &[]);
+        let (lib_candidate_source, _) = manifest_source("acme:lib", "1.8.0", &[]);
+        let root = MvsContract::new(
+            package_version("acme:app", "1.0.0"),
+            vec![
+                crate::mvs::MvsEdge::new_path_pinned(
+                    "acme:lib",
+                    VersionReq::parse("^1.5").expect("valid path requirement"),
+                    version("1.5.0"),
+                    root_span,
+                )
+                .expect("valid path pin"),
+                edge_with_span(
+                    "acme:b",
+                    "^1",
+                    "1.0.0",
+                    source_span(&root_source, "acme:b @ ^1"),
+                ),
+            ],
+        )
+        .expect("valid root contract");
+        let b = MvsContract::new(
+            package_version("acme:b", "1.0.0"),
+            vec![edge_with_span(
+                "acme:lib",
+                "^1.8",
+                "1.8.0",
+                b_spans[0].clone(),
+            )],
+        )
+        .expect("valid conflicting requirer");
+        let lib_pin = MvsContract::new(package_version("acme:lib", "1.5.0"), vec![])
+            .expect("valid pinned package");
+        let lib_candidate = MvsContract::new(package_version("acme:lib", "1.8.0"), vec![])
+            .expect("valid unselected candidate");
+        let contracts = HashMap::from([
+            (b.package_version().clone(), b),
+            (lib_pin.package_version().clone(), lib_pin),
+            (lib_candidate.package_version().clone(), lib_candidate),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("MVS selection");
+        let manifests = manifests_for(
+            (package_version("acme:app", "1.0.0"), root_source),
+            vec![
+                (package_version("acme:b", "1.0.0"), b_source),
+                (package_version("acme:lib", "1.5.0"), lib_pin_source),
+                (package_version("acme:lib", "1.8.0"), lib_candidate_source),
+            ],
+        );
+        (selection, manifests)
+    }
+
+    fn dependency_cycle_fixture() -> (MvsSelectionOutput, MvsManifestLocations) {
+        let (root_source, root_spans) = manifest_source("acme:app", "1.0.0", &[("acme:a", "^1")]);
+        let (a_source, a_spans) = manifest_source("acme:a", "1.0.0", &[("acme:b", "^1")]);
+        let (b_source, b_spans) = manifest_source("acme:b", "1.0.0", &[("acme:a", "^1")]);
+        let root = MvsContract::new(
+            package_version("acme:app", "1.0.0"),
+            vec![edge_with_span(
+                "acme:a",
+                "^1",
+                "1.0.0",
+                root_spans[0].clone(),
+            )],
+        )
+        .expect("valid root contract");
+        let a = MvsContract::new(
+            package_version("acme:a", "1.0.0"),
+            vec![edge_with_span("acme:b", "^1", "1.0.0", a_spans[0].clone())],
+        )
+        .expect("valid cycle package");
+        let b = MvsContract::new(
+            package_version("acme:b", "1.0.0"),
+            vec![edge_with_span("acme:a", "^1", "1.0.0", b_spans[0].clone())],
+        )
+        .expect("valid cycle package");
+        let contracts = HashMap::from([
+            (a.package_version().clone(), a),
+            (b.package_version().clone(), b),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("MVS selection");
+        let manifests = manifests_for(
+            (package_version("acme:app", "1.0.0"), root_source),
+            vec![
+                (package_version("acme:a", "1.0.0"), a_source),
+                (package_version("acme:b", "1.0.0"), b_source),
+            ],
+        );
+        (selection, manifests)
+    }
+
+    fn dependency_cycle_with_floor_fixture() -> (MvsSelectionOutput, MvsManifestLocations) {
+        let (root_source, root_spans) = manifest_source("acme:app", "1.0.0", &[("acme:a", "^1")]);
+        let (floor_source, floor_spans) = manifest_source("acme:a", "1.5.0", &[("acme:b", "^1")]);
+        let (b_source, b_spans) = manifest_source("acme:b", "1.0.0", &[("acme:a", "^1")]);
+        let root = MvsContract::new(
+            package_version("acme:app", "1.0.0"),
+            vec![edge_with_span(
+                "acme:a",
+                "^1",
+                "1.0.0",
+                root_spans[0].clone(),
+            )],
+        )
+        .expect("valid root contract");
+        let named_a = MvsContract::new(package_version("acme:a", "1.0.0"), vec![])
+            .expect("valid named candidate");
+        let floor_a = MvsContract::new(
+            package_version("acme:a", "1.5.0"),
+            vec![edge_with_span(
+                "acme:b",
+                "^1",
+                "1.0.0",
+                floor_spans[0].clone(),
+            )],
+        )
+        .expect("valid lock-floor contract");
+        let b = MvsContract::new(
+            package_version("acme:b", "1.0.0"),
+            vec![edge_with_span("acme:a", "^1", "1.0.0", b_spans[0].clone())],
+        )
+        .expect("valid cycle package");
+        let contracts = HashMap::from([
+            (named_a.package_version().clone(), named_a),
+            (floor_a.package_version().clone(), floor_a),
+            (b.package_version().clone(), b),
+        ]);
+        let floors = HashMap::from([(package_version("acme:a", "1.0.0").node(), version("1.5.0"))]);
+        let selection = select(&root, &contracts, &floors, &HashMap::new()).expect("MVS selection");
+        let manifests = manifests_for(
+            (package_version("acme:app", "1.0.0"), root_source),
+            vec![
+                (package_version("acme:a", "1.5.0"), floor_source),
+                (package_version("acme:b", "1.0.0"), b_source),
+            ],
+        );
+        (selection, manifests)
+    }
+
+    fn root_dependency_cycle_fixture() -> (MvsSelectionOutput, MvsManifestLocations) {
+        root_dependency_cycle_fixture_with("1.0.0", "1.0.0", false)
+    }
+
+    fn root_dependency_cycle_fixture_with(
+        root_version: &str,
+        named_root_version: &str,
+        include_missing_contract: bool,
+    ) -> (MvsSelectionOutput, MvsManifestLocations) {
+        root_dependency_cycle_fixture_with_a_floor(
+            root_version,
+            named_root_version,
+            include_missing_contract,
+            None,
+        )
+    }
+
+    fn root_dependency_cycle_fixture_with_a_floor(
+        root_version: &str,
+        named_root_version: &str,
+        include_missing_contract: bool,
+        selected_a_floor: Option<&str>,
+    ) -> (MvsSelectionOutput, MvsManifestLocations) {
+        let mut root_requirements = vec![("acme:a", "^1")];
+        if include_missing_contract {
+            root_requirements.push(("acme:missing", "^1"));
+        }
+        let (root_source, root_spans) =
+            manifest_source("acme:app", root_version, &root_requirements);
+        let (a_source, a_spans) = manifest_source("acme:a", "1.0.0", &[("acme:b", "^1")]);
+        let (b_source, b_spans) = manifest_source("acme:b", "1.0.0", &[("acme:app", "^1")]);
+        let mut root_edges = vec![edge_with_span(
+            "acme:a",
+            "^1",
+            "1.0.0",
+            root_spans[0].clone(),
+        )];
+        if include_missing_contract {
+            root_edges.push(edge_with_span(
+                "acme:missing",
+                "^1",
+                "1.0.0",
+                root_spans[1].clone(),
+            ));
+        }
+        let root = MvsContract::new(package_version("acme:app", root_version), root_edges)
+            .expect("valid root contract");
+        let a = MvsContract::new(
+            package_version("acme:a", "1.0.0"),
+            vec![edge_with_span("acme:b", "^1", "1.0.0", a_spans[0].clone())],
+        )
+        .expect("valid dependency");
+        let b = MvsContract::new(
+            package_version("acme:b", "1.0.0"),
+            vec![edge_with_span(
+                "acme:app",
+                "^1",
+                named_root_version,
+                b_spans[0].clone(),
+            )],
+        )
+        .expect("valid dependency");
+        let mut contracts = vec![
+            (a.package_version().clone(), a),
+            (b.package_version().clone(), b),
+        ];
+        if let Some(floor_version) = selected_a_floor {
+            let a_floor = MvsContract::new(package_version("acme:a", floor_version), vec![])
+                .expect("valid lock-floor contract");
+            contracts.push((a_floor.package_version().clone(), a_floor));
+        }
+        let contracts = HashMap::from_iter(contracts);
+        let floors = selected_a_floor
+            .map(|floor_version| {
+                HashMap::from([(
+                    package_version("acme:a", floor_version).node(),
+                    version(floor_version),
+                )])
+            })
+            .unwrap_or_default();
+        let selection = select(&root, &contracts, &floors, &HashMap::new()).expect("MVS selection");
+        let manifests = manifests_for(
+            (package_version("acme:app", root_version), root_source),
+            vec![
+                (package_version("acme:a", "1.0.0"), a_source),
+                (package_version("acme:b", "1.0.0"), b_source),
+            ],
+        );
+        (selection, manifests)
     }
 
     fn duplicate_with_candidate_chain_fixture() -> (
@@ -1945,6 +3221,495 @@ mod tests {
                 .children()
                 .iter()
                 .any(|child| child.message == "acme:b 1.0.0 (not selected) requires acme:lib @ ^2")
+        );
+    }
+
+    #[test]
+    fn version_conflict_reports_selected_and_rejecting_requirement_chains() {
+        let (selection, manifests) = version_conflict_fixture();
+        let diagnostics =
+            version_conflict_diagnostics(&selection, &manifests).expect("conflict diagnostics");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one conflict diagnostic");
+        };
+
+        assert_eq!(diagnostic.code.as_str(), "VERSION_CONFLICT");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.message,
+            "acme:lib#1 is selected at 1.9.0, but acme:b 1.0.0 requires `>=1.4, <1.8`"
+        );
+        assert_eq!(
+            diagnostic.primary().expect("primary requirement").file.path,
+            "dep:acme:b@1.0.0/sai.package"
+        );
+        assert_eq!(
+            diagnostic.data.get("selected_reason"),
+            Some(&Value::String("requirement".to_owned()))
+        );
+        assert_eq!(
+            diagnostic.data.get("selected_version"),
+            Some(&Value::String("1.9.0".to_owned()))
+        );
+        let Value::Object(rejected_chain) = diagnostic
+            .data
+            .get("requirement_chain")
+            .expect("structured rejecting chain")
+        else {
+            panic!("requirement chain must be an object");
+        };
+        let Value::Object(origin) = rejected_chain.get("origin").expect("chain origin") else {
+            panic!("chain origin must be an object");
+        };
+        assert_eq!(origin.get("kind"), Some(&Value::String("root".to_owned())));
+        let Value::Array(steps) = rejected_chain.get("steps").expect("chain steps") else {
+            panic!("chain steps must be an array");
+        };
+        let Value::Object(rejected_step) = steps.last().expect("final conflict step") else {
+            panic!("chain step must be an object");
+        };
+        assert_eq!(
+            rejected_step.get("requirement"),
+            Some(&Value::String(">=1.4, <1.8".to_owned()))
+        );
+        assert_eq!(
+            rejected_step.get("target_version"),
+            Some(&Value::String("1.4.0".to_owned()))
+        );
+        assert!(
+            diagnostic.children().iter().any(|child| child.message
+                == "acme:a 1.0.0 requires acme:lib @ ^1.9 (names 1.9.0)")
+        );
+        assert!(
+            diagnostic.children().iter().any(|child| child.message
+                == "acme:b 1.0.0 requires acme:lib @ >=1.4, <1.8 (names 1.4.0)")
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.kind == ChildKind::Help
+                    && child.message.contains("sai update acme:b"))
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.kind == ChildKind::Help
+                    && child.message.contains("use path` or `use git"))
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.kind == ChildKind::Help
+                    && child.message
+                        == "or override acme:b with a patched copy using `use path` or `use git`")
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.kind == ChildKind::Help
+                    && child.message
+                        == "lower the root requirement for acme:lib to a version accepted by acme:b (>=1.4, <1.8)")
+        );
+
+        let related = diagnostic.related();
+        assert_eq!(related.len(), 1);
+        let Related::RequirementChain {
+            steps: conflicting_chain,
+        } = &related[0]
+        else {
+            panic!("the related entry explains the conflicting requirement");
+        };
+        assert_eq!(conflicting_chain.len(), 3);
+        assert_eq!(conflicting_chain[0].relation, Relation::Requires);
+        assert_eq!(conflicting_chain[0].name, "acme:app 1.0.0 (root)");
+        assert_eq!(conflicting_chain[1].relation, Relation::Requires);
+        assert_eq!(conflicting_chain[1].name, "acme:b 1.0.0");
+        assert_eq!(
+            conflicting_chain[2].name,
+            "acme:lib @ >=1.4, <1.8 (names 1.4.0)"
+        );
+        assert!(conflicting_chain[2].location.is_none());
+        assert_eq!(
+            conflicting_chain[1]
+                .location
+                .as_ref()
+                .expect("structured edge source")
+                .file
+                .path,
+            "dep:acme:b@1.0.0/sai.package"
+        );
+    }
+
+    #[test]
+    fn suggests_lowering_the_root_requirement_when_it_selected_the_version() {
+        let (selection, manifests) = root_selected_version_conflict_fixture();
+        let diagnostics =
+            version_conflict_diagnostics(&selection, &manifests).expect("conflict diagnostics");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one conflict diagnostic");
+        };
+
+        assert_eq!(
+            diagnostic.data.get("requirer_is_root"),
+            Some(&Value::Bool(false))
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.kind == ChildKind::Help
+                    && child.message
+                        == "lower the root requirement for acme:lib to a version accepted by acme:b (>=1.4, <1.8)")
+        );
+    }
+
+    #[test]
+    fn singular_version_conflict_diagnostic_rejects_a_conflict_from_another_selection() {
+        let (selection, manifests) = version_conflict_fixture();
+        let explanations = MvsExplanationGraph::new(&selection).expect("explanation graph");
+        let unrelated = super::MvsVersionConflict {
+            requirer: MvsRequirer::Root(package_version("acme:app", "1.0.0")),
+            named_target: package_version("acme:lib", "1.9.0"),
+            target: package_version("acme:lib", "1.9.0"),
+            requirement: VersionReq::parse("=2.0.0").expect("valid requirement"),
+            span: 1..2,
+        };
+
+        let error = version_conflict_diagnostic(&explanations, &unrelated, &manifests)
+            .expect_err("conflict must belong to the explanation graph");
+        assert!(matches!(
+            error,
+            super::MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(_)
+        ));
+    }
+
+    #[test]
+    fn does_not_suggest_update_for_a_path_pin_below_a_dependency_minimum() {
+        let (selection, manifests) = path_pinned_lower_bound_conflict_fixture();
+        let diagnostics =
+            version_conflict_diagnostics(&selection, &manifests).expect("conflict diagnostics");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one conflict diagnostic");
+        };
+
+        assert_eq!(
+            diagnostic.data.get("selected_reason"),
+            Some(&Value::String("path_pin".to_owned()))
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.message.contains("pinned by this path requirement"))
+        );
+        assert!(
+            !diagnostic
+                .children()
+                .iter()
+                .any(|child| child.message.contains("sai update"))
+        );
+        assert!(diagnostic.children().iter().any(|child| child.message
+            == "or override acme:lib with a patched copy using `use path` or `use git`"));
+    }
+
+    #[test]
+    fn dependency_cycle_diagnostic_lists_each_selected_edge_and_location() {
+        let (selection, manifests) = dependency_cycle_fixture();
+        let diagnostics =
+            super::dependency_cycle_diagnostics(&selection, &manifests).expect("cycle diagnostic");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one cycle diagnostic");
+        };
+
+        assert_eq!(diagnostic.code.as_str(), "DEPENDENCY_CYCLE");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.message,
+            "selected package versions form a dependency cycle: acme:a 1.0.0 -> acme:b 1.0.0 -> acme:a 1.0.0"
+        );
+        assert_eq!(
+            diagnostic.primary().expect("primary cycle edge").file.path,
+            "dep:acme:a@1.0.0/sai.package"
+        );
+        assert_eq!(
+            diagnostic.children()[0].message,
+            "acme:a 1.0.0 requires acme:b @ ^1 (selected 1.0.0)"
+        );
+        assert_eq!(
+            diagnostic.children()[0]
+                .location
+                .as_ref()
+                .expect("cycle edge location")
+                .file
+                .path,
+            "dep:acme:a@1.0.0/sai.package"
+        );
+        assert_eq!(
+            diagnostic.children()[1]
+                .location
+                .as_ref()
+                .expect("cycle edge location")
+                .file
+                .path,
+            "dep:acme:b@1.0.0/sai.package"
+        );
+        assert!(
+            diagnostic.children().iter().any(|child| {
+                child
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| location.file.path == "sai.package")
+            }),
+            "the root-to-cycle chain should retain the root requirement location"
+        );
+        let Value::Object(requirement_chain) = diagnostic
+            .data
+            .get("requirement_chain")
+            .expect("root-to-cycle requirement chain")
+        else {
+            panic!("the cycle requirement chain must be an object");
+        };
+        let Value::Array(chain_steps) = requirement_chain
+            .get("steps")
+            .expect("cycle requirement chain steps")
+        else {
+            panic!("the cycle requirement chain steps must be an array");
+        };
+        assert_eq!(chain_steps.len(), 3);
+        assert_eq!(diagnostic.related().len(), 1);
+        let Value::Array(nodes) = diagnostic.data.get("nodes").expect("cycle nodes") else {
+            panic!("cycle nodes must be an array");
+        };
+        assert_eq!(nodes.len(), 3);
+        let Value::Object(last_node) = nodes.last().expect("closed cycle") else {
+            panic!("cycle node must be an object");
+        };
+        assert_eq!(
+            last_node.get("package"),
+            Some(&Value::String("acme:a".to_owned()))
+        );
+        let Value::Array(edges) = diagnostic.data.get("edges").expect("cycle edges") else {
+            panic!("cycle edges must be an array");
+        };
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[test]
+    fn rejects_a_cycle_that_is_not_the_selected_graphs_canonical_cycle() {
+        let (selection, manifests) = dependency_cycle_fixture();
+        let unrelated = super::MvsDependencyCycle {
+            nodes: vec![
+                package_version("acme:b", "1.0.0"),
+                package_version("acme:a", "1.0.0"),
+                package_version("acme:b", "1.0.0"),
+            ],
+            spans: vec![0..1, 1..2],
+        };
+
+        let error = super::dependency_cycle_diagnostic(&selection, &unrelated, &manifests)
+            .expect_err("a caller cannot choose a different cycle");
+        assert!(matches!(
+            error,
+            super::MvsDuplicatePackageLineDiagnosticError::CycleNotInSelectedGraph(_)
+        ));
+    }
+
+    #[test]
+    fn selected_graph_without_a_cycle_emits_no_cycle_diagnostic() {
+        let (selection, _) = duplicate_fixture();
+
+        assert!(
+            super::dependency_cycle_diagnostics(&selection, &MvsManifestLocations::default())
+                .expect("valid acyclic graph")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn selected_cycle_provenance_preserves_its_lock_floor_origin() {
+        let (selection, manifests) = dependency_cycle_with_floor_fixture();
+        let diagnostics =
+            super::dependency_cycle_diagnostics(&selection, &manifests).expect("cycle diagnostic");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one cycle diagnostic");
+        };
+
+        let Value::Object(chain) = diagnostic
+            .data
+            .get("requirement_chain")
+            .expect("cycle-closing requirement chain")
+        else {
+            panic!("requirement chain must be an object");
+        };
+        let Value::Object(origin) = chain.get("origin").expect("chain origin") else {
+            panic!("chain origin must be an object");
+        };
+        assert_eq!(
+            origin.get("kind"),
+            Some(&Value::String("lock_floor".to_owned()))
+        );
+        assert_eq!(
+            origin.get("package"),
+            Some(&Value::String("acme:a".to_owned()))
+        );
+        assert_eq!(
+            origin.get("version"),
+            Some(&Value::String("1.5.0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn root_cycle_diagnostic_reports_the_path_and_indirect_edge() {
+        let (selection, manifests) = root_dependency_cycle_fixture();
+        let diagnostics = super::root_dependency_cycle_diagnostics(&selection, &manifests)
+            .expect("root cycle diagnostics");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one root cycle diagnostic");
+        };
+
+        assert_eq!(diagnostic.code.as_str(), "DEPENDENCY_CYCLE");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(
+            diagnostic
+                .message
+                .ends_with("acme:app 1.0.0 -> acme:a 1.0.0 -> acme:b 1.0.0 -> acme:app 1.0.0")
+        );
+        assert_eq!(
+            diagnostic.primary().expect("closing edge").file.path,
+            "dep:acme:b@1.0.0/sai.package"
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.message == "acme:b 1.0.0 requires acme:app @ ^1 (names 1.0.0)")
+        );
+        let Value::Array(nodes) = diagnostic.data.get("nodes").expect("cycle nodes") else {
+            panic!("cycle nodes must be an array");
+        };
+        assert_eq!(nodes.len(), 4);
+        let Value::Array(edges) = diagnostic.data.get("edges").expect("cycle edges") else {
+            panic!("cycle edges must be an array");
+        };
+        assert_eq!(edges.len(), 3);
+        assert_eq!(diagnostic.related().len(), 1);
+    }
+
+    #[test]
+    fn root_cycle_closes_at_the_selected_root_version() {
+        let (selection, manifests) = root_dependency_cycle_fixture_with("1.4.0", "1.0.0", false);
+        let diagnostics = super::root_dependency_cycle_diagnostics(&selection, &manifests)
+            .expect("root cycle diagnostics");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one root cycle diagnostic");
+        };
+
+        let Value::Array(nodes) = diagnostic.data.get("nodes").expect("cycle nodes") else {
+            panic!("cycle nodes must be an array");
+        };
+        assert_eq!(nodes.len(), 4);
+        let Value::Object(last_node) = nodes.last().expect("closed cycle") else {
+            panic!("cycle node must be an object");
+        };
+        assert_eq!(
+            last_node.get("package"),
+            Some(&Value::String("acme:app".to_owned()))
+        );
+        assert_eq!(
+            last_node.get("version"),
+            Some(&Value::String("1.4.0".to_owned()))
+        );
+
+        let Value::Array(edges) = diagnostic.data.get("edges").expect("cycle edges") else {
+            panic!("cycle edges must be an array");
+        };
+        let Value::Object(closing_edge) = edges.last().expect("closing edge") else {
+            panic!("cycle edge must be an object");
+        };
+        assert_eq!(
+            closing_edge.get("target_version"),
+            Some(&Value::String("1.4.0".to_owned()))
+        );
+        assert_eq!(
+            closing_edge.get("named_target_version"),
+            Some(&Value::String("1.0.0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn root_cycle_edge_records_selected_and_named_target_versions() {
+        let (selection, manifests) =
+            root_dependency_cycle_fixture_with_a_floor("1.0.0", "1.0.0", false, Some("1.5.0"));
+        let diagnostics = super::root_dependency_cycle_diagnostics(&selection, &manifests)
+            .expect("root cycle diagnostics");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one root cycle diagnostic");
+        };
+
+        let Value::Array(nodes) = diagnostic.data.get("nodes").expect("cycle nodes") else {
+            panic!("cycle nodes must be an array");
+        };
+        let Value::Object(first_target) = nodes.get(1).expect("first dependency") else {
+            panic!("cycle node must be an object");
+        };
+        assert_eq!(
+            first_target.get("version"),
+            Some(&Value::String("1.0.0".to_owned()))
+        );
+
+        let Value::Array(edges) = diagnostic.data.get("edges").expect("cycle edges") else {
+            panic!("cycle edges must be an array");
+        };
+        let Value::Object(root_edge) = edges.first().expect("root edge") else {
+            panic!("cycle edge must be an object");
+        };
+        assert_eq!(
+            root_edge.get("target_version"),
+            Some(&Value::String("1.5.0".to_owned()))
+        );
+        assert_eq!(
+            root_edge.get("named_target_version"),
+            Some(&Value::String("1.0.0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn root_cycle_is_reported_alongside_an_independent_missing_contract() {
+        let (selection, manifests) = root_dependency_cycle_fixture_with("1.0.0", "1.0.0", true);
+        assert!(selection.errors().len() > 1);
+
+        let diagnostics = super::root_dependency_cycle_diagnostics(&selection, &manifests)
+            .expect("the visited root cycle remains explainable");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("dependency cycle reaches"));
+    }
+
+    #[test]
+    fn rejects_root_cycle_errors_from_another_selection() {
+        let (selection, manifests) = root_dependency_cycle_fixture();
+        let mut unrelated = selection.errors()[0].clone();
+        unrelated.span = Some(0..1);
+
+        let error = super::root_dependency_cycle_diagnostic(&selection, &unrelated, &manifests)
+            .expect_err("a caller cannot pair a different cycle error");
+        assert!(matches!(
+            error,
+            super::MvsDuplicatePackageLineDiagnosticError::RootCycleNotInSelection(_)
+        ));
+    }
+
+    #[test]
+    fn complete_selection_has_no_root_cycle_diagnostics() {
+        let (selection, _) = duplicate_fixture();
+
+        assert!(
+            super::root_dependency_cycle_diagnostics(&selection, &MvsManifestLocations::default())
+                .expect("complete selection")
+                .is_empty()
         );
     }
 }

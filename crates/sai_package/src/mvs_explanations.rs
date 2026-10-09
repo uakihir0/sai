@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use crate::mvs::{
     MvsContract, MvsEdge, MvsNamedEdge, MvsNode, MvsPackageVersion, MvsRequirer, MvsSelectionError,
-    MvsSelectionOutput,
+    MvsSelectionErrorKind, MvsSelectionOutput,
 };
 use crate::mvs_graph_validation::{
     MvsDependencyCycle, MvsDuplicatePackageLines, MvsVersionConflict,
@@ -102,9 +102,37 @@ impl<'a> MvsExplanationGraph<'a> {
                 selection.errors().to_vec(),
             ));
         }
+        Self::build(selection, false)
+    }
 
+    /// Builds provenance for the successfully visited portion of a selection
+    /// that contains an indirect edge back to the root package line.
+    ///
+    /// Independent failed branches are treated as leaves. A requested root
+    /// cycle chain still has to consist entirely of visited, source-backed
+    /// edges.
+    pub(crate) fn new_for_root_cycle_errors(
+        selection: &'a MvsSelectionOutput,
+    ) -> Result<Self, MvsExplanationError> {
+        if !selection.errors().iter().any(|error| {
+            matches!(
+                &error.kind,
+                MvsSelectionErrorKind::DependencyCycleToRoot { .. }
+            )
+        }) {
+            return Err(MvsExplanationError::SelectionIncomplete(
+                selection.errors().to_vec(),
+            ));
+        }
+        Self::build(selection, true)
+    }
+
+    fn build(
+        selection: &'a MvsSelectionOutput,
+        allow_root_cycle_edges: bool,
+    ) -> Result<Self, MvsExplanationError> {
         let root = selection.root().clone();
-        let selected_graph_nodes = collect_selected_graph_nodes(selection)?;
+        let selected_graph_nodes = collect_selected_graph_nodes(selection, allow_root_cycle_edges)?;
         let mut graph = Self {
             selection,
             predecessors: HashMap::new(),
@@ -288,6 +316,35 @@ impl<'a> MvsExplanationGraph<'a> {
         ))
     }
 
+    /// Returns whether an ordinary root requirement directly named this version.
+    ///
+    /// This can differ from [`Self::why_selected`]: another requirer may be
+    /// the canonical explanation even when the root also names the selected
+    /// version.
+    pub fn is_named_by_root_requirement(
+        &self,
+        selected_version: &MvsPackageVersion,
+    ) -> Result<bool, MvsExplanationError> {
+        if self.selection.selected().get(&selected_version.node())
+            != Some(selected_version.version())
+        {
+            return Err(MvsExplanationError::VersionNotSelected(
+                selected_version.clone(),
+            ));
+        }
+        Ok(self
+            .selection
+            .named_by()
+            .get(selected_version)
+            .is_some_and(|edges| {
+                edges.iter().any(|edge| {
+                    matches!(edge.requirer, MvsRequirer::Root(_))
+                        && !edge.path_pin
+                        && !edge.root_override_pin
+                })
+            }))
+    }
+
     /// Explains both why a conflict's selected version was chosen and why its
     /// rejecting requirement exists.
     pub fn explain_conflict(
@@ -435,7 +492,10 @@ impl<'a> MvsExplanationGraph<'a> {
         if package_version == self.selection.root() {
             return self.selection.root_contract().edges();
         }
-        self.selection.read_contracts()[package_version].edges()
+        self.selection
+            .read_contracts()
+            .get(package_version)
+            .map_or(&[], MvsContract::edges)
     }
 
     fn edge_exists(
@@ -532,6 +592,7 @@ fn package_version_for_node(node: &MvsNode, version: &Version) -> MvsPackageVers
 
 fn collect_selected_graph_nodes(
     selection: &MvsSelectionOutput,
+    allow_root_cycle_edges: bool,
 ) -> Result<BTreeSet<MvsPackageVersion>, MvsExplanationError> {
     let root = selection.root().clone();
     let mut nodes = BTreeSet::from([root.clone()]);
@@ -540,20 +601,27 @@ fn collect_selected_graph_nodes(
     while let Some(source) = pending.pop_front() {
         let edges = if source == root {
             selection.root_contract().edges()
+        } else if let Some(contract) = selection.read_contracts().get(&source) {
+            contract.edges()
+        } else if allow_root_cycle_edges {
+            // A failed contract read ends that independent branch. Any
+            // reported root-cycle path still has to be reconstructed from
+            // the contracts that were successfully visited.
+            continue;
         } else {
-            selection
-                .read_contracts()
-                .get(&source)
-                .ok_or_else(|| MvsExplanationError::SelectedContractNotFound(source.clone()))?
-                .edges()
+            return Err(MvsExplanationError::SelectedContractNotFound(
+                source.clone(),
+            ));
         };
 
         for edge in edges {
             let node = edge.target().node();
-            let version = selection
-                .selected()
-                .get(&node)
-                .ok_or_else(|| MvsExplanationError::SelectedVersionNotFound(node.clone()))?;
+            let Some(version) = selection.selected().get(&node) else {
+                if allow_root_cycle_edges && node == root.node() {
+                    continue;
+                }
+                return Err(MvsExplanationError::SelectedVersionNotFound(node));
+            };
             let target = package_version_for_node(&node, version);
             if nodes.insert(target.clone()) {
                 pending.push_back(target);
