@@ -8,7 +8,10 @@ rust-version.workspace = true
 sai_diagnostics = { path = "../sai_diagnostics" }
 libc.workspace = true
 rustix.workspace = true
+sha2.workspace = true
 spdx.workspace = true
+unicode-general-category.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 sai_vfs = { path = "../sai_vfs" }

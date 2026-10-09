@@ -23,6 +23,7 @@ siphasher = "1.0.4"
 libc = "0.2.190"
 rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
 spdx = "0.13.6"
+sha2 = "0.11.0"
 unicode-general-category = "=1.1.0"
 unicode-ident = "=1.0.18"
 unicode-normalization = "=0.1.24"

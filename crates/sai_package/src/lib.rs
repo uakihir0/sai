@@ -17,6 +17,8 @@ pub mod package_path;
 pub mod resolver_contract;
 pub mod resolver_source;
 pub mod resolver_source_provider;
+pub mod tree_hash;
+mod unicode_casefold_16;
 pub mod validation;
 pub mod version;
 pub mod version_req;
