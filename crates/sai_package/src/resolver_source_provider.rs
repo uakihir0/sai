@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::lock_validation::canonical_git_url;
 use crate::manifest::PackageRole;
 use crate::mvs::{
-    MvsContractProviderFailure, MvsContractRequest, MvsInputError, MvsNode, MvsPackageVersion,
-    MvsRequirer, MvsSelectionError, MvsSelectionOutput, MvsSelectionProviderError,
-    select_with_provider,
+    MvsContractProviderFailure, MvsContractRequest, MvsInputError, MvsNamedEdge, MvsNode,
+    MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionOutput,
+    MvsSelectionProviderError, select_with_provider,
 };
 use crate::mvs_graph_validation::{
     MvsSelectedGraph, MvsSelectedGraphInputError, check_selected_graph_with_root_cycles,
@@ -243,6 +244,7 @@ pub struct ResolverFinalSourcePlanEntry {
     read_contract: ResolverContract,
     read_source: ResolverSourceSelection,
     final_source: ResolverSourceSelection,
+    unused_source_clauses: Vec<ResolverUnusedSourceClause>,
 }
 
 impl ResolverFinalSourcePlanEntry {
@@ -269,6 +271,28 @@ impl ResolverFinalSourcePlanEntry {
     pub const fn final_source(&self) -> &ResolverSourceSelection {
         &self.final_source
     }
+
+    /// Source clauses that did not select the final source for this package
+    /// version. This includes incoming selected-graph edges and any other MVS
+    /// candidate edge that named this exact version. The winning named edge
+    /// and all path pins validated together are treated as used.
+    pub fn unused_source_clauses(&self) -> &[ResolverUnusedSourceClause] {
+        &self.unused_source_clauses
+    }
+}
+
+/// A manifest source clause that did not select the source used for a
+/// resolved package version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverUnusedSourceClause {
+    /// The concrete version named by this requirement before MVS selected the
+    /// version represented by the containing plan entry.
+    pub named_target: MvsPackageVersion,
+    /// The requirement edge and its source location.
+    pub edge: MvsNamedEdge,
+    /// The source clause for review: canonical Git URL and directory, or
+    /// manifest path spelling relative to the requiring package.
+    pub source: ResolverPackageSource,
 }
 
 /// A selected node whose final source could not be selected.
@@ -570,6 +594,14 @@ impl ResolverFinalSourcePlan {
 pub enum ResolverFinalSourcePlanError {
     SelectedGraph(Box<MvsSelectedGraphInputError>),
     ProviderOutputMismatch(Box<MvsPackageVersion>),
+    SourceClauseSelection {
+        package_version: Box<MvsPackageVersion>,
+        error: Box<ResolverSourceSelectionError>,
+    },
+    InvalidReviewGitUrl {
+        package_version: Box<MvsPackageVersion>,
+        url: Box<str>,
+    },
 }
 
 /// A contract-loading failure associated with its exact MVS request.
@@ -1056,17 +1088,30 @@ pub fn plan_resolver_final_sources(
             &dependency_contracts,
             locked_sources,
         ) {
-            Ok(final_source) => entries.push(ResolverFinalSourcePlanEntry {
-                package_version: package_version.clone(),
-                read_request: read_request.clone(),
-                final_request,
-                read_contract: dependency_contracts
-                    .get(package_version)
-                    .expect("selected read contract was validated above")
-                    .clone(),
-                read_source: read_source.clone(),
-                final_source,
-            }),
+            Ok(final_source) => {
+                let unused_source_clauses = collect_unused_source_clauses(
+                    &output.selection,
+                    &graph,
+                    package_version,
+                    &final_request,
+                    &final_source,
+                    &output.root_contract,
+                    root_context,
+                    &dependency_contracts,
+                )?;
+                entries.push(ResolverFinalSourcePlanEntry {
+                    package_version: package_version.clone(),
+                    read_request: read_request.clone(),
+                    final_request,
+                    read_contract: dependency_contracts
+                        .get(package_version)
+                        .expect("selected read contract was validated above")
+                        .clone(),
+                    read_source: read_source.clone(),
+                    final_source,
+                    unused_source_clauses,
+                });
+            }
             Err(error) => failures.push(ResolverFinalSourcePlanFailure {
                 package_version: package_version.clone(),
                 read_request: read_request.clone(),
@@ -1084,6 +1129,141 @@ pub fn plan_resolver_final_sources(
         entries,
         failures,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_unused_source_clauses(
+    selection: &MvsSelectionOutput,
+    graph: &MvsSelectedGraph,
+    package_version: &MvsPackageVersion,
+    final_request: &MvsContractRequest,
+    final_source: &ResolverSourceSelection,
+    root_contract: &ResolverContract,
+    root_context: &ResolverContractContext<'_>,
+    dependency_contracts: &HashMap<MvsPackageVersion, ResolverContract>,
+) -> Result<Vec<ResolverUnusedSourceClause>, ResolverFinalSourcePlanError> {
+    let mut candidates = final_request
+        .named_by
+        .iter()
+        .cloned()
+        .map(|edge| (package_version.clone(), edge))
+        .collect::<Vec<_>>();
+
+    for graph_edge in graph
+        .edges
+        .iter()
+        .filter(|edge| &edge.target == package_version)
+    {
+        let Some(named_edges) = selection.named_by().get(&graph_edge.named_target) else {
+            return Err(ResolverFinalSourcePlanError::ProviderOutputMismatch(
+                Box::new(package_version.clone()),
+            ));
+        };
+        let mut matches = named_edges
+            .iter()
+            .filter(|edge| edge.requirer == graph_edge.requirer && edge.span == graph_edge.span);
+        let Some(edge) = matches.next() else {
+            return Err(ResolverFinalSourcePlanError::ProviderOutputMismatch(
+                Box::new(package_version.clone()),
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(ResolverFinalSourcePlanError::ProviderOutputMismatch(
+                Box::new(package_version.clone()),
+            ));
+        }
+        candidates.push((graph_edge.named_target.clone(), edge.clone()));
+    }
+
+    candidates.sort_by(|(left_target, left_edge), (right_target, right_edge)| {
+        left_edge
+            .requirer
+            .package_version()
+            .cmp(right_edge.requirer.package_version())
+            .then_with(|| left_target.cmp(right_target))
+            .then_with(|| left_edge.span.start.cmp(&right_edge.span.start))
+            .then_with(|| left_edge.span.end.cmp(&right_edge.span.end))
+            .then_with(|| compare_requirer_role(&left_edge.requirer, &right_edge.requirer))
+            .then_with(|| left_edge.path_pin.cmp(&right_edge.path_pin))
+            .then_with(|| {
+                left_edge
+                    .root_override_pin
+                    .cmp(&right_edge.root_override_pin)
+            })
+    });
+    candidates.dedup();
+
+    let mut unused = Vec::new();
+    for (named_target, edge) in candidates {
+        let source = source_for_edge(
+            &edge,
+            &named_target,
+            root_contract,
+            root_context,
+            dependency_contracts,
+        )
+        .map_err(
+            |error| ResolverFinalSourcePlanError::SourceClauseSelection {
+                package_version: Box::new(package_version.clone()),
+                error: Box::new(error),
+            },
+        )?;
+        if source_clause_was_used(final_source, package_version, &edge, &source) {
+            continue;
+        }
+        let source = match source {
+            ResolverPackageSource::Git { url, directory } => ResolverPackageSource::Git {
+                url: canonical_git_url(&url)
+                    .map_err(|()| ResolverFinalSourcePlanError::InvalidReviewGitUrl {
+                        package_version: Box::new(package_version.clone()),
+                        url: url.clone(),
+                    })?
+                    .into(),
+                directory: directory.filter(|directory| directory.as_ref() != "."),
+            },
+            path @ ResolverPackageSource::Path { .. } => path,
+        };
+        unused.push(ResolverUnusedSourceClause {
+            named_target,
+            edge,
+            source,
+        });
+    }
+    Ok(unused)
+}
+
+fn compare_requirer_role(left: &MvsRequirer, right: &MvsRequirer) -> std::cmp::Ordering {
+    match (left, right) {
+        (MvsRequirer::Root(_), MvsRequirer::Root(_))
+        | (MvsRequirer::Package(_), MvsRequirer::Package(_)) => std::cmp::Ordering::Equal,
+        (MvsRequirer::Root(_), MvsRequirer::Package(_)) => std::cmp::Ordering::Less,
+        (MvsRequirer::Package(_), MvsRequirer::Root(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
+fn source_clause_was_used(
+    final_source: &ResolverSourceSelection,
+    selected_version: &MvsPackageVersion,
+    edge: &MvsNamedEdge,
+    source: &ResolverPackageSource,
+) -> bool {
+    match final_source.provenance() {
+        ResolverSourceProvenance::NamedRequirement {
+            edge: selected_edge,
+        } => {
+            selected_edge == edge
+                && final_source.package_version() == selected_version
+                && final_source.source() == source
+        }
+        ResolverSourceProvenance::PathPin { .. } => {
+            final_source.path_pin_sources().iter().any(|pin| {
+                pin.requirer == edge.requirer && pin.span == edge.span && pin.source == *source
+            })
+        }
+        ResolverSourceProvenance::RootPathOverride { .. }
+        | ResolverSourceProvenance::RootGitOverride { .. }
+        | ResolverSourceProvenance::LockFloor { .. } => false,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2687,7 +2867,7 @@ targets { wasm32-core }
 source "src"
 targets { wasm32-core }
 requires {
-    acme:dep @ ^1 from git "https://example.test/root-dep"
+    acme:dep @ ^1 from git "HTTPS://EXAMPLE.TEST:443/root-dep/" dir "."
     z:late @ ^1 from git "https://example.test/late"
 }
 "#,
@@ -2750,8 +2930,8 @@ requires { acme:dep @ ^1 from git "https://example.test/late-dep" }
         assert_eq!(
             dep.read_source.source(),
             &ResolverPackageSource::Git {
-                url: "https://example.test/root-dep".into(),
-                directory: None,
+                url: "HTTPS://EXAMPLE.TEST:443/root-dep/".into(),
+                directory: Some(".".into()),
             }
         );
         assert_eq!(
@@ -2764,6 +2944,19 @@ requires { acme:dep @ ^1 from git "https://example.test/late-dep" }
         assert_eq!(
             dep.final_source.reason(),
             ResolverSourceReason::NamedRequirement
+        );
+        assert_eq!(dep.unused_source_clauses().len(), 1);
+        assert_eq!(dep.unused_source_clauses()[0].named_target, dep_version);
+        assert_eq!(
+            dep.unused_source_clauses()[0].edge.requirer,
+            MvsRequirer::Root(package_version("zz:root", "1.0.0"))
+        );
+        assert_eq!(
+            dep.unused_source_clauses()[0].source,
+            ResolverPackageSource::Git {
+                url: "https://example.test/root-dep".into(),
+                directory: None,
+            }
         );
         assert!(plan.failures.is_empty());
 
@@ -3516,6 +3709,264 @@ requires { acme:child @ ^1 from path "../child" }
     }
 
     #[test]
+    fn final_source_plan_lists_requirement_clauses_overridden_by_root_git() {
+        let root = parse(
+            br#"package zz:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from git "https://example.test/original" }
+overrides { acme:dep use git "https://example.test/fork" }
+"#,
+        );
+        let path_packages = BTreeMap::<ResolverPathKey, MvsPackageVersion>::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let output = select_with_source_provider(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |_| Ok::<_, ()>("unused"),
+            |request, _source| {
+                assert_eq!(
+                    request.package_version,
+                    package_version("acme:dep", "1.0.0")
+                );
+                let manifest = parse_for_role(
+                    br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                    PackageRole::Dependency,
+                );
+                build_resolver_contract(&manifest, &context, PackageValidationContext::default())
+                    .map_err(|_| "loaded manifest failed validation")
+            },
+        )
+        .expect("all MVS contracts load");
+        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
+            .expect("final source plan is consistent");
+        let dep = plan
+            .entries
+            .iter()
+            .find(|entry| entry.package_version == package_version("acme:dep", "1.0.0"))
+            .expect("selected dependency has a plan entry");
+
+        assert_eq!(
+            dep.final_source.reason(),
+            ResolverSourceReason::RootGitOverride
+        );
+        assert_eq!(dep.unused_source_clauses().len(), 1);
+        assert_eq!(
+            dep.unused_source_clauses()[0].source,
+            ResolverPackageSource::Git {
+                url: "https://example.test/original".into(),
+                directory: None,
+            }
+        );
+    }
+
+    #[test]
+    fn final_source_plan_lists_non_pin_sources_beside_verified_path_pins() {
+        let root = parse(
+            br#"package zz:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires {
+    acme:alpha @ ^1 from git "https://example.test/alpha"
+    acme:beta @ ^1 from git "https://example.test/beta"
+    acme:dep @ ^1 from git "https://example.test/root-dep"
+}
+"#,
+        );
+        let dep_version = package_version("acme:dep", "1.5.0");
+        let path_packages = BTreeMap::from([
+            (
+                ResolverPathKey::new(package_version("acme:alpha", "1.0.0"), "../dep"),
+                dep_version.clone(),
+            ),
+            (
+                ResolverPathKey::new(package_version("acme:beta", "1.0.0"), "../dep-alias"),
+                dep_version.clone(),
+            ),
+        ]);
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let output = select_with_source_provider(
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |_| Ok::<_, ()>("same-dep-tree"),
+            |request, _source| {
+                let manifest = match (
+                    request.package_version.package(),
+                    request.package_version.version().to_string().as_str(),
+                ) {
+                    ("acme:alpha", _) => parse_for_role(
+                        br#"package acme:alpha @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from path "../dep" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    ("acme:beta", _) => parse_for_role(
+                        br#"package acme:beta @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from path "../dep-alias" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    ("acme:dep", "1.0.0") => parse_for_role(
+                        br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    ("acme:dep", "1.5.0") => parse_for_role(
+                        br#"package acme:dep @ 1.5.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    (package, version) => {
+                        panic!("unexpected package request: {package}@{version}")
+                    }
+                };
+                build_resolver_contract(&manifest, &context, PackageValidationContext::default())
+                    .map_err(|_| "loaded manifest failed validation")
+            },
+        )
+        .expect("all path pins resolve to one package source");
+        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
+            .expect("final source plan is consistent");
+        let dep = plan
+            .entries
+            .iter()
+            .find(|entry| entry.package_version == dep_version)
+            .expect("selected dependency has a plan entry");
+
+        assert_eq!(dep.final_source.reason(), ResolverSourceReason::PathPin);
+        assert_eq!(dep.final_source.path_pin_sources().len(), 2);
+        assert_eq!(dep.unused_source_clauses().len(), 1);
+        assert_eq!(
+            dep.unused_source_clauses()[0].named_target,
+            package_version("acme:dep", "1.0.0")
+        );
+        assert_eq!(
+            dep.unused_source_clauses()[0].source,
+            ResolverPackageSource::Git {
+                url: "https://example.test/root-dep".into(),
+                directory: None,
+            }
+        );
+    }
+
+    #[test]
+    fn final_source_plan_lists_incoming_sources_when_a_lock_floor_wins() {
+        let root = parse(
+            br#"package zz:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from git "https://example.test/root-dep" }
+"#,
+        );
+        let dep_version = package_version("acme:dep", "1.5.0");
+        let path_packages = BTreeMap::<ResolverPathKey, MvsPackageVersion>::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let lock_floors = HashMap::from([(
+            dep_version.node(),
+            Version::parse("1.5.0").expect("valid lock floor"),
+        )]);
+        let locked_sources = HashMap::from([(
+            dep_version.clone(),
+            ResolverPackageSource::Git {
+                url: "https://example.test/locked-dep".into(),
+                directory: None,
+            },
+        )]);
+        let output = select_with_source_provider(
+            &root_contract,
+            &context,
+            &lock_floors,
+            &locked_sources,
+            |_| Ok::<_, ()>("unused"),
+            |request, _source| {
+                let version = request.package_version.version().to_string();
+                let manifest = if version == "1.0.0" {
+                    parse_for_role(
+                        br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    )
+                } else {
+                    parse_for_role(
+                        br#"package acme:dep @ 1.5.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    )
+                };
+                build_resolver_contract(&manifest, &context, PackageValidationContext::default())
+                    .map_err(|_| "loaded manifest failed validation")
+            },
+        )
+        .expect("all MVS contracts load");
+        let plan = plan_resolver_final_sources(&output, &context, &locked_sources)
+            .expect("final source plan is consistent");
+        let dep = plan
+            .entries
+            .iter()
+            .find(|entry| entry.package_version == dep_version)
+            .expect("selected dependency has a plan entry");
+
+        assert_eq!(dep.final_source.reason(), ResolverSourceReason::LockFloor);
+        assert_eq!(dep.unused_source_clauses().len(), 1);
+        assert_eq!(
+            dep.unused_source_clauses()[0].source,
+            ResolverPackageSource::Git {
+                url: "https://example.test/root-dep".into(),
+                directory: None,
+            }
+        );
+    }
+
+    #[test]
     fn final_source_plan_only_includes_selected_graph_versions() {
         let root = parse(
             br#"package zz:root @ 1.0.0
@@ -3524,6 +3975,7 @@ targets { wasm32-core }
 requires {
     acme:alpha @ ^1 from git "https://example.test/alpha"
     acme:dep @ ^1 from git "https://example.test/root-dep"
+    acme:target @ ^1 from git "https://example.test/root-target"
 }
 "#,
         );
@@ -3554,7 +4006,10 @@ requires {
                         br#"package acme:alpha @ 1.0.0
 source "src"
 targets { wasm32-core }
-requires { acme:dep @ ^1.2 from git "https://example.test/new-dep" }
+requires {
+    acme:dep @ ^1.2 from git "https://example.test/new-dep"
+    acme:target @ ^1.2 from git "https://example.test/alpha-target"
+}
 "#,
                         PackageRole::Dependency,
                     ),
@@ -3562,7 +4017,10 @@ requires { acme:dep @ ^1.2 from git "https://example.test/new-dep" }
                         br#"package acme:dep @ 1.0.0
 source "src"
 targets { wasm32-core }
-requires { acme:orphan @ ^1 from git "https://example.test/orphan" }
+requires {
+    acme:orphan @ ^1 from git "https://example.test/orphan"
+    acme:target @ ^1.2 from git "https://example.test/unselected-target"
+}
 "#,
                         PackageRole::Dependency,
                     ),
@@ -3575,6 +4033,20 @@ targets { wasm32-core }
                     ),
                     ("acme:orphan", _) => parse_for_role(
                         br#"package acme:orphan @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    ("acme:target", "1.0.0") => parse_for_role(
+                        br#"package acme:target @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    ("acme:target", "1.2.0") => parse_for_role(
+                        br#"package acme:target @ 1.2.0
 source "src"
 targets { wasm32-core }
 "#,
@@ -3605,10 +4077,61 @@ targets { wasm32-core }
             [
                 package_version("acme:alpha", "1.0.0"),
                 package_version("acme:dep", "1.2.0"),
+                package_version("acme:target", "1.2.0"),
             ]
         );
         assert!(!planned_versions.contains(&package_version("acme:dep", "1.0.0")));
+        assert!(!planned_versions.contains(&package_version("acme:target", "1.0.0")));
         assert!(!planned_versions.contains(&package_version("acme:orphan", "1.0.0")));
+        let dep = plan
+            .entries
+            .iter()
+            .find(|entry| entry.package_version == package_version("acme:dep", "1.2.0"))
+            .expect("selected dependency has a plan entry");
+        assert_eq!(dep.unused_source_clauses().len(), 1);
+        assert_eq!(
+            dep.unused_source_clauses()[0].named_target,
+            package_version("acme:dep", "1.0.0")
+        );
+        assert_eq!(
+            dep.unused_source_clauses()[0].edge.requirer,
+            MvsRequirer::Root(package_version("zz:root", "1.0.0"))
+        );
+        assert_eq!(
+            dep.unused_source_clauses()[0].source,
+            ResolverPackageSource::Git {
+                url: "https://example.test/root-dep".into(),
+                directory: None,
+            }
+        );
+        let target = plan
+            .entries
+            .iter()
+            .find(|entry| entry.package_version == package_version("acme:target", "1.2.0"))
+            .expect("selected target package has a plan entry");
+        assert_eq!(target.unused_source_clauses().len(), 2);
+        assert_eq!(
+            target
+                .unused_source_clauses()
+                .iter()
+                .map(|clause| clause.source.clone())
+                .collect::<Vec<_>>(),
+            [
+                ResolverPackageSource::Git {
+                    url: "https://example.test/unselected-target".into(),
+                    directory: None,
+                },
+                ResolverPackageSource::Git {
+                    url: "https://example.test/root-target".into(),
+                    directory: None,
+                },
+            ]
+        );
+        assert!(target.unused_source_clauses().iter().any(|clause| {
+            clause.named_target == package_version("acme:target", "1.2.0")
+                && clause.edge.requirer
+                    == MvsRequirer::Package(package_version("acme:dep", "1.0.0"))
+        }));
     }
 
     #[test]
