@@ -123,6 +123,33 @@ pub enum LocalPackageDirectoryIndexError {
         found_version: Box<Version>,
     },
     ConflictingDirectories(MvsPackageVersion),
+    ConflictingVersionsForDirectory {
+        existing: Box<MvsPackageVersion>,
+        discovered: Box<MvsPackageVersion>,
+    },
+}
+
+/// Failure to discover and index a local dependency path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackagePathIndexError {
+    MissingBaseDirectory(MvsPackageVersion),
+    InvalidPath(PackagePathError),
+    Directory(LocalPackageError),
+    InvalidManifest(Box<PackageParseOutput>),
+    MissingPackageHeader(Box<PackageParseOutput>),
+    InvalidPackageIdentity(Box<str>),
+    Index(LocalPackageDirectoryIndexError),
+}
+
+impl LocalPackagePathIndexError {
+    /// Returns the captured parse result when path discovery fails on manifest
+    /// syntax or a missing package header.
+    pub fn manifest_parse_output(&self) -> Option<&PackageParseOutput> {
+        match self {
+            Self::InvalidManifest(parsed) | Self::MissingPackageHeader(parsed) => Some(parsed),
+            _ => None,
+        }
+    }
 }
 
 /// Failure to resolve a local filesystem path pin.
@@ -331,6 +358,58 @@ impl LocalPackageDirectoryIndex {
         role: PackageRole,
     ) -> Result<(), LocalPackageDirectoryIndexError> {
         let parsed = directory.parse_manifest(role);
+        self.insert_parsed(package_version, directory, &parsed)
+    }
+
+    /// Resolves a dependency path from an indexed local package, discovers the
+    /// dependency version from the captured manifest, and indexes that same
+    /// opened directory snapshot.
+    ///
+    /// Call this when building local path-package maps so the version used to
+    /// create resolver context and the manifest later consumed by the loader
+    /// come from one per-load directory index.
+    pub fn index_dependency_path(
+        &mut self,
+        relative_to: &MvsPackageVersion,
+        path: &str,
+    ) -> Result<MvsPackageVersion, LocalPackagePathIndexError> {
+        let path =
+            DependencyPackagePath::parse(path).map_err(LocalPackagePathIndexError::InvalidPath)?;
+        let base = self
+            .entries
+            .get(relative_to)
+            .ok_or_else(|| LocalPackagePathIndexError::MissingBaseDirectory(relative_to.clone()))?;
+        let directory = base
+            .resolve_dependency(&path)
+            .map_err(LocalPackagePathIndexError::Directory)?;
+        let parsed = directory.parse_manifest(PackageRole::Dependency);
+        if !parsed.is_syntax_valid() {
+            return Err(LocalPackagePathIndexError::InvalidManifest(Box::new(
+                parsed,
+            )));
+        }
+        let header = match parsed.file().header.as_ref() {
+            Some(header) => header,
+            None => {
+                return Err(LocalPackagePathIndexError::MissingPackageHeader(Box::new(
+                    parsed,
+                )));
+            }
+        };
+        let package = header.value.identity.to_string();
+        let package_version = MvsPackageVersion::new(package.clone(), header.value.version.clone())
+            .map_err(|_| LocalPackagePathIndexError::InvalidPackageIdentity(package.into()))?;
+        self.insert_parsed(package_version.clone(), directory, &parsed)
+            .map_err(LocalPackagePathIndexError::Index)?;
+        Ok(package_version)
+    }
+
+    fn insert_parsed(
+        &mut self,
+        package_version: MvsPackageVersion,
+        directory: LocalPackageDirectory,
+        parsed: &PackageParseOutput,
+    ) -> Result<(), LocalPackageDirectoryIndexError> {
         if !parsed.is_syntax_valid() {
             return Err(LocalPackageDirectoryIndexError::InvalidManifest(
                 package_version,
@@ -355,6 +434,18 @@ impl LocalPackageDirectoryIndex {
                 package_version,
             )),
             None => {
+                if let Some((existing, _)) = self
+                    .entries
+                    .iter()
+                    .find(|(_, existing)| *existing == &directory)
+                {
+                    return Err(
+                        LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
+                            existing: Box::new(existing.clone()),
+                            discovered: Box::new(package_version),
+                        },
+                    );
+                }
                 self.entries.insert(package_version, directory);
                 Ok(())
             }
@@ -594,6 +685,45 @@ impl fmt::Display for LocalPackageDirectoryIndexError {
                 package_version.package(),
                 package_version.version()
             ),
+            Self::ConflictingVersionsForDirectory {
+                existing,
+                discovered,
+            } => write!(
+                formatter,
+                "one local directory was registered as both {}@{} and {}@{}",
+                existing.package(),
+                existing.version(),
+                discovered.package(),
+                discovered.version()
+            ),
+        }
+    }
+}
+
+impl fmt::Display for LocalPackagePathIndexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingBaseDirectory(package_version) => write!(
+                formatter,
+                "no local package directory is registered for path base {}@{}",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::InvalidPath(error) => fmt::Display::fmt(error, formatter),
+            Self::Directory(error) => fmt::Display::fmt(error, formatter),
+            Self::InvalidManifest(_) => {
+                formatter.write_str("local dependency manifest is not syntactically valid")
+            }
+            Self::MissingPackageHeader(_) => {
+                formatter.write_str("local dependency manifest has no package header")
+            }
+            Self::InvalidPackageIdentity(package) => {
+                write!(
+                    formatter,
+                    "local dependency has invalid package identity `{package}`"
+                )
+            }
+            Self::Index(error) => fmt::Display::fmt(error, formatter),
         }
     }
 }
@@ -745,6 +875,16 @@ impl fmt::Debug for LocalPackageDirectory {
 
 impl std::error::Error for LocalPackageError {}
 impl std::error::Error for LocalPackageDirectoryIndexError {}
+impl std::error::Error for LocalPackagePathIndexError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPath(error) => Some(error),
+            Self::Directory(error) => Some(error),
+            Self::Index(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 impl std::error::Error for LocalPackagePathPinError {}
 impl std::error::Error for LocalPackageSourceResolveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -932,7 +1072,7 @@ mod tests {
 
     use crate::manifest::{PackageRole, parse};
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
-    use crate::package_path::DependencyPackagePath;
+    use crate::package_path::{DependencyPackagePath, PackagePathError};
     use crate::resolver_contract::{ResolverContractBuildError, ResolverContractContext};
     use crate::resolver_source::{ResolverPackageSource, ResolverPathPinSource};
     use crate::validation::PackageValidationContext;
@@ -940,7 +1080,8 @@ mod tests {
 
     use super::{
         LocalPackageContractLoadError, LocalPackageDirectory, LocalPackageDirectoryIndex,
-        LocalPackageDirectoryIndexError, LocalPackageError, LocalPackagePathPinError,
+        LocalPackageDirectoryIndexError, LocalPackageError, LocalPackagePathIndexError,
+        LocalPackagePathPinError,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -1283,6 +1424,161 @@ mod tests {
                 .expect("resolve symlink path pin");
             assert_eq!(direct_pin_directory, alias_pin_directory);
         }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn indexing_a_dependency_path_returns_its_version_and_captured_manifest() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        let dependency_directory = tree.package("workspace/dependency", DEPENDENCY_MANIFEST);
+        let root_version = package_version("acme:root", "1.0.0");
+        let expected_dependency = package_version("acme:dependency", "1.2.0");
+        let root_manifest = parse(ROOT_MANIFEST);
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root_manifest,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("valid root context");
+
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(root_directory).expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        let discovered = index
+            .index_dependency_path(&root_version, "../dependency")
+            .expect("discover and index path dependency");
+        assert_eq!(discovered, expected_dependency);
+
+        fs::write(
+            dependency_directory.join("sai.package"),
+            b"package acme:dependency @ 1.2.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:late @ ^1 from git \"https://example.test/late\" }\n",
+        )
+        .expect("replace dependency manifest after indexing");
+        let contract = index.entries[&discovered]
+            .build_dependency_contract(&discovered, &context, PackageValidationContext::default())
+            .expect("load the manifest snapshot used during version discovery");
+        assert!(contract.mvs.edges().is_empty());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn indexing_one_directory_under_two_versions_is_rejected() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        let dependency_directory = tree.package("workspace/dependency", DEPENDENCY_MANIFEST);
+        let root_version = package_version("acme:root", "1.0.0");
+        let first_version = package_version("acme:dependency", "1.2.0");
+        let second_version = package_version("acme:dependency", "2.0.0");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(root_directory).expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        assert_eq!(
+            index
+                .index_dependency_path(&root_version, "../dependency")
+                .expect("index first manifest snapshot"),
+            first_version
+        );
+
+        fs::write(
+            dependency_directory.join("sai.package"),
+            b"package acme:dependency @ 2.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .expect("replace dependency version during discovery");
+        assert_eq!(
+            index.index_dependency_path(&root_version, "../dependency"),
+            Err(LocalPackagePathIndexError::Index(
+                LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
+                    existing: Box::new(first_version),
+                    discovered: Box::new(second_version),
+                }
+            ))
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn indexing_a_dependency_path_reports_missing_bases_and_invalid_paths() {
+        let root_version = package_version("acme:root", "1.0.0");
+        let mut index = LocalPackageDirectoryIndex::default();
+
+        assert_eq!(
+            index.index_dependency_path(&root_version, "../dependency"),
+            Err(LocalPackagePathIndexError::MissingBaseDirectory(
+                root_version
+            ))
+        );
+        assert_eq!(
+            index.index_dependency_path(&package_version("acme:root", "1.0.0"), "./dependency",),
+            Err(LocalPackagePathIndexError::InvalidPath(
+                PackagePathError::InvalidPackagePath
+            ))
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn indexing_a_dependency_path_retains_manifest_syntax_diagnostics() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        tree.package(
+            "workspace/invalid",
+            b"package acme:invalid @ 1.0.0\nsource \"src\"\nthis is invalid\n",
+        );
+        let root_version = package_version("acme:root", "1.0.0");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(root_directory).expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+
+        let error = index
+            .index_dependency_path(&root_version, "../invalid")
+            .expect_err("reject invalid dependency syntax");
+        assert!(matches!(
+            &error,
+            LocalPackagePathIndexError::InvalidManifest(_)
+        ));
+        assert!(
+            !error
+                .manifest_parse_output()
+                .expect("syntax failure retains its parse output")
+                .errors()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -950,15 +950,12 @@ mod tests {
         directories
             .insert(root_version.clone(), root_directory, PackageRole::Root)
             .expect("index root package");
-        let selected_directory =
-            LocalPackageDirectory::open(patched_directory.clone()).expect("open override");
-        directories
-            .insert(
-                dependency_version.clone(),
-                selected_directory,
-                PackageRole::Dependency,
-            )
-            .expect("index path override");
+        assert_eq!(
+            directories
+                .index_dependency_path(&root_version, "../patched")
+                .expect("discover and index path override"),
+            dependency_version
+        );
         fs::write(
             patched_directory.join("sai.package"),
             b"package acme:dep @ 1.5.0\n\
@@ -1062,15 +1059,12 @@ mod tests {
         directories
             .insert(root_version.clone(), root_directory, PackageRole::Root)
             .expect("index root package");
-        let selected_directory =
-            LocalPackageDirectory::open(override_link.clone()).expect("open original override");
-        directories
-            .insert(
-                dependency_version.clone(),
-                selected_directory,
-                PackageRole::Dependency,
-            )
-            .expect("index original override");
+        assert_eq!(
+            directories
+                .index_dependency_path(&root_version, "../override-link")
+                .expect("discover and index original override"),
+            dependency_version
+        );
 
         fs::remove_file(&override_link).expect("remove original link");
         symlink(&replacement_directory, &override_link).expect("link replacement override");
