@@ -32,24 +32,32 @@ pub enum PackageLintPolicyError {
     SourceSpanOutOfRange(Range<usize>),
 }
 
-/// Extracts validated lint-denying policy locations from a syntax-valid
-/// package manifest.
+/// Extracts lint-denying policy locations from a package manifest.
 ///
 /// Call this only after semantic validation succeeds. Package-local
 /// `ambient_imports` and `runtime_contracts` apply to dependencies as well.
 /// `duplicate_lines` is retained only for a root package because that policy
-/// applies to the whole graph and dependency declarations are ignored.
+/// applies to the whole graph and dependency declarations are ignored. The
+/// manifest source and its locations are derived from the VFS snapshot.
 pub fn resolve_lint_policies(
+    snapshot: &sai_diagnostics::WorkspaceSnapshot,
+    file_id: sai_diagnostics::FileId,
+    role: PackageRole,
+) -> Result<sai_diagnostics::LintPolicies, PackageLintPolicyError> {
+    let (parsed, source) = parse_bound_manifest(snapshot, file_id, role)?;
+    resolve_lint_policies_from_parsed(&parsed, &source, file_id)
+}
+
+fn resolve_lint_policies_from_parsed(
     parsed: &PackageParseOutput,
-    source: sai_diagnostics::SourceRef,
+    source: &sai_diagnostics::SourceRef,
     file_id: sai_diagnostics::FileId,
 ) -> Result<sai_diagnostics::LintPolicies, PackageLintPolicyError> {
     if !parsed.is_syntax_valid() {
         return Err(PackageLintPolicyError::PackageSyntaxInvalid);
     }
-
     let mut policies = sai_diagnostics::LintPolicies::default();
-    for declaration in &parsed.file.declarations {
+    for declaration in &parsed.file().declarations {
         let PackageDeclaration::Policy(items) = &declaration.value else {
             continue;
         };
@@ -63,11 +71,7 @@ pub fn resolve_lint_policies(
                 _ => continue,
             };
             if destination.is_none() {
-                *destination = Some(package_policy_location(
-                    &source,
-                    file_id,
-                    item.span.clone(),
-                )?);
+                *destination = Some(package_policy_location(source, file_id, item.span.clone())?);
             }
         }
     }
@@ -88,6 +92,15 @@ pub fn resolve_manifest_lint_levels(
     file_id: sai_diagnostics::FileId,
     role: PackageRole,
 ) -> Result<BTreeMap<String, sai_diagnostics::ManifestLintLevel>, PackageLintPolicyError> {
+    let (parsed, source) = parse_bound_manifest(snapshot, file_id, role)?;
+    resolve_manifest_lint_levels_from_parsed(&parsed, &source, file_id)
+}
+
+fn parse_bound_manifest(
+    snapshot: &sai_diagnostics::WorkspaceSnapshot,
+    file_id: sai_diagnostics::FileId,
+    role: PackageRole,
+) -> Result<(PackageParseOutput, sai_diagnostics::SourceRef), PackageLintPolicyError> {
     let snapshot_file = snapshot
         .file(file_id)
         .ok_or(PackageLintPolicyError::MissingSnapshotFile(file_id))?;
@@ -98,11 +111,10 @@ pub fn resolve_manifest_lint_levels(
             found: source_file.id(),
         });
     }
-    if role == PackageRole::Root
-        && (snapshot_file.path().starts_with("dep:")
-            || snapshot_file.path().rsplit('/').next() != Some("sai.package")
-            || snapshot_file.path() == "<stdin>")
-    {
+    let root_manifest_path = !snapshot_file.path().starts_with("dep:")
+        && snapshot_file.path().rsplit('/').next() == Some("sai.package")
+        && snapshot_file.path() != "<stdin>";
+    if role == PackageRole::Root && !root_manifest_path {
         return Err(PackageLintPolicyError::ManifestPathMismatch {
             file_id,
             found: snapshot_file.path().to_owned(),
@@ -113,16 +125,25 @@ pub fn resolve_manifest_lint_levels(
     if !parsed.is_syntax_valid() {
         return Err(PackageLintPolicyError::PackageSyntaxInvalid);
     }
-    if role != PackageRole::Root {
-        return Ok(BTreeMap::new());
-    }
-
     let expected_package = parsed
         .file()
         .header
         .as_ref()
         .map(|header| format!("{}@{}", header.value.identity, header.value.version))
         .ok_or(PackageLintPolicyError::PackageSyntaxInvalid)?;
+    let expected_path = match role {
+        PackageRole::Root => None,
+        PackageRole::Dependency => Some(format!("dep:{expected_package}/sai.package")),
+    };
+    if expected_path
+        .as_deref()
+        .is_some_and(|expected| snapshot_file.path() != expected)
+    {
+        return Err(PackageLintPolicyError::ManifestPathMismatch {
+            file_id,
+            found: snapshot_file.path().to_owned(),
+        });
+    }
     let found_package = snapshot_file.package().map(str::to_owned);
     if found_package.as_deref() != Some(expected_package.as_str()) {
         return Err(PackageLintPolicyError::ManifestPackageMismatch {
@@ -136,6 +157,38 @@ pub fn resolve_manifest_lint_levels(
         package: snapshot_file.package().map(str::to_owned),
         snapshot: snapshot_file.document_version(),
     };
+
+    Ok((parsed, source))
+}
+
+pub(crate) fn resolve_package_lint_settings_from_parsed(
+    parsed: &PackageParseOutput,
+    source: &sai_diagnostics::SourceRef,
+    file_id: sai_diagnostics::FileId,
+) -> Result<
+    (
+        sai_diagnostics::LintPolicies,
+        BTreeMap<String, sai_diagnostics::ManifestLintLevel>,
+    ),
+    PackageLintPolicyError,
+> {
+    Ok((
+        resolve_lint_policies_from_parsed(parsed, source, file_id)?,
+        resolve_manifest_lint_levels_from_parsed(parsed, source, file_id)?,
+    ))
+}
+
+fn resolve_manifest_lint_levels_from_parsed(
+    parsed: &PackageParseOutput,
+    source: &sai_diagnostics::SourceRef,
+    file_id: sai_diagnostics::FileId,
+) -> Result<BTreeMap<String, sai_diagnostics::ManifestLintLevel>, PackageLintPolicyError> {
+    if !parsed.is_syntax_valid() {
+        return Err(PackageLintPolicyError::PackageSyntaxInvalid);
+    }
+    if parsed.role() != PackageRole::Root {
+        return Ok(BTreeMap::new());
+    }
 
     let mut levels = BTreeMap::new();
     for declaration in &parsed.file().declarations {
@@ -154,7 +207,7 @@ pub fn resolve_manifest_lint_levels(
                 crate::manifest::LintLevel::Warn => sai_diagnostics::OverrideLintLevel::Warn,
                 crate::manifest::LintLevel::Deny => sai_diagnostics::OverrideLintLevel::Deny,
             };
-            let location = package_policy_location(&source, file_id, item.span.clone())?;
+            let location = package_policy_location(source, file_id, item.span.clone())?;
             levels
                 .entry(item.value.code.to_string())
                 .or_insert_with(|| sai_diagnostics::ManifestLintLevel::new(level, location));
@@ -1126,14 +1179,10 @@ mod tests {
              policy { deny duplicate_lines, deny ambient_imports, deny runtime_contracts }\n";
         let parsed = parse(source.as_bytes());
         assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
-        let source_ref = sai_diagnostics::SourceRef {
-            path: "sai.package".into(),
-            package: Some("acme:app@1.0.0".into()),
-            snapshot: Some(1),
-        };
         let file_id = sai_diagnostics::FileId::new(7);
+        let snapshot = manifest_snapshot(file_id, source, "sai.package", Some("acme:app@1.0.0"));
         let policies =
-            resolve_lint_policies(&parsed, source_ref.clone(), file_id).expect("valid policies");
+            resolve_lint_policies(&snapshot, file_id, PackageRole::Root).expect("valid policies");
         let duplicate_location = policies
             .deny_duplicate_package_lines
             .as_ref()
@@ -1142,7 +1191,14 @@ mod tests {
             .find("deny duplicate_lines")
             .expect("policy item is in source");
 
-        assert_eq!(duplicate_location.file, source_ref);
+        assert_eq!(
+            duplicate_location.file,
+            sai_diagnostics::SourceRef {
+                path: "sai.package".into(),
+                package: Some("acme:app@1.0.0".into()),
+                snapshot: Some(1),
+            }
+        );
         assert_eq!(duplicate_location.span.file, file_id);
         assert_eq!(
             duplicate_location.span.range.start().to_usize(),
@@ -1176,24 +1232,21 @@ mod tests {
 
     #[test]
     fn ignores_duplicate_line_policy_in_dependency_manifests() {
-        let parsed = parse_for_role(
-            b"package acme:dep @ 1.0.0\n\
-              source \"src\"\n\
-              targets { wasm32-core }\n\
-              policy { deny duplicate_lines, deny ambient_imports }\n",
-            PackageRole::Dependency,
-        );
+        let source = "package acme:dep @ 1.0.0\n\
+                      source \"src\"\n\
+                      targets { wasm32-core }\n\
+                      policy { deny duplicate_lines, deny ambient_imports }\n";
+        let parsed = parse_for_role(source.as_bytes(), PackageRole::Dependency);
         assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
-        let policies = resolve_lint_policies(
-            &parsed,
-            sai_diagnostics::SourceRef {
-                path: "dep:acme:dep@1.0.0/sai.package".into(),
-                package: Some("acme:dep@1.0.0".into()),
-                snapshot: Some(1),
-            },
-            sai_diagnostics::FileId::new(8),
-        )
-        .expect("valid dependency policy");
+        let file_id = sai_diagnostics::FileId::new(8);
+        let snapshot = manifest_snapshot(
+            file_id,
+            source,
+            "dep:acme:dep@1.0.0/sai.package",
+            Some("acme:dep@1.0.0"),
+        );
+        let policies = resolve_lint_policies(&snapshot, file_id, PackageRole::Dependency)
+            .expect("valid dependency policy");
 
         assert!(policies.deny_duplicate_package_lines.is_none());
         assert!(policies.deny_ambient_imports.is_some());
@@ -1201,18 +1254,12 @@ mod tests {
 
     #[test]
     fn rejects_lint_policy_extraction_from_incomplete_syntax() {
-        let parsed = parse(b"package acme:broken @ 1.0.0\npolicy { deny duplicate_lines\n");
+        let source = "package acme:broken @ 1.0.0\npolicy { deny duplicate_lines\n";
+        let file_id = sai_diagnostics::FileId::new(9);
+        let snapshot = manifest_snapshot(file_id, source, "sai.package", Some("acme:broken@1.0.0"));
 
         assert_eq!(
-            resolve_lint_policies(
-                &parsed,
-                sai_diagnostics::SourceRef {
-                    path: "sai.package".into(),
-                    package: Some("acme:broken".into()),
-                    snapshot: Some(1),
-                },
-                sai_diagnostics::FileId::new(9),
-            ),
+            resolve_lint_policies(&snapshot, file_id, PackageRole::Root),
             Err(PackageLintPolicyError::PackageSyntaxInvalid)
         );
     }

@@ -130,6 +130,11 @@ impl<'a> MvsExplanationGraph<'a> {
         Ok(graph)
     }
 
+    /// Returns the root package version used to build this explanation graph.
+    pub fn root_package_version(&self) -> &MvsPackageVersion {
+        self.selection.root()
+    }
+
     /// Returns a chain to `requirer` followed by the specified edge.
     pub fn chain_to_edge(
         &self,

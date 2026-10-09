@@ -10,6 +10,7 @@ use crate::mvs_graph_validation::{
     MvsDuplicatePackageLines, MvsSelectedGraphInputError, check_selected_graph,
     duplicate_package_lines,
 };
+use crate::validation::resolve_package_lint_settings_from_parsed;
 use crate::version_req::VersionReq;
 use sai_diagnostics::{
     Child, ChildKind, Code, Diagnostic, LintPolicies, LintResolution, LintResolutionContext,
@@ -27,6 +28,8 @@ pub struct MvsManifestLocation {
     workspace_snapshot: sai_diagnostics::WorkspaceSnapshotId,
     source_len: usize,
     requirements: BTreeMap<(usize, usize), ManifestRequirement>,
+    lint_policies: LintPolicies,
+    manifest_lint_levels: BTreeMap<String, ManifestLintLevel>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,18 +131,26 @@ impl MvsManifestLocation {
             }
         }
 
+        let source = SourceRef {
+            path: snapshot_file.path().to_owned(),
+            package: found_package.clone(),
+            snapshot: snapshot_file.document_version(),
+        };
+        let (lint_policies, manifest_lint_levels) =
+            resolve_package_lint_settings_from_parsed(&parsed, &source, file_id).map_err(
+                |error| MvsDuplicatePackageLineDiagnosticError::LintConfiguration(Box::new(error)),
+            )?;
+
         Ok(Self {
-            source: SourceRef {
-                path: snapshot_file.path().to_owned(),
-                package: found_package,
-                snapshot: snapshot_file.document_version(),
-            },
+            source,
             file_id,
             package_version: package_version.clone(),
             role,
             workspace_snapshot: snapshot.id(),
             source_len: source_file.raw_bytes().len(),
             requirements,
+            lint_policies,
+            manifest_lint_levels,
         })
     }
 
@@ -149,6 +160,14 @@ impl MvsManifestLocation {
 
     pub const fn file_id(&self) -> sai_diagnostics::FileId {
         self.file_id
+    }
+
+    pub fn lint_policies(&self) -> &LintPolicies {
+        &self.lint_policies
+    }
+
+    pub fn manifest_lint_levels(&self) -> &BTreeMap<String, ManifestLintLevel> {
+        &self.manifest_lint_levels
     }
 }
 
@@ -250,11 +269,7 @@ impl MvsManifestLocations {
 /// Configuration and source locations for a graph-wide duplicate-line lint.
 pub struct MvsDuplicatePackageLineDiagnosticContext<'a> {
     pub manifests: &'a MvsManifestLocations,
-    /// Policies parsed from the root package manifest.
-    pub root_policy: &'a LintPolicies,
     pub cli: Option<OverrideLintLevel>,
-    /// The root package's validated `lints` setting for this code, if any.
-    pub manifest: Option<&'a ManifestLintLevel>,
     pub deny_warnings: bool,
 }
 
@@ -264,6 +279,8 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
     InvalidExplanation(Box<MvsExplanationError>),
     InvalidSelectedGraph(Box<MvsSelectedGraphInputError>),
     LintResolution(LintResolutionError),
+    LintConfiguration(Box<crate::validation::PackageLintPolicyError>),
+    MissingRootManifest,
     MissingManifestLocation(Box<MvsRequirer>),
     MissingSnapshotFile(sai_diagnostics::FileId),
     SnapshotFileIdMismatch {
@@ -333,6 +350,22 @@ pub fn duplicate_package_line_diagnostic(
     duplicate: &MvsDuplicatePackageLines,
     context: &MvsDuplicatePackageLineDiagnosticContext<'_>,
 ) -> Result<Option<Diagnostic>, MvsDuplicatePackageLineDiagnosticError> {
+    let root_manifest = context
+        .manifests
+        .root
+        .as_ref()
+        .ok_or(MvsDuplicatePackageLineDiagnosticError::MissingRootManifest)?;
+    let selection_root = explanations.root_package_version();
+    if root_manifest.package_version != *selection_root {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::ManifestVersionMismatch {
+                requirer: Box::new(MvsRequirer::Root(selection_root.clone())),
+                expected: Box::new(selection_root.clone()),
+                found: Box::new(root_manifest.package_version.clone()),
+            },
+        );
+    }
+
     let explanation = explanations
         .explain_duplicate_lines(duplicate)
         .map_err(|error| {
@@ -340,15 +373,19 @@ pub fn duplicate_package_line_diagnostic(
         })?;
 
     let no_attributes = [];
+    let root_policy = root_manifest.lint_policies();
+    let manifest_level = root_manifest
+        .manifest_lint_levels
+        .get("DUPLICATE_PACKAGE_LINE");
     let resolution = resolve_lint_occurrence(
         "DUPLICATE_PACKAGE_LINE",
         &LintResolutionContext {
             primary: None,
             attributes: &no_attributes,
             cli: context.cli,
-            manifest: context.manifest,
-            package_policy: context.root_policy,
-            root_policy: context.root_policy,
+            manifest: manifest_level,
+            package_policy: root_policy,
+            root_policy,
             is_root_or_workspace_member: true,
             deny_warnings: context.deny_warnings,
         },
@@ -774,7 +811,7 @@ mod tests {
     use crate::mvs_graph_validation::{
         MvsDuplicatePackageLines, check_selected_graph, duplicate_package_lines,
     };
-    use crate::validation::{PackageValidationContext, resolve_lint_policies, validate};
+    use crate::validation::{PackageValidationContext, validate};
     use crate::version::Version;
     use crate::version_req::VersionReq;
 
@@ -1144,7 +1181,6 @@ mod tests {
         selection: &MvsSelectionOutput,
         duplicate: &MvsDuplicatePackageLines,
         manifests: &MvsManifestLocations,
-        root_policy: &sai_diagnostics::LintPolicies,
         cli: Option<sai_diagnostics::OverrideLintLevel>,
         deny_warnings: bool,
     ) -> Option<sai_diagnostics::Diagnostic> {
@@ -1153,9 +1189,7 @@ mod tests {
             duplicate,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests,
-                root_policy,
                 cli,
-                manifest: None,
                 deny_warnings,
             },
         )
@@ -1166,15 +1200,8 @@ mod tests {
     fn emits_source_mapped_duplicate_lines_without_a_primary_span() {
         let (selection, duplicate) = duplicate_fixture();
         let manifests = manifests();
-        let diagnostic = diagnostic(
-            &selection,
-            &duplicate,
-            &manifests,
-            &sai_diagnostics::LintPolicies::default(),
-            None,
-            false,
-        )
-        .expect("warning is enabled");
+        let diagnostic = diagnostic(&selection, &duplicate, &manifests, None, false)
+            .expect("warning is enabled");
 
         assert_eq!(diagnostic.code.as_str(), "DUPLICATE_PACKAGE_LINE");
         assert_eq!(diagnostic.severity, Severity::Warning);
@@ -1311,9 +1338,7 @@ mod tests {
             &selection,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests: &manifests,
-                root_policy: &sai_diagnostics::LintPolicies::default(),
                 cli: None,
-                manifest: None,
                 deny_warnings: false,
             },
         )
@@ -1324,21 +1349,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_root_lint_configuration_from_another_selection() {
+        let (selection, duplicate) = duplicate_fixture();
+        let graph = MvsExplanationGraph::new(&selection).expect("explanation graph");
+        let root_version = package_version("acme:app", "2.0.0");
+        let root_source = ROOT_MANIFEST.replace("@ 1.0.0", "@ 2.0.0");
+        let manifests = manifests_for(
+            (root_version.clone(), root_source),
+            vec![(package_version("acme:a", "1.0.0"), A_MANIFEST.to_owned())],
+        );
+        let error = duplicate_package_line_diagnostic(
+            &graph,
+            &duplicate,
+            &MvsDuplicatePackageLineDiagnosticContext {
+                manifests: &manifests,
+                cli: None,
+                deny_warnings: false,
+            },
+        )
+        .expect_err("lint configuration must come from the selection root");
+
+        assert_eq!(
+            error,
+            super::MvsDuplicatePackageLineDiagnosticError::ManifestVersionMismatch {
+                requirer: Box::new(MvsRequirer::Root(selection.root().clone())),
+                expected: Box::new(selection.root().clone()),
+                found: Box::new(root_version),
+            }
+        );
+    }
+
+    #[test]
     fn root_policy_sets_error_level_and_keeps_its_manifest_location() {
         let (selection, duplicate) = duplicate_fixture();
-        let source = format!("{ROOT_MANIFEST}policy {{ deny duplicate_lines }}\n");
+        let source = format!(
+            "{ROOT_MANIFEST}lints {{ allow DUPLICATE_PACKAGE_LINE }}\n\
+             policy {{ deny duplicate_lines }}\n"
+        );
         let manifests = manifests_with(&source, A_MANIFEST);
         let parsed = parse(source.as_bytes());
         assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
         let root_manifest = manifests.root().expect("root manifest");
         let source_ref = root_manifest.source().clone();
-        let policy = resolve_lint_policies(&parsed, source_ref.clone(), root_manifest.file_id())
-            .expect("valid root policy");
-        let policy_location = policy
+        let policy_location = root_manifest
+            .lint_policies()
             .deny_duplicate_package_lines
             .as_ref()
             .expect("duplicate-line policy");
-        let diagnostic = diagnostic(&selection, &duplicate, &manifests, &policy, None, false)
+        let diagnostic = diagnostic(&selection, &duplicate, &manifests, None, false)
             .expect("policy-denied warning is emitted");
 
         assert_eq!(diagnostic.severity, Severity::Error);
@@ -1350,24 +1408,41 @@ mod tests {
     }
 
     #[test]
+    fn root_manifest_lint_level_controls_duplicate_line_diagnostic() {
+        let (selection, duplicate) = duplicate_fixture();
+        let source = format!("{ROOT_MANIFEST}lints {{ deny DUPLICATE_PACKAGE_LINE }}\n");
+        let manifests = manifests_with(&source, A_MANIFEST);
+        let root_manifest = manifests.root().expect("root manifest");
+        let manifest_level = root_manifest
+            .manifest_lint_levels()
+            .get("DUPLICATE_PACKAGE_LINE")
+            .expect("root lint level");
+        let diagnostic = diagnostic(&selection, &duplicate, &manifests, None, false)
+            .expect("manifest-denied lint is emitted");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        let level = diagnostic.level().expect("lint level");
+        assert_eq!(level.value, LintLevel::Deny);
+        assert_eq!(level.source, LevelSource::Manifest);
+        assert_eq!(level.location.as_ref(), Some(manifest_level.location()));
+    }
+
+    #[test]
     fn allow_suppresses_the_graph_lint_and_deny_warnings_escalates_it() {
         let (selection, duplicate) = duplicate_fixture();
         let manifests = manifests();
-        let policies = sai_diagnostics::LintPolicies::default();
-
         assert!(
             diagnostic(
                 &selection,
                 &duplicate,
                 &manifests,
-                &policies,
                 Some(sai_diagnostics::OverrideLintLevel::Allow),
                 false,
             )
             .is_none()
         );
 
-        let denied = diagnostic(&selection, &duplicate, &manifests, &policies, None, true)
+        let denied = diagnostic(&selection, &duplicate, &manifests, None, true)
             .expect("deny warnings keeps the lint");
         assert_eq!(denied.severity, Severity::Error);
         let level = denied.level().expect("lint level");
@@ -1377,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn requires_manifest_locations_for_every_requirement_edge() {
+    fn requires_root_manifest_before_resolving_cli_allow() {
         let (selection, duplicate) = duplicate_fixture();
         let graph = MvsExplanationGraph::new(&selection).expect("explanation graph");
         let error = duplicate_package_line_diagnostic(
@@ -1385,18 +1460,44 @@ mod tests {
             &duplicate,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests: &MvsManifestLocations::default(),
-                root_policy: &sai_diagnostics::LintPolicies::default(),
-                cli: None,
-                manifest: None,
+                cli: Some(sai_diagnostics::OverrideLintLevel::Allow),
                 deny_warnings: false,
             },
         )
-        .expect_err("source-less requirement edges cannot be rendered faithfully");
+        .expect_err("root policy cannot be resolved without the root manifest");
+
+        assert_eq!(
+            error,
+            super::MvsDuplicatePackageLineDiagnosticError::MissingRootManifest
+        );
+    }
+
+    #[test]
+    fn requires_a_manifest_for_every_requirement_edge() {
+        let (selection, duplicate) = duplicate_fixture();
+        let graph = MvsExplanationGraph::new(&selection).expect("explanation graph");
+        let manifests = manifests_for(
+            (
+                package_version("acme:app", "1.0.0"),
+                ROOT_MANIFEST.to_owned(),
+            ),
+            Vec::new(),
+        );
+        let error = duplicate_package_line_diagnostic(
+            &graph,
+            &duplicate,
+            &MvsDuplicatePackageLineDiagnosticContext {
+                manifests: &manifests,
+                cli: None,
+                deny_warnings: false,
+            },
+        )
+        .expect_err("source-less dependency edges cannot be rendered faithfully");
 
         assert_eq!(
             error,
             super::MvsDuplicatePackageLineDiagnosticError::MissingManifestLocation(Box::new(
-                MvsRequirer::Root(package_version("acme:app", "1.0.0"))
+                MvsRequirer::Package(package_version("acme:a", "1.0.0"))
             ))
         );
     }
@@ -1556,15 +1657,8 @@ mod tests {
                 .expect("dependency manifest location"),
             )
             .expect("dependency belongs to the snapshot");
-        let diagnostic = diagnostic(
-            &selection,
-            &duplicate,
-            &manifests,
-            &sai_diagnostics::LintPolicies::default(),
-            None,
-            false,
-        )
-        .expect("warning is enabled");
+        let diagnostic = diagnostic(&selection, &duplicate, &manifests, None, false)
+            .expect("warning is enabled");
 
         let children = diagnostic.children();
         assert_eq!(
@@ -1698,9 +1792,7 @@ mod tests {
             &duplicate,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests: &manifests,
-                root_policy: &sai_diagnostics::LintPolicies::default(),
                 cli: None,
-                manifest: None,
                 deny_warnings: false,
             },
         )
@@ -1725,9 +1817,7 @@ mod tests {
             &duplicate,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests: &manifests,
-                root_policy: &sai_diagnostics::LintPolicies::default(),
                 cli: None,
-                manifest: None,
                 deny_warnings: false,
             },
         )
@@ -1754,9 +1844,7 @@ mod tests {
             &duplicate,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests: &manifests,
-                root_policy: &sai_diagnostics::LintPolicies::default(),
                 cli: None,
-                manifest: None,
                 deny_warnings: false,
             },
         )
@@ -1786,9 +1874,7 @@ mod tests {
             &duplicate,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests: &manifests,
-                root_policy: &sai_diagnostics::LintPolicies::default(),
                 cli: None,
-                manifest: None,
                 deny_warnings: false,
             },
         )
@@ -1831,9 +1917,7 @@ mod tests {
             &duplicate,
             &MvsDuplicatePackageLineDiagnosticContext {
                 manifests: &locations,
-                root_policy: &sai_diagnostics::LintPolicies::default(),
                 cli: None,
-                manifest: None,
                 deny_warnings: false,
             },
         )
