@@ -329,6 +329,22 @@ pub struct MvsNamedEdge {
     pub root_override_pin: bool,
 }
 
+/// Source-selection inputs captured when a concrete contract leaves the queue.
+///
+/// The snapshot is recorded even when the caller has not supplied the
+/// contract. A loader can therefore choose the source using exactly the edges
+/// known at the deterministic dequeue point, without later edges changing
+/// that choice. Edge source clauses remain in the corresponding manifest
+/// metadata and can be matched by requiring package version and source span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvsContractRequest {
+    pub package_version: MvsPackageVersion,
+    pub named_by: Vec<MvsNamedEdge>,
+    /// Whether this version is also the node's lock floor. It is the source
+    /// fallback only when `named_by` is empty.
+    pub lock_floor: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvsSelectionError {
     pub kind: MvsSelectionErrorKind,
@@ -358,6 +374,9 @@ pub struct MvsSelectionOutput {
     /// Package versions whose contracts were read, in deterministic queue
     /// order.
     read_order: Vec<MvsPackageVersion>,
+    /// Every concrete version whose contract was requested, including
+    /// unavailable contracts, in deterministic queue order.
+    contract_requests: Vec<MvsContractRequest>,
     /// All real edges that named each version. Lock floors are excluded.
     named_by: BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>>,
     /// The `named_by` snapshot available when each contract left the queue.
@@ -376,6 +395,7 @@ impl MvsSelectionOutput {
             read_contracts: BTreeMap::new(),
             selected: BTreeMap::new(),
             read_order: Vec::new(),
+            contract_requests: Vec::new(),
             named_by: BTreeMap::new(),
             read_named_by: BTreeMap::new(),
             reached_pins: BTreeMap::new(),
@@ -402,6 +422,10 @@ impl MvsSelectionOutput {
 
     pub fn read_order(&self) -> &[MvsPackageVersion] {
         &self.read_order
+    }
+
+    pub fn contract_requests(&self) -> &[MvsContractRequest] {
+        &self.contract_requests
     }
 
     pub fn named_by(&self) -> &BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>> {
@@ -446,7 +470,8 @@ impl MvsSelectionOutput {
 /// filtering.
 ///
 /// The function computes selected versions and records source-selection
-/// provenance. It does not fetch contracts, inspect path packages, choose
+/// provenance, including the `named_by` snapshot at each contract's queue
+/// dequeue. It does not fetch contracts, inspect path packages, choose
 /// sources, or perform the selected-graph range/cycle checks of §2.4.3–4.
 pub fn select(
     root: &MvsContract,
@@ -466,6 +491,19 @@ pub fn select(
         if !state.read.insert(package_version.clone()) {
             continue;
         }
+        let named_by = state
+            .output
+            .named_by
+            .get(&package_version)
+            .cloned()
+            .unwrap_or_default();
+        let node = package_version.node();
+        let lock_floor = state.output.reached_floors.get(&node) == Some(package_version.version());
+        state.output.contract_requests.push(MvsContractRequest {
+            package_version: package_version.clone(),
+            named_by: named_by.clone(),
+            lock_floor,
+        });
         let Some(contract) = contracts.get(&package_version) else {
             state.output.errors.push(MvsSelectionError {
                 kind: MvsSelectionErrorKind::ContractNotProvided(package_version),
@@ -488,15 +526,10 @@ pub fn select(
             .read_contracts
             .insert(package_version.clone(), contract.clone());
         state.output.read_order.push(package_version.clone());
-        state.output.read_named_by.insert(
-            package_version.clone(),
-            state
-                .output
-                .named_by
-                .get(&package_version)
-                .cloned()
-                .unwrap_or_default(),
-        );
+        state
+            .output
+            .read_named_by
+            .insert(package_version.clone(), named_by);
         for edge in &contract.edges {
             state
                 .name_edge(edge, MvsRequirer::Package(package_version.clone()))
@@ -519,6 +552,9 @@ pub fn select(
     }
     sort_named_edges(&mut state.output.named_by);
     sort_named_edges(&mut state.output.read_named_by);
+    for request in &mut state.output.contract_requests {
+        sort_named_edge_list(&mut request.named_by);
+    }
     Ok(state.output)
 }
 
@@ -674,14 +710,18 @@ impl<'a> MvsSelectionState<'a> {
 
 fn sort_named_edges(named_by: &mut BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>>) {
     for edges in named_by.values_mut() {
-        edges.sort_by(|left, right| {
-            left.requirer
-                .package_version()
-                .cmp(right.requirer.package_version())
-                .then_with(|| left.span.start.cmp(&right.span.start))
-                .then_with(|| left.span.end.cmp(&right.span.end))
-        });
+        sort_named_edge_list(edges);
     }
+}
+
+fn sort_named_edge_list(edges: &mut [MvsNamedEdge]) {
+    edges.sort_by(|left, right| {
+        left.requirer
+            .package_version()
+            .cmp(right.requirer.package_version())
+            .then_with(|| left.span.start.cmp(&right.span.start))
+            .then_with(|| left.span.end.cmp(&right.span.end))
+    });
 }
 
 #[cfg(test)]
@@ -823,6 +863,65 @@ mod tests {
         assert_eq!(output.selected[&node("acme:b", "1.0.0")], version("1.8.0"));
         assert!(!output.named_by.contains_key(&floor));
         assert!(output.read_named_by[&floor].is_empty());
+    }
+
+    #[test]
+    fn contract_requests_capture_named_edges_at_the_dequeue_point() {
+        let root = contract(
+            "acme:app",
+            "1.0.0",
+            vec![
+                edge("acme:a", "^1", "1.0.0", 0),
+                edge("acme:zz", "^1", "1.0.0", 1),
+            ],
+        );
+        let contracts = catalog(vec![
+            contract("acme:a", "1.0.0", vec![edge("acme:z", "^1", "1.0.0", 10)]),
+            contract("acme:zz", "1.0.0", vec![edge("acme:z", "^1", "1.0.0", 20)]),
+        ]);
+        let output =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("valid MVS inputs");
+        let z = package_version("acme:z", "1.0.0");
+        let request = output
+            .contract_requests()
+            .iter()
+            .find(|request| request.package_version == z)
+            .expect("the missing contract was requested");
+
+        assert_eq!(
+            request
+                .named_by
+                .iter()
+                .map(|edge| edge.requirer.package_version().package())
+                .collect::<Vec<_>>(),
+            ["acme:a"]
+        );
+        assert!(!request.lock_floor);
+        assert_eq!(output.named_by()[&z].len(), 2);
+        assert!(!output.read_named_by().contains_key(&z));
+        assert!(output.errors().iter().any(|error| {
+            error.kind == super::MvsSelectionErrorKind::ContractNotProvided(z.clone())
+        }));
+    }
+
+    #[test]
+    fn contract_requests_identify_lock_floor_only_versions() {
+        let root = contract("acme:app", "1.0.0", vec![edge("acme:a", "^1", "1.0.0", 0)]);
+        let contracts = catalog(vec![
+            contract("acme:a", "1.0.0", vec![]),
+            contract("acme:a", "1.8.0", vec![]),
+        ]);
+        let floors = HashMap::from([(node("acme:a", "1.0.0"), version("1.8.0"))]);
+        let output = select(&root, &contracts, &floors, &HashMap::new())
+            .expect("valid MVS inputs with a floor");
+        let request = output
+            .contract_requests()
+            .iter()
+            .find(|request| request.package_version == package_version("acme:a", "1.8.0"))
+            .expect("the floor contract was requested");
+
+        assert!(request.named_by.is_empty());
+        assert!(request.lock_floor);
     }
 
     #[test]
