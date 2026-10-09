@@ -1,6 +1,7 @@
 use std::{
     sync::{
         Arc,
+        atomic::AtomicBool,
         mpsc::{Receiver, SyncSender},
     },
     thread,
@@ -9,9 +10,102 @@ use std::{
 use gix_features::io;
 use parking_lot::Mutex;
 
+use crate::client::blocking_io::FetchTransferLimit;
 use crate::client::blocking_io::http::{self, traits::PostBodyDataKind};
 
 mod remote;
+
+/// A curl response body that reports when the fetch byte budget is exceeded.
+pub struct CurlResponseBody {
+    inner: io::pipe::Reader,
+    transfer_limit: Option<FetchTransferLimit>,
+    transfer_limit_exceeded: Arc<AtomicBool>,
+}
+
+impl CurlResponseBody {
+    fn transfer_limit_error(&self) -> Option<std::io::Error> {
+        if self
+            .transfer_limit_exceeded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.transfer_limit
+                .as_ref()
+                .map(FetchTransferLimit::exceeded_error)
+        } else {
+            None
+        }
+    }
+
+    fn map_transport_error(&self, error: std::io::Error) -> std::io::Error {
+        self.transfer_limit_error().unwrap_or(error)
+    }
+}
+
+impl std::io::Read for CurlResponseBody {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        match self.inner.read(buffer) {
+            Err(error) => Err(self.map_transport_error(error)),
+            Ok(0) => match self.transfer_limit_error() {
+                Some(error) => Err(error),
+                None => Ok(0),
+            },
+            Ok(read) => Ok(read),
+        }
+    }
+}
+
+impl std::io::BufRead for CurlResponseBody {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        let transfer_limit_error = self.transfer_limit_error();
+        let buffer = match self.inner.fill_buf() {
+            Err(error) => return Err(transfer_limit_error.unwrap_or(error)),
+            Ok(buffer) => buffer,
+        };
+        if buffer.is_empty()
+            && let Some(error) = transfer_limit_error
+        {
+            return Err(error);
+        }
+        Ok(buffer)
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+    }
+}
+
+#[cfg(test)]
+mod transfer_limit_tests {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use crate::client::blocking_io::FetchTransferLimit;
+
+    use super::CurlResponseBody;
+
+    #[test]
+    fn curl_transport_errors_are_classified_as_limit_errors_after_overflow() {
+        let (_, reader) = gix_features::io::pipe::unidirectional(1);
+        let body = CurlResponseBody {
+            inner: reader,
+            transfer_limit: Some(FetchTransferLimit::new(4)),
+            transfer_limit_exceeded: Arc::new(AtomicBool::new(true)),
+        };
+
+        let error = body.map_transport_error(std::io::Error::other("curl callback failed"));
+
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|source| source
+                    .downcast_ref::<crate::client::blocking_io::FetchTransferLimitExceeded>())
+                .map(|source| source.limit_bytes),
+            Some(4)
+        );
+    }
+}
 
 /// Options to configure the `curl` HTTP handler.
 #[derive(Default)]
@@ -92,7 +186,7 @@ impl Curl {
         base_url: &str,
         headers: impl IntoIterator<Item = impl AsRef<str>>,
         upload_body_kind: Option<PostBodyDataKind>,
-    ) -> Result<http::PostResponse<io::pipe::Reader, io::pipe::Reader, io::pipe::Writer>, http::Error>
+    ) -> Result<http::PostResponse<io::pipe::Reader, CurlResponseBody, io::pipe::Writer>, http::Error>
     {
         let mut list = curl::easy::List::new();
         for header in headers {
@@ -115,6 +209,7 @@ impl Curl {
             headers,
             body,
             upload_body,
+            transfer_limit_exceeded,
         } = match self.res.recv() {
             Ok(res) => res,
             Err(_) => return Err(self.restore_thread_after_failure()),
@@ -122,7 +217,11 @@ impl Curl {
         Ok(http::PostResponse {
             post_body: upload_body,
             headers,
-            body,
+            body: CurlResponseBody {
+                inner: body,
+                transfer_limit: self.config.fetch_transfer_limit.clone(),
+                transfer_limit_exceeded,
+            },
         })
     }
 }
@@ -142,7 +241,7 @@ impl Default for Curl {
 
 impl http::Http for Curl {
     type Headers = io::pipe::Reader;
-    type ResponseBody = io::pipe::Reader;
+    type ResponseBody = CurlResponseBody;
     type PostBody = io::pipe::Writer;
 
     fn get(

@@ -16,7 +16,7 @@ use crate::{
     Protocol, Service,
     client::{
         self, MessageKind, WriteMode,
-        blocking_io::{RequestWriter, SetServiceResponse, ssh},
+        blocking_io::{FetchTransferLimit, RequestWriter, SetServiceResponse, ssh},
         git::blocking_io::Connection,
     },
 };
@@ -55,6 +55,7 @@ pub struct SpawnProcessOnDemand {
     connection: Option<Connection<Box<dyn std::io::Read + Send>, process::ChildStdin>>,
     child: Option<process::Child>,
     subprocess_read_timeout: Option<Duration>,
+    fetch_transfer_limit: Option<FetchTransferLimit>,
     stdout_reader_thread: Option<JoinHandle<()>>,
     stderr_reader_thread: Option<JoinHandle<()>>,
     trace: bool,
@@ -79,6 +80,7 @@ impl SpawnProcessOnDemand {
             child: None,
             connection: None,
             subprocess_read_timeout: None,
+            fetch_transfer_limit: None,
             stdout_reader_thread: None,
             stderr_reader_thread: None,
             desired_version: version,
@@ -109,6 +111,7 @@ impl SpawnProcessOnDemand {
             child: None,
             connection: None,
             subprocess_read_timeout: None,
+            fetch_transfer_limit: None,
             stdout_reader_thread: None,
             stderr_reader_thread: None,
             desired_version: version,
@@ -235,7 +238,10 @@ impl client::TransportWithoutIO for SpawnProcessOnDemand {
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         self.subprocess_read_timeout = config
             .downcast_ref::<super::SubprocessReadTimeout>()
-            .map(|options| options.duration());
+            .map(super::SubprocessReadTimeout::duration);
+        self.fetch_transfer_limit = config
+            .downcast_ref::<super::SubprocessReadTimeout>()
+            .and_then(|options| options.transfer_limit().cloned());
         Ok(())
     }
 }
@@ -407,6 +413,7 @@ fn supervise_stdout(
     stdout: process::ChildStdout,
     deadline: Option<Instant>,
     read_ssh_errors: bool,
+    transfer_limit: Option<FetchTransferLimit>,
 ) -> std::io::Result<(
     ReadStdoutWithDeadline,
     Option<SyncSender<SshStderrMessage>>,
@@ -426,9 +433,42 @@ fn supervise_stdout(
             let mut stdout = stdout;
             let mut buffer = vec![0; 8 * 1024];
             loop {
-                let message = match stdout.read(&mut buffer) {
+                let remaining = transfer_limit
+                    .as_ref()
+                    .map(FetchTransferLimit::remaining_bytes);
+                let read_capacity = remaining.map_or(buffer.len(), |remaining| {
+                    remaining.saturating_add(1).min(buffer.len() as u64) as usize
+                });
+                let message = match stdout.read(&mut buffer[..read_capacity]) {
                     Ok(0) => StdoutMessage::Eof,
-                    Ok(read) => StdoutMessage::Data(buffer[..read].to_vec()),
+                    Ok(read) => {
+                        if let (Some(limit), Some(remaining)) = (&transfer_limit, remaining)
+                            && read as u64 > remaining
+                        {
+                            let allowed = remaining as usize;
+                            if allowed > 0 {
+                                if let Err(error) = limit.consume(remaining) {
+                                    let _ = send.send(StdoutMessage::Error(error));
+                                    break;
+                                }
+                                if send
+                                    .send(StdoutMessage::Data(buffer[..allowed].to_vec()))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            let _ = send.send(StdoutMessage::Error(limit.exceeded_error()));
+                            break;
+                        }
+                        if let Some(limit) = &transfer_limit
+                            && limit.consume(read as u64).is_err()
+                        {
+                            let _ = send.send(StdoutMessage::Error(limit.exceeded_error()));
+                            break;
+                        }
+                        StdoutMessage::Data(buffer[..read].to_vec())
+                    }
                     Err(error) => StdoutMessage::Error(error),
                 };
                 let done = matches!(&message, StdoutMessage::Error(_) | StdoutMessage::Eof);
@@ -565,8 +605,13 @@ impl client::blocking_io::Transport for SpawnProcessOnDemand {
         let deadline = self
             .subprocess_read_timeout
             .and_then(|timeout| Instant::now().checked_add(timeout));
-        let (stdout, ssh_error_send, stdout_reader) =
-            supervise_stdout(stdout, deadline, ssh_kind.is_some()).map_err(client::Error::Io)?;
+        let (stdout, ssh_error_send, stdout_reader) = supervise_stdout(
+            stdout,
+            deadline,
+            ssh_kind.is_some(),
+            self.fetch_transfer_limit.clone(),
+        )
+        .map_err(client::Error::Io)?;
         self.stdout_reader_thread = Some(stdout_reader);
         if let Some(ssh_kind) = ssh_kind {
             let stderr = stderr.expect("SSH stderr is piped");
@@ -628,7 +673,7 @@ mod tests {
         use crate::{
             Protocol,
             client::blocking_io::{
-                SubprocessReadTimeout,
+                FetchTransferLimit, SubprocessReadTimeout,
                 file::{
                     ReadStdoutWithDeadline, SpawnProcessOnDemand, SshStderrMessage, StdoutMessage,
                 },
@@ -650,6 +695,7 @@ mod tests {
                 stdout,
                 Some(Instant::now() + Duration::from_millis(20)),
                 false,
+                None,
             )
             .expect("reader thread can start");
             let mut transport =
@@ -674,6 +720,44 @@ mod tests {
 
         #[cfg(unix)]
         #[test]
+        fn stdout_transfer_limit_reads_only_one_byte_past_the_budget() {
+            let mut child = Command::new("sh")
+                .args(["-c", "printf abcdef"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("shell is available on Unix");
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let limit = FetchTransferLimit::new(4);
+            let (mut reader, _, worker) = super::super::supervise_stdout(
+                stdout,
+                Some(Instant::now() + Duration::from_secs(1)),
+                false,
+                Some(limit.clone()),
+            )
+            .expect("reader thread can start");
+            let mut output = Vec::new();
+
+            let error = reader
+                .read_to_end(&mut output)
+                .expect_err("the fifth response byte exceeds the budget");
+            worker.join().expect("stdout worker exits");
+            child.wait().expect("child exits");
+
+            assert_eq!(output, b"abcd");
+            assert_eq!(limit.consumed_bytes(), 4);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|source| source
+                        .downcast_ref::<crate::client::blocking_io::FetchTransferLimitExceeded>())
+                    .map(|source| source.limit_bytes),
+                Some(4)
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
         fn cleanup_subprocess_stops_a_failed_handshake_before_retry() {
             let mut child = Command::new("sh")
                 .args(["-c", "exec sleep 30"])
@@ -685,7 +769,7 @@ mod tests {
             let stdout = child.stdout.take().expect("stdout was piped");
             let stderr = child.stderr.take().expect("stderr was piped");
             let (stdout, ssh_error_send, stdout_reader) =
-                super::super::supervise_stdout(stdout, None, true)
+                super::super::supervise_stdout(stdout, None, true, None)
                     .expect("stdout reader thread can start");
             let stderr_reader = super::super::supervise_stderr(
                 ProgramKind::Ssh,

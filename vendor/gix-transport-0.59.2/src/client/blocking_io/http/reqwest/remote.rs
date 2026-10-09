@@ -263,7 +263,21 @@ impl Default for Remote {
 
                 // reading the response body is streaming and may fail for many reasons. If so, we send the error over the response
                 // body channel and that's all we can do.
-                if let Err(err) = std::io::copy(&mut res, &mut response_body_tx) {
+                let copy_result = match config.fetch_transfer_limit.as_ref() {
+                    Some(limit) => {
+                        let mut writer = crate::client::blocking_io::LimitedResponseBodyWriter::new(
+                            &mut response_body_tx,
+                            limit,
+                        );
+                        crate::client::blocking_io::copy_response_body_with_limit(
+                            &mut res,
+                            &mut writer,
+                            limit,
+                        )
+                    }
+                    None => std::io::copy(&mut res, &mut response_body_tx),
+                };
+                if let Err(err) = copy_result {
                     response_body_tx.channel.send(Err(err)).ok();
                 }
             }

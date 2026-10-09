@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread,
@@ -14,6 +15,7 @@ use curl::easy::{Auth, Easy2};
 use gix_features::io::pipe;
 use parking_lot::Mutex;
 
+use crate::client::blocking_io::FetchTransferLimit;
 use crate::client::blocking_io::http::{
     self,
     curl::Error,
@@ -58,6 +60,8 @@ struct Handler {
     /// Caller-provided base URL used to derive the transport-visible base URL after redirects.
     base_url: String,
     redirected_base_url: SharedRedirectedBaseUrl,
+    transfer_limit: Option<FetchTransferLimit>,
+    transfer_limit_exceeded: Option<Arc<AtomicBool>>,
 }
 
 impl Handler {
@@ -67,6 +71,8 @@ impl Handler {
         self.last_status = 0;
         self.follow = FollowRedirects::default();
         self.redirect_action = RedirectAction::Stop;
+        self.transfer_limit = None;
+        self.transfer_limit_exceeded = None;
     }
 
     fn track_redirects(
@@ -236,7 +242,33 @@ impl curl::easy::Handler for Handler {
     fn write(&mut self, data: &[u8]) -> Result<usize, curl::easy::WriteError> {
         drop(self.send_header.take()); // signal header readers to stop trying
         match self.send_data.as_mut() {
-            Some(writer) => writer.write_all(data).map(|_| data.len()).or(Ok(0)),
+            Some(writer) => {
+                if let Some(limit) = &self.transfer_limit {
+                    let remaining = limit.remaining_bytes();
+                    let permitted = data.len().min(remaining.min(usize::MAX as u64) as usize);
+                    if permitted > 0 {
+                        if writer.write_all(&data[..permitted]).is_err() {
+                            return Ok(0);
+                        }
+                        if limit.consume(permitted as u64).is_err() {
+                            if let Some(exceeded) = &self.transfer_limit_exceeded {
+                                exceeded.store(true, Ordering::Release);
+                            }
+                            return Ok(0);
+                        }
+                    }
+                    if data.len() as u64 > remaining {
+                        if let Some(exceeded) = &self.transfer_limit_exceeded {
+                            exceeded.store(true, Ordering::Release);
+                        }
+                        Ok(0)
+                    } else {
+                        Ok(data.len())
+                    }
+                } else {
+                    writer.write_all(data).map(|_| data.len()).or(Ok(0))
+                }
+            }
             None => Ok(0), // nothing more to receive, reader is done
         }
     }
@@ -321,6 +353,7 @@ pub struct Response {
     pub headers: pipe::Reader,
     pub body: pipe::Reader,
     pub upload_body: pipe::Writer,
+    pub transfer_limit_exceeded: Arc<AtomicBool>,
 }
 
 type Worker = (
@@ -361,6 +394,7 @@ pub fn new() -> Worker {
                     user_agent,
                     proxy_authenticate,
                     verbose,
+                    fetch_transfer_limit,
                     ssl_ca_info,
                     ssl_version,
                     ssl_verify,
@@ -483,6 +517,9 @@ pub fn new() -> Worker {
             }
             let (receive_data, receive_headers, send_body, mut receive_body) = {
                 let handler = handle.get_mut();
+                handler.transfer_limit.clone_from(&fetch_transfer_limit);
+                let transfer_limit_exceeded = Arc::new(AtomicBool::new(false));
+                handler.transfer_limit_exceeded = Some(transfer_limit_exceeded.clone());
                 let (send, receive_data) = pipe::unidirectional(1);
                 handler.send_data = Some(send);
                 let (send, receive_headers) = pipe::unidirectional(1);
@@ -490,6 +527,12 @@ pub fn new() -> Worker {
                 let (send_body, receive_body) = pipe::unidirectional(0);
                 (receive_data, receive_headers, send_body, receive_body)
             };
+            let transfer_limit_exceeded = handle
+                .get_mut()
+                .transfer_limit_exceeded
+                .as_ref()
+                .expect("transfer limit status was initialized")
+                .clone();
 
             let follow = follow.get_or_insert(follow_redirects);
             let may_follow_redirects =
@@ -517,6 +560,7 @@ pub fn new() -> Worker {
                     headers: receive_headers,
                     body: receive_data,
                     upload_body: send_body,
+                    transfer_limit_exceeded,
                 })
                 .is_err()
             {
@@ -782,6 +826,61 @@ mod resolve_location_path_tests {
             resolve_location_path(REQUEST_PATH, "../objects/info/packs"),
             "/original/repo/objects/info/packs",
             "relative Location paths should resolve against the request path without its existing query"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transfer_limit_tests {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use curl::easy::Handler as CurlHandler;
+
+    use crate::client::blocking_io::{FetchTransferLimit, http::curl::remote::Handler};
+
+    #[test]
+    fn curl_callback_stops_and_reports_an_exhausted_budget() {
+        let (writer, reader) = gix_features::io::pipe::unidirectional(1);
+        let limit = FetchTransferLimit::new(4);
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let callback_chunk = vec![b'x'; 16 * 1024];
+        let body_limit = limit.clone();
+        let body_exceeded = exceeded.clone();
+        let body_reader = std::thread::spawn(move || {
+            let mut body = super::super::CurlResponseBody {
+                inner: reader,
+                transfer_limit: Some(body_limit),
+                transfer_limit_exceeded: body_exceeded,
+            };
+            let mut output = Vec::new();
+            let error = std::io::Read::read_to_end(&mut body, &mut output)
+                .expect_err("curl must report the exhausted response budget");
+            (output, error)
+        });
+        let mut handler = Handler {
+            send_data: Some(writer),
+            transfer_limit: Some(limit.clone()),
+            transfer_limit_exceeded: Some(exceeded.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            CurlHandler::write(&mut handler, &callback_chunk).unwrap(),
+            0
+        );
+        drop(handler);
+
+        let (output, error) = body_reader.join().expect("response reader exits");
+
+        assert_eq!(output, b"xxxx");
+        assert_eq!(limit.consumed_bytes(), 4);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|source| source
+                    .downcast_ref::<crate::client::blocking_io::FetchTransferLimitExceeded>())
+                .map(|source| source.limit_bytes),
+            Some(4)
         );
     }
 }

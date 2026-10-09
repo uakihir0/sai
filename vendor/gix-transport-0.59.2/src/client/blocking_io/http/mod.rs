@@ -186,6 +186,9 @@ pub struct Options {
     pub http_version: Option<HttpVersion>,
     /// Backend specific options, if available.
     pub backend: Option<Arc<Mutex<dyn Any + Send + Sync + 'static>>>,
+    /// A per-fetch response body byte budget, when supplied by a package client.
+    #[doc(hidden)]
+    pub fetch_transfer_limit: Option<blocking_io::FetchTransferLimit>,
 }
 
 impl Default for Options {
@@ -207,6 +210,7 @@ impl Default for Options {
             ssl_verify: true,
             http_version: None,
             backend: None,
+            fetch_transfer_limit: None,
         }
     }
 }
