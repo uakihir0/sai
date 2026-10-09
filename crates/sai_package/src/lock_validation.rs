@@ -479,7 +479,7 @@ fn valid_commit(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn valid_checksum(value: &str) -> bool {
+pub(crate) fn valid_checksum(value: &str) -> bool {
     value.strip_prefix("sai1:").is_some_and(|digest| {
         digest.len() == 64
             && digest

@@ -1,5 +1,6 @@
 //! Bounded Git release-tag listing and locked-source fetching.
 
+use std::collections::BTreeSet;
 use std::error::Error as StdError;
 use std::ffi::OsString;
 use std::fmt;
@@ -18,8 +19,8 @@ use crate::git_tree::{
     GitPackageArtifactChecksum, GitPackageFile, GitPackageSourceTree, GitTreeReadError,
     GitTreeReader,
 };
-use crate::lock::{LockPackage, LockPackageField};
-use crate::lock_validation::canonical_git_url;
+use crate::lock::{LockPackage, LockPackageField, LockSource};
+use crate::lock_validation::{canonical_git_url, valid_checksum};
 use crate::manifest::PackageParseOutput;
 use crate::mvs::MvsPackageVersion;
 #[cfg(not(test))]
@@ -28,7 +29,7 @@ use crate::package_cache::{
     PackageCache, PackageCacheError, create_staging_activity_lock, release_staging_activity_lock,
     staging_activity_lock_path,
 };
-use crate::package_path::DependencyPackagePath;
+use crate::package_path::{ContentPackagePath, DependencyPackagePath};
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, build_resolver_contract,
 };
@@ -86,6 +87,145 @@ impl ExpectedPackageChecksums {
             artifact_checksums,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LockedReleaseRequest {
+    url: Box<str>,
+    version: Version,
+    directory: Option<DependencyPackagePath>,
+    commit: gix::ObjectId,
+    checksums: ExpectedPackageChecksums,
+}
+
+fn locked_release_request(
+    package: &LockPackage,
+) -> Result<LockedReleaseRequest, GitRemoteReleaseFetchError> {
+    let mut source = None;
+    let mut directory = None;
+    let mut commit = None;
+    let mut has_checksum = false;
+    let mut has_wit_checksum = false;
+    let mut artifact_targets = BTreeSet::new();
+    for field in &package.fields {
+        match &field.value {
+            LockPackageField::Source(LockSource::Git(url)) => {
+                if source.replace(url.clone()).is_some() {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "source",
+                    ));
+                }
+            }
+            LockPackageField::Source(LockSource::Path(_)) => {
+                return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                    "source",
+                ));
+            }
+            LockPackageField::Directory(value) => {
+                if directory.replace(value.clone()).is_some() {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "directory",
+                    ));
+                }
+            }
+            LockPackageField::Commit(value) => {
+                if commit.replace(value.clone()).is_some() {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "commit",
+                    ));
+                }
+            }
+            LockPackageField::Checksum(value) => {
+                if std::mem::replace(&mut has_checksum, true) {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "checksum",
+                    ));
+                }
+                if !valid_checksum(value) {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "checksum",
+                    ));
+                }
+            }
+            LockPackageField::WitChecksum(value) => {
+                if std::mem::replace(&mut has_wit_checksum, true) {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "WIT checksum",
+                    ));
+                }
+                if !valid_checksum(value) {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "WIT checksum",
+                    ));
+                }
+            }
+            LockPackageField::Artifact { target, checksum } => {
+                if !valid_checksum(checksum) {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "artifact checksum",
+                    ));
+                }
+                if !crate::validation::is_component_target(target) {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "artifact target",
+                    ));
+                }
+                if !artifact_targets.insert(target.as_ref()) {
+                    return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                        "artifact target",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let url = source.ok_or(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+        "Git source",
+    ))?;
+    let canonical_url = canonical_git_url(&url)
+        .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("source"))?;
+    if canonical_url != url.as_ref() {
+        return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+            "source",
+        ));
+    }
+    let directory = if let Some(value) = directory.as_deref() {
+        ContentPackagePath::parse(value)
+            .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("directory"))?;
+        Some(
+            DependencyPackagePath::parse(value)
+                .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("directory"))?,
+        )
+    } else {
+        None
+    };
+    if !artifact_targets.is_empty() && !has_wit_checksum {
+        return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+            "WIT checksum",
+        ));
+    }
+    let commit_text = commit.ok_or(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+        "commit",
+    ))?;
+    let commit = gix::ObjectId::from_hex(commit_text.as_bytes())
+        .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("commit"))?;
+    if commit.to_hex() != commit_text.as_ref() {
+        return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+            "commit",
+        ));
+    }
+    let checksums = ExpectedPackageChecksums::from_lock_package(package).ok_or(
+        GitRemoteReleaseFetchError::InvalidLockedPackageField("source checksum"),
+    )?;
+
+    Ok(LockedReleaseRequest {
+        url,
+        version: package.version.clone(),
+        directory,
+        commit,
+        checksums,
+    })
 }
 
 /// The checksum kind named by a locked-content mismatch.
@@ -364,6 +504,8 @@ impl StdError for GitRemoteReleaseContractError {
 /// Errors while fetching, peeling, and checking one remote release tag.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitRemoteReleaseFetchError {
+    /// A package entry passed to the lock-aware fetch API has invalid fields.
+    InvalidLockedPackageField(&'static str),
     /// The URL is not a supported secure SAI Git URL.
     InvalidGitUrl,
     /// The package directory or release tag does not belong to its namespace.
@@ -421,6 +563,7 @@ impl GitRemoteReleaseFetchError {
     /// Return the user-facing diagnostic code for this failure.
     pub const fn diagnostic_code(&self) -> sai_diagnostics::Code {
         match self {
+            Self::InvalidLockedPackageField(_) => sai_diagnostics::Code::LockCorrupt,
             Self::InvalidGitUrl => sai_diagnostics::Code::UnsupportedGitUrl,
             Self::InvalidPackageDirectory => sai_diagnostics::Code::InvalidPackagePath,
             Self::TemporaryRepository | Self::RemoteConfiguration | Self::FetchFailed => {
@@ -475,6 +618,9 @@ impl GitRemoteReleaseFetchError {
 impl fmt::Display for GitRemoteReleaseFetchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidLockedPackageField(field) => {
+                write!(formatter, "lock package has an invalid {field} field")
+            }
             Self::InvalidGitUrl => formatter.write_str("Git URL is not supported"),
             Self::InvalidPackageDirectory => {
                 formatter.write_str("Git release tag is outside the package tag namespace")
@@ -648,6 +794,24 @@ pub fn fetch_locked_release_tree(
         locked_commit,
         expected_checksums,
         &transfer_limit,
+    )
+}
+
+/// Fetch one Git package directly from its validated lock entry.
+///
+/// The caller must run lock syntax and semantic validation first. The fetched
+/// commit, source tree, WIT tree, and complete artifact checksum set are
+/// verified before the release is returned.
+pub fn fetch_locked_package_tree(
+    package: &LockPackage,
+) -> Result<FetchedGitRelease, GitRemoteReleaseFetchError> {
+    let request = locked_release_request(package)?;
+    fetch_locked_release_tree(
+        &request.url,
+        &request.version,
+        request.directory.as_ref(),
+        &request.commit,
+        &request.checksums,
     )
 }
 
@@ -1333,6 +1497,7 @@ fn credential_key(subsection: Option<&BStr>, value_name: &[u8]) -> BString {
 
 struct TemporaryGitDirectory {
     path: PathBuf,
+    cache_root: PathBuf,
     activity_lock_path: PathBuf,
     activity_lock: Option<File>,
 }
@@ -1341,7 +1506,8 @@ impl TemporaryGitDirectory {
     fn create() -> Result<Self, ()> {
         #[cfg(test)]
         {
-            Self::create_in(&std::env::temp_dir())
+            let temp_dir = std::env::temp_dir();
+            Self::create_in(&temp_dir, &temp_dir)
         }
         #[cfg(not(test))]
         {
@@ -1353,10 +1519,10 @@ impl TemporaryGitDirectory {
 
     fn create_with_cache(cache: &PackageCache) -> Result<Self, ()> {
         cache.cleanup_stale_temporary_directories();
-        Self::create_in(cache.temporary_directory())
+        Self::create_in(cache.temporary_directory(), cache.root())
     }
 
-    fn create_in(parent: &Path) -> Result<Self, ()> {
+    fn create_in(parent: &Path, cache_root: &Path) -> Result<Self, ()> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         for _ in 0..128 {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -1366,7 +1532,8 @@ impl TemporaryGitDirectory {
                 std::process::id()
             ));
             let activity_lock_path = staging_activity_lock_path(&path);
-            let activity_lock = match create_staging_activity_lock(&activity_lock_path) {
+            let activity_lock = match create_staging_activity_lock(&activity_lock_path, cache_root)
+            {
                 Ok(lock) => lock,
                 Err(PackageCacheError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::AlreadyExists =>
@@ -1379,15 +1546,26 @@ impl TemporaryGitDirectory {
                 Ok(()) => {
                     return Ok(Self {
                         path,
+                        cache_root: cache_root.to_path_buf(),
                         activity_lock_path,
                         activity_lock: Some(activity_lock),
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    release_staging_activity_lock(&activity_lock_path, activity_lock, true);
+                    release_staging_activity_lock(
+                        &activity_lock_path,
+                        activity_lock,
+                        true,
+                        cache_root,
+                    );
                 }
                 Err(_) => {
-                    release_staging_activity_lock(&activity_lock_path, activity_lock, true);
+                    release_staging_activity_lock(
+                        &activity_lock_path,
+                        activity_lock,
+                        true,
+                        cache_root,
+                    );
                     return Err(());
                 }
             }
@@ -1412,13 +1590,14 @@ fn create_temporary_directory(path: &Path) -> std::io::Result<()> {
 
 impl Drop for TemporaryGitDirectory {
     fn drop(&mut self) {
-        let removed = match fs::remove_dir_all(&self.path) {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
+        let removed = crate::package_cache::remove_tree_at_path(&self.path, &self.cache_root);
         if let Some(lock) = self.activity_lock.take() {
-            release_staging_activity_lock(&self.activity_lock_path, lock, removed);
+            release_staging_activity_lock(
+                &self.activity_lock_path,
+                lock,
+                removed,
+                &self.cache_root,
+            );
         }
     }
 }
@@ -2279,6 +2458,237 @@ mod tests {
         assert!(fetched.tag_missing());
         assert_eq!(fetched.commit_id(), &remote.commit_id);
         assert_eq!(fetched.source_tree().checksum, checksum);
+    }
+
+    #[test]
+    fn builds_locked_fetch_request_from_a_validated_lock_package() {
+        let commit = gix::ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567")
+            .expect("valid SHA-1 commit");
+        let source_checksum: Box<str> = format!("sai1:{}", "1".repeat(64)).into();
+        let wit_checksum: Box<str> = format!("sai1:{}", "2".repeat(64)).into();
+        let artifact_checksum: Box<str> = format!("sai1:{}", "3".repeat(64)).into();
+        let package = crate::lock::LockPackage {
+            package: "acme:sample".into(),
+            version: crate::version::Version::parse("1.2.3").unwrap(),
+            fields: [
+                crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                    "https://example.com/acme/sample.git".into(),
+                )),
+                crate::lock::LockPackageField::Directory("packages/sample".into()),
+                crate::lock::LockPackageField::Commit(commit.to_hex().to_string().into()),
+                crate::lock::LockPackageField::Checksum(source_checksum.clone()),
+                crate::lock::LockPackageField::WitChecksum(wit_checksum.clone()),
+                crate::lock::LockPackageField::Artifact {
+                    target: "wasm32-wasi".into(),
+                    checksum: artifact_checksum.clone(),
+                },
+            ]
+            .into_iter()
+            .map(|value| crate::manifest::Spanned { value, span: 0..0 })
+            .collect(),
+        };
+
+        let request = super::locked_release_request(&package).unwrap();
+
+        assert_eq!(request.url.as_ref(), "https://example.com/acme/sample.git");
+        assert_eq!(request.version.to_string(), "1.2.3");
+        assert_eq!(
+            request.directory.as_ref().map(|path| path.as_str()),
+            Some("packages/sample")
+        );
+        assert_eq!(request.commit, commit);
+        assert_eq!(request.checksums.source_checksum, source_checksum);
+        assert_eq!(request.checksums.wit_checksum, Some(wit_checksum));
+        assert_eq!(
+            request.checksums.artifact_checksums,
+            [super::ExpectedArtifactChecksum {
+                target: "wasm32-wasi".into(),
+                checksum: artifact_checksum,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_locked_checksums_before_fetching() {
+        let valid_checksum: Box<str> = format!("sai1:{}", "1".repeat(64)).into();
+        let mut invalid_source_fields = vec![
+            crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                "https://example.com/acme/sample.git".into(),
+            )),
+            crate::lock::LockPackageField::Commit(
+                "0123456789abcdef0123456789abcdef01234567".into(),
+            ),
+            crate::lock::LockPackageField::Checksum("sai1:bad".into()),
+        ];
+        let mut invalid_wit_fields = vec![
+            crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                "https://example.com/acme/sample.git".into(),
+            )),
+            crate::lock::LockPackageField::Commit(
+                "0123456789abcdef0123456789abcdef01234567".into(),
+            ),
+            crate::lock::LockPackageField::Checksum(valid_checksum.clone()),
+            crate::lock::LockPackageField::WitChecksum("sai1:bad".into()),
+        ];
+        let mut invalid_artifact_fields = vec![
+            crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                "https://example.com/acme/sample.git".into(),
+            )),
+            crate::lock::LockPackageField::Commit(
+                "0123456789abcdef0123456789abcdef01234567".into(),
+            ),
+            crate::lock::LockPackageField::Checksum(valid_checksum),
+            crate::lock::LockPackageField::Artifact {
+                target: "wasm32-wasi".into(),
+                checksum: "sai1:bad".into(),
+            },
+        ];
+        let cases = [
+            (&mut invalid_source_fields, "checksum"),
+            (&mut invalid_wit_fields, "WIT checksum"),
+            (&mut invalid_artifact_fields, "artifact checksum"),
+        ];
+
+        for (fields, field_name) in cases {
+            let package = crate::lock::LockPackage {
+                package: "acme:sample".into(),
+                version: crate::version::Version::parse("1.2.3").unwrap(),
+                fields: fields
+                    .drain(..)
+                    .map(|value| crate::manifest::Spanned { value, span: 0..0 })
+                    .collect(),
+            };
+
+            let error = super::fetch_locked_package_tree(&package).unwrap_err();
+
+            assert_eq!(
+                error,
+                GitRemoteReleaseFetchError::InvalidLockedPackageField(field_name)
+            );
+            assert_eq!(error.diagnostic_code(), sai_diagnostics::Code::LockCorrupt);
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_locked_fields_before_fetching() {
+        let valid_checksum: Box<str> = format!("sai1:{}", "1".repeat(64)).into();
+        let commit: Box<str> = "0123456789abcdef0123456789abcdef01234567".into();
+        let cases = [
+            (
+                vec![
+                    crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                        "https://EXAMPLE.com/acme/sample.git".into(),
+                    )),
+                    crate::lock::LockPackageField::Commit(commit.clone()),
+                    crate::lock::LockPackageField::Checksum(valid_checksum.clone()),
+                ],
+                "source",
+            ),
+            (
+                vec![
+                    crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                        "https://example.com/acme/sample.git".into(),
+                    )),
+                    crate::lock::LockPackageField::Directory("out/build".into()),
+                    crate::lock::LockPackageField::Commit(commit.clone()),
+                    crate::lock::LockPackageField::Checksum(valid_checksum.clone()),
+                ],
+                "directory",
+            ),
+            (
+                vec![
+                    crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                        "https://example.com/acme/sample.git".into(),
+                    )),
+                    crate::lock::LockPackageField::Commit(commit),
+                    crate::lock::LockPackageField::Checksum(valid_checksum.clone()),
+                    crate::lock::LockPackageField::Artifact {
+                        target: "wasm32-wasi".into(),
+                        checksum: valid_checksum.clone(),
+                    },
+                ],
+                "WIT checksum",
+            ),
+        ];
+
+        for (fields, field_name) in cases {
+            let package = crate::lock::LockPackage {
+                package: "acme:sample".into(),
+                version: crate::version::Version::parse("1.2.3").unwrap(),
+                fields: fields
+                    .into_iter()
+                    .map(|value| crate::manifest::Spanned { value, span: 0..0 })
+                    .collect(),
+            };
+
+            let error = super::fetch_locked_package_tree(&package).unwrap_err();
+
+            assert_eq!(
+                error,
+                GitRemoteReleaseFetchError::InvalidLockedPackageField(field_name)
+            );
+            assert_eq!(error.diagnostic_code(), sai_diagnostics::Code::LockCorrupt);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_lock_entries_before_fetching() {
+        let package = crate::lock::LockPackage {
+            package: "acme:sample".into(),
+            version: crate::version::Version::parse("1.2.3").unwrap(),
+            fields: [crate::lock::LockPackageField::Source(
+                crate::lock::LockSource::Path("vendor/sample".into()),
+            )]
+            .into_iter()
+            .map(|value| crate::manifest::Spanned { value, span: 0..0 })
+            .collect(),
+        };
+
+        let error = super::locked_release_request(&package).unwrap_err();
+
+        assert_eq!(
+            error,
+            GitRemoteReleaseFetchError::InvalidLockedPackageField("source")
+        );
+        assert_eq!(error.diagnostic_code(), sai_diagnostics::Code::LockCorrupt);
+    }
+
+    #[test]
+    fn rejects_duplicate_locked_artifact_targets_before_fetching() {
+        let checksum: Box<str> = format!("sai1:{}", "1".repeat(64)).into();
+        let fields = [
+            crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
+                "https://example.com/acme/sample.git".into(),
+            )),
+            crate::lock::LockPackageField::Commit(
+                "0123456789abcdef0123456789abcdef01234567".into(),
+            ),
+            crate::lock::LockPackageField::Checksum(checksum.clone()),
+            crate::lock::LockPackageField::Artifact {
+                target: "wasm32-wasi".into(),
+                checksum: checksum.clone(),
+            },
+            crate::lock::LockPackageField::Artifact {
+                target: "wasm32-wasi".into(),
+                checksum,
+            },
+        ]
+        .into_iter()
+        .map(|value| crate::manifest::Spanned { value, span: 0..0 })
+        .collect();
+        let package = crate::lock::LockPackage {
+            package: "acme:sample".into(),
+            version: crate::version::Version::parse("1.2.3").unwrap(),
+            fields,
+        };
+
+        let error = super::locked_release_request(&package).unwrap_err();
+
+        assert_eq!(
+            error,
+            GitRemoteReleaseFetchError::InvalidLockedPackageField("artifact target")
+        );
+        assert_eq!(error.diagnostic_code(), sai_diagnostics::Code::LockCorrupt);
     }
 
     #[test]

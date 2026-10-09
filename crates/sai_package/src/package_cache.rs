@@ -379,7 +379,7 @@ impl PackageCache {
         let destination = cache_record_slot_path(target, destination_slot);
         let bytes = encode_cache_record(magic, next_generation, fields);
 
-        let staging = StagingDirectory::create(&self.temporary_directory)?;
+        let staging = StagingDirectory::create(&self.temporary_directory, &self.root)?;
         let staged_record = staging.path().join("record");
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -403,11 +403,16 @@ impl PackageCache {
 
         if path_exists_without_following(&destination)? {
             #[cfg(windows)]
-            fs::remove_file(&destination).map_err(|source| PackageCacheError::Io {
-                operation: "replace inactive package cache record slot",
-                path: destination.clone(),
-                source,
-            })?;
+            if !remove_file_at_path(&destination, &self.root) {
+                return Err(PackageCacheError::Io {
+                    operation: "replace inactive package cache record slot",
+                    path: destination.clone(),
+                    source: io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "cache record could not be removed through its verified parent",
+                    ),
+                });
+            }
         }
         fs::rename(&staged_record, &destination).map_err(|source| PackageCacheError::Io {
             operation: "publish package cache record",
@@ -439,7 +444,7 @@ impl PackageCache {
             });
         }
 
-        let mut staging = StagingDirectory::create(&self.temporary_directory)?;
+        let mut staging = StagingDirectory::create(&self.temporary_directory, &self.root)?;
         for source_file in &files {
             write_source_file(staging.path(), source_file)?;
         }
@@ -476,7 +481,7 @@ impl PackageCache {
             });
         }
         if let Err(error) = seal_published_source_directory(&target) {
-            let _ = remove_tree_at_path(&target);
+            let _ = remove_tree_at_path(&target, &self.root);
             return Err(error);
         }
         staging.mark_published();
@@ -626,7 +631,7 @@ impl PackageCache {
                             // Claim the marker name atomically before removing a
                             // legacy directory whose old writer is no longer
                             // running. This coordinates cleaners and new writers.
-                            match create_staging_activity_lock(&activity_path) {
+                            match create_staging_activity_lock(&activity_path, &self.root) {
                                 Ok(lock) => (lock, true),
                                 Err(PackageCacheError::Io { source, .. })
                                     if source.kind() == io::ErrorKind::AlreadyExists =>
@@ -643,8 +648,8 @@ impl PackageCache {
                 {
                     continue;
                 }
-                let removed = remove_tree_at_path(&path);
-                release_staging_activity_lock(&activity_path, activity_lock, removed);
+                let removed = remove_tree_at_path(&path, &self.root);
+                release_staging_activity_lock(&activity_path, activity_lock, removed, &self.root);
                 continue;
             }
 
@@ -666,7 +671,7 @@ impl PackageCache {
             };
             let orphaned = matches!(path_exists_without_following(&staging_path), Ok(false))
                 && is_stale_temporary_path(&path, now);
-            release_staging_activity_lock(&path, activity_lock, orphaned);
+            release_staging_activity_lock(&path, activity_lock, orphaned, &self.root);
         }
     }
 }
@@ -1076,7 +1081,7 @@ fn create_private_directory(path: &Path) -> Result<(), PackageCacheError> {
     set_private_directory_permissions(path)
 }
 
-fn create_staging_directory(path: &Path) -> Result<(), PackageCacheError> {
+fn create_staging_directory(path: &Path, cache_root: &Path) -> Result<(), PackageCacheError> {
     let mut builder = fs::DirBuilder::new();
     set_new_directory_mode(&mut builder);
     builder
@@ -1087,13 +1092,16 @@ fn create_staging_directory(path: &Path) -> Result<(), PackageCacheError> {
             source,
         })?;
     if let Err(error) = set_private_directory_permissions(path) {
-        let _ = fs::remove_dir(path);
+        let _ = remove_tree_at_path(path, cache_root);
         return Err(error);
     }
     Ok(())
 }
 
-pub(crate) fn create_staging_activity_lock(path: &Path) -> Result<File, PackageCacheError> {
+pub(crate) fn create_staging_activity_lock(
+    path: &Path,
+    cache_root: &Path,
+) -> Result<File, PackageCacheError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     set_new_file_mode(&mut options);
@@ -1105,7 +1113,7 @@ pub(crate) fn create_staging_activity_lock(path: &Path) -> Result<File, PackageC
     })?;
     if let Err(source) = acquire_platform_lock(&file) {
         drop(file);
-        let _ = fs::remove_file(path);
+        let _ = remove_file_at_path(path, cache_root);
         return Err(PackageCacheError::Io {
             operation: "lock package cache staging directory",
             path: path.to_path_buf(),
@@ -1245,20 +1253,28 @@ pub(crate) fn staging_activity_lock_path(staging_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub(crate) fn release_staging_activity_lock(path: &Path, lock: File, remove_marker: bool) {
+pub(crate) fn release_staging_activity_lock(
+    path: &Path,
+    lock: File,
+    remove_marker: bool,
+    cache_root: &Path,
+) {
+    let marker_parent = remove_marker
+        .then(|| open_parent_at_boundary(path, cache_root))
+        .flatten();
+
     #[cfg(unix)]
-    if remove_marker {
-        let _ = fs::remove_file(path);
+    if let Some((parent, name)) = &marker_parent {
+        let _ = remove_file_from_parent(parent, name);
     }
 
     drop(lock);
 
     #[cfg(not(unix))]
-    if remove_marker {
-        // Windows does not allow unlinking an open marker. The path remains
-        // present until after the exclusive handle is released, so a new
-        // writer cannot claim this staging name in the gap.
-        let _ = fs::remove_file(path);
+    if let Some((parent, name)) = &marker_parent {
+        // Windows does not allow unlinking an open marker. Keep the verified
+        // parent capability while releasing the exclusive handle.
+        let _ = remove_file_from_parent(parent, name);
     }
 }
 
@@ -1849,7 +1865,10 @@ fn open_cached_source_root(root: &Path) -> Result<CachedSourceRoot, PackageCache
             });
         }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if metadata.file_type().is_symlink()
+        || is_windows_directory_reparse_point(&metadata)
+        || !metadata.is_dir()
+    {
         return Ok(CachedSourceRoot::Corrupt);
     }
     let root_directory = match source_directory.open_dir(&root_name) {
@@ -1928,7 +1947,10 @@ fn open_cache_layout_directory(
             path: path.to_path_buf(),
             source,
         })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if metadata.file_type().is_symlink()
+        || is_windows_directory_reparse_point(&metadata)
+        || !metadata.is_dir()
+    {
         return Err(PackageCacheError::Io {
             operation: "validate package source cache directory",
             path: path.to_path_buf(),
@@ -2621,18 +2643,20 @@ fn writable_capability_permissions(
 
 struct StagingDirectory {
     path: PathBuf,
+    cache_root: PathBuf,
     activity_lock_path: PathBuf,
     activity_lock: Option<File>,
     published: bool,
 }
 
 impl StagingDirectory {
-    fn create(parent: &Path) -> Result<Self, PackageCacheError> {
+    fn create(parent: &Path, cache_root: &Path) -> Result<Self, PackageCacheError> {
         for _ in 0..32 {
             let id = NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!("source-{}-{id}", std::process::id()));
             let activity_lock_path = staging_activity_lock_path(&path);
-            let activity_lock = match create_staging_activity_lock(&activity_lock_path) {
+            let activity_lock = match create_staging_activity_lock(&activity_lock_path, cache_root)
+            {
                 Ok(file) => file,
                 Err(PackageCacheError::Io { source, .. })
                     if source.kind() == io::ErrorKind::AlreadyExists =>
@@ -2641,10 +2665,11 @@ impl StagingDirectory {
                 }
                 Err(error) => return Err(error),
             };
-            match create_staging_directory(&path) {
+            match create_staging_directory(&path, cache_root) {
                 Ok(()) => {
                     return Ok(Self {
                         path,
+                        cache_root: cache_root.to_path_buf(),
                         activity_lock_path,
                         activity_lock: Some(activity_lock),
                         published: false,
@@ -2653,12 +2678,20 @@ impl StagingDirectory {
                 Err(PackageCacheError::Io { source, .. })
                     if source.kind() == io::ErrorKind::AlreadyExists =>
                 {
-                    drop(activity_lock);
-                    let _ = fs::remove_file(activity_lock_path);
+                    release_staging_activity_lock(
+                        &activity_lock_path,
+                        activity_lock,
+                        true,
+                        cache_root,
+                    );
                 }
                 Err(error) => {
-                    drop(activity_lock);
-                    let _ = fs::remove_file(activity_lock_path);
+                    release_staging_activity_lock(
+                        &activity_lock_path,
+                        activity_lock,
+                        true,
+                        cache_root,
+                    );
                     return Err(error);
                 }
             }
@@ -2700,7 +2733,12 @@ impl StagingDirectory {
 
     fn release_activity_lock(&mut self, remove_marker: bool) {
         if let Some(lock) = self.activity_lock.take() {
-            release_staging_activity_lock(&self.activity_lock_path, lock, remove_marker);
+            release_staging_activity_lock(
+                &self.activity_lock_path,
+                lock,
+                remove_marker,
+                &self.cache_root,
+            );
         }
     }
 
@@ -2715,7 +2753,7 @@ impl Drop for StagingDirectory {
         if self.published {
             return;
         }
-        let removed = remove_tree_at_path(&self.path);
+        let removed = remove_tree_at_path(&self.path, &self.cache_root);
         self.release_activity_lock(removed);
     }
 }
@@ -2799,55 +2837,84 @@ fn make_tree_read_only(root: &Path) -> Result<(), PackageCacheError> {
     set_read_only_directory_permissions(root)
 }
 
-fn remove_tree_at_path(root: &Path) -> bool {
-    let (Some(parent_path), Some(name)) = (root.parent(), root.file_name()) else {
+pub(crate) fn remove_tree_at_path(root: &Path, boundary: &Path) -> bool {
+    let Some((parent, name)) = open_parent_at_boundary(root, boundary) else {
         return false;
     };
-    match fs::symlink_metadata(parent_path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        _ => return false,
-    }
-    let Ok(parent) = CapabilityDir::open_ambient_dir(parent_path, ambient_authority()) else {
-        return false;
-    };
-    match fs::symlink_metadata(parent_path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        _ => return false,
-    }
-    let current_parent = match CapabilityDir::open_ambient_dir(parent_path, ambient_authority()) {
-        Ok(parent) => parent,
-        Err(_) => return false,
-    };
-    if !same_cached_directories(&parent, &current_parent).unwrap_or(false) {
-        return false;
-    }
 
-    let metadata = match parent.symlink_metadata(name) {
+    let metadata = match parent.symlink_metadata(&name) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
         Err(_) => return false,
     };
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        if make_capability_tree_removable(&parent, name, root).is_err() {
+    if metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && !is_windows_directory_reparse_point(&metadata)
+    {
+        if make_capability_tree_removable(&parent, &name, root).is_err() {
             return false;
         }
-        parent.remove_dir_all(name).is_ok()
+        parent.remove_dir_all(&name).is_ok()
     } else if is_windows_directory_reparse_point(&metadata) {
-        parent.remove_dir(name).is_ok()
+        parent.remove_dir(&name).is_ok()
     } else if metadata.is_file() {
-        if let Ok(file) = open_cached_source_file(&parent, name) {
+        if let Ok(file) = open_cached_source_file(&parent, &name) {
             if let Ok(opened_metadata) = file.metadata()
-                && cached_file_entry_matches(&parent, name, &file).unwrap_or(false)
+                && cached_file_entry_matches(&parent, &name, &file).unwrap_or(false)
                 && is_single_link_file(Some(&file), &opened_metadata)
             {
                 let _ = set_writable_file_handle(&file, &opened_metadata, root);
             }
         }
         if metadata.is_dir() {
-            parent.remove_dir(name).is_ok()
+            parent.remove_dir(&name).is_ok()
         } else {
-            parent.remove_file(name).is_ok()
+            parent.remove_file(&name).is_ok()
         }
+    } else {
+        parent.remove_file(&name).is_ok()
+    }
+}
+
+fn open_parent_at_boundary(root: &Path, boundary: &Path) -> Option<(CapabilityDir, OsString)> {
+    let relative = root.strip_prefix(boundary).ok()?;
+    let mut components = relative.components().map(|component| match component {
+        Component::Normal(name) => Some(name),
+        _ => None,
+    });
+    let names = components.by_ref().collect::<Option<Vec<_>>>()?;
+    let (name, parents) = names.split_last()?;
+
+    // Treat the supplied root as the trust boundary. Every directory below it
+    // is opened relative to the preceding capability and checked for symlinks
+    // or reparse points before it can become a parent.
+    let mut parent = CapabilityDir::open_ambient_dir(boundary, ambient_authority()).ok()?;
+    let mut parent_path = boundary.to_path_buf();
+    for component in parents {
+        parent_path.push(component);
+        parent = open_cache_layout_directory(&parent, component, &parent_path).ok()?;
+    }
+
+    Some((parent, name.to_os_string()))
+}
+
+fn remove_file_at_path(path: &Path, boundary: &Path) -> bool {
+    let Some((parent, name)) = open_parent_at_boundary(path, boundary) else {
+        return false;
+    };
+    remove_file_from_parent(&parent, &name)
+}
+
+fn remove_file_from_parent(parent: &CapabilityDir, name: &OsStr) -> bool {
+    let metadata = match parent.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if is_windows_directory_reparse_point(&metadata) {
+        parent.remove_dir(name).is_ok()
+    } else if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        false
     } else {
         parent.remove_file(name).is_ok()
     }
@@ -3190,7 +3257,10 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            let _ = super::remove_tree_at_path(&self.0);
+            let Some(boundary) = self.0.parent() else {
+                return;
+            };
+            let _ = super::remove_tree_at_path(&self.0, boundary);
         }
     }
 
@@ -3784,7 +3854,8 @@ mod tests {
             .unwrap();
 
         let activity_path = super::staging_activity_lock_path(&staging);
-        let activity_lock = super::create_staging_activity_lock(&activity_path).unwrap();
+        let activity_lock =
+            super::create_staging_activity_lock(&activity_path, &cache.root).unwrap();
         cache.cleanup_stale_temporary_directories();
 
         assert!(staging.is_dir());
@@ -3802,7 +3873,8 @@ mod tests {
 
         let temp = TestDirectory::new("active-stale-temp");
         let cache = PackageCache::open(temp.path().join("cache")).unwrap();
-        let staging = super::StagingDirectory::create(&cache.temporary_directory).unwrap();
+        let staging =
+            super::StagingDirectory::create(&cache.temporary_directory, &cache.root).unwrap();
         let staging_path = staging.path().to_path_buf();
         let activity_path = staging.activity_lock_path.clone();
         let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
@@ -4670,7 +4742,7 @@ mod tests {
         super::set_read_only_path_permissions(&file).unwrap();
         super::set_read_only_directory_permissions(&root).unwrap();
 
-        assert!(super::remove_tree_at_path(&root));
+        assert!(super::remove_tree_at_path(&root, temp.path()));
         assert!(!root.exists());
     }
 
@@ -4692,13 +4764,72 @@ mod tests {
         symlink(&outside, &cache_parent_link).unwrap();
 
         assert!(!super::remove_tree_at_path(
-            &cache_parent_link.join("entry")
+            &cache_parent_link.join("entry"),
+            temp.path()
         ));
         assert!(outside_entry.is_dir());
         assert_eq!(
             fs::metadata(outside_file).unwrap().permissions().mode() & 0o777,
             0o444
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_a_symlinked_cache_layout_ancestor() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TestDirectory::new("readonly-cleanup-cache-ancestor-symlink");
+        let cache_root = temp.path().join("cache");
+        fs::create_dir(&cache_root).unwrap();
+        let outside = temp.path().join("outside");
+        let outside_source = outside.join("src");
+        let outside_entry = outside_source.join("entry");
+        fs::create_dir_all(&outside_entry).unwrap();
+        let outside_file = outside_entry.join("keep");
+        fs::write(&outside_file, b"outside").unwrap();
+        fs::set_permissions(&outside_file, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&outside_entry, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&outside_source, fs::Permissions::from_mode(0o555)).unwrap();
+        symlink(&outside, cache_root.join(super::CACHE_LAYOUT_VERSION)).unwrap();
+
+        assert!(!super::remove_tree_at_path(
+            &cache_root
+                .join(super::CACHE_LAYOUT_VERSION)
+                .join("src")
+                .join("entry"),
+            &cache_root
+        ));
+        assert_eq!(fs::read(&outside_file).unwrap(), b"outside");
+        assert_eq!(
+            fs::metadata(&outside_file).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_cleanup_refuses_a_symlinked_cache_layout_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDirectory::new("marker-cleanup-cache-ancestor-symlink");
+        let cache_root = temp.path().join("cache");
+        fs::create_dir(&cache_root).unwrap();
+        let outside = temp.path().join("outside");
+        let outside_tmp = outside.join("tmp");
+        fs::create_dir_all(&outside_tmp).unwrap();
+        let outside_marker = outside_tmp.join("source-1-2.lock");
+        fs::write(&outside_marker, b"outside marker").unwrap();
+        symlink(&outside, cache_root.join(super::CACHE_LAYOUT_VERSION)).unwrap();
+
+        assert!(!super::remove_file_at_path(
+            &cache_root
+                .join(super::CACHE_LAYOUT_VERSION)
+                .join("tmp")
+                .join("source-1-2.lock"),
+            &cache_root
+        ));
+        assert_eq!(fs::read(outside_marker).unwrap(), b"outside marker");
     }
 
     #[cfg(target_os = "macos")]
