@@ -3,6 +3,7 @@
 pub mod identity;
 pub mod lexer;
 pub mod lock;
+pub mod lock_graph_validation;
 pub mod lock_serialization;
 pub mod lock_validation;
 pub mod manifest;
