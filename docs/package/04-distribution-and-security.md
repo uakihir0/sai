@@ -165,10 +165,11 @@ There is one global package cache per user, shared by all projects and all toolc
 
 ### 4.4.4 Limits
 
-Fetched content is subject to fixed limits (N-G-51). They are not configurable, so that a package accepted on one host is accepted on every host (P8).
+Fetched content is subject to fixed limits (N-G-51). They are not configurable, so that a package accepted on one host is accepted on every host (P8). A `sai.package` manifest read from any source, including a local path source, is capped before parsing.
 
 | Limit | Value |
 |---|---|
+| size of one `sai.package` manifest | 16 MiB |
 | selected files in one package directory | 100,000 |
 | size of one file | 256 MiB |
 | total size of one package directory | 1 GiB |
@@ -176,7 +177,7 @@ Fetched content is subject to fixed limits (N-G-51). They are not configurable, 
 | path length, component length | 4096 bytes, 255 bytes ([03 §3.4.3](03-lock-file.md)) |
 | release tags considered in one listing | 100,000 |
 
-Exceeding a limit is the error `PACKAGE_TOO_LARGE`, naming the package, the limit, and the value reached. The fetch is aborted, and nothing is written to `src/`.
+Exceeding a limit is the error `PACKAGE_TOO_LARGE`, naming the package, the limit, and the value reached. For fetched content, the fetch is aborted and nothing is written to `src/`. A manifest over 16 MiB is rejected before parsing, and the reader consumes at most one byte beyond that limit to detect it.
 
 ### 4.4.5 Concurrency
 
@@ -486,7 +487,7 @@ Each entry is provisional until it is merged into [decisions.md](../design/decis
 | N-G-48 | Git transport details (protocol version, depth, filters, negotiation) are deliberately left to the implementation; only the Git configuration of §4.2.3 is honored (§4.3.1). | The result is fixed by object ids and lock checksums, so the freedom cannot affect output (P8); ignoring `insteadOf` and similar settings keeps sources explicit (P1). |
 | N-G-49 | The lock is authoritative after the first fetch: a release tag that no longer peels to the locked commit is `TAG_MOVED`; a deleted tag with an available commit is `TAG_MISSING`; replacing locked content under the same version needs approval in `sai update` (§4.3.3). | P5, P8: published versions are immutable; rewriting is visible and never silently accepted. |
 | N-G-50 | One global, content-addressed package cache per user, located by `SAI_CACHE_DIR` or the host's cache directory, with a versioned layout; `src/` and tag records are normative, other internal formats are deliberately private (§4.4.1). | P8: content-addressing makes sharing safe; a private internal format lets implementations evolve without breaking users. |
-| N-G-51 | Fixed, non-configurable size limits for fetched content: 100,000 files, 256 MiB per file, 1 GiB per package, 4 GiB per fetch, 4096/255-byte paths, 100,000 tags (`PACKAGE_TOO_LARGE`, §4.4.4). | P8: a package accepted on one host is accepted on all; protection against resource exhaustion (P5). |
+| N-G-51 | Fixed, non-configurable size limits: a 16 MiB `sai.package` manifest from any source; and for fetched content, 100,000 files, 256 MiB per file, 1 GiB per package, 4 GiB per fetch, 4096/255-byte paths, and 100,000 tags (`PACKAGE_TOO_LARGE`, §4.4.4). | P8: a package accepted on one host is accepted on all; protection against resource exhaustion (P5). |
 | N-G-52 | Dependents see artifact and hybrid packages only through the SAI view of their WIT, in both forms; the WIT generated from a hybrid package's source MUST equal its declared world (`HYBRID_WIT_MISMATCH`, §4.5.3). | P4, P8: switching forms under D-PKG-05 never changes whether a dependent type-checks. |
 | N-G-53 | There is no yanking in v0.1; broken releases are superseded by new versions; tags MUST NOT be deleted or moved (§4.6.2). | P8: resolution never depends on mutable remote metadata; MVS never picks a version nobody named. |
 | N-G-54 | The review has the headings Package, Source, Form, Capabilities, Supported, Not supported, Estimated contribution, Needs approval, Unused source clauses, in this order, with fixed JSON keys (§4.7.1). | P1, P5: costs, authority, and source selection of a dependency are visible before it is accepted (draft §75); a fixed schema serves agents and CI (P8). |
@@ -511,7 +512,7 @@ Each entry is provisional until it is merged into [decisions.md](../design/decis
 | `TAG_MOVED` | error | a release tag of a locked version peels to another commit than the lock records, or its content replacement was not approved (§4.3.3, §4.7.2) |
 | `TAG_MISSING` | warning | the release tag of a locked version no longer exists; the locked commit was used (§4.3.3) |
 | `CACHE_CORRUPT` | warning | a cached entry does not match its checksum and was removed (§4.4.2) |
-| `PACKAGE_TOO_LARGE` | error | fetched content exceeds a limit of §4.4.4 |
+| `PACKAGE_TOO_LARGE` | error | a package manifest or fetched content exceeds a limit of §4.4.4 |
 | `INVALID_ARTIFACT` | error | an artifact is not a valid Wasm component, or uses the wrong memory width (§4.5.2) |
 | `ARTIFACT_WIT_MISMATCH` | error | an artifact does not conform to the package's `export world` (§4.5.2) |
 | `HYBRID_WIT_MISMATCH` | error | the WIT generated from a hybrid package's source differs from its declared world (§4.5.3) |
