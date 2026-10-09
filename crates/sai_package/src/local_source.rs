@@ -3,31 +3,68 @@
 //! Git-backed package trees are resolved by a separate provider. This module
 //! handles local package directories without invoking external tools.
 
+use std::collections::BTreeMap;
 use std::fmt;
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+use rustix::fs::{CWD, Mode, OFlags, openat};
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+use std::os::unix::fs::MetadataExt;
+
 use crate::manifest::{
     MAX_PACKAGE_MANIFEST_BYTES, PackageParseOutput, PackageRole, parse_for_role,
 };
-use crate::package_path::DependencyPackagePath;
+use crate::mvs::MvsPackageVersion;
+use crate::package_path::{DependencyPackagePath, PackagePathError};
+use crate::resolver_source::{
+    ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
+    ResolverSourceSelection, validate_resolver_path_pins,
+};
+use crate::version::Version;
 
 /// A local package directory identified after filesystem path resolution.
 ///
-/// Equality compares canonical paths and is suitable for checking whether two
-/// local path pins name the same directory. The path is intentionally exposed
-/// only to loader code; callers should not include it in user-facing
-/// diagnostics because it may contain host-specific absolute paths. The
-/// manifest bytes are captured during `open`, so later parsing uses the file
-/// that was safely opened rather than reopening a mutable path.
+/// Equality compares the opened directory identity on supported Unix targets
+/// and the canonical path elsewhere. Dependency resolution is supported only
+/// on Unix targets where it can be anchored to an open directory handle.
+/// Other hosts fail closed because path-string identity cannot detect a
+/// replaced directory reliably. The path is intentionally exposed only to
+/// loader code; callers should not include it in user-facing diagnostics
+/// because it may contain host-specific absolute paths.
 #[derive(Clone)]
 pub struct LocalPackageDirectory {
     canonical_path: PathBuf,
     manifest_source: Arc<[u8]>,
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    directory: Arc<File>,
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    identity: LocalPackageDirectoryIdentity,
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalPackageDirectoryIdentity {
+    device: u64,
+    inode: u64,
 }
 
 /// A filesystem failure while resolving or reading a local package.
@@ -42,6 +79,8 @@ pub enum LocalPackageError {
         kind: io::ErrorKind,
     },
     NotDirectory,
+    DirectoryChanged,
+    PlatformNotSupported,
     MissingManifest,
     ManifestNotFile,
     ManifestTooLarge,
@@ -52,8 +91,45 @@ pub enum LocalPackageError {
 pub enum LocalPackageIoOperation {
     CanonicalizeDirectory,
     InspectDirectory,
+    ResolveDependency,
     OpenManifest,
     ReadManifest,
+}
+
+/// Local directories already read for concrete package versions.
+///
+/// A separate index can be used for each resolver load snapshot. Inserting
+/// the same version twice is idempotent when both entries resolve to the same
+/// directory, and rejects two different local directories for that version.
+#[derive(Clone, Debug, Default)]
+pub struct LocalPackageDirectoryIndex {
+    entries: BTreeMap<MvsPackageVersion, LocalPackageDirectory>,
+}
+
+/// A conflict while indexing local package directories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageDirectoryIndexError {
+    InvalidManifest(MvsPackageVersion),
+    MissingPackageHeader(MvsPackageVersion),
+    PackageVersionMismatch {
+        expected: Box<MvsPackageVersion>,
+        found_package: Box<str>,
+        found_version: Box<Version>,
+    },
+    ConflictingDirectories(MvsPackageVersion),
+}
+
+/// Failure to resolve a local filesystem path pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackagePathPinError {
+    UnsupportedGitTreeBase,
+    SourceBaseMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    MissingRequirerDirectory(MvsPackageVersion),
+    InvalidPath(PackagePathError),
+    Directory(LocalPackageError),
 }
 
 impl LocalPackageDirectory {
@@ -72,20 +148,46 @@ impl LocalPackageDirectory {
             operation: LocalPackageIoOperation::CanonicalizeDirectory,
             kind: error.kind(),
         })?;
-        let metadata = fs::metadata(&canonical_path).map_err(|error| LocalPackageError::Io {
-            operation: LocalPackageIoOperation::InspectDirectory,
-            kind: error.kind(),
-        })?;
-        if !metadata.is_dir() {
-            return Err(LocalPackageError::NotDirectory);
+
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            let directory = open_directory_from_cwd(
+                &canonical_path,
+                LocalPackageIoOperation::CanonicalizeDirectory,
+            )?;
+            let identity = directory_identity(&directory)?;
+            let manifest_source = read_manifest_from_directory(&directory)?;
+            Ok(Self {
+                canonical_path,
+                manifest_source,
+                directory: Arc::new(directory),
+                identity,
+            })
         }
 
-        let manifest_source = read_manifest(&canonical_path.join("sai.package"))?;
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let metadata =
+                fs::metadata(&canonical_path).map_err(|error| LocalPackageError::Io {
+                    operation: LocalPackageIoOperation::InspectDirectory,
+                    kind: error.kind(),
+                })?;
+            if !metadata.is_dir() {
+                return Err(LocalPackageError::NotDirectory);
+            }
+            let manifest_source = read_manifest(&canonical_path.join("sai.package"))?;
 
-        Ok(Self {
-            canonical_path,
-            manifest_source,
-        })
+            Ok(Self {
+                canonical_path,
+                manifest_source,
+            })
+        }
     }
 
     /// Resolves a dependency path relative to this package directory.
@@ -93,13 +195,55 @@ impl LocalPackageDirectory {
         &self,
         path: &DependencyPackagePath,
     ) -> Result<Self, LocalPackageError> {
-        Self::open(self.canonical_path.join(path.as_str()))
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            let directory = open_directory_relative(
+                &self.directory,
+                path.as_str(),
+                LocalPackageIoOperation::ResolveDependency,
+            )?;
+            let canonical_path = fs::canonicalize(self.canonical_path.join(path.as_str()))
+                .map_err(|error| LocalPackageError::Io {
+                    operation: LocalPackageIoOperation::CanonicalizeDirectory,
+                    kind: error.kind(),
+                })?;
+            let path_directory = open_directory_from_cwd(
+                &canonical_path,
+                LocalPackageIoOperation::CanonicalizeDirectory,
+            )?;
+            let identity = directory_identity(&directory)?;
+            if directory_identity(&path_directory)? != identity {
+                return Err(LocalPackageError::DirectoryChanged);
+            }
+            let manifest_source = read_manifest_from_directory(&directory)?;
+
+            Ok(Self {
+                canonical_path,
+                manifest_source,
+                directory: Arc::new(directory),
+                identity,
+            })
+        }
+
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let _ = path;
+            Err(LocalPackageError::PlatformNotSupported)
+        }
     }
 
-    /// Returns the absolute canonical directory for loader use.
+    /// Returns the canonical path spelling captured when this directory opened.
     ///
-    /// Avoid displaying this value in diagnostics; local paths are
-    /// host-specific and may reveal private filesystem layout.
+    /// The path may become stale if the directory is renamed. On supported
+    /// Unix targets, the open directory handle remains authoritative for
+    /// dependency resolution. Avoid displaying this value in diagnostics;
+    /// local paths are host-specific and may reveal private filesystem layout.
     pub fn path(&self) -> &Path {
         &self.canonical_path
     }
@@ -112,13 +256,183 @@ impl LocalPackageDirectory {
     }
 }
 
+impl LocalPackageDirectoryIndex {
+    /// Adds a directory after confirming its parsed header matches the version.
+    ///
+    /// This verifies syntax and header identity only; the caller remains
+    /// responsible for reporting all manifest diagnostics and validating
+    /// package semantics before resolver use.
+    pub fn insert(
+        &mut self,
+        package_version: MvsPackageVersion,
+        directory: LocalPackageDirectory,
+        role: PackageRole,
+    ) -> Result<(), LocalPackageDirectoryIndexError> {
+        let parsed = directory.parse_manifest(role);
+        if !parsed.is_syntax_valid() {
+            return Err(LocalPackageDirectoryIndexError::InvalidManifest(
+                package_version,
+            ));
+        }
+        let header = parsed.file().header.as_ref().ok_or_else(|| {
+            LocalPackageDirectoryIndexError::MissingPackageHeader(package_version.clone())
+        })?;
+        if header.value.identity.to_string() != package_version.package()
+            || header.value.version != *package_version.version()
+        {
+            return Err(LocalPackageDirectoryIndexError::PackageVersionMismatch {
+                expected: Box::new(package_version),
+                found_package: header.value.identity.to_string().into(),
+                found_version: Box::new(header.value.version.clone()),
+            });
+        }
+
+        match self.entries.get(&package_version) {
+            Some(existing) if existing == &directory => Ok(()),
+            Some(_) => Err(LocalPackageDirectoryIndexError::ConflictingDirectories(
+                package_version,
+            )),
+            None => {
+                self.entries.insert(package_version, directory);
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolves and canonicalizes a path pin relative to its requiring package.
+    ///
+    /// The pin's `relative_to` package must match its recorded requirer. A
+    /// Git-backed base is left to the Git-tree source provider.
+    pub fn canonicalize_path_pin(
+        &self,
+        pin: &ResolverPathPinSource,
+    ) -> Result<LocalPackageDirectory, LocalPackagePathPinError> {
+        let ResolverPackageSource::Path { relative_to, path } = &pin.source else {
+            return Err(LocalPackagePathPinError::UnsupportedGitTreeBase);
+        };
+        let expected = pin.requirer.package_version();
+        if relative_to != expected {
+            return Err(LocalPackagePathPinError::SourceBaseMismatch {
+                expected: Box::new(expected.clone()),
+                found: Box::new(relative_to.clone()),
+            });
+        }
+        let base = self.entries.get(relative_to).ok_or_else(|| {
+            LocalPackagePathPinError::MissingRequirerDirectory(relative_to.clone())
+        })?;
+        let path =
+            DependencyPackagePath::parse(path).map_err(LocalPackagePathPinError::InvalidPath)?;
+        base.resolve_dependency(&path)
+            .map_err(LocalPackagePathPinError::Directory)
+    }
+
+    /// Validates every path pin and returns the directory opened for the winner.
+    ///
+    /// Keeping the returned directory lets the caller parse the exact manifest
+    /// snapshot whose source identity was checked, instead of resolving the
+    /// winning path a second time after validation.
+    pub fn canonicalize_selection_path_pins(
+        &self,
+        selection: &ResolverSourceSelection,
+    ) -> Result<
+        Option<LocalPackageDirectory>,
+        ResolverPathPinValidationError<LocalPackageDirectory, LocalPackagePathPinError>,
+    > {
+        let mut winner = None;
+        validate_resolver_path_pins(selection, |pin| {
+            let directory = self.canonicalize_path_pin(pin)?;
+            if winner.is_none() {
+                winner = Some(directory.clone());
+            }
+            Ok(directory)
+        })?;
+        Ok(winner)
+    }
+}
+
 impl PartialEq for LocalPackageDirectory {
     fn eq(&self, other: &Self) -> bool {
-        self.canonical_path == other.canonical_path
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            self.identity == other.identity
+        }
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            self.canonical_path == other.canonical_path
+        }
     }
 }
 
 impl Eq for LocalPackageDirectory {}
+
+impl fmt::Display for LocalPackageDirectoryIndexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidManifest(package_version) => write!(
+                formatter,
+                "manifest for {}@{} is not syntactically valid",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::MissingPackageHeader(package_version) => write!(
+                formatter,
+                "manifest for {}@{} has no package header",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::PackageVersionMismatch {
+                expected,
+                found_package,
+                found_version,
+            } => write!(
+                formatter,
+                "expected {}@{}, found {}@{}",
+                expected.package(),
+                expected.version(),
+                found_package,
+                found_version
+            ),
+            Self::ConflictingDirectories(package_version) => write!(
+                formatter,
+                "multiple local directories were registered for {}@{}",
+                package_version.package(),
+                package_version.version()
+            ),
+        }
+    }
+}
+
+impl fmt::Display for LocalPackagePathPinError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedGitTreeBase => {
+                formatter.write_str("a Git-tree path pin needs the Git source provider")
+            }
+            Self::SourceBaseMismatch { expected, found } => write!(
+                formatter,
+                "path pin source base {}@{} does not match its requiring package {}@{}",
+                found.package(),
+                found.version(),
+                expected.package(),
+                expected.version()
+            ),
+            Self::MissingRequirerDirectory(package_version) => write!(
+                formatter,
+                "no local directory is registered for requiring package {}@{}",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::InvalidPath(error) => fmt::Display::fmt(error, formatter),
+            Self::Directory(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
 
 impl fmt::Display for LocalPackageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -133,6 +447,11 @@ impl fmt::Display for LocalPackageError {
                 )
             }
             Self::NotDirectory => formatter.write_str("local package source is not a directory"),
+            Self::DirectoryChanged => {
+                formatter.write_str("local package path changed while resolving its dependency")
+            }
+            Self::PlatformNotSupported => formatter
+                .write_str("this host cannot safely resolve a local package path dependency"),
             Self::MissingManifest => {
                 formatter.write_str("local package directory has no `sai.package` file")
             }
@@ -152,6 +471,7 @@ impl fmt::Display for LocalPackageIoOperation {
         let operation = match self {
             Self::CanonicalizeDirectory => "canonicalizing its directory",
             Self::InspectDirectory => "inspecting its directory",
+            Self::ResolveDependency => "resolving a dependency directory",
             Self::OpenManifest => "opening `sai.package`",
             Self::ReadManifest => "reading `sai.package`",
         };
@@ -168,7 +488,104 @@ impl fmt::Debug for LocalPackageDirectory {
 }
 
 impl std::error::Error for LocalPackageError {}
+impl std::error::Error for LocalPackageDirectoryIndexError {}
+impl std::error::Error for LocalPackagePathPinError {}
 
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn open_directory_from_cwd(
+    path: &Path,
+    operation: LocalPackageIoOperation,
+) -> Result<File, LocalPackageError> {
+    openat(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| map_directory_open_error(error.into(), operation))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn open_directory_relative(
+    base: &File,
+    path: &str,
+    operation: LocalPackageIoOperation,
+) -> Result<File, LocalPackageError> {
+    openat(
+        base,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| map_directory_open_error(error.into(), operation))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn map_directory_open_error(
+    error: io::Error,
+    operation: LocalPackageIoOperation,
+) -> LocalPackageError {
+    if error.kind() == io::ErrorKind::NotADirectory {
+        LocalPackageError::NotDirectory
+    } else {
+        LocalPackageError::Io {
+            operation,
+            kind: error.kind(),
+        }
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn directory_identity(file: &File) -> Result<LocalPackageDirectoryIdentity, LocalPackageError> {
+    let metadata = file.metadata().map_err(|error| LocalPackageError::Io {
+        operation: LocalPackageIoOperation::InspectDirectory,
+        kind: error.kind(),
+    })?;
+    if !metadata.is_dir() {
+        return Err(LocalPackageError::NotDirectory);
+    }
+    Ok(LocalPackageDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn read_manifest_from_directory(directory: &File) -> Result<Arc<[u8]>, LocalPackageError> {
+    let file = openat(
+        directory,
+        "sai.package",
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| map_manifest_open_error(error.into()))?;
+    read_manifest_file(file)
+}
+
+#[cfg(any(
+    not(unix),
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "redox"
+))]
 fn read_manifest(path: &Path) -> Result<Arc<[u8]>, LocalPackageError> {
     let file = open_manifest(path).map_err(|error| match error.kind() {
         io::ErrorKind::NotFound => LocalPackageError::MissingManifest,
@@ -177,6 +594,20 @@ fn read_manifest(path: &Path) -> Result<Arc<[u8]>, LocalPackageError> {
             kind,
         },
     })?;
+    read_manifest_file(file)
+}
+
+fn map_manifest_open_error(error: io::Error) -> LocalPackageError {
+    match error.kind() {
+        io::ErrorKind::NotFound => LocalPackageError::MissingManifest,
+        kind => LocalPackageError::Io {
+            operation: LocalPackageIoOperation::OpenManifest,
+            kind,
+        },
+    }
+}
+
+fn read_manifest_file(file: File) -> Result<Arc<[u8]>, LocalPackageError> {
     let metadata = file.metadata().map_err(|error| LocalPackageError::Io {
         operation: LocalPackageIoOperation::OpenManifest,
         kind: error.kind(),
@@ -201,11 +632,14 @@ fn read_manifest(path: &Path) -> Result<Arc<[u8]>, LocalPackageError> {
     Ok(Arc::from(source))
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    any(target_os = "espidf", target_os = "horizon", target_os = "redox")
+))]
 fn open_manifest(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    OpenOptions::new()
+    std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
@@ -223,9 +657,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::manifest::PackageRole;
+    use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::package_path::DependencyPackagePath;
+    use crate::resolver_source::{ResolverPackageSource, ResolverPathPinSource};
+    use crate::version::Version;
 
-    use super::{LocalPackageDirectory, LocalPackageError};
+    use super::{
+        LocalPackageDirectory, LocalPackageDirectoryIndex, LocalPackageDirectoryIndexError,
+        LocalPackageError, LocalPackagePathPinError,
+    };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -266,6 +706,14 @@ mod tests {
     const DEPENDENCY_MANIFEST: &[u8] = b"package acme:dependency @ 1.2.0\n\
         source \"src\"\n\
         targets { wasm32-core }\n";
+
+    fn package_version(package: &str, version: &str) -> MvsPackageVersion {
+        MvsPackageVersion::new(
+            package,
+            Version::parse(version).expect("valid package version"),
+        )
+        .expect("valid package identity")
+    }
 
     #[test]
     fn opens_absolute_package_directories_and_reads_manifests_by_role() {
@@ -409,6 +857,242 @@ mod tests {
         );
     }
 
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    )))]
+    #[test]
+    fn unsupported_hosts_fail_closed_for_local_dependency_resolution() {
+        let tree = TempTree::new();
+        let requiring = LocalPackageDirectory::open(tree.package("root", ROOT_MANIFEST))
+            .expect("open requiring package");
+        let path = DependencyPackagePath::parse("../dependency").expect("valid dependency path");
+
+        assert_eq!(
+            requiring.resolve_dependency(&path),
+            Err(LocalPackageError::PlatformNotSupported)
+        );
+    }
+
+    #[test]
+    fn local_directory_index_resolves_path_pins_from_the_recorded_requirer() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        let dependency_directory = tree.package("workspace/dependency", DEPENDENCY_MANIFEST);
+        let root_version = package_version("acme:root", "1.0.0");
+
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(root_directory).expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        let pin = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: root_version.clone(),
+                path: "../dependency".into(),
+            },
+            requirer: MvsRequirer::Root(root_version),
+            span: 12..36,
+        };
+
+        let resolved = index
+            .canonicalize_path_pin(&pin)
+            .expect("resolve local path pin");
+        assert_eq!(
+            resolved.path(),
+            fs::canonicalize(dependency_directory).expect("canonical dependency directory")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let root_version = package_version("acme:root", "1.0.0");
+            let root_directory = tree.path().join("workspace/root");
+            symlink(
+                tree.path().join("workspace/dependency"),
+                tree.path().join("dependency-alias"),
+            )
+            .expect("create dependency directory alias");
+            let alias_pin = ResolverPathPinSource {
+                source: ResolverPackageSource::Path {
+                    relative_to: root_version.clone(),
+                    path: "../../dependency-alias".into(),
+                },
+                requirer: MvsRequirer::Root(root_version),
+                span: 40..68,
+            };
+            let requiring = LocalPackageDirectory::open(root_directory)
+                .expect("open indexed requiring package");
+            let direct_pin_directory = requiring
+                .resolve_dependency(
+                    &DependencyPackagePath::parse("../dependency")
+                        .expect("valid direct package path"),
+                )
+                .expect("resolve direct package path");
+            let alias_pin_directory = index
+                .canonicalize_path_pin(&alias_pin)
+                .expect("resolve symlink path pin");
+            assert_eq!(direct_pin_directory, alias_pin_directory);
+        }
+    }
+
+    #[test]
+    fn local_directory_index_rejects_substituted_bases_and_sources() {
+        let tree = TempTree::new();
+        let root_version = package_version("acme:root", "1.0.0");
+        let other_version = package_version("acme:other", "1.0.0");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(tree.package("root", ROOT_MANIFEST))
+                    .expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+
+        let mismatched_base = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: other_version.clone(),
+                path: "../dependency".into(),
+            },
+            requirer: MvsRequirer::Root(root_version.clone()),
+            span: 0..1,
+        };
+        assert_eq!(
+            index.canonicalize_path_pin(&mismatched_base),
+            Err(LocalPackagePathPinError::SourceBaseMismatch {
+                expected: Box::new(root_version.clone()),
+                found: Box::new(other_version.clone()),
+            })
+        );
+
+        let git_tree_base = ResolverPathPinSource {
+            source: ResolverPackageSource::Git {
+                url: "https://example.test/repo".into(),
+                directory: None,
+            },
+            requirer: MvsRequirer::Package(other_version.clone()),
+            span: 1..2,
+        };
+        assert_eq!(
+            index.canonicalize_path_pin(&git_tree_base),
+            Err(LocalPackagePathPinError::UnsupportedGitTreeBase)
+        );
+
+        assert_eq!(
+            index.insert(
+                other_version.clone(),
+                LocalPackageDirectory::open(tree.package("wrong", ROOT_MANIFEST))
+                    .expect("open mismatched package"),
+                PackageRole::Dependency,
+            ),
+            Err(LocalPackageDirectoryIndexError::PackageVersionMismatch {
+                expected: Box::new(other_version.clone()),
+                found_package: "acme:root".into(),
+                found_version: Box::new(Version::parse("1.0.0").unwrap()),
+            })
+        );
+
+        let root_directory = tree.path().join("root");
+        assert_eq!(
+            index.insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(&root_directory)
+                    .expect("reopen root package directory"),
+                PackageRole::Root,
+            ),
+            Ok(()),
+            "registering the same canonical directory should be idempotent"
+        );
+        assert_eq!(
+            index.insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(tree.package("root-alias", ROOT_MANIFEST))
+                    .expect("open second root package directory"),
+                PackageRole::Root,
+            ),
+            Err(LocalPackageDirectoryIndexError::ConflictingDirectories(
+                root_version.clone()
+            ))
+        );
+
+        let missing_requirer = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: other_version.clone(),
+                path: "../dependency".into(),
+            },
+            requirer: MvsRequirer::Package(other_version.clone()),
+            span: 2..3,
+        };
+        assert_eq!(
+            index.canonicalize_path_pin(&missing_requirer),
+            Err(LocalPackagePathPinError::MissingRequirerDirectory(
+                other_version
+            ))
+        );
+
+        let invalid_path = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: root_version.clone(),
+                path: "./dependency".into(),
+            },
+            requirer: MvsRequirer::Root(root_version.clone()),
+            span: 3..4,
+        };
+        assert_eq!(
+            index.canonicalize_path_pin(&invalid_path),
+            Err(LocalPackagePathPinError::InvalidPath(
+                crate::package_path::PackagePathError::InvalidPackagePath
+            ))
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn path_resolution_fails_closed_when_the_requiring_directory_is_replaced() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        tree.package("workspace/dependency", DEPENDENCY_MANIFEST);
+        tree.package("moved/dependency", DEPENDENCY_MANIFEST);
+
+        let root_version = package_version("acme:root", "1.0.0");
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(&root_directory).expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+
+        fs::rename(&root_directory, tree.path().join("moved/root"))
+            .expect("move the opened root directory");
+        tree.package("workspace/root", ROOT_MANIFEST);
+
+        let pin = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: root_version.clone(),
+                path: "../dependency".into(),
+            },
+            requirer: MvsRequirer::Root(root_version),
+            span: 0..14,
+        };
+        assert_eq!(
+            index.canonicalize_path_pin(&pin),
+            Err(LocalPackagePathPinError::Directory(
+                LocalPackageError::DirectoryChanged
+            ))
+        );
+    }
+
     #[test]
     fn rejects_missing_and_non_directory_package_sources_without_disclosing_paths() {
         let tree = TempTree::new();
@@ -456,6 +1140,35 @@ mod tests {
         assert_eq!(
             LocalPackageDirectory::open(directory),
             Err(LocalPackageError::ManifestNotFile)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios")),
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn opens_fifo_manifests_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use rustix::fs::{CWD, Mode, mkfifoat};
+
+        let tree = TempTree::new();
+        let directory = tree.path().join("fifo-manifest");
+        fs::create_dir(&directory).expect("create package directory");
+        mkfifoat(CWD, directory.join("sai.package"), Mode::RUSR | Mode::WUSR)
+            .expect("create FIFO manifest");
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(LocalPackageDirectory::open(directory));
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(LocalPackageError::ManifestNotFile)),
+            "opening a FIFO manifest must return without waiting for a writer"
         );
     }
 

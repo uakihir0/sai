@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 sai_diagnostics = { path = "../sai_diagnostics" }
 libc.workspace = true
+rustix.workspace = true
 spdx.workspace = true
 
 [dev-dependencies]

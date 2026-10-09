@@ -584,13 +584,17 @@ fn requirement_for_edge<'a>(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::fs;
     use std::ops::Range;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
         ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
         ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
         select_resolver_source, validate_resolver_path_pins,
     };
+    use crate::local_source::{LocalPackageDirectory, LocalPackageDirectoryIndex};
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{MvsContractRequest, MvsNamedEdge, MvsPackageVersion, MvsRequirer};
     use crate::resolver_contract::{
@@ -599,6 +603,32 @@ mod tests {
     };
     use crate::validation::PackageValidationContext;
     use crate::version::Version;
+
+    static NEXT_LOCAL_SOURCE_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct LocalSourceTestTree(PathBuf);
+
+    impl LocalSourceTestTree {
+        fn new() -> Self {
+            let id = NEXT_LOCAL_SOURCE_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sai-resolver-source-local-pins-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create local-source test tree");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for LocalSourceTestTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn package_version(package: &str, version: &str) -> MvsPackageVersion {
         MvsPackageVersion::new(package, Version::parse(version).expect("valid version"))
@@ -674,6 +704,93 @@ mod tests {
             provenance: ResolverSourceProvenance::PathPin { pin },
             path_pin_sources: pins,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_directory_index_canonicalizes_pins_for_resolver_validation() {
+        use std::os::unix::fs::symlink;
+
+        let tree = LocalSourceTestTree::new();
+        fs::create_dir_all(tree.path().join("workspace/root")).expect("create root package");
+        fs::create_dir_all(tree.path().join("workspace/other")).expect("create other package");
+        fs::create_dir_all(tree.path().join("workspace/dependency"))
+            .expect("create dependency package");
+        fs::write(
+            tree.path().join("workspace/root/sai.package"),
+            b"package acme:app @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n",
+        )
+        .expect("write root manifest");
+        fs::write(
+            tree.path().join("workspace/other/sai.package"),
+            b"package acme:other @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n",
+        )
+        .expect("write other requiring-package manifest");
+        fs::write(
+            tree.path().join("workspace/dependency/sai.package"),
+            b"package acme:dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n",
+        )
+        .expect("write dependency manifest");
+        symlink(
+            tree.path().join("workspace/dependency"),
+            tree.path().join("workspace/dependency-alias"),
+        )
+        .expect("create dependency alias");
+
+        let root_version = package_version("acme:app", "1.0.0");
+        let other_version = package_version("acme:other", "1.0.0");
+        let mut directories = LocalPackageDirectoryIndex::default();
+        directories
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(tree.path().join("workspace/root"))
+                    .expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        directories
+            .insert(
+                other_version.clone(),
+                LocalPackageDirectory::open(tree.path().join("workspace/other"))
+                    .expect("open second requiring package"),
+                PackageRole::Dependency,
+            )
+            .expect("index second requiring package");
+
+        let first = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: root_version.clone(),
+                path: "../dependency".into(),
+            },
+            requirer: MvsRequirer::Root(root_version),
+            span: 1..12,
+        };
+        let second = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: other_version.clone(),
+                path: "../dependency-alias".into(),
+            },
+            requirer: MvsRequirer::Package(other_version),
+            span: 20..40,
+        };
+        let selection = path_pin_selection(vec![first, second]);
+
+        let resolved = directories
+            .canonicalize_selection_path_pins(&selection)
+            .expect("local path pins resolve to one source")
+            .expect("the selection has path pins");
+        assert_eq!(
+            resolved
+                .parse_manifest(PackageRole::Dependency)
+                .file()
+                .header
+                .as_ref()
+                .expect("resolved dependency manifest has a package header")
+                .value
+                .identity
+                .to_string(),
+            "acme:dep"
+        );
     }
 
     #[test]
