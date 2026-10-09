@@ -275,12 +275,34 @@ pub struct ResolverContractEdge {
 }
 
 /// Field-by-field comparison of two contracts for the same package version.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ResolverContractEdgeComparison {
+    token: ResolverContractComparisonToken,
     package_version: MvsPackageVersion,
     expected_edges: Vec<ResolverContractEdge>,
     actual_edges: Vec<ResolverContractEdge>,
 }
+
+#[derive(Clone, Debug)]
+struct ResolverContractComparisonToken(Arc<()>);
+
+impl PartialEq for ResolverContractComparisonToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ResolverContractComparisonToken {}
+
+impl PartialEq for ResolverContractEdgeComparison {
+    fn eq(&self, other: &Self) -> bool {
+        self.package_version == other.package_version
+            && self.expected_edges == other.expected_edges
+            && self.actual_edges == other.actual_edges
+    }
+}
+
+impl Eq for ResolverContractEdgeComparison {}
 
 /// Whether the edge comparison is conclusive for every source clause.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,20 +337,57 @@ pub struct ResolverContractPathResolutionFailure<E> {
     pub error: Box<E>,
 }
 
-/// The result after attempting every source-bound path in both contracts.
+/// Matching path clauses that resolved to different package source identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolverContractResolvedPathComparison<E> {
-    status: ResolverContractComparisonStatus,
-    failures: Vec<ResolverContractPathResolutionFailure<E>>,
+pub struct ResolverContractPathSourceDifference {
+    pub package: Box<str>,
+    pub expected: ResolverContractPathSourceRequest,
+    pub actual: ResolverContractPathSourceRequest,
 }
 
+/// The result after attempting every source-bound path in both contracts.
+#[derive(Clone, Debug)]
+pub struct ResolverContractResolvedPathComparison<E> {
+    package_version: MvsPackageVersion,
+    edge_comparison_token: ResolverContractComparisonToken,
+    status: ResolverContractComparisonStatus,
+    failures: Vec<ResolverContractPathResolutionFailure<E>>,
+    path_differences: Vec<ResolverContractPathSourceDifference>,
+}
+
+impl<E> PartialEq for ResolverContractResolvedPathComparison<E>
+where
+    E: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.package_version == other.package_version
+            && self.status == other.status
+            && self.failures == other.failures
+            && self.path_differences == other.path_differences
+    }
+}
+
+impl<E> Eq for ResolverContractResolvedPathComparison<E> where E: Eq {}
+
 impl<E> ResolverContractResolvedPathComparison<E> {
+    pub const fn package_version(&self) -> &MvsPackageVersion {
+        &self.package_version
+    }
+
     pub const fn status(&self) -> ResolverContractComparisonStatus {
         self.status
     }
 
     pub fn failures(&self) -> &[ResolverContractPathResolutionFailure<E>] {
         &self.failures
+    }
+
+    pub fn path_differences(&self) -> &[ResolverContractPathSourceDifference] {
+        &self.path_differences
+    }
+
+    pub fn matches_edge_comparison(&self, edges: &ResolverContractEdgeComparison) -> bool {
+        self.edge_comparison_token == edges.token
     }
 }
 
@@ -391,6 +450,7 @@ impl ResolverContractEdgeComparison {
         );
         let mut different =
             !same_except_source_bound_path(&self.expected_edges, &self.actual_edges);
+        let mut path_differences = Vec::new();
         for (index, (expected, actual)) in self
             .expected_edges
             .iter()
@@ -411,7 +471,19 @@ impl ResolverContractEdgeComparison {
             if let (Some(expected_key), Some(actual_key)) =
                 (&expected_keys[index], &actual_keys[index])
             {
-                different |= expected_key != actual_key;
+                if expected_key != actual_key {
+                    different = true;
+                    path_differences.push(ResolverContractPathSourceDifference {
+                        package: expected.package.clone(),
+                        expected: path_source_request(
+                            expected,
+                            ResolverContractSourceSide::Expected,
+                        )
+                        .expect("a resolved path edge has path source metadata"),
+                        actual: path_source_request(actual, ResolverContractSourceSide::Actual)
+                            .expect("a resolved path edge has path source metadata"),
+                    });
+                }
             }
         }
         let status = if different {
@@ -421,8 +493,35 @@ impl ResolverContractEdgeComparison {
         } else {
             ResolverContractComparisonStatus::Equivalent
         };
-        ResolverContractResolvedPathComparison { status, failures }
+        ResolverContractResolvedPathComparison {
+            package_version: self.package_version.clone(),
+            edge_comparison_token: self.token.clone(),
+            status,
+            failures,
+            path_differences,
+        }
     }
+}
+
+fn path_source_request(
+    edge: &ResolverContractEdge,
+    side: ResolverContractSourceSide,
+) -> Option<ResolverContractPathSourceRequest> {
+    let Some(ResolverContractSourceClause::Path {
+        relative_to,
+        root_relative,
+        path,
+    }) = &edge.source
+    else {
+        return None;
+    };
+    Some(ResolverContractPathSourceRequest {
+        side,
+        requiring_package: relative_to.clone(),
+        root_relative: *root_relative,
+        package: edge.package.clone(),
+        path: path.clone(),
+    })
 }
 
 fn resolve_path_edges<K, E>(
@@ -567,6 +666,7 @@ pub fn compare_resolver_contract_edges(
     let expected_edges = comparable_contract_edges(expected, expected_context)?;
     let actual_edges = comparable_contract_edges(actual, actual_context)?;
     Ok(ResolverContractEdgeComparison {
+        token: ResolverContractComparisonToken(Arc::new(())),
         package_version,
         expected_edges,
         actual_edges,
@@ -1835,6 +1935,23 @@ requires { acme:local @ ^1 from path "../local" }
             ResolverContractComparisonStatus::Different
         );
         assert!(resolved.failures().is_empty());
+        assert_eq!(resolved.path_differences().len(), 1);
+        assert_eq!(
+            resolved.path_differences()[0].package.as_ref(),
+            "acme:local"
+        );
+        assert_eq!(
+            resolved.path_differences()[0].expected.side,
+            ResolverContractSourceSide::Expected
+        );
+        assert_eq!(
+            resolved.path_differences()[0].actual.side,
+            ResolverContractSourceSide::Actual
+        );
+        let unrelated_comparison =
+            compare_resolver_contract_edges(&expected, &expected_context, &actual, &actual_context)
+                .expect("an equivalent edge comparison can be independently constructed");
+        assert!(!resolved.matches_edge_comparison(&unrelated_comparison));
         assert_eq!(
             resolved_requests
                 .iter()

@@ -460,12 +460,27 @@ pub enum ResolverFinalContractPathResolutionError<E> {
 /// The edge and path comparison for one selected dependency reloaded from its final source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverReloadedContractComparison<K, E> {
-    pub reload: ResolverSourceReload<K>,
-    pub edges: ResolverContractEdgeComparison,
-    pub paths: ResolverContractResolvedPathComparison<ResolverFinalContractPathResolutionError<E>>,
+    pub(crate) reload: ResolverSourceReload<K>,
+    pub(crate) edges: ResolverContractEdgeComparison,
+    pub(crate) paths:
+        ResolverContractResolvedPathComparison<ResolverFinalContractPathResolutionError<E>>,
 }
 
 impl<K, E> ResolverReloadedContractComparison<K, E> {
+    pub const fn reload(&self) -> &ResolverSourceReload<K> {
+        &self.reload
+    }
+
+    pub const fn edges(&self) -> &ResolverContractEdgeComparison {
+        &self.edges
+    }
+
+    pub const fn paths(
+        &self,
+    ) -> &ResolverContractResolvedPathComparison<ResolverFinalContractPathResolutionError<E>> {
+        &self.paths
+    }
+
     pub fn status(&self) -> ResolverContractComparisonStatus {
         self.paths.status()
     }

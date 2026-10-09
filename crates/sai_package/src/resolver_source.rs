@@ -37,11 +37,23 @@ pub enum ResolverSourceReason {
 /// The manifest or lock entry that caused a source to be selected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolverSourceProvenance {
-    RootPathOverride { span: Range<usize> },
-    RootGitOverride { span: Range<usize> },
-    PathPin { pin: ResolverPathPinSource },
-    NamedRequirement { edge: MvsNamedEdge },
-    LockFloor { package_version: MvsPackageVersion },
+    RootPathOverride {
+        root_package: MvsPackageVersion,
+        span: Range<usize>,
+    },
+    RootGitOverride {
+        root_package: MvsPackageVersion,
+        span: Range<usize>,
+    },
+    PathPin {
+        pin: ResolverPathPinSource,
+    },
+    NamedRequirement {
+        edge: MvsNamedEdge,
+    },
+    LockFloor {
+        package_version: MvsPackageVersion,
+    },
 }
 
 /// One path-pin source that the filesystem layer must canonicalize and
@@ -310,6 +322,7 @@ pub fn select_resolver_source(
                     },
                     reason: ResolverSourceReason::RootGitOverride,
                     provenance: ResolverSourceProvenance::RootGitOverride {
+                        root_package: root_version.clone(),
                         span: item.span.clone(),
                     },
                     path_pin_sources: Vec::new(),
@@ -326,6 +339,7 @@ pub fn select_resolver_source(
                     },
                     reason: ResolverSourceReason::RootPathOverride,
                     provenance: ResolverSourceProvenance::RootPathOverride {
+                        root_package: root_version.clone(),
                         span: item.span.clone(),
                     },
                     path_pin_sources: Vec::new(),
@@ -1141,6 +1155,7 @@ overrides { acme:dep use git "https://example.test/fork" dir "packages/dep" }
         assert_eq!(
             selection.provenance,
             ResolverSourceProvenance::RootGitOverride {
+                root_package: package_version("acme:app", "1.0.0"),
                 span: override_span
             }
         );
@@ -1218,6 +1233,7 @@ overrides { acme:dep use path "../patched" }
         assert_eq!(
             selection.provenance,
             ResolverSourceProvenance::RootPathOverride {
+                root_package: package_version("acme:app", "1.0.0"),
                 span: override_span
             }
         );

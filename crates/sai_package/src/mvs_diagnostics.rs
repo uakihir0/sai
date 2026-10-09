@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use crate::manifest::{PackageDeclaration, PackageParseError, PackageRole, parse_for_role};
+use crate::manifest::{
+    OverrideSource, PackageDeclaration, PackageParseError, PackageRole, RequirementSource,
+    parse_for_role,
+};
 use crate::mvs::{
     MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionErrorKind, MvsSelectionOutput,
 };
@@ -14,6 +17,13 @@ use crate::mvs_explanations::{
 use crate::mvs_graph_validation::{
     MvsDependencyCycle, MvsDuplicatePackageLines, MvsSelectedGraphInputError, MvsVersionConflict,
     check_selected_graph, duplicate_package_lines,
+};
+use crate::resolver_contract::{ResolverContractEdge, ResolverContractSourceClause};
+use crate::resolver_source::{
+    ResolverPackageSource, ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
+};
+use crate::resolver_source_provider::{
+    ResolverFinalContractAudit, ResolverReloadedContractComparison,
 };
 use crate::validation::resolve_package_lint_settings_from_parsed;
 use crate::version_req::VersionReq;
@@ -34,6 +44,7 @@ pub struct MvsManifestLocation {
     workspace_snapshot: sai_diagnostics::WorkspaceSnapshotId,
     source_len: usize,
     requirements: BTreeMap<(usize, usize), ManifestRequirement>,
+    overrides: BTreeMap<(usize, usize), ManifestOverride>,
     lint_policies: LintPolicies,
     manifest_lint_levels: BTreeMap<String, ManifestLintLevel>,
 }
@@ -42,6 +53,13 @@ pub struct MvsManifestLocation {
 struct ManifestRequirement {
     package: Box<str>,
     version: VersionReq,
+    source: Option<RequirementSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestOverride {
+    package: Box<str>,
+    source: OverrideSource,
 }
 
 impl MvsManifestLocation {
@@ -118,22 +136,42 @@ impl MvsManifestLocation {
         }
 
         let mut requirements = BTreeMap::new();
+        let mut overrides = BTreeMap::new();
         for declaration in &parsed.file().declarations {
-            let PackageDeclaration::Requires { test, entries } = &declaration.value else {
-                continue;
-            };
-            if *test && role == PackageRole::Dependency {
-                continue;
-            }
-            for entry in entries {
-                let key = (entry.span.start, entry.span.end);
-                requirements.insert(
-                    key,
-                    ManifestRequirement {
-                        package: entry.value.package.clone(),
-                        version: entry.value.version.clone(),
-                    },
-                );
+            match &declaration.value {
+                PackageDeclaration::Requires { test, entries } => {
+                    if *test && role == PackageRole::Dependency {
+                        continue;
+                    }
+                    for entry in entries {
+                        let key = (entry.span.start, entry.span.end);
+                        requirements.insert(
+                            key,
+                            ManifestRequirement {
+                                package: entry.value.package.clone(),
+                                version: entry.value.version.clone(),
+                                source: entry
+                                    .value
+                                    .source
+                                    .as_ref()
+                                    .map(|source| source.value.clone()),
+                            },
+                        );
+                    }
+                }
+                PackageDeclaration::Overrides(entries) => {
+                    for entry in entries {
+                        let key = (entry.span.start, entry.span.end);
+                        overrides.insert(
+                            key,
+                            ManifestOverride {
+                                package: entry.value.package.clone(),
+                                source: entry.value.source.clone(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -155,6 +193,7 @@ impl MvsManifestLocation {
             workspace_snapshot: snapshot.id(),
             source_len: source_file.raw_bytes().len(),
             requirements,
+            overrides,
             lint_policies,
             manifest_lint_levels,
         })
@@ -310,6 +349,22 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
         expected: String,
         found: String,
     },
+    ContractNotDivergent(Box<MvsPackageVersion>),
+    DivergentContractPackageVersionMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    DivergentSourcePackageVersionMismatch {
+        side: &'static str,
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    DivergentPathComparisonPackageVersionMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    DivergentPathComparisonDoesNotMatchEdges(Box<MvsPackageVersion>),
+    DivergentSourcesHaveSameIdentity(Box<MvsPackageVersion>),
     ManifestPackageMismatch {
         requirer: Box<MvsRequirer>,
         expected: String,
@@ -345,6 +400,12 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
     SourceSpanOutOfRange {
         requirer: Box<MvsRequirer>,
         span: Range<usize>,
+    },
+    SourceSelectionDoesNotMatchManifest {
+        requirer: Box<MvsRequirer>,
+        span: Range<usize>,
+        expected: String,
+        found: Option<String>,
     },
 }
 
@@ -486,6 +547,206 @@ pub fn version_conflict_diagnostics(
         .conflicts
         .iter()
         .map(|conflict| version_conflict_diagnostic(&explanations, conflict, manifests))
+        .collect()
+}
+
+/// Builds the hard `DIVERGENT_SOURCES` diagnostic for one selected version.
+///
+/// Both source-selection provenances are shown so a user can see which
+/// requirement edges selected the read-time and final sources. The included
+/// contract edges are listed in diagnostic data and notes, including source
+/// differences that require source-bound path resolution.
+pub fn divergent_sources_diagnostic<K, E>(
+    comparison: &ResolverReloadedContractComparison<K, E>,
+    manifests: &MvsManifestLocations,
+) -> Result<Diagnostic, MvsDuplicatePackageLineDiagnosticError>
+where
+    K: Eq,
+{
+    let expected_package_version = &comparison.reload.package_version;
+    let edge_package_version = comparison.edges.package_version();
+    if edge_package_version != expected_package_version {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::DivergentContractPackageVersionMismatch {
+                expected: Box::new(expected_package_version.clone()),
+                found: Box::new(edge_package_version.clone()),
+            },
+        );
+    }
+    for (side, selection) in [
+        ("read-time", &comparison.reload.read_source),
+        ("final", &comparison.reload.final_source),
+    ] {
+        if selection.package_version() != expected_package_version {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::DivergentSourcePackageVersionMismatch {
+                    side,
+                    expected: Box::new(expected_package_version.clone()),
+                    found: Box::new(selection.package_version().clone()),
+                },
+            );
+        }
+    }
+    let path_package_version = comparison.paths.package_version();
+    if path_package_version != expected_package_version {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::DivergentPathComparisonPackageVersionMismatch {
+                expected: Box::new(expected_package_version.clone()),
+                found: Box::new(path_package_version.clone()),
+            },
+        );
+    }
+    if !comparison.paths.matches_edge_comparison(&comparison.edges) {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::DivergentPathComparisonDoesNotMatchEdges(
+                Box::new(expected_package_version.clone()),
+            ),
+        );
+    }
+    if comparison.reload.read_identity == comparison.reload.final_identity {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::DivergentSourcesHaveSameIdentity(Box::new(
+                expected_package_version.clone(),
+            )),
+        );
+    }
+    if comparison.status() != crate::resolver_contract::ResolverContractComparisonStatus::Different
+    {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::ContractNotDivergent(Box::new(
+                expected_package_version.clone(),
+            )),
+        );
+    }
+
+    let read_location =
+        resolver_source_selection_location(&comparison.reload.read_source, manifests)?;
+    let final_location =
+        resolver_source_selection_location(&comparison.reload.final_source, manifests)?;
+    let read_source = resolver_package_source_display(comparison.reload.read_source.source());
+    let final_source = resolver_package_source_display(comparison.reload.final_source.source());
+    let package_version = &comparison.reload.package_version;
+    let primary = final_location.clone().or_else(|| read_location.clone());
+    let mut diagnostic = Diagnostic::new(
+        Code::from_name("DIVERGENT_SOURCES")
+            .expect("DIVERGENT_SOURCES is a registered hard diagnostic"),
+        Severity::Error,
+        format!(
+            "{}@{} has different included contracts in its read-time and final sources",
+            package_version.package(),
+            package_version.version()
+        ),
+        primary,
+    );
+    diagnostic.primary_label = if final_location.is_some() {
+        "the final source selected here provides a different contract".to_owned()
+    } else {
+        "these sources provide different contracts for the same version".to_owned()
+    };
+    diagnostic.data = divergent_sources_data(comparison, &read_source, &final_source);
+
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Note,
+            message: format!(
+                "the contract was read from {read_source} (the read-time source tree); {}",
+                resolver_source_selection_reason(&comparison.reload.read_source)
+            ),
+            location: read_location,
+        })
+        .expect("both source locations belong to one manifest snapshot");
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Note,
+            message: format!(
+                "after Check, the final source is {final_source} (a different resolved source tree); {}",
+                resolver_source_selection_reason(&comparison.reload.final_source)
+            ),
+            location: final_location,
+        })
+        .expect("both source locations belong to one manifest snapshot");
+
+    for edge in comparison.edges.expected_edges() {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: format!(
+                    "read-time contract includes {}",
+                    resolver_contract_edge_display(edge)
+                ),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    for edge in comparison.edges.actual_edges() {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: format!(
+                    "final-source contract includes {}",
+                    resolver_contract_edge_display(edge)
+                ),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    if comparison.edges.status()
+        == crate::resolver_contract::ResolverContractComparisonStatus::RequiresSourceBoundPathResolution
+        && comparison.paths.status()
+            == crate::resolver_contract::ResolverContractComparisonStatus::Different
+    {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: "one or more path clauses resolve to different package sources when based on the read-time and final source trees".to_owned(),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    for difference in comparison.paths.path_differences() {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: format!(
+                    "path dependency {} resolves differently: read-time {} versus final-source {}",
+                    difference.package,
+                    resolver_path_request_display(&difference.expected),
+                    resolver_path_request_display(&difference.actual)
+                ),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+    }
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Help,
+            message: format!(
+                "make the source choice explicit with a root override for {} using `use path \"…\"` or `use git \"…\"`",
+                package_version.package()
+            ),
+            location: None,
+        })
+        .expect("a new diagnostic has no snapshot-bound locations");
+    Ok(diagnostic)
+}
+
+/// Builds diagnostics for every selected version whose final source differs
+/// from the source used during selection.
+pub fn divergent_sources_diagnostics<K, IE, PE>(
+    audit: &ResolverFinalContractAudit<'_, K, IE, PE>,
+    manifests: &MvsManifestLocations,
+) -> Result<Vec<Diagnostic>, MvsDuplicatePackageLineDiagnosticError>
+where
+    K: Eq,
+{
+    audit
+        .comparisons()
+        .iter()
+        .filter(|comparison| {
+            comparison.status()
+                == crate::resolver_contract::ResolverContractComparisonStatus::Different
+        })
+        .map(|comparison| divergent_sources_diagnostic(comparison, manifests))
         .collect()
 }
 
@@ -1680,6 +1941,527 @@ fn chain_link_location(
     })
 }
 
+fn divergent_sources_data<K, E>(
+    comparison: &ResolverReloadedContractComparison<K, E>,
+    read_source: &str,
+    final_source: &str,
+) -> ValueObject {
+    let package_version = &comparison.reload.package_version;
+    let mut data = ValueObject::new();
+    data.insert(
+        "package".to_owned(),
+        Value::String(package_version.package().to_owned()),
+    );
+    data.insert(
+        "version".to_owned(),
+        Value::String(package_version.version().to_string()),
+    );
+    data.insert(
+        "read_source".to_owned(),
+        Value::String(read_source.to_owned()),
+    );
+    data.insert(
+        "final_source".to_owned(),
+        Value::String(final_source.to_owned()),
+    );
+    data.insert("source_identities_differ".to_owned(), Value::Bool(true));
+    data.insert(
+        "read_contract_edges".to_owned(),
+        Value::Array(
+            comparison
+                .edges
+                .expected_edges()
+                .iter()
+                .map(resolver_contract_edge_data)
+                .collect(),
+        ),
+    );
+    data.insert(
+        "final_contract_edges".to_owned(),
+        Value::Array(
+            comparison
+                .edges
+                .actual_edges()
+                .iter()
+                .map(resolver_contract_edge_data)
+                .collect(),
+        ),
+    );
+    data.insert(
+        "edge_comparison".to_owned(),
+        Value::String(comparison_status_name(comparison.edges.status()).to_owned()),
+    );
+    data.insert(
+        "path_comparison".to_owned(),
+        Value::String(comparison_status_name(comparison.paths.status()).to_owned()),
+    );
+    data.insert(
+        "path_source_differences".to_owned(),
+        Value::Array(
+            comparison
+                .paths
+                .path_differences()
+                .iter()
+                .map(|difference| {
+                    let mut fields = ValueObject::new();
+                    fields.insert(
+                        "package".to_owned(),
+                        Value::String(difference.package.to_string()),
+                    );
+                    fields.insert(
+                        "read_time".to_owned(),
+                        resolver_path_request_data(&difference.expected),
+                    );
+                    fields.insert(
+                        "final_source".to_owned(),
+                        resolver_path_request_data(&difference.actual),
+                    );
+                    Value::Object(fields)
+                })
+                .collect(),
+        ),
+    );
+    data
+}
+
+fn comparison_status_name(
+    status: crate::resolver_contract::ResolverContractComparisonStatus,
+) -> &'static str {
+    use crate::resolver_contract::ResolverContractComparisonStatus;
+    match status {
+        ResolverContractComparisonStatus::Equivalent => "equivalent",
+        ResolverContractComparisonStatus::Different => "different",
+        ResolverContractComparisonStatus::RequiresSourceBoundPathResolution => {
+            "requires_source_bound_path_resolution"
+        }
+        ResolverContractComparisonStatus::PathResolutionFailed => "path_resolution_failed",
+    }
+}
+
+fn resolver_contract_edge_data(edge: &ResolverContractEdge) -> Value {
+    let mut fields = ValueObject::new();
+    fields.insert(
+        "package".to_owned(),
+        Value::String(edge.package.to_string()),
+    );
+    fields.insert(
+        "requirement".to_owned(),
+        Value::String(edge.requirement.to_string()),
+    );
+    fields.insert(
+        "named_version".to_owned(),
+        Value::String(edge.named_version.to_string()),
+    );
+    fields.insert(
+        "source".to_owned(),
+        edge.source.as_ref().map_or(Value::Null, |source| {
+            Value::String(resolver_contract_source_display(source))
+        }),
+    );
+    fields.insert(
+        "only".to_owned(),
+        string_set_value(
+            edge.only
+                .as_ref()
+                .map(|items| items.iter().map(AsRef::as_ref)),
+        ),
+    );
+    fields.insert(
+        "grant".to_owned(),
+        string_set_value(
+            edge.grant
+                .as_ref()
+                .map(|items| items.iter().map(AsRef::as_ref)),
+        ),
+    );
+    Value::Object(fields)
+}
+
+fn resolver_path_request_data(
+    request: &crate::resolver_contract::ResolverContractPathSourceRequest,
+) -> Value {
+    let mut fields = ValueObject::new();
+    fields.insert(
+        "requiring_package".to_owned(),
+        Value::String(request.requiring_package.package().to_owned()),
+    );
+    fields.insert(
+        "requiring_version".to_owned(),
+        Value::String(request.requiring_package.version().to_string()),
+    );
+    fields.insert(
+        "root_relative".to_owned(),
+        Value::Bool(request.root_relative),
+    );
+    fields.insert("path".to_owned(), Value::String(request.path.to_string()));
+    Value::Object(fields)
+}
+
+fn resolver_path_request_display(
+    request: &crate::resolver_contract::ResolverContractPathSourceRequest,
+) -> String {
+    format!(
+        "path {:?} relative to {}@{}{}",
+        request.path,
+        request.requiring_package.package(),
+        request.requiring_package.version(),
+        if request.root_relative {
+            " in the root source tree"
+        } else {
+            ""
+        }
+    )
+}
+
+fn string_set_value<'a>(values: Option<impl Iterator<Item = &'a str>>) -> Value {
+    values.map_or(Value::Null, |values| {
+        Value::Array(
+            values
+                .map(|value| Value::String(value.to_owned()))
+                .collect(),
+        )
+    })
+}
+
+fn resolver_contract_source_display(source: &ResolverContractSourceClause) -> String {
+    match source {
+        ResolverContractSourceClause::Git {
+            canonical_url,
+            directory,
+        } => directory.as_ref().map_or_else(
+            || format!("git {canonical_url:?}"),
+            |directory| format!("git {canonical_url:?} dir {directory:?}"),
+        ),
+        ResolverContractSourceClause::Path {
+            relative_to,
+            root_relative,
+            path,
+        } => format!(
+            "path {path:?} relative to {}@{}{}",
+            relative_to.package(),
+            relative_to.version(),
+            if *root_relative { " (root)" } else { "" }
+        ),
+    }
+}
+
+fn resolver_contract_edge_display(edge: &ResolverContractEdge) -> String {
+    let source = edge.source.as_ref().map_or_else(
+        || "no source clause".to_owned(),
+        resolver_contract_source_display,
+    );
+    let only = edge.only.as_ref().map_or_else(
+        || "omitted".to_owned(),
+        |items| {
+            items
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    let grant = edge.grant.as_ref().map_or_else(
+        || "omitted".to_owned(),
+        |items| {
+            items
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    format!(
+        "{} @ {} (names {}; source: {}; only: {}; grant: {})",
+        edge.package, edge.requirement, edge.named_version, source, only, grant
+    )
+}
+
+fn resolver_package_source_display(source: &ResolverPackageSource) -> String {
+    match source {
+        ResolverPackageSource::Git { url, directory } => directory.as_ref().map_or_else(
+            || format!("git {url:?}"),
+            |directory| format!("git {url:?} dir {directory:?}"),
+        ),
+        ResolverPackageSource::Path { relative_to, path } => format!(
+            "path {path:?} relative to {}@{}",
+            relative_to.package(),
+            relative_to.version()
+        ),
+    }
+}
+
+fn resolver_source_selection_reason(selection: &ResolverSourceSelection) -> String {
+    match (selection.reason(), selection.provenance()) {
+        (
+            ResolverSourceReason::RootPathOverride,
+            ResolverSourceProvenance::RootPathOverride { .. },
+        ) => format!(
+            "the root path override for {}@{} selected this source",
+            selection.package_version().package(),
+            selection.package_version().version()
+        ),
+        (
+            ResolverSourceReason::RootGitOverride,
+            ResolverSourceProvenance::RootGitOverride { .. },
+        ) => format!(
+            "the root Git override for {} selected this source",
+            selection.package_version().package()
+        ),
+        (ResolverSourceReason::PathPin, ResolverSourceProvenance::PathPin { pin }) => format!(
+            "the path requirement edge from {} to {}@{} selected it",
+            requirer_display(&pin.requirer),
+            selection.package_version().package(),
+            selection.package_version().version()
+        ),
+        (
+            ResolverSourceReason::NamedRequirement,
+            ResolverSourceProvenance::NamedRequirement { edge },
+        ) => {
+            format!(
+                "the requirement edge from {} to {}@{} selected it",
+                requirer_display(&edge.requirer),
+                selection.package_version().package(),
+                selection.package_version().version()
+            )
+        }
+        (ResolverSourceReason::LockFloor, ResolverSourceProvenance::LockFloor { .. }) => {
+            format!(
+                "the lock-file floor for {}@{} selected this source",
+                selection.package_version().package(),
+                selection.package_version().version()
+            )
+        }
+        _ => "the source-selection provenance is inconsistent".to_owned(),
+    }
+}
+
+fn resolver_source_selection_location(
+    selection: &ResolverSourceSelection,
+    manifests: &MvsManifestLocations,
+) -> Result<Option<sai_diagnostics::Location>, MvsDuplicatePackageLineDiagnosticError> {
+    let location = match selection.provenance() {
+        ResolverSourceProvenance::RootPathOverride { root_package, span }
+        | ResolverSourceProvenance::RootGitOverride { root_package, span } => {
+            let Some(manifest) = manifests.root() else {
+                return Err(MvsDuplicatePackageLineDiagnosticError::MissingRootManifest);
+            };
+            let requirer = MvsRequirer::Root(root_package.clone());
+            let location = manifest_span_location(manifest, &requirer, span)?;
+            let expected = format!(
+                "{} from {}",
+                selection.package_version().package(),
+                resolver_package_source_display(selection.source())
+            );
+            let found_override = manifest.overrides.get(&(span.start, span.end));
+            let found_source = found_override
+                .and_then(|item| resolver_package_source_from_override(root_package, item));
+            if !found_override.is_some_and(|item| {
+                item.package.as_ref() == selection.package_version().package()
+                    && found_source.as_ref() == Some(selection.source())
+            }) {
+                return Err(
+                    MvsDuplicatePackageLineDiagnosticError::SourceSelectionDoesNotMatchManifest {
+                        requirer: Box::new(requirer.clone()),
+                        span: span.clone(),
+                        expected,
+                        found: found_override.map(|item| {
+                            format!(
+                                "{} from {}",
+                                item.package,
+                                found_source.as_ref().map_or_else(
+                                    || "an artifact or unsupported source".to_owned(),
+                                    resolver_package_source_display
+                                )
+                            )
+                        }),
+                    },
+                );
+            }
+            Some(location)
+        }
+        ResolverSourceProvenance::PathPin { pin } => Some(named_source_requirement_location(
+            manifests,
+            &pin.requirer,
+            selection.package_version(),
+            selection.source(),
+            &pin.span,
+        )?),
+        ResolverSourceProvenance::NamedRequirement { edge } => {
+            Some(named_source_requirement_location(
+                manifests,
+                &edge.requirer,
+                selection.package_version(),
+                selection.source(),
+                &edge.span,
+            )?)
+        }
+        ResolverSourceProvenance::LockFloor { .. } => None,
+    };
+    Ok(location)
+}
+
+fn named_source_requirement_location(
+    manifests: &MvsManifestLocations,
+    requirer: &MvsRequirer,
+    target: &MvsPackageVersion,
+    selected_source: &ResolverPackageSource,
+    span: &Range<usize>,
+) -> Result<sai_diagnostics::Location, MvsDuplicatePackageLineDiagnosticError> {
+    let Some(manifest) = manifests.for_requirer(requirer) else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::MissingManifestLocation(Box::new(
+                requirer.clone(),
+            )),
+        );
+    };
+    let Some(requirement) = manifest.requirements.get(&(span.start, span.end)) else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::RequirementNotInManifest {
+                requirer: Box::new(requirer.clone()),
+                span: span.clone(),
+            },
+        );
+    };
+    let location = chain_link_location(manifests, requirer, target, &requirement.version, span)?;
+    let found_source = requirement
+        .source
+        .as_ref()
+        .map(|source| resolver_package_source_from_requirement(requirer.package_version(), source));
+    if found_source.as_ref() != Some(selected_source) {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::SourceSelectionDoesNotMatchManifest {
+                requirer: Box::new(requirer.clone()),
+                span: span.clone(),
+                expected: format!(
+                    "{} from {}",
+                    target.package(),
+                    resolver_package_source_display(selected_source)
+                ),
+                found: found_source.as_ref().map(|source| {
+                    format!(
+                        "{} from {}",
+                        requirement.package,
+                        resolver_package_source_display(source)
+                    )
+                }),
+            },
+        );
+    }
+    Ok(location)
+}
+
+fn resolver_package_source_from_requirement(
+    requiring_package: &MvsPackageVersion,
+    source: &RequirementSource,
+) -> ResolverPackageSource {
+    match source {
+        RequirementSource::Git { url, directory } => ResolverPackageSource::Git {
+            url: url.clone(),
+            directory: directory.clone(),
+        },
+        RequirementSource::Path(path) => ResolverPackageSource::Path {
+            relative_to: requiring_package.clone(),
+            path: path.clone(),
+        },
+    }
+}
+
+fn resolver_package_source_from_override(
+    root_package: &MvsPackageVersion,
+    item: &ManifestOverride,
+) -> Option<ResolverPackageSource> {
+    match &item.source {
+        OverrideSource::Artifact => None,
+        OverrideSource::Path(path) => Some(ResolverPackageSource::Path {
+            relative_to: root_package.clone(),
+            path: path.clone(),
+        }),
+        OverrideSource::Git { url, directory } => Some(ResolverPackageSource::Git {
+            url: url.clone(),
+            directory: directory.clone(),
+        }),
+    }
+}
+
+fn manifest_span_location(
+    manifest: &MvsManifestLocation,
+    requirer: &MvsRequirer,
+    span: &Range<usize>,
+) -> Result<sai_diagnostics::Location, MvsDuplicatePackageLineDiagnosticError> {
+    let package_version = requirer.package_version();
+    let expected_package = format!(
+        "{}@{}",
+        package_version.package(),
+        package_version.version()
+    );
+    if manifest.source.package.as_deref() != Some(expected_package.as_str()) {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::ManifestPackageMismatch {
+                requirer: Box::new(requirer.clone()),
+                expected: expected_package,
+                found: manifest.source.package.clone(),
+            },
+        );
+    }
+    if manifest.package_version != *package_version {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::ManifestVersionMismatch {
+                requirer: Box::new(requirer.clone()),
+                expected: Box::new(package_version.clone()),
+                found: Box::new(manifest.package_version.clone()),
+            },
+        );
+    }
+    let expected_role = match requirer {
+        MvsRequirer::Root(_) => PackageRole::Root,
+        MvsRequirer::Package(_) => PackageRole::Dependency,
+    };
+    if manifest.role != expected_role {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::ManifestRoleMismatch {
+                expected: expected_role,
+                found: manifest.role,
+            },
+        );
+    }
+    if span.start > span.end || span.end > manifest.source_len {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::SourceSpanOutOfRange {
+                requirer: Box::new(requirer.clone()),
+                span: span.clone(),
+            },
+        );
+    }
+    let Some(start) = TextSize::from_usize(span.start) else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::SourceSpanOutOfRange {
+                requirer: Box::new(requirer.clone()),
+                span: span.clone(),
+            },
+        );
+    };
+    let Some(end) = TextSize::from_usize(span.end) else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::SourceSpanOutOfRange {
+                requirer: Box::new(requirer.clone()),
+                span: span.clone(),
+            },
+        );
+    };
+    let Some(range) = TextRange::new(start, end) else {
+        return Err(
+            MvsDuplicatePackageLineDiagnosticError::SourceSpanOutOfRange {
+                requirer: Box::new(requirer.clone()),
+                span: span.clone(),
+            },
+        );
+    };
+    Ok(sai_diagnostics::Location {
+        file: manifest.source.clone(),
+        span: sai_diagnostics::Span::new(manifest.file_id, range),
+    })
+}
+
 fn location_data(location: &sai_diagnostics::Location) -> Value {
     let mut fields = ValueObject::new();
     fields.insert("path".to_owned(), Value::String(location.file.path.clone()));
@@ -1722,17 +2504,29 @@ mod tests {
     use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     use super::{
-        MvsDuplicatePackageLineDiagnosticContext, MvsManifestLocation, MvsManifestLocations,
+        MvsDuplicatePackageLineDiagnosticContext, MvsDuplicatePackageLineDiagnosticError,
+        MvsManifestLocation, MvsManifestLocations, divergent_sources_diagnostic,
         duplicate_package_line_diagnostic, duplicate_package_line_diagnostics,
-        version_conflict_diagnostic, version_conflict_diagnostics,
+        resolver_source_selection_location, version_conflict_diagnostic,
+        version_conflict_diagnostics,
     };
-    use crate::manifest::parse;
+    use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{
-        MvsContract, MvsEdge, MvsPackageVersion, MvsRequirer, MvsSelectionOutput, select,
+        MvsContract, MvsContractRequest, MvsEdge, MvsNamedEdge, MvsPackageVersion, MvsRequirer,
+        MvsSelectionOutput, select,
     };
     use crate::mvs_explanations::MvsExplanationGraph;
     use crate::mvs_graph_validation::{
         MvsDuplicatePackageLines, check_selected_graph, duplicate_package_lines,
+    };
+    use crate::resolver_contract::{
+        ResolverContractContext, ResolverPathKey, build_resolver_contract,
+        compare_resolver_contract_edges,
+    };
+    use crate::resolver_source::select_resolver_source;
+    use crate::resolver_source_provider::{
+        ResolverFinalContractPathResolutionError, ResolverReloadedContractComparison,
+        ResolverSourceReload,
     };
     use crate::validation::{PackageValidationContext, validate};
     use crate::version::Version;
@@ -1870,6 +2664,432 @@ mod tests {
                 .expect("dependency belongs to the snapshot");
         }
         locations
+    }
+
+    fn divergent_comparison_fixture() -> (
+        ResolverReloadedContractComparison<String, ()>,
+        MvsManifestLocations,
+    ) {
+        let root_source = r#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires {
+    acme:dep @ ^1 from git "https://example.test/read"
+    acme:alpha @ ^1 from git "https://example.test/alpha"
+}
+"#;
+        let alpha_source = r#"package acme:alpha @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from git "https://example.test/final" }
+"#;
+        let read_contract_source = r#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires {
+    acme:old @ ^1 from git "https://example.test/old"
+    acme:sibling @ ^1 from path "../sibling"
+}
+"#;
+        let final_contract_source = r#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires {
+    acme:new @ ^2 from git "https://example.test/new"
+    acme:sibling @ ^1 from path "../sibling"
+}
+"#;
+        let package = package_version("acme:dep", "1.0.0");
+        let root = parse_for_role(root_source.as_bytes(), PackageRole::Root);
+        let path_packages = std::collections::BTreeMap::from([(
+            ResolverPathKey::new(package.clone(), "../sibling"),
+            package_version("acme:sibling", "1.0.0"),
+        )]);
+        let root_path_overrides = std::collections::BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root contract context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root contract is valid");
+        let alpha = parse_for_role(alpha_source.as_bytes(), PackageRole::Dependency);
+        let alpha_contract =
+            build_resolver_contract(&alpha, &context, PackageValidationContext::default())
+                .expect("alpha contract is valid");
+        let alpha_version = alpha_contract.mvs.package_version().clone();
+        let read_contract = build_resolver_contract(
+            &parse_for_role(read_contract_source.as_bytes(), PackageRole::Dependency),
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("read-time dependency contract is valid");
+        let final_contract = build_resolver_contract(
+            &parse_for_role(final_contract_source.as_bytes(), PackageRole::Dependency),
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("final dependency contract is valid");
+
+        let named_edge = |contract: &crate::resolver_contract::ResolverContract,
+                          package: &str,
+                          requirer: MvsRequirer| {
+            let requirement = contract
+                .requirements()
+                .iter()
+                .find(|requirement| requirement.package.as_ref() == package)
+                .expect("source requirement metadata exists");
+            let (path_pin, root_override_pin) = match requirement.resolution {
+                crate::resolver_contract::ResolverRequirementResolution::Included {
+                    pin, ..
+                } => (
+                    pin == crate::resolver_contract::ResolverPinKind::Path,
+                    pin == crate::resolver_contract::ResolverPinKind::RootPathOverride,
+                ),
+                crate::resolver_contract::ResolverRequirementResolution::ExcludedByRootTargets => {
+                    panic!("fixture requirements are included")
+                }
+            };
+            MvsNamedEdge {
+                requirer,
+                span: requirement.span.clone(),
+                path_pin,
+                root_override_pin,
+            }
+        };
+        let root_edge = named_edge(
+            &root_contract,
+            "acme:dep",
+            MvsRequirer::Root(root_contract.mvs.package_version().clone()),
+        );
+        let alpha_edge = named_edge(
+            &alpha_contract,
+            "acme:dep",
+            MvsRequirer::Package(alpha_version.clone()),
+        );
+        let dependency_contracts = HashMap::from([(alpha_version.clone(), alpha_contract.clone())]);
+        let read_source = select_resolver_source(
+            &MvsContractRequest {
+                package_version: package.clone(),
+                named_by: vec![root_edge],
+                lock_floor: false,
+            },
+            &root_contract,
+            &context,
+            &dependency_contracts,
+            &HashMap::new(),
+        )
+        .expect("read-time source is selected");
+        let final_source = select_resolver_source(
+            &MvsContractRequest {
+                package_version: package.clone(),
+                named_by: vec![alpha_edge],
+                lock_floor: false,
+            },
+            &root_contract,
+            &context,
+            &dependency_contracts,
+            &HashMap::new(),
+        )
+        .expect("final source is selected");
+        let edges =
+            compare_resolver_contract_edges(&read_contract, &context, &final_contract, &context)
+                .expect("contracts can be compared");
+        let paths = edges.compare_with_resolved_paths(|request| {
+            Ok::<_, ResolverFinalContractPathResolutionError<()>>(match request.side {
+                crate::resolver_contract::ResolverContractSourceSide::Expected => {
+                    "read-time sibling source"
+                }
+                crate::resolver_contract::ResolverContractSourceSide::Actual => {
+                    "final sibling source"
+                }
+            })
+        });
+        let comparison = ResolverReloadedContractComparison {
+            reload: ResolverSourceReload {
+                package_version: package,
+                read_source,
+                final_source,
+                read_identity: "/private/read-source-id".to_owned(),
+                final_identity: "/private/final-source-id".to_owned(),
+            },
+            edges,
+            paths,
+        };
+        let manifests = manifests_for(
+            (
+                root_contract.mvs.package_version().clone(),
+                root_source.to_owned(),
+            ),
+            vec![(alpha_version, alpha_source.to_owned())],
+        );
+        (comparison, manifests)
+    }
+
+    #[test]
+    fn divergent_source_diagnostic_shows_both_sources_edges_and_override_help() {
+        let (comparison, manifests) = divergent_comparison_fixture();
+
+        let diagnostic =
+            divergent_sources_diagnostic(&comparison, &manifests).expect("valid diagnostic");
+
+        assert_eq!(diagnostic.code.as_str(), "DIVERGENT_SOURCES");
+        assert_eq!(
+            diagnostic.message,
+            "acme:dep@1.0.0 has different included contracts in its read-time and final sources"
+        );
+        assert_eq!(
+            diagnostic.children()[0]
+                .location
+                .as_ref()
+                .unwrap()
+                .file
+                .path,
+            "sai.package"
+        );
+        assert_eq!(
+            diagnostic.children()[1]
+                .location
+                .as_ref()
+                .unwrap()
+                .file
+                .path,
+            "dep:acme:alpha@1.0.0/sai.package"
+        );
+        let root_source = r#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires {
+    acme:dep @ ^1 from git "https://example.test/read"
+    acme:alpha @ ^1 from git "https://example.test/alpha"
+}
+"#;
+        let alpha_source = r#"package acme:alpha @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from git "https://example.test/final" }
+"#;
+        assert_eq!(
+            diagnostic.children()[0]
+                .location
+                .as_ref()
+                .unwrap()
+                .span
+                .range
+                .start()
+                .to_usize(),
+            root_source
+                .find("acme:dep @ ^1 from git \"https://example.test/read\"")
+                .unwrap()
+        );
+        assert_eq!(
+            diagnostic.children()[1]
+                .location
+                .as_ref()
+                .unwrap()
+                .span
+                .range
+                .start()
+                .to_usize(),
+            alpha_source
+                .find("acme:dep @ ^1 from git \"https://example.test/final\"")
+                .unwrap()
+        );
+        assert!(
+            diagnostic.children()[0]
+                .message
+                .contains("https://example.test/read")
+        );
+        assert!(
+            diagnostic.children()[1]
+                .message
+                .contains("https://example.test/final")
+        );
+        assert!(
+            diagnostic.children()[1]
+                .message
+                .contains("a different resolved source tree")
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .all(|child| !child.message.contains("/private/"))
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.message.contains("acme:old @ ^1"))
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.message.contains("acme:new @ ^2"))
+        );
+        assert!(diagnostic.children().iter().any(|child| {
+            child
+                .message
+                .contains("path dependency acme:sibling resolves differently")
+                && child.message.contains("../sibling")
+        }));
+        assert!(
+            diagnostic
+                .children()
+                .last()
+                .unwrap()
+                .message
+                .contains("root override")
+        );
+        assert!(matches!(
+            diagnostic.data.get("read_contract_edges"),
+            Some(Value::Array(edges)) if edges.len() == 2
+        ));
+        assert!(matches!(
+            diagnostic.data.get("final_contract_edges"),
+            Some(Value::Array(edges)) if edges.len() == 2
+        ));
+        assert!(matches!(
+            diagnostic.data.get("path_source_differences"),
+            Some(Value::Array(differences)) if differences.len() == 1
+        ));
+        assert_eq!(
+            diagnostic.data.get("source_identities_differ"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn divergent_source_diagnostic_rejects_a_mismatched_contract_version() {
+        let (mut comparison, manifests) = divergent_comparison_fixture();
+        comparison.reload.package_version = package_version("acme:other", "1.0.0");
+
+        assert!(matches!(
+            divergent_sources_diagnostic(&comparison, &manifests),
+            Err(
+                MvsDuplicatePackageLineDiagnosticError::DivergentContractPackageVersionMismatch { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn divergent_source_diagnostic_rejects_equal_source_identities() {
+        let (mut comparison, manifests) = divergent_comparison_fixture();
+        comparison.reload.final_identity = comparison.reload.read_identity.clone();
+
+        assert!(matches!(
+            divergent_sources_diagnostic(&comparison, &manifests),
+            Err(MvsDuplicatePackageLineDiagnosticError::DivergentSourcesHaveSameIdentity(_))
+        ));
+    }
+
+    #[test]
+    fn divergent_source_diagnostic_rejects_a_changed_source_clause_at_the_same_span() {
+        let (comparison, _) = divergent_comparison_fixture();
+        let changed_root = r#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires {
+    acme:dep @ ^1 from git "https://example.test/evil"
+    acme:alpha @ ^1 from git "https://example.test/alpha"
+}
+"#;
+        let alpha_source = r#"package acme:alpha @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from git "https://example.test/final" }
+"#;
+        let manifests = manifests_for(
+            (
+                package_version("acme:app", "1.0.0"),
+                changed_root.to_owned(),
+            ),
+            vec![(
+                package_version("acme:alpha", "1.0.0"),
+                alpha_source.to_owned(),
+            )],
+        );
+
+        assert!(matches!(
+            divergent_sources_diagnostic(&comparison, &manifests),
+            Err(MvsDuplicatePackageLineDiagnosticError::SourceSelectionDoesNotMatchManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn root_git_override_location_rejects_a_different_root_at_the_same_span() {
+        let selected_root_source = r#"package acme:app @ 1.0.0
+source "src"
+targets { wasm32-core }
+overrides { acme:dep use git "https://example.test/fork" }
+requires { acme:dep @ ^1 from git "https://example.test/read" }
+"#;
+        let selected_root = parse_for_role(selected_root_source.as_bytes(), PackageRole::Root);
+        let path_packages = std::collections::BTreeMap::new();
+        let root_path_overrides = std::collections::BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &selected_root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("selected root context is valid");
+        let root_contract = build_resolver_contract(
+            &selected_root,
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("selected root contract is valid");
+        let package = package_version("acme:dep", "1.0.0");
+        let root_package = root_contract.mvs.package_version().clone();
+        let requirement = root_contract
+            .requirements()
+            .iter()
+            .find(|requirement| requirement.package.as_ref() == package.package())
+            .expect("root dependency edge is present");
+        let selection = select_resolver_source(
+            &MvsContractRequest {
+                package_version: package,
+                named_by: vec![MvsNamedEdge {
+                    requirer: MvsRequirer::Root(root_package),
+                    span: requirement.span.clone(),
+                    path_pin: false,
+                    root_override_pin: false,
+                }],
+                lock_floor: false,
+            },
+            &root_contract,
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("root Git override selects a source");
+        let wrong_root_source = selected_root_source.replacen("1.0.0", "2.0.0", 1);
+        let wrong_root_manifests = manifests_for(
+            (package_version("acme:app", "2.0.0"), wrong_root_source),
+            vec![],
+        );
+
+        assert!(matches!(
+            resolver_source_selection_location(&selection, &wrong_root_manifests),
+            Err(MvsDuplicatePackageLineDiagnosticError::ManifestPackageMismatch { .. })
+        ));
+        let changed_override_source = selected_root_source.replace("fork", "evil");
+        let changed_override_manifests = manifests_for(
+            (
+                package_version("acme:app", "1.0.0"),
+                changed_override_source,
+            ),
+            vec![],
+        );
+        assert!(matches!(
+            resolver_source_selection_location(&selection, &changed_override_manifests),
+            Err(MvsDuplicatePackageLineDiagnosticError::SourceSelectionDoesNotMatchManifest { .. })
+        ));
     }
 
     const ROOT_MANIFEST: &str = "package acme:app @ 1.0.0\n\
