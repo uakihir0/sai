@@ -201,7 +201,7 @@ impl MvsEdge {
         self.root_override_pin
     }
 
-    fn target(&self) -> MvsPackageVersion {
+    pub(crate) fn target(&self) -> MvsPackageVersion {
         MvsPackageVersion {
             package: self.package.clone(),
             version: self.named_version.clone(),
@@ -346,24 +346,75 @@ pub enum MvsSelectionErrorKind {
     ContractNotProvided(MvsPackageVersion),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvsSelectionOutput {
+    root_contract: MvsContract,
+    read_contracts: BTreeMap<MvsPackageVersion, MvsContract>,
     /// Selected version per reached identity and compatibility line: the
     /// maximum named version for unpinned nodes, or the exact path pin.
-    pub selected: BTreeMap<MvsNode, Version>,
+    selected: BTreeMap<MvsNode, Version>,
     /// Package versions whose contracts were read, in deterministic queue
     /// order.
-    pub read_order: Vec<MvsPackageVersion>,
+    read_order: Vec<MvsPackageVersion>,
     /// All real edges that named each version. Lock floors are excluded.
-    pub named_by: BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>>,
+    named_by: BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>>,
     /// The `named_by` snapshot available when each contract left the queue.
-    pub read_named_by: BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>>,
+    read_named_by: BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>>,
     /// Pin versions from root overrides and path edges that were reached.
-    pub reached_pins: BTreeMap<MvsNode, BTreeSet<Version>>,
-    pub errors: Vec<MvsSelectionError>,
+    reached_pins: BTreeMap<MvsNode, BTreeSet<Version>>,
+    errors: Vec<MvsSelectionError>,
 }
 
 impl MvsSelectionOutput {
+    fn new(root_contract: MvsContract) -> Self {
+        Self {
+            root_contract,
+            read_contracts: BTreeMap::new(),
+            selected: BTreeMap::new(),
+            read_order: Vec::new(),
+            named_by: BTreeMap::new(),
+            read_named_by: BTreeMap::new(),
+            reached_pins: BTreeMap::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    pub const fn root(&self) -> &MvsPackageVersion {
+        self.root_contract.package_version()
+    }
+
+    pub const fn root_contract(&self) -> &MvsContract {
+        &self.root_contract
+    }
+
+    pub fn read_contracts(&self) -> &BTreeMap<MvsPackageVersion, MvsContract> {
+        &self.read_contracts
+    }
+
+    pub fn selected(&self) -> &BTreeMap<MvsNode, Version> {
+        &self.selected
+    }
+
+    pub fn read_order(&self) -> &[MvsPackageVersion] {
+        &self.read_order
+    }
+
+    pub fn named_by(&self) -> &BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>> {
+        &self.named_by
+    }
+
+    pub fn read_named_by(&self) -> &BTreeMap<MvsPackageVersion, Vec<MvsNamedEdge>> {
+        &self.read_named_by
+    }
+
+    pub fn reached_pins(&self) -> &BTreeMap<MvsNode, BTreeSet<Version>> {
+        &self.reached_pins
+    }
+
+    pub fn errors(&self) -> &[MvsSelectionError] {
+        &self.errors
+    }
+
     pub fn is_complete(&self) -> bool {
         self.errors.is_empty()
     }
@@ -394,8 +445,7 @@ pub fn select(
     floors: &HashMap<MvsNode, Version>,
     pins: &HashMap<MvsNode, Version>,
 ) -> Result<MvsSelectionOutput, Vec<MvsInputError>> {
-    let root_version = root.package_version.clone();
-    let mut state = MvsSelectionState::new(root_version, floors, pins);
+    let mut state = MvsSelectionState::new(root.clone(), floors, pins);
 
     for edge in &root.edges {
         state
@@ -424,6 +474,10 @@ pub fn select(
             )]);
         }
 
+        state
+            .output
+            .read_contracts
+            .insert(package_version.clone(), contract.clone());
         state.output.read_order.push(package_version.clone());
         state.output.read_named_by.insert(
             package_version.clone(),
@@ -472,10 +526,12 @@ struct MvsSelectionState<'a> {
 
 impl<'a> MvsSelectionState<'a> {
     fn new(
-        root_version: MvsPackageVersion,
+        root_contract: MvsContract,
         floors: &'a HashMap<MvsNode, Version>,
         pins: &'a HashMap<MvsNode, Version>,
     ) -> Self {
+        let root_version = root_contract.package_version.clone();
+        let output = MvsSelectionOutput::new(root_contract);
         Self {
             root_node: root_version.node(),
             root_version,
@@ -484,7 +540,7 @@ impl<'a> MvsSelectionState<'a> {
             touched: HashSet::new(),
             read: HashSet::new(),
             queue: BTreeSet::new(),
-            output: MvsSelectionOutput::default(),
+            output,
         }
     }
 
