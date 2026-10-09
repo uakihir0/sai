@@ -16,6 +16,7 @@ pub mod mvs;
 pub mod mvs_diagnostics;
 pub mod mvs_explanations;
 pub mod mvs_graph_validation;
+pub mod package_cache;
 pub mod package_path;
 pub mod resolver_contract;
 pub mod resolver_source;

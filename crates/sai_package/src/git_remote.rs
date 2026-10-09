@@ -14,7 +14,7 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use crate::git_tags::{
     GitReleaseTag, GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs,
 };
-use crate::git_tree::{GitPackageFile, GitTreeReadError, GitTreeReader};
+use crate::git_tree::{GitPackageFile, GitPackageSourceTree, GitTreeReadError, GitTreeReader};
 use crate::lock_validation::canonical_git_url;
 use crate::manifest::PackageParseOutput;
 use crate::mvs::MvsPackageVersion;
@@ -105,9 +105,7 @@ pub struct FetchedGitRelease {
     tag_object_id: Option<gix::ObjectId>,
     tag_missing: bool,
     commit_id: gix::ObjectId,
-    source_tree: TreeHash,
-    package_manifest: PackageParseOutput,
-    source_files: Vec<GitPackageFile>,
+    source: GitPackageSourceTree,
 }
 
 impl FetchedGitRelease {
@@ -141,7 +139,7 @@ impl FetchedGitRelease {
 
     /// The checksum and warnings for the selected package source tree.
     pub const fn source_tree(&self) -> &TreeHash {
-        &self.source_tree
+        self.source.source_tree()
     }
 
     /// The dependency-role parse result for the fetched `sai.package`.
@@ -150,12 +148,21 @@ impl FetchedGitRelease {
     /// [`Self::build_dependency_contract`] before using this release in
     /// dependency resolution.
     pub const fn package_manifest(&self) -> &PackageParseOutput {
-        &self.package_manifest
+        self.source.package_manifest()
     }
 
     /// The exact selected source files, sorted by their package-relative paths.
     pub fn source_files(&self) -> &[GitPackageFile] {
-        &self.source_files
+        self.source.files()
+    }
+
+    /// Consume the release and return its verified source snapshot for caching.
+    ///
+    /// The snapshot keeps the checksum, parsed manifest, and selected files
+    /// together so callers cannot associate one tree's files with another
+    /// tree's content address.
+    pub fn into_source_tree(self) -> GitPackageSourceTree {
+        self.source
     }
 
     /// Validate the fetched manifest and build its resolver contract.
@@ -173,8 +180,9 @@ impl FetchedGitRelease {
                 tag_version: self.version.clone(),
             });
         }
-        let contract = build_resolver_contract(&self.package_manifest, context, validation_context)
-            .map_err(GitRemoteReleaseContractError::InvalidContract)?;
+        let contract =
+            build_resolver_contract(self.source.package_manifest(), context, validation_context)
+                .map_err(GitRemoteReleaseContractError::InvalidContract)?;
         let found = contract.mvs.package_version();
         if found != expected {
             return Err(GitRemoteReleaseContractError::PackageVersionMismatch {
@@ -669,13 +677,12 @@ fn fetch_release_tree_in_repository(
     let package_source_tree = reader
         .read_commit_package_source_tree(&commit_id, package_directory)
         .map_err(GitRemoteReleaseFetchError::SourceTree)?;
-    let (source_tree, package_manifest, source_files) = package_source_tree.into_parts();
     if let Some(expected_source_checksum) = expected_source_checksum
-        && source_tree.checksum != expected_source_checksum
+        && package_source_tree.source_tree().checksum != expected_source_checksum
     {
         return Err(GitRemoteReleaseFetchError::ChecksumMismatch {
             expected: expected_source_checksum.into(),
-            actual: source_tree.checksum.clone().into(),
+            actual: package_source_tree.source_tree().checksum.clone().into(),
         });
     }
 
@@ -685,9 +692,7 @@ fn fetch_release_tree_in_repository(
         tag_object_id,
         tag_missing,
         commit_id,
-        source_tree,
-        package_manifest,
-        source_files,
+        source: package_source_tree,
     })
 }
 
