@@ -10,6 +10,7 @@ members = [
     "crates/sai_stable_hash",
     "crates/sai_syntax",
     "crates/sai_vfs",
+    "vendor/gix-protocol-0.65.1",
 ]
 
 [workspace.package]
@@ -29,3 +30,6 @@ sha2 = "0.11.0"
 unicode-general-category = "=1.1.0"
 unicode-ident = "=1.0.18"
 unicode-normalization = "=0.1.24"
+
+[patch.crates-io]
+gix-protocol = { path = "vendor/gix-protocol-0.65.1" }

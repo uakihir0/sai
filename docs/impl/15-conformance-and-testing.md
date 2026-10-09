@@ -661,6 +661,7 @@ These tests live in `tests/impl/` and use the reference implementation's crates 
 
 1. The `ssh` transport of [package/04](../package/04-distribution-and-security.md) §4.2.3 is tested against an SSH server in the CI sandbox with fixture repositories (§15.2.7), and against a mock that refuses authentication, closes the connection, and sends malformed responses.
 2. Fetch failures, retries and partial downloads into the global cache are tested by a fixture server that fails requests at chosen points; the cache MUST never contain an entry whose tree hash does not match ([package/04](../package/04-distribution-and-security.md) §4.4).
+3. If `gix-protocol` is locally patched, its bounded ref-advertisement parser tests run explicitly in both adapter configurations: `cargo test -p gix-protocol --lib --features blocking-client,async-client,sha1,sha256` and `cargo test -p gix-protocol --lib --features async-client,sha1,sha256`. The workspace build does not enable the crate's optional protocol-client features, so `cargo test --workspace` alone does not run these cases.
 
 ### 15.12.5 The command line
 
