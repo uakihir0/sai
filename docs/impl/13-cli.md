@@ -809,15 +809,18 @@ Estimated contribution
 
 Needs approval
   CAPABILITY_ESCALATION
+
+Unused source clauses
+  none
 ```
 
 This is the example of package/04 §4.7.3. The headings, their order, and their values are defined by package/04 §4.7.1. An empty list is printed as the single value `none`. In JSON, each review is one record of kind `review`, written before the command's own record:
 
 ```json
-{"type":"result","kind":"review","data":{"package":"acme:sqlite@3.1.0","source":"git \"https://github.com/acme/sqlite\"","form":"artifact","capabilities":["alloc","wasi:filesystem"],"supported":["wasm32-wasi","wasm64-wasi"],"not_supported":["wasm32-core","wasm64-core"],"estimated_contribution_bytes":626688,"needs_approval":["CAPABILITY_ESCALATION"]}}
+{"type":"result","kind":"review","data":{"package":"acme:sqlite@3.1.0","source":"git \"https://github.com/acme/sqlite\"","form":"artifact","capabilities":["alloc","wasi:filesystem"],"supported":["wasm32-wasi","wasm64-wasi"],"not_supported":["wasm32-core","wasm64-core"],"estimated_contribution_bytes":626688,"needs_approval":["CAPABILITY_ESCALATION"],"unused_sources":[]}}
 ```
 
-`form` is `"source"`, `"artifact"`, or `"hybrid"` (package/02 §2.11 rule 7). `estimated_contribution_bytes` is `null` when package/04 gives no estimate. `needs_approval` lists the codes of the review items that need approval, in byte order.
+`form` is `"source"`, `"artifact"`, or `"hybrid"` (package/02 §2.11 rule 7). `estimated_contribution_bytes` is `null` when package/04 gives no estimate. `needs_approval` lists the codes of the review items that need approval, in byte order. Each `unused_sources` object identifies the requiring package, whether it is the root, the version it named, and the source clause, in the order defined by package/04 §4.7.1.
 
 ### 13.6.9 `sai add`
 
@@ -1400,6 +1403,10 @@ Every result record that a command of this chapter writes MUST validate against 
     "target": { "enum": ["wasm32-core", "wasm64-core", "wasm32-wasi", "wasm64-wasi"] },
     "profile": { "enum": ["dev", "release", "tiny"] },
     "strings": { "type": "array", "items": { "type": "string" } },
+    "unused_source": {
+      "type": "object", "required": ["requirer", "requirer_is_root", "named_version", "source"], "additionalProperties": false,
+      "properties": { "requirer": { "$ref": "#/$defs/package_ref" }, "requirer_is_root": { "type": "boolean" }, "named_version": { "type": "string" }, "source": { "type": "string" } }
+    },
     "file_record": {
       "type": "object", "required": ["path", "bytes", "sha256"], "additionalProperties": false,
       "properties": { "path": { "type": "string" }, "bytes": { "$ref": "#/$defs/uint" }, "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
@@ -1467,12 +1474,13 @@ Every result record that a command of this chapter writes MUST validate against 
       "properties": { "check": { "type": "boolean" }, "files": { "$ref": "#/$defs/uint" }, "changed": { "$ref": "#/$defs/strings" }, "refused": { "$ref": "#/$defs/strings" }, "output": { "type": ["string", "null"] } }
     },
     "review": {
-      "type": "object", "required": ["package", "source", "form", "capabilities", "supported", "not_supported", "estimated_contribution_bytes", "needs_approval"], "additionalProperties": false,
+      "type": "object", "required": ["package", "source", "form", "capabilities", "supported", "not_supported", "estimated_contribution_bytes", "needs_approval", "unused_sources"], "additionalProperties": false,
       "properties": {
         "package": { "$ref": "#/$defs/package_ref" }, "source": { "type": "string" }, "form": { "enum": ["source", "artifact", "hybrid"] },
         "capabilities": { "$ref": "#/$defs/strings" }, "supported": { "type": "array", "items": { "$ref": "#/$defs/target" } }, "not_supported": { "type": "array", "items": { "$ref": "#/$defs/target" } },
         "estimated_contribution_bytes": { "oneOf": [{ "$ref": "#/$defs/uint" }, { "type": "null" }] },
-        "needs_approval": { "type": "array", "items": { "enum": ["CAPABILITY_ESCALATION", "SOURCE_CHANGED"] } }
+        "needs_approval": { "type": "array", "items": { "enum": ["CAPABILITY_ESCALATION", "SOURCE_CHANGED"] } },
+        "unused_sources": { "type": "array", "items": { "$ref": "#/$defs/unused_source" } }
       }
     },
     "section": { "enum": ["requires", "requires test"] },

@@ -387,7 +387,7 @@ During selection, the contract of `(id, v)` is read from the source given by the
 
 1. After `Check`, for every resolved node, the final source (§2.8.1) is compared with the source used to read its selected version (§2.8.2). If they differ, the version is fetched from the final source, and its included edges (identity, requirement, source clause, `only`, `grant`) MUST equal those read during selection.
 2. Otherwise the error is `DIVERGENT_SOURCES`: two sources provide different contracts for the same package version. The diagnostic names both sources and the edges that named them, and suggests an override that makes the choice explicit (§2.7.3).
-3. Different sources that provide equal contracts are accepted. The review lists, for every node, the source clauses that were not used ([04 §4.7](04-distribution-and-security.md)).
+3. Different sources that provide equal contracts are accepted. Each package review that is shown lists the source clauses that did not select that node's final source ([04 §4.7](04-distribution-and-security.md)). This includes clauses on incoming edges of the selected graph and on any other candidate edge that named the exact selected version. It omits the final winning named-requirement clause and every path-pin clause in the final path-pin set, because all such pins participate in the source-identity check. A root override or lock-floor source does not select a requirement clause, so all included incoming requirement clauses are listed. Edges excluded by target filtering and edges to other, non-selected candidates are omitted.
 
 ---
 

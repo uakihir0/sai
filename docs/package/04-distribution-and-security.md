@@ -280,6 +280,7 @@ A **review** describes one package version as a dependency (draft §75). `sai ad
 | `Not supported` | `not_supported` | the root's targets that the package does not list, sorted by bytes |
 | `Estimated contribution` | `estimated_contribution_bytes` | the size of the largest artifact used in artifact form for one of the root's targets with the `release` profile (§4.5.1); for packages used only in source form there is no estimate (JSON `null`, human `unknown`), because their contribution depends on reachability and is reported by `sai size` |
 | `Needs approval` | `needs_approval` | the codes of the items of §4.7.2, sorted by bytes |
+| `Unused source clauses` | `unused_sources` | requirement source clauses that did not select the final source for this node, with their requiring package and named version; sorted by requiring identity bytes, requiring version, named version, then source span |
 
 1. In human format, a list is printed one value per line, and an empty list as the single value `none` ([impl/13 §13.6.8](../impl/13-cli.md)). Sizes are printed in the largest of `B`, `KiB`, `MiB` in which the value is at least 1, rounded up to an integer (`612 KiB`).
 2. For a changed node, a capability that escalates ([02 §2.12.3](02-resolver.md)) is followed by ` (new)`, and a capability that disappeared is listed with ` (removed)`. In JSON, the additional keys `capabilities_added` and `capabilities_removed` carry the same lists.
@@ -289,7 +290,9 @@ A **review** describes one package version as a dependency (draft §75). `sai ad
    - `FOOTPRINT_NOT_GRANTED` (info): the footprint of the package, or of a package reachable from it, is not covered by the `grant` of an edge to it ([01 §1.10.8](01-package-contract.md)).
    - `CONFUSABLE_PACKAGE_NAME` (warning): §4.11.1.
    - `DUPLICATE_PACKAGE_LINE` (lint, [02 §2.9](02-resolver.md)): the node is a second line of a package in the graph.
-5. The example of draft §75, corrected to this format, is in §4.7.3.
+5. In human format, each unused source is printed as `<root or requiring package>@<version> names <reviewed package>@<named version> from <source clause>`. In JSON, each `unused_sources` entry has `requirer`, `requirer_is_root`, `named_version`, and `source` fields. Git URLs use the canonical spelling from §4.2.2; path clauses retain their manifest spelling and are relative to `requirer`.
+6. The list includes source clauses on incoming edges of the selected graph and on any other candidate edge that named the exact selected version. It omits the final winning named-requirement clause. Every path-pin clause in the final path-pin set is also omitted because it participates in the source-identity check. A root override or lock-floor source does not select a requirement clause, so all included incoming requirement clauses are listed. Edges excluded by target filtering and edges to other, non-selected candidates are not listed.
+7. The example of draft §75, corrected to this format, is in §4.7.3.
 
 ### 4.7.2 Approval
 
@@ -339,12 +342,15 @@ Estimated contribution
 
 Needs approval
   CAPABILITY_ESCALATION
+
+Unused source clauses
+  none
 ```
 
 It is followed by the prompt `approve these changes? [y/N] ` of [impl/13 §13.4.6](../impl/13-cli.md). The same review in JSON:
 
 ```json
-{"type":"result","kind":"review","data":{"package":"acme:sqlite@3.1.0","source":"git \"https://github.com/acme/sqlite\"","form":"artifact","capabilities":["alloc","wasi:filesystem"],"supported":["wasm32-wasi","wasm64-wasi"],"not_supported":["wasm32-core","wasm64-core"],"estimated_contribution_bytes":626688,"needs_approval":["CAPABILITY_ESCALATION"]}}
+{"type":"result","kind":"review","data":{"package":"acme:sqlite@3.1.0","source":"git \"https://github.com/acme/sqlite\"","form":"artifact","capabilities":["alloc","wasi:filesystem"],"supported":["wasm32-wasi","wasm64-wasi"],"not_supported":["wasm32-core","wasm64-core"],"estimated_contribution_bytes":626688,"needs_approval":["CAPABILITY_ESCALATION"],"unused_sources":[]}}
 ```
 
 The corrections against the draft:
@@ -358,6 +364,7 @@ The corrections against the draft:
 | `Supported`, `Not supported` | the same headings | relative to the root's targets; the draft listed only one unsupported target |
 | `Estimated contribution` | `Estimated contribution` | defined for packages used in artifact form; `unknown` otherwise (§4.7.1) |
 | (absent) | `Needs approval` | approval items of §4.7.2, so that a non-interactive caller can decide from the record alone |
+| (absent) | `Unused source clauses` | the resolver requires unused source clauses to remain visible even when they do not need approval (§4.7.1) |
 
 Notes on the example:
 
@@ -482,7 +489,7 @@ Each entry is provisional until it is merged into [decisions.md](../design/decis
 | N-G-51 | Fixed, non-configurable size limits for fetched content: 100,000 files, 256 MiB per file, 1 GiB per package, 4 GiB per fetch, 4096/255-byte paths, 100,000 tags (`PACKAGE_TOO_LARGE`, §4.4.4). | P8: a package accepted on one host is accepted on all; protection against resource exhaustion (P5). |
 | N-G-52 | Dependents see artifact and hybrid packages only through the SAI view of their WIT, in both forms; the WIT generated from a hybrid package's source MUST equal its declared world (`HYBRID_WIT_MISMATCH`, §4.5.3). | P4, P8: switching forms under D-PKG-05 never changes whether a dependent type-checks. |
 | N-G-53 | There is no yanking in v0.1; broken releases are superseded by new versions; tags MUST NOT be deleted or moved (§4.6.2). | P8: resolution never depends on mutable remote metadata; MVS never picks a version nobody named. |
-| N-G-54 | The review has the headings Package, Source, Form, Capabilities, Supported, Not supported, Estimated contribution, Needs approval, in this order, with fixed JSON keys (§4.7.1). | P1, P5: costs and authority of a dependency are visible before it is accepted (draft §75); a fixed schema serves agents and CI (P8). |
+| N-G-54 | The review has the headings Package, Source, Form, Capabilities, Supported, Not supported, Estimated contribution, Needs approval, Unused source clauses, in this order, with fixed JSON keys (§4.7.1). | P1, P5: costs, authority, and source selection of a dependency are visible before it is accepted (draft §75); a fixed schema serves agents and CI (P8). |
 | N-G-55 | Approval items are `CAPABILITY_ESCALATION`, `SOURCE_CHANGED` (a different canonical URL or `dir` for a Git node in both locks), and `TAG_MOVED` content replacement; approval is all-or-nothing per command and recorded by the written lock (§4.7.2). | P5: new authority and new provenance need a human decision; P8: a partially approved lock would be a resolution nobody reviewed. |
 | N-G-56 | The package system passes to the compiler only each node's identity, version, verified files, and form; URLs, commits, and the cache location are not compiler inputs (§4.8). | P8: mirrors with identical content and moved caches give identical outputs. |
 | N-G-57 | Git fetching is the toolchain's only network access; there are no update checks or telemetry; `--offline` means no DNS lookup and no connection of any kind (§4.9). | P5: the toolchain itself uses no ambient authority beyond what the user asked for; P8: offline results equal online results or fail. |
