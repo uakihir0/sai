@@ -12,6 +12,9 @@ use crate::package_path::{ContentPackagePath, DependencyPackagePath, PackagePath
 use crate::version::{Version, VersionParseError};
 use crate::version_req::{PartialVersion, VersionReq, VersionReqParseError};
 
+/// Maximum number of bytes accepted for a `sai.package` manifest.
+pub const MAX_PACKAGE_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+
 /// A value associated with its half-open byte range in the original file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Spanned<T> {
@@ -170,6 +173,7 @@ pub enum PackageParseErrorKind {
     InvalidDependencyPath(PackagePathError),
     ConflictingLintLevel,
     InvalidVersionRequirement(VersionReqParseError),
+    ManifestTooLarge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -241,8 +245,23 @@ pub fn parse(source: &[u8]) -> PackageParseOutput {
 ///
 /// Root-only declarations remain in the syntax tree for dependencies, but
 /// duplicate-declaration and duplicate-list diagnostics for those ignored
-/// declarations are suppressed.
+/// declarations are suppressed. Inputs larger than
+/// [`MAX_PACKAGE_MANIFEST_BYTES`] return one `ManifestTooLarge` error without
+/// lexing the file.
 pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
+    if source.len() > MAX_PACKAGE_MANIFEST_BYTES {
+        return PackageParseOutput {
+            file: PackageFile::default(),
+            role,
+            lexical_errors: Vec::new(),
+            errors: vec![PackageParseError {
+                kind: PackageParseErrorKind::ManifestTooLarge,
+                span: 0..0,
+            }],
+            warnings: Vec::new(),
+        };
+    }
+
     let lexed = lex(source);
     let mut file = PackageFile {
         trivia: lexed.trivia,
@@ -1744,8 +1763,9 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        LintLevel, OverrideSource, PackageDeclaration, PackageIdentityError, PackageParseErrorKind,
-        PackageRole, ProfileItem, RequirementSource, parse, parse_for_role,
+        LintLevel, MAX_PACKAGE_MANIFEST_BYTES, OverrideSource, PackageDeclaration,
+        PackageIdentityError, PackageParseErrorKind, PackageRole, ProfileItem, RequirementSource,
+        parse, parse_for_role,
     };
 
     fn parse_text(source: &str) -> super::PackageParseOutput {
@@ -1761,6 +1781,22 @@ mod tests {
             output.errors
         );
         output
+    }
+
+    #[test]
+    fn oversized_manifests_fail_before_lexing_and_return_the_requested_role() {
+        let source = vec![0xff; MAX_PACKAGE_MANIFEST_BYTES + 1];
+        let parsed = parse_for_role(&source, PackageRole::Dependency);
+
+        assert_eq!(parsed.role(), PackageRole::Dependency);
+        assert!(parsed.lexical_errors().is_empty());
+        assert_eq!(parsed.errors().len(), 1);
+        assert_eq!(
+            parsed.errors()[0].kind,
+            PackageParseErrorKind::ManifestTooLarge
+        );
+        assert_eq!(parsed.errors()[0].span, 0..0);
+        assert!(!parsed.is_syntax_valid());
     }
 
     #[test]
