@@ -1,19 +1,34 @@
 //! Cross-declaration validation for parsed package contracts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::manifest::{
     OverrideSource, PackageDeclaration, PackageParseOutput, ProfileItem, Requirement, Spanned,
+    parse_for_role,
 };
 use crate::version::Version;
 
 pub use crate::manifest::PackageRole;
 
-/// A package manifest cannot supply lint policy data.
+/// A package manifest could not produce trusted lint configuration data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PackageLintPolicyError {
     PackageSyntaxInvalid,
+    MissingSnapshotFile(sai_diagnostics::FileId),
+    SnapshotFileIdMismatch {
+        expected: sai_diagnostics::FileId,
+        found: sai_diagnostics::FileId,
+    },
+    ManifestPathMismatch {
+        file_id: sai_diagnostics::FileId,
+        found: String,
+    },
+    ManifestPackageMismatch {
+        file_id: sai_diagnostics::FileId,
+        expected: String,
+        found: Option<String>,
+    },
     SourceSpanOutOfRange(Range<usize>),
 }
 
@@ -58,6 +73,95 @@ pub fn resolve_lint_policies(
     }
 
     Ok(policies)
+}
+
+/// Resolves validated root-package `lints {}` entries to source-bound
+/// manifest levels.
+///
+/// Parses the manifest from the supplied VFS snapshot, verifies that it is
+/// the root package's `sai.package`, and resolves its validated lint entries.
+/// Dependency manifests do not contribute lint levels. Unknown codes and hard
+/// diagnostic codes are omitted, matching the manifest rule that invalid
+/// entries are ignored; semantic validation is responsible for reporting them.
+pub fn resolve_manifest_lint_levels(
+    snapshot: &sai_diagnostics::WorkspaceSnapshot,
+    file_id: sai_diagnostics::FileId,
+    role: PackageRole,
+) -> Result<BTreeMap<String, sai_diagnostics::ManifestLintLevel>, PackageLintPolicyError> {
+    let snapshot_file = snapshot
+        .file(file_id)
+        .ok_or(PackageLintPolicyError::MissingSnapshotFile(file_id))?;
+    let source_file = snapshot_file.source();
+    if source_file.id() != file_id {
+        return Err(PackageLintPolicyError::SnapshotFileIdMismatch {
+            expected: file_id,
+            found: source_file.id(),
+        });
+    }
+    if role == PackageRole::Root
+        && (snapshot_file.path().starts_with("dep:")
+            || snapshot_file.path().rsplit('/').next() != Some("sai.package")
+            || snapshot_file.path() == "<stdin>")
+    {
+        return Err(PackageLintPolicyError::ManifestPathMismatch {
+            file_id,
+            found: snapshot_file.path().to_owned(),
+        });
+    }
+
+    let parsed = parse_for_role(source_file.raw_bytes(), role);
+    if !parsed.is_syntax_valid() {
+        return Err(PackageLintPolicyError::PackageSyntaxInvalid);
+    }
+    if role != PackageRole::Root {
+        return Ok(BTreeMap::new());
+    }
+
+    let expected_package = parsed
+        .file()
+        .header
+        .as_ref()
+        .map(|header| format!("{}@{}", header.value.identity, header.value.version))
+        .ok_or(PackageLintPolicyError::PackageSyntaxInvalid)?;
+    let found_package = snapshot_file.package().map(str::to_owned);
+    if found_package.as_deref() != Some(expected_package.as_str()) {
+        return Err(PackageLintPolicyError::ManifestPackageMismatch {
+            file_id,
+            expected: expected_package,
+            found: found_package,
+        });
+    }
+    let source = sai_diagnostics::SourceRef {
+        path: snapshot_file.path().to_owned(),
+        package: snapshot_file.package().map(str::to_owned),
+        snapshot: snapshot_file.document_version(),
+    };
+
+    let mut levels = BTreeMap::new();
+    for declaration in &parsed.file().declarations {
+        let PackageDeclaration::Lints(items) = &declaration.value else {
+            continue;
+        };
+        for item in items {
+            if !matches!(
+                sai_diagnostics::lookup_lint_name(&item.value.code),
+                sai_diagnostics::LintNameLookup::Lint(_)
+            ) {
+                continue;
+            }
+            let level = match item.value.level {
+                crate::manifest::LintLevel::Allow => sai_diagnostics::OverrideLintLevel::Allow,
+                crate::manifest::LintLevel::Warn => sai_diagnostics::OverrideLintLevel::Warn,
+                crate::manifest::LintLevel::Deny => sai_diagnostics::OverrideLintLevel::Deny,
+            };
+            let location = package_policy_location(&source, file_id, item.span.clone())?;
+            levels
+                .entry(item.value.code.to_string())
+                .or_insert_with(|| sai_diagnostics::ManifestLintLevel::new(level, location));
+        }
+    }
+
+    Ok(levels)
 }
 
 fn package_policy_location(
@@ -794,14 +898,34 @@ mod tests {
         PackageDeclaration, PackageParseOutput, PackageRole, parse, parse_for_role,
     };
     use crate::version::Version;
+    use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
+    use std::sync::Arc;
 
     use super::{
         PackageLintPolicyError, PackageValidationContext, PackageValidationErrorKind,
-        PackageValidationWarningKind, resolve_lint_policies, validate,
+        PackageValidationWarningKind, resolve_lint_policies, resolve_manifest_lint_levels,
+        validate,
     };
 
     fn parse_text(source: &str) -> PackageParseOutput {
         parse(source.as_bytes())
+    }
+
+    fn manifest_snapshot(
+        file_id: sai_diagnostics::FileId,
+        source: &str,
+        path: &str,
+        package: Option<&str>,
+    ) -> WorkspaceSnapshot {
+        WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(file_id, source.as_bytes()).expect("manifest source decodes"),
+            ),
+            path,
+            package.map(str::to_owned),
+            Some(1),
+        )])
+        .expect("manifest snapshot is valid")
     }
 
     fn kinds(source: &str) -> Vec<PackageValidationErrorKind> {
@@ -810,6 +934,190 @@ mod tests {
             .into_iter()
             .map(|error| error.kind)
             .collect()
+    }
+
+    #[test]
+    fn resolves_root_manifest_lint_levels_with_first_source_locations() {
+        let source = "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core }\n\
+             lints { deny NAMING_CONVENTION, warn CONTRACT_RUNTIME_CHECK, \
+                     allow PUBLIC_EFFECTS_INFERRED, deny NAMING_CONVENTION }\n";
+        let parsed = parse(source.as_bytes());
+        assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
+        let file_id = sai_diagnostics::FileId::new(7);
+        let snapshot = manifest_snapshot(file_id, source, "sai.package", Some("acme:app@1.0.0"));
+        let levels = resolve_manifest_lint_levels(&snapshot, file_id, PackageRole::Root)
+            .expect("valid manifest lint levels");
+
+        assert_eq!(levels.len(), 3);
+        let naming = levels
+            .get("NAMING_CONVENTION")
+            .expect("configured lint level");
+        assert_eq!(naming.level(), sai_diagnostics::OverrideLintLevel::Deny);
+        assert_eq!(
+            naming.location().file,
+            sai_diagnostics::SourceRef {
+                path: "sai.package".into(),
+                package: Some("acme:app@1.0.0".into()),
+                snapshot: Some(1),
+            }
+        );
+        assert_eq!(naming.location().span.file, file_id);
+        assert_eq!(
+            naming.location().span.range.start().to_usize(),
+            source
+                .find("deny NAMING_CONVENTION")
+                .expect("first lint entry is in source")
+        );
+        assert_eq!(
+            levels
+                .get("CONTRACT_RUNTIME_CHECK")
+                .expect("configured lint level")
+                .level(),
+            sai_diagnostics::OverrideLintLevel::Warn
+        );
+        assert_eq!(
+            levels
+                .get("PUBLIC_EFFECTS_INFERRED")
+                .expect("configured lint level")
+                .level(),
+            sai_diagnostics::OverrideLintLevel::Allow
+        );
+
+        let resolved = sai_diagnostics::resolve_lint_occurrence(
+            "NAMING_CONVENTION",
+            &sai_diagnostics::LintResolutionContext {
+                primary: None,
+                attributes: &[],
+                cli: None,
+                manifest: Some(naming),
+                package_policy: &sai_diagnostics::LintPolicies::default(),
+                root_policy: &sai_diagnostics::LintPolicies::default(),
+                is_root_or_workspace_member: true,
+                deny_warnings: false,
+            },
+        )
+        .expect("registered package lint");
+        let sai_diagnostics::LintResolution::Emitted { severity, level } = resolved else {
+            panic!("manifest deny level must emit the lint");
+        };
+        assert_eq!(severity, sai_diagnostics::Severity::Error);
+        assert_eq!(level.source, sai_diagnostics::LevelSource::Manifest);
+        assert_eq!(level.location.as_ref(), Some(naming.location()));
+    }
+
+    #[test]
+    fn ignores_invalid_lint_names_and_hard_diagnostics_in_manifest_levels() {
+        let source = "package acme:app @ 1.0.0\n\
+                      source \"src\"\n\
+                      targets { wasm32-core }\n\
+                      lints { deny NAMING_CONVENTION, deny FUTURE_LINT, \
+                              warn INVALID_DESCRIPTION }\n";
+        let file_id = sai_diagnostics::FileId::new(8);
+        let snapshot = manifest_snapshot(file_id, source, "sai.package", Some("acme:app@1.0.0"));
+        let levels = resolve_manifest_lint_levels(&snapshot, file_id, PackageRole::Root)
+            .expect("syntax-valid manifest lint levels");
+
+        assert_eq!(levels.len(), 1);
+        assert!(levels.contains_key("NAMING_CONVENTION"));
+        let validation = validate(
+            &parse(source.as_bytes()),
+            PackageValidationContext::default(),
+        );
+        assert_eq!(
+            validation
+                .errors
+                .iter()
+                .map(|error| &error.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                &PackageValidationErrorKind::UnknownLint("FUTURE_LINT".into()),
+                &PackageValidationErrorKind::NotALint("INVALID_DESCRIPTION".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_dependency_manifest_lint_levels() {
+        let source = "package acme:dep @ 1.0.0\n\
+                      source \"src\"\n\
+                      targets { wasm32-core }\n\
+                      lints { deny NAMING_CONVENTION }\n";
+        let parsed = parse_for_role(source.as_bytes(), PackageRole::Dependency);
+        assert!(validate(&parsed, PackageValidationContext::default()).is_valid());
+        let file_id = sai_diagnostics::FileId::new(9);
+        let snapshot = manifest_snapshot(
+            file_id,
+            source,
+            "dep:acme:dep@1.0.0/sai.package",
+            Some("acme:dep@1.0.0"),
+        );
+        let levels = resolve_manifest_lint_levels(&snapshot, file_id, PackageRole::Dependency)
+            .expect("valid dependency manifest");
+
+        assert!(levels.is_empty());
+    }
+
+    #[test]
+    fn rejects_manifest_lint_levels_from_conflicting_syntax() {
+        let source = "package acme:app @ 1.0.0\n\
+                      source \"src\"\n\
+                      targets { wasm32-core }\n\
+                      lints { deny NAMING_CONVENTION, warn NAMING_CONVENTION }\n";
+        let file_id = sai_diagnostics::FileId::new(10);
+        let snapshot = manifest_snapshot(file_id, source, "sai.package", Some("acme:app@1.0.0"));
+
+        assert_eq!(
+            resolve_manifest_lint_levels(&snapshot, file_id, PackageRole::Root,),
+            Err(PackageLintPolicyError::PackageSyntaxInvalid)
+        );
+    }
+
+    #[test]
+    fn rejects_manifest_source_metadata_that_does_not_match_its_header() {
+        let source = "package acme:app @ 1.0.0\n\
+                      source \"src\"\n\
+                      targets { wasm32-core }\n\
+                      lints { deny NAMING_CONVENTION }\n";
+        let file_id = sai_diagnostics::FileId::new(11);
+        let snapshot = manifest_snapshot(file_id, source, "sai.package", Some("acme:other@1.0.0"));
+
+        assert_eq!(
+            resolve_manifest_lint_levels(&snapshot, file_id, PackageRole::Root),
+            Err(PackageLintPolicyError::ManifestPackageMismatch {
+                file_id,
+                expected: "acme:app@1.0.0".into(),
+                found: Some("acme:other@1.0.0".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_manifest_paths_and_file_ids_outside_the_snapshot() {
+        let source = "package acme:app @ 1.0.0\n\
+                      source \"src\"\n\
+                      targets { wasm32-core }\n\
+                      lints { deny NAMING_CONVENTION }\n";
+        let file_id = sai_diagnostics::FileId::new(12);
+        let source_mismatch =
+            manifest_snapshot(file_id, source, "src/lib.sai", Some("acme:app@1.0.0"));
+        assert_eq!(
+            resolve_manifest_lint_levels(&source_mismatch, file_id, PackageRole::Root),
+            Err(PackageLintPolicyError::ManifestPathMismatch {
+                file_id,
+                found: "src/lib.sai".into(),
+            })
+        );
+
+        let manifest_id = sai_diagnostics::FileId::new(13);
+        let snapshot =
+            manifest_snapshot(manifest_id, source, "sai.package", Some("acme:app@1.0.0"));
+        let missing_file_id = sai_diagnostics::FileId::new(14);
+        assert_eq!(
+            resolve_manifest_lint_levels(&snapshot, missing_file_id, PackageRole::Root),
+            Err(PackageLintPolicyError::MissingSnapshotFile(missing_file_id))
+        );
     }
 
     #[test]
