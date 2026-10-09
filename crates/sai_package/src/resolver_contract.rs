@@ -255,6 +255,8 @@ pub enum ResolverContractSourceClause {
     /// filesystem or Git-tree identity is checked by source loading.
     Path {
         relative_to: MvsPackageVersion,
+        /// True when the root manifest or a root override supplied the path.
+        root_relative: bool,
         path: Box<str>,
     },
 }
@@ -301,6 +303,7 @@ pub enum ResolverContractSourceSide {
 pub struct ResolverContractPathSourceRequest {
     pub side: ResolverContractSourceSide,
     pub requiring_package: MvsPackageVersion,
+    pub root_relative: bool,
     pub package: Box<str>,
     pub path: Box<str>,
 }
@@ -431,13 +434,18 @@ fn resolve_path_edges<K, E>(
     edges
         .iter()
         .map(|edge| {
-            let Some(ResolverContractSourceClause::Path { relative_to, path }) = &edge.source
+            let Some(ResolverContractSourceClause::Path {
+                relative_to,
+                root_relative,
+                path,
+            }) = &edge.source
             else {
                 return None;
             };
             let request = ResolverContractPathSourceRequest {
                 side,
                 requiring_package: relative_to.clone(),
+                root_relative: *root_relative,
                 package: edge.package.clone(),
                 path: path.clone(),
             };
@@ -633,8 +641,13 @@ fn comparable_contract_edges(
         else {
             continue;
         };
-        let source =
-            canonical_requirement_source(requirement, named_version, requiring_package, context)?;
+        let source = canonical_requirement_source(
+            requirement,
+            named_version,
+            requiring_package,
+            contract.role() == PackageRole::Root,
+            context,
+        )?;
         edges.push(ResolverContractEdge {
             package: requirement.package.clone(),
             requirement: requirement.version.clone(),
@@ -652,6 +665,7 @@ fn canonical_requirement_source(
     requirement: &ResolverRequirement,
     named_version: &Version,
     requiring_package: &MvsPackageVersion,
+    requiring_package_is_root: bool,
     context: &ResolverContractContext<'_>,
 ) -> Result<Option<ResolverContractSourceClause>, ResolverContractComparisonError> {
     for item in &context.root_overrides {
@@ -668,6 +682,7 @@ fn canonical_requirement_source(
                     },
                     item.span.clone(),
                     context.root_package.clone(),
+                    true,
                 )
                 .map(Some);
             }
@@ -685,6 +700,7 @@ fn canonical_requirement_source(
                     RequirementSource::Path(path.clone()),
                     item.span.clone(),
                     context.root_package.clone(),
+                    true,
                 )
                 .map(Some);
             }
@@ -701,6 +717,7 @@ fn canonical_requirement_source(
                 spanned.value.clone(),
                 spanned.span.clone(),
                 requiring_package.clone(),
+                requiring_package_is_root,
             )
         })
         .transpose()
@@ -711,6 +728,7 @@ fn canonical_source_clause(
     source: RequirementSource,
     span: Range<usize>,
     path_base: MvsPackageVersion,
+    root_relative: bool,
 ) -> Result<ResolverContractSourceClause, ResolverContractComparisonError> {
     match source {
         RequirementSource::Git { url, directory } => {
@@ -735,6 +753,7 @@ fn canonical_source_clause(
         }
         RequirementSource::Path(path) => Ok(ResolverContractSourceClause::Path {
             relative_to: path_base,
+            root_relative,
             path,
         }),
     }
@@ -1679,6 +1698,22 @@ overrides { acme:edge use path "../override-edge" }
             path_comparison.status(),
             ResolverContractComparisonStatus::RequiresSourceBoundPathResolution
         );
+        let mut path_requests = Vec::new();
+        let resolved = path_comparison.compare_with_resolved_paths(|request| {
+            path_requests.push(request.clone());
+            Ok::<_, ()>("root-override-tree")
+        });
+        assert_eq!(
+            resolved.status(),
+            ResolverContractComparisonStatus::Equivalent
+        );
+        assert_eq!(path_requests.len(), 2);
+        assert!(path_requests.iter().all(|request| request.root_relative));
+        assert!(
+            path_requests.iter().all(|request| {
+                request.requiring_package == package_version("acme:app", "1.0.0")
+            })
+        );
     }
 
     #[test]
@@ -1815,6 +1850,7 @@ requires { acme:local @ ^1 from path "../local" }
             resolved_requests[0].requiring_package,
             package_version("acme:dep", "1.0.0")
         );
+        assert!(!resolved_requests[0].root_relative);
         assert_eq!(resolved_requests[0].path.as_ref(), "../local");
     }
 

@@ -1,20 +1,27 @@
 //! Drives MVS contract loading through manifest-aware source selection.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::sync::Arc;
 
 use crate::manifest::PackageRole;
 use crate::mvs::{
     MvsContractProviderFailure, MvsContractRequest, MvsInputError, MvsNode, MvsPackageVersion,
-    MvsSelectionError, MvsSelectionOutput, MvsSelectionProviderError, select_with_provider,
+    MvsRequirer, MvsSelectionError, MvsSelectionOutput, MvsSelectionProviderError,
+    select_with_provider,
 };
 use crate::mvs_graph_validation::{
     MvsSelectedGraph, MvsSelectedGraphInputError, check_selected_graph_with_root_cycles,
 };
-use crate::resolver_contract::{ResolverContract, ResolverContractContext};
+use crate::resolver_contract::{
+    ResolverContract, ResolverContractComparisonError, ResolverContractComparisonStatus,
+    ResolverContractContext, ResolverContractEdgeComparison, ResolverContractPathSourceRequest,
+    ResolverContractResolvedPathComparison, compare_resolver_contract_edges,
+};
 use crate::resolver_source::{
     ResolverPackageSource, ResolverPathPinSource, ResolverPathPinValidationError,
-    ResolverSourceSelection, ResolverSourceSelectionError, select_resolver_source, source_for_edge,
-    validate_resolver_path_pins,
+    ResolverSourceProvenance, ResolverSourceSelection, ResolverSourceSelectionError,
+    select_resolver_source, source_for_edge, validate_resolver_path_pins,
 };
 use crate::version::Version;
 
@@ -63,14 +70,169 @@ fn canonicalize_path_pin_with_cache<K: Clone, C>(
 /// The completed or partial result of source-aware MVS contract loading.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverSourceProviderOutput {
-    pub root_contract: ResolverContract,
-    pub selection: MvsSelectionOutput,
+    root_contract: ResolverContract,
+    selection: MvsSelectionOutput,
     /// Successfully loaded dependency contracts, including unselected MVS
     /// candidates whose edges contributed to selection.
-    pub dependency_contracts: BTreeMap<MvsPackageVersion, ResolverContract>,
+    dependency_contracts: BTreeMap<MvsPackageVersion, ResolverContract>,
     /// Source chosen when each concrete version left the MVS queue.
-    pub sources_used: BTreeMap<MvsPackageVersion, ResolverSourceSelection>,
+    sources_used: BTreeMap<MvsPackageVersion, ResolverSourceSelection>,
+    load_token: Option<ResolverSourceLoadToken>,
 }
+
+impl ResolverSourceProviderOutput {
+    pub const fn root_contract(&self) -> &ResolverContract {
+        &self.root_contract
+    }
+
+    pub const fn selection(&self) -> &MvsSelectionOutput {
+        &self.selection
+    }
+
+    pub fn dependency_contracts(&self) -> &BTreeMap<MvsPackageVersion, ResolverContract> {
+        &self.dependency_contracts
+    }
+
+    pub fn sources_used(&self) -> &BTreeMap<MvsPackageVersion, ResolverSourceSelection> {
+        &self.sources_used
+    }
+}
+
+#[derive(Clone)]
+struct ResolverSourceLoadToken(Arc<()>);
+
+impl fmt::Debug for ResolverSourceLoadToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ResolverSourceLoadToken")
+    }
+}
+
+impl PartialEq for ResolverSourceLoadToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ResolverSourceLoadToken {}
+
+impl ResolverSourceLoadToken {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+/// A validated contract and the complete identity of the source tree read for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverLoadedContract<K> {
+    contract: ResolverContract,
+    source_identity: K,
+}
+
+impl<K> ResolverLoadedContract<K> {
+    pub const fn new(contract: ResolverContract, source_identity: K) -> Self {
+        Self {
+            contract,
+            source_identity,
+        }
+    }
+
+    pub const fn contract(&self) -> &ResolverContract {
+        &self.contract
+    }
+
+    pub const fn source_identity(&self) -> &K {
+        &self.source_identity
+    }
+}
+
+/// The root contract paired with the identity of the exact root source read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverLoadedRootContract<K> {
+    contract: ResolverContract,
+    source_identity: K,
+}
+
+impl<K> ResolverLoadedRootContract<K> {
+    pub const fn new(contract: ResolverContract, source_identity: K) -> Self {
+        Self {
+            contract,
+            source_identity,
+        }
+    }
+
+    pub const fn contract(&self) -> &ResolverContract {
+        &self.contract
+    }
+
+    pub const fn source_identity(&self) -> &K {
+        &self.source_identity
+    }
+}
+
+/// Source identities captured by the loader when it read each contract.
+///
+/// The root is stored separately because it can have the same package version
+/// as a dependency selected from another source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverSourceIdentitySnapshot<K> {
+    root_package: MvsPackageVersion,
+    root_identity: Option<K>,
+    package_identities: BTreeMap<MvsPackageVersion, K>,
+}
+
+impl<K> ResolverSourceIdentitySnapshot<K> {
+    pub const fn root_package(&self) -> &MvsPackageVersion {
+        &self.root_package
+    }
+
+    pub const fn root_identity(&self) -> Option<&K> {
+        self.root_identity.as_ref()
+    }
+
+    pub fn package_identities(&self) -> &BTreeMap<MvsPackageVersion, K> {
+        &self.package_identities
+    }
+}
+
+/// Successful source-aware load result with identities captured alongside contracts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverSourceProviderIdentifiedOutput<K> {
+    output: ResolverSourceProviderOutput,
+    source_identities: ResolverSourceIdentitySnapshot<K>,
+}
+
+impl<K> ResolverSourceProviderIdentifiedOutput<K> {
+    pub const fn output(&self) -> &ResolverSourceProviderOutput {
+        &self.output
+    }
+
+    pub const fn source_identities(&self) -> &ResolverSourceIdentitySnapshot<K> {
+        &self.source_identities
+    }
+}
+
+/// Partial source-aware loading output together with identities captured for
+/// every contract that loaded successfully.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverSourceProviderIdentityLoadError<E, K, C, I> {
+    error: ResolverSourceProviderError<E, K, C>,
+    source_identities: ResolverSourceIdentitySnapshot<I>,
+}
+
+impl<E, K, C, I> ResolverSourceProviderIdentityLoadError<E, K, C, I> {
+    pub const fn error(&self) -> &ResolverSourceProviderError<E, K, C> {
+        &self.error
+    }
+
+    pub const fn source_identities(&self) -> &ResolverSourceIdentitySnapshot<I> {
+        &self.source_identities
+    }
+}
+
+pub type ResolverSourceProviderIdentifiedResult<E, K, C, I> = Result<
+    ResolverSourceProviderIdentifiedOutput<I>,
+    Box<ResolverSourceProviderIdentityLoadError<E, K, C, I>>,
+>;
 
 /// One resolved dependency's read-time and post-Check source choices.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +240,7 @@ pub struct ResolverFinalSourcePlanEntry {
     package_version: MvsPackageVersion,
     read_request: MvsContractRequest,
     final_request: MvsContractRequest,
+    read_contract: ResolverContract,
     read_source: ResolverSourceSelection,
     final_source: ResolverSourceSelection,
 }
@@ -93,6 +256,10 @@ impl ResolverFinalSourcePlanEntry {
 
     pub const fn final_request(&self) -> &MvsContractRequest {
         &self.final_request
+    }
+
+    pub const fn read_contract(&self) -> &ResolverContract {
+        &self.read_contract
     }
 
     pub const fn read_source(&self) -> &ResolverSourceSelection {
@@ -142,6 +309,18 @@ pub enum ResolverSourceIdentitySide {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolverSourceIdentityFailureKind<E> {
     MissingReadTimeIdentity(Box<MvsPackageVersion>),
+    MissingRootSourceIdentity(Box<MvsPackageVersion>),
+    RootPackageMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    PathBaseProvenanceMismatch {
+        relative_to: Box<MvsPackageVersion>,
+        requirer: Box<MvsPackageVersion>,
+    },
+    ProviderOutputMismatch,
+    UnexpectedReadTimeIdentity(Box<MvsPackageVersion>),
+    IdentifiedLoadMismatch,
     MissingBaseSourceIdentity(Box<MvsPackageVersion>),
     FinalBaseSourceIdentityUnavailable(Box<MvsPackageVersion>),
     FinalSourceSelection(Box<ResolverSourceSelectionError>),
@@ -184,17 +363,161 @@ pub struct ResolverSourceReload<K> {
 /// Per-node identity results for the post-`Check` source audit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverSourceIdentityPlan<K, E> {
+    /// Identified load whose contracts and source identities formed this plan.
+    load_token: Option<ResolverSourceLoadToken>,
+    /// Exact identity snapshot supplied with the root and contracts at read time.
+    read_source_identities: ResolverSourceIdentitySnapshot<K>,
     /// Nodes whose read-time and final sources identify the same source tree.
-    pub same_identity: Vec<ResolverSameSourceIdentity<K>>,
+    same_identity: Vec<ResolverSameSourceIdentity<K>>,
     /// Nodes that must be fetched and revalidated from the final source.
-    pub reloads: Vec<ResolverSourceReload<K>>,
+    reloads: Vec<ResolverSourceReload<K>>,
     /// Final-source selection and identity errors, in package-version/side order.
-    pub failures: Vec<ResolverSourceIdentityFailure<E>>,
+    failures: Vec<ResolverSourceIdentityFailure<E>>,
+}
+
+impl<K, E> ResolverSourceIdentityPlan<K, E> {
+    pub const fn read_source_identities(&self) -> &ResolverSourceIdentitySnapshot<K> {
+        &self.read_source_identities
+    }
+
+    pub fn same_identity(&self) -> &[ResolverSameSourceIdentity<K>] {
+        &self.same_identity
+    }
+
+    pub fn reloads(&self) -> &[ResolverSourceReload<K>] {
+        &self.reloads
+    }
+
+    pub fn failures(&self) -> &[ResolverSourceIdentityFailure<E>] {
+        &self.failures
+    }
+}
+
+/// Why a requested final-contract comparison could not be constructed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolverFinalContractAuditFailureKind<K> {
+    MissingReloadedContract,
+    UnexpectedReloadedContract,
+    IdentifiedLoadMismatch,
+    ReloadedSourceIdentityMismatch { expected: Box<K>, found: Box<K> },
+    MissingIdentityResult,
+    UnexpectedIdentityResult,
+    IdentityPlanMismatch,
+    ContractComparison(Box<ResolverContractComparisonError>),
+}
+
+/// A contract, its final comparison context, and the identity of the source
+/// tree from which the contract was loaded.
+#[derive(Clone, Debug)]
+pub struct ResolverReloadedSourceContract<'a, K> {
+    contract: ResolverContract,
+    context: ResolverContractContext<'a>,
+    source_identity: K,
+}
+
+impl<'a, K> ResolverReloadedSourceContract<'a, K> {
+    pub const fn new(
+        contract: ResolverContract,
+        context: ResolverContractContext<'a>,
+        source_identity: K,
+    ) -> Self {
+        Self {
+            contract,
+            context,
+            source_identity,
+        }
+    }
+
+    pub const fn contract(&self) -> &ResolverContract {
+        &self.contract
+    }
+
+    pub const fn context(&self) -> &ResolverContractContext<'a> {
+        &self.context
+    }
+
+    pub const fn source_identity(&self) -> &K {
+        &self.source_identity
+    }
+}
+
+/// A selected package version that could not be compared with its reloaded contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverFinalContractAuditFailure<K> {
+    pub package_version: MvsPackageVersion,
+    pub read_source: Option<ResolverSourceSelection>,
+    pub final_source: Option<ResolverSourceSelection>,
+    pub error: ResolverFinalContractAuditFailureKind<K>,
+}
+
+/// A missing source identity needed to resolve a path clause, or a loader error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolverFinalContractPathResolutionError<E> {
+    MissingSourceIdentity(Box<MvsPackageVersion>),
+    Resolver(Box<E>),
+}
+
+/// The edge and path comparison for one selected dependency reloaded from its final source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverReloadedContractComparison<K, E> {
+    pub reload: ResolverSourceReload<K>,
+    pub edges: ResolverContractEdgeComparison,
+    pub paths: ResolverContractResolvedPathComparison<ResolverFinalContractPathResolutionError<E>>,
+}
+
+impl<K, E> ResolverReloadedContractComparison<K, E> {
+    pub fn status(&self) -> ResolverContractComparisonStatus {
+        self.paths.status()
+    }
+}
+
+/// Results of checking every required final-source contract reload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolverFinalContractAudit<'a, K, IE, PE> {
+    source_identities: &'a ResolverSourceIdentityPlan<K, IE>,
+    comparisons: Vec<ResolverReloadedContractComparison<K, PE>>,
+    failures: Vec<ResolverFinalContractAuditFailure<K>>,
+}
+
+impl<K, IE, PE> ResolverFinalContractAudit<'_, K, IE, PE> {
+    pub const fn source_identities(&self) -> &ResolverSourceIdentityPlan<K, IE> {
+        self.source_identities
+    }
+
+    pub fn comparisons(&self) -> &[ResolverReloadedContractComparison<K, PE>] {
+        &self.comparisons
+    }
+
+    pub fn failures(&self) -> &[ResolverFinalContractAuditFailure<K>] {
+        &self.failures
+    }
+
+    pub fn has_divergent_sources(&self) -> bool {
+        self.comparisons
+            .iter()
+            .any(|comparison| comparison.status() == ResolverContractComparisonStatus::Different)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.source_identities.failures().is_empty()
+            && self.failures.is_empty()
+            && self
+                .comparisons
+                .iter()
+                .all(|comparison| comparison.paths.failures().is_empty())
+    }
+
+    pub fn is_equivalent(&self) -> bool {
+        self.is_complete() && !self.has_divergent_sources()
+    }
 }
 
 /// Read-time and final-source selections for the selected graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolverFinalSourcePlan {
+    /// Binds identity planning to the exact source-aware loader result.
+    load_token: Option<ResolverSourceLoadToken>,
+    root_package: MvsPackageVersion,
     /// Includes range conflicts and dependency-to-dependency cycles.
     graph: MvsSelectedGraph,
     /// Selection-time edges back to the root, which are not dependency nodes.
@@ -206,6 +529,10 @@ pub struct ResolverFinalSourcePlan {
 }
 
 impl ResolverFinalSourcePlan {
+    pub const fn root_package(&self) -> &MvsPackageVersion {
+        &self.root_package
+    }
+
     pub const fn graph(&self) -> &MvsSelectedGraph {
         &self.graph
     }
@@ -393,6 +720,7 @@ where
             .map(|(version, contract)| (version.clone(), contract.clone()))
             .collect(),
         sources_used: sources_used.clone(),
+        load_token: None,
     };
 
     let (selection, failures) = match selection {
@@ -442,6 +770,77 @@ where
             path_pin_failures,
             output: Box::new(partial_selection),
         })
+    }
+}
+
+/// Loads contracts and captures each read source identity in the same loader
+/// result so later audit steps cannot substitute a separate identity map.
+///
+/// The identity must describe the exact tree from which `contract` was read.
+/// The root identity is passed separately from dependency identities because
+/// the root can share a package version with a selected dependency.
+pub fn select_with_source_provider_and_identities<E, K, C, I>(
+    root: ResolverLoadedRootContract<I>,
+    root_context: &ResolverContractContext<'_>,
+    lock_floors: &HashMap<MvsNode, Version>,
+    locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
+    canonicalize_path_pin: impl FnMut(&ResolverPathPinSource) -> Result<K, C>,
+    mut load_contract: impl FnMut(
+        &MvsContractRequest,
+        &ResolverSourceSelection,
+    ) -> Result<ResolverLoadedContract<I>, E>,
+) -> ResolverSourceProviderIdentifiedResult<E, K, C, I>
+where
+    K: Eq + Clone,
+{
+    let root_package = root.contract.mvs.package_version().clone();
+    let mut package_identities = BTreeMap::new();
+    let result = select_with_source_provider(
+        &root.contract,
+        root_context,
+        lock_floors,
+        locked_sources,
+        canonicalize_path_pin,
+        |request, source| {
+            let loaded = load_contract(request, source)?;
+            package_identities.insert(request.package_version.clone(), loaded.source_identity);
+            Ok(loaded.contract)
+        },
+    );
+
+    let accepted_contracts = match &result {
+        Ok(output) => Some(&output.dependency_contracts),
+        Err(ResolverSourceProviderError::Resolution { output, .. }) => {
+            Some(&output.dependency_contracts)
+        }
+        Err(
+            ResolverSourceProviderError::RootContract(_) | ResolverSourceProviderError::Input(_),
+        ) => None,
+    };
+    if let Some(accepted_contracts) = accepted_contracts {
+        package_identities
+            .retain(|package_version, _| accepted_contracts.contains_key(package_version));
+    } else {
+        package_identities.clear();
+    }
+    let source_identities = ResolverSourceIdentitySnapshot {
+        root_package,
+        root_identity: Some(root.source_identity),
+        package_identities,
+    };
+
+    match result {
+        Ok(mut output) => {
+            output.load_token = Some(ResolverSourceLoadToken::new());
+            Ok(ResolverSourceProviderIdentifiedOutput {
+                output,
+                source_identities,
+            })
+        }
+        Err(error) => Err(Box::new(ResolverSourceProviderIdentityLoadError {
+            error,
+            source_identities,
+        })),
     }
 }
 
@@ -646,6 +1045,10 @@ pub fn plan_resolver_final_sources(
                 package_version: package_version.clone(),
                 read_request: read_request.clone(),
                 final_request,
+                read_contract: dependency_contracts
+                    .get(package_version)
+                    .expect("selected read contract was validated above")
+                    .clone(),
                 read_source: read_source.clone(),
                 final_source,
             }),
@@ -659,6 +1062,8 @@ pub fn plan_resolver_final_sources(
     }
 
     Ok(ResolverFinalSourcePlan {
+        load_token: output.load_token.clone(),
+        root_package: root_version,
         graph,
         root_cycles,
         entries,
@@ -666,15 +1071,197 @@ pub fn plan_resolver_final_sources(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResolverSourceBaseOwner {
+    Root,
+    Package(MvsPackageVersion),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResolverSourceBaseIdentityError {
+    MissingRoot(MvsPackageVersion),
+    MissingPackage(MvsPackageVersion),
+    SelectedUnavailable(MvsPackageVersion),
+    ProvenanceMismatch {
+        relative_to: MvsPackageVersion,
+        requirer: MvsPackageVersion,
+    },
+    InvalidProvenance,
+}
+
+fn path_source_base_owner(
+    selection: &ResolverSourceSelection,
+) -> Option<(ResolverSourceBaseOwner, MvsPackageVersion)> {
+    let ResolverPackageSource::Path { relative_to, .. } = selection.source() else {
+        return None;
+    };
+    let owner = match selection.provenance() {
+        ResolverSourceProvenance::RootPathOverride { .. } => ResolverSourceBaseOwner::Root,
+        ResolverSourceProvenance::PathPin { pin } => match &pin.requirer {
+            MvsRequirer::Root(_) => ResolverSourceBaseOwner::Root,
+            MvsRequirer::Package(package_version) => {
+                ResolverSourceBaseOwner::Package(package_version.clone())
+            }
+        },
+        ResolverSourceProvenance::NamedRequirement { edge } => match &edge.requirer {
+            MvsRequirer::Root(_) => ResolverSourceBaseOwner::Root,
+            MvsRequirer::Package(package_version) => {
+                ResolverSourceBaseOwner::Package(package_version.clone())
+            }
+        },
+        // Lock path entries are recorded relative to the root directory.
+        ResolverSourceProvenance::LockFloor { .. } => ResolverSourceBaseOwner::Root,
+        ResolverSourceProvenance::RootGitOverride { .. } => return None,
+    };
+    Some((owner, relative_to.clone()))
+}
+
+fn source_base_identity_failure<E>(
+    error: ResolverSourceBaseIdentityError,
+) -> ResolverSourceIdentityFailureKind<E> {
+    match error {
+        ResolverSourceBaseIdentityError::MissingRoot(package_version) => {
+            ResolverSourceIdentityFailureKind::MissingRootSourceIdentity(Box::new(package_version))
+        }
+        ResolverSourceBaseIdentityError::MissingPackage(package_version) => {
+            ResolverSourceIdentityFailureKind::MissingBaseSourceIdentity(Box::new(package_version))
+        }
+        ResolverSourceBaseIdentityError::SelectedUnavailable(package_version) => {
+            ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(Box::new(
+                package_version,
+            ))
+        }
+        ResolverSourceBaseIdentityError::ProvenanceMismatch {
+            relative_to,
+            requirer,
+        } => ResolverSourceIdentityFailureKind::PathBaseProvenanceMismatch {
+            relative_to: Box::new(relative_to),
+            requirer: Box::new(requirer),
+        },
+        ResolverSourceBaseIdentityError::InvalidProvenance => {
+            ResolverSourceIdentityFailureKind::ProviderOutputMismatch
+        }
+    }
+}
+
+fn source_base_dependency<K, E>(
+    selection: &ResolverSourceSelection,
+    root_package: &MvsPackageVersion,
+    selected_versions: &BTreeSet<MvsPackageVersion>,
+    entries_by_version: &BTreeMap<MvsPackageVersion, &ResolverFinalSourcePlanEntry>,
+    identities: &ResolverSourceIdentitySnapshot<K>,
+) -> Result<Option<MvsPackageVersion>, ResolverSourceIdentityFailureKind<E>> {
+    let (owner, relative_to) = path_source_base_owner(selection).ok_or_else(|| {
+        source_base_identity_failure(ResolverSourceBaseIdentityError::InvalidProvenance)
+    })?;
+    match owner {
+        ResolverSourceBaseOwner::Root => {
+            if &relative_to != root_package || &relative_to != identities.root_package() {
+                return Err(source_base_identity_failure(
+                    ResolverSourceBaseIdentityError::ProvenanceMismatch {
+                        relative_to,
+                        requirer: identities.root_package().clone(),
+                    },
+                ));
+            }
+            if identities.root_identity().is_none() {
+                return Err(source_base_identity_failure(
+                    ResolverSourceBaseIdentityError::MissingRoot(relative_to),
+                ));
+            }
+            Ok(None)
+        }
+        ResolverSourceBaseOwner::Package(requirer) => {
+            if relative_to != requirer {
+                return Err(source_base_identity_failure(
+                    ResolverSourceBaseIdentityError::ProvenanceMismatch {
+                        relative_to,
+                        requirer,
+                    },
+                ));
+            }
+            if selected_versions.contains(&relative_to) {
+                if entries_by_version.contains_key(&relative_to) {
+                    Ok(Some(relative_to))
+                } else {
+                    Err(source_base_identity_failure(
+                        ResolverSourceBaseIdentityError::SelectedUnavailable(relative_to),
+                    ))
+                }
+            } else if identities.package_identities.contains_key(&relative_to) {
+                Ok(None)
+            } else {
+                Err(source_base_identity_failure(
+                    ResolverSourceBaseIdentityError::MissingPackage(relative_to),
+                ))
+            }
+        }
+    }
+}
+
+fn source_base_identity<'a, K, E>(
+    selection: &ResolverSourceSelection,
+    root_package: &MvsPackageVersion,
+    selected_versions: &BTreeSet<MvsPackageVersion>,
+    final_identities: &'a BTreeMap<MvsPackageVersion, K>,
+    identities: &'a ResolverSourceIdentitySnapshot<K>,
+) -> Result<&'a K, ResolverSourceIdentityFailureKind<E>> {
+    let (owner, relative_to) = path_source_base_owner(selection).ok_or_else(|| {
+        source_base_identity_failure(ResolverSourceBaseIdentityError::InvalidProvenance)
+    })?;
+    match owner {
+        ResolverSourceBaseOwner::Root => {
+            if &relative_to != root_package || &relative_to != identities.root_package() {
+                return Err(source_base_identity_failure(
+                    ResolverSourceBaseIdentityError::ProvenanceMismatch {
+                        relative_to,
+                        requirer: identities.root_package().clone(),
+                    },
+                ));
+            }
+            identities.root_identity().ok_or_else(|| {
+                source_base_identity_failure(ResolverSourceBaseIdentityError::MissingRoot(
+                    relative_to,
+                ))
+            })
+        }
+        ResolverSourceBaseOwner::Package(requirer) => {
+            if relative_to != requirer {
+                return Err(source_base_identity_failure(
+                    ResolverSourceBaseIdentityError::ProvenanceMismatch {
+                        relative_to,
+                        requirer,
+                    },
+                ));
+            }
+            if selected_versions.contains(&relative_to) {
+                final_identities.get(&relative_to).ok_or_else(|| {
+                    source_base_identity_failure(
+                        ResolverSourceBaseIdentityError::SelectedUnavailable(relative_to),
+                    )
+                })
+            } else {
+                identities
+                    .package_identities
+                    .get(&relative_to)
+                    .ok_or_else(|| {
+                        source_base_identity_failure(
+                            ResolverSourceBaseIdentityError::MissingPackage(relative_to),
+                        )
+                    })
+            }
+        }
+    }
+}
+
 /// Resolves final source identities and plans conditional reloads.
 ///
-/// `read_source_identities` must contain the identities captured when each
-/// source was actually read, including the root and any unselected packages
-/// whose contracts contributed source clauses. The callback resolves only
-/// the final selection. For a Git source its `base_identity` is `None`; for
-/// a path source relative to a selected dependency, it is that dependency's
-/// final identity. For a path source relative to the root or an unselected
-/// package, it is the captured read-time identity of `relative_to`.
+/// `loaded` binds each dependency contract to the complete identity captured
+/// by its loader and carries the root identity separately. The callback
+/// resolves only the final selection. For a Git source its `base_identity` is
+/// `None`; for a path source relative to a selected dependency, it is that
+/// dependency's final identity. For a path source relative to the root or an
+/// unselected package, it is the captured identity of the provenanced base.
 ///
 /// The caller owns source identity resolution because it depends on the host
 /// filesystem and Git backend. The returned identity must be complete: local
@@ -691,7 +1278,7 @@ pub fn plan_resolver_final_sources(
 /// failures so a caller receives a complete audit result.
 pub fn plan_resolver_source_reloads<K, E>(
     plan: &ResolverFinalSourcePlan,
-    read_source_identities: &BTreeMap<MvsPackageVersion, K>,
+    loaded: &ResolverSourceProviderIdentifiedOutput<K>,
     mut resolve_final_identity: impl FnMut(
         &MvsPackageVersion,
         &ResolverSourceSelection,
@@ -704,6 +1291,37 @@ where
     let mut same_identity = Vec::new();
     let mut reloads = Vec::new();
     let mut failures = Vec::new();
+    let read_source_identities = &loaded.source_identities;
+    let provider_output = &loaded.output;
+
+    if !matches!(
+        (plan.load_token.as_ref(), provider_output.load_token.as_ref()),
+        (Some(planned), Some(loaded)) if planned == loaded
+    ) {
+        failures.push(ResolverSourceIdentityFailure {
+            package_version: plan.root_package.clone(),
+            side: ResolverSourceIdentitySide::ReadTime,
+            source: None,
+            error: ResolverSourceIdentityFailureKind::IdentifiedLoadMismatch,
+        });
+        for selection_failure in &plan.failures {
+            failures.push(ResolverSourceIdentityFailure {
+                package_version: selection_failure.package_version.clone(),
+                side: ResolverSourceIdentitySide::Final,
+                source: None,
+                error: ResolverSourceIdentityFailureKind::FinalSourceSelection(Box::new(
+                    selection_failure.error.clone(),
+                )),
+            });
+        }
+        return ResolverSourceIdentityPlan {
+            load_token: provider_output.load_token.clone(),
+            read_source_identities: read_source_identities.clone(),
+            same_identity,
+            reloads,
+            failures,
+        };
+    }
 
     let entries_by_version = plan
         .entries
@@ -723,41 +1341,96 @@ where
     let mut final_identities = BTreeMap::new();
     let mut final_identity_failures = BTreeMap::new();
 
+    if read_source_identities.root_package() != &plan.root_package
+        || provider_output.root_contract.mvs.package_version() != &plan.root_package
+    {
+        failures.push(ResolverSourceIdentityFailure {
+            package_version: plan.root_package.clone(),
+            side: ResolverSourceIdentitySide::ReadTime,
+            source: None,
+            error: ResolverSourceIdentityFailureKind::RootPackageMismatch {
+                expected: Box::new(plan.root_package.clone()),
+                found: Box::new(read_source_identities.root_package().clone()),
+            },
+        });
+    }
+    for package_version in provider_output.dependency_contracts.keys() {
+        if !selected_versions.contains(package_version)
+            && !read_source_identities
+                .package_identities
+                .contains_key(package_version)
+        {
+            failures.push(ResolverSourceIdentityFailure {
+                package_version: package_version.clone(),
+                side: ResolverSourceIdentitySide::ReadTime,
+                source: provider_output.sources_used.get(package_version).cloned(),
+                error: ResolverSourceIdentityFailureKind::MissingReadTimeIdentity(Box::new(
+                    package_version.clone(),
+                )),
+            });
+        }
+    }
+    for package_version in read_source_identities.package_identities.keys() {
+        if !provider_output
+            .dependency_contracts
+            .contains_key(package_version)
+        {
+            failures.push(ResolverSourceIdentityFailure {
+                package_version: package_version.clone(),
+                side: ResolverSourceIdentitySide::ReadTime,
+                source: None,
+                error: ResolverSourceIdentityFailureKind::UnexpectedReadTimeIdentity(Box::new(
+                    package_version.clone(),
+                )),
+            });
+        }
+    }
+    for entry in &plan.entries {
+        if provider_output
+            .dependency_contracts
+            .get(&entry.package_version)
+            != Some(&entry.read_contract)
+            || provider_output.sources_used.get(&entry.package_version) != Some(&entry.read_source)
+        {
+            failures.push(ResolverSourceIdentityFailure {
+                package_version: entry.package_version.clone(),
+                side: ResolverSourceIdentitySide::ReadTime,
+                source: Some(entry.read_source.clone()),
+                error: ResolverSourceIdentityFailureKind::ProviderOutputMismatch,
+            });
+        }
+    }
+
     for entry in &plan.entries {
         dependency_counts.insert(entry.package_version.clone(), 0);
         match entry.final_source.source() {
             ResolverPackageSource::Git { .. } => {
                 ready.insert(entry.package_version.clone());
             }
-            ResolverPackageSource::Path { relative_to, .. } => {
-                if selected_versions.contains(relative_to) {
-                    if entries_by_version.contains_key(relative_to) {
+            ResolverPackageSource::Path { .. } => {
+                match source_base_dependency(
+                    &entry.final_source,
+                    &plan.root_package,
+                    &selected_versions,
+                    &entries_by_version,
+                    read_source_identities,
+                ) {
+                    Ok(Some(relative_to)) => {
                         base_dependencies
                             .insert(entry.package_version.clone(), relative_to.clone());
                         dependents
-                            .entry(relative_to.clone())
+                            .entry(relative_to)
                             .or_default()
                             .push(entry.package_version.clone());
                         dependency_counts.insert(entry.package_version.clone(), 1);
-                    } else {
-                        final_identity_failures.insert(
-                            entry.package_version.clone(),
-                            ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(
-                                Box::new(relative_to.clone()),
-                            ),
-                        );
+                    }
+                    Ok(None) => {
                         ready.insert(entry.package_version.clone());
                     }
-                } else if !read_source_identities.contains_key(relative_to) {
-                    final_identity_failures.insert(
-                        entry.package_version.clone(),
-                        ResolverSourceIdentityFailureKind::MissingBaseSourceIdentity(Box::new(
-                            relative_to.clone(),
-                        )),
-                    );
-                    ready.insert(entry.package_version.clone());
-                } else {
-                    ready.insert(entry.package_version.clone());
+                    Err(error) => {
+                        final_identity_failures.insert(entry.package_version.clone(), error);
+                        ready.insert(entry.package_version.clone());
+                    }
                 }
             }
         }
@@ -781,35 +1454,23 @@ where
                                 ResolverSourceIdentityFailureKind::Canonicalization(Box::new(error))
                             })
                     }
-                    ResolverPackageSource::Path { relative_to, .. } => {
-                        let base_identity = if selected_versions.contains(relative_to) {
-                            final_identities.get(relative_to)
-                        } else {
-                            read_source_identities.get(relative_to)
-                        };
-                        match base_identity {
-                            Some(identity) => resolve_final_identity(
-                                &entry.package_version,
-                                &entry.final_source,
-                                Some(identity),
-                            )
-                            .map_err(|error| {
-                                ResolverSourceIdentityFailureKind::Canonicalization(Box::new(
-                                    error,
-                                ))
-                            }),
-                            None if selected_versions.contains(relative_to) => Err(
-                                ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(
-                                    Box::new(relative_to.clone()),
-                                ),
-                            ),
-                            None => Err(
-                                ResolverSourceIdentityFailureKind::MissingBaseSourceIdentity(
-                                    Box::new(relative_to.clone()),
-                                ),
-                            ),
-                        }
-                    }
+                    ResolverPackageSource::Path { .. } => source_base_identity(
+                        &entry.final_source,
+                        &plan.root_package,
+                        &selected_versions,
+                        &final_identities,
+                        read_source_identities,
+                    )
+                    .and_then(|identity| {
+                        resolve_final_identity(
+                            &entry.package_version,
+                            &entry.final_source,
+                            Some(identity),
+                        )
+                        .map_err(|error| {
+                            ResolverSourceIdentityFailureKind::Canonicalization(Box::new(error))
+                        })
+                    }),
                 }
             };
             match result {
@@ -867,7 +1528,10 @@ where
                         found: Box::new(read_source.package_version().clone()),
                     },
                 });
-            } else if !read_source_identities.contains_key(package_version) {
+            } else if !read_source_identities
+                .package_identities
+                .contains_key(package_version)
+            {
                 failures.push(ResolverSourceIdentityFailure {
                     package_version: package_version.clone(),
                     side: ResolverSourceIdentitySide::ReadTime,
@@ -902,7 +1566,10 @@ where
                 },
             });
             None
-        } else if let Some(identity) = read_source_identities.get(package_version) {
+        } else if let Some(identity) = read_source_identities
+            .package_identities
+            .get(package_version)
+        {
             Some(identity.clone())
         } else {
             failures.push(ResolverSourceIdentityFailure {
@@ -951,8 +1618,323 @@ where
     }
 
     ResolverSourceIdentityPlan {
+        load_token: provider_output.load_token.clone(),
+        read_source_identities: read_source_identities.clone(),
         same_identity,
         reloads,
+        failures,
+    }
+}
+
+/// Compares every contract loaded by the final-source reload plan.
+///
+/// `reloaded_contracts` is keyed by selected package version and must contain
+/// exactly the packages in `source_identities.reloads()`. Each value binds
+/// the parsed contract and its context to the identity returned by the final
+/// source loader; that identity must match the planned final identity.
+/// Path clauses from the read-time contract are resolved with their captured
+/// read-time base identity retained in `source_identities`; it cannot be
+/// substituted by the caller after identity planning. Path clauses from the
+/// reloaded contract use the final base identity for a selected dependency,
+/// and the captured identity for the root or an unselected package. All path
+/// lookups are attempted even when other edge fields differ or another lookup
+/// fails.
+pub fn audit_resolver_reloaded_contracts<'identity, 'context, K, IE, PI, PE>(
+    final_sources: &ResolverFinalSourcePlan,
+    source_identities: &'identity ResolverSourceIdentityPlan<K, IE>,
+    expected_context: &ResolverContractContext<'_>,
+    reloaded_contracts: &BTreeMap<MvsPackageVersion, ResolverReloadedSourceContract<'context, K>>,
+    mut resolve_path: impl FnMut(
+        &ResolverSourceReload<K>,
+        &ResolverContractPathSourceRequest,
+        &K,
+    ) -> Result<PI, PE>,
+) -> ResolverFinalContractAudit<'identity, K, IE, PE>
+where
+    K: Clone + Eq,
+    PI: Eq,
+{
+    let mut comparisons = Vec::new();
+    let mut failures = Vec::new();
+    if !matches!(
+        (
+            final_sources.load_token.as_ref(),
+            source_identities.load_token.as_ref()
+        ),
+        (Some(planned), Some(identified)) if planned == identified
+    ) {
+        failures.push(ResolverFinalContractAuditFailure {
+            package_version: final_sources.root_package.clone(),
+            read_source: None,
+            final_source: None,
+            error: ResolverFinalContractAuditFailureKind::IdentifiedLoadMismatch,
+        });
+        return ResolverFinalContractAudit {
+            source_identities,
+            comparisons,
+            failures,
+        };
+    }
+
+    let selected_versions = final_sources
+        .graph
+        .dependencies
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let entries_by_version = final_sources
+        .entries
+        .iter()
+        .map(|entry| (entry.package_version.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let source_failures_by_version = final_sources
+        .failures
+        .iter()
+        .map(|failure| (failure.package_version.clone(), failure))
+        .collect::<BTreeMap<_, _>>();
+    let reload_versions = source_identities
+        .reloads()
+        .iter()
+        .map(|reload| reload.package_version.clone())
+        .collect::<BTreeSet<_>>();
+    let identity_versions = source_identities
+        .same_identity()
+        .iter()
+        .map(|same| same.package_version.clone())
+        .chain(
+            source_identities
+                .reloads()
+                .iter()
+                .map(|reload| reload.package_version.clone()),
+        )
+        .chain(
+            source_identities
+                .failures()
+                .iter()
+                .map(|failure| failure.package_version.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+
+    for package_version in &selected_versions {
+        if !identity_versions.contains(package_version) {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: package_version.clone(),
+                read_source: entries_by_version
+                    .get(package_version)
+                    .map(|entry| entry.read_source.clone())
+                    .or_else(|| {
+                        source_failures_by_version
+                            .get(package_version)
+                            .map(|failure| failure.read_source.clone())
+                    }),
+                final_source: entries_by_version
+                    .get(package_version)
+                    .map(|entry| entry.final_source.clone()),
+                error: ResolverFinalContractAuditFailureKind::MissingIdentityResult,
+            });
+        }
+    }
+    for package_version in identity_versions
+        .iter()
+        .filter(|version| !selected_versions.contains(*version))
+    {
+        failures.push(ResolverFinalContractAuditFailure {
+            package_version: package_version.clone(),
+            read_source: None,
+            final_source: None,
+            error: ResolverFinalContractAuditFailureKind::UnexpectedIdentityResult,
+        });
+    }
+
+    for same in source_identities.same_identity() {
+        let matches_plan = entries_by_version
+            .get(&same.package_version)
+            .is_some_and(|entry| {
+                entry.read_source == same.read_source && entry.final_source == same.final_source
+            });
+        if !selected_versions.contains(&same.package_version) || !matches_plan {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: same.package_version.clone(),
+                read_source: Some(same.read_source.clone()),
+                final_source: Some(same.final_source.clone()),
+                error: ResolverFinalContractAuditFailureKind::IdentityPlanMismatch,
+            });
+        }
+    }
+    for reload in source_identities.reloads() {
+        let matches_plan = entries_by_version
+            .get(&reload.package_version)
+            .is_some_and(|entry| {
+                entry.read_source == reload.read_source && entry.final_source == reload.final_source
+            });
+        if !selected_versions.contains(&reload.package_version) || !matches_plan {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: reload.package_version.clone(),
+                read_source: Some(reload.read_source.clone()),
+                final_source: Some(reload.final_source.clone()),
+                error: ResolverFinalContractAuditFailureKind::IdentityPlanMismatch,
+            });
+        }
+    }
+    for source_failure in source_identities.failures() {
+        let expected_read = entries_by_version
+            .get(&source_failure.package_version)
+            .map(|entry| &entry.read_source)
+            .or_else(|| {
+                source_failures_by_version
+                    .get(&source_failure.package_version)
+                    .map(|failure| &failure.read_source)
+            });
+        let expected_final = entries_by_version
+            .get(&source_failure.package_version)
+            .map(|entry| &entry.final_source);
+        let matches_plan = match source_failure.side {
+            ResolverSourceIdentitySide::ReadTime => source_failure.source.as_ref() == expected_read,
+            ResolverSourceIdentitySide::Final => match &source_failure.error {
+                ResolverSourceIdentityFailureKind::FinalSourceSelection(error) => {
+                    source_failure.source.is_none()
+                        && source_failures_by_version
+                            .get(&source_failure.package_version)
+                            .is_some_and(|failure| &failure.error == error.as_ref())
+                }
+                _ => source_failure.source.as_ref() == expected_final,
+            },
+        };
+        if !selected_versions.contains(&source_failure.package_version) || !matches_plan {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: source_failure.package_version.clone(),
+                read_source: expected_read.cloned(),
+                final_source: expected_final.cloned(),
+                error: ResolverFinalContractAuditFailureKind::IdentityPlanMismatch,
+            });
+        }
+    }
+    for package_version in reloaded_contracts.keys() {
+        if !reload_versions.contains(package_version) {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: package_version.clone(),
+                read_source: entries_by_version
+                    .get(package_version)
+                    .map(|entry| entry.read_source.clone())
+                    .or_else(|| {
+                        source_failures_by_version
+                            .get(package_version)
+                            .map(|failure| failure.read_source.clone())
+                    }),
+                final_source: entries_by_version
+                    .get(package_version)
+                    .map(|entry| entry.final_source.clone()),
+                error: ResolverFinalContractAuditFailureKind::UnexpectedReloadedContract,
+            });
+        }
+    }
+    let mut final_identities = BTreeMap::new();
+    for same in source_identities.same_identity() {
+        final_identities.insert(same.package_version.clone(), &same.identity);
+    }
+    for reload in source_identities.reloads() {
+        final_identities.insert(reload.package_version.clone(), &reload.final_identity);
+    }
+
+    for reload in source_identities.reloads() {
+        let Some(final_source_entry) = entries_by_version.get(&reload.package_version) else {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: reload.package_version.clone(),
+                read_source: Some(reload.read_source.clone()),
+                final_source: Some(reload.final_source.clone()),
+                error: ResolverFinalContractAuditFailureKind::IdentityPlanMismatch,
+            });
+            continue;
+        };
+        let expected = &final_source_entry.read_contract;
+        let Some(actual_bundle) = reloaded_contracts.get(&reload.package_version) else {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: reload.package_version.clone(),
+                read_source: Some(reload.read_source.clone()),
+                final_source: Some(reload.final_source.clone()),
+                error: ResolverFinalContractAuditFailureKind::MissingReloadedContract,
+            });
+            continue;
+        };
+        if actual_bundle.source_identity != reload.final_identity {
+            failures.push(ResolverFinalContractAuditFailure {
+                package_version: reload.package_version.clone(),
+                read_source: Some(reload.read_source.clone()),
+                final_source: Some(reload.final_source.clone()),
+                error: ResolverFinalContractAuditFailureKind::ReloadedSourceIdentityMismatch {
+                    expected: Box::new(reload.final_identity.clone()),
+                    found: Box::new(actual_bundle.source_identity.clone()),
+                },
+            });
+            continue;
+        }
+        let actual = &actual_bundle.contract;
+        let actual_context = &actual_bundle.context;
+        let edge_comparison = match compare_resolver_contract_edges(
+            expected,
+            expected_context,
+            actual,
+            actual_context,
+        ) {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                failures.push(ResolverFinalContractAuditFailure {
+                    package_version: reload.package_version.clone(),
+                    read_source: Some(reload.read_source.clone()),
+                    final_source: Some(reload.final_source.clone()),
+                    error: ResolverFinalContractAuditFailureKind::ContractComparison(Box::new(
+                        error,
+                    )),
+                });
+                continue;
+            }
+        };
+        let paths = edge_comparison.compare_with_resolved_paths(|request| {
+            let identity = match request.side {
+                crate::resolver_contract::ResolverContractSourceSide::Expected => {
+                    if request.root_relative {
+                        source_identities.read_source_identities.root_identity()
+                    } else {
+                        source_identities
+                            .read_source_identities
+                            .package_identities
+                            .get(&request.requiring_package)
+                    }
+                }
+                crate::resolver_contract::ResolverContractSourceSide::Actual => {
+                    if request.root_relative {
+                        source_identities.read_source_identities.root_identity()
+                    } else if selected_versions.contains(&request.requiring_package) {
+                        final_identities.get(&request.requiring_package).copied()
+                    } else {
+                        source_identities
+                            .read_source_identities
+                            .package_identities
+                            .get(&request.requiring_package)
+                    }
+                }
+            };
+            let Some(identity) = identity else {
+                return Err(
+                    ResolverFinalContractPathResolutionError::MissingSourceIdentity(Box::new(
+                        request.requiring_package.clone(),
+                    )),
+                );
+            };
+            resolve_path(reload, request, identity).map_err(|error| {
+                ResolverFinalContractPathResolutionError::Resolver(Box::new(error))
+            })
+        });
+        comparisons.push(ResolverReloadedContractComparison {
+            reload: reload.clone(),
+            edges: edge_comparison,
+            paths,
+        });
+    }
+
+    ResolverFinalContractAudit {
+        source_identities,
+        comparisons,
         failures,
     }
 }
@@ -1070,9 +2052,13 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::{
-        ResolverPackageLoadError, ResolverPathPinProviderFailureKind, ResolverSourceIdentitySide,
-        ResolverSourceProviderError, plan_resolver_final_sources, plan_resolver_source_reloads,
-        select_with_source_provider,
+        ResolverLoadedContract, ResolverLoadedRootContract, ResolverPackageLoadError,
+        ResolverPathPinProviderFailureKind, ResolverReloadedSourceContract,
+        ResolverSourceIdentitySide, ResolverSourceIdentitySnapshot, ResolverSourceProviderError,
+        ResolverSourceProviderIdentifiedOutput, ResolverSourceProviderOutput,
+        audit_resolver_reloaded_contracts, plan_resolver_final_sources,
+        plan_resolver_source_reloads, select_with_source_provider,
+        select_with_source_provider_and_identities,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{MvsContractRequest, MvsNamedEdge, MvsPackageVersion, MvsRequirer};
@@ -1089,6 +2075,30 @@ mod tests {
     fn package_version(package: &str, version: &str) -> MvsPackageVersion {
         MvsPackageVersion::new(package, Version::parse(version).expect("valid version"))
             .expect("valid package version")
+    }
+
+    fn identified_output_from_map<K: Clone>(
+        output: &ResolverSourceProviderOutput,
+        identities: &BTreeMap<MvsPackageVersion, K>,
+    ) -> ResolverSourceProviderIdentifiedOutput<K> {
+        let root_package = output.root_contract.mvs.package_version().clone();
+        let package_identities = identities
+            .iter()
+            .filter(|(package_version, _)| {
+                *package_version != output.root_contract.mvs.package_version()
+            })
+            .map(|(package_version, identity)| (package_version.clone(), identity.clone()))
+            .collect();
+        let mut output = output.clone();
+        output.load_token = Some(super::ResolverSourceLoadToken::new());
+        ResolverSourceProviderIdentifiedOutput {
+            output,
+            source_identities: ResolverSourceIdentitySnapshot {
+                root_identity: identities.get(&root_package).cloned(),
+                root_package,
+                package_identities,
+            },
+        }
     }
 
     #[test]
@@ -1746,9 +2756,13 @@ requires { acme:dep @ ^1 from git "https://example.test/late-dep" }
             (dep_version.clone(), "canonical-dep-tree"),
             (package_version("z:late", "1.0.0"), "late-package-tree"),
         ]);
+        let identified_output = identified_output_from_map(&output, &read_source_identities);
+        let plan =
+            plan_resolver_final_sources(identified_output.output(), &context, &HashMap::new())
+                .expect("final source plan is consistent");
         let same_identity_plan = plan_resolver_source_reloads(
             &plan,
-            &read_source_identities,
+            &identified_output,
             |package_version, _source, _base| {
                 Ok::<_, ()>(if package_version.package() == "acme:dep" {
                     "canonical-dep-tree"
@@ -1763,7 +2777,7 @@ requires { acme:dep @ ^1 from git "https://example.test/late-dep" }
 
         let changed_identity_plan = plan_resolver_source_reloads(
             &plan,
-            &read_source_identities,
+            &identified_output,
             |package_version, source, _base| {
                 if package_version.package() == "z:late" {
                     return Err("source identity is unavailable");
@@ -1789,8 +2803,13 @@ requires { acme:dep @ ^1 from git "https://example.test/late-dep" }
             changed_identity_plan.failures[0].side,
             ResolverSourceIdentitySide::Final
         );
+        let mut missing_identity_output = identified_output.clone();
+        missing_identity_output
+            .source_identities
+            .package_identities
+            .clear();
         let missing_read_identities =
-            plan_resolver_source_reloads(&plan, &BTreeMap::new(), |_, _, _| {
+            plan_resolver_source_reloads(&plan, &missing_identity_output, |_, _, _| {
                 Ok::<_, ()>("final-tree")
             });
         assert!(missing_read_identities.reloads.is_empty());
@@ -1801,6 +2820,21 @@ requires { acme:dep @ ^1 from git "https://example.test/late-dep" }
                 .iter()
                 .all(|failure| failure.side == ResolverSourceIdentitySide::ReadTime)
         );
+        let same_values_from_another_load =
+            identified_output_from_map(&output, &read_source_identities);
+        let mismatched_load = plan_resolver_source_reloads(
+            &plan,
+            &same_values_from_another_load,
+            |_, _, _| -> Result<&str, ()> {
+                panic!("a plan cannot consume identities from a separate load")
+            },
+        );
+        assert!(mismatched_load.same_identity().is_empty());
+        assert!(mismatched_load.reloads().is_empty());
+        assert!(matches!(
+            mismatched_load.failures()[0].error,
+            super::ResolverSourceIdentityFailureKind::IdentifiedLoadMismatch
+        ));
 
         let alternative_root = parse(
             br#"package zz:root @ 1.0.0
@@ -1895,16 +2929,18 @@ targets { wasm32-core }
             },
         )
         .expect("all MVS contracts load");
-        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
-            .expect("final source plan is consistent");
         let read_source_identities = BTreeMap::from([
             (root_version.clone(), "root-read-tree"),
             (dep_version.clone(), "dependency-read-tree"),
         ]);
+        let identified_output = identified_output_from_map(&output, &read_source_identities);
+        let plan =
+            plan_resolver_final_sources(identified_output.output(), &context, &HashMap::new())
+                .expect("final source plan is consistent");
 
         let identity_plan = plan_resolver_source_reloads(
             &plan,
-            &read_source_identities,
+            &identified_output,
             |package_version, source, base_identity| {
                 assert_eq!(package_version, &dep_version);
                 let ResolverPackageSource::Path { relative_to, path } = source.source() else {
@@ -1928,9 +2964,11 @@ targets { wasm32-core }
         );
         assert!(identity_plan.failures.is_empty());
 
+        let mut missing_base_output = identified_output.clone();
+        missing_base_output.source_identities.root_identity = None;
         let missing_base_plan = plan_resolver_source_reloads(
             &plan,
-            &BTreeMap::from([(dep_version.clone(), "dependency-read-tree")]),
+            &missing_base_output,
             |_, _, _| -> Result<&str, ()> {
                 panic!("a path with no captured base identity must not be resolved")
             },
@@ -1943,7 +2981,7 @@ targets { wasm32-core }
         );
         assert!(matches!(
             &missing_base_plan.failures[0].error,
-            super::ResolverSourceIdentityFailureKind::MissingBaseSourceIdentity(package)
+            super::ResolverSourceIdentityFailureKind::MissingRootSourceIdentity(package)
                 if **package == root_version
         ));
     }
@@ -2017,19 +3055,21 @@ requires { zz:base @ ^1 from git "https://example.test/late-base" }
             },
         )
         .expect("all MVS contracts load");
-        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
-            .expect("final source plan is consistent");
         let read_source_identities = BTreeMap::from([
             (root_version, "root-tree"),
             (base_version.clone(), "base-read"),
             (dep_version.clone(), "dep-read"),
             (late_version, "late-read"),
         ]);
+        let identified_output = identified_output_from_map(&output, &read_source_identities);
+        let plan =
+            plan_resolver_final_sources(identified_output.output(), &context, &HashMap::new())
+                .expect("final source plan is consistent");
         let mut final_path_base = None;
 
         let identity_plan = plan_resolver_source_reloads(
             &plan,
-            &read_source_identities,
+            &identified_output,
             |package_version, source, base_identity| match package_version.package() {
                 "acme:dep" => {
                     assert_eq!(base_identity, Some(&"base-final"));
@@ -2127,16 +3167,18 @@ requires { acme:a @ ^1 from path "../a" }
             },
         )
         .expect("the path cycle is retained for graph validation");
-        let plan = plan_resolver_final_sources(&output, &context, &HashMap::new())
-            .expect("final source plan retains dependency cycles");
         let read_source_identities = BTreeMap::from([
             (root_version, "root-read"),
             (a_version.clone(), "a-read"),
             (b_version.clone(), "b-read"),
         ]);
+        let identified_output = identified_output_from_map(&output, &read_source_identities);
+        let plan =
+            plan_resolver_final_sources(identified_output.output(), &context, &HashMap::new())
+                .expect("final source plan retains dependency cycles");
         let identity_plan = plan_resolver_source_reloads(
             &plan,
-            &read_source_identities,
+            &identified_output,
             |_, _, _| -> Result<&str, ()> {
                 panic!("cyclic final path bases must not be resolved")
             },
@@ -2159,6 +3201,303 @@ requires { acme:a @ ^1 from path "../a" }
             &identity_plan.failures[1].error,
             super::ResolverSourceIdentityFailureKind::FinalBaseSourceIdentityUnavailable(_)
         ));
+    }
+
+    #[test]
+    fn reloaded_contract_audit_resolves_both_path_sides_from_their_own_source_identity() {
+        let root = parse(
+            br#"package zz:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from git "https://example.test/read-dep" }
+"#,
+        );
+        let dep_version = package_version("acme:dep", "1.0.0");
+        let child_version = package_version("acme:child", "1.0.0");
+        let path_packages = BTreeMap::from([(
+            ResolverPathKey::new(dep_version.clone(), "../child"),
+            child_version.clone(),
+        )]);
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let output = select_with_source_provider_and_identities(
+            ResolverLoadedRootContract::new(root_contract, "root-tree"),
+            &context,
+            &HashMap::new(),
+            &HashMap::new(),
+            |_| Ok::<_, ()>("child-tree"),
+            |request, _| {
+                let manifest = match request.package_version.package() {
+                    "acme:dep" => parse_for_role(
+                        br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:child @ ^1 from path "../child" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    "acme:child" => parse_for_role(
+                        br#"package acme:child @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    package => panic!("unexpected package request: {package}"),
+                };
+                let contract = build_resolver_contract(
+                    &manifest,
+                    &context,
+                    PackageValidationContext::default(),
+                )
+                .map_err(|_| "loaded manifest failed validation")?;
+                let source_identity = match request.package_version.package() {
+                    "acme:dep" => "dep-read",
+                    "acme:child" => "child-final",
+                    package => panic!("unexpected package request: {package}"),
+                };
+                Ok::<_, &str>(ResolverLoadedContract::new(contract, source_identity))
+            },
+        )
+        .expect("all MVS contracts load");
+        let final_sources = plan_resolver_final_sources(output.output(), &context, &HashMap::new())
+            .expect("final source plan is consistent");
+        let source_identities = plan_resolver_source_reloads(
+            &final_sources,
+            &output,
+            |package_version, _, base_identity| match package_version.package() {
+                "acme:dep" => {
+                    assert_eq!(base_identity, None);
+                    Ok::<_, ()>("dep-final")
+                }
+                "acme:child" => {
+                    assert_eq!(base_identity, Some(&"dep-final"));
+                    Ok("child-final")
+                }
+                package => panic!("unexpected selected package {package}"),
+            },
+        );
+        assert_eq!(source_identities.reloads().len(), 1);
+        assert_eq!(source_identities.reloads()[0].package_version, dep_version);
+        assert_eq!(source_identities.same_identity().len(), 1);
+        assert_eq!(
+            source_identities
+                .read_source_identities()
+                .package_identities()
+                .get(&dep_version),
+            Some(&"dep-read")
+        );
+
+        let actual_context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("reloaded contract context is valid");
+        let actual_manifest = parse_for_role(
+            br#"package acme:dep @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:child @ ^1 from path "../child" }
+"#,
+            PackageRole::Dependency,
+        );
+        let actual_contract = build_resolver_contract(
+            &actual_manifest,
+            &actual_context,
+            PackageValidationContext::default(),
+        )
+        .expect("reloaded contract is valid");
+        let reloaded_contracts = BTreeMap::from([(
+            dep_version.clone(),
+            ResolverReloadedSourceContract::new(actual_contract, actual_context, "dep-final"),
+        )]);
+        let equivalent = audit_resolver_reloaded_contracts(
+            &final_sources,
+            &source_identities,
+            &context,
+            &reloaded_contracts,
+            |reload, request, base_identity| {
+                assert_eq!(reload.package_version, dep_version);
+                assert_eq!(request.requiring_package, dep_version);
+                assert_eq!(request.path.as_ref(), "../child");
+                assert!(!request.root_relative);
+                match request.side {
+                    crate::resolver_contract::ResolverContractSourceSide::Expected => {
+                        assert_eq!(base_identity, &"dep-read");
+                    }
+                    crate::resolver_contract::ResolverContractSourceSide::Actual => {
+                        assert_eq!(base_identity, &"dep-final");
+                    }
+                }
+                Ok::<_, ()>("resolved-child")
+            },
+        );
+        assert!(equivalent.is_complete());
+        assert!(equivalent.is_equivalent());
+        assert!(!equivalent.has_divergent_sources());
+        assert_eq!(equivalent.comparisons().len(), 1);
+
+        let same_contracts_from_another_load = identified_output_from_map(
+            output.output(),
+            &BTreeMap::from([
+                (package_version("zz:root", "1.0.0"), "other-root"),
+                (dep_version.clone(), "other-dep"),
+                (child_version.clone(), "other-child"),
+            ]),
+        );
+        let unrelated_final_sources = plan_resolver_final_sources(
+            same_contracts_from_another_load.output(),
+            &context,
+            &HashMap::new(),
+        )
+        .expect("the second load has the same final source choices");
+        let unrelated_plan_audit = audit_resolver_reloaded_contracts(
+            &unrelated_final_sources,
+            &source_identities,
+            &context,
+            &reloaded_contracts,
+            |_, _, _| -> Result<&str, ()> {
+                panic!("different load plans must fail before resolving paths")
+            },
+        );
+        assert!(!unrelated_plan_audit.is_complete());
+        assert!(unrelated_plan_audit.comparisons().is_empty());
+        assert!(matches!(
+            unrelated_plan_audit.failures()[0].error,
+            super::ResolverFinalContractAuditFailureKind::IdentifiedLoadMismatch
+        ));
+
+        let wrong_source = BTreeMap::from([(
+            dep_version.clone(),
+            ResolverReloadedSourceContract::new(
+                reloaded_contracts[&dep_version].contract().clone(),
+                reloaded_contracts[&dep_version].context().clone(),
+                "dep-read",
+            ),
+        )]);
+        let mismatched_identity = audit_resolver_reloaded_contracts(
+            &final_sources,
+            &source_identities,
+            &context,
+            &wrong_source,
+            |_, _, _| -> Result<&str, ()> {
+                panic!("a reload from the wrong source identity must fail before comparison")
+            },
+        );
+        assert!(!mismatched_identity.is_complete());
+        match &mismatched_identity.failures()[0].error {
+            super::ResolverFinalContractAuditFailureKind::ReloadedSourceIdentityMismatch {
+                expected,
+                found,
+            } => {
+                assert_eq!(**expected, "dep-final");
+                assert_eq!(**found, "dep-read");
+            }
+            failure => panic!("unexpected reload identity failure: {failure:?}"),
+        }
+
+        let divergent = audit_resolver_reloaded_contracts(
+            &final_sources,
+            &source_identities,
+            &context,
+            &reloaded_contracts,
+            |_, request, _| {
+                Ok::<_, ()>(match request.side {
+                    crate::resolver_contract::ResolverContractSourceSide::Expected => {
+                        "read-tree-child"
+                    }
+                    crate::resolver_contract::ResolverContractSourceSide::Actual => {
+                        "final-tree-child"
+                    }
+                })
+            },
+        );
+        assert!(divergent.is_complete());
+        assert!(divergent.has_divergent_sources());
+        assert!(!divergent.is_equivalent());
+        assert_eq!(
+            divergent.comparisons()[0].status(),
+            crate::resolver_contract::ResolverContractComparisonStatus::Different
+        );
+
+        let unresolved = audit_resolver_reloaded_contracts(
+            &final_sources,
+            &source_identities,
+            &context,
+            &reloaded_contracts,
+            |_, _, _| -> Result<&str, &str> { Err("path is unavailable") },
+        );
+        assert!(!unresolved.is_complete());
+        assert_eq!(unresolved.comparisons()[0].paths.failures().len(), 2);
+        assert_eq!(
+            unresolved.comparisons()[0].status(),
+            crate::resolver_contract::ResolverContractComparisonStatus::PathResolutionFailed
+        );
+
+        let missing_reload = audit_resolver_reloaded_contracts(
+            &final_sources,
+            &source_identities,
+            &context,
+            &BTreeMap::new(),
+            |_, _, _| -> Result<&str, ()> {
+                panic!("missing reload contract must fail before path comparison")
+            },
+        );
+        assert!(!missing_reload.is_complete());
+        assert!(matches!(
+            &missing_reload.failures()[0].error,
+            super::ResolverFinalContractAuditFailureKind::MissingReloadedContract
+        ));
+
+        let mut extra_contracts = reloaded_contracts.clone();
+        extra_contracts.insert(
+            child_version.clone(),
+            ResolverReloadedSourceContract::new(
+                reloaded_contracts[&dep_version].contract().clone(),
+                reloaded_contracts[&dep_version].context().clone(),
+                "child-final",
+            ),
+        );
+        let unexpected_reload = audit_resolver_reloaded_contracts(
+            &final_sources,
+            &source_identities,
+            &context,
+            &extra_contracts,
+            |_, _, _| Ok::<_, ()>("resolved-child"),
+        );
+        let selected_child = final_sources
+            .entries()
+            .iter()
+            .find(|entry| entry.package_version() == &child_version)
+            .expect("the path dependency is selected");
+        let unexpected_contract = unexpected_reload
+            .failures()
+            .iter()
+            .find(|failure| {
+                failure.package_version == child_version
+                    && failure.error
+                        == super::ResolverFinalContractAuditFailureKind::UnexpectedReloadedContract
+            })
+            .expect("same-identity package cannot have reloaded contract output");
+        assert_eq!(
+            unexpected_contract.read_source.as_ref(),
+            Some(selected_child.read_source())
+        );
+        assert_eq!(
+            unexpected_contract.final_source.as_ref(),
+            Some(selected_child.final_source())
+        );
     }
 
     #[test]
@@ -2363,9 +3702,13 @@ requires { acme:b @ ^1 from git "https://example.test/b-from-late" }
             (b_version.clone(), "acme:b".to_owned()),
             (late_version, "z:late".to_owned()),
         ]);
+        let identified_output = identified_output_from_map(&output, &read_source_identities);
+        let plan =
+            plan_resolver_final_sources(identified_output.output(), &context, &HashMap::new())
+                .expect("a selected-graph cycle does not suppress source planning");
         let identity_plan = plan_resolver_source_reloads(
             &plan,
-            &read_source_identities,
+            &identified_output,
             |package_version, _, base_identity| {
                 assert_eq!(base_identity, None);
                 Ok::<_, ()>(package_version.package().to_owned())
@@ -2388,6 +3731,17 @@ requires { acme:b @ ^1 from git "https://example.test/b-from-late" }
                     ResolverSourceSelectionError::MissingRequirementSource { .. }
                 )
         ));
+        let audit = audit_resolver_reloaded_contracts(
+            &plan,
+            &identity_plan,
+            &context,
+            &BTreeMap::new(),
+            |_, _, _| -> Result<&str, ()> {
+                panic!("a source-selection failure prevents contract comparison")
+            },
+        );
+        assert!(!audit.is_complete());
+        assert!(!audit.is_equivalent());
     }
 
     #[test]
@@ -2526,6 +3880,108 @@ targets { wasm32-core }
             Err(super::ResolverFinalSourcePlanError::ProviderOutputMismatch(version))
                 if *version == floor
         ));
+    }
+
+    #[test]
+    fn lock_floor_path_identity_uses_the_root_directory() {
+        let root = parse(
+            br#"package zz:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:alpha @ ^1 from git "https://example.test/alpha" }
+"#,
+        );
+        let root_version = package_version("zz:root", "1.0.0");
+        let floor = package_version("acme:b", "1.5.0");
+        let path_packages = BTreeMap::<ResolverPathKey, MvsPackageVersion>::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root resolver context is valid");
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root resolver contract is valid");
+        let lock_floors = HashMap::from([(floor.node(), floor.version().clone())]);
+        let locked_path = ResolverPackageSource::Path {
+            relative_to: root_version.clone(),
+            path: "../locked-b".into(),
+        };
+        let locked_sources = HashMap::from([(floor.clone(), locked_path.clone())]);
+        let output = select_with_source_provider_and_identities(
+            ResolverLoadedRootContract::new(root_contract, "root-tree".to_owned()),
+            &context,
+            &lock_floors,
+            &locked_sources,
+            |_| Ok::<_, ()>("unused"),
+            |request, _| {
+                let manifest = match (
+                    request.package_version.package(),
+                    request.package_version.version().to_string().as_str(),
+                ) {
+                    ("acme:alpha", _) => parse_for_role(
+                        br#"package acme:alpha @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:b @ ^1 from git "https://example.test/alpha-b" }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    ("acme:b", "1.0.0") => parse_for_role(
+                        br#"package acme:b @ 1.0.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    ("acme:b", "1.5.0") => parse_for_role(
+                        br#"package acme:b @ 1.5.0
+source "src"
+targets { wasm32-core }
+"#,
+                        PackageRole::Dependency,
+                    ),
+                    (package, version) => panic!("unexpected request {package}@{version}"),
+                };
+                let contract = build_resolver_contract(
+                    &manifest,
+                    &context,
+                    PackageValidationContext::default(),
+                )
+                .map_err(|_| "loaded manifest failed validation")?;
+                let identity = if request.package_version == floor {
+                    "locked-b-read".to_owned()
+                } else {
+                    request.package_version.package().to_owned()
+                };
+                Ok::<_, &str>(ResolverLoadedContract::new(contract, identity))
+            },
+        )
+        .expect("all lock-floor contracts load");
+        let plan = plan_resolver_final_sources(output.output(), &context, &locked_sources)
+            .expect("final source plan retains the lock path");
+        let identity_plan = plan_resolver_source_reloads(
+            &plan,
+            &output,
+            |package_version, source, base_identity| {
+                if package_version == &floor {
+                    assert_eq!(source.source(), &locked_path);
+                    assert_eq!(base_identity.map(String::as_str), Some("root-tree"));
+                    Ok::<_, ()>("locked-b-final".to_owned())
+                } else {
+                    assert_eq!(package_version.package(), "acme:alpha");
+                    assert_eq!(base_identity, None);
+                    Ok("acme:alpha".to_owned())
+                }
+            },
+        );
+
+        assert!(identity_plan.failures().is_empty());
+        assert_eq!(identity_plan.reloads().len(), 1);
+        assert_eq!(identity_plan.reloads()[0].package_version, floor);
     }
 
     #[test]
