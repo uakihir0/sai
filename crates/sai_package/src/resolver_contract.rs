@@ -49,7 +49,7 @@ pub struct ResolverContractContext<'a> {
     root_package: MvsPackageVersion,
     root_targets: BTreeSet<Box<str>>,
     path_packages: ResolverPathPackages<'a>,
-    root_path_overrides: &'a BTreeMap<Box<str>, MvsPackageVersion>,
+    root_path_overrides: ResolverRootPathOverrides<'a>,
     root_git_override_ids: BTreeSet<Box<str>>,
     root_overrides: Vec<Spanned<Override>>,
 }
@@ -60,6 +60,12 @@ enum ResolverPathPackages<'a> {
     Owned(Arc<BTreeMap<ResolverPathKey, MvsPackageVersion>>),
 }
 
+#[derive(Clone, Debug)]
+enum ResolverRootPathOverrides<'a> {
+    Borrowed(&'a BTreeMap<Box<str>, MvsPackageVersion>),
+    Owned(Arc<BTreeMap<Box<str>, MvsPackageVersion>>),
+}
+
 impl Deref for ResolverPathPackages<'_> {
     type Target = BTreeMap<ResolverPathKey, MvsPackageVersion>;
 
@@ -67,6 +73,17 @@ impl Deref for ResolverPathPackages<'_> {
         match self {
             Self::Borrowed(path_packages) => path_packages,
             Self::Owned(path_packages) => path_packages,
+        }
+    }
+}
+
+impl Deref for ResolverRootPathOverrides<'_> {
+    type Target = BTreeMap<Box<str>, MvsPackageVersion>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(root_path_overrides) => root_path_overrides,
+            Self::Owned(root_path_overrides) => root_path_overrides,
         }
     }
 }
@@ -168,7 +185,7 @@ impl<'a> ResolverContractContext<'a> {
             root_package,
             root_targets,
             path_packages: ResolverPathPackages::Borrowed(path_packages),
-            root_path_overrides,
+            root_path_overrides: ResolverRootPathOverrides::Borrowed(root_path_overrides),
             root_git_override_ids,
             root_overrides,
         })
@@ -205,10 +222,32 @@ impl<'a> ResolverContractContext<'a> {
             root_package: self.root_package.clone(),
             root_targets: self.root_targets.clone(),
             path_packages: ResolverPathPackages::Owned(Arc::new(path_packages)),
-            root_path_overrides: self.root_path_overrides,
+            root_path_overrides: self.root_path_overrides.clone(),
             root_git_override_ids: self.root_git_override_ids.clone(),
             root_overrides: self.root_overrides.clone(),
         })
+    }
+
+    /// Copies the root-owned maps into this context so it can outlive their
+    /// original borrowed inputs.
+    ///
+    /// The root binding token is preserved, so contracts built with the
+    /// returned context remain bound to the same root contract.
+    pub fn into_owned(self) -> ResolverContractContext<'static> {
+        ResolverContractContext {
+            root_manifest: self.root_manifest,
+            root_context_binding: self.root_context_binding,
+            root_package: self.root_package,
+            root_targets: self.root_targets,
+            path_packages: ResolverPathPackages::Owned(Arc::new(
+                self.path_packages.deref().clone(),
+            )),
+            root_path_overrides: ResolverRootPathOverrides::Owned(Arc::new(
+                self.root_path_overrides.deref().clone(),
+            )),
+            root_git_override_ids: self.root_git_override_ids,
+            root_overrides: self.root_overrides,
+        }
     }
 
     pub const fn root_package(&self) -> &MvsPackageVersion {
@@ -225,6 +264,10 @@ impl<'a> ResolverContractContext<'a> {
 
     pub fn path_packages(&self) -> &BTreeMap<ResolverPathKey, MvsPackageVersion> {
         &self.path_packages
+    }
+
+    pub fn root_path_overrides(&self) -> &BTreeMap<Box<str>, MvsPackageVersion> {
+        &self.root_path_overrides
     }
 
     pub(crate) fn root_path_override(&self, package: &str) -> Option<&MvsPackageVersion> {
@@ -779,7 +822,7 @@ fn same_root_resolution_context(
     left.root_manifest == right.root_manifest
         && left.root_package == right.root_package
         && left.root_targets == right.root_targets
-        && left.root_path_overrides == right.root_path_overrides
+        && left.root_path_overrides.deref() == right.root_path_overrides.deref()
         && left.root_overrides == right.root_overrides
         && root_path_packages(left) == root_path_packages(right)
 }
@@ -1364,6 +1407,50 @@ mod tests {
                 && *discovered == conflicting_version
         ));
         assert_eq!(context.path_packages()[&key], indexed_version);
+    }
+
+    #[test]
+    fn owned_context_retains_maps_and_root_binding_after_inputs_are_dropped() {
+        let root = parse(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              overrides { acme:local use path \"../local\" }\n",
+        );
+        let root_version = package_version("acme:root", "1.0.0");
+        let local_version = package_version("acme:local", "1.2.0");
+        let sibling_version = package_version("acme:sibling", "1.4.0");
+        let sibling_key = ResolverPathKey::new(root_version.clone(), "../sibling");
+        let root_contract;
+        let owned = {
+            let path_packages = BTreeMap::from([(sibling_key.clone(), sibling_version.clone())]);
+            let root_path_overrides =
+                BTreeMap::from([(Box::<str>::from("acme:local"), local_version.clone())]);
+            let context = root_context(&root, &path_packages, &root_path_overrides);
+            root_contract =
+                build_resolver_contract(&root, &context, PackageValidationContext::default())
+                    .expect("build root contract");
+            context.into_owned()
+        };
+
+        assert_eq!(
+            owned.path_packages(),
+            &BTreeMap::from([(sibling_key, sibling_version)])
+        );
+        assert_eq!(
+            owned.root_path_overrides(),
+            &BTreeMap::from([(Box::<str>::from("acme:local"), local_version.clone())])
+        );
+        assert_eq!(
+            owned.root_override_pins(),
+            [(local_version.node(), local_version.version().clone())]
+                .into_iter()
+                .collect()
+        );
+        assert!(
+            owned.is_bound_to_root_contract(&root_contract),
+            "owning borrowed maps preserves the original root binding"
+        );
     }
 
     #[test]
