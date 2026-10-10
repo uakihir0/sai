@@ -12,7 +12,7 @@ use crate::manifest::{
 };
 use crate::mixed_source::{
     MixedPackageSourceIdentity, MixedSourceFinalAuditPlan, MixedSourceFinalIdentityError,
-    MixedSourceFinalReloadError, MixedSourceMvsOutput,
+    MixedSourceFinalPathResolutionError, MixedSourceFinalReloadError, MixedSourceMvsOutput,
 };
 use crate::mvs::{
     MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionErrorKind, MvsSelectionOutput,
@@ -27,7 +27,8 @@ use crate::mvs_graph_validation::{
 };
 use crate::resolver_contract::{
     ResolverContractBuildError, ResolverContractComparisonError, ResolverContractEdge,
-    ResolverContractSourceClause,
+    ResolverContractPathResolutionFailure, ResolverContractPathSourceRequest,
+    ResolverContractSourceClause, ResolverContractSourceSide,
 };
 use crate::resolver_source::{
     ResolverPackageSource, ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
@@ -53,6 +54,7 @@ use sai_diagnostics::{
 const MAX_FINAL_MANIFEST_SYNTAX_ISSUES: usize = 32;
 const MAX_FINAL_MANIFEST_SYNTAX_CANDIDATES: usize = (MAX_FINAL_MANIFEST_SYNTAX_ISSUES + 1) * 3;
 const MAX_FINAL_MANIFEST_SEMANTIC_ISSUES: usize = 32;
+const MAX_FINAL_PATH_RESOLUTION_ISSUES: usize = 32;
 
 /// Source identity for one parsed package manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -830,6 +832,14 @@ struct ReportableFinalReloadFailure<'a> {
     final_package_identity_mismatch: Option<MvsPackageVersion>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReportableFinalPathResolutionFailure<'a> {
+    compared_package: &'a MvsPackageVersion,
+    request: &'a ResolverContractPathSourceRequest,
+    code: Code,
+    detail: String,
+}
+
 impl MvsManifestLocations {
     pub fn set_root(
         &mut self,
@@ -961,6 +971,106 @@ impl MvsManifestLocations {
         )
     }
 
+    /// Finds the unique retained final-source requirement that produced this
+    /// path comparison request, then revalidates its exact source bytes.
+    pub fn final_path_request_location(
+        &self,
+        request: &ResolverContractPathSourceRequest,
+    ) -> Result<sai_diagnostics::Location, MvsDuplicatePackageLineDiagnosticError> {
+        let requiring_package = &request.requiring_package;
+        if request.side != ResolverContractSourceSide::Actual {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::PathRequestLocationMismatch {
+                    requiring_package: Box::new(requiring_package.clone()),
+                    requirement_package: request.package.clone(),
+                    ambiguous: false,
+                },
+            );
+        }
+        if request.root_relative {
+            let Some(manifest) = self.root.as_ref() else {
+                return Err(MvsDuplicatePackageLineDiagnosticError::MissingRootManifest);
+            };
+            if &manifest.package_version != requiring_package {
+                return Err(
+                    MvsDuplicatePackageLineDiagnosticError::DivergentPathComparisonPackageVersionMismatch {
+                        expected: Box::new(requiring_package.clone()),
+                        found: Box::new(manifest.package_version.clone()),
+                    },
+                );
+            }
+            let mut matching_overrides = manifest.overrides.iter().filter(|(_, override_)| {
+                override_.package.as_ref() == request.package.as_ref()
+                    && matches!(
+                        &override_.source,
+                        OverrideSource::Path(path) if path.as_ref() == request.path.as_ref()
+                    )
+            });
+            let Some(((start, end), _)) = matching_overrides.next() else {
+                return Err(
+                    MvsDuplicatePackageLineDiagnosticError::PathRequestLocationMismatch {
+                        requiring_package: Box::new(requiring_package.clone()),
+                        requirement_package: request.package.clone(),
+                        ambiguous: false,
+                    },
+                );
+            };
+            if matching_overrides.next().is_some() {
+                return Err(
+                    MvsDuplicatePackageLineDiagnosticError::PathRequestLocationMismatch {
+                        requiring_package: Box::new(requiring_package.clone()),
+                        requirement_package: request.package.clone(),
+                        ambiguous: true,
+                    },
+                );
+            }
+            let span = *start..*end;
+            return manifest_span_location(
+                manifest,
+                &MvsRequirer::Root(requiring_package.clone()),
+                &span,
+            );
+        }
+
+        let manifest = self.final_packages.get(requiring_package).ok_or_else(|| {
+            MvsDuplicatePackageLineDiagnosticError::MissingFinalManifestLocation(Box::new(
+                requiring_package.clone(),
+            ))
+        })?;
+        let mut matching_requirements = manifest.requirements.iter().filter(|(_, requirement)| {
+            requirement.package.as_ref() == request.package.as_ref()
+                && matches!(
+                    requirement.source.as_ref(),
+                    Some(RequirementSource::Path(path)) if path.as_ref() == request.path.as_ref()
+                )
+        });
+        let Some(((start, end), _)) = matching_requirements.next() else {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::PathRequestLocationMismatch {
+                    requiring_package: Box::new(requiring_package.clone()),
+                    requirement_package: request.package.clone(),
+                    ambiguous: false,
+                },
+            );
+        };
+        if matching_requirements.next().is_some() {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::PathRequestLocationMismatch {
+                    requiring_package: Box::new(requiring_package.clone()),
+                    requirement_package: request.package.clone(),
+                    ambiguous: true,
+                },
+            );
+        }
+        let span = *start..*end;
+        self.final_path_requirement_location(
+            requiring_package,
+            &request.package,
+            &request.path,
+            &span,
+        )
+    }
+
     /// Returns the package-header location only when the retained final
     /// manifest declares the identity and version captured by the failure.
     pub fn final_package_identity_location(
@@ -1049,6 +1159,11 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
     FinalManifestRequirementMismatch {
         requiring_package: Box<MvsPackageVersion>,
         span: Range<usize>,
+    },
+    PathRequestLocationMismatch {
+        requiring_package: Box<MvsPackageVersion>,
+        requirement_package: Box<str>,
+        ambiguous: bool,
     },
     FinalManifestIdentityMismatch {
         expected: Box<MvsPackageVersion>,
@@ -1488,6 +1603,20 @@ fn reportable_final_source_identity_failure(
     Some((error.diagnostic_code()?, error.diagnostic_message()?))
 }
 
+fn reportable_final_path_resolution_failure(
+    failure: &ResolverContractPathResolutionFailure<
+        ResolverFinalContractPathResolutionError<MixedSourceFinalPathResolutionError>,
+    >,
+) -> Option<(Code, String)> {
+    if failure.request.side != ResolverContractSourceSide::Actual {
+        return None;
+    }
+    let ResolverFinalContractPathResolutionError::Resolver(error) = failure.error.as_ref() else {
+        return None;
+    };
+    Some((error.diagnostic_code()?, error.diagnostic_message()?))
+}
+
 /// Builds source-located diagnostics for reportable final-source identity
 /// failures. Internal provenance mismatches remain on the audit plan for the
 /// package workflow to handle as compiler errors.
@@ -1681,6 +1810,30 @@ pub fn mixed_source_reload_failure_diagnostics(
         })
         .collect::<Vec<_>>();
     let audit = audit_plan.audit();
+    let mut reportable_path_failures = audit
+        .comparisons()
+        .iter()
+        .flat_map(|comparison| {
+            comparison
+                .paths()
+                .failures()
+                .iter()
+                .map(|failure| (&comparison.reload().package_version, failure))
+        })
+        .filter_map(|(compared_package, failure)| {
+            reportable_final_path_resolution_failure(failure).map(|(code, detail)| {
+                ReportableFinalPathResolutionFailure {
+                    compared_package,
+                    request: &failure.request,
+                    code,
+                    detail,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_and_deduplicate_final_path_resolution_failures(&mut reportable_path_failures);
+    let truncated_path_packages =
+        truncate_final_path_resolution_failures(&mut reportable_path_failures);
     let reportable_identity_packages = audit
         .source_identities()
         .failures()
@@ -1731,6 +1884,7 @@ pub fn mixed_source_reload_failure_diagnostics(
     if reportable_failures.is_empty()
         && final_syntax_packages.is_empty()
         && final_semantic_failures.is_empty()
+        && reportable_path_failures.is_empty()
         && internal_audit_error.is_none()
     {
         return Ok(Vec::new());
@@ -2005,6 +2159,85 @@ pub fn mixed_source_reload_failure_diagnostics(
             .expect("a new diagnostic has no snapshot-bound locations");
         add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
         diagnostics.push(diagnostic);
+    }
+    let mut last_path_diagnostic_indices = BTreeMap::new();
+    for failure in reportable_path_failures {
+        let request = failure.request;
+        let package_version = failure.compared_package;
+        let chain = explanations
+            .chain_to_package_version(package_version)
+            .map_err(|error| {
+                MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+            })?;
+        let primary = manifests.final_path_request_location(request)?;
+        let mut diagnostic = Diagnostic::new(
+            failure.code,
+            Severity::Error,
+            format!(
+                "could not resolve final path dependency {} while comparing {}@{}: {}",
+                request.package,
+                package_version.package(),
+                package_version.version(),
+                failure.detail
+            ),
+            Some(primary),
+        );
+        diagnostic.primary_label =
+            "this path requirement could not be resolved in the final source".to_owned();
+        diagnostic.package = Some(package_version.package().to_owned());
+        let mut data = ValueObject::new();
+        data.insert(
+            "package".to_owned(),
+            Value::String(package_version.package().to_owned()),
+        );
+        data.insert(
+            "version".to_owned(),
+            Value::String(package_version.version().to_string()),
+        );
+        data.insert(
+            "path_package".to_owned(),
+            Value::String(request.package.to_string()),
+        );
+        data.insert("side".to_owned(), Value::String("final_source".to_owned()));
+        data.insert(
+            "stage".to_owned(),
+            Value::String("final_source_path_comparison".to_owned()),
+        );
+        data.insert("failure".to_owned(), Value::String(failure.detail));
+        data.insert(
+            "requirement_chain".to_owned(),
+            requirement_chain_data(&chain, manifests)?,
+        );
+        diagnostic.data = data;
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: "the selected package is reached through:".to_owned(),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+        add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
+        diagnostics.push(diagnostic);
+        last_path_diagnostic_indices
+            .insert(request.requiring_package.clone(), diagnostics.len() - 1);
+    }
+    for package_version in truncated_path_packages {
+        if let Some(diagnostic_index) = last_path_diagnostic_indices.get(&package_version) {
+            let diagnostic = &mut diagnostics[*diagnostic_index];
+            diagnostic.data.insert(
+                "additional_path_resolution_errors_omitted".to_owned(),
+                Value::Bool(true),
+            );
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: format!(
+                        "additional final path resolution failures were omitted after the limit of {MAX_FINAL_PATH_RESOLUTION_ISSUES}"
+                    ),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+        }
     }
     sort_final_source_diagnostics(
         &mut diagnostics,
@@ -2302,6 +2535,42 @@ fn sort_and_deduplicate_final_reload_failure_diagnostics(
             && left.final_package_identity_mismatch == right.final_package_identity_mismatch;
         same_identity_mismatch || *left == *right
     });
+}
+
+fn sort_and_deduplicate_final_path_resolution_failures(
+    failures: &mut Vec<ReportableFinalPathResolutionFailure<'_>>,
+) {
+    failures.sort_by(|left, right| {
+        left.request
+            .requiring_package
+            .cmp(&right.request.requiring_package)
+            .then_with(|| left.compared_package.cmp(right.compared_package))
+            .then_with(|| left.request.package.cmp(&right.request.package))
+            .then_with(|| left.request.path.cmp(&right.request.path))
+            .then_with(|| left.request.root_relative.cmp(&right.request.root_relative))
+            .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+    failures.dedup();
+}
+
+fn truncate_final_path_resolution_failures(
+    failures: &mut Vec<ReportableFinalPathResolutionFailure<'_>>,
+) -> BTreeSet<MvsPackageVersion> {
+    let mut counts = BTreeMap::<MvsPackageVersion, usize>::new();
+    let mut truncated = BTreeSet::new();
+    failures.retain(|failure| {
+        let package_version = &failure.request.requiring_package;
+        let count = counts.entry(package_version.clone()).or_default();
+        if *count == MAX_FINAL_PATH_RESOLUTION_ISSUES {
+            truncated.insert(package_version.clone());
+            false
+        } else {
+            *count += 1;
+            true
+        }
+    });
+    truncated
 }
 
 #[cfg(test)]
@@ -4095,14 +4364,17 @@ mod tests {
     use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     use super::{
-        MAX_FINAL_MANIFEST_SYNTAX_ISSUES, MvsDuplicatePackageLineDiagnosticContext,
-        MvsDuplicatePackageLineDiagnosticError, MvsManifestLocation, MvsManifestLocations,
+        MAX_FINAL_MANIFEST_SYNTAX_ISSUES, MAX_FINAL_PATH_RESOLUTION_ISSUES,
+        MvsDuplicatePackageLineDiagnosticContext, MvsDuplicatePackageLineDiagnosticError,
+        MvsManifestLocation, MvsManifestLocations, ReportableFinalPathResolutionFailure,
         divergent_sources_diagnostic, duplicate_package_line_diagnostic,
         duplicate_package_line_diagnostics, final_contract_audit_failure_is_unexplained,
         final_contract_audit_internal_error, final_manifest_semantic_diagnostic,
         final_manifest_syntax_issues, mixed_source_identity_failure_diagnostics,
-        resolver_source_selection_location, sort_and_deduplicate_reload_failure_diagnostics,
-        sort_final_source_diagnostics, version_conflict_diagnostic, version_conflict_diagnostics,
+        resolver_source_selection_location, sort_and_deduplicate_final_path_resolution_failures,
+        sort_and_deduplicate_reload_failure_diagnostics, sort_final_source_diagnostics,
+        truncate_final_path_resolution_failures, version_conflict_diagnostic,
+        version_conflict_diagnostics,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{
@@ -4114,8 +4386,8 @@ mod tests {
         MvsDuplicatePackageLines, check_selected_graph, duplicate_package_lines,
     };
     use crate::resolver_contract::{
-        ResolverContractContext, ResolverPathKey, build_resolver_contract,
-        compare_resolver_contract_edges,
+        ResolverContractContext, ResolverContractPathSourceRequest, ResolverContractSourceSide,
+        ResolverPathKey, build_resolver_contract, compare_resolver_contract_edges,
     };
     use crate::resolver_source::select_resolver_source;
     use crate::resolver_source_provider::{
@@ -4250,26 +4522,53 @@ mod tests {
 
     #[test]
     fn final_manifest_locations_require_the_exact_retained_path_edge() {
+        let root_package = package_version("acme:root", "1.0.0");
         let package = package_version("acme:target", "1.0.0");
+        let root_source = "package acme:root @ 1.0.0\n\
+                           source \"src\"\n\
+                           targets { wasm32-core }\n\
+                           overrides { acme:secret use path \"root-private\" }\n";
         let source = "package acme:changed @ 9.0.0\n\
                      requires { acme:secret @ ^1 from path \"private\" }\n";
         let requirement = "acme:secret @ ^1 from path \"private\"";
         let start = source.find(requirement).expect("requirement is present");
         let span = start..start + requirement.len();
+        let root_file_id = sai_diagnostics::FileId::new(70);
         let file_id = sai_diagnostics::FileId::new(71);
-        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
-            Arc::new(
-                SourceFile::decode(file_id, source.as_bytes())
-                    .expect("final manifest fits in a source file"),
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(root_file_id, root_source.as_bytes())
+                        .expect("root manifest fits in a source file"),
+                ),
+                "sai.package",
+                Some("acme:root@1.0.0".to_owned()),
+                None,
             ),
-            MvsManifestLocation::final_snapshot_path(&package, 3),
-            Some("acme:target@1.0.0".to_owned()),
-            None,
-        )])
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::decode(file_id, source.as_bytes())
+                        .expect("final manifest fits in a source file"),
+                ),
+                MvsManifestLocation::final_snapshot_path(&package, 3),
+                Some("acme:target@1.0.0".to_owned()),
+                None,
+            ),
+        ])
         .expect("the final manifest has a canonical synthetic path");
+        let root_manifest = MvsManifestLocation::from_snapshot(
+            &snapshot,
+            root_file_id,
+            &root_package,
+            PackageRole::Root,
+        )
+        .expect("the root override is bound to its source snapshot");
         let final_manifest = MvsManifestLocation::from_final_snapshot(&snapshot, file_id, &package)
             .expect("a changed package header does not invalidate retained source spans");
         let mut manifests = MvsManifestLocations::default();
+        manifests
+            .set_root(root_manifest)
+            .expect("the root manifest belongs to the snapshot");
         manifests
             .insert_final_package(final_manifest)
             .expect("the final manifest belongs to the snapshot");
@@ -4281,6 +4580,52 @@ mod tests {
         let end = location.span.range.end().to_usize();
         assert_eq!(&source.as_bytes()[start..end], requirement.as_bytes());
         assert_eq!(location.file.package.as_deref(), Some("acme:target@1.0.0"));
+        let request = ResolverContractPathSourceRequest {
+            side: ResolverContractSourceSide::Actual,
+            requiring_package: package.clone(),
+            root_relative: false,
+            package: "acme:secret".into(),
+            path: "private".into(),
+        };
+        let request_location = manifests
+            .final_path_request_location(&request)
+            .expect("the unique path request resolves to the retained final edge");
+        let request_start = request_location.span.range.start().to_usize();
+        let request_end = request_location.span.range.end().to_usize();
+        assert_eq!(
+            &source.as_bytes()[request_start..request_end],
+            requirement.as_bytes()
+        );
+        let root_request = ResolverContractPathSourceRequest {
+            side: ResolverContractSourceSide::Actual,
+            requiring_package: root_package.clone(),
+            root_relative: true,
+            package: "acme:secret".into(),
+            path: "root-private".into(),
+        };
+        let root_location = manifests
+            .final_path_request_location(&root_request)
+            .expect("root-relative path requests are located at their override");
+        let root_start = root_location.span.range.start().to_usize();
+        let root_end = root_location.span.range.end().to_usize();
+        assert_eq!(
+            &root_source.as_bytes()[root_start..root_end],
+            b"acme:secret use path \"root-private\""
+        );
+        let mismatched_request = ResolverContractPathSourceRequest {
+            path: "other".into(),
+            ..request
+        };
+        assert_eq!(
+            manifests.final_path_request_location(&mismatched_request),
+            Err(
+                MvsDuplicatePackageLineDiagnosticError::PathRequestLocationMismatch {
+                    requiring_package: Box::new(package.clone()),
+                    requirement_package: "acme:secret".into(),
+                    ambiguous: false,
+                }
+            )
+        );
         let found_identity = package_version("acme:changed", "9.0.0");
         let identity_location = manifests
             .final_package_identity_location(&package, &found_identity)
@@ -4323,6 +4668,102 @@ mod tests {
             ),
             Err(MvsDuplicatePackageLineDiagnosticError::FinalManifestRequirementMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn final_path_request_location_rejects_ambiguous_matching_edges() {
+        let package = package_version("acme:target", "1.0.0");
+        let source = "package acme:target @ 1.0.0\n\
+                      requires {\n\
+                        acme:secret @ ^1 from path \"private\"\n\
+                        acme:secret @ ^1 from path \"private\"\n\
+                      }\n";
+        let file_id = sai_diagnostics::FileId::new(73);
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(file_id, source.as_bytes())
+                    .expect("the final manifest fits in a source file"),
+            ),
+            MvsManifestLocation::final_snapshot_path(&package, 4),
+            Some("acme:target@1.0.0".to_owned()),
+            None,
+        )])
+        .expect("the final manifest snapshot is valid");
+        let final_manifest = MvsManifestLocation::from_final_snapshot(&snapshot, file_id, &package)
+            .expect("the final manifest is syntactically valid");
+        let mut manifests = MvsManifestLocations::default();
+        manifests
+            .insert_final_package(final_manifest)
+            .expect("the final manifest belongs to the snapshot");
+        let request = ResolverContractPathSourceRequest {
+            side: ResolverContractSourceSide::Actual,
+            requiring_package: package.clone(),
+            root_relative: false,
+            package: "acme:secret".into(),
+            path: "private".into(),
+        };
+
+        assert_eq!(
+            manifests.final_path_request_location(&request),
+            Err(
+                MvsDuplicatePackageLineDiagnosticError::PathRequestLocationMismatch {
+                    requiring_package: Box::new(package),
+                    requirement_package: "acme:secret".into(),
+                    ambiguous: true,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn final_path_resolution_failures_are_bounded_per_source_manifest() {
+        let package = package_version("acme:target", "1.0.0");
+        let other_package = package_version("acme:other", "1.0.0");
+        let mut requests = (0..MAX_FINAL_PATH_RESOLUTION_ISSUES + 3)
+            .map(|index| ResolverContractPathSourceRequest {
+                side: ResolverContractSourceSide::Actual,
+                requiring_package: package.clone(),
+                root_relative: false,
+                package: format!("acme:leaf-{index}").into(),
+                path: format!("leaf-{index}").into(),
+            })
+            .collect::<Vec<_>>();
+        requests.extend((0..2).map(|index| ResolverContractPathSourceRequest {
+            side: ResolverContractSourceSide::Actual,
+            requiring_package: other_package.clone(),
+            root_relative: false,
+            package: format!("acme:other-leaf-{index}").into(),
+            path: format!("other-leaf-{index}").into(),
+        }));
+        let mut failures = requests
+            .iter()
+            .map(|request| ReportableFinalPathResolutionFailure {
+                compared_package: &package,
+                request,
+                code: Code::PathPackageNotFound,
+                detail: "the local package was not found".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        sort_and_deduplicate_final_path_resolution_failures(&mut failures);
+
+        let truncated = truncate_final_path_resolution_failures(&mut failures);
+
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|failure| failure.request.requiring_package == package)
+                .count(),
+            MAX_FINAL_PATH_RESOLUTION_ISSUES
+        );
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|failure| failure.request.requiring_package == other_package)
+                .count(),
+            2,
+            "the limit applies separately to each source manifest"
+        );
+        assert_eq!(truncated, BTreeSet::from([package]));
     }
 
     #[test]

@@ -419,6 +419,10 @@ impl MixedSourceMvsOutput {
                     validation_context,
                 ) {
                     Ok(contract) => {
+                        final_manifest_snapshots.insert(
+                            reload.package_version.clone(),
+                            Arc::from(package.package_manifest_bytes()),
+                        );
                         reloaded_contracts.insert(
                             reload.package_version.clone(),
                             ResolverReloadedSourceContract::new(
@@ -465,6 +469,16 @@ impl MixedSourceMvsOutput {
             };
             match contract {
                 Ok(contract) => {
+                    let final_manifest = match snapshot {
+                        MixedSourceFinalSnapshot::Local(directory) => directory.manifest_bytes(),
+                        MixedSourceFinalSnapshot::GitRelease(release) => {
+                            Arc::from(release.package_manifest_bytes())
+                        }
+                        MixedSourceFinalSnapshot::GitPath(_) => {
+                            unreachable!("Git path contracts are handled above")
+                        }
+                    };
+                    final_manifest_snapshots.insert(reload.package_version.clone(), final_manifest);
                     reloaded_contracts.insert(
                         reload.package_version.clone(),
                         ResolverReloadedSourceContract::new(
@@ -1077,6 +1091,46 @@ pub enum MixedSourceFinalPathResolutionError {
     GitPath(GitPackagePathError),
 }
 
+impl MixedSourceFinalPathResolutionError {
+    /// Returns a safe package diagnostic classification for a failed
+    /// final-source path comparison.
+    pub fn diagnostic_code(&self) -> Option<sai_diagnostics::Code> {
+        use sai_diagnostics::Code;
+
+        match self {
+            Self::LocalPathSyntax(PackagePathError::InvalidPackagePath) => {
+                Some(Code::InvalidPackagePath)
+            }
+            Self::LocalPathSyntax(PackagePathError::PathEscapesRepository) => {
+                Some(Code::PathEscapesRepository)
+            }
+            Self::LocalPath(error) => local_package_error_diagnostic_code(error),
+            Self::GitPath(error) => Some(error.diagnostic_code()),
+        }
+    }
+
+    /// Returns a bounded explanation that omits the unresolved relative path
+    /// and any host or repository location.
+    pub fn diagnostic_message(&self) -> Option<String> {
+        let message = match self {
+            Self::LocalPathSyntax(PackagePathError::InvalidPackagePath) => {
+                "the final source contains an invalid local package path".to_owned()
+            }
+            Self::LocalPathSyntax(PackagePathError::PathEscapesRepository) => {
+                "the final local package path escapes its allowed root".to_owned()
+            }
+            Self::LocalPath(error) => local_package_error_diagnostic_message(error)?,
+            Self::GitPath(GitPackagePathError::InvalidPackagePath) => {
+                "the final Git source contains an invalid dependency path".to_owned()
+            }
+            Self::GitPath(GitPackagePathError::PathEscapesRepository) => {
+                "the final Git dependency path escapes its repository".to_owned()
+            }
+        };
+        self.diagnostic_code().map(|_| message)
+    }
+}
+
 /// Source data retained while planning and loading final-source reloads.
 #[derive(Debug)]
 enum MixedSourceFinalSnapshot {
@@ -1132,8 +1186,8 @@ impl MixedSourceFinalAuditPlan {
         &self.reload_failures
     }
 
-    /// Exact final-manifest bytes retained for classified path-discovery
-    /// failures and package identity mismatches with a final header location.
+    /// Exact final-manifest bytes for changed sources, retained for reload
+    /// diagnostics and source-bound path comparisons.
     pub fn final_manifest_snapshots(&self) -> &BTreeMap<MvsPackageVersion, Arc<[u8]>> {
         &self.final_manifest_snapshots
     }

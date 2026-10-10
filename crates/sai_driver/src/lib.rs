@@ -1124,6 +1124,253 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn mixed_source_reload_diagnostics_bound_final_path_comparison_failures() {
+        use std::os::unix::fs::symlink;
+
+        const PATH_REQUIREMENT_COUNT: usize = 35;
+        let directory = TestDirectory::new();
+        let root_path = directory.0.join("root");
+        let first_path = directory.0.join("target-first");
+        let final_path = directory.0.join("target-final");
+        for path in [&root_path, &first_path, &final_path] {
+            std::fs::create_dir_all(path.join("src")).unwrap();
+        }
+
+        let mut root_manifest = String::from(
+            "package acme:root @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core }\n\
+             overrides {\n",
+        );
+        for index in 0..PATH_REQUIREMENT_COUNT {
+            root_manifest.push_str(&format!(
+                "  acme:leaf-{index} use path \"root-leaf-{index}\"\n"
+            ));
+        }
+        root_manifest.push_str("}\nrequires { acme:target @ ^1 from path \"switch\" }\n");
+        let root_manifest = root_manifest.into_bytes();
+        let leaf_manifests = (0..PATH_REQUIREMENT_COUNT)
+            .map(|index| {
+                let package = format!("acme:leaf-{index}");
+                let manifest = format!(
+                    "package {package} @ 1.0.0\n\
+                     source \"src\"\n\
+                     targets {{ wasm32-core }}\n"
+                );
+                (package, manifest.into_bytes())
+            })
+            .collect::<Vec<_>>();
+        let mut target_manifest = String::from(
+            "package acme:target @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core }\n\
+             requires {\n",
+        );
+        for (package, _) in &leaf_manifests {
+            target_manifest.push_str(&format!("  {package} @ ^1 from path \"ignored/leaf\"\n"));
+        }
+        target_manifest.push_str("}\n");
+        let read_time_target_manifest = target_manifest.clone().into_bytes();
+        let final_target_manifest =
+            format!("// final source snapshot\n{target_manifest}").into_bytes();
+        std::fs::write(root_path.join("sai.package"), &root_manifest).unwrap();
+        std::fs::write(root_path.join("src/main.sai"), b"fn main() {}\n").unwrap();
+        std::fs::write(first_path.join("sai.package"), &read_time_target_manifest).unwrap();
+        std::fs::write(first_path.join("src/main.sai"), b"").unwrap();
+        std::fs::write(final_path.join("sai.package"), &final_target_manifest).unwrap();
+        std::fs::write(final_path.join("src/main.sai"), b"").unwrap();
+        for (index, (_, leaf_manifest)) in leaf_manifests.iter().enumerate() {
+            let leaf_path = root_path.join(format!("root-leaf-{index}"));
+            std::fs::create_dir_all(leaf_path.join("src")).unwrap();
+            std::fs::write(leaf_path.join("sai.package"), leaf_manifest).unwrap();
+            std::fs::write(leaf_path.join("src/main.sai"), b"").unwrap();
+        }
+        symlink("../target-first", root_path.join("switch")).unwrap();
+
+        let mixed_output = resolve_mixed_source_packages(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("the read-time path graph resolves");
+        std::fs::remove_file(root_path.join("switch")).unwrap();
+        symlink("../target-final", root_path.join("switch")).unwrap();
+        let audit_plan = mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("the changed final source and its path package are loaded");
+
+        let selection = mixed_output.provider().output().selection();
+        let target_version = selection
+            .read_contracts()
+            .keys()
+            .find(|package_version| package_version.package() == "acme:target")
+            .expect("the target dependency was loaded")
+            .clone();
+        let leaf_versions = selection
+            .read_contracts()
+            .keys()
+            .filter(|package_version| package_version.package().starts_with("acme:leaf-"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(leaf_versions.len(), PATH_REQUIREMENT_COUNT);
+        assert_eq!(
+            audit_plan.final_manifest_snapshots()[&target_version].as_ref(),
+            final_target_manifest.as_slice(),
+            "successful reloads retain their exact final manifest for path diagnostics"
+        );
+        assert_ne!(
+            read_time_target_manifest, final_target_manifest,
+            "the final manifest must differ from the read-time bytes"
+        );
+
+        // Remove root override targets only after final manifests and contracts
+        // have been captured. Both Expected and Actual lookups fail, but only
+        // the Actual failure belongs to the final contract comparison.
+        for index in 0..PATH_REQUIREMENT_COUNT {
+            std::fs::remove_dir_all(root_path.join(format!("root-leaf-{index}"))).unwrap();
+        }
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let root_file = database
+            .intern_file_key(FileKey::new("acme:root#1", "sai.package").unwrap())
+            .unwrap();
+        let target_file = database
+            .intern_file_key(FileKey::new("acme:target#1", "sai.package").unwrap())
+            .unwrap();
+        let mut dependency_manifest_files = BTreeMap::from([(target_version.clone(), target_file)]);
+        let mut snapshot_files = vec![
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(root_file, &root_manifest).unwrap()),
+                "sai.package",
+                Some("acme:root@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(target_file, &read_time_target_manifest).unwrap()),
+                "dep:acme:target@1.0.0/sai.package",
+                Some("acme:target@1.0.0".to_owned()),
+                Some(1),
+            ),
+        ];
+        for (package, leaf_manifest) in &leaf_manifests {
+            let package_version = leaf_versions
+                .iter()
+                .find(|package_version| package_version.package() == package)
+                .expect("every path requirement selected its matching package");
+            let file_id = database
+                .intern_file_key(FileKey::new(format!("{package}#1"), "sai.package").unwrap())
+                .unwrap();
+            dependency_manifest_files.insert(package_version.clone(), file_id);
+            snapshot_files.push(SnapshotFile::new(
+                Arc::new(SourceFile::decode(file_id, leaf_manifest).unwrap()),
+                format!("dep:{package}@1.0.0/sai.package"),
+                Some(format!("{package}@1.0.0")),
+                Some(1),
+            ));
+        }
+        let snapshot = WorkspaceSnapshot::new(snapshot_files)
+            .expect("the read-time manifests belong to one workspace snapshot");
+        let diagnostics = database
+            .mixed_source_reload_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &dependency_manifest_files,
+            )
+            .expect("the path comparison failure binds to the retained final source");
+        assert_eq!(diagnostics.len(), 32);
+        assert!(
+            diagnostics
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code.as_str() == "PATH_PACKAGE_NOT_FOUND")
+        );
+        let diagnostic = diagnostics
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .data
+                    .contains_key("additional_path_resolution_errors_omitted")
+            })
+            .expect("the final emitted diagnostic marks omitted path failures");
+        assert_eq!(diagnostic.package.as_deref(), Some("acme:target"));
+        assert_eq!(
+            diagnostic.data.get("package"),
+            Some(&sai_diagnostics::Value::String("acme:target".to_owned()))
+        );
+        assert_eq!(
+            diagnostic
+                .data
+                .get("additional_path_resolution_errors_omitted"),
+            Some(&sai_diagnostics::Value::Bool(true))
+        );
+        let path_package = match diagnostic.data.get("path_package") {
+            Some(sai_diagnostics::Value::String(package)) => package,
+            other => panic!("expected the failed path package name, got {other:?}"),
+        };
+        assert_eq!(
+            diagnostic.message,
+            format!(
+                "could not resolve final path dependency {} while comparing acme:target@1.0.0: a local package required by the final source was not found",
+                path_package
+            )
+        );
+        assert_eq!(
+            diagnostic.data.get("side"),
+            Some(&sai_diagnostics::Value::String("final_source".to_owned()))
+        );
+        assert!(
+            !diagnostic.data.contains_key("path"),
+            "the unresolved relative path is not copied into diagnostic data"
+        );
+        let primary = diagnostic
+            .primary()
+            .expect("exact final requirement location");
+        assert_eq!(primary.file.path, "sai.package");
+        assert_eq!(primary.file.package.as_deref(), Some("acme:root@1.0.0"));
+        let start = primary.span.range.start().to_usize();
+        let end = primary.span.range.end().to_usize();
+        assert_eq!(
+            &diagnostics
+                .snapshot()
+                .file(primary.span.file)
+                .expect("the workspace snapshot retains the root manifest")
+                .source()
+                .raw_bytes()[start..end],
+            &root_manifest[start..end]
+        );
+        assert!(
+            root_manifest[start..end].starts_with(b"acme:leaf-")
+                && root_manifest[start..end]
+                    .windows(b"use path \"root-leaf-".len())
+                    .any(|window| { window == b"use path \"root-leaf-" }),
+            "the primary span selects one exact root override"
+        );
+        assert!(
+            matches!(
+                diagnostic.data.get("requirement_chain"),
+                Some(sai_diagnostics::Value::Object(fields))
+                    if matches!(
+                        fields.get("steps"),
+                        Some(sai_diagnostics::Value::Array(steps)) if !steps.is_empty()
+                    )
+            ),
+            "the original MVS chain remains attached"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn mixed_source_identity_diagnostics_report_final_local_path_failures() {
         use std::os::unix::fs::symlink;
 

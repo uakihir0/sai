@@ -4876,6 +4876,55 @@ mod tests {
         )
         .expect("the read-time MVS graph resolves from its original Git sources");
 
+        let target_version = expected_package_version("acme:target", "1.0.0");
+        let successful_final_target_manifest = format!(
+            "// final source snapshot\n{}",
+            String::from_utf8_lossy(read_time_target_manifest)
+        )
+        .into_bytes();
+        let successful_final_target_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(&successful_final_target_manifest),
+        );
+        let mut successful_final_target_release = Some(
+            fetch_fixture_with_canonical_url(
+                &successful_final_target_remote,
+                Some(&successful_final_target_remote.commit_id),
+                None,
+                FINAL_URL,
+            )
+            .unwrap(),
+        );
+        let successful_audit_plan = output
+            .plan_final_source_audit(
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                PackageValidationContext::default(),
+                |selection, locked_package| {
+                    assert!(locked_package.is_none());
+                    assert_eq!(selection.package_version().package(), "acme:target");
+                    let ResolverPackageSource::Git { url, .. } = selection.source() else {
+                        panic!("the late named edge must select a final Git release")
+                    };
+                    assert_eq!(url.as_ref(), FINAL_URL);
+                    Ok(successful_final_target_release.take().unwrap())
+                },
+                |_, _| unreachable!("this fixture has no Git-relative path requirements"),
+            )
+            .expect("the final Git release contract reloads successfully");
+        assert!(successful_audit_plan.reload_failures().is_empty());
+        assert_ne!(
+            successful_final_target_manifest, read_time_target_manifest,
+            "the final Git manifest must differ from the read-time bytes"
+        );
+        assert_eq!(
+            successful_audit_plan.final_manifest_snapshots()[&target_version].as_ref(),
+            successful_final_target_manifest.as_slice(),
+            "successful Git release reloads retain the exact final manifest bytes"
+        );
+
         let mut final_target_release = Some(
             fetch_fixture_with_canonical_url(
                 &final_target_remote,
@@ -4902,7 +4951,6 @@ mod tests {
                 |_, _| unreachable!("this fixture has no Git-relative path requirements"),
             )
             .expect("the final source plan retains Git release reload failures");
-        let target_version = expected_package_version("acme:target", "1.0.0");
         assert_eq!(
             audit_plan.final_manifest_snapshots()[&target_version].as_ref(),
             final_target_manifest
