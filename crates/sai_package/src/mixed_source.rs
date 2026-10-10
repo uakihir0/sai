@@ -553,21 +553,14 @@ pub enum MixedSourceFinalReloadError {
 }
 
 impl MixedSourceFinalReloadError {
-    /// Return a package diagnostic code for direct selected-package identity
-    /// mismatches. Failures on newly discovered final-source path edges need
-    /// their own final manifest locations and remain caller-owned.
+    /// Return a package diagnostic code when the failure has a safe
+    /// node-level classification independent of final-manifest spans.
     pub fn diagnostic_code(&self) -> Option<sai_diagnostics::Code> {
         use sai_diagnostics::Code;
 
         match self {
-            Self::LocalDirectoryIndex(error)
-                if matches!(
-                    error.as_ref(),
-                    LocalPackageDirectoryIndexError::PackageVersionMismatch { .. }
-                ) =>
-            {
-                Some(Code::PackageIdentityMismatch)
-            }
+            Self::LocalDirectoryIndex(error) => local_directory_index_diagnostic_code(error),
+            Self::LocalPathIndex(error) => local_path_index_diagnostic_code(error),
             Self::LocalContract(error)
                 if matches!(
                     error.as_ref(),
@@ -576,21 +569,11 @@ impl MixedSourceFinalReloadError {
             {
                 Some(Code::PackageIdentityMismatch)
             }
-            Self::GitPathDiscovery(error)
-                if matches!(
-                    error.as_ref(),
-                    GitPathRequirementDiscoveryError::RequirerVersionMismatch { .. }
-                ) =>
-            {
-                Some(Code::PackageIdentityMismatch)
-            }
+            Self::GitPathFetch(error) => Some(git_path_fetch_diagnostic_code(error)),
+            Self::GitPathDiscovery(error) => git_path_discovery_diagnostic_code(error),
             Self::GitContract(error) => error.diagnostic_code(),
             Self::MissingRootDirectory
             | Self::MissingFinalSourceSnapshot
-            | Self::LocalPathIndex(_)
-            | Self::LocalDirectoryIndex(_)
-            | Self::GitPathFetch(_)
-            | Self::GitPathDiscovery(_)
             | Self::LocalContract(_)
             | Self::ResolverContext(_) => None,
         }
@@ -600,23 +583,7 @@ impl MixedSourceFinalReloadError {
     /// local absolute paths.
     pub fn diagnostic_message(&self) -> Option<String> {
         let message = match self {
-            Self::LocalDirectoryIndex(error) => {
-                let LocalPackageDirectoryIndexError::PackageVersionMismatch {
-                    expected,
-                    found_package,
-                    found_version,
-                } = error.as_ref()
-                else {
-                    return None;
-                };
-                format!(
-                    "expected {}@{}, found {}@{}",
-                    expected.package(),
-                    expected.version(),
-                    found_package,
-                    found_version
-                )
-            }
+            Self::LocalDirectoryIndex(error) => local_directory_index_diagnostic_message(error)?,
             Self::LocalContract(error) => {
                 let LocalPackageContractLoadError::PackageVersionMismatch { expected, found } =
                     error.as_ref()
@@ -631,20 +598,7 @@ impl MixedSourceFinalReloadError {
                     found.version()
                 )
             }
-            Self::GitPathDiscovery(error) => {
-                let GitPathRequirementDiscoveryError::RequirerVersionMismatch { expected, found } =
-                    error.as_ref()
-                else {
-                    return None;
-                };
-                format!(
-                    "final Git package declares {}@{}, expected {}@{}",
-                    found.package(),
-                    found.version(),
-                    expected.package(),
-                    expected.version()
-                )
-            }
+            Self::GitPathDiscovery(error) => git_path_discovery_diagnostic_message(error)?,
             Self::GitContract(error) => match error.as_ref() {
                 GitRemoteReleaseContractError::ReleaseTagVersionMismatch {
                     expected,
@@ -667,13 +621,390 @@ impl MixedSourceFinalReloadError {
                 }
                 GitRemoteReleaseContractError::InvalidContract(_) => return None,
             },
+            Self::LocalPathIndex(error) => local_path_index_diagnostic_message(error)?,
+            Self::GitPathFetch(error) => git_path_fetch_diagnostic_message(error),
             Self::MissingRootDirectory
             | Self::MissingFinalSourceSnapshot
-            | Self::LocalPathIndex(_)
-            | Self::GitPathFetch(_)
             | Self::ResolverContext(_) => return None,
         };
         self.diagnostic_code().map(|_| message)
+    }
+}
+
+fn local_directory_index_diagnostic_code(
+    error: &LocalPackageDirectoryIndexError,
+) -> Option<sai_diagnostics::Code> {
+    use sai_diagnostics::Code;
+
+    match error {
+        LocalPackageDirectoryIndexError::PackageVersionMismatch { .. } => {
+            Some(Code::PackageIdentityMismatch)
+        }
+        LocalPackageDirectoryIndexError::ConflictingDirectories(_) => {
+            Some(Code::ConflictingPathSources)
+        }
+        LocalPackageDirectoryIndexError::InvalidManifest(_)
+        | LocalPackageDirectoryIndexError::MissingPackageHeader(_)
+        | LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory { .. } => None,
+    }
+}
+
+fn local_directory_index_diagnostic_message(
+    error: &LocalPackageDirectoryIndexError,
+) -> Option<String> {
+    match error {
+        LocalPackageDirectoryIndexError::PackageVersionMismatch {
+            expected,
+            found_package,
+            found_version,
+        } => Some(format!(
+            "expected {}@{}, found {}@{}",
+            expected.package(),
+            expected.version(),
+            found_package,
+            found_version
+        )),
+        LocalPackageDirectoryIndexError::ConflictingDirectories(_) => {
+            Some("multiple local directories provide the same final path package".to_owned())
+        }
+        LocalPackageDirectoryIndexError::InvalidManifest(_)
+        | LocalPackageDirectoryIndexError::MissingPackageHeader(_)
+        | LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory { .. } => None,
+    }
+}
+
+fn local_path_index_diagnostic_code(
+    error: &LocalPackagePathIndexError,
+) -> Option<sai_diagnostics::Code> {
+    use sai_diagnostics::Code;
+
+    match error {
+        LocalPackagePathIndexError::InvalidPath(error) => Some(match error {
+            PackagePathError::InvalidPackagePath => Code::InvalidPackagePath,
+            PackagePathError::PathEscapesRepository => Code::PathEscapesRepository,
+        }),
+        LocalPackagePathIndexError::Directory(error) => local_package_error_diagnostic_code(error),
+        LocalPackagePathIndexError::Index(error) => local_directory_index_diagnostic_code(error),
+        LocalPackagePathIndexError::PathDiscovery { error, .. }
+        | LocalPackagePathIndexError::PathRequirementDiscovery { error, .. } => {
+            local_path_index_diagnostic_code(error)
+        }
+        LocalPackagePathIndexError::AmbiguousRequirerRole(_)
+        | LocalPackagePathIndexError::InvalidManifest(_)
+        | LocalPackagePathIndexError::MissingPackageHeader(_)
+        | LocalPackagePathIndexError::InvalidPackageIdentity(_)
+        | LocalPackagePathIndexError::InvalidRootManifest(_)
+        | LocalPackagePathIndexError::MissingRootPackageHeader(_)
+        | LocalPackagePathIndexError::InvalidRootPackageIdentity(_)
+        | LocalPackagePathIndexError::MissingBaseDirectory(_)
+        | LocalPackagePathIndexError::MissingRootDirectory(_)
+        | LocalPackagePathIndexError::RootManifestSnapshotMismatch(_)
+        | LocalPackagePathIndexError::MissingRootTargets(_)
+        | LocalPackagePathIndexError::DependencyPathRequirementBaseIsRoot(_)
+        | LocalPackagePathIndexError::DuplicateRootPathOverride { .. }
+        | LocalPackagePathIndexError::RootPathOverrideIdentityMismatch { .. } => None,
+    }
+}
+
+fn local_path_index_diagnostic_message(error: &LocalPackagePathIndexError) -> Option<String> {
+    match error {
+        LocalPackagePathIndexError::InvalidPath(PackagePathError::InvalidPackagePath) => {
+            Some("the final source contains an invalid local package path".to_owned())
+        }
+        LocalPackagePathIndexError::InvalidPath(PackagePathError::PathEscapesRepository) => {
+            Some("the final local package path escapes its allowed root".to_owned())
+        }
+        LocalPackagePathIndexError::Directory(error) => {
+            local_package_error_diagnostic_message(error)
+        }
+        LocalPackagePathIndexError::Index(error) => local_directory_index_diagnostic_message(error),
+        LocalPackagePathIndexError::PathDiscovery { error, .. }
+        | LocalPackagePathIndexError::PathRequirementDiscovery { error, .. } => {
+            local_path_index_diagnostic_message(error)
+        }
+        LocalPackagePathIndexError::AmbiguousRequirerRole(_)
+        | LocalPackagePathIndexError::InvalidManifest(_)
+        | LocalPackagePathIndexError::MissingPackageHeader(_)
+        | LocalPackagePathIndexError::InvalidPackageIdentity(_)
+        | LocalPackagePathIndexError::InvalidRootManifest(_)
+        | LocalPackagePathIndexError::MissingRootPackageHeader(_)
+        | LocalPackagePathIndexError::InvalidRootPackageIdentity(_)
+        | LocalPackagePathIndexError::MissingBaseDirectory(_)
+        | LocalPackagePathIndexError::MissingRootDirectory(_)
+        | LocalPackagePathIndexError::RootManifestSnapshotMismatch(_)
+        | LocalPackagePathIndexError::MissingRootTargets(_)
+        | LocalPackagePathIndexError::DependencyPathRequirementBaseIsRoot(_)
+        | LocalPackagePathIndexError::DuplicateRootPathOverride { .. }
+        | LocalPackagePathIndexError::RootPathOverrideIdentityMismatch { .. } => None,
+    }
+}
+
+fn local_package_error_diagnostic_code(error: &LocalPackageError) -> Option<sai_diagnostics::Code> {
+    use sai_diagnostics::Code;
+
+    match error {
+        LocalPackageError::MissingManifest
+        | LocalPackageError::ManifestNotFile
+        | LocalPackageError::NotDirectory
+        | LocalPackageError::Io {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        } => Some(Code::PathPackageNotFound),
+        LocalPackageError::ManifestTooLarge => Some(Code::PackageTooLarge),
+        LocalPackageError::RelativeDirectory
+        | LocalPackageError::Io { .. }
+        | LocalPackageError::DirectoryChanged
+        | LocalPackageError::PlatformNotSupported => None,
+    }
+}
+
+fn local_package_error_diagnostic_message(error: &LocalPackageError) -> Option<String> {
+    match error {
+        LocalPackageError::MissingManifest
+        | LocalPackageError::ManifestNotFile
+        | LocalPackageError::NotDirectory
+        | LocalPackageError::Io {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        } => Some("a local package required by the final source was not found".to_owned()),
+        LocalPackageError::ManifestTooLarge => {
+            Some("a local package manifest exceeds the supported size limit".to_owned())
+        }
+        LocalPackageError::RelativeDirectory
+        | LocalPackageError::Io { .. }
+        | LocalPackageError::DirectoryChanged
+        | LocalPackageError::PlatformNotSupported => None,
+    }
+}
+
+fn git_path_discovery_diagnostic_code(
+    error: &GitPathRequirementDiscoveryError<GitRemoteReleaseFetchError>,
+) -> Option<sai_diagnostics::Code> {
+    use sai_diagnostics::Code;
+
+    match error {
+        GitPathRequirementDiscoveryError::RequirerVersionMismatch { .. } => {
+            Some(Code::PackageIdentityMismatch)
+        }
+        GitPathRequirementDiscoveryError::DependencyPath { error, .. } => {
+            Some(error.diagnostic_code())
+        }
+        GitPathRequirementDiscoveryError::FetchSibling { source, .. } => {
+            Some(git_path_fetch_diagnostic_code(source))
+        }
+        GitPathRequirementDiscoveryError::SiblingSourceIdentityMismatch { .. } => {
+            Some(Code::FetchFailed)
+        }
+        GitPathRequirementDiscoveryError::SiblingIdentityMismatch { .. } => {
+            Some(Code::PackageIdentityMismatch)
+        }
+        GitPathRequirementDiscoveryError::InvalidRequirerManifest(_)
+        | GitPathRequirementDiscoveryError::MissingRequirerHeader(_)
+        | GitPathRequirementDiscoveryError::InvalidRequirerIdentity { .. }
+        | GitPathRequirementDiscoveryError::RootContextMismatch { .. }
+        | GitPathRequirementDiscoveryError::InvalidSiblingManifest { .. }
+        | GitPathRequirementDiscoveryError::MissingSiblingHeader { .. }
+        | GitPathRequirementDiscoveryError::InvalidSiblingIdentity { .. } => None,
+    }
+}
+
+fn git_path_fetch_diagnostic_code(error: &GitRemoteReleaseFetchError) -> sai_diagnostics::Code {
+    match error {
+        GitRemoteReleaseFetchError::TagNotFound { .. }
+        | GitRemoteReleaseFetchError::LockedCommitUnavailable { .. }
+        | GitRemoteReleaseFetchError::TagMoved { .. }
+        | GitRemoteReleaseFetchError::InvalidTag(_) => sai_diagnostics::Code::FetchFailed,
+        _ => error.diagnostic_code(),
+    }
+}
+
+fn git_path_discovery_diagnostic_message(
+    error: &GitPathRequirementDiscoveryError<GitRemoteReleaseFetchError>,
+) -> Option<String> {
+    match error {
+        GitPathRequirementDiscoveryError::RequirerVersionMismatch { expected, found } => {
+            Some(format!(
+                "final Git package declares {}@{}, expected {}@{}",
+                found.package(),
+                found.version(),
+                expected.package(),
+                expected.version()
+            ))
+        }
+        GitPathRequirementDiscoveryError::DependencyPath {
+            error: GitPackagePathError::InvalidPackagePath,
+            ..
+        } => Some("the final Git source contains an invalid dependency path".to_owned()),
+        GitPathRequirementDiscoveryError::DependencyPath {
+            error: GitPackagePathError::PathEscapesRepository,
+            ..
+        } => Some("the final Git dependency path escapes its repository".to_owned()),
+        GitPathRequirementDiscoveryError::FetchSibling { .. } => Some(
+            "a Git-relative package required by the final source could not be fetched or validated"
+                .to_owned(),
+        ),
+        GitPathRequirementDiscoveryError::SiblingSourceIdentityMismatch { .. } => {
+            Some("the Git path loader returned a different source identity".to_owned())
+        }
+        GitPathRequirementDiscoveryError::SiblingIdentityMismatch {
+            expected, found, ..
+        } => Some(format!(
+            "final Git path package declares {found}, expected {expected}"
+        )),
+        GitPathRequirementDiscoveryError::InvalidRequirerManifest(_)
+        | GitPathRequirementDiscoveryError::MissingRequirerHeader(_)
+        | GitPathRequirementDiscoveryError::InvalidRequirerIdentity { .. }
+        | GitPathRequirementDiscoveryError::RootContextMismatch { .. }
+        | GitPathRequirementDiscoveryError::InvalidSiblingManifest { .. }
+        | GitPathRequirementDiscoveryError::MissingSiblingHeader { .. }
+        | GitPathRequirementDiscoveryError::InvalidSiblingIdentity { .. } => None,
+    }
+}
+
+fn git_path_fetch_diagnostic_message(error: &GitRemoteReleaseFetchError) -> String {
+    match error {
+        GitRemoteReleaseFetchError::PathPackageNotFound => {
+            "a Git-relative package required by the final source was not found".to_owned()
+        }
+        GitRemoteReleaseFetchError::InvalidPackageDirectory
+        | GitRemoteReleaseFetchError::InvalidGitDependencyPath
+        | GitRemoteReleaseFetchError::TagList(
+            crate::git_tags::GitReleaseTagListError::InvalidPackageDirectory,
+        ) => "the final Git package path is invalid".to_owned(),
+        GitRemoteReleaseFetchError::PathEscapesRepository => {
+            "the final Git package path escapes its repository".to_owned()
+        }
+        GitRemoteReleaseFetchError::TransferLimitExceeded { .. }
+        | GitRemoteReleaseFetchError::TagList(
+            crate::git_tags::GitReleaseTagListError::LimitExceeded { .. },
+        )
+        | GitRemoteReleaseFetchError::InvalidTag(
+            crate::git_tree::GitTreeReadError::PackageTooLarge { .. },
+        )
+        | GitRemoteReleaseFetchError::SourceTree(
+            crate::git_tree::GitTreeReadError::PackageTooLarge { .. },
+        ) => "the final Git package exceeds the supported size limit".to_owned(),
+        GitRemoteReleaseFetchError::TagNotFound { .. }
+        | GitRemoteReleaseFetchError::LockedCommitUnavailable { .. }
+        | GitRemoteReleaseFetchError::RepositoryCommitUnavailable { .. } => {
+            "the selected Git package version is no longer available".to_owned()
+        }
+        GitRemoteReleaseFetchError::GitPathSourceIdentityMismatch => {
+            "the Git path loader returned a different source identity".to_owned()
+        }
+        _ => "the selected Git package source could not be fetched or validated".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod final_reload_diagnostic_tests {
+    use super::{
+        MixedSourceFinalReloadError, git_path_discovery_diagnostic_code,
+        git_path_discovery_diagnostic_message, local_path_index_diagnostic_code,
+        local_path_index_diagnostic_message,
+    };
+    use crate::git_path_requirements::GitPathRequirementDiscoveryError;
+    use crate::git_remote::GitRemoteReleaseFetchError;
+    use crate::local_source::{LocalPackageDirectoryIndexError, LocalPackagePathIndexError};
+    use crate::mvs::MvsPackageVersion;
+    use crate::package_path::PackagePathError;
+    use crate::version::Version;
+
+    fn package_version() -> MvsPackageVersion {
+        MvsPackageVersion::new("acme:target", "1.0.0".parse::<Version>().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn final_local_path_failure_is_classified_without_exposing_its_path() {
+        let error = LocalPackagePathIndexError::PathRequirementDiscovery {
+            package: "acme:secret".into(),
+            path: "/private/customer/workspace".into(),
+            requiring_package: package_version(),
+            span: 0..1,
+            error: Box::new(LocalPackagePathIndexError::InvalidPath(
+                PackagePathError::InvalidPackagePath,
+            )),
+        };
+
+        assert_eq!(
+            local_path_index_diagnostic_code(&error),
+            Some(sai_diagnostics::Code::InvalidPackagePath)
+        );
+        let message = local_path_index_diagnostic_message(&error).unwrap();
+        assert_eq!(
+            message,
+            "the final source contains an invalid local package path"
+        );
+        assert!(!message.contains("/private/customer/workspace"));
+        assert!(!message.contains("acme:secret"));
+        assert!(
+            MixedSourceFinalReloadError::LocalPathIndex(Box::new(error))
+                .diagnostic_message()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn git_sibling_fetch_failure_keeps_remote_metadata_out_of_message() {
+        let error = GitPathRequirementDiscoveryError::FetchSibling {
+            path: "private/customer/package".into(),
+            source: Box::new(GitRemoteReleaseFetchError::TagNotFound {
+                name: "refs/tags/acme:private@9.9.9".into(),
+            }),
+        };
+
+        assert_eq!(
+            git_path_discovery_diagnostic_code(&error),
+            Some(sai_diagnostics::Code::FetchFailed)
+        );
+        let message = git_path_discovery_diagnostic_message(&error).unwrap();
+        assert_eq!(
+            message,
+            "a Git-relative package required by the final source could not be fetched or validated"
+        );
+        assert!(!message.contains("private/customer/package"));
+        assert!(!message.contains("refs/tags/"));
+        assert!(!message.contains("9.9.9"));
+    }
+
+    #[test]
+    fn exact_git_path_fetch_does_not_report_release_tag_failures() {
+        let error = MixedSourceFinalReloadError::GitPathFetch(Box::new(
+            GitRemoteReleaseFetchError::TagMoved {
+                name: "refs/tags/acme:private@9.9.9".into(),
+                expected: gix::ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567")
+                    .unwrap(),
+                actual: gix::ObjectId::from_hex(b"89abcdef0123456789abcdef0123456789abcdef")
+                    .unwrap(),
+            },
+        ));
+
+        assert_eq!(
+            error.diagnostic_code(),
+            Some(sai_diagnostics::Code::FetchFailed)
+        );
+        let message = error.diagnostic_message().unwrap();
+        assert_eq!(
+            message,
+            "the selected Git package source could not be fetched or validated"
+        );
+        assert!(!message.contains("refs/tags/"));
+    }
+
+    #[test]
+    fn local_directory_version_conflict_is_not_a_requirement_mismatch() {
+        let error = MixedSourceFinalReloadError::LocalDirectoryIndex(Box::new(
+            LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
+                existing: Box::new(package_version()),
+                discovered: Box::new(
+                    MvsPackageVersion::new("acme:target", "2.0.0".parse::<Version>().unwrap())
+                        .unwrap(),
+                ),
+            },
+        ));
+
+        assert_eq!(error.diagnostic_code(), None);
+        assert_eq!(error.diagnostic_message(), None);
     }
 }
 

@@ -870,11 +870,12 @@ pub fn mixed_source_identity_failure_diagnostics(
     Ok(diagnostics)
 }
 
-/// Builds source-located diagnostics for final reload failures that prove a
-/// selected package's identity or version differs from the MVS selection.
+/// Builds source-located diagnostics for final reload failures that have a
+/// safe, package-level classification independent of final-manifest spans.
 ///
-/// Failures on newly discovered edges inside changed final manifests are
-/// omitted until those manifests have source locations of their own.
+/// Diagnostics point to the original MVS chain or source selection. Failures
+/// whose useful location is inside a changed final manifest are omitted until
+/// that manifest has a retained source snapshot of its own.
 pub fn mixed_source_reload_failure_diagnostics(
     mixed_source: &MixedSourceMvsOutput,
     audit_plan: &MixedSourceFinalAuditPlan,
@@ -948,7 +949,7 @@ pub fn mixed_source_reload_failure_diagnostics(
             source_location.or(chain_location),
         );
         diagnostic.primary_label =
-            "the final source declares a different package identity or version".to_owned();
+            "the selected package's final source could not be reloaded".to_owned();
 
         let mut data = ValueObject::new();
         data.insert(

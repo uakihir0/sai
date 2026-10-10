@@ -1241,6 +1241,132 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mixed_source_reload_diagnostics_report_final_local_path_failures_safely() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root_path = directory.0.join("root");
+        let first_path = directory.0.join("target-first");
+        let final_path = directory.0.join("target-final");
+        for path in [&root_path, &first_path, &final_path] {
+            std::fs::create_dir_all(path.join("src")).unwrap();
+        }
+        let root_manifest = b"package acme:root @ 1.0.0\n\
+                             source \"src\"\n\
+                             targets { wasm32-core }\n\
+                             requires { acme:target @ ^1 from path \"switch\" }\n";
+        let first_manifest = b"package acme:target @ 1.0.0\n\
+                              source \"src\"\n\
+                              targets { wasm32-core }\n";
+        let final_manifest = b"package acme:target @ 1.0.0\n\
+                              source \"src\"\n\
+                              targets { wasm32-core }\n\
+                              requires { acme:secret @ ^1 from path \"missing/private-workspace\" }\n";
+        std::fs::write(root_path.join("sai.package"), root_manifest).unwrap();
+        std::fs::write(root_path.join("src/main.sai"), b"fn main() {}\n").unwrap();
+        std::fs::write(first_path.join("sai.package"), first_manifest).unwrap();
+        std::fs::write(first_path.join("src/main.sai"), b"").unwrap();
+        std::fs::write(final_path.join("sai.package"), final_manifest).unwrap();
+        std::fs::write(final_path.join("src/main.sai"), b"").unwrap();
+        symlink("../target-first", root_path.join("switch")).unwrap();
+
+        let mixed_output = resolve_mixed_source_packages(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("the read-time local source resolves");
+
+        std::fs::remove_file(root_path.join("switch")).unwrap();
+        symlink("../target-final", root_path.join("switch")).unwrap();
+        let audit_plan = mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("the final-source reload failures are retained");
+        assert!(audit_plan.reload_failures().iter().any(|failure| matches!(
+            &failure.error,
+            sai_package::mixed_source::MixedSourceFinalReloadError::LocalPathIndex(error)
+                if matches!(
+                    error.as_ref(),
+                    sai_package::local_source::LocalPackagePathIndexError::PathRequirementDiscovery { .. }
+                )
+        )), "unexpected final reload failures: {:#?}", audit_plan.reload_failures());
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let root_file = database
+            .intern_file_key(FileKey::new("acme:root#1", "sai.package").unwrap())
+            .unwrap();
+        let target_file = database
+            .intern_file_key(FileKey::new("acme:target#1", "sai.package").unwrap())
+            .unwrap();
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(root_file, root_manifest).unwrap()),
+                "sai.package",
+                Some("acme:root@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(target_file, first_manifest).unwrap()),
+                "dep:acme:target@1.0.0/sai.package",
+                Some("acme:target@1.0.0".to_owned()),
+                Some(1),
+            ),
+        ])
+        .expect("the read-time manifests belong to one workspace snapshot");
+        let target_version = mixed_output
+            .provider()
+            .output()
+            .selection()
+            .read_contracts()
+            .keys()
+            .next()
+            .expect("one dependency was loaded")
+            .clone();
+        let diagnostics = database
+            .mixed_source_reload_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &BTreeMap::from([(target_version, target_file)]),
+            )
+            .expect("the reload failure is bound to the original workspace");
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_str(), "PATH_PACKAGE_NOT_FOUND");
+        assert_eq!(
+            diagnostics[0].message,
+            "could not reload selected package acme:target@1.0.0: a local package required by the final source was not found"
+        );
+        assert_eq!(
+            diagnostics[0].primary_label,
+            "the selected package's final source could not be reloaded"
+        );
+        let primary = diagnostics[0]
+            .primary()
+            .expect("original source-selection location");
+        assert_eq!(primary.file.path, "sai.package");
+        assert_eq!(primary.file.package.as_deref(), Some("acme:root@1.0.0"));
+        assert!(
+            diagnostics[0].data.contains_key("requirement_chain"),
+            "the original MVS chain remains attached"
+        );
+        assert!(
+            !diagnostics[0].message.contains("missing/private-workspace"),
+            "final paths are not exposed in diagnostics"
+        );
+    }
+
     #[test]
     fn root_database_updates_inputs_and_rebinds_syntax_and_item_tree() {
         let mut database = RootDatabase::new().expect("root database initializes");
