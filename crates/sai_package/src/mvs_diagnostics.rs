@@ -1,6 +1,6 @@
 //! Diagnostics produced from resolved package-graph facts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::git_remote::GitRemoteReleaseContractError;
@@ -11,8 +11,8 @@ use crate::manifest::{
     RequirementSource, parse_for_role,
 };
 use crate::mixed_source::{
-    MixedSourceFinalAuditPlan, MixedSourceFinalIdentityError, MixedSourceFinalReloadError,
-    MixedSourceMvsOutput,
+    MixedPackageSourceIdentity, MixedSourceFinalAuditPlan, MixedSourceFinalIdentityError,
+    MixedSourceFinalReloadError, MixedSourceMvsOutput,
 };
 use crate::mvs::{
     MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionErrorKind, MvsSelectionOutput,
@@ -26,13 +26,16 @@ use crate::mvs_graph_validation::{
     check_selected_graph, duplicate_package_lines,
 };
 use crate::resolver_contract::{
-    ResolverContractBuildError, ResolverContractEdge, ResolverContractSourceClause,
+    ResolverContractBuildError, ResolverContractComparisonError, ResolverContractEdge,
+    ResolverContractSourceClause,
 };
 use crate::resolver_source::{
     ResolverPackageSource, ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
 };
 use crate::resolver_source_provider::{
-    ResolverFinalContractAudit, ResolverReloadedContractComparison, ResolverSourceIdentityFailure,
+    ResolverFinalContractAudit, ResolverFinalContractAuditFailure,
+    ResolverFinalContractAuditFailureKind, ResolverFinalContractPathResolutionError,
+    ResolverReloadedContractComparison, ResolverSourceIdentityFailure,
     ResolverSourceIdentityFailureKind, ResolverSourceIdentitySide,
 };
 use crate::validation::{
@@ -1473,6 +1476,18 @@ where
         .collect()
 }
 
+fn reportable_final_source_identity_failure(
+    failure: &ResolverSourceIdentityFailure<MixedSourceFinalIdentityError>,
+) -> Option<(Code, String)> {
+    if failure.side != ResolverSourceIdentitySide::Final {
+        return None;
+    }
+    let ResolverSourceIdentityFailureKind::Canonicalization(error) = &failure.error else {
+        return None;
+    };
+    Some((error.diagnostic_code()?, error.diagnostic_message()?))
+}
+
 /// Builds source-located diagnostics for reportable final-source identity
 /// failures. Internal provenance mismatches remain on the audit plan for the
 /// package workflow to handle as compiler errors.
@@ -1484,17 +1499,8 @@ pub fn mixed_source_identity_failure_diagnostics(
     let mut reportable_failures = failures
         .iter()
         .filter_map(|failure| {
-            if failure.side != ResolverSourceIdentitySide::Final {
-                return None;
-            }
-            let ResolverSourceIdentityFailureKind::Canonicalization(error) = &failure.error else {
-                return None;
-            };
-            Some((
-                failure,
-                error.diagnostic_code()?,
-                error.diagnostic_message()?,
-            ))
+            reportable_final_source_identity_failure(failure)
+                .map(|(code, detail)| (failure, code, detail))
         })
         .collect::<Vec<_>>();
     reportable_failures
@@ -1594,6 +1600,7 @@ pub fn mixed_source_reload_failure_diagnostics(
         return Err(MvsDuplicatePackageLineDiagnosticError::MixedSourceAuditLoadMismatch);
     }
     let selection = mixed_source.provider().output().selection();
+    let workspace_member_packages = workspace_member_source_packages(audit_plan, manifests);
     let mut reportable_failures = audit_plan
         .reload_failures()
         .iter()
@@ -1673,9 +1680,58 @@ pub fn mixed_source_reload_failure_diagnostics(
             (!errors.is_empty()).then_some((package_version, errors))
         })
         .collect::<Vec<_>>();
+    let audit = audit_plan.audit();
+    let reportable_identity_packages = audit
+        .source_identities()
+        .failures()
+        .iter()
+        .filter_map(|failure| {
+            reportable_final_source_identity_failure(failure)
+                .map(|_| failure.package_version.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let reportable_reload_packages = reportable_failures
+        .iter()
+        .map(|failure| failure.package_version.clone())
+        .chain(
+            final_syntax_packages
+                .iter()
+                .map(|package| (*package).clone()),
+        )
+        .chain(
+            final_semantic_failures
+                .iter()
+                .map(|(package, _)| (*package).clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    let missing_path_source_identities = audit
+        .comparisons()
+        .iter()
+        .flat_map(|comparison| comparison.paths().failures())
+        .filter_map(|failure| {
+            let ResolverFinalContractPathResolutionError::MissingSourceIdentity(package_version) =
+                failure.error.as_ref()
+            else {
+                return None;
+            };
+            (!reportable_identity_packages.contains(package_version.as_ref())).then_some(())
+        })
+        .count();
+    let unexplained_audit_failures = audit.failures().iter().filter(|failure| {
+        final_contract_audit_failure_is_unexplained(
+            failure,
+            &reportable_reload_packages,
+            &reportable_identity_packages,
+        )
+    });
+    let internal_audit_error = final_contract_audit_internal_error(
+        unexplained_audit_failures,
+        missing_path_source_identities,
+    );
     if reportable_failures.is_empty()
         && final_syntax_packages.is_empty()
         && final_semantic_failures.is_empty()
+        && internal_audit_error.is_none()
     {
         return Ok(Vec::new());
     }
@@ -1950,21 +2006,243 @@ pub fn mixed_source_reload_failure_diagnostics(
         add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
         diagnostics.push(diagnostic);
     }
+    sort_final_source_diagnostics(
+        &mut diagnostics,
+        manifests,
+        &workspace_member_packages,
+        internal_audit_error,
+    );
+    Ok(diagnostics)
+}
+
+fn workspace_member_source_packages(
+    audit_plan: &MixedSourceFinalAuditPlan,
+    manifests: &MvsManifestLocations,
+) -> BTreeSet<String> {
+    let identities = audit_plan.source_identities();
+    let Some(MixedPackageSourceIdentity::Local(root_directory)) =
+        identities.read_source_identities().root_identity()
+    else {
+        return BTreeSet::new();
+    };
+
+    let mut package_identities = identities
+        .read_source_identities()
+        .package_identities()
+        .iter()
+        .map(|(package_version, identity)| (package_version.clone(), identity))
+        .collect::<BTreeMap<_, _>>();
+    for same_identity in identities.same_identity() {
+        package_identities.insert(
+            same_identity.package_version.clone(),
+            &same_identity.identity,
+        );
+    }
+    for reload in identities.reloads() {
+        package_identities.insert(reload.package_version.clone(), &reload.final_identity);
+    }
+
+    package_identities
+        .into_iter()
+        .filter_map(|(package_version, identity)| {
+            let MixedPackageSourceIdentity::Local(directory) = identity else {
+                return None;
+            };
+            (directory.path() != root_directory.path()
+                && directory.path().starts_with(root_directory.path()))
+            .then_some(package_version)
+        })
+        .filter_map(|package_version| {
+            manifests
+                .packages
+                .get(&package_version)
+                .and_then(|manifest| manifest.source.package.clone())
+        })
+        .collect()
+}
+
+fn sort_final_source_diagnostics(
+    diagnostics: &mut Vec<Diagnostic>,
+    manifests: &MvsManifestLocations,
+    workspace_member_packages: &BTreeSet<String>,
+    internal_error: Option<Diagnostic>,
+) {
     diagnostics.sort_by(|left, right| {
         let left_primary = left.primary();
         let right_primary = right.primary();
         left_primary
-            .map(|location| location.file.path.as_str())
-            .cmp(&right_primary.map(|location| location.file.path.as_str()))
+            .is_some()
+            .cmp(&right_primary.is_some())
+            .then_with(|| {
+                final_diagnostic_package_rank(left_primary, manifests, workspace_member_packages)
+                    .cmp(&final_diagnostic_package_rank(
+                        right_primary,
+                        manifests,
+                        workspace_member_packages,
+                    ))
+            })
+            .then_with(|| {
+                final_diagnostic_file_rank(left_primary)
+                    .cmp(&final_diagnostic_file_rank(right_primary))
+            })
+            .then_with(|| {
+                left_primary
+                    .map(|location| location.file.path.as_str())
+                    .cmp(&right_primary.map(|location| location.file.path.as_str()))
+            })
             .then_with(|| {
                 left_primary
                     .map(|location| location.span.range.start())
                     .cmp(&right_primary.map(|location| location.span.range.start()))
             })
-            .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| {
+                left_primary
+                    .map(|location| location.span.range.end())
+                    .cmp(&right_primary.map(|location| location.span.range.end()))
+            })
+            .then_with(|| left.severity.cmp(&right.severity))
+            .then_with(|| left.code.as_str().cmp(right.code.as_str()))
             .then_with(|| left.message.cmp(&right.message))
+            .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
     });
-    Ok(diagnostics)
+    if let Some(internal_error) = internal_error {
+        diagnostics.push(internal_error);
+    }
+}
+
+fn final_diagnostic_package_rank(
+    location: Option<&sai_diagnostics::Location>,
+    manifests: &MvsManifestLocations,
+    workspace_member_packages: &BTreeSet<String>,
+) -> (u8, String) {
+    let Some(location) = location else {
+        return (0, String::new());
+    };
+    let package = location.file.package.as_deref().unwrap_or_default();
+    if manifests
+        .root
+        .as_ref()
+        .is_some_and(|root| root.source.package.as_deref() == Some(package))
+    {
+        (0, String::new())
+    } else if workspace_member_packages.contains(package) {
+        (1, package.to_owned())
+    } else {
+        (2, package.to_owned())
+    }
+}
+
+fn final_diagnostic_file_rank(location: Option<&sai_diagnostics::Location>) -> (u8, String) {
+    let Some(path) = location.map(|location| location.file.path.as_str()) else {
+        return (0, String::new());
+    };
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let rank = match file_name {
+        "sai.package" => 0,
+        "sai.lock" => 1,
+        _ => 2,
+    };
+    (rank, path.to_owned())
+}
+
+fn final_contract_audit_internal_error<'a>(
+    failures: impl IntoIterator<
+        Item = &'a ResolverFinalContractAuditFailure<MixedPackageSourceIdentity>,
+    >,
+    missing_path_source_identities: usize,
+) -> Option<Diagnostic> {
+    let failures = failures.into_iter().collect::<Vec<_>>();
+    if failures.is_empty() && missing_path_source_identities == 0 {
+        return None;
+    }
+
+    let mut categories = failures
+        .iter()
+        .map(|failure| final_contract_audit_failure_name(&failure.error))
+        .collect::<BTreeSet<_>>();
+    if missing_path_source_identities > 0 {
+        categories.insert("missing_path_source_identity");
+    }
+    let finding_count = failures.len() + missing_path_source_identities;
+    let description = format!(
+        "final-source contract audit found {finding_count} internal inconsistencies ({})",
+        categories.into_iter().collect::<Vec<_>>().join(", ")
+    );
+    let panic_message = format!("{description} at {}:{}:{}", file!(), line!(), column!());
+    let mut diagnostic = Diagnostic::new(
+        Code::InternalCompilerError,
+        Severity::Error,
+        format!("internal compiler error: {description}"),
+        None,
+    );
+    let mut data = ValueObject::new();
+    data.insert(
+        "component".to_owned(),
+        Value::String("sai_package".to_owned()),
+    );
+    data.insert("panic_message".to_owned(), Value::String(panic_message));
+    data.insert("query_stack".to_owned(), Value::Array(Vec::new()));
+    data.insert(
+        "compiler_version".to_owned(),
+        Value::String(concat!(env!("CARGO_PKG_VERSION"), "+", env!("SAI_BUILD_ID")).to_owned()),
+    );
+    diagnostic.data = data;
+    Some(diagnostic)
+}
+
+fn final_contract_audit_failure_is_unexplained(
+    failure: &ResolverFinalContractAuditFailure<MixedPackageSourceIdentity>,
+    reportable_reload_packages: &BTreeSet<MvsPackageVersion>,
+    reportable_identity_packages: &BTreeSet<MvsPackageVersion>,
+) -> bool {
+    !matches!(
+        failure.error,
+        ResolverFinalContractAuditFailureKind::MissingReloadedContract
+    ) || (!reportable_reload_packages.contains(&failure.package_version)
+        && !reportable_identity_packages.contains(&failure.package_version))
+}
+
+fn final_contract_audit_failure_name(
+    error: &ResolverFinalContractAuditFailureKind<MixedPackageSourceIdentity>,
+) -> &'static str {
+    match error {
+        ResolverFinalContractAuditFailureKind::MissingReloadedContract => {
+            "missing_reloaded_contract"
+        }
+        ResolverFinalContractAuditFailureKind::UnexpectedReloadedContract => {
+            "unexpected_reloaded_contract"
+        }
+        ResolverFinalContractAuditFailureKind::IdentifiedLoadMismatch => "identified_load_mismatch",
+        ResolverFinalContractAuditFailureKind::ReloadedSourceIdentityMismatch { .. } => {
+            "reloaded_source_identity_mismatch"
+        }
+        ResolverFinalContractAuditFailureKind::MissingIdentityResult => "missing_identity_result",
+        ResolverFinalContractAuditFailureKind::UnexpectedIdentityResult => {
+            "unexpected_identity_result"
+        }
+        ResolverFinalContractAuditFailureKind::IdentityPlanMismatch => "identity_plan_mismatch",
+        ResolverFinalContractAuditFailureKind::ContractComparison(error) => match error.as_ref() {
+            ResolverContractComparisonError::DependencyRoleMismatch { .. } => {
+                "contract_dependency_role_mismatch"
+            }
+            ResolverContractComparisonError::PackageVersionMismatch { .. } => {
+                "contract_package_version_mismatch"
+            }
+            ResolverContractComparisonError::ContractContextMismatch(_) => {
+                "contract_context_mismatch"
+            }
+            ResolverContractComparisonError::ContractMetadataMismatch(_) => {
+                "contract_metadata_mismatch"
+            }
+            ResolverContractComparisonError::RootContextMismatch => {
+                "contract_root_context_mismatch"
+            }
+            ResolverContractComparisonError::InvalidGitUrl { .. } => "contract_invalid_git_url",
+            ResolverContractComparisonError::InvalidGitDirectory { .. } => {
+                "contract_invalid_git_directory"
+            }
+        },
+    }
 }
 
 fn final_package_identity_mismatch_found(
@@ -3806,13 +4084,13 @@ fn location_data(location: &sai_diagnostics::Location) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::ops::Range;
     use std::sync::Arc;
 
     use sai_diagnostics::{
-        ChildKind, Code, LevelSource, LintLevel, Related, Relation, Severity, TextRange, TextSize,
-        Value, ValueObject,
+        ChildKind, Code, Diagnostic, LevelSource, LintLevel, Location, Related, Relation, Severity,
+        SourceRef, Span, TextRange, TextSize, Value, ValueObject,
     };
     use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
@@ -3820,10 +4098,11 @@ mod tests {
         MAX_FINAL_MANIFEST_SYNTAX_ISSUES, MvsDuplicatePackageLineDiagnosticContext,
         MvsDuplicatePackageLineDiagnosticError, MvsManifestLocation, MvsManifestLocations,
         divergent_sources_diagnostic, duplicate_package_line_diagnostic,
-        duplicate_package_line_diagnostics, final_manifest_semantic_diagnostic,
+        duplicate_package_line_diagnostics, final_contract_audit_failure_is_unexplained,
+        final_contract_audit_internal_error, final_manifest_semantic_diagnostic,
         final_manifest_syntax_issues, mixed_source_identity_failure_diagnostics,
         resolver_source_selection_location, sort_and_deduplicate_reload_failure_diagnostics,
-        version_conflict_diagnostic, version_conflict_diagnostics,
+        sort_final_source_diagnostics, version_conflict_diagnostic, version_conflict_diagnostics,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{
@@ -3840,6 +4119,7 @@ mod tests {
     };
     use crate::resolver_source::select_resolver_source;
     use crate::resolver_source_provider::{
+        ResolverFinalContractAuditFailure, ResolverFinalContractAuditFailureKind,
         ResolverFinalContractPathResolutionError, ResolverReloadedContractComparison,
         ResolverSourceIdentityFailure, ResolverSourceIdentityFailureKind,
         ResolverSourceIdentitySide, ResolverSourceReload,
@@ -4348,6 +4628,234 @@ mod tests {
             );
             assert!(!message.is_empty(), "empty diagnostic for {error:?}");
         }
+    }
+
+    #[test]
+    fn internal_final_contract_audit_failures_use_the_internal_error_record() {
+        let failure = ResolverFinalContractAuditFailure {
+            package_version: package_version("acme:dep", "1.0.0"),
+            read_source: None,
+            final_source: None,
+            error: ResolverFinalContractAuditFailureKind::MissingReloadedContract,
+        };
+        let diagnostic = final_contract_audit_internal_error(&[failure], 1)
+            .expect("inconsistent audit output produces an internal compiler error");
+        assert_eq!(diagnostic.code, Code::InternalCompilerError);
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(diagnostic.primary().is_none());
+        let description = "final-source contract audit found 2 internal inconsistencies (missing_path_source_identity, missing_reloaded_contract)";
+        assert_eq!(
+            diagnostic.message,
+            format!("internal compiler error: {description}")
+        );
+        assert_eq!(
+            diagnostic.data.get("component"),
+            Some(&Value::String("sai_package".to_owned()))
+        );
+        let Some(Value::String(panic_message)) = diagnostic.data.get("panic_message") else {
+            panic!("internal error record has a panic_message string");
+        };
+        let location_prefix = format!("{description} at {}:", file!());
+        let location = panic_message
+            .strip_prefix(&location_prefix)
+            .expect("panic_message includes the description and Rust source location");
+        let mut location_parts = location.split(':');
+        let line = location_parts
+            .next()
+            .expect("panic_message includes a source line");
+        let column = location_parts
+            .next()
+            .expect("panic_message includes a source column");
+        assert!(location_parts.next().is_none());
+        assert!(line.parse::<u32>().is_ok_and(|line| line > 0));
+        assert!(column.parse::<u32>().is_ok_and(|column| column > 0));
+        assert_eq!(
+            diagnostic.data.get("query_stack"),
+            Some(&Value::Array(Vec::new()))
+        );
+        let Some(Value::String(compiler_version)) = diagnostic.data.get("compiler_version") else {
+            panic!("internal error record has a compiler_version string");
+        };
+        let Some((package_version, build_id)) = compiler_version.split_once('+') else {
+            panic!("compiler version includes SemVer build metadata");
+        };
+        assert_eq!(package_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(build_id.len(), 16);
+        assert!(
+            build_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_eq!(diagnostic.data.len(), 4);
+        assert!(
+            final_contract_audit_internal_error(&[], 0).is_none(),
+            "complete audit results do not emit internal errors"
+        );
+    }
+
+    #[test]
+    fn missing_reloaded_contract_is_suppressed_only_by_a_reportable_failure() {
+        let package_version = package_version("acme:dep", "1.0.0");
+        let failure = ResolverFinalContractAuditFailure {
+            package_version: package_version.clone(),
+            read_source: None,
+            final_source: None,
+            error: ResolverFinalContractAuditFailureKind::MissingReloadedContract,
+        };
+        assert!(
+            final_contract_audit_failure_is_unexplained(
+                &failure,
+                &BTreeSet::new(),
+                &BTreeSet::new()
+            ),
+            "an unreportable reload failure must not hide the audit inconsistency"
+        );
+        assert!(
+            !final_contract_audit_failure_is_unexplained(
+                &failure,
+                &BTreeSet::from([package_version.clone()]),
+                &BTreeSet::new()
+            ),
+            "a source-located reload diagnostic explains the missing contract"
+        );
+        assert!(
+            !final_contract_audit_failure_is_unexplained(
+                &failure,
+                &BTreeSet::new(),
+                &BTreeSet::from([package_version])
+            ),
+            "a reportable source-identity diagnostic explains the missing contract"
+        );
+    }
+
+    #[test]
+    fn final_source_diagnostics_follow_location_package_and_span_order() {
+        let root = package_version("acme:root", "1.0.0");
+        let dependency = package_version("acme:aaa-dep", "1.0.0");
+        let workspace_member = package_version("acme:zzz-member", "1.0.0");
+        let manifests = manifests_for(
+            (
+                root.clone(),
+                "package acme:root @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n".to_owned(),
+            ),
+            vec![
+                (
+                    dependency.clone(),
+                    "package acme:aaa-dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n"
+                        .to_owned(),
+                ),
+                (
+                    workspace_member.clone(),
+                    "package acme:zzz-member @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n"
+                        .to_owned(),
+                ),
+            ],
+        );
+        let workspace_member_packages = BTreeSet::from([manifests
+            .packages
+            .get(&workspace_member)
+            .and_then(|manifest| manifest.source.package.clone())
+            .expect("the workspace member manifest has a package identity")]);
+        let diagnostic = |package: &str, path: &str, start: u32, end: u32, value: &str| {
+            let mut diagnostic = Diagnostic::new(
+                Code::PathPackageNotFound,
+                Severity::Error,
+                "same",
+                Some(Location {
+                    file: SourceRef {
+                        path: path.to_owned(),
+                        package: Some(package.to_owned()),
+                        snapshot: None,
+                    },
+                    span: Span::new(
+                        sai_diagnostics::FileId::new(99),
+                        TextRange::new(TextSize::new(start), TextSize::new(end))
+                            .expect("test span is ordered"),
+                    ),
+                }),
+            );
+            diagnostic
+                .data
+                .insert("value".to_owned(), Value::String(value.to_owned()));
+            diagnostic
+        };
+        let mut diagnostics = vec![
+            diagnostic(
+                "acme:aaa-dep@1.0.0",
+                "dep:acme:aaa-dep@1.0.0/sai.package",
+                0,
+                1,
+                "dependency",
+            ),
+            {
+                let mut diagnostic = Diagnostic::new(
+                    Code::PathPackageNotFound,
+                    Severity::Error,
+                    "locationless ordinary diagnostic",
+                    None,
+                );
+                diagnostic
+                    .data
+                    .insert("value".to_owned(), Value::String("unlocated".to_owned()));
+                diagnostic
+            },
+            diagnostic("acme:root@1.0.0", "sai.package", 0, 5, "z"),
+            diagnostic("acme:root@1.0.0", "sai.package", 0, 5, "a"),
+            diagnostic("acme:root@1.0.0", "sai.package", 0, 3, "shorter"),
+            diagnostic(
+                "acme:zzz-member@1.0.0",
+                "dep:acme:zzz-member@1.0.0/sai.package",
+                0,
+                1,
+                "workspace member",
+            ),
+        ];
+
+        sort_final_source_diagnostics(
+            &mut diagnostics,
+            &manifests,
+            &workspace_member_packages,
+            Some(Diagnostic::new(
+                Code::InternalCompilerError,
+                Severity::Error,
+                "internal compiler error",
+                None,
+            )),
+        );
+
+        assert_eq!(
+            diagnostics[0].data.get("value"),
+            Some(&Value::String("unlocated".to_owned())),
+            "locationless ordinary records precede source-located diagnostics"
+        );
+        assert_eq!(
+            diagnostics[1].data.get("value"),
+            Some(&Value::String("shorter".to_owned())),
+            "root package precedes dependencies and the shorter span sorts first"
+        );
+        assert_eq!(
+            diagnostics[2].data.get("value"),
+            Some(&Value::String("a".to_owned())),
+            "the final stable-record tiebreaker distinguishes otherwise equal locations"
+        );
+        assert_eq!(
+            diagnostics[3].data.get("value"),
+            Some(&Value::String("z".to_owned()))
+        );
+        assert_eq!(
+            diagnostics[4].data.get("value"),
+            Some(&Value::String("workspace member".to_owned())),
+            "workspace members precede dependencies even when identity bytes sort later"
+        );
+        assert_eq!(
+            diagnostics[5].data.get("value"),
+            Some(&Value::String("dependency".to_owned()))
+        );
+        assert_eq!(
+            diagnostics[6].code,
+            Code::InternalCompilerError,
+            "the ICE is appended after ordered ordinary diagnostics"
+        );
     }
 
     #[test]

@@ -1205,7 +1205,7 @@ mod tests {
                 &mixed_output,
                 &audit_plan,
                 root_file,
-                &BTreeMap::from([(target_version, target_file)]),
+                &BTreeMap::from([(target_version.clone(), target_file)]),
             )
             .expect("the failure is bound to the original manifest snapshot");
         assert_eq!(diagnostics.len(), 1);
@@ -1223,6 +1223,22 @@ mod tests {
                             Some(sai_diagnostics::Value::Array(steps)) if !steps.is_empty()
                         )
                 ))
+        );
+        let reload_diagnostics = database
+            .mixed_source_reload_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &BTreeMap::from([(target_version, target_file)]),
+            )
+            .expect("the reload audit remains bound to the original manifest snapshot");
+        assert!(
+            reload_diagnostics
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code.as_str() != "INTERNAL_COMPILER_ERROR"),
+            "the missing path identity is explained by the reported identity failure"
         );
     }
 
