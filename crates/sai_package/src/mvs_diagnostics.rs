@@ -42,6 +42,7 @@ pub struct MvsManifestLocation {
     package_version: MvsPackageVersion,
     role: PackageRole,
     workspace_snapshot: sai_diagnostics::WorkspaceSnapshotId,
+    manifest_digest: [u8; 32],
     source_len: usize,
     requirements: BTreeMap<(usize, usize), ManifestRequirement>,
     overrides: BTreeMap<(usize, usize), ManifestOverride>,
@@ -191,6 +192,9 @@ impl MvsManifestLocation {
             package_version: package_version.clone(),
             role,
             workspace_snapshot: snapshot.id(),
+            manifest_digest: *parsed
+                .manifest_digest()
+                .expect("syntax-valid manifest is within the parser size limit"),
             source_len: source_file.raw_bytes().len(),
             requirements,
             overrides,
@@ -201,6 +205,11 @@ impl MvsManifestLocation {
 
     pub fn source(&self) -> &SourceRef {
         &self.source
+    }
+
+    /// SHA-256 digest of the exact manifest bytes in the workspace snapshot.
+    pub const fn manifest_digest(&self) -> &[u8; 32] {
+        &self.manifest_digest
     }
 
     pub const fn file_id(&self) -> sai_diagnostics::FileId {

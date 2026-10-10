@@ -337,10 +337,13 @@ pub struct ResolverRequirement {
 }
 
 /// A validated manifest adapted for MVS and subsequent graph processing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ResolverContract {
     pub mvs: MvsContract,
     role: PackageRole,
+    /// Retained for exact workspace-snapshot provenance checks. Excluded
+    /// from resolver-contract equality; semantic fields below define Eq.
+    manifest_digest: [u8; 32],
     /// Root requirements include test edges. Dependency test requirements are
     /// omitted as required by resolver §2.5.1.
     pub(crate) requirements: Vec<ResolverRequirement>,
@@ -349,9 +352,27 @@ pub struct ResolverContract {
     context_binding: Option<Arc<u8>>,
 }
 
+impl PartialEq for ResolverContract {
+    fn eq(&self, other: &Self) -> bool {
+        self.mvs == other.mvs
+            && self.role == other.role
+            && self.requirements == other.requirements
+            && self.parse_warnings == other.parse_warnings
+            && self.validation_warnings == other.validation_warnings
+            && self.context_binding == other.context_binding
+    }
+}
+
+impl Eq for ResolverContract {}
+
 impl ResolverContract {
     pub const fn role(&self) -> PackageRole {
         self.role
+    }
+
+    /// SHA-256 digest of the exact manifest bytes adapted into this contract.
+    pub const fn manifest_digest(&self) -> &[u8; 32] {
+        &self.manifest_digest
     }
 
     pub fn requirements(&self) -> &[ResolverRequirement] {
@@ -1202,6 +1223,9 @@ pub fn build_resolver_contract(
     Ok(ResolverContract {
         mvs,
         role: parsed.role(),
+        manifest_digest: *parsed
+            .manifest_digest()
+            .expect("validated manifest is within the parser size limit"),
         requirements,
         parse_warnings: parsed.warnings().to_vec(),
         validation_warnings: validation.warnings,
@@ -1398,6 +1422,51 @@ mod tests {
             sibling_version.version()
         );
         assert!(context.path_packages().is_empty());
+    }
+
+    #[test]
+    fn resolver_contract_equality_ignores_non_contract_manifest_text() {
+        let root = parse(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let first_manifest = parse_for_role(
+            b"package acme:dependency @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              description \"first wording\"\n",
+            PackageRole::Dependency,
+        );
+        let second_manifest = parse_for_role(
+            b"package acme:dependency @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              description \"different wording\"\n",
+            PackageRole::Dependency,
+        );
+
+        let first_contract = build_resolver_contract(
+            &first_manifest,
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("first contract is valid");
+        let second_contract = build_resolver_contract(
+            &second_manifest,
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("second contract is valid");
+
+        assert_ne!(
+            first_contract.manifest_digest(),
+            second_contract.manifest_digest()
+        );
+        assert_eq!(first_contract, second_contract);
     }
 
     #[test]

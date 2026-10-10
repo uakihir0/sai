@@ -418,6 +418,14 @@ impl<K, E> ResolverSourceIdentityPlan<K, E> {
         &self.read_source_identities
     }
 
+    /// Returns whether this identity plan was created from the given load.
+    pub fn belongs_to(&self, loaded: &ResolverSourceProviderIdentifiedOutput<K>) -> bool {
+        matches!(
+            (self.load_token.as_ref(), loaded.output.load_token.as_ref()),
+            (Some(planned), Some(actual)) if planned == actual
+        )
+    }
+
     pub fn same_identity(&self) -> &[ResolverSameSourceIdentity<K>] {
         &self.same_identity
     }

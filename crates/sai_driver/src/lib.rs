@@ -5,12 +5,13 @@ use sai_hir::item_tree::ItemTree;
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
 use sai_package::manifest::PackageRole;
+use sai_package::mixed_source::{MixedSourceFinalAuditPlan, MixedSourceMvsOutput};
 use sai_package::mvs::{MvsPackageVersion, MvsSelectionOutput};
 use sai_package::mvs_diagnostics::{
     MvsDuplicatePackageLineDiagnosticContext, MvsDuplicatePackageLineDiagnosticError,
     MvsManifestLocation, MvsManifestLocations, dependency_cycle_diagnostics,
-    duplicate_package_line_diagnostics, root_dependency_cycle_diagnostics,
-    version_conflict_diagnostics,
+    divergent_sources_diagnostics, duplicate_package_line_diagnostics,
+    root_dependency_cycle_diagnostics, version_conflict_diagnostics,
 };
 use sai_query::{Durability, QueryDatabase, QueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
@@ -54,6 +55,8 @@ pub enum RootDatabaseError {
     PackageDiagnostics(MvsDuplicatePackageLineDiagnosticError),
     MissingPackageManifest(MvsPackageVersion),
     UnexpectedPackageManifest(MvsPackageVersion),
+    MixedSourceAuditLoadMismatch,
+    MixedSourceManifestContractMismatch(MvsPackageVersion),
     PackageManifestFileKeyMismatch {
         file_id: FileId,
         expected_package_key: String,
@@ -504,6 +507,71 @@ impl RootDatabase {
         Ok(diagnostics)
     }
 
+    /// Builds source-bound `DIVERGENT_SOURCES` diagnostics for a mixed-source audit.
+    ///
+    /// This shares the manifest binding checks used by [`Self::mvs_graph_diagnostics`].
+    /// The manifest map must include every dependency contract visited during
+    /// MVS, including unselected candidates whose edges contributed source
+    /// choices. Pass the audit plan returned by `mixed_source`; reload and
+    /// identity failures remain available on that plan for the package-loading
+    /// caller to report. The audit plan must come from the same MVS load, and
+    /// the workspace manifest parses must match the contracts used by that
+    /// load.
+    pub fn mixed_source_divergent_diagnostics(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        mixed_source: &MixedSourceMvsOutput,
+        audit_plan: &MixedSourceFinalAuditPlan,
+        root_manifest_file: FileId,
+        dependency_manifest_files: &BTreeMap<MvsPackageVersion, FileId>,
+    ) -> Result<Vec<Diagnostic>, RootDatabaseError> {
+        if !audit_plan.belongs_to(mixed_source) {
+            return Err(RootDatabaseError::MixedSourceAuditLoadMismatch);
+        }
+        let selection = mixed_source.provider().output().selection();
+        let manifests = self.mvs_manifest_locations(
+            snapshot,
+            selection,
+            root_manifest_file,
+            dependency_manifest_files,
+        )?;
+        let provider = mixed_source.provider().output();
+        if manifests.root().is_none_or(|manifest| {
+            manifest.manifest_digest() != provider.root_contract().manifest_digest()
+        }) {
+            return Err(RootDatabaseError::MixedSourceManifestContractMismatch(
+                selection.root().clone(),
+            ));
+        }
+        if manifests.packages().len() != provider.dependency_contracts().len() {
+            let package_version = selection
+                .read_contracts()
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| selection.root().clone());
+            return Err(RootDatabaseError::MixedSourceManifestContractMismatch(
+                package_version,
+            ));
+        }
+        for (package_version, manifest) in manifests.packages() {
+            let Some(contract) = provider.dependency_contracts().get(package_version) else {
+                return Err(RootDatabaseError::MixedSourceManifestContractMismatch(
+                    package_version.clone(),
+                ));
+            };
+            if manifest.manifest_digest() != contract.manifest_digest() {
+                return Err(RootDatabaseError::MixedSourceManifestContractMismatch(
+                    package_version.clone(),
+                ));
+            }
+        }
+        Ok(divergent_sources_diagnostics(
+            &audit_plan.audit(),
+            &manifests,
+        )?)
+    }
+
     fn mvs_manifest_locations(
         &self,
         snapshot: &WorkspaceSnapshot,
@@ -576,10 +644,32 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use sai_package::local_source::LocalPackageDirectory;
+    use sai_package::mixed_source::resolve_mixed_source_packages;
     use sai_package::mvs::{MvsContract, MvsEdge, MvsPackageVersion, select};
+    use sai_package::validation::PackageValidationContext;
     use sai_package::version::Version;
     use sai_package::version_req::VersionReq;
     use sai_vfs::{PackageRelativePath, SnapshotFile, SourceFile, WorkspaceSnapshot};
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("sai-driver-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("test directory is created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn snapshot(file_id: FileId, contents: &[u8], version: u64) -> WorkspaceSnapshot {
         WorkspaceSnapshot::new([SnapshotFile::new(
@@ -589,6 +679,246 @@ mod tests {
             Some(version),
         )])
         .expect("workspace snapshot is valid")
+    }
+
+    #[test]
+    fn mixed_source_divergent_diagnostics_bind_audits_to_the_workspace() {
+        let directory = TestDirectory::new();
+        let root_path = directory.0.join("root");
+        std::fs::create_dir_all(root_path.join("src")).unwrap();
+        let root_manifest = b"package acme:app @ 1.0.0\n\
+                             source \"src\"\n\
+                             targets { wasm32-core }\n";
+        std::fs::write(root_path.join("sai.package"), root_manifest).unwrap();
+        std::fs::write(root_path.join("src/main.sai"), b"fn main() {}\n").unwrap();
+
+        let mixed_output = resolve_mixed_source_packages(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("root package resolves without dependencies");
+        let audit_plan = mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("the final source audit plan is complete");
+        assert!(audit_plan.is_equivalent());
+        let other_mixed_output = resolve_mixed_source_packages(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("the same package can be loaded in an independent resolver run");
+        let other_audit_plan = other_mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("the second source audit plan is complete");
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let root_file = database
+            .intern_file_key(FileKey::new("acme:app#1", "sai.package").expect("file key is valid"))
+            .expect("root manifest key is interned");
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::decode(root_file, root_manifest).unwrap()),
+            "sai.package",
+            Some("acme:app@1.0.0".to_owned()),
+            Some(1),
+        )])
+        .expect("root manifest snapshot is valid");
+        let diagnostics = database
+            .mixed_source_divergent_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &BTreeMap::new(),
+            )
+            .expect("the source audit binds to the same workspace snapshot");
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            database.mixed_source_divergent_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &other_audit_plan,
+                root_file,
+                &BTreeMap::new(),
+            ),
+            Err(RootDatabaseError::MixedSourceAuditLoadMismatch)
+        );
+
+        let mut stale_manifest = root_manifest.to_vec();
+        stale_manifest.extend_from_slice(b"requires { acme:unseen @ ^1 }\n");
+        let stale_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::decode(root_file, &stale_manifest).unwrap()),
+            "sai.package",
+            Some("acme:app@1.0.0".to_owned()),
+            Some(2),
+        )])
+        .expect("stale but syntactically valid manifest snapshot is valid");
+        assert_eq!(
+            database.mixed_source_divergent_diagnostics(
+                &stale_snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &BTreeMap::new(),
+            ),
+            Err(RootDatabaseError::MixedSourceManifestContractMismatch(
+                mixed_output.provider().output().selection().root().clone(),
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_source_divergent_diagnostics_report_a_matching_changed_local_source() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root_path = directory.0.join("root");
+        let first_path = directory.0.join("target-first");
+        let final_path = directory.0.join("target-final");
+        for path in [&root_path, &first_path, &final_path] {
+            std::fs::create_dir_all(path.join("src")).unwrap();
+        }
+        let root_manifest = b"package acme:root @ 1.0.0\n\
+                             source \"src\"\n\
+                             targets { wasm32-core }\n\
+                             requires { acme:target @ ^1 from path \"switch\" }\n";
+        let first_manifest = b"package acme:target @ 1.0.0\n\
+                              source \"src\"\n\
+                              targets { wasm32-core }\n";
+        let final_manifest = b"package acme:target @ 1.0.0\n\
+                              source \"src\"\n\
+                              targets { wasm32-core }\n\
+                              requires { acme:leaf @ ^1 from path \"leaf\" }\n";
+        std::fs::write(root_path.join("sai.package"), root_manifest).unwrap();
+        std::fs::write(root_path.join("src/main.sai"), b"fn main() {}\n").unwrap();
+        std::fs::write(first_path.join("sai.package"), first_manifest).unwrap();
+        std::fs::write(first_path.join("src/main.sai"), b"").unwrap();
+        std::fs::write(final_path.join("sai.package"), final_manifest).unwrap();
+        std::fs::write(final_path.join("src/main.sai"), b"").unwrap();
+        std::fs::create_dir_all(final_path.join("leaf/src")).unwrap();
+        std::fs::write(
+            final_path.join("leaf/sai.package"),
+            b"package acme:leaf @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .unwrap();
+        std::fs::write(final_path.join("leaf/src/main.sai"), b"").unwrap();
+        symlink("../target-first", root_path.join("switch")).unwrap();
+
+        let mixed_output = resolve_mixed_source_packages(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("the initial local source resolves");
+
+        std::fs::remove_file(root_path.join("switch")).unwrap();
+        symlink("../target-final", root_path.join("switch")).unwrap();
+        let audit_plan = mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("the changed local source is reloaded and audited");
+        assert!(audit_plan.audit().is_complete());
+        assert!(audit_plan.audit().has_divergent_sources());
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let root_file = database
+            .intern_file_key(FileKey::new("acme:root#1", "sai.package").unwrap())
+            .unwrap();
+        let target_file = database
+            .intern_file_key(FileKey::new("acme:target#1", "sai.package").unwrap())
+            .unwrap();
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(root_file, root_manifest).unwrap()),
+                "sai.package",
+                Some("acme:root@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(target_file, first_manifest).unwrap()),
+                "dep:acme:target@1.0.0/sai.package",
+                Some("acme:target@1.0.0".to_owned()),
+                Some(1),
+            ),
+        ])
+        .expect("the read-time manifests belong to one workspace snapshot");
+        let target_version = mixed_output
+            .provider()
+            .output()
+            .selection()
+            .read_contracts()
+            .keys()
+            .next()
+            .expect("one dependency was loaded")
+            .clone();
+        let dependency_manifest_files = BTreeMap::from([(target_version.clone(), target_file)]);
+        let diagnostics = database
+            .mixed_source_divergent_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &dependency_manifest_files,
+            )
+            .expect("the matching audit is bound to the snapshot contracts");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_str(), "DIVERGENT_SOURCES");
+
+        let mut stale_target_manifest = first_manifest.to_vec();
+        stale_target_manifest.extend_from_slice(b"requires { acme:other @ ^1 }\n");
+        let stale_snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(root_file, root_manifest).unwrap()),
+                "sai.package",
+                Some("acme:root@1.0.0".to_owned()),
+                Some(2),
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(target_file, &stale_target_manifest).unwrap()),
+                "dep:acme:target@1.0.0/sai.package",
+                Some("acme:target@1.0.0".to_owned()),
+                Some(2),
+            ),
+        ])
+        .expect("stale dependency manifest remains a valid snapshot");
+        assert_eq!(
+            database.mixed_source_divergent_diagnostics(
+                &stale_snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &dependency_manifest_files,
+            ),
+            Err(RootDatabaseError::MixedSourceManifestContractMismatch(
+                target_version,
+            ))
+        );
     }
 
     #[test]

@@ -533,6 +533,11 @@ pub struct MixedSourceFinalAuditPlan {
 }
 
 impl MixedSourceFinalAuditPlan {
+    /// Returns whether this audit plan belongs to the supplied MVS load.
+    pub fn belongs_to(&self, mixed_source: &MixedSourceMvsOutput) -> bool {
+        self.source_identities.belongs_to(&mixed_source.provider)
+    }
+
     pub const fn final_sources(&self) -> &ResolverFinalSourcePlan {
         &self.final_sources
     }

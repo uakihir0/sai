@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+use sha2::{Digest, Sha256};
+
 use crate::identity::{PackageIdentity, PackageIdentityError};
 use crate::lexer::{
     PackageLexError, PackageLexErrorKind, PackagePunctuator, PackageToken, PackageTokenKind,
@@ -191,9 +193,10 @@ pub enum PackageParseWarningKind {
 }
 
 /// The syntax tree and diagnostics from parsing one `sai.package` file.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PackageParseOutput {
     pub(crate) file: PackageFile,
+    manifest_digest: Option<[u8; 32]>,
     /// Package-graph role used while parsing, which affects root-only
     /// duplicate diagnostics.
     role: PackageRole,
@@ -202,9 +205,29 @@ pub struct PackageParseOutput {
     pub(crate) warnings: Vec<PackageParseWarning>,
 }
 
+impl PartialEq for PackageParseOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.file == other.file
+            && self.role == other.role
+            && self.lexical_errors == other.lexical_errors
+            && self.errors == other.errors
+            && self.warnings == other.warnings
+    }
+}
+
+impl Eq for PackageParseOutput {}
+
 impl PackageParseOutput {
     pub const fn file(&self) -> &PackageFile {
         &self.file
+    }
+
+    /// SHA-256 digest of the exact manifest bytes supplied to the parser.
+    ///
+    /// The digest is unavailable when the input exceeds the manifest-size
+    /// limit and is rejected before parsing.
+    pub const fn manifest_digest(&self) -> Option<&[u8; 32]> {
+        self.manifest_digest.as_ref()
     }
 
     pub const fn role(&self) -> PackageRole {
@@ -255,6 +278,7 @@ pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
     if source.len() > MAX_PACKAGE_MANIFEST_BYTES {
         return PackageParseOutput {
             file: PackageFile::default(),
+            manifest_digest: None,
             role,
             lexical_errors: Vec::new(),
             errors: vec![PackageParseError {
@@ -265,6 +289,7 @@ pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
         };
     }
 
+    let manifest_digest = Some(Sha256::digest(source).into());
     let lexed = lex(source);
     let mut file = PackageFile {
         trivia: lexed.trivia,
@@ -277,6 +302,7 @@ pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
     {
         return PackageParseOutput {
             file,
+            manifest_digest,
             role,
             lexical_errors,
             errors: Vec::new(),
@@ -290,6 +316,7 @@ pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
     collect_list_diagnostics(&file, role, &mut parser.warnings, &mut parser.errors);
     PackageParseOutput {
         file,
+        manifest_digest,
         role,
         lexical_errors,
         errors: parser.errors,
@@ -1805,6 +1832,15 @@ mod tests {
     }
 
     #[test]
+    fn package_parse_output_equality_ignores_exact_byte_provenance() {
+        let first = parse_for_role(&[0xff], PackageRole::Root);
+        let second = parse_for_role(&[0xfe], PackageRole::Root);
+
+        assert_eq!(first, second);
+        assert_ne!(first.manifest_digest(), second.manifest_digest());
+    }
+
+    #[test]
     fn oversized_manifests_fail_before_lexing_and_return_the_requested_role() {
         let source = vec![0xff; MAX_PACKAGE_MANIFEST_BYTES + 1];
         let parsed = parse_for_role(&source, PackageRole::Dependency);
@@ -1818,6 +1854,7 @@ mod tests {
         );
         assert_eq!(parsed.errors()[0].span, 0..0);
         assert!(!parsed.is_syntax_valid());
+        assert!(parsed.manifest_digest().is_none());
     }
 
     #[test]
