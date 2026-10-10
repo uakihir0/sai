@@ -73,6 +73,39 @@ pub enum LockConflictValidationError {
         side: LockConflictSide,
         package: Box<str>,
     },
+    MissingGitContentMetadata {
+        side: LockConflictSide,
+        package: Box<str>,
+        version: Version,
+    },
+    ConflictingKnownContent(Box<LockConflictContentConflict>),
+}
+
+/// The two inconsistent records for the same package version and Git source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockConflictContentConflict {
+    pub node: MvsNode,
+    pub version: Version,
+    pub source: LockConflictGitSource,
+    pub ours: LockConflictGitContent,
+    pub theirs: LockConflictGitContent,
+}
+
+/// A Git source identity recorded in a lock entry.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct LockConflictGitSource {
+    pub url: Box<str>,
+    /// `None` identifies the repository root; `dir "."` is normalized to it.
+    pub directory: Option<Box<str>>,
+}
+
+/// Content metadata that must agree when both sides record the same Git source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockConflictGitContent {
+    pub commit: Box<str>,
+    pub checksum: Box<str>,
+    pub wit_checksum: Option<Box<str>>,
+    pub artifact_checksums: BTreeMap<Box<str>, Box<str>>,
 }
 
 /// Validated merge inputs and the combined MVS floors from both conflict sides.
@@ -82,6 +115,8 @@ pub struct ValidatedLockConflictSides {
     theirs: LockParseOutput,
     floors: BTreeMap<MvsNode, Version>,
     pinned_nodes: BTreeSet<MvsNode>,
+    known_git_content: BTreeMap<(MvsNode, Version, LockConflictGitSource), LockConflictGitContent>,
+    previous_footprints: BTreeMap<MvsNode, BTreeSet<Box<str>>>,
 }
 
 impl ValidatedLockConflictSides {
@@ -101,6 +136,20 @@ impl ValidatedLockConflictSides {
     /// contract's `use path` overrides.
     pub const fn pinned_nodes(&self) -> &BTreeSet<MvsNode> {
         &self.pinned_nodes
+    }
+
+    /// Known commit and checksum records, keyed by node, exact version, and
+    /// canonical Git source identity.
+    pub const fn known_git_content(
+        &self,
+    ) -> &BTreeMap<(MvsNode, Version, LockConflictGitSource), LockConflictGitContent> {
+        &self.known_git_content
+    }
+
+    /// The union of the recorded capability footprints from both sides,
+    /// including artifact imports, keyed by identity and compatibility line.
+    pub const fn previous_footprints(&self) -> &BTreeMap<MvsNode, BTreeSet<Box<str>>> {
+        &self.previous_footprints
     }
 }
 
@@ -256,23 +305,100 @@ pub fn validate_conflict_sides(
     add_path_pins(LockConflictSide::Theirs, &theirs, &mut pinned_nodes)?;
 
     let mut floors = BTreeMap::new();
+    let mut known_git_content =
+        BTreeMap::<(MvsNode, Version, LockConflictGitSource), LockConflictGitContent>::new();
+    let mut previous_footprints = BTreeMap::<MvsNode, BTreeSet<Box<str>>>::new();
     for (side, parsed) in [
         (LockConflictSide::Ours, &ours),
         (LockConflictSide::Theirs, &theirs),
     ] {
         for package in &parsed.file.packages {
             let node = package_node(side, &package.value.package, &package.value.version)?;
-            if pinned_nodes.contains(&node) {
-                continue;
+            if !pinned_nodes.contains(&node) {
+                floors
+                    .entry(node.clone())
+                    .and_modify(|floor: &mut Version| {
+                        if package.value.version > *floor {
+                            *floor = package.value.version.clone();
+                        }
+                    })
+                    .or_insert_with(|| package.value.version.clone());
             }
-            floors
-                .entry(node)
-                .and_modify(|floor: &mut Version| {
-                    if package.value.version > *floor {
-                        *floor = package.value.version.clone();
+
+            let footprint = previous_footprints.entry(node.clone()).or_default();
+            let mut source_url = None;
+            let mut directory = None;
+            let mut commit = None;
+            let mut checksum = None;
+            let mut wit_checksum = None;
+            let mut artifact_checksums = BTreeMap::new();
+            for field in &package.value.fields {
+                match &field.value {
+                    LockPackageField::Source(LockSource::Git(url)) => {
+                        source_url = Some(url.clone())
                     }
-                })
-                .or_insert_with(|| package.value.version.clone());
+                    LockPackageField::Directory(value) if value.as_ref() != "." => {
+                        directory = Some(value.clone());
+                    }
+                    LockPackageField::Commit(value) => commit = Some(value.clone()),
+                    LockPackageField::Checksum(value) => checksum = Some(value.clone()),
+                    LockPackageField::WitChecksum(value) => wit_checksum = Some(value.clone()),
+                    LockPackageField::Artifact { target, checksum } => {
+                        artifact_checksums.insert(target.clone(), checksum.clone());
+                    }
+                    LockPackageField::Capabilities(capabilities) => {
+                        footprint.extend(
+                            capabilities
+                                .iter()
+                                .map(|capability| capability.value.clone()),
+                        );
+                    }
+                    LockPackageField::Imports { capabilities, .. } => {
+                        footprint.extend(
+                            capabilities
+                                .iter()
+                                .map(|capability| capability.value.clone()),
+                        );
+                    }
+                    LockPackageField::Source(LockSource::Path(_))
+                    | LockPackageField::Directory(_) => {}
+                    LockPackageField::Compiler(_) | LockPackageField::Requires(_) => {}
+                }
+            }
+
+            let Some(url) = source_url else {
+                continue;
+            };
+            let (Some(commit), Some(checksum)) = (commit, checksum) else {
+                return Err(LockConflictValidationError::MissingGitContentMetadata {
+                    side,
+                    package: package.value.package.clone(),
+                    version: package.value.version.clone(),
+                });
+            };
+            let source = LockConflictGitSource { url, directory };
+            let content = LockConflictGitContent {
+                commit,
+                checksum,
+                wit_checksum,
+                artifact_checksums,
+            };
+            let key = (node.clone(), package.value.version.clone(), source.clone());
+            if let Some(ours) = known_git_content.get(&key) {
+                if ours != &content {
+                    return Err(LockConflictValidationError::ConflictingKnownContent(
+                        Box::new(LockConflictContentConflict {
+                            node,
+                            version: package.value.version.clone(),
+                            source,
+                            ours: ours.clone(),
+                            theirs: content,
+                        }),
+                    ));
+                }
+            } else {
+                known_git_content.insert(key, content);
+            }
         }
     }
 
@@ -281,6 +407,8 @@ pub fn validate_conflict_sides(
         theirs,
         floors,
         pinned_nodes,
+        known_git_content,
+        previous_footprints,
     })
 }
 
@@ -607,15 +735,248 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejects_different_content_for_the_same_locked_git_source() {
+        for (ours_commit, ours_checksum, theirs_commit, theirs_checksum) in
+            [('a', 'a', 'b', 'a'), ('a', 'a', 'a', 'b')]
+        {
+            let sides = LockConflictSides {
+                ours: git_lock_with(
+                    "1.4.0",
+                    "https://example.test/dep",
+                    ours_commit,
+                    ours_checksum,
+                    "alloc",
+                    None,
+                    None,
+                    None,
+                    'c',
+                )
+                .into_bytes(),
+                theirs: git_lock_with(
+                    "1.4.0",
+                    "https://example.test/dep",
+                    theirs_commit,
+                    theirs_checksum,
+                    "alloc",
+                    None,
+                    None,
+                    None,
+                    'c',
+                )
+                .into_bytes(),
+            };
+            match validate_conflict_sides(&sides, &BTreeSet::new()).unwrap_err() {
+                LockConflictValidationError::ConflictingKnownContent(conflict) => {
+                    assert_eq!(conflict.source.url.as_ref(), "https://example.test/dep");
+                    assert_eq!(conflict.ours.commit, "a".repeat(40).into_boxed_str());
+                    assert_eq!(
+                        conflict.theirs.commit,
+                        theirs_commit.to_string().repeat(40).into_boxed_str()
+                    );
+                    assert_eq!(
+                        conflict.ours.checksum,
+                        format!("sai1:{}", ours_checksum.to_string().repeat(64)).into_boxed_str()
+                    );
+                    assert_eq!(
+                        conflict.theirs.checksum,
+                        format!("sai1:{}", theirs_checksum.to_string().repeat(64)).into_boxed_str()
+                    );
+                }
+                other => panic!("expected conflicting content, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_wit_or_artifact_checksum_disagreement() {
+        for (ours_wit, theirs_wit, ours_artifact, theirs_artifact) in
+            [('b', 'c', 'd', 'd'), ('b', 'b', 'd', 'e')]
+        {
+            let sides = LockConflictSides {
+                ours: git_lock_with(
+                    "1.4.0",
+                    "https://example.test/dep",
+                    'a',
+                    'a',
+                    "alloc",
+                    None,
+                    Some(ours_wit),
+                    Some("wasi:filesystem"),
+                    ours_artifact,
+                )
+                .into_bytes(),
+                theirs: git_lock_with(
+                    "1.4.0",
+                    "https://example.test/dep",
+                    'a',
+                    'a',
+                    "alloc",
+                    None,
+                    Some(theirs_wit),
+                    Some("wasi:filesystem"),
+                    theirs_artifact,
+                )
+                .into_bytes(),
+            };
+            assert!(matches!(
+                validate_conflict_sides(&sides, &BTreeSet::new()),
+                Err(LockConflictValidationError::ConflictingKnownContent(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn identical_known_git_content_is_reused_once() {
+        let lock = git_lock_with(
+            "1.4.0",
+            "https://example.test/dep",
+            'a',
+            'a',
+            "alloc",
+            Some("."),
+            None,
+            None,
+            'b',
+        );
+        let sides = LockConflictSides {
+            ours: lock.clone().into_bytes(),
+            theirs: lock.into_bytes(),
+        };
+        let merged = validate_conflict_sides(&sides, &BTreeSet::new()).unwrap();
+        assert_eq!(merged.known_git_content().len(), 1);
+    }
+
+    #[test]
+    fn keeps_distinct_sources_for_reuse_and_normalizes_dot_directory() {
+        let sides = LockConflictSides {
+            ours: git_lock_with(
+                "1.4.0",
+                "https://example.test/dep",
+                'a',
+                'a',
+                "alloc",
+                Some("."),
+                None,
+                None,
+                'c',
+            )
+            .into_bytes(),
+            theirs: git_lock_with(
+                "1.4.0",
+                "https://example.test/mirror",
+                'b',
+                'b',
+                "alloc",
+                None,
+                None,
+                None,
+                'c',
+            )
+            .into_bytes(),
+        };
+        let merged = validate_conflict_sides(&sides, &BTreeSet::new()).unwrap();
+        assert_eq!(merged.known_git_content().len(), 2);
+        assert!(
+            merged
+                .known_git_content()
+                .keys()
+                .any(
+                    |(_, _, source)| source.url.as_ref() == "https://example.test/dep"
+                        && source.directory.is_none()
+                )
+        );
+    }
+
+    #[test]
+    fn unions_source_capabilities_and_artifact_imports_by_node() {
+        let sides = LockConflictSides {
+            ours: git_lock_with(
+                "1.2.0",
+                "https://example.test/dep",
+                'a',
+                'a',
+                "alloc",
+                None,
+                None,
+                None,
+                'c',
+            )
+            .into_bytes(),
+            theirs: git_lock_with(
+                "1.4.0",
+                "https://example.test/dep",
+                'b',
+                'b',
+                "alloc",
+                None,
+                Some('e'),
+                Some("wasi:filesystem"),
+                'd',
+            )
+            .into_bytes(),
+        };
+        let merged = validate_conflict_sides(&sides, &BTreeSet::new()).unwrap();
+        let node = MvsNode::new(
+            "acme:dep",
+            Version::parse("1.0.0").unwrap().compatibility_line(),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.previous_footprints().get(&node),
+            Some(&BTreeSet::from([
+                Box::<str>::from("alloc"),
+                Box::<str>::from("wasi:filesystem"),
+            ]))
+        );
+    }
+
     fn semantically_invalid_lock() -> String {
         "lock 1\n\nroot acme:app @ 1.0.0\n".to_string()
     }
 
     fn git_lock(version: &str) -> String {
+        git_lock_with(
+            version,
+            "https://example.test/dep",
+            'a',
+            'a',
+            "",
+            None,
+            None,
+            None,
+            'b',
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn git_lock_with(
+        version: &str,
+        url: &str,
+        commit_byte: char,
+        checksum_byte: char,
+        capabilities: &str,
+        directory: Option<&str>,
+        wit_checksum_byte: Option<char>,
+        imports: Option<&str>,
+        artifact_checksum_byte: char,
+    ) -> String {
+        let directory = directory.map_or_else(String::new, |directory| {
+            format!("    dir \"{directory}\"\n")
+        });
+        let wit = wit_checksum_byte.map_or_else(String::new, |byte| {
+            format!("    wit \"sai1:{}\"\n", byte.to_string().repeat(64))
+        });
+        let artifact = imports.map_or_else(String::new, |imports| {
+            format!(
+                "    artifact wasm32-wasi \"sai1:{}\"\n    imports wasm32-wasi {{ {imports} }}\n",
+                artifact_checksum_byte.to_string().repeat(64)
+            )
+        });
         format!(
-            "lock 1\n\nroot acme:app @ 1.0.0\n    targets {{ wasm32-wasi }}\n    requires acme:dep @ ^1.0 -> {version}\n\npackage acme:dep @ {version}\n    source git \"https://example.test/dep\"\n    commit \"{}\"\n    checksum \"sai1:{}\"\n    compiler ^0.1\n    capabilities {{ }}\n",
-            "a".repeat(40),
-            "a".repeat(64),
+            "lock 1\n\nroot acme:app @ 1.0.0\n    targets {{ wasm32-wasi }}\n    requires acme:dep @ ^1.0 -> {version}\n\npackage acme:dep @ {version}\n    source git \"{url}\"\n{directory}    commit \"{}\"\n    checksum \"sai1:{}\"\n{wit}    compiler ^0.1\n    capabilities {{ {capabilities} }}\n{artifact}",
+            commit_byte.to_string().repeat(40),
+            checksum_byte.to_string().repeat(64),
         )
     }
 
