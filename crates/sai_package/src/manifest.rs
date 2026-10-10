@@ -168,7 +168,7 @@ pub enum PackageParseErrorKind {
     },
     UnknownArtifactKind(Box<str>),
     ExpectedToken(Box<str>),
-    ExpectedListSeparator,
+    ExpectedListSeparator(Vec<Box<str>>),
     ExpectedDeclaration,
     ExpectedProfileItem,
     InvalidPackageIdentity(PackageIdentityError),
@@ -966,7 +966,12 @@ impl<'a> Parser<'a> {
                 self.error_here(PackageParseErrorKind::ExpectedToken("`}`".into()));
                 break;
             }
-            self.error_here(PackageParseErrorKind::ExpectedListSeparator);
+            self.error_here(PackageParseErrorKind::ExpectedListSeparator(
+                match separator {
+                    ListSeparator::LinesOnly => vec!["NEWLINE".into()],
+                    ListSeparator::CommaOrLine => vec![",".into(), "NEWLINE".into()],
+                },
+            ));
             if self.stop_before_declaration(self.position, recovery) {
                 break;
             }
@@ -2056,12 +2061,19 @@ mod tests {
             output
                 .errors
                 .iter()
-                .filter(|error| error.kind == PackageParseErrorKind::ExpectedListSeparator)
+                .filter(|error| {
+                    matches!(error.kind, PackageParseErrorKind::ExpectedListSeparator(_))
+                })
                 .count(),
             2,
             "{:#?}",
             output.errors
         );
+        assert!(output.errors.iter().all(|error| matches!(
+            &error.kind,
+            PackageParseErrorKind::ExpectedListSeparator(expected)
+                if expected.len() == 1 && expected[0].as_ref() == "NEWLINE"
+        )));
     }
 
     #[test]

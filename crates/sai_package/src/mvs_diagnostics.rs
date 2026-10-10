@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use crate::lexer::PackageLexErrorKind;
 use crate::local_source::LocalPackagePathIndexError;
 use crate::manifest::{
-    OverrideSource, PackageDeclaration, PackageParseError, PackageRole, RequirementSource,
-    parse_for_role,
+    OverrideSource, PackageDeclaration, PackageParseError, PackageParseErrorKind, PackageRole,
+    RequirementSource, parse_for_role,
 };
 use crate::mixed_source::{
     MixedSourceFinalAuditPlan, MixedSourceFinalIdentityError, MixedSourceFinalReloadError,
@@ -41,6 +42,9 @@ use sai_diagnostics::{
     resolve_lint_occurrence,
 };
 
+const MAX_FINAL_MANIFEST_SYNTAX_ISSUES: usize = 32;
+const MAX_FINAL_MANIFEST_SYNTAX_CANDIDATES: usize = (MAX_FINAL_MANIFEST_SYNTAX_ISSUES + 1) * 3;
+
 /// Source identity for one parsed package manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvsManifestLocation {
@@ -52,6 +56,8 @@ pub struct MvsManifestLocation {
     manifest_digest: [u8; 32],
     source_len: usize,
     final_package_header: Option<FinalPackageHeader>,
+    final_manifest_syntax_issues: Vec<FinalManifestSyntaxIssue>,
+    final_manifest_syntax_issues_truncated: bool,
     requirements: BTreeMap<(usize, usize), ManifestRequirement>,
     overrides: BTreeMap<(usize, usize), ManifestOverride>,
     lint_policies: LintPolicies,
@@ -76,6 +82,281 @@ struct FinalPackageHeader {
     package: Box<str>,
     version: Version,
     span: Range<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FinalManifestSyntaxIssue {
+    code: Code,
+    message: String,
+    span: Range<usize>,
+    expected_tokens: Option<Vec<String>>,
+}
+
+fn push_bounded_final_manifest_syntax_issue(
+    issues: &mut Vec<FinalManifestSyntaxIssue>,
+    truncated: &mut bool,
+    issue: FinalManifestSyntaxIssue,
+) {
+    if issues.contains(&issue) {
+        return;
+    }
+    if issues.len() == MAX_FINAL_MANIFEST_SYNTAX_CANDIDATES {
+        *truncated = true;
+    } else {
+        issues.push(issue);
+    }
+}
+
+fn expected_tokens_from_description(description: &str) -> Option<Vec<String>> {
+    let alternatives = description
+        .split('`')
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .map(|(_, token)| token.to_owned())
+        .collect::<Vec<_>>();
+    if !alternatives.is_empty() {
+        return Some(alternatives);
+    }
+
+    let alternatives = match description {
+        "version comparator" => vec!["^", "~", "=", ">=", ">", "<=", "<"],
+        "version after comparator" => vec!["INTEGER", "VERSION"],
+        "package identity" | "package path" => vec!["PACKAGE_PATH"],
+        "full package version" => vec!["VERSION"],
+        "size integer" => vec!["INTEGER"],
+        "size unit" | "lint code" => vec!["UPPER_WORD"],
+        "path string" | "repository directory" | "string" => vec!["STRING"],
+        "capability name" => vec!["WORD", "PACKAGE_PATH"],
+        "word" => vec!["WORD"],
+        "at least one list item" => vec!["LIST_ITEM"],
+        _ => return None,
+    };
+    Some(alternatives.into_iter().map(str::to_owned).collect())
+}
+
+fn final_manifest_syntax_issues(
+    parsed: &crate::manifest::PackageParseOutput,
+    invalid_utf8_spans: &[Range<usize>],
+    invalid_utf8_truncated: bool,
+) -> (Vec<FinalManifestSyntaxIssue>, bool) {
+    let issue_limit = MAX_FINAL_MANIFEST_SYNTAX_ISSUES + 1;
+    let mut issues = Vec::with_capacity(MAX_FINAL_MANIFEST_SYNTAX_CANDIDATES);
+    let mut truncated = false;
+    let lexical_issue_count = parsed
+        .lexical_errors()
+        .iter()
+        .filter(|error| error.kind != PackageLexErrorKind::InvalidUtf8)
+        .count();
+    truncated |= lexical_issue_count > issue_limit;
+    for error in parsed
+        .lexical_errors()
+        .iter()
+        .filter(|error| error.kind != PackageLexErrorKind::InvalidUtf8)
+        .take(issue_limit)
+    {
+        let (code, message) = match error.kind {
+            PackageLexErrorKind::InvalidUtf8 => unreachable!("invalid UTF-8 uses VFS spans"),
+            PackageLexErrorKind::InvalidLineEnding => {
+                ("INVALID_LINE_ENDING", "lone carriage return".to_owned())
+            }
+            PackageLexErrorKind::ForbiddenCharacter => (
+                "FORBIDDEN_CHARACTER",
+                "forbidden character in manifest".to_owned(),
+            ),
+            PackageLexErrorKind::UnexpectedCharacter => (
+                "UNEXPECTED_CHARACTER",
+                "unexpected character in manifest".to_owned(),
+            ),
+            PackageLexErrorKind::UnterminatedComment => {
+                ("UNTERMINATED_COMMENT", "unterminated comment".to_owned())
+            }
+            PackageLexErrorKind::UnterminatedString => {
+                ("UNTERMINATED_STRING", "unterminated string".to_owned())
+            }
+            PackageLexErrorKind::InvalidEscape => {
+                ("INVALID_ESCAPE", "invalid string escape".to_owned())
+            }
+            PackageLexErrorKind::UnsupportedStringForm => (
+                "UNSUPPORTED_STRING_FORM",
+                "unsupported string form in manifest".to_owned(),
+            ),
+            PackageLexErrorKind::InvalidVersion => {
+                ("INVALID_VERSION", "invalid package version".to_owned())
+            }
+            PackageLexErrorKind::BuildMetadataNotAllowed => (
+                "BUILD_METADATA_NOT_ALLOWED",
+                "build metadata is not allowed in a package version".to_owned(),
+            ),
+            PackageLexErrorKind::NoSemicolon => (
+                "NO_SEMICOLON",
+                "semicolons are not allowed in manifests".to_owned(),
+            ),
+        };
+        push_bounded_final_manifest_syntax_issue(
+            &mut issues,
+            &mut truncated,
+            FinalManifestSyntaxIssue {
+                code: Code::from_name(code).expect("manifest syntax diagnostic code is registered"),
+                message,
+                span: error.span.clone(),
+                expected_tokens: None,
+            },
+        );
+    }
+    truncated |= invalid_utf8_truncated;
+    for span in invalid_utf8_spans.iter().take(issue_limit) {
+        push_bounded_final_manifest_syntax_issue(
+            &mut issues,
+            &mut truncated,
+            FinalManifestSyntaxIssue {
+                code: Code::InvalidUtf8,
+                message: "manifest is not valid UTF-8".to_owned(),
+                span: span.clone(),
+                expected_tokens: None,
+            },
+        );
+    }
+    truncated |= parsed.errors().len() > issue_limit;
+    for error in parsed.errors().iter().take(issue_limit) {
+        let (code, message, expected_tokens) = match &error.kind {
+            PackageParseErrorKind::MissingPackageDeclaration => (
+                "MISSING_PACKAGE_DECL",
+                "missing `package` declaration".to_owned(),
+                None,
+            ),
+            PackageParseErrorKind::PackageDeclarationNotFirst => (
+                "PACKAGE_DECL_NOT_FIRST",
+                "`package` declaration must be first".to_owned(),
+                None,
+            ),
+            PackageParseErrorKind::DuplicateDeclaration(name) => (
+                "DUPLICATE_DECLARATION",
+                format!("duplicate `{name}` declaration"),
+                None,
+            ),
+            PackageParseErrorKind::UnknownDeclaration { name, .. } => (
+                "UNKNOWN_DECLARATION",
+                format!("unknown package declaration `{name}`"),
+                None,
+            ),
+            PackageParseErrorKind::UnknownArtifactKind(kind) => (
+                "UNKNOWN_ARTIFACT_KIND",
+                format!("unknown artifact kind `{kind}`"),
+                None,
+            ),
+            PackageParseErrorKind::ExpectedToken(token)
+                if token.as_ref() == "newline between declarations" =>
+            {
+                (
+                    "EXPECTED_TOKEN",
+                    "expected a newline between declarations".to_owned(),
+                    Some(vec!["NEWLINE".to_owned()]),
+                )
+            }
+            PackageParseErrorKind::ExpectedToken(token) => (
+                "EXPECTED_TOKEN",
+                format!("expected {token}"),
+                expected_tokens_from_description(token),
+            ),
+            PackageParseErrorKind::ExpectedListSeparator(expected_tokens) => (
+                "EXPECTED_TOKEN",
+                "expected a list separator".to_owned(),
+                Some(expected_tokens.iter().map(ToString::to_string).collect()),
+            ),
+            PackageParseErrorKind::ExpectedDeclaration => (
+                "EXPECTED_TOKEN",
+                "expected a package declaration".to_owned(),
+                Some(
+                    [
+                        "package",
+                        "compiler",
+                        "source",
+                        "wit",
+                        "artifact",
+                        "targets",
+                        "export",
+                        "requires",
+                        "allow",
+                        "deny",
+                        "policy",
+                        "lints",
+                        "profile",
+                        "allocator",
+                        "overrides",
+                        "description",
+                        "license",
+                        "authors",
+                        "repository",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                ),
+            ),
+            PackageParseErrorKind::ExpectedProfileItem => (
+                "EXPECTED_TOKEN",
+                "expected a profile item".to_owned(),
+                Some(vec!["allow".to_owned(), "budget".to_owned()]),
+            ),
+            PackageParseErrorKind::InvalidPackageIdentity(_) => (
+                "INVALID_PACKAGE_NAME",
+                "invalid package identity".to_owned(),
+                None,
+            ),
+            PackageParseErrorKind::InvalidPackageVersion(_) => (
+                "INVALID_VERSION",
+                "invalid package version".to_owned(),
+                None,
+            ),
+            PackageParseErrorKind::InvalidContentPath(_)
+            | PackageParseErrorKind::InvalidDependencyPath(_)
+            | PackageParseErrorKind::InvalidRepositoryDirectory(_) => (
+                "INVALID_PACKAGE_PATH",
+                "invalid package path".to_owned(),
+                None,
+            ),
+            PackageParseErrorKind::ConflictingLintLevel => (
+                "CONFLICTING_LINT_LEVEL",
+                "conflicting lint levels".to_owned(),
+                None,
+            ),
+            PackageParseErrorKind::InvalidVersionRequirement(_) => (
+                "INVALID_VERSION_REQUIREMENT",
+                "invalid version requirement".to_owned(),
+                None,
+            ),
+            PackageParseErrorKind::ManifestTooLarge => (
+                "PACKAGE_TOO_LARGE",
+                "package manifest exceeds the supported size limit".to_owned(),
+                None,
+            ),
+        };
+        push_bounded_final_manifest_syntax_issue(
+            &mut issues,
+            &mut truncated,
+            FinalManifestSyntaxIssue {
+                code: Code::from_name(code).expect("manifest syntax diagnostic code is registered"),
+                message,
+                span: error.span.clone(),
+                expected_tokens,
+            },
+        );
+    }
+    issues.sort_by(|left, right| {
+        left.span
+            .start
+            .cmp(&right.span.start)
+            .then_with(|| left.span.end.cmp(&right.span.end))
+            .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| left.message.cmp(&right.message))
+            .then_with(|| left.expected_tokens.cmp(&right.expected_tokens))
+    });
+    issues.dedup();
+    if issues.len() > MAX_FINAL_MANIFEST_SYNTAX_ISSUES {
+        issues.truncate(MAX_FINAL_MANIFEST_SYNTAX_ISSUES);
+        truncated = true;
+    }
+    (issues, truncated)
 }
 
 impl MvsManifestLocation {
@@ -212,6 +493,8 @@ impl MvsManifestLocation {
                 .expect("syntax-valid manifest is within the parser size limit"),
             source_len: source_file.raw_bytes().len(),
             final_package_header: None,
+            final_manifest_syntax_issues: Vec::new(),
+            final_manifest_syntax_issues_truncated: false,
             requirements,
             overrides,
             lint_policies,
@@ -223,8 +506,8 @@ impl MvsManifestLocation {
     ///
     /// Unlike a read-time MVS manifest, a final source may have changed its
     /// header or contain syntax errors. The caller supplies the exact retained
-    /// bytes and this constructor records only path-requirement spans when the
-    /// final manifest parses successfully.
+    /// bytes; this constructor records the changed header and syntax issues,
+    /// and records path-requirement spans only when parsing succeeds.
     pub fn from_final_snapshot(
         snapshot: &sai_diagnostics::WorkspaceSnapshot,
         file_id: sai_diagnostics::FileId,
@@ -281,6 +564,17 @@ impl MvsManifestLocation {
                 version: header.value.version.clone(),
                 span: header.span.clone(),
             });
+        let issue_limit = MAX_FINAL_MANIFEST_SYNTAX_ISSUES + 1;
+        let invalid_utf8_sequences = source_file.invalid_utf8_sequences();
+        let invalid_utf8_truncated = invalid_utf8_sequences.len() > issue_limit;
+        let invalid_utf8_spans = invalid_utf8_sequences
+            .iter()
+            .take(issue_limit)
+            .filter_map(|sequence| source_file.to_original_range(sequence.decoded_range()))
+            .map(|span| span.start().to_usize()..span.end().to_usize())
+            .collect::<Vec<_>>();
+        let (final_manifest_syntax_issues, final_manifest_syntax_issues_truncated) =
+            final_manifest_syntax_issues(&parsed, &invalid_utf8_spans, invalid_utf8_truncated);
         let mut requirements = BTreeMap::new();
         if parsed.is_syntax_valid() {
             for declaration in &parsed.file().declarations {
@@ -320,6 +614,8 @@ impl MvsManifestLocation {
             manifest_digest,
             source_len: source_file.raw_bytes().len(),
             final_package_header,
+            final_manifest_syntax_issues,
+            final_manifest_syntax_issues_truncated,
             requirements,
             overrides: BTreeMap::new(),
             lint_policies: LintPolicies::default(),
@@ -1142,9 +1438,10 @@ pub fn mixed_source_identity_failure_diagnostics(
 
 /// Builds source-located diagnostics for final reload failures that have a
 /// safe, package-level classification. Local and Git path-requirement failures
-/// point into their retained final manifest, and package identity mismatches
-/// point to the changed final header. The original MVS chain remains bound to
-/// the read-time manifests.
+/// point into their retained final manifest, package identity mismatches point
+/// to the changed final header, and retained lexical/parser errors use their
+/// final-source byte ranges. The original MVS chain remains bound to the
+/// read-time manifests.
 pub fn mixed_source_reload_failure_diagnostics(
     mixed_source: &MixedSourceMvsOutput,
     audit_plan: &MixedSourceFinalAuditPlan,
@@ -1203,13 +1500,113 @@ pub fn mixed_source_reload_failure_diagnostics(
         })
         .collect::<Vec<_>>();
     sort_and_deduplicate_final_reload_failure_diagnostics(&mut reportable_failures);
-    if reportable_failures.is_empty() {
+    let final_syntax_packages = audit_plan
+        .final_manifest_snapshots()
+        .keys()
+        .filter(|package_version| {
+            audit_plan
+                .final_sources()
+                .entries()
+                .iter()
+                .any(|entry| entry.package_version() == *package_version)
+                && manifests
+                    .final_packages
+                    .get(*package_version)
+                    .is_some_and(|manifest| !manifest.final_manifest_syntax_issues.is_empty())
+        })
+        .collect::<Vec<_>>();
+    if reportable_failures.is_empty() && final_syntax_packages.is_empty() {
         return Ok(Vec::new());
     }
     let explanations = explanation_graph_for_mvs_diagnostics(selection)?;
     validate_root_manifest(&explanations, manifests)?;
 
-    let mut diagnostics = Vec::with_capacity(reportable_failures.len());
+    let mut diagnostics = Vec::new();
+    for package_version in final_syntax_packages {
+        let manifest = manifests
+            .final_packages
+            .get(package_version)
+            .expect("syntax-reportable final packages have bound manifests");
+        let chain = explanations
+            .chain_to_package_version(package_version)
+            .map_err(|error| {
+                MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+            })?;
+        for (issue_index, issue) in manifest.final_manifest_syntax_issues.iter().enumerate() {
+            let primary = manifest_span_location(
+                manifest,
+                &MvsRequirer::Package(package_version.clone()),
+                &issue.span,
+            )?;
+            let mut diagnostic = Diagnostic::new(
+                issue.code,
+                Severity::Error,
+                format!(
+                    "could not reload selected package {}@{}: {}",
+                    package_version.package(),
+                    package_version.version(),
+                    issue.message
+                ),
+                Some(primary),
+            );
+            diagnostic.primary_label = issue.message.clone();
+            diagnostic.package = Some(package_version.package().to_owned());
+            let mut data = ValueObject::new();
+            data.insert(
+                "package".to_owned(),
+                Value::String(package_version.package().to_owned()),
+            );
+            data.insert(
+                "version".to_owned(),
+                Value::String(package_version.version().to_string()),
+            );
+            data.insert(
+                "stage".to_owned(),
+                Value::String("final_source_reload".to_owned()),
+            );
+            data.insert(
+                "requirement_chain".to_owned(),
+                requirement_chain_data(&chain, manifests)?,
+            );
+            if let Some(expected_tokens) = &issue.expected_tokens {
+                data.insert(
+                    "expected_tokens".to_owned(),
+                    Value::Array(expected_tokens.iter().cloned().map(Value::String).collect()),
+                );
+            }
+            if manifest.final_manifest_syntax_issues_truncated
+                && issue_index + 1 == manifest.final_manifest_syntax_issues.len()
+            {
+                data.insert(
+                    "additional_syntax_errors_omitted".to_owned(),
+                    Value::Bool(true),
+                );
+            }
+            diagnostic.data = data;
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: "the selected package is reached through:".to_owned(),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+            add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
+            if manifest.final_manifest_syntax_issues_truncated
+                && issue_index + 1 == manifest.final_manifest_syntax_issues.len()
+            {
+                diagnostic
+                    .push_child(Child {
+                        kind: ChildKind::Note,
+                        message: format!(
+                            "additional final manifest syntax errors were omitted after the limit of {MAX_FINAL_MANIFEST_SYNTAX_ISSUES}"
+                        ),
+                        location: None,
+                    })
+                    .expect("a new diagnostic has no snapshot-bound locations");
+            }
+            diagnostics.push(diagnostic);
+        }
+    }
     for failure in reportable_failures {
         let package_version = failure.package_version;
         let detail = failure.detail;
@@ -1314,6 +1711,20 @@ pub fn mixed_source_reload_failure_diagnostics(
         add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
         diagnostics.push(diagnostic);
     }
+    diagnostics.sort_by(|left, right| {
+        let left_primary = left.primary();
+        let right_primary = right.primary();
+        left_primary
+            .map(|location| location.file.path.as_str())
+            .cmp(&right_primary.map(|location| location.file.path.as_str()))
+            .then_with(|| {
+                left_primary
+                    .map(|location| location.span.range.start())
+                    .cmp(&right_primary.map(|location| location.span.range.start()))
+            })
+            .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| left.message.cmp(&right.message))
+    });
     Ok(diagnostics)
 }
 
@@ -3167,9 +3578,10 @@ mod tests {
     use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     use super::{
-        MvsDuplicatePackageLineDiagnosticContext, MvsDuplicatePackageLineDiagnosticError,
-        MvsManifestLocation, MvsManifestLocations, divergent_sources_diagnostic,
-        duplicate_package_line_diagnostic, duplicate_package_line_diagnostics,
+        MAX_FINAL_MANIFEST_SYNTAX_ISSUES, MvsDuplicatePackageLineDiagnosticContext,
+        MvsDuplicatePackageLineDiagnosticError, MvsManifestLocation, MvsManifestLocations,
+        divergent_sources_diagnostic, duplicate_package_line_diagnostic,
+        duplicate_package_line_diagnostics, final_manifest_syntax_issues,
         mixed_source_identity_failure_diagnostics, resolver_source_selection_location,
         sort_and_deduplicate_reload_failure_diagnostics, version_conflict_diagnostic,
         version_conflict_diagnostics,
@@ -3390,6 +3802,181 @@ mod tests {
             ),
             Err(MvsDuplicatePackageLineDiagnosticError::FinalManifestRequirementMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn final_manifest_syntax_issues_preserve_bytes_codes_and_expected_tokens() {
+        let invalid_bytes = [0xff, b'x', 0xfe];
+        let package = package_version("acme:target", "1.0.0");
+        let file_id = sai_diagnostics::FileId::new(72);
+        let invalid_source = Arc::new(
+            SourceFile::decode(file_id, &invalid_bytes)
+                .expect("the VFS retains malformed bytes for diagnostics"),
+        );
+        let invalid_utf8 = parse_for_role(&invalid_bytes, PackageRole::Dependency);
+        let invalid_utf8_spans = invalid_source
+            .invalid_utf8_sequences()
+            .iter()
+            .map(|sequence| {
+                let span = invalid_source
+                    .to_original_range(sequence.decoded_range())
+                    .expect("the malformed byte range maps to its original source");
+                span.start().to_usize()..span.end().to_usize()
+            })
+            .collect::<Vec<_>>();
+        let (issues, truncated) =
+            final_manifest_syntax_issues(&invalid_utf8, &invalid_utf8_spans, false);
+        assert!(!truncated);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].code.as_str(), "INVALID_UTF8");
+        assert_eq!(issues[0].span, 0..1);
+        assert_eq!(issues[1].code.as_str(), "INVALID_UTF8");
+        assert_eq!(issues[1].span, 2..3);
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            invalid_source,
+            MvsManifestLocation::final_snapshot_path(&package, 9),
+            Some("acme:target@1.0.0".to_owned()),
+            None,
+        )])
+        .expect("the malformed final manifest has a canonical synthetic path");
+        let final_manifest = MvsManifestLocation::from_final_snapshot(&snapshot, file_id, &package)
+            .expect("the bounded malformed manifest is retained");
+        let location = super::manifest_span_location(
+            &final_manifest,
+            &MvsRequirer::Package(package),
+            &issues[0].span,
+        )
+        .expect("the invalid byte span belongs to the retained source");
+        assert_eq!(location.span.range.start().to_usize(), 0);
+        assert_eq!(location.span.range.end().to_usize(), 1);
+        assert_eq!(
+            &snapshot
+                .file(file_id)
+                .expect("the final manifest remains in the snapshot")
+                .source()
+                .raw_bytes()
+                [location.span.range.start().to_usize()..location.span.range.end().to_usize()],
+            &[0xff]
+        );
+
+        let missing_newline_bytes =
+            b"package acme:target @ 1.0.0\nsource \"src\" targets { wasm32-core }\n";
+        let missing_newline_source =
+            SourceFile::decode(sai_diagnostics::FileId::new(73), missing_newline_bytes)
+                .expect("the parser fixture fits in a source file");
+        let missing_newline = parse_for_role(missing_newline_bytes, PackageRole::Dependency);
+        let (issues, truncated) = final_manifest_syntax_issues(
+            &missing_newline,
+            &[],
+            missing_newline_source.invalid_utf8_sequences().len()
+                > MAX_FINAL_MANIFEST_SYNTAX_ISSUES + 1,
+        );
+        assert!(!truncated);
+        assert!(issues.iter().any(|issue| {
+            issue.code.as_str() == "EXPECTED_TOKEN"
+                && issue.message == "expected a newline between declarations"
+                && issue.expected_tokens.as_deref() == Some(&["NEWLINE".to_owned()])
+        }));
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.code.as_str() != "UNEXPECTED_NEWLINE")
+        );
+
+        let alternatives_bytes =
+            b"package acme:target @ 1.0.0\nrequires { acme:dep @ ^1 from invalid }\n";
+        let alternatives = parse_for_role(alternatives_bytes, PackageRole::Dependency);
+        let (issues, truncated) = final_manifest_syntax_issues(&alternatives, &[], false);
+        assert!(!truncated);
+        assert!(issues.iter().any(|issue| {
+            issue.code.as_str() == "EXPECTED_TOKEN"
+                && issue.expected_tokens.as_deref() == Some(&["git".to_owned(), "path".to_owned()])
+        }));
+
+        let comparator_bytes = b"package acme:target @ 1.0.0\nrequires { acme:dep @ ^1.0.0, }\n";
+        let comparator = parse_for_role(comparator_bytes, PackageRole::Dependency);
+        let (issues, truncated) = final_manifest_syntax_issues(&comparator, &[], false);
+        assert!(!truncated);
+        assert!(issues.iter().any(|issue| {
+            issue.code.as_str() == "EXPECTED_TOKEN"
+                && issue.expected_tokens.as_deref()
+                    == Some(
+                        &[
+                            "^".to_owned(),
+                            "~".to_owned(),
+                            "=".to_owned(),
+                            ">=".to_owned(),
+                            ">".to_owned(),
+                            "<=".to_owned(),
+                            "<".to_owned(),
+                        ][..],
+                    )
+        }));
+
+        let version_bytes = b"package acme:target @ 1.0.0\nrequires { acme:dep @ ^ }\n";
+        let version = parse_for_role(version_bytes, PackageRole::Dependency);
+        let (issues, truncated) = final_manifest_syntax_issues(&version, &[], false);
+        assert!(!truncated);
+        assert!(issues.iter().any(|issue| {
+            issue.code.as_str() == "EXPECTED_TOKEN"
+                && issue.expected_tokens.as_deref()
+                    == Some(&["INTEGER".to_owned(), "VERSION".to_owned()])
+        }));
+
+        let list_separator_bytes =
+            b"package acme:target @ 1.0.0\ntargets { wasm32-core arm64-core }\n";
+        let list_separator = parse_for_role(list_separator_bytes, PackageRole::Dependency);
+        let (issues, truncated) = final_manifest_syntax_issues(&list_separator, &[], false);
+        assert!(!truncated);
+        assert!(issues.iter().any(|issue| {
+            issue.code.as_str() == "EXPECTED_TOKEN"
+                && issue.expected_tokens.as_deref() == Some(&[",".to_owned(), "NEWLINE".to_owned()])
+        }));
+    }
+
+    #[test]
+    fn expected_token_sets_follow_package_parser_expectations() {
+        let cases: &[(&str, &[&str])] = &[
+            ("`component`", &["component"]),
+            ("`git` or `path`", &["git", "path"]),
+            ("`allow`, `warn`, or `deny`", &["allow", "warn", "deny"]),
+            ("`artifact`, `path`, or `git`", &["artifact", "path", "git"]),
+            ("at least one list item", &["LIST_ITEM"]),
+            ("version comparator", &["^", "~", "=", ">=", ">", "<=", "<"]),
+            ("version after comparator", &["INTEGER", "VERSION"]),
+            ("package identity", &["PACKAGE_PATH"]),
+            ("full package version", &["VERSION"]),
+            ("size integer", &["INTEGER"]),
+            ("size unit", &["UPPER_WORD"]),
+            ("path string", &["STRING"]),
+            ("repository directory", &["STRING"]),
+            ("capability name", &["WORD", "PACKAGE_PATH"]),
+            ("package path", &["PACKAGE_PATH"]),
+            ("word", &["WORD"]),
+            ("string", &["STRING"]),
+            ("lint code", &["UPPER_WORD"]),
+        ];
+
+        for (description, expected) in cases {
+            let expected = expected
+                .iter()
+                .map(|token| (*token).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::expected_tokens_from_description(description),
+                Some(expected),
+                "unexpected token set for parser expectation {description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_manifest_syntax_issue_collection_is_bounded() {
+        let bytes = vec![b';'; MAX_FINAL_MANIFEST_SYNTAX_ISSUES * 4];
+        let parsed = parse_for_role(&bytes, PackageRole::Dependency);
+        let (issues, truncated) = final_manifest_syntax_issues(&parsed, &[], false);
+        assert_eq!(issues.len(), MAX_FINAL_MANIFEST_SYNTAX_ISSUES);
+        assert!(truncated);
     }
 
     fn manifests_for(

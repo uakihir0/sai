@@ -672,9 +672,10 @@ impl RootDatabase {
     }
 
     /// Builds source-bound diagnostics for reportable final-source reload
-    /// failures. Local and Git path-requirement failures use their retained
-    /// final manifest, and package identity mismatches point at the changed
-    /// final header. The MVS chain stays attached to the original manifests.
+    /// failures and retained lexical/parser issues. Local and Git path-
+    /// requirement failures use their retained final manifest, and package
+    /// identity mismatches point at the changed final header. The MVS chain
+    /// stays attached to the original manifests.
     ///
     /// The audit plan must belong to `mixed_source`, and snapshot manifests
     /// must match the contracts used for the original MVS load. The returned
@@ -1388,6 +1389,280 @@ mod tests {
                 .contains(directory.0.to_str().unwrap()),
             "diagnostic messages do not expose local absolute paths"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_source_reload_diagnostics_bind_final_manifest_syntax_errors() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root_path = directory.0.join("root");
+        let target_first_path = directory.0.join("target-first");
+        let target_final_path = directory.0.join("target-final");
+        let other_first_path = directory.0.join("other-first");
+        let other_final_path = directory.0.join("other-final");
+        for path in [
+            &root_path,
+            &target_first_path,
+            &target_final_path,
+            &other_first_path,
+            &other_final_path,
+        ] {
+            std::fs::create_dir_all(path.join("src")).unwrap();
+        }
+        let root_manifest = b"package acme:root @ 1.0.0\n\
+                             source \"src\"\n\
+                             targets { wasm32-core }\n\
+                             requires {\n\
+                                 acme:target @ ^1 from path \"switch-target\"\n\
+                                 acme:other @ ^1 from path \"switch-other\"\n\
+                             }\n";
+        let target_first_manifest = b"package acme:target @ 1.0.0\n\
+                                      source \"src\"\n\
+                                      targets { wasm32-core }\n";
+        let target_final_manifest = b"source \"src\" targets { wasm32-core }\n";
+        let other_first_manifest = b"package acme:other @ 1.0.0\n\
+                                     source \"src\"\n\
+                                     targets { wasm32-core }\n";
+        let other_final_manifest = b"package acme:other @ 1.0.0\n\
+                                     source \"src\"\n\
+                                     targets { wasm32-core }\n\
+                                     requires { acme:missing @ ^1 from path \"missing\" }\n";
+        std::fs::write(root_path.join("sai.package"), root_manifest).unwrap();
+        std::fs::write(root_path.join("src/main.sai"), b"fn main() {}\n").unwrap();
+        std::fs::write(target_first_path.join("sai.package"), target_first_manifest).unwrap();
+        std::fs::write(target_first_path.join("src/main.sai"), b"").unwrap();
+        std::fs::write(target_final_path.join("sai.package"), target_final_manifest).unwrap();
+        std::fs::write(target_final_path.join("src/main.sai"), b"").unwrap();
+        std::fs::write(other_first_path.join("sai.package"), other_first_manifest).unwrap();
+        std::fs::write(other_first_path.join("src/main.sai"), b"").unwrap();
+        std::fs::write(other_final_path.join("sai.package"), other_final_manifest).unwrap();
+        std::fs::write(other_final_path.join("src/main.sai"), b"").unwrap();
+        symlink("../target-first", root_path.join("switch-target")).unwrap();
+        symlink("../other-first", root_path.join("switch-other")).unwrap();
+
+        let mixed_output = resolve_mixed_source_packages(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("the read-time local source resolves");
+        std::fs::remove_file(root_path.join("switch-target")).unwrap();
+        symlink("../target-final", root_path.join("switch-target")).unwrap();
+        std::fs::remove_file(root_path.join("switch-other")).unwrap();
+        symlink("../other-final", root_path.join("switch-other")).unwrap();
+        let audit_plan = mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("the invalid final manifest is retained for diagnostics");
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let root_file = database
+            .intern_file_key(FileKey::new("acme:root#1", "sai.package").unwrap())
+            .unwrap();
+        let target_file = database
+            .intern_file_key(FileKey::new("acme:target#1", "sai.package").unwrap())
+            .unwrap();
+        let other_file = database
+            .intern_file_key(FileKey::new("acme:other#1", "sai.package").unwrap())
+            .unwrap();
+        let snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(root_file, root_manifest).unwrap()),
+                "sai.package",
+                Some("acme:root@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(target_file, target_first_manifest).unwrap()),
+                "dep:acme:target@1.0.0/sai.package",
+                Some("acme:target@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                Arc::new(SourceFile::decode(other_file, other_first_manifest).unwrap()),
+                "dep:acme:other@1.0.0/sai.package",
+                Some("acme:other@1.0.0".to_owned()),
+                Some(1),
+            ),
+        ])
+        .expect("the read-time manifests belong to one workspace snapshot");
+        let read_contracts = mixed_output
+            .provider()
+            .output()
+            .selection()
+            .read_contracts();
+        let target_version = read_contracts
+            .keys()
+            .find(|package_version| package_version.package() == "acme:target")
+            .expect("the target dependency was loaded")
+            .clone();
+        let other_version = read_contracts
+            .keys()
+            .find(|package_version| package_version.package() == "acme:other")
+            .expect("the other dependency was loaded")
+            .clone();
+        assert_eq!(
+            audit_plan.final_manifest_snapshots()[&target_version].as_ref(),
+            target_final_manifest
+        );
+        assert_eq!(
+            audit_plan.final_manifest_snapshots()[&other_version].as_ref(),
+            other_final_manifest
+        );
+        let diagnostics = database
+            .mixed_source_reload_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &audit_plan,
+                root_file,
+                &BTreeMap::from([
+                    (target_version.clone(), target_file),
+                    (other_version.clone(), other_file),
+                ]),
+            )
+            .expect("the final syntax diagnostic is bound to the source snapshot");
+        assert_eq!(diagnostics.len(), 3);
+        let expected_token_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_str() == "EXPECTED_TOKEN")
+            .expect("the missing declaration separator is reported");
+        let syntax_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_str() == "MISSING_PACKAGE_DECL")
+            .expect("the target's final syntax error is reported");
+        let path_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_str() == "PATH_PACKAGE_NOT_FOUND")
+            .expect("the other package's independent reload failure is reported");
+        assert!(matches!(
+            expected_token_diagnostic.data.get("expected_tokens"),
+            Some(sai_diagnostics::Value::Array(tokens))
+                if tokens == &[sai_diagnostics::Value::String("NEWLINE".to_owned())]
+        ));
+        let expected_primary = expected_token_diagnostic
+            .primary()
+            .expect("the missing separator points into the final manifest");
+        let expected_final_file = diagnostics
+            .snapshot()
+            .file(expected_primary.span.file)
+            .expect("the augmented snapshot includes the malformed final manifest");
+        let expected_span = expected_primary.span.range.start().to_usize()
+            ..expected_primary.span.range.end().to_usize();
+        assert_eq!(
+            &expected_final_file.source().raw_bytes()[expected_span],
+            b"targets"
+        );
+        assert_eq!(
+            syntax_diagnostic.message,
+            "could not reload selected package acme:target@1.0.0: missing `package` declaration"
+        );
+        let primary = syntax_diagnostic
+            .primary()
+            .expect("the missing declaration points into the final manifest");
+        assert!(
+            primary
+                .file
+                .path
+                .starts_with("dep:acme:target@1.0.0/.sai/final-source-")
+        );
+        assert_eq!(
+            primary.span.range.start().to_usize(),
+            target_final_manifest.len()
+        );
+        assert_eq!(
+            primary.span.range.end().to_usize(),
+            target_final_manifest.len()
+        );
+        assert!(matches!(
+            syntax_diagnostic.data.get("requirement_chain"),
+            Some(sai_diagnostics::Value::Object(fields))
+                if matches!(
+                    fields.get("steps"),
+                    Some(sai_diagnostics::Value::Array(steps)) if !steps.is_empty()
+                )
+        ));
+        let bound_final_file = diagnostics
+            .snapshot()
+            .file(primary.span.file)
+            .expect("the augmented snapshot includes the invalid final manifest");
+        assert_eq!(bound_final_file.source().raw_bytes(), target_final_manifest);
+        let path_primary = path_diagnostic
+            .primary()
+            .expect("the path failure points into the other final manifest");
+        assert!(
+            path_primary
+                .file
+                .path
+                .starts_with("dep:acme:other@1.0.0/.sai/final-source-")
+        );
+        let path_span =
+            path_primary.span.range.start().to_usize()..path_primary.span.range.end().to_usize();
+        assert_eq!(
+            &diagnostics
+                .snapshot()
+                .file(path_primary.span.file)
+                .expect("the augmented snapshot includes the other final manifest")
+                .source()
+                .raw_bytes()[path_span],
+            b"acme:missing @ ^1 from path \"missing\""
+        );
+
+        let oversized_final_manifest = vec![b';'; 128];
+        std::fs::write(
+            target_final_path.join("sai.package"),
+            &oversized_final_manifest,
+        )
+        .unwrap();
+        let truncated_audit_plan = mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("the oversized final syntax is retained for diagnostics");
+        let truncated_diagnostics = database
+            .mixed_source_reload_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &truncated_audit_plan,
+                root_file,
+                &BTreeMap::from([(target_version, target_file), (other_version, other_file)]),
+            )
+            .expect("bounded syntax diagnostics are produced");
+        let target_syntax_diagnostics = truncated_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .is_some_and(|primary| primary.file.path.starts_with("dep:acme:target@"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(target_syntax_diagnostics.len(), 32);
+        let omission_diagnostic = target_syntax_diagnostics
+            .iter()
+            .find(|diagnostic| {
+                matches!(
+                    diagnostic.data.get("additional_syntax_errors_omitted"),
+                    Some(sai_diagnostics::Value::Bool(true))
+                )
+            })
+            .expect("the final syntax diagnostic marks omitted errors");
+        assert!(omission_diagnostic.children().iter().any(|child| {
+            child
+                .message
+                .contains("additional final manifest syntax errors were omitted")
+        }));
     }
 
     #[cfg(unix)]
