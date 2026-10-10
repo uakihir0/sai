@@ -817,6 +817,88 @@ mod tests {
         not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
     ))]
     #[test]
+    fn selected_path_source_uses_dependency_entry_when_it_matches_root_version() {
+        let tree = LocalSourceTestTree::new();
+        let root_path = tree.path().join("workspace/root");
+        let dependency_path = tree.path().join("workspace/root-package");
+        let parent_path = tree.path().join("workspace/parent");
+        for path in [&root_path, &dependency_path, &parent_path] {
+            fs::create_dir_all(path).expect("create package directory");
+        }
+        let root_manifest = b"package acme:app @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n";
+        fs::write(root_path.join("sai.package"), root_manifest).expect("write root manifest");
+        fs::write(dependency_path.join("sai.package"), root_manifest)
+            .expect("write same-version dependency manifest");
+        fs::write(
+            parent_path.join("sai.package"),
+            b"package acme:parent @ 1.0.0\nsource \"src\"\ntargets { wasm32-core }\n",
+        )
+        .expect("write parent manifest");
+
+        let root_version = package_version("acme:app", "1.0.0");
+        let parent_version = package_version("acme:parent", "1.0.0");
+        let mut directories = LocalPackageDirectoryIndex::default();
+        directories
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(&root_path).expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        directories
+            .insert(
+                root_version.clone(),
+                LocalPackageDirectory::open(&dependency_path)
+                    .expect("open same-version dependency package"),
+                PackageRole::Dependency,
+            )
+            .expect("index same-version dependency package");
+        directories
+            .insert(
+                parent_version.clone(),
+                LocalPackageDirectory::open(&parent_path).expect("open parent package"),
+                PackageRole::Dependency,
+            )
+            .expect("index parent package");
+
+        let pin = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: parent_version.clone(),
+                path: "../root-package".into(),
+            },
+            requirer: MvsRequirer::Package(parent_version),
+            span: 12..40,
+        };
+        let selection = ResolverSourceSelection {
+            package_version: root_version.clone(),
+            source: pin.source.clone(),
+            reason: ResolverSourceReason::PathPin,
+            provenance: ResolverSourceProvenance::PathPin { pin: pin.clone() },
+            path_pin_sources: vec![pin.clone()],
+        };
+        let canonicalized = directories
+            .canonicalize_path_pin(&pin)
+            .expect("canonicalize the selected package path");
+        let selected = directories
+            .resolve_selected_path_source(&selection, &root_version, &[canonicalized])
+            .expect("resolve selected same-version path source")
+            .expect("path source resolves to a local directory");
+
+        assert_eq!(
+            selected.path(),
+            fs::canonicalize(dependency_path).expect("canonical dependency directory")
+        );
+        assert_ne!(
+            selected.path(),
+            fs::canonicalize(root_path).expect("canonical root directory")
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
     fn mvs_source_provider_loads_a_validated_contract_from_the_path_pin_snapshot() {
         let tree = LocalSourceTestTree::new();
         let root_directory = tree.path().join("workspace/root");

@@ -27,7 +27,7 @@ use crate::manifest::{
     MAX_PACKAGE_MANIFEST_BYTES, OverrideSource, PackageDeclaration, PackageParseOutput,
     PackageRole, RequirementSource, Spanned, parse_for_role,
 };
-use crate::mvs::{MvsNode, MvsPackageVersion};
+use crate::mvs::{MvsNode, MvsPackageVersion, MvsRequirer};
 use crate::package_path::{DependencyPackagePath, PackagePathError};
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, ResolverPathKey,
@@ -110,13 +110,16 @@ pub enum LocalPackageIoOperation {
     ReadManifest,
 }
 
-/// Local directories already read for concrete package versions.
+/// Local directories already read for the root or concrete dependency versions.
 ///
 /// A separate index can be used for each resolver load snapshot. Inserting
 /// the same version twice is idempotent when both entries resolve to the same
-/// directory, and rejects two different local directories for that version.
+/// dependency directory, and rejects two different local directories for that
+/// dependency version. The root directory is stored separately so a root and a
+/// dependency with the same package version keep distinct source identities.
 #[derive(Clone, Debug, Default)]
 pub struct LocalPackageDirectoryIndex {
+    root: Option<(MvsPackageVersion, LocalPackageDirectory)>,
     entries: BTreeMap<MvsPackageVersion, LocalPackageDirectory>,
 }
 
@@ -141,6 +144,7 @@ pub enum LocalPackageDirectoryIndexError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalPackagePathIndexError {
     MissingBaseDirectory(MvsPackageVersion),
+    AmbiguousRequirerRole(MvsPackageVersion),
     InvalidPath(PackagePathError),
     Directory(LocalPackageError),
     InvalidManifest(Box<PackageParseOutput>),
@@ -532,7 +536,7 @@ impl LocalPackageDirectoryIndex {
         role: PackageRole,
     ) -> Result<(), LocalPackageDirectoryIndexError> {
         let parsed = directory.parse_manifest(role);
-        self.insert_parsed(package_version, directory, &parsed)
+        self.insert_parsed(package_version, directory, &parsed, role)
     }
 
     /// Resolves a dependency path from an indexed local package, discovers the
@@ -541,18 +545,45 @@ impl LocalPackageDirectoryIndex {
     ///
     /// Call this when building local path-package maps so the version used to
     /// create resolver context and the manifest later consumed by the loader
-    /// come from one per-load directory index.
+    /// come from one per-load directory index. It is kept for compatibility
+    /// when the version identifies exactly one indexed base. Use
+    /// [`Self::index_dependency_path_from`] when the requirer role is known;
+    /// this method returns an error if both roles have that version.
     pub fn index_dependency_path(
         &mut self,
         relative_to: &MvsPackageVersion,
         path: &str,
     ) -> Result<MvsPackageVersion, LocalPackagePathIndexError> {
+        let is_root = self
+            .root
+            .as_ref()
+            .is_some_and(|(root_package, _)| root_package == relative_to);
+        let is_dependency = self.entries.contains_key(relative_to);
+        let requirer = match (is_root, is_dependency) {
+            (true, true) => {
+                return Err(LocalPackagePathIndexError::AmbiguousRequirerRole(
+                    relative_to.clone(),
+                ));
+            }
+            (true, false) => MvsRequirer::Root(relative_to.clone()),
+            (false, _) => MvsRequirer::Package(relative_to.clone()),
+        };
+        self.index_dependency_path_from(&requirer, path)
+    }
+
+    /// Resolves a path from the exact root or dependency directory and indexes
+    /// the resulting package snapshot.
+    pub fn index_dependency_path_from(
+        &mut self,
+        requirer: &MvsRequirer,
+        path: &str,
+    ) -> Result<MvsPackageVersion, LocalPackagePathIndexError> {
         let path =
             DependencyPackagePath::parse(path).map_err(LocalPackagePathIndexError::InvalidPath)?;
-        let base = self
-            .entries
-            .get(relative_to)
-            .ok_or_else(|| LocalPackagePathIndexError::MissingBaseDirectory(relative_to.clone()))?;
+        let requiring_package = requirer.package_version();
+        let base = self.directory_for_requirer(requirer).ok_or_else(|| {
+            LocalPackagePathIndexError::MissingBaseDirectory(requiring_package.clone())
+        })?;
         let directory = base
             .resolve_dependency(&path)
             .map_err(LocalPackagePathIndexError::Directory)?;
@@ -573,9 +604,25 @@ impl LocalPackageDirectoryIndex {
         let package = header.value.identity.to_string();
         let package_version = MvsPackageVersion::new(package.clone(), header.value.version.clone())
             .map_err(|_| LocalPackagePathIndexError::InvalidPackageIdentity(package.into()))?;
-        self.insert_parsed(package_version.clone(), directory, &parsed)
-            .map_err(LocalPackagePathIndexError::Index)?;
+        self.insert_parsed(
+            package_version.clone(),
+            directory,
+            &parsed,
+            PackageRole::Dependency,
+        )
+        .map_err(LocalPackagePathIndexError::Index)?;
         Ok(package_version)
+    }
+
+    fn directory_for_requirer(&self, requirer: &MvsRequirer) -> Option<&LocalPackageDirectory> {
+        match requirer {
+            MvsRequirer::Root(package_version) => self
+                .root
+                .as_ref()
+                .filter(|(root_package, _)| root_package == package_version)
+                .map(|(_, directory)| directory),
+            MvsRequirer::Package(package_version) => self.entries.get(package_version),
+        }
     }
 
     /// Discovers and indexes every root `use path` override from the captured
@@ -608,9 +655,11 @@ impl LocalPackageDirectoryIndex {
             .map_err(|_| {
                 LocalPackagePathIndexError::InvalidRootPackageIdentity(root_name.into())
             })?;
-        let indexed_root = self.entries.get(&root_package).ok_or_else(|| {
-            LocalPackagePathIndexError::MissingRootDirectory(root_package.clone())
-        })?;
+        let indexed_root = self
+            .directory_for_requirer(&MvsRequirer::Root(root_package.clone()))
+            .ok_or_else(|| {
+                LocalPackagePathIndexError::MissingRootDirectory(root_package.clone())
+            })?;
         if indexed_root != root_directory
             || indexed_root.parse_manifest(PackageRole::Root) != root_manifest
         {
@@ -635,14 +684,13 @@ impl LocalPackageDirectoryIndex {
                         span: item.span.clone(),
                     });
                 }
-                let package_version =
-                    staged
-                        .index_dependency_path(&root_package, path)
-                        .map_err(|error| LocalPackagePathIndexError::PathDiscovery {
-                            package: item.value.package.clone(),
-                            span: item.span.clone(),
-                            error: Box::new(error),
-                        })?;
+                let package_version = staged
+                    .index_dependency_path_from(&MvsRequirer::Root(root_package.clone()), path)
+                    .map_err(|error| LocalPackagePathIndexError::PathDiscovery {
+                        package: item.value.package.clone(),
+                        span: item.span.clone(),
+                        error: Box::new(error),
+                    })?;
                 if package_version.package() != item.value.package.as_ref() {
                     return Err(
                         LocalPackagePathIndexError::RootPathOverrideIdentityMismatch {
@@ -689,9 +737,11 @@ impl LocalPackageDirectoryIndex {
             .map_err(|_| {
                 LocalPackagePathIndexError::InvalidRootPackageIdentity(root_name.into())
             })?;
-        let indexed_root = self.entries.get(&root_package).ok_or_else(|| {
-            LocalPackagePathIndexError::MissingRootDirectory(root_package.clone())
-        })?;
+        let indexed_root = self
+            .directory_for_requirer(&MvsRequirer::Root(root_package.clone()))
+            .ok_or_else(|| {
+                LocalPackagePathIndexError::MissingRootDirectory(root_package.clone())
+            })?;
         if indexed_root != root_directory
             || indexed_root.parse_manifest(PackageRole::Root) != root_manifest
         {
@@ -765,18 +815,17 @@ impl LocalPackageDirectoryIndex {
                 if path_packages.contains_key(&key) {
                     continue;
                 }
-                let package_version =
-                    staged
-                        .index_dependency_path(&root_package, path)
-                        .map_err(
-                            |error| LocalPackagePathIndexError::PathRequirementDiscovery {
-                                package: requirement.package.clone(),
-                                path: path.clone(),
-                                requiring_package: root_package.clone(),
-                                span: item.span.clone(),
-                                error: Box::new(error),
-                            },
-                        )?;
+                let package_version = staged
+                    .index_dependency_path_from(&MvsRequirer::Root(root_package.clone()), path)
+                    .map_err(
+                        |error| LocalPackagePathIndexError::PathRequirementDiscovery {
+                            package: requirement.package.clone(),
+                            path: path.clone(),
+                            requiring_package: root_package.clone(),
+                            span: item.span.clone(),
+                            error: Box::new(error),
+                        },
+                    )?;
                 path_packages.insert(key, package_version);
             }
         }
@@ -795,13 +844,6 @@ impl LocalPackageDirectoryIndex {
         requiring_package: &MvsPackageVersion,
         root_context: &ResolverContractContext<'_>,
     ) -> Result<BTreeMap<ResolverPathKey, MvsPackageVersion>, LocalPackagePathIndexError> {
-        if requiring_package == root_context.root_package() {
-            return Err(
-                LocalPackagePathIndexError::DependencyPathRequirementBaseIsRoot(
-                    requiring_package.clone(),
-                ),
-            );
-        }
         let base = self.entries.get(requiring_package).ok_or_else(|| {
             LocalPackagePathIndexError::MissingBaseDirectory(requiring_package.clone())
         })?;
@@ -867,7 +909,10 @@ impl LocalPackageDirectoryIndex {
                     continue;
                 }
                 let package_version = staged
-                    .index_dependency_path(requiring_package, path)
+                    .index_dependency_path_from(
+                        &MvsRequirer::Package(requiring_package.clone()),
+                        path,
+                    )
                     .map_err(
                         |error| LocalPackagePathIndexError::PathRequirementDiscovery {
                             package: requirement.package.clone(),
@@ -889,6 +934,7 @@ impl LocalPackageDirectoryIndex {
         package_version: MvsPackageVersion,
         directory: LocalPackageDirectory,
         parsed: &PackageParseOutput,
+        role: PackageRole,
     ) -> Result<(), LocalPackageDirectoryIndexError> {
         if !parsed.is_syntax_valid() {
             return Err(LocalPackageDirectoryIndexError::InvalidManifest(
@@ -908,20 +954,60 @@ impl LocalPackageDirectoryIndex {
             });
         }
 
-        match self.entries.get(&package_version) {
-            Some(existing) if existing == &directory => Ok(()),
-            Some(_) => Err(LocalPackageDirectoryIndexError::ConflictingDirectories(
-                package_version,
-            )),
-            None => {
-                if let Some((existing, _)) = self
-                    .entries
-                    .iter()
-                    .find(|(_, existing)| *existing == &directory)
+        match role {
+            PackageRole::Root => {
+                if let Some((existing_version, existing_directory)) = &self.root {
+                    if existing_version == &package_version && existing_directory == &directory {
+                        return Ok(());
+                    }
+                    return Err(LocalPackageDirectoryIndexError::ConflictingDirectories(
+                        existing_version.clone(),
+                    ));
+                }
+                if let Some((existing, _)) =
+                    self.entries.iter().find(|(existing, existing_directory)| {
+                        *existing != &package_version && *existing_directory == &directory
+                    })
                 {
                     return Err(
                         LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
                             existing: Box::new(existing.clone()),
+                            discovered: Box::new(package_version),
+                        },
+                    );
+                }
+                self.root = Some((package_version, directory));
+                Ok(())
+            }
+            PackageRole::Dependency => {
+                match self.entries.get(&package_version) {
+                    Some(existing) if existing == &directory => return Ok(()),
+                    Some(_) => {
+                        return Err(LocalPackageDirectoryIndexError::ConflictingDirectories(
+                            package_version,
+                        ));
+                    }
+                    None => {}
+                }
+                if let Some((existing, _)) = self
+                    .entries
+                    .iter()
+                    .find(|(_, existing_directory)| *existing_directory == &directory)
+                {
+                    return Err(
+                        LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
+                            existing: Box::new(existing.clone()),
+                            discovered: Box::new(package_version),
+                        },
+                    );
+                }
+                if let Some((root_version, root_directory)) = &self.root
+                    && root_version != &package_version
+                    && root_directory == &directory
+                {
+                    return Err(
+                        LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
+                            existing: Box::new(root_version.clone()),
                             discovered: Box::new(package_version),
                         },
                     );
@@ -950,7 +1036,7 @@ impl LocalPackageDirectoryIndex {
                 found: Box::new(relative_to.clone()),
             });
         }
-        let base = self.entries.get(relative_to).ok_or_else(|| {
+        let base = self.directory_for_requirer(&pin.requirer).ok_or_else(|| {
             LocalPackagePathPinError::MissingRequirerDirectory(relative_to.clone())
         })?;
         let path =
@@ -1116,9 +1202,11 @@ impl LocalPackageDirectoryIndex {
                 found: Box::new(relative_to.clone()),
             });
         }
-        let base = self.entries.get(relative_to).ok_or_else(|| {
-            LocalPackageSourceResolveError::MissingBaseDirectory(relative_to.clone())
-        })?;
+        let base = self
+            .directory_for_requirer(&MvsRequirer::Root(expected_base.clone()))
+            .ok_or_else(|| {
+                LocalPackageSourceResolveError::MissingBaseDirectory(relative_to.clone())
+            })?;
         let path = DependencyPackagePath::parse(path)
             .map_err(LocalPackageSourceResolveError::InvalidPath)?;
         base.resolve_dependency(&path)
@@ -1296,6 +1384,12 @@ impl fmt::Display for LocalPackagePathIndexError {
             Self::MissingBaseDirectory(package_version) => write!(
                 formatter,
                 "no local package directory is registered for path base {}@{}",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::AmbiguousRequirerRole(package_version) => write!(
+                formatter,
+                "local package {}@{} is indexed as both root and dependency; specify its requirer role",
                 package_version.package(),
                 package_version.version()
             ),
@@ -2172,6 +2266,158 @@ mod tests {
         not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
     ))]
     #[test]
+    fn root_and_dependency_with_the_same_version_keep_distinct_path_bases() {
+        let tree = TempTree::new();
+        let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
+        let dependency_directory = tree.package("workspace/dependency-root", ROOT_MANIFEST);
+        let root_child = tree.package("workspace/root-child", DEPENDENCY_MANIFEST);
+        let dependency_child = tree.package(
+            "workspace/dependency-child",
+            b"package acme:package-child @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        );
+        let same_version = package_version("acme:root", "1.0.0");
+
+        let mut index = LocalPackageDirectoryIndex::default();
+        index
+            .insert(
+                same_version.clone(),
+                LocalPackageDirectory::open(&root_directory).expect("open root package"),
+                PackageRole::Root,
+            )
+            .expect("index root package");
+        index
+            .insert(
+                same_version.clone(),
+                LocalPackageDirectory::open(&dependency_directory)
+                    .expect("open same-version dependency package"),
+                PackageRole::Dependency,
+            )
+            .expect("index same-version dependency package");
+
+        assert_eq!(
+            index.index_dependency_path(&same_version, "../root-child"),
+            Err(LocalPackagePathIndexError::AmbiguousRequirerRole(
+                same_version.clone()
+            )),
+            "the version-only compatibility API fails closed when the requirer role is ambiguous"
+        );
+        assert_eq!(
+            index
+                .index_dependency_path_from(
+                    &MvsRequirer::Root(same_version.clone()),
+                    "../root-child"
+                )
+                .expect("resolve from root directory"),
+            package_version("acme:dependency", "1.2.0")
+        );
+        assert_eq!(
+            index
+                .index_dependency_path_from(
+                    &MvsRequirer::Package(same_version.clone()),
+                    "../dependency-child",
+                )
+                .expect("resolve from dependency directory"),
+            package_version("acme:package-child", "1.0.0")
+        );
+
+        let root_pin = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: same_version.clone(),
+                path: "../root-child".into(),
+            },
+            requirer: MvsRequirer::Root(same_version.clone()),
+            span: 12..36,
+        };
+        let dependency_pin = ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to: same_version.clone(),
+                path: "../dependency-child".into(),
+            },
+            requirer: MvsRequirer::Package(same_version),
+            span: 40..68,
+        };
+        assert_eq!(
+            index
+                .canonicalize_path_pin(&root_pin)
+                .expect("canonicalize root-relative pin")
+                .path(),
+            fs::canonicalize(root_child).expect("canonical root child path")
+        );
+        assert_eq!(
+            index
+                .canonicalize_path_pin(&dependency_pin)
+                .expect("canonicalize dependency-relative pin")
+                .path(),
+            fs::canonicalize(dependency_child).expect("canonical dependency child path")
+        );
+    }
+
+    #[test]
+    fn root_and_dependency_directory_version_conflicts_are_order_independent() {
+        let tree = TempTree::new();
+        let shared_path = tree.package("shared", ROOT_MANIFEST);
+        let root_directory =
+            LocalPackageDirectory::open(&shared_path).expect("capture root v1 directory");
+        fs::write(
+            shared_path.join("sai.package"),
+            b"package acme:root @ 2.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .expect("change shared directory manifest");
+        let dependency_directory =
+            LocalPackageDirectory::open(&shared_path).expect("capture dependency v2 directory");
+        let root_version = package_version("acme:root", "1.0.0");
+        let dependency_version = package_version("acme:root", "2.0.0");
+
+        let mut root_first = LocalPackageDirectoryIndex::default();
+        root_first
+            .insert(
+                root_version.clone(),
+                root_directory.clone(),
+                PackageRole::Root,
+            )
+            .expect("index root first");
+        assert_eq!(
+            root_first.insert(
+                dependency_version.clone(),
+                dependency_directory.clone(),
+                PackageRole::Dependency,
+            ),
+            Err(
+                LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
+                    existing: Box::new(root_version.clone()),
+                    discovered: Box::new(dependency_version.clone()),
+                }
+            )
+        );
+
+        let mut dependency_first = LocalPackageDirectoryIndex::default();
+        dependency_first
+            .insert(
+                dependency_version.clone(),
+                dependency_directory,
+                PackageRole::Dependency,
+            )
+            .expect("index dependency first");
+        assert_eq!(
+            dependency_first.insert(root_version.clone(), root_directory, PackageRole::Root),
+            Err(
+                LocalPackageDirectoryIndexError::ConflictingVersionsForDirectory {
+                    existing: Box::new(dependency_version),
+                    discovered: Box::new(root_version),
+                }
+            )
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
     fn indexing_a_dependency_path_returns_its_version_and_captured_manifest() {
         let tree = TempTree::new();
         let root_directory = tree.package("workspace/root", ROOT_MANIFEST);
@@ -2395,10 +2641,14 @@ mod tests {
                 && found.as_ref() == "acme:actual"
                 && span == expected_span
         ));
-        assert_eq!(
-            index.entries.keys().collect::<Vec<_>>(),
-            [&root_version],
+        assert!(
+            index.entries.is_empty(),
             "failed discovery does not retain the first override snapshot"
+        );
+        assert_eq!(
+            index.root.as_ref().map(|(version, _)| version),
+            Some(&root_version),
+            "failed discovery preserves the separately indexed root"
         );
     }
 
@@ -2655,7 +2905,7 @@ mod tests {
         );
         assert_eq!(
             index.entries.len(),
-            3,
+            2,
             "neither replaced path source is opened"
         );
     }
@@ -2737,10 +2987,14 @@ mod tests {
             "bytes {}..{}",
             expected_span.start, expected_span.end
         )));
-        assert_eq!(
-            index.entries.keys().collect::<Vec<_>>(),
-            [&root_version],
+        assert!(
+            index.entries.is_empty(),
             "failed root requirement discovery commits no partial paths"
+        );
+        assert_eq!(
+            index.root.as_ref().map(|(version, _)| version),
+            Some(&root_version),
+            "failed discovery preserves the separately indexed root"
         );
     }
 
@@ -2894,7 +3148,7 @@ mod tests {
                 package_version("acme:other", "1.2.0"),
             )])
         );
-        assert_eq!(index.entries.len(), 4);
+        assert_eq!(index.entries.len(), 3);
     }
 
     #[cfg(all(
@@ -2981,8 +3235,13 @@ mod tests {
         ));
         assert_eq!(
             index.entries.keys().cloned().collect::<Vec<_>>(),
-            [dependency_version, root_version],
+            [dependency_version],
             "failed discovery does not retain the first path snapshot"
+        );
+        assert_eq!(
+            index.root.as_ref().map(|(version, _)| version),
+            Some(&root_version),
+            "failed discovery preserves the separately indexed root"
         );
     }
 
