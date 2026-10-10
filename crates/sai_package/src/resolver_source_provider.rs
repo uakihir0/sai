@@ -2515,7 +2515,7 @@ requires { acme:dep @ ^1 from path "../dep" }
             })
             .expect("root path requirement exists");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(root_version.clone(), "../dep"),
+            ResolverPathKey::root(root_version.clone(), "../dep"),
             package_version("acme:dep", "1.5.0"),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -2586,7 +2586,7 @@ requires { acme:dep @ ^1 from path "../dep" }
         let root_version = package_version("acme:app", "1.0.0");
         let dep_version = package_version("acme:dep", "1.5.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(root_version.clone(), "../dep"),
+            ResolverPathKey::root(root_version.clone(), "../dep"),
             dep_version,
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -2653,11 +2653,11 @@ requires {
         let dep_version = package_version("acme:dep", "1.5.0");
         let path_packages = BTreeMap::from([
             (
-                ResolverPathKey::new(alpha_version, "../dep-a"),
+                ResolverPathKey::package(alpha_version, "../dep-a"),
                 dep_version.clone(),
             ),
             (
-                ResolverPathKey::new(beta_version, "../dep-b"),
+                ResolverPathKey::package(beta_version, "../dep-b"),
                 dep_version.clone(),
             ),
         ]);
@@ -2782,11 +2782,11 @@ requires {
         let dep_version = package_version("acme:dep", "1.5.0");
         let path_packages = BTreeMap::from([
             (
-                ResolverPathKey::new(alpha_version.clone(), "../dep-a"),
+                ResolverPathKey::package(alpha_version.clone(), "../dep-a"),
                 dep_version.clone(),
             ),
             (
-                ResolverPathKey::new(beta_version, "../dep-b"),
+                ResolverPathKey::package(beta_version, "../dep-b"),
                 dep_version.clone(),
             ),
         ]);
@@ -3220,7 +3220,7 @@ requires { acme:dep @ ^1 from path "../dep" }
         let root_version = package_version("acme:app", "1.0.0");
         let dep_version = package_version("acme:dep", "1.0.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(root_version.clone(), "../dep"),
+            ResolverPathKey::root(root_version.clone(), "../dep"),
             dep_version.clone(),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -3327,7 +3327,7 @@ requires {
         let dep_version = package_version("acme:dep", "1.0.0");
         let late_version = package_version("zz:late", "1.0.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(base_version.clone(), "../dep"),
+            ResolverPathKey::package(base_version.clone(), "../dep"),
             dep_version.clone(),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -3441,11 +3441,11 @@ requires { acme:a @ ^1 from git "https://example.test/a" }
         let b_version = package_version("acme:b", "1.0.0");
         let path_packages = BTreeMap::from([
             (
-                ResolverPathKey::new(a_version.clone(), "../b"),
+                ResolverPathKey::package(a_version.clone(), "../b"),
                 b_version.clone(),
             ),
             (
-                ResolverPathKey::new(b_version.clone(), "../a"),
+                ResolverPathKey::package(b_version.clone(), "../a"),
                 a_version.clone(),
             ),
         ]);
@@ -3539,7 +3539,7 @@ requires { acme:dep @ ^1 from git "https://example.test/read-dep" }
         let dep_version = package_version("acme:dep", "1.0.0");
         let child_version = package_version("acme:child", "1.0.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(dep_version.clone(), "../child"),
+            ResolverPathKey::package(dep_version.clone(), "../child"),
             child_version.clone(),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -3912,11 +3912,11 @@ requires {
         let dep_version = package_version("acme:dep", "1.5.0");
         let path_packages = BTreeMap::from([
             (
-                ResolverPathKey::new(package_version("acme:alpha", "1.0.0"), "../dep"),
+                ResolverPathKey::package(package_version("acme:alpha", "1.0.0"), "../dep"),
                 dep_version.clone(),
             ),
             (
-                ResolverPathKey::new(package_version("acme:beta", "1.0.0"), "../dep-alias"),
+                ResolverPathKey::package(package_version("acme:beta", "1.0.0"), "../dep-alias"),
                 dep_version.clone(),
             ),
         ]);

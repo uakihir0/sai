@@ -6,7 +6,7 @@ use crate::git_remote::{
     FetchedGitPackage, GitPackagePathError, GitPackageSourceIdentity, GitPackageSourceView,
 };
 use crate::manifest::{PackageDeclaration, PackageParseOutput, RequirementSource};
-use crate::mvs::MvsPackageVersion;
+use crate::mvs::{MvsPackageVersion, MvsRequirer};
 use crate::package_path::RepositoryPackageDirectory;
 use crate::resolver_contract::{ResolverContractContext, ResolverPathKey};
 
@@ -83,6 +83,11 @@ pub enum GitPathRequirementDiscoveryError<E> {
         expected: Box<MvsPackageVersion>,
         found: Box<MvsPackageVersion>,
     },
+    /// The root requirer does not match the root bound to the resolver context.
+    RootContextMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
     /// A sibling path is invalid or escapes the repository.
     DependencyPath {
         path: Box<str>,
@@ -145,10 +150,19 @@ impl<E> GitPathRequirementDiscoveryError<E> {
 /// before its manifest is used.
 pub fn discover_git_path_requirements<E>(
     requiring: &impl GitPackageSourceView,
-    expected_requirer: &MvsPackageVersion,
+    requirer: &MvsRequirer,
     root_context: &ResolverContractContext<'_>,
     mut fetch_sibling: impl FnMut(&GitPackageSourceIdentity) -> Result<FetchedGitPackage, E>,
 ) -> Result<GitPathRequirementIndex, GitPathRequirementDiscoveryError<E>> {
+    if let MvsRequirer::Root(root_package) = requirer
+        && root_package != root_context.root_package()
+    {
+        return Err(GitPathRequirementDiscoveryError::RootContextMismatch {
+            expected: Box::new(root_context.root_package().clone()),
+            found: Box::new(root_package.clone()),
+        });
+    }
+    let expected_requirer = requirer.package_version();
     let manifest = requiring.git_package_manifest();
     let actual_requirer = manifest_package_version(manifest).map_err(|error| match error {
         ManifestPackageVersionError::InvalidSyntax => {
@@ -205,7 +219,7 @@ pub fn discover_git_path_requirements<E>(
                 continue;
             };
 
-            let path_key = ResolverPathKey::new(expected_requirer.clone(), path.clone());
+            let path_key = ResolverPathKey::new(requirer.clone(), path.clone());
             if index.path_packages.contains_key(&path_key) {
                 continue;
             }

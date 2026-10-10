@@ -761,7 +761,7 @@ impl LocalPackageDirectoryIndex {
                 else {
                     continue;
                 };
-                let key = ResolverPathKey::new(root_package.clone(), path.clone());
+                let key = ResolverPathKey::root(root_package.clone(), path.clone());
                 if path_packages.contains_key(&key) {
                     continue;
                 }
@@ -862,7 +862,7 @@ impl LocalPackageDirectoryIndex {
                 else {
                     continue;
                 };
-                let key = ResolverPathKey::new(requiring_package.clone(), path.clone());
+                let key = ResolverPathKey::package(requiring_package.clone(), path.clone());
                 if path_packages.contains_key(&key) {
                     continue;
                 }
@@ -2571,11 +2571,11 @@ mod tests {
             path_packages,
             BTreeMap::from([
                 (
-                    ResolverPathKey::new(root_version.clone(), "../direct"),
+                    ResolverPathKey::root(root_version.clone(), "../direct"),
                     package_version("acme:direct", "1.2.0"),
                 ),
                 (
-                    ResolverPathKey::new(root_version.clone(), "../test-tool"),
+                    ResolverPathKey::root(root_version.clone(), "../test-tool"),
                     package_version("acme:test-tool", "1.4.0"),
                 ),
             ])
@@ -2643,7 +2643,7 @@ mod tests {
         assert_eq!(
             path_packages,
             BTreeMap::from([(
-                ResolverPathKey::new(root_version, "../other"),
+                ResolverPathKey::root(root_version, "../other"),
                 package_version("acme:other", "1.2.0"),
             )])
         );
@@ -2797,7 +2797,7 @@ mod tests {
         assert_eq!(
             path_packages,
             BTreeMap::from([(
-                ResolverPathKey::new(dependency_version.clone(), "../active"),
+                ResolverPathKey::package(dependency_version.clone(), "../active"),
                 package_version("acme:active", "1.3.0"),
             )])
         );
@@ -2890,7 +2890,7 @@ mod tests {
         assert_eq!(
             path_packages,
             BTreeMap::from([(
-                ResolverPathKey::new(dependency_version, "../other"),
+                ResolverPathKey::package(dependency_version, "../other"),
                 package_version("acme:other", "1.2.0"),
             )])
         );
@@ -3318,7 +3318,7 @@ mod tests {
             output
                 .context()
                 .path_packages()
-                .get(&ResolverPathKey::new(dependency.clone(), "../sibling")),
+                .get(&ResolverPathKey::package(dependency.clone(), "../sibling")),
             Some(&sibling)
         );
 
@@ -3633,7 +3633,7 @@ mod tests {
             failure
                 .context()
                 .path_packages()
-                .get(&ResolverPathKey::new(valid.clone(), "../valid-common")),
+                .get(&ResolverPathKey::package(valid.clone(), "../valid-common")),
             Some(&actual)
         );
         assert!(

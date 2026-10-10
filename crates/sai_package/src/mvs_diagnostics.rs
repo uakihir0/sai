@@ -2702,7 +2702,7 @@ requires {
         let package = package_version("acme:dep", "1.0.0");
         let root = parse_for_role(root_source.as_bytes(), PackageRole::Root);
         let path_packages = std::collections::BTreeMap::from([(
-            ResolverPathKey::new(package.clone(), "../sibling"),
+            ResolverPathKey::package(package.clone(), "../sibling"),
             package_version("acme:sibling", "1.0.0"),
         )]);
         let root_path_overrides = std::collections::BTreeMap::new();

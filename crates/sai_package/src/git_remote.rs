@@ -3437,10 +3437,29 @@ mod tests {
             source: requiring_source,
         };
         let root_context = path_discovery_root_context();
+        let matching_root_manifest = parse_for_role(
+            b"package acme:client @ 2.0.0\n\
+              source \"main.sai\"\n\
+              targets { wasm32-core }\n\
+              overrides { acme:ignored use git \"https://example.test/acme/ignored.git\" }\n\
+              requires { acme:sibling @ ^1 from path \"../sibling\" }\n",
+            PackageRole::Root,
+        );
+        let matching_root_context = ResolverContractContext::from_root_manifest(
+            &matching_root_manifest,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("valid root context for the fetched requiring package")
+        .into_owned();
         let mut fetch_count = 0;
 
-        let index =
-            discover_git_path_requirements(&fetched, &requiring, &root_context, |identity| {
+        let index = discover_git_path_requirements(
+            &fetched,
+            &MvsRequirer::Package(requiring.clone()),
+            &root_context,
+            |identity| {
                 fetch_count += 1;
                 assert_eq!(
                     identity,
@@ -3458,11 +3477,12 @@ mod tests {
                     source_identity: identity.clone(),
                     source,
                 })
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let path_key =
-            crate::resolver_contract::ResolverPathKey::new(requiring.clone(), "../sibling");
+            crate::resolver_contract::ResolverPathKey::package(requiring.clone(), "../sibling");
         let sibling_version = expected_package_version("acme:sibling", "1.4.0");
         assert_eq!(fetch_count, 1, "only the included sibling is fetched");
         assert_eq!(
@@ -3479,6 +3499,58 @@ mod tests {
                     .resolve_dependency_path("../sibling")
                     .unwrap()
             )
+        );
+
+        let mismatch = discover_git_path_requirements(
+            &fetched,
+            &MvsRequirer::Root(requiring.clone()),
+            &root_context,
+            |_| -> Result<FetchedGitPackage, ()> {
+                panic!("a root-context mismatch must fail before sibling fetch")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            mismatch,
+            crate::git_path_requirements::GitPathRequirementDiscoveryError::RootContextMismatch {
+                expected: Box::new(root_context.root_package().clone()),
+                found: Box::new(requiring.clone()),
+            }
+        );
+
+        let root_index = discover_git_path_requirements(
+            &fetched,
+            &MvsRequirer::Root(requiring.clone()),
+            &matching_root_context,
+            |identity| {
+                assert_eq!(
+                    identity,
+                    &requiring_identity
+                        .resolve_dependency_path("../sibling")
+                        .unwrap()
+                );
+                let source = reader
+                    .read_commit_repository_package_source_tree(
+                        identity.commit_id(),
+                        identity.directory(),
+                    )
+                    .unwrap();
+                Ok::<_, ()>(FetchedGitPackage {
+                    source_identity: identity.clone(),
+                    source,
+                })
+            },
+        )
+        .unwrap();
+        let root_path_key =
+            crate::resolver_contract::ResolverPathKey::root(requiring, "../sibling");
+        assert_eq!(
+            root_index.path_packages(),
+            &BTreeMap::from([(root_path_key.clone(), sibling_version.clone())])
+        );
+        assert_eq!(
+            root_index.package_version(&root_path_key),
+            Some(&sibling_version)
         );
     }
 
@@ -3500,7 +3572,7 @@ mod tests {
 
         let error = discover_git_path_requirements(
             &fetched,
-            &requiring,
+            &MvsRequirer::Package(requiring.clone()),
             &path_discovery_root_context(),
             |_| -> Result<FetchedGitPackage, ()> { panic!("escaping path must fail before fetch") },
         )
@@ -3523,7 +3595,7 @@ mod tests {
 
         let error = discover_git_path_requirements(
             &fetched,
-            &expected,
+            &MvsRequirer::Package(expected.clone()),
             &path_discovery_root_context(),
             |_| -> Result<FetchedGitPackage, ()> {
                 panic!("invalid requirer must fail before fetch")
@@ -3577,7 +3649,7 @@ mod tests {
 
         let error = discover_git_path_requirements(
             &fetched,
-            &requiring,
+            &MvsRequirer::Package(requiring.clone()),
             &path_discovery_root_context(),
             |identity| {
                 let source = reader
@@ -3646,7 +3718,7 @@ mod tests {
 
         let error = discover_git_path_requirements(
             &fetched,
-            &requiring,
+            &MvsRequirer::Package(requiring.clone()),
             &path_discovery_root_context(),
             |identity| {
                 fetch_count += 1;

@@ -10,27 +10,38 @@ use crate::manifest::{
     Override, OverrideSource, PackageDeclaration, PackageParseError, PackageParseOutput,
     PackageParseWarning, PackageRole, Requirement, RequirementSource, Spanned,
 };
-use crate::mvs::{MvsContract, MvsEdge, MvsInputError, MvsNode, MvsPackageVersion};
+use crate::mvs::{MvsContract, MvsEdge, MvsInputError, MvsNode, MvsPackageVersion, MvsRequirer};
 use crate::validation::{
     PackageValidationContext, PackageValidationError, PackageValidationWarning,
     validate as validate_package,
 };
 use crate::version::Version;
 
-/// A path requirement's resolved package, keyed by the requiring package and
+/// A path requirement's resolved package, keyed by the exact requirer role and
 /// the source spelling from its manifest.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ResolverPathKey {
-    pub requiring_package: MvsPackageVersion,
+    pub requirer: MvsRequirer,
     pub path: Box<str>,
 }
 
 impl ResolverPathKey {
-    pub fn new(requiring_package: MvsPackageVersion, path: impl Into<Box<str>>) -> Self {
+    /// Creates a key for a path requirement declared by this exact requirer.
+    pub fn new(requirer: MvsRequirer, path: impl Into<Box<str>>) -> Self {
         Self {
-            requiring_package,
+            requirer,
             path: path.into(),
         }
+    }
+
+    /// Creates a key for a dependency package's path requirement.
+    pub fn package(requiring_package: MvsPackageVersion, path: impl Into<Box<str>>) -> Self {
+        Self::new(MvsRequirer::Package(requiring_package), path)
+    }
+
+    /// Creates a key for a path requirement declared by the root package.
+    pub fn root(root_package: MvsPackageVersion, path: impl Into<Box<str>>) -> Self {
+        Self::new(MvsRequirer::Root(root_package), path)
     }
 }
 
@@ -39,7 +50,7 @@ impl ResolverPathKey {
 ///
 /// The path maps contain concrete package versions whose manifests have
 /// already been read and whose declared identity has been checked by the
-/// caller. Direct path requirements are keyed by requiring package version
+/// caller. Direct path requirements are keyed by the exact requiring role
 /// and source spelling. Root `use path` overrides are keyed by the overridden
 /// identity. Root Git overrides are read from the validated root manifest.
 #[derive(Clone, Debug)]
@@ -834,8 +845,11 @@ fn root_path_packages(
         .path_packages
         .iter()
         .filter_map(|(key, package_version)| {
-            (key.requiring_package == context.root_package)
-                .then_some((key.clone(), package_version.clone()))
+            matches!(
+                &key.requirer,
+                MvsRequirer::Root(package) if package == &context.root_package
+            )
+            .then_some((key.clone(), package_version.clone()))
         })
         .collect()
 }
@@ -1074,8 +1088,8 @@ impl fmt::Display for ResolverContractBuildError {
                 formatter,
                 "path `{}` from {}@{} was indexed as both {}@{} and {}@{}",
                 key.path,
-                key.requiring_package.package(),
-                key.requiring_package.version(),
+                key.requirer.package_version().package(),
+                key.requirer.package_version().version(),
                 existing.package(),
                 existing.version(),
                 discovered.package(),
@@ -1147,8 +1161,12 @@ pub fn build_resolver_contract(
                     .any(|target| context.root_targets.contains(&target.value))
             });
             let resolution = if included {
+                let requirer = match parsed.role() {
+                    PackageRole::Root => MvsRequirer::Root(package_version.clone()),
+                    PackageRole::Dependency => MvsRequirer::Package(package_version.clone()),
+                };
                 let (edge, named_version, pin) =
-                    build_edge(requirement, entry.span.clone(), &package_version, context)?;
+                    build_edge(requirement, entry.span.clone(), &requirer, context)?;
                 mvs_edges.push(edge);
                 ResolverRequirementResolution::Included { named_version, pin }
             } else {
@@ -1213,9 +1231,10 @@ fn validate_manifest(
 fn build_edge(
     requirement: &Requirement,
     span: Range<usize>,
-    requiring_package: &MvsPackageVersion,
+    requirer: &MvsRequirer,
     context: &ResolverContractContext<'_>,
 ) -> Result<(MvsEdge, Version, ResolverPinKind), ResolverContractBuildError> {
+    let requiring_package = requirer.package_version();
     let override_path = context
         .root_path_overrides
         .get(requirement.package.as_ref())
@@ -1247,7 +1266,7 @@ fn build_edge(
             ..
         }) = &requirement.source
     {
-        let key = ResolverPathKey::new(requiring_package.clone(), path.clone());
+        let key = ResolverPathKey::new(requirer.clone(), path.clone());
         let package_version = context.path_packages.get(&key).ok_or_else(|| {
             ResolverContractBuildError::MissingPathPackageVersion {
                 package: requirement.package.clone(),
@@ -1357,7 +1376,7 @@ mod tests {
         );
         let dependency_version = package_version("acme:dependency", "1.0.0");
         let sibling_version = package_version("acme:sibling", "1.2.0");
-        let key = ResolverPathKey::new(dependency_version, "../sibling");
+        let key = ResolverPathKey::package(dependency_version, "../sibling");
         let additions = BTreeMap::from([(key.clone(), sibling_version.clone())]);
         let derived_context = context
             .with_path_packages(&additions)
@@ -1382,13 +1401,62 @@ mod tests {
     }
 
     #[test]
+    fn path_package_keys_distinguish_root_and_dependency_roles_for_one_version() {
+        let root = parse(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:root-sibling @ ^1 from path \"../shared\" }\n",
+        );
+        let root_version = package_version("acme:root", "1.0.0");
+        let root_sibling_version = package_version("acme:root-sibling", "1.1.0");
+        let dependency_sibling_version = package_version("acme:dependency-sibling", "1.2.0");
+        let path_packages = BTreeMap::from([
+            (
+                ResolverPathKey::root(root_version.clone(), "../shared"),
+                root_sibling_version.clone(),
+            ),
+            (
+                ResolverPathKey::package(root_version.clone(), "../shared"),
+                dependency_sibling_version.clone(),
+            ),
+        ]);
+        let root_path_overrides = BTreeMap::new();
+        let context = root_context(&root, &path_packages, &root_path_overrides);
+        let root_contract =
+            build_resolver_contract(&root, &context, PackageValidationContext::default())
+                .expect("root path uses the root-keyed snapshot");
+
+        let dependency = parse_for_role(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires { acme:dependency-sibling @ ^1 from path \"../shared\" }\n",
+            PackageRole::Dependency,
+        );
+        let dependency_contract =
+            build_resolver_contract(&dependency, &context, PackageValidationContext::default())
+                .expect("same-version dependency uses its package-keyed snapshot");
+
+        assert_eq!(context.path_packages().len(), 2);
+        assert_eq!(
+            root_contract.mvs.edges()[0].named_version(),
+            root_sibling_version.version()
+        );
+        assert_eq!(
+            dependency_contract.mvs.edges()[0].named_version(),
+            dependency_sibling_version.version()
+        );
+    }
+
+    #[test]
     fn derived_context_rejects_conflicting_path_package_versions() {
         let root = parse(
             b"package acme:root @ 1.0.0\n\
               source \"src\"\n\
               targets { wasm32-core }\n",
         );
-        let key = ResolverPathKey::new(package_version("acme:root", "1.0.0"), "../local");
+        let key = ResolverPathKey::root(package_version("acme:root", "1.0.0"), "../local");
         let indexed_version = package_version("acme:local", "1.1.0");
         let path_packages = BTreeMap::from([(key.clone(), indexed_version.clone())]);
         let root_path_overrides = BTreeMap::new();
@@ -1420,7 +1488,7 @@ mod tests {
         let root_version = package_version("acme:root", "1.0.0");
         let local_version = package_version("acme:local", "1.2.0");
         let sibling_version = package_version("acme:sibling", "1.4.0");
-        let sibling_key = ResolverPathKey::new(root_version.clone(), "../sibling");
+        let sibling_key = ResolverPathKey::root(root_version.clone(), "../sibling");
         let root_contract;
         let owned = {
             let path_packages = BTreeMap::from([(sibling_key.clone(), sibling_version.clone())]);
@@ -1586,7 +1654,7 @@ overrides {
         );
         let root_version = package_version("acme:app", "1.0.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(root_version, "../local"),
+            ResolverPathKey::root(root_version, "../local"),
             package_version("acme:local", "1.5.0"),
         )]);
         let root_path_overrides = BTreeMap::from([(
@@ -1706,7 +1774,7 @@ overrides { acme:dep use git "https://example.test/fork" }
         );
         let root_version = package_version("acme:app", "1.0.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(root_version, "../dep"),
+            ResolverPathKey::root(root_version, "../dep"),
             package_version("acme:dep", "1.5.0"),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -1943,7 +2011,7 @@ requires { acme:local @ ^1 from path "../local" }
         );
         let root_version = package_version("acme:app", "1.0.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(root_version, "../local"),
+            ResolverPathKey::root(root_version, "../local"),
             package_version("acme:local", "2.0.0"),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -2146,11 +2214,11 @@ targets { wasm32-core }
         );
         let requiring_version = package_version("acme:dep", "1.0.0");
         let expected_paths = BTreeMap::from([(
-            ResolverPathKey::new(requiring_version.clone(), "../local"),
+            ResolverPathKey::package(requiring_version.clone(), "../local"),
             package_version("acme:local", "1.1.0"),
         )]);
         let actual_paths = BTreeMap::from([(
-            ResolverPathKey::new(requiring_version, "../local"),
+            ResolverPathKey::package(requiring_version, "../local"),
             package_version("acme:local", "1.2.0"),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -2206,7 +2274,7 @@ targets { wasm32-core }
         );
         let requiring_version = package_version("acme:dep", "1.0.0");
         let path_packages = BTreeMap::from([(
-            ResolverPathKey::new(requiring_version, "../local"),
+            ResolverPathKey::package(requiring_version, "../local"),
             package_version("acme:local", "1.1.0"),
         )]);
         let empty_root_overrides = BTreeMap::new();
@@ -2304,15 +2372,15 @@ targets { wasm32-core }
         let other_version = package_version("acme:other", "1.0.0");
         let path_packages = BTreeMap::from([
             (
-                ResolverPathKey::new(requiring_version.clone(), "../child"),
+                ResolverPathKey::package(requiring_version.clone(), "../child"),
                 local_version.clone(),
             ),
             (
-                ResolverPathKey::new(requiring_version.clone(), "../tmp/../child"),
+                ResolverPathKey::package(requiring_version.clone(), "../tmp/../child"),
                 local_version,
             ),
             (
-                ResolverPathKey::new(requiring_version, "../other"),
+                ResolverPathKey::package(requiring_version, "../other"),
                 other_version,
             ),
         ]);
@@ -2483,11 +2551,11 @@ requires { acme:local @ ^1 from path "../local" }
         let root_version = package_version("acme:app", "1.0.0");
         let root_path_overrides = BTreeMap::new();
         let expected_paths = BTreeMap::from([(
-            ResolverPathKey::new(root_version.clone(), "../local"),
+            ResolverPathKey::root(root_version.clone(), "../local"),
             package_version("acme:local", "1.0.0"),
         )]);
         let actual_paths = BTreeMap::from([(
-            ResolverPathKey::new(root_version, "../local"),
+            ResolverPathKey::root(root_version, "../local"),
             package_version("acme:local", "1.1.0"),
         )]);
         let expected_context = root_context(&root, &expected_paths, &root_path_overrides);

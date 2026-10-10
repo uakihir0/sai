@@ -850,7 +850,7 @@ mod tests {
             .expect("index root package");
 
         let path_packages = BTreeMap::from([(
-            crate::resolver_contract::ResolverPathKey::new(root_version.clone(), "../dependency"),
+            crate::resolver_contract::ResolverPathKey::root(root_version.clone(), "../dependency"),
             dependency_version.clone(),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -1422,7 +1422,7 @@ requires { acme:dep @ ^1 from git "https://example.test/root-dep" }
         );
         let caller_version = package_version("acme:zz", "1.0.0");
         let path_packages = BTreeMap::from([(
-            crate::resolver_contract::ResolverPathKey::new(caller_version.clone(), "../dep"),
+            crate::resolver_contract::ResolverPathKey::package(caller_version.clone(), "../dep"),
             package_version("acme:dep", "1.0.0"),
         )]);
         let root_path_overrides = BTreeMap::new();
@@ -1828,7 +1828,7 @@ requires { acme:dep @ ^1 from path "../dep" }
         );
         let root_version = package_version("acme:app", "1.0.0");
         let path_packages = BTreeMap::from([(
-            crate::resolver_contract::ResolverPathKey::new(root_version, "../dep"),
+            crate::resolver_contract::ResolverPathKey::root(root_version, "../dep"),
             package_version("acme:dep", "1.5.0"),
         )]);
         let root_path_overrides = BTreeMap::new();
