@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use crate::git_remote::GitRemoteReleaseContractError;
 use crate::lexer::PackageLexErrorKind;
-use crate::local_source::LocalPackagePathIndexError;
+use crate::local_source::{LocalPackageContractLoadError, LocalPackagePathIndexError};
 use crate::manifest::{
     OverrideSource, PackageDeclaration, PackageParseError, PackageParseErrorKind, PackageRole,
     RequirementSource, parse_for_role,
@@ -24,7 +25,9 @@ use crate::mvs_graph_validation::{
     MvsDependencyCycle, MvsDuplicatePackageLines, MvsSelectedGraphInputError, MvsVersionConflict,
     check_selected_graph, duplicate_package_lines,
 };
-use crate::resolver_contract::{ResolverContractEdge, ResolverContractSourceClause};
+use crate::resolver_contract::{
+    ResolverContractBuildError, ResolverContractEdge, ResolverContractSourceClause,
+};
 use crate::resolver_source::{
     ResolverPackageSource, ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
 };
@@ -32,7 +35,9 @@ use crate::resolver_source_provider::{
     ResolverFinalContractAudit, ResolverReloadedContractComparison, ResolverSourceIdentityFailure,
     ResolverSourceIdentityFailureKind, ResolverSourceIdentitySide,
 };
-use crate::validation::resolve_package_lint_settings_from_parsed;
+use crate::validation::{
+    PackageValidationError, PackageValidationErrorKind, resolve_package_lint_settings_from_parsed,
+};
 use crate::version::Version;
 use crate::version_req::VersionReq;
 use sai_diagnostics::{
@@ -44,6 +49,7 @@ use sai_diagnostics::{
 
 const MAX_FINAL_MANIFEST_SYNTAX_ISSUES: usize = 32;
 const MAX_FINAL_MANIFEST_SYNTAX_CANDIDATES: usize = (MAX_FINAL_MANIFEST_SYNTAX_ISSUES + 1) * 3;
+const MAX_FINAL_MANIFEST_SEMANTIC_ISSUES: usize = 32;
 
 /// Source identity for one parsed package manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +138,143 @@ fn expected_tokens_from_description(description: &str) -> Option<Vec<String>> {
         _ => return None,
     };
     Some(alternatives.into_iter().map(str::to_owned).collect())
+}
+
+fn final_manifest_semantic_diagnostic(error: &PackageValidationErrorKind) -> (Code, &'static str) {
+    let (code, message) = match error {
+        PackageValidationErrorKind::MissingTargets => {
+            ("MISSING_TARGETS", "package has no targets declaration")
+        }
+        PackageValidationErrorKind::PackageHasNoContent => (
+            "PACKAGE_HAS_NO_CONTENT",
+            "package declares neither a source directory nor an artifact",
+        ),
+        PackageValidationErrorKind::UnknownTarget(_) => ("UNKNOWN_TARGET", "unknown target name"),
+        PackageValidationErrorKind::OnlyTargetNotDeclared(_) => (
+            "ONLY_TARGET_NOT_DECLARED",
+            "dependency is restricted to a target not declared by this package",
+        ),
+        PackageValidationErrorKind::ArtifactTargetNotDeclared(_) => (
+            "ARTIFACT_TARGET_NOT_DECLARED",
+            "artifact names a target not declared by this package",
+        ),
+        PackageValidationErrorKind::ArtifactOnCoreTarget(_) => (
+            "ARTIFACT_ON_CORE_TARGET",
+            "artifact target must be a component target",
+        ),
+        PackageValidationErrorKind::MissingArtifactForTarget(_) => (
+            "MISSING_ARTIFACT_FOR_TARGET",
+            "package has no artifact for one of its declared targets",
+        ),
+        PackageValidationErrorKind::WitRequired => {
+            ("WIT_REQUIRED", "artifact packages require a WIT directory")
+        }
+        PackageValidationErrorKind::MissingExportWorld => (
+            "MISSING_EXPORT_WORLD",
+            "artifact packages require an exported world",
+        ),
+        PackageValidationErrorKind::InvalidWorldName(_) => (
+            "INVALID_WORLD_NAME",
+            "exported world name is invalid for this package",
+        ),
+        PackageValidationErrorKind::MissingSource(_) => (
+            "MISSING_SOURCE",
+            "dependency requirement does not declare a source",
+        ),
+        PackageValidationErrorKind::InvalidPackageName(_) => {
+            ("INVALID_PACKAGE_NAME", "invalid package identity")
+        }
+        PackageValidationErrorKind::InvalidDescription => (
+            "INVALID_DESCRIPTION",
+            "description must be a single line of at most 1024 UTF-8 bytes",
+        ),
+        PackageValidationErrorKind::ImplicitPackageRequired(_) => (
+            "IMPLICIT_PACKAGE_REQUIRED",
+            "implicit runtime packages cannot be used directly here",
+        ),
+        PackageValidationErrorKind::PackageRequiresItself(_) => {
+            ("PACKAGE_REQUIRES_ITSELF", "package cannot require itself")
+        }
+        PackageValidationErrorKind::DuplicateRequirement(_) => (
+            "DUPLICATE_REQUIREMENT",
+            "package is required more than once",
+        ),
+        PackageValidationErrorKind::InvalidCapabilityName(_) => {
+            ("INVALID_CAPABILITY_NAME", "invalid capability name")
+        }
+        PackageValidationErrorKind::CapabilityAllowDenyConflict(_) => (
+            "CAPABILITY_ALLOW_DENY_CONFLICT",
+            "capability appears in both allow and deny declarations",
+        ),
+        PackageValidationErrorKind::UnknownPolicyItem(_) => {
+            ("UNKNOWN_POLICY_ITEM", "unknown package policy item")
+        }
+        PackageValidationErrorKind::PolicyItemIsCapability(_) => (
+            "POLICY_ITEM_IS_CAPABILITY",
+            "capability name cannot be used as a policy item",
+        ),
+        PackageValidationErrorKind::UnknownLint(_) => ("UNKNOWN_LINT", "unknown lint code"),
+        PackageValidationErrorKind::NotALint(_) => (
+            "NOT_A_LINT",
+            "hard diagnostic codes cannot be used as lints",
+        ),
+        PackageValidationErrorKind::UnknownProfile(_) => {
+            ("UNKNOWN_PROFILE", "unknown build profile")
+        }
+        PackageValidationErrorKind::ProfileAllowExceedsPackage(_) => (
+            "PROFILE_ALLOW_EXCEEDS_PACKAGE",
+            "profile allows a capability not allowed by the package",
+        ),
+        PackageValidationErrorKind::UnknownBudgetMetric(_) => {
+            ("UNKNOWN_BUDGET_METRIC", "unknown size budget metric")
+        }
+        PackageValidationErrorKind::InvalidSize => {
+            ("INVALID_SIZE", "invalid size budget amount or unit")
+        }
+        PackageValidationErrorKind::AllocatorNotRequired(_) => (
+            "ALLOCATOR_NOT_REQUIRED",
+            "allocator package is not required by the root package",
+        ),
+        PackageValidationErrorKind::DuplicateOverride { kind, .. } => match kind {
+            crate::validation::OverrideKind::Source => (
+                "DUPLICATE_OVERRIDE",
+                "package has more than one source override for this identity",
+            ),
+            crate::validation::OverrideKind::Artifact => (
+                "DUPLICATE_OVERRIDE",
+                "package has more than one artifact override for this identity",
+            ),
+        },
+        PackageValidationErrorKind::CompilerVersionMismatch { .. } => (
+            "COMPILER_VERSION_MISMATCH",
+            "package compiler requirement does not match the current compiler",
+        ),
+    };
+    (
+        Code::from_name(code).expect("package validation diagnostic code is registered"),
+        message,
+    )
+}
+
+fn final_manifest_semantic_validation_errors(
+    error: &MixedSourceFinalReloadError,
+) -> Option<&[PackageValidationError]> {
+    let build_error = match error {
+        MixedSourceFinalReloadError::LocalContract(error) => match error.as_ref() {
+            LocalPackageContractLoadError::InvalidContract(error) => error,
+            LocalPackageContractLoadError::PackageVersionMismatch { .. } => return None,
+        },
+        MixedSourceFinalReloadError::GitContract(error) => match error.as_ref() {
+            GitRemoteReleaseContractError::InvalidContract(error) => error,
+            GitRemoteReleaseContractError::ReleaseTagVersionMismatch { .. }
+            | GitRemoteReleaseContractError::PackageVersionMismatch { .. } => return None,
+        },
+        _ => return None,
+    };
+    match build_error {
+        ResolverContractBuildError::SemanticValidationErrors(errors) => Some(errors),
+        _ => None,
+    }
 }
 
 fn final_manifest_syntax_issues(
@@ -1515,7 +1658,25 @@ pub fn mixed_source_reload_failure_diagnostics(
                     .is_some_and(|manifest| !manifest.final_manifest_syntax_issues.is_empty())
         })
         .collect::<Vec<_>>();
-    if reportable_failures.is_empty() && final_syntax_packages.is_empty() {
+    let final_semantic_failures = audit_plan
+        .reload_failures()
+        .iter()
+        .filter_map(|failure| {
+            let package_version = failure.package_version.as_ref()?;
+            audit_plan
+                .final_sources()
+                .entries()
+                .iter()
+                .any(|entry| entry.package_version() == package_version)
+                .then_some(())?;
+            let errors = final_manifest_semantic_validation_errors(&failure.error)?;
+            (!errors.is_empty()).then_some((package_version, errors))
+        })
+        .collect::<Vec<_>>();
+    if reportable_failures.is_empty()
+        && final_syntax_packages.is_empty()
+        && final_semantic_failures.is_empty()
+    {
         return Ok(Vec::new());
     }
     let explanations = explanation_graph_for_mvs_diagnostics(selection)?;
@@ -1599,6 +1760,84 @@ pub fn mixed_source_reload_failure_diagnostics(
                         kind: ChildKind::Note,
                         message: format!(
                             "additional final manifest syntax errors were omitted after the limit of {MAX_FINAL_MANIFEST_SYNTAX_ISSUES}"
+                        ),
+                        location: None,
+                    })
+                    .expect("a new diagnostic has no snapshot-bound locations");
+            }
+            diagnostics.push(diagnostic);
+        }
+    }
+    for (package_version, errors) in final_semantic_failures {
+        let manifest = manifests.final_package(package_version).ok_or_else(|| {
+            MvsDuplicatePackageLineDiagnosticError::MissingFinalManifestLocation(Box::new(
+                package_version.clone(),
+            ))
+        })?;
+        let chain = explanations
+            .chain_to_package_version(package_version)
+            .map_err(|error| {
+                MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+            })?;
+        let error_count = errors.len().min(MAX_FINAL_MANIFEST_SEMANTIC_ISSUES);
+        let omitted_errors = errors.len() > error_count;
+        for (issue_index, error) in errors.iter().take(error_count).enumerate() {
+            let (code, message) = final_manifest_semantic_diagnostic(&error.kind);
+            let primary = manifest_span_location(
+                manifest,
+                &MvsRequirer::Package(package_version.clone()),
+                &error.span,
+            )?;
+            let mut diagnostic = Diagnostic::new(
+                code,
+                Severity::Error,
+                format!(
+                    "could not reload selected package {}@{}: {message}",
+                    package_version.package(),
+                    package_version.version()
+                ),
+                Some(primary),
+            );
+            diagnostic.primary_label = message.to_owned();
+            diagnostic.package = Some(package_version.package().to_owned());
+            let mut data = ValueObject::new();
+            data.insert(
+                "package".to_owned(),
+                Value::String(package_version.package().to_owned()),
+            );
+            data.insert(
+                "version".to_owned(),
+                Value::String(package_version.version().to_string()),
+            );
+            data.insert(
+                "stage".to_owned(),
+                Value::String("final_source_reload".to_owned()),
+            );
+            data.insert(
+                "requirement_chain".to_owned(),
+                requirement_chain_data(&chain, manifests)?,
+            );
+            if omitted_errors && issue_index + 1 == error_count {
+                data.insert(
+                    "additional_semantic_errors_omitted".to_owned(),
+                    Value::Bool(true),
+                );
+            }
+            diagnostic.data = data;
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Note,
+                    message: "the selected package is reached through:".to_owned(),
+                    location: None,
+                })
+                .expect("a new diagnostic has no snapshot-bound locations");
+            add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
+            if omitted_errors && issue_index + 1 == error_count {
+                diagnostic
+                    .push_child(Child {
+                        kind: ChildKind::Note,
+                        message: format!(
+                            "additional final manifest semantic errors were omitted after the limit of {MAX_FINAL_MANIFEST_SEMANTIC_ISSUES}"
                         ),
                         location: None,
                     })
@@ -3581,10 +3820,10 @@ mod tests {
         MAX_FINAL_MANIFEST_SYNTAX_ISSUES, MvsDuplicatePackageLineDiagnosticContext,
         MvsDuplicatePackageLineDiagnosticError, MvsManifestLocation, MvsManifestLocations,
         divergent_sources_diagnostic, duplicate_package_line_diagnostic,
-        duplicate_package_line_diagnostics, final_manifest_syntax_issues,
-        mixed_source_identity_failure_diagnostics, resolver_source_selection_location,
-        sort_and_deduplicate_reload_failure_diagnostics, version_conflict_diagnostic,
-        version_conflict_diagnostics,
+        duplicate_package_line_diagnostics, final_manifest_semantic_diagnostic,
+        final_manifest_syntax_issues, mixed_source_identity_failure_diagnostics,
+        resolver_source_selection_location, sort_and_deduplicate_reload_failure_diagnostics,
+        version_conflict_diagnostic, version_conflict_diagnostics,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{
@@ -3605,7 +3844,9 @@ mod tests {
         ResolverSourceIdentityFailure, ResolverSourceIdentityFailureKind,
         ResolverSourceIdentitySide, ResolverSourceReload,
     };
-    use crate::validation::{PackageValidationContext, validate};
+    use crate::validation::{
+        OverrideKind, PackageValidationContext, PackageValidationErrorKind, validate,
+    };
     use crate::version::Version;
     use crate::version_req::VersionReq;
 
@@ -3967,6 +4208,145 @@ mod tests {
                 Some(expected),
                 "unexpected token set for parser expectation {description:?}"
             );
+        }
+    }
+
+    #[test]
+    fn final_manifest_semantic_diagnostics_use_registered_package_codes() {
+        let cases = [
+            (
+                PackageValidationErrorKind::MissingTargets,
+                "MISSING_TARGETS",
+            ),
+            (
+                PackageValidationErrorKind::PackageHasNoContent,
+                "PACKAGE_HAS_NO_CONTENT",
+            ),
+            (
+                PackageValidationErrorKind::UnknownTarget("target".into()),
+                "UNKNOWN_TARGET",
+            ),
+            (
+                PackageValidationErrorKind::OnlyTargetNotDeclared("target".into()),
+                "ONLY_TARGET_NOT_DECLARED",
+            ),
+            (
+                PackageValidationErrorKind::ArtifactTargetNotDeclared("target".into()),
+                "ARTIFACT_TARGET_NOT_DECLARED",
+            ),
+            (
+                PackageValidationErrorKind::ArtifactOnCoreTarget("target".into()),
+                "ARTIFACT_ON_CORE_TARGET",
+            ),
+            (
+                PackageValidationErrorKind::MissingArtifactForTarget("target".into()),
+                "MISSING_ARTIFACT_FOR_TARGET",
+            ),
+            (PackageValidationErrorKind::WitRequired, "WIT_REQUIRED"),
+            (
+                PackageValidationErrorKind::MissingExportWorld,
+                "MISSING_EXPORT_WORLD",
+            ),
+            (
+                PackageValidationErrorKind::InvalidWorldName("world".into()),
+                "INVALID_WORLD_NAME",
+            ),
+            (
+                PackageValidationErrorKind::MissingSource("acme:dep".into()),
+                "MISSING_SOURCE",
+            ),
+            (
+                PackageValidationErrorKind::InvalidPackageName("invalid".into()),
+                "INVALID_PACKAGE_NAME",
+            ),
+            (
+                PackageValidationErrorKind::InvalidDescription,
+                "INVALID_DESCRIPTION",
+            ),
+            (
+                PackageValidationErrorKind::ImplicitPackageRequired("sai:core".into()),
+                "IMPLICIT_PACKAGE_REQUIRED",
+            ),
+            (
+                PackageValidationErrorKind::PackageRequiresItself("acme:self".into()),
+                "PACKAGE_REQUIRES_ITSELF",
+            ),
+            (
+                PackageValidationErrorKind::DuplicateRequirement("acme:dep".into()),
+                "DUPLICATE_REQUIREMENT",
+            ),
+            (
+                PackageValidationErrorKind::InvalidCapabilityName("invalid".into()),
+                "INVALID_CAPABILITY_NAME",
+            ),
+            (
+                PackageValidationErrorKind::CapabilityAllowDenyConflict("alloc".into()),
+                "CAPABILITY_ALLOW_DENY_CONFLICT",
+            ),
+            (
+                PackageValidationErrorKind::UnknownPolicyItem("policy".into()),
+                "UNKNOWN_POLICY_ITEM",
+            ),
+            (
+                PackageValidationErrorKind::PolicyItemIsCapability("alloc".into()),
+                "POLICY_ITEM_IS_CAPABILITY",
+            ),
+            (
+                PackageValidationErrorKind::UnknownLint("UNKNOWN".into()),
+                "UNKNOWN_LINT",
+            ),
+            (
+                PackageValidationErrorKind::NotALint("EXPECTED_TOKEN".into()),
+                "NOT_A_LINT",
+            ),
+            (
+                PackageValidationErrorKind::UnknownProfile("fast".into()),
+                "UNKNOWN_PROFILE",
+            ),
+            (
+                PackageValidationErrorKind::ProfileAllowExceedsPackage("host".into()),
+                "PROFILE_ALLOW_EXCEEDS_PACKAGE",
+            ),
+            (
+                PackageValidationErrorKind::UnknownBudgetMetric("memory".into()),
+                "UNKNOWN_BUDGET_METRIC",
+            ),
+            (PackageValidationErrorKind::InvalidSize, "INVALID_SIZE"),
+            (
+                PackageValidationErrorKind::AllocatorNotRequired("acme:alloc".into()),
+                "ALLOCATOR_NOT_REQUIRED",
+            ),
+            (
+                PackageValidationErrorKind::DuplicateOverride {
+                    package: "acme:dep".into(),
+                    kind: OverrideKind::Source,
+                },
+                "DUPLICATE_OVERRIDE",
+            ),
+            (
+                PackageValidationErrorKind::DuplicateOverride {
+                    package: "acme:dep".into(),
+                    kind: OverrideKind::Artifact,
+                },
+                "DUPLICATE_OVERRIDE",
+            ),
+            (
+                PackageValidationErrorKind::CompilerVersionMismatch {
+                    requirement: "^1".into(),
+                    found: "0.1.0".into(),
+                },
+                "COMPILER_VERSION_MISMATCH",
+            ),
+        ];
+        assert_eq!(cases.len(), 30);
+        for (error, expected_code) in cases {
+            let (code, message) = final_manifest_semantic_diagnostic(&error);
+            assert_eq!(
+                code.as_str(),
+                expected_code,
+                "incorrect mapping for {error:?}"
+            );
+            assert!(!message.is_empty(), "empty diagnostic for {error:?}");
         }
     }
 

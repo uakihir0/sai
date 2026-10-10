@@ -4470,7 +4470,7 @@ mod tests {
                                          targets { wasm32-core }\n";
         let final_target_manifest = b"package acme:target @ 1.0.0\n\
                                      source \"main.sai\"\n\
-                                     targets { wasm32-core }\n\
+                                     targets { wasm32-core, wasm32-invalid }\n\
                                      requires { acme:outside @ ^1 from path \"../../../outside\" }\n";
         let late_manifest = b"package acme:z-late @ 1.0.0\n\
                               source \"main.sai\"\n\
@@ -4586,7 +4586,13 @@ mod tests {
         let failure = audit_plan
             .reload_failures()
             .iter()
-            .find(|failure| failure.package_version.as_ref() == Some(&target_version))
+            .find(|failure| {
+                failure.package_version.as_ref() == Some(&target_version)
+                    && matches!(
+                        &failure.error,
+                        crate::mixed_source::MixedSourceFinalReloadError::GitPathDiscovery(_)
+                    )
+            })
             .expect("the final Git path failure is retained");
         let crate::mixed_source::MixedSourceFinalReloadError::GitPathDiscovery(error) =
             &failure.error
@@ -4609,6 +4615,26 @@ mod tests {
         assert_eq!(
             failure.error.diagnostic_code(),
             Some(sai_diagnostics::Code::PathEscapesRepository)
+        );
+        assert!(
+            audit_plan.reload_failures().iter().any(|failure| {
+                failure.package_version.as_ref() == Some(&target_version)
+                    && matches!(
+                        &failure.error,
+                        crate::mixed_source::MixedSourceFinalReloadError::GitContract(error)
+                            if matches!(
+                                error.as_ref(),
+                                GitRemoteReleaseContractError::InvalidContract(
+                                    crate::resolver_contract::ResolverContractBuildError::SemanticValidationErrors(errors)
+                                ) if errors.iter().any(|error| matches!(
+                                    &error.kind,
+                                    crate::validation::PackageValidationErrorKind::UnknownTarget(target)
+                                        if target.as_ref() == "wasm32-invalid"
+                                ))
+                            )
+                    )
+            }),
+            "the final Git contract retains the independent semantic validation error"
         );
 
         let root_version = expected_package_version("acme:root", "1.0.0");
@@ -4710,16 +4736,20 @@ mod tests {
             &manifests,
         )
         .unwrap();
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        let path_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::PathEscapesRepository)
+            .expect("the independent final Git path failure is reported");
+        let semantic_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_str() == "UNKNOWN_TARGET")
+            .expect("the final Git semantic error is reported");
         assert_eq!(
-            diagnostics[0].code,
-            sai_diagnostics::Code::PathEscapesRepository
-        );
-        assert_eq!(
-            diagnostics[0].primary_label,
+            path_diagnostic.primary_label,
             "this path dependency could not be resolved in the final source"
         );
-        let primary = diagnostics[0]
+        let primary = path_diagnostic
             .primary()
             .expect("the diagnostic points into the final Git manifest");
         assert_eq!(primary.span.file, final_file_id);
@@ -4739,6 +4769,23 @@ mod tests {
                 .source()
                 .raw_bytes(),
             final_target_manifest
+        );
+        let semantic_primary = semantic_diagnostic
+            .primary()
+            .expect("the semantic diagnostic points into the final Git manifest");
+        assert_eq!(semantic_primary.span.file, final_file_id);
+        assert_eq!(
+            &snapshot
+                .file(semantic_primary.span.file)
+                .unwrap()
+                .source()
+                .raw_bytes()[semantic_primary.span.range.start().to_usize()
+                ..semantic_primary.span.range.end().to_usize()],
+            b"wasm32-invalid"
+        );
+        assert!(
+            semantic_diagnostic.data.contains_key("requirement_chain"),
+            "the final Git semantic error retains the original MVS chain"
         );
     }
 

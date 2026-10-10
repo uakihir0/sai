@@ -1667,7 +1667,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mixed_source_reload_diagnostics_report_final_local_path_failures_safely() {
+    fn mixed_source_reload_diagnostics_report_final_path_and_semantic_failures() {
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::new();
@@ -1686,7 +1686,7 @@ mod tests {
                               targets { wasm32-core }\n";
         let final_manifest = b"package acme:target @ 1.0.0\n\
                               source \"src\"\n\
-                              targets { wasm32-core }\n\
+                              targets { wasm32-core, wasm32-invalid }\n\
                               requires { acme:secret @ ^1 from path \"missing/private-workspace\" }\n";
         std::fs::write(root_path.join("sai.package"), root_manifest).unwrap();
         std::fs::write(root_path.join("src/main.sai"), b"fn main() {}\n").unwrap();
@@ -1766,21 +1766,28 @@ mod tests {
                 &mixed_output,
                 &audit_plan,
                 root_file,
-                &BTreeMap::from([(target_version, target_file)]),
+                &BTreeMap::from([(target_version.clone(), target_file)]),
             )
             .expect("the reload failure is bound to the original workspace");
 
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code.as_str(), "PATH_PACKAGE_NOT_FOUND");
+        assert_eq!(diagnostics.len(), 2);
+        let path_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_str() == "PATH_PACKAGE_NOT_FOUND")
+            .expect("the missing path package remains reportable");
+        let semantic_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_str() == "UNKNOWN_TARGET")
+            .expect("the invalid final target is source-located");
         assert_eq!(
-            diagnostics[0].message,
+            path_diagnostic.message,
             "could not reload selected package acme:target@1.0.0: a local package required by the final source was not found"
         );
         assert_eq!(
-            diagnostics[0].primary_label,
+            path_diagnostic.primary_label,
             "this path dependency could not be resolved in the final source"
         );
-        let primary = diagnostics[0]
+        let primary = path_diagnostic
             .primary()
             .expect("final-manifest path requirement location");
         assert!(
@@ -1811,11 +1818,11 @@ mod tests {
             b"acme:secret @ ^1 from path \"missing/private-workspace\""
         );
         assert!(
-            diagnostics[0].data.contains_key("requirement_chain"),
+            path_diagnostic.data.contains_key("requirement_chain"),
             "the original MVS chain remains attached"
         );
         assert!(
-            diagnostics[0].children().iter().any(|child| {
+            path_diagnostic.children().iter().any(|child| {
                 child.location.as_ref().is_some_and(|location| {
                     location.file.path == "sai.package"
                         && location.file.package.as_deref() == Some("acme:root@1.0.0")
@@ -1824,9 +1831,89 @@ mod tests {
             "the original MVS edge remains attached to the read-time root manifest"
         );
         assert!(
-            !diagnostics[0].message.contains("missing/private-workspace"),
+            !path_diagnostic
+                .message
+                .contains("missing/private-workspace"),
             "final paths are not exposed in diagnostics"
         );
+
+        let semantic_primary = semantic_diagnostic
+            .primary()
+            .expect("the semantic error points into the final manifest");
+        let semantic_source = diagnostics
+            .snapshot()
+            .file(semantic_primary.span.file)
+            .expect("the augmented snapshot includes the final semantic source");
+        assert_eq!(
+            &semantic_source.source().raw_bytes()[semantic_primary.span.range.start().to_usize()
+                ..semantic_primary.span.range.end().to_usize()],
+            b"wasm32-invalid"
+        );
+        assert!(
+            semantic_diagnostic.data.contains_key("requirement_chain"),
+            "semantic diagnostics retain the original MVS chain"
+        );
+
+        let mut oversized_final_manifest =
+            String::from("package acme:target @ 1.0.0\nsource \"src\"\ntargets { wasm32-core");
+        for index in 0..40 {
+            oversized_final_manifest.push_str(&format!(", unknown_target_{index}"));
+        }
+        oversized_final_manifest.push_str(
+            " }\nrequires { acme:secret @ ^1 from path \"missing/private-workspace\" }\n",
+        );
+        std::fs::write(
+            final_path.join("sai.package"),
+            oversized_final_manifest.as_bytes(),
+        )
+        .unwrap();
+        let truncated_audit_plan = mixed_output
+            .plan_final_source_audit(
+                &HashMap::new(),
+                &HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("this fixture has no Git release"),
+                |_, _| unreachable!("this fixture has no Git path"),
+            )
+            .expect("semantic validation errors are retained for diagnostics");
+        let truncated_diagnostics = database
+            .mixed_source_reload_diagnostics(
+                &snapshot,
+                &mixed_output,
+                &truncated_audit_plan,
+                root_file,
+                &BTreeMap::from([(target_version, target_file)]),
+            )
+            .expect("bounded semantic diagnostics are produced");
+        let target_semantic_diagnostics = truncated_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code.as_str() == "UNKNOWN_TARGET")
+            .collect::<Vec<_>>();
+        assert_eq!(target_semantic_diagnostics.len(), 32);
+        let omission_indices = target_semantic_diagnostics
+            .iter()
+            .enumerate()
+            .filter_map(|(index, diagnostic)| {
+                matches!(
+                    diagnostic.data.get("additional_semantic_errors_omitted"),
+                    Some(sai_diagnostics::Value::Bool(true))
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            omission_indices,
+            vec![target_semantic_diagnostics.len() - 1],
+            "only the final emitted semantic diagnostic marks omitted errors"
+        );
+        let omission_diagnostic = target_semantic_diagnostics
+            .last()
+            .expect("the bounded diagnostics include a final entry");
+        assert!(omission_diagnostic.children().iter().any(|child| {
+            child
+                .message
+                .contains("additional final manifest semantic errors were omitted")
+        }));
     }
 
     #[test]
