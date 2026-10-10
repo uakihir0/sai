@@ -1080,9 +1080,9 @@ pub fn mixed_source_identity_failure_diagnostics(
 }
 
 /// Builds source-located diagnostics for final reload failures that have a
-/// safe, package-level classification. Local path-requirement failures point
-/// into their retained final manifest; the original MVS chain remains bound
-/// to the read-time manifests.
+/// safe, package-level classification. Local and Git path-requirement failures
+/// point into their retained final manifest; the original MVS chain remains
+/// bound to the read-time manifests.
 pub fn mixed_source_reload_failure_diagnostics(
     mixed_source: &MixedSourceMvsOutput,
     audit_plan: &MixedSourceFinalAuditPlan,
@@ -1119,6 +1119,14 @@ pub fn mixed_source_reload_failure_diagnostics(
                     }),
                     _ => None,
                 },
+                MixedSourceFinalReloadError::GitPathDiscovery(error) => {
+                    error.requirement_edge().map(|edge| FinalPathRequirement {
+                        requirement_package: edge.package(),
+                        path: edge.path(),
+                        requiring_package: package_version,
+                        span: edge.span().clone(),
+                    })
+                }
                 _ => None,
             };
             Some(ReportableFinalReloadFailure {

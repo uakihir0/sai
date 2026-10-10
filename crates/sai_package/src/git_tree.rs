@@ -326,6 +326,15 @@ impl GitPackageSourceTree {
         &self.package_manifest
     }
 
+    /// The exact bytes of the `sai.package` file in this source snapshot.
+    pub fn package_manifest_bytes(&self) -> &[u8] {
+        self.files
+            .iter()
+            .find(|file| file.path() == "sai.package")
+            .expect("a Git package source tree retains its package manifest")
+            .content()
+    }
+
     /// The selected regular files, sorted by their UTF-8 path bytes.
     pub fn files(&self) -> &[GitPackageFile] {
         &self.files

@@ -336,15 +336,23 @@ impl MixedSourceMvsOutput {
                     }
                 }
                 Some(MixedSourceFinalSnapshot::GitRelease(release)) => {
-                    append_final_git_path_packages(
+                    if let Err(error) = append_final_git_path_packages(
                         release.as_ref(),
                         package_version,
                         &self.root_context,
                         locked_packages,
                         &mut fetch_git_sibling,
                         &mut final_path_packages,
-                        &mut reload_failures,
-                    );
+                    ) {
+                        final_manifest_snapshots.insert(
+                            package_version.clone(),
+                            Arc::from(release.package_manifest_bytes()),
+                        );
+                        reload_failures.push(MixedSourceFinalReloadFailure {
+                            package_version: Some(package_version.clone()),
+                            error: MixedSourceFinalReloadError::GitPathDiscovery(error),
+                        });
+                    }
                 }
                 Some(MixedSourceFinalSnapshot::GitPath(identity)) => {
                     let fetched = matching_locked_git_path_package(identity, locked_packages)
@@ -358,15 +366,23 @@ impl MixedSourceMvsOutput {
                         });
                     match fetched {
                         Ok(package) => {
-                            append_final_git_path_packages(
+                            if let Err(error) = append_final_git_path_packages(
                                 &package,
                                 package_version,
                                 &self.root_context,
                                 locked_packages,
                                 &mut fetch_git_sibling,
                                 &mut final_path_packages,
-                                &mut reload_failures,
-                            );
+                            ) {
+                                final_manifest_snapshots.insert(
+                                    package_version.clone(),
+                                    Arc::from(package.package_manifest_bytes()),
+                                );
+                                reload_failures.push(MixedSourceFinalReloadFailure {
+                                    package_version: Some(package_version.clone()),
+                                    error: MixedSourceFinalReloadError::GitPathDiscovery(error),
+                                });
+                            }
                             reloaded_git_path_packages.insert(package_version.clone(), package);
                         }
                         Err(error) => reload_failures.push(MixedSourceFinalReloadFailure {
@@ -914,7 +930,7 @@ mod final_reload_diagnostic_tests {
         git_path_discovery_diagnostic_message, local_path_index_diagnostic_code,
         local_path_index_diagnostic_message,
     };
-    use crate::git_path_requirements::GitPathRequirementDiscoveryError;
+    use crate::git_path_requirements::{GitPathRequirementDiscoveryError, GitPathRequirementEdge};
     use crate::git_remote::GitRemoteReleaseFetchError;
     use crate::local_source::{LocalPackageDirectoryIndexError, LocalPackagePathIndexError};
     use crate::mvs::MvsPackageVersion;
@@ -958,7 +974,11 @@ mod final_reload_diagnostic_tests {
     #[test]
     fn git_sibling_fetch_failure_keeps_remote_metadata_out_of_message() {
         let error = GitPathRequirementDiscoveryError::FetchSibling {
-            path: "private/customer/package".into(),
+            requirement: GitPathRequirementEdge::new(
+                "acme:secret",
+                "private/customer/package",
+                0..1,
+            ),
             source: Box::new(GitRemoteReleaseFetchError::TagNotFound {
                 name: "refs/tags/acme:private@9.9.9".into(),
             }),
@@ -1089,9 +1109,8 @@ impl MixedSourceFinalAuditPlan {
         &self.reload_failures
     }
 
-    /// Exact local final-manifest bytes retained for path-index reload
-    /// failures. Git snapshots and failures without a usable local source are
-    /// omitted until they can be bound to their own source files.
+    /// Exact final-manifest bytes retained for local and Git path-discovery
+    /// failures that can be anchored to a requirement edge.
     pub fn final_manifest_snapshots(&self) -> &BTreeMap<MvsPackageVersion, Arc<[u8]>> {
         &self.final_manifest_snapshots
     }
@@ -1250,20 +1269,14 @@ fn append_final_git_path_packages(
         Option<&LockPackage>,
     ) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError>,
     destination: &mut BTreeMap<crate::resolver_contract::ResolverPathKey, MvsPackageVersion>,
-    failures: &mut Vec<MixedSourceFinalReloadFailure>,
-) {
+) -> Result<(), Box<GitPathRequirementDiscoveryError<GitRemoteReleaseFetchError>>> {
     let requirer = MvsRequirer::Package(package_version.clone());
     let discovered = discover_git_path_requirements(source, &requirer, root_context, |identity| {
         let locked = matching_locked_git_path_package(identity, locked_packages)?;
         fetch_git_sibling(identity, locked)
-    });
-    match discovered {
-        Ok(discovered) => destination.extend(discovered.path_packages().clone()),
-        Err(error) => failures.push(MixedSourceFinalReloadFailure {
-            package_version: Some(package_version.clone()),
-            error: MixedSourceFinalReloadError::GitPathDiscovery(Box::new(error)),
-        }),
-    }
+    })?;
+    destination.extend(discovered.path_packages().clone());
+    Ok(())
 }
 
 fn resolve_mixed_source_path_request(

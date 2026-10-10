@@ -1,6 +1,7 @@
 //! Discovery of Git-relative path packages named by a fetched Git manifest.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use crate::git_remote::{
     FetchedGitPackage, GitPackagePathError, GitPackageSourceIdentity, GitPackageSourceView,
@@ -66,6 +67,40 @@ impl From<&GitPackageSourceIdentity> for GitPackageSourceIdentityKey {
     }
 }
 
+/// Exact final-manifest requirement that introduced a Git path operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPathRequirementEdge {
+    package: Box<str>,
+    path: Box<str>,
+    span: Range<usize>,
+}
+
+impl GitPathRequirementEdge {
+    pub fn new(
+        package: impl Into<Box<str>>,
+        path: impl Into<Box<str>>,
+        span: Range<usize>,
+    ) -> Self {
+        Self {
+            package: package.into(),
+            path: path.into(),
+            span,
+        }
+    }
+
+    pub fn package(&self) -> &str {
+        &self.package
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn span(&self) -> &Range<usize> {
+        &self.span
+    }
+}
+
 /// A Git-relative dependency could not be discovered from its fetched source.
 #[derive(Debug, Eq, PartialEq)]
 pub enum GitPathRequirementDiscoveryError<E> {
@@ -90,14 +125,17 @@ pub enum GitPathRequirementDiscoveryError<E> {
     },
     /// A sibling path is invalid or escapes the repository.
     DependencyPath {
-        path: Box<str>,
+        requirement: GitPathRequirementEdge,
         error: GitPackagePathError,
     },
     /// Fetching a sibling at the requiring commit failed.
-    FetchSibling { path: Box<str>, source: Box<E> },
+    FetchSibling {
+        requirement: GitPathRequirementEdge,
+        source: Box<E>,
+    },
     /// The loader returned a package from another repository, commit, or directory.
     SiblingSourceIdentityMismatch {
-        path: Box<str>,
+        requirement: GitPathRequirementEdge,
         expected: Box<GitPackageSourceIdentity>,
         found: Box<GitPackageSourceIdentity>,
     },
@@ -119,13 +157,24 @@ pub enum GitPathRequirementDiscoveryError<E> {
     },
     /// The sibling's package identity does not match the requirement.
     SiblingIdentityMismatch {
-        path: Box<str>,
+        requirement: GitPathRequirementEdge,
         expected: Box<str>,
         found: Box<str>,
     },
 }
 
 impl<E> GitPathRequirementDiscoveryError<E> {
+    /// The final-manifest path clause responsible for a path-resolution failure.
+    pub fn requirement_edge(&self) -> Option<&GitPathRequirementEdge> {
+        match self {
+            Self::DependencyPath { requirement, .. }
+            | Self::FetchSibling { requirement, .. }
+            | Self::SiblingSourceIdentityMismatch { requirement, .. }
+            | Self::SiblingIdentityMismatch { requirement, .. } => Some(requirement),
+            _ => None,
+        }
+    }
+
     /// Return parse diagnostics retained when a Git package manifest is invalid.
     pub fn manifest_parse_output(&self) -> Option<&PackageParseOutput> {
         match self {
@@ -218,6 +267,11 @@ pub fn discover_git_path_requirements<E>(
             else {
                 continue;
             };
+            let requirement_edge = GitPathRequirementEdge::new(
+                requirement.package.clone(),
+                path.clone(),
+                item.span.clone(),
+            );
 
             let path_key = ResolverPathKey::new(requirer.clone(), path.clone());
             if index.path_packages.contains_key(&path_key) {
@@ -227,7 +281,7 @@ pub fn discover_git_path_requirements<E>(
                 .git_source_identity()
                 .resolve_dependency_path(path)
                 .map_err(|error| GitPathRequirementDiscoveryError::DependencyPath {
-                    path: path.clone(),
+                    requirement: requirement_edge.clone(),
                     error,
                 })?;
             let identity_key = GitPackageSourceIdentityKey::from(&sibling_identity);
@@ -235,14 +289,14 @@ pub fn discover_git_path_requirements<E>(
             if !index.packages.contains_key(&identity_key) {
                 let sibling = fetch_sibling(&sibling_identity).map_err(|source| {
                     GitPathRequirementDiscoveryError::FetchSibling {
-                        path: path.clone(),
+                        requirement: requirement_edge.clone(),
                         source: Box::new(source),
                     }
                 })?;
                 if sibling.source_identity() != &sibling_identity {
                     return Err(
                         GitPathRequirementDiscoveryError::SiblingSourceIdentityMismatch {
-                            path: path.clone(),
+                            requirement: requirement_edge.clone(),
                             expected: Box::new(sibling_identity),
                             found: Box::new(sibling.source_identity().clone()),
                         },
@@ -288,7 +342,7 @@ pub fn discover_git_path_requirements<E>(
                 .clone();
             if package_version.package() != requirement.package.as_ref() {
                 return Err(GitPathRequirementDiscoveryError::SiblingIdentityMismatch {
-                    path: path.clone(),
+                    requirement: requirement_edge,
                     expected: requirement.package.clone(),
                     found: package_version.package().into(),
                 });

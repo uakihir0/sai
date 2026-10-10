@@ -672,9 +672,9 @@ impl RootDatabase {
     }
 
     /// Builds source-bound diagnostics for reportable final-source reload
-    /// failures. Local path-requirement failures use their retained final
-    /// manifest for the primary location, while the MVS chain stays attached
-    /// to the original manifests.
+    /// failures. Local and Git path-requirement failures use their retained
+    /// final manifest for the primary location, while the MVS chain stays
+    /// attached to the original manifests.
     ///
     /// The audit plan must belong to `mixed_source`, and snapshot manifests
     /// must match the contracts used for the original MVS load. The returned
