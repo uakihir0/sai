@@ -365,6 +365,54 @@ pub struct FetchedGitRelease {
     source: GitPackageSourceTree,
 }
 
+/// A package source tree fetched from an exact Git repository commit.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FetchedGitPackage {
+    canonical_url: Box<str>,
+    commit_id: gix::ObjectId,
+    directory: RepositoryPackageDirectory,
+    source: GitPackageSourceTree,
+}
+
+impl FetchedGitPackage {
+    /// The canonical repository URL used to fetch the package.
+    pub fn canonical_url(&self) -> &str {
+        &self.canonical_url
+    }
+
+    /// The exact repository commit that supplied this package.
+    pub const fn commit_id(&self) -> &gix::ObjectId {
+        &self.commit_id
+    }
+
+    /// The normalized repository-relative package directory.
+    pub const fn directory(&self) -> &RepositoryPackageDirectory {
+        &self.directory
+    }
+
+    /// The validated manifest and source files read from this commit.
+    pub const fn source(&self) -> &GitPackageSourceTree {
+        &self.source
+    }
+
+    /// Consume the package and return its verified source snapshot.
+    pub fn into_source(self) -> GitPackageSourceTree {
+        self.source
+    }
+
+    /// Validate the fetched manifest and build its resolver contract.
+    ///
+    /// The declared package identity and version must equal `expected`.
+    pub fn build_dependency_contract(
+        &self,
+        expected: &MvsPackageVersion,
+        context: &ResolverContractContext<'_>,
+        validation_context: PackageValidationContext<'_>,
+    ) -> Result<ResolverContract, GitRemoteReleaseContractError> {
+        build_git_source_dependency_contract(&self.source, expected, context, validation_context)
+    }
+}
+
 impl FetchedGitRelease {
     /// The complete Git ref name that was fetched.
     pub fn tag_name(&self) -> &str {
@@ -447,18 +495,26 @@ impl FetchedGitRelease {
                 tag_version: self.version.clone(),
             });
         }
-        let contract =
-            build_resolver_contract(self.source.package_manifest(), context, validation_context)
-                .map_err(GitRemoteReleaseContractError::InvalidContract)?;
-        let found = contract.mvs.package_version();
-        if found != expected {
-            return Err(GitRemoteReleaseContractError::PackageVersionMismatch {
-                expected: Box::new(expected.clone()),
-                found: Box::new(found.clone()),
-            });
-        }
-        Ok(contract)
+        build_git_source_dependency_contract(&self.source, expected, context, validation_context)
     }
+}
+
+fn build_git_source_dependency_contract(
+    source: &GitPackageSourceTree,
+    expected: &MvsPackageVersion,
+    context: &ResolverContractContext<'_>,
+    validation_context: PackageValidationContext<'_>,
+) -> Result<ResolverContract, GitRemoteReleaseContractError> {
+    let contract = build_resolver_contract(source.package_manifest(), context, validation_context)
+        .map_err(GitRemoteReleaseContractError::InvalidContract)?;
+    let found = contract.mvs.package_version();
+    if found != expected {
+        return Err(GitRemoteReleaseContractError::PackageVersionMismatch {
+            expected: Box::new(expected.clone()),
+            found: Box::new(found.clone()),
+        });
+    }
+    Ok(contract)
 }
 
 /// A fetched `sai.package` could not become the requested dependency contract.
@@ -1006,7 +1062,7 @@ pub fn fetch_git_package_source_tree_at_commit(
     url: &str,
     commit_id: &gix::ObjectId,
     directory: &RepositoryPackageDirectory,
-) -> Result<GitPackageSourceTree, GitRemoteReleaseFetchError> {
+) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError> {
     let canonical_url =
         canonical_git_url(url).map_err(|()| GitRemoteReleaseFetchError::InvalidGitUrl)?;
     let config_overrides = transport_config_overrides().map_err(map_tag_list_error_for_fetch)?;
@@ -1037,14 +1093,14 @@ pub fn fetch_git_package_source_tree_at_commit(
 
 fn fetch_git_package_source_tree_at_commit_in_repository(
     repository: &gix::Repository,
-    url: &str,
+    canonical_url: &str,
     commit_id: &gix::ObjectId,
     directory: &RepositoryPackageDirectory,
     transfer_limit: &gix_transport::client::blocking_io::FetchTransferLimit,
-) -> Result<GitPackageSourceTree, GitRemoteReleaseFetchError> {
+) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError> {
     fetch_locked_commit(
         repository,
-        url,
+        canonical_url,
         commit_id,
         LockedCommitFetchContext::RepositoryPackage,
         transfer_limit,
@@ -1054,9 +1110,15 @@ fn fetch_git_package_source_tree_at_commit_in_repository(
         repository.object_hash(),
     )
     .map_err(GitRemoteReleaseFetchError::SourceTree)?;
-    reader
+    let source = reader
         .read_commit_repository_package_source_tree(commit_id, directory)
-        .map_err(GitRemoteReleaseFetchError::SourceTree)
+        .map_err(GitRemoteReleaseFetchError::SourceTree)?;
+    Ok(FetchedGitPackage {
+        canonical_url: canonical_url.into(),
+        commit_id: *commit_id,
+        directory: directory.clone(),
+        source,
+    })
 }
 
 /// Fetch one Git package directly from its validated lock entry.
@@ -2395,7 +2457,11 @@ mod tests {
             let repository =
                 gix::open_opts(&self.directory.path, gix::open::Options::isolated()).unwrap();
             let manifest_id = repository
-                .write_blob(b"package acme:sibling @ 1.4.0\n")
+                .write_blob(
+                    b"package acme:sibling @ 1.4.0\n\
+                      source \"main.sai\"\n\
+                      targets { wasm32-core }\n",
+                )
                 .unwrap()
                 .detach();
             let source_id = repository
@@ -3130,7 +3196,7 @@ mod tests {
         let transfer_limit =
             gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
 
-        let source = super::fetch_git_package_source_tree_at_commit_in_repository(
+        let fetched = super::fetch_git_package_source_tree_at_commit_in_repository(
             &repository,
             &remote.url(),
             &commit_id,
@@ -3139,13 +3205,78 @@ mod tests {
         )
         .unwrap();
 
-        let manifest = source
+        let manifest = fetched
+            .source()
             .files()
             .iter()
             .find(|file| file.path() == "sai.package")
             .unwrap();
-        assert_eq!(manifest.content(), b"package acme:sibling @ 1.4.0\n");
-        assert!(source.source_tree().checksum.starts_with("sai1:"));
+        assert_eq!(
+            manifest.content(),
+            b"package acme:sibling @ 1.4.0\n\
+              source \"main.sai\"\n\
+              targets { wasm32-core }\n"
+        );
+        assert_eq!(fetched.commit_id(), &commit_id);
+        assert_eq!(fetched.directory(), &directory);
+        assert_eq!(fetched.canonical_url(), remote.url());
+        assert!(fetched.source().source_tree().checksum.starts_with("sai1:"));
+
+        let contract = fetched
+            .build_dependency_contract(
+                &expected_package_version("acme:sibling", "1.4.0"),
+                &root_contract_context(),
+                PackageValidationContext::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            contract.mvs.package_version(),
+            &expected_package_version("acme:sibling", "1.4.0")
+        );
+        assert_eq!(contract.role(), PackageRole::Dependency);
+    }
+
+    #[test]
+    fn git_sibling_contract_rejects_another_identity_or_version() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let commit_id = remote.commit_with_sibling_package();
+        let directory = RepositoryPackageDirectory::parse("packages/sibling").unwrap();
+        let scratch = TemporaryGitDirectory::create().unwrap();
+        let repository = init_bare_repository(&scratch.path, Some(commit_id.kind()));
+        let transfer_limit =
+            gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
+        let fetched = super::fetch_git_package_source_tree_at_commit_in_repository(
+            &repository,
+            &remote.url(),
+            &commit_id,
+            &directory,
+            &transfer_limit,
+        )
+        .unwrap();
+
+        for expected in [
+            expected_package_version("acme:other", "1.4.0"),
+            expected_package_version("acme:sibling", "1.5.0"),
+        ] {
+            let error = fetched
+                .build_dependency_contract(
+                    &expected,
+                    &root_contract_context(),
+                    PackageValidationContext::default(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                super::GitRemoteReleaseContractError::PackageVersionMismatch {
+                    expected: Box::new(expected),
+                    found: Box::new(expected_package_version("acme:sibling", "1.4.0")),
+                }
+            );
+            assert_eq!(
+                error.diagnostic_code(),
+                Some(sai_diagnostics::Code::PackageIdentityMismatch)
+            );
+        }
     }
 
     #[test]
