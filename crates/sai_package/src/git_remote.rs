@@ -2984,6 +2984,9 @@ mod tests {
         MixedPackageSourceIdentity, resolve_mixed_source_packages_with_fetchers,
     };
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
+    use crate::mvs_diagnostics::{
+        MvsManifestLocation, MvsManifestLocations, mixed_source_reload_failure_diagnostics,
+    };
     use crate::package_cache::PackageCache;
     use crate::package_path::RepositoryPackageDirectory;
     use crate::resolver_contract::ResolverContractContext;
@@ -2992,6 +2995,7 @@ mod tests {
     };
     use crate::validation::PackageValidationContext;
     use gix::objs::tree::{Entry, EntryKind};
+    use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     const TEST_CANONICAL_GIT_URL: &str = "https://example.test/acme/sample.git";
 
@@ -4706,7 +4710,7 @@ mod tests {
             &manifests,
         )
         .unwrap();
-        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert_eq!(
             diagnostics[0].code,
             sai_diagnostics::Code::PathEscapesRepository
@@ -4881,6 +4885,262 @@ mod tests {
         assert_eq!(
             failure.error.diagnostic_code(),
             Some(sai_diagnostics::Code::PathEscapesRepository)
+        );
+    }
+
+    #[test]
+    fn mixed_source_final_git_release_identity_mismatch_retains_manifest_bytes() {
+        const TARGET_URL: &str = "https://example.test/acme/target.git";
+        const LATE_URL: &str = "https://example.test/acme/late.git";
+        const FINAL_URL: &str = "https://example.test/acme/final-target.git";
+        let read_time_target_manifest = b"package acme:target @ 1.0.0\n\
+                                         source \"main.sai\"\n\
+                                         targets { wasm32-core }\n";
+        let late_manifest = format!(
+            "package acme:z-late @ 1.0.0\n\
+             source \"main.sai\"\n\
+             targets {{ wasm32-core }}\n\
+             requires {{ acme:target @ ^1 from git \"{FINAL_URL}\" }}\n"
+        );
+        let final_target_manifest = b"package acme:target @ 2.0.0\n\
+                                     source \"main.sai\"\n\
+                                     targets { wasm32-core }\n";
+        let directory = TestDirectory::new("mixed-source-final-git-release-contract-failure");
+        let root_path = directory.0.join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root_manifest = format!(
+            "package zz:root @ 1.0.0\n\
+             source \"main.sai\"\n\
+             targets {{ wasm32-core }}\n\
+             requires {{\n\
+               acme:target @ ^1 from git \"{TARGET_URL}\"\n\
+               acme:z-late @ ^1 from git \"{LATE_URL}\"\n\
+             }}\n"
+        );
+        std::fs::write(root_path.join("sai.package"), root_manifest.as_bytes()).unwrap();
+
+        let target_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(read_time_target_manifest),
+        );
+        let late_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(late_manifest.as_bytes()),
+        );
+        let final_target_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(final_target_manifest),
+        );
+        let mut target_release = Some(
+            fetch_fixture_with_canonical_url(
+                &target_remote,
+                Some(&target_remote.commit_id),
+                None,
+                TARGET_URL,
+            )
+            .unwrap(),
+        );
+        let mut late_release = Some(
+            fetch_fixture_with_canonical_url(
+                &late_remote,
+                Some(&late_remote.commit_id),
+                None,
+                LATE_URL,
+            )
+            .unwrap(),
+        );
+        let output = resolve_mixed_source_packages_with_fetchers(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            PackageValidationContext::default(),
+            |selection, locked_package| {
+                assert!(locked_package.is_none());
+                match selection.package_version().package() {
+                    "acme:target" => {
+                        let ResolverPackageSource::Git { url, .. } = selection.source() else {
+                            panic!("the read-time target source must be Git")
+                        };
+                        assert_eq!(url.as_ref(), TARGET_URL);
+                        Ok(target_release.take().unwrap())
+                    }
+                    "acme:z-late" => Ok(late_release.take().unwrap()),
+                    package => panic!("unexpected Git package request for {package}"),
+                }
+            },
+            |_, _| unreachable!("this fixture has no Git-relative path requirements"),
+        )
+        .expect("the read-time MVS graph resolves from its original Git sources");
+
+        let mut final_target_release = Some(
+            fetch_fixture_with_canonical_url(
+                &final_target_remote,
+                Some(&final_target_remote.commit_id),
+                None,
+                FINAL_URL,
+            )
+            .unwrap(),
+        );
+        let audit_plan = output
+            .plan_final_source_audit(
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                PackageValidationContext::default(),
+                |selection, locked_package| {
+                    assert!(locked_package.is_none());
+                    assert_eq!(selection.package_version().package(), "acme:target");
+                    let ResolverPackageSource::Git { url, .. } = selection.source() else {
+                        panic!("the late named edge must select a final Git release")
+                    };
+                    assert_eq!(url.as_ref(), FINAL_URL);
+                    Ok(final_target_release.take().unwrap())
+                },
+                |_, _| unreachable!("this fixture has no Git-relative path requirements"),
+            )
+            .expect("the final source plan retains Git identity failures");
+        let target_version = expected_package_version("acme:target", "1.0.0");
+        assert_eq!(
+            audit_plan.final_manifest_snapshots()[&target_version].as_ref(),
+            final_target_manifest
+        );
+        let failure = audit_plan
+            .reload_failures()
+            .iter()
+            .find(|failure| failure.package_version.as_ref() == Some(&target_version))
+            .expect("the final Git identity failure is retained");
+        let crate::mixed_source::MixedSourceFinalReloadError::GitPathDiscovery(error) =
+            &failure.error
+        else {
+            panic!(
+                "expected a Git path-discovery failure, got {:#?}",
+                failure.error
+            );
+        };
+        let crate::git_path_requirements::GitPathRequirementDiscoveryError::RequirerVersionMismatch {
+            expected,
+            found,
+        } = error.as_ref()
+        else {
+            panic!("expected a Git requirer identity mismatch, got {error:#?}");
+        };
+        assert_eq!(**expected, target_version);
+        assert_eq!(**found, expected_package_version("acme:target", "2.0.0"));
+        assert_eq!(
+            failure.error.diagnostic_code(),
+            Some(sai_diagnostics::Code::PackageIdentityMismatch)
+        );
+
+        let root_version = expected_package_version("zz:root", "1.0.0");
+        let late_version = expected_package_version("acme:z-late", "1.0.0");
+        let root_file_id = sai_diagnostics::FileId::new(1);
+        let target_file_id = sai_diagnostics::FileId::new(2);
+        let final_file_id = sai_diagnostics::FileId::new(3);
+        let late_file_id = sai_diagnostics::FileId::new(4);
+        let diagnostic_snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(
+                std::sync::Arc::new(
+                    SourceFile::decode(root_file_id, root_manifest.as_bytes()).unwrap(),
+                ),
+                "sai.package",
+                Some("zz:root@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                std::sync::Arc::new(
+                    SourceFile::decode(target_file_id, read_time_target_manifest).unwrap(),
+                ),
+                "dep:acme:target@1.0.0/sai.package",
+                Some("acme:target@1.0.0".to_owned()),
+                Some(1),
+            ),
+            SnapshotFile::new(
+                std::sync::Arc::new(
+                    SourceFile::decode(final_file_id, final_target_manifest).unwrap(),
+                ),
+                MvsManifestLocation::final_snapshot_path(&target_version, 0),
+                Some("acme:target@1.0.0".to_owned()),
+                None,
+            ),
+            SnapshotFile::new(
+                std::sync::Arc::new(
+                    SourceFile::decode(late_file_id, late_manifest.as_bytes()).unwrap(),
+                ),
+                "dep:acme:z-late@1.0.0/sai.package",
+                Some("acme:z-late@1.0.0".to_owned()),
+                Some(1),
+            ),
+        ])
+        .expect("the diagnostic snapshot contains read-time and final manifests");
+        let mut manifests = MvsManifestLocations::default();
+        manifests
+            .set_root(
+                MvsManifestLocation::from_snapshot(
+                    &diagnostic_snapshot,
+                    root_file_id,
+                    &root_version,
+                    PackageRole::Root,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        manifests
+            .insert_package(
+                MvsManifestLocation::from_snapshot(
+                    &diagnostic_snapshot,
+                    late_file_id,
+                    &late_version,
+                    PackageRole::Dependency,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        manifests
+            .insert_package(
+                MvsManifestLocation::from_snapshot(
+                    &diagnostic_snapshot,
+                    target_file_id,
+                    &target_version,
+                    PackageRole::Dependency,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        manifests
+            .insert_final_package(
+                MvsManifestLocation::from_final_snapshot(
+                    &diagnostic_snapshot,
+                    final_file_id,
+                    &target_version,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let diagnostics =
+            mixed_source_reload_failure_diagnostics(&output, &audit_plan, &manifests).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::PackageIdentityMismatch
+        );
+        let primary = diagnostics[0]
+            .primary()
+            .expect("the changed final Git package header is primary");
+        assert_eq!(
+            primary.file.path,
+            MvsManifestLocation::final_snapshot_path(&target_version, 0)
+        );
+        let start = primary.span.range.start().to_usize();
+        let end = primary.span.range.end().to_usize();
+        assert_eq!(
+            &final_target_manifest[start..end],
+            b"package acme:target @ 2.0.0"
         );
     }
 

@@ -240,6 +240,7 @@ impl MixedSourceMvsOutput {
 
         let mut reload_failures = Vec::new();
         let mut local_directories = LocalPackageDirectoryIndex::default();
+        let mut final_manifest_snapshots = BTreeMap::new();
         let root_identity = identities
             .get(&MvsRequirer::Root(root_package.clone()))
             .and_then(|identity| match identity {
@@ -283,6 +284,8 @@ impl MixedSourceMvsOutput {
                     PackageRole::Dependency,
                 )
             {
+                final_manifest_snapshots
+                    .insert(reload.package_version.clone(), directory.manifest_bytes());
                 reload_failures.push(MixedSourceFinalReloadFailure {
                     package_version: Some(reload.package_version.clone()),
                     error: MixedSourceFinalReloadError::LocalDirectoryIndex(Box::new(error)),
@@ -292,7 +295,6 @@ impl MixedSourceMvsOutput {
 
         let mut final_path_packages = BTreeMap::new();
         let mut reloaded_git_path_packages = BTreeMap::new();
-        let mut final_manifest_snapshots = BTreeMap::new();
         for entry in final_sources.entries() {
             let package_version = entry.package_version();
             if source_identities
@@ -426,10 +428,16 @@ impl MixedSourceMvsOutput {
                             ),
                         );
                     }
-                    Err(error) => reload_failures.push(MixedSourceFinalReloadFailure {
-                        package_version: Some(reload.package_version.clone()),
-                        error: MixedSourceFinalReloadError::GitContract(Box::new(error)),
-                    }),
+                    Err(error) => {
+                        final_manifest_snapshots.insert(
+                            reload.package_version.clone(),
+                            Arc::from(package.package_manifest_bytes()),
+                        );
+                        reload_failures.push(MixedSourceFinalReloadFailure {
+                            package_version: Some(reload.package_version.clone()),
+                            error: MixedSourceFinalReloadError::GitContract(Box::new(error)),
+                        });
+                    }
                 }
                 continue;
             }
@@ -466,10 +474,25 @@ impl MixedSourceMvsOutput {
                         ),
                     );
                 }
-                Err(error) => reload_failures.push(MixedSourceFinalReloadFailure {
-                    package_version: Some(reload.package_version.clone()),
-                    error,
-                }),
+                Err(error) => {
+                    let final_manifest = match snapshot {
+                        MixedSourceFinalSnapshot::Local(directory) => {
+                            Some(directory.manifest_bytes())
+                        }
+                        MixedSourceFinalSnapshot::GitRelease(release) => {
+                            Some(Arc::from(release.package_manifest_bytes()))
+                        }
+                        MixedSourceFinalSnapshot::GitPath(_) => None,
+                    };
+                    if let Some(final_manifest) = final_manifest {
+                        final_manifest_snapshots
+                            .insert(reload.package_version.clone(), final_manifest);
+                    }
+                    reload_failures.push(MixedSourceFinalReloadFailure {
+                        package_version: Some(reload.package_version.clone()),
+                        error,
+                    });
+                }
             }
         }
 
@@ -1109,8 +1132,8 @@ impl MixedSourceFinalAuditPlan {
         &self.reload_failures
     }
 
-    /// Exact final-manifest bytes retained for local and Git path-discovery
-    /// failures that can be anchored to a requirement edge.
+    /// Exact final-manifest bytes retained for classified path-discovery
+    /// failures and package identity mismatches with a final header location.
     pub fn final_manifest_snapshots(&self) -> &BTreeMap<MvsPackageVersion, Arc<[u8]>> {
         &self.final_manifest_snapshots
     }

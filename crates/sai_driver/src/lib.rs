@@ -673,8 +673,8 @@ impl RootDatabase {
 
     /// Builds source-bound diagnostics for reportable final-source reload
     /// failures. Local and Git path-requirement failures use their retained
-    /// final manifest for the primary location, while the MVS chain stays
-    /// attached to the original manifests.
+    /// final manifest, and package identity mismatches point at the changed
+    /// final header. The MVS chain stays attached to the original manifests.
     ///
     /// The audit plan must belong to `mixed_source`, and snapshot manifests
     /// must match the contracts used for the original MVS load. The returned
@@ -1317,6 +1317,10 @@ mod tests {
             .next()
             .expect("one dependency was loaded")
             .clone();
+        assert_eq!(
+            audit_plan.final_manifest_snapshots()[&target_version].as_ref(),
+            final_manifest
+        );
         let diagnostics = database
             .mixed_source_reload_diagnostics(
                 &snapshot,
@@ -1335,10 +1339,40 @@ mod tests {
         assert_eq!(
             diagnostics[0]
                 .primary()
-                .expect("root path source location")
+                .expect("final manifest header location")
                 .file
                 .path,
-            "sai.package"
+            "dep:acme:target@1.0.0/.sai/final-source-0/sai.package"
+        );
+        let primary = diagnostics[0].primary().unwrap();
+        assert_eq!(
+            primary.span.file,
+            diagnostics
+                .snapshot()
+                .file(primary.span.file)
+                .unwrap()
+                .source()
+                .id()
+        );
+        let start = primary.span.range.start().to_usize();
+        let end = primary.span.range.end().to_usize();
+        assert_eq!(
+            &diagnostics
+                .snapshot()
+                .file(primary.span.file)
+                .unwrap()
+                .source()
+                .raw_bytes()[start..end],
+            b"package acme:target @ 2.0.0"
+        );
+        assert_eq!(
+            diagnostics
+                .snapshot()
+                .file(primary.span.file)
+                .unwrap()
+                .source()
+                .raw_bytes(),
+            final_manifest
         );
         assert!(matches!(
             diagnostics[0].data.get("requirement_chain"),

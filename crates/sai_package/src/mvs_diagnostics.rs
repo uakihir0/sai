@@ -32,6 +32,7 @@ use crate::resolver_source_provider::{
     ResolverSourceIdentityFailureKind, ResolverSourceIdentitySide,
 };
 use crate::validation::resolve_package_lint_settings_from_parsed;
+use crate::version::Version;
 use crate::version_req::VersionReq;
 use sai_diagnostics::{
     ChainStep, Child, ChildKind, Code, Diagnostic, LintPolicies, LintResolution,
@@ -50,6 +51,7 @@ pub struct MvsManifestLocation {
     workspace_snapshot: sai_diagnostics::WorkspaceSnapshotId,
     manifest_digest: [u8; 32],
     source_len: usize,
+    final_package_header: Option<FinalPackageHeader>,
     requirements: BTreeMap<(usize, usize), ManifestRequirement>,
     overrides: BTreeMap<(usize, usize), ManifestOverride>,
     lint_policies: LintPolicies,
@@ -67,6 +69,13 @@ struct ManifestRequirement {
 struct ManifestOverride {
     package: Box<str>,
     source: OverrideSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FinalPackageHeader {
+    package: Box<str>,
+    version: Version,
+    span: Range<usize>,
 }
 
 impl MvsManifestLocation {
@@ -202,6 +211,7 @@ impl MvsManifestLocation {
                 .manifest_digest()
                 .expect("syntax-valid manifest is within the parser size limit"),
             source_len: source_file.raw_bytes().len(),
+            final_package_header: None,
             requirements,
             overrides,
             lint_policies,
@@ -262,6 +272,15 @@ impl MvsManifestLocation {
         let manifest_digest = *parsed
             .manifest_digest()
             .ok_or(MvsDuplicatePackageLineDiagnosticError::FinalManifestTooLarge(file_id))?;
+        let final_package_header = parsed
+            .file()
+            .header
+            .as_ref()
+            .map(|header| FinalPackageHeader {
+                package: header.value.identity.to_string().into(),
+                version: header.value.version.clone(),
+                span: header.span.clone(),
+            });
         let mut requirements = BTreeMap::new();
         if parsed.is_syntax_valid() {
             for declaration in &parsed.file().declarations {
@@ -300,6 +319,7 @@ impl MvsManifestLocation {
             workspace_snapshot: snapshot.id(),
             manifest_digest,
             source_len: source_file.raw_bytes().len(),
+            final_package_header,
             requirements,
             overrides: BTreeMap::new(),
             lint_policies: LintPolicies::default(),
@@ -365,6 +385,7 @@ struct ReportableFinalReloadFailure<'a> {
     code: Code,
     detail: String,
     final_path_requirement: Option<FinalPathRequirement<'a>>,
+    final_package_identity_mismatch: Option<MvsPackageVersion>,
 }
 
 impl MvsManifestLocations {
@@ -498,6 +519,42 @@ impl MvsManifestLocations {
         )
     }
 
+    /// Returns the package-header location only when the retained final
+    /// manifest declares the identity and version captured by the failure.
+    pub fn final_package_identity_location(
+        &self,
+        expected: &MvsPackageVersion,
+        found: &MvsPackageVersion,
+    ) -> Result<sai_diagnostics::Location, MvsDuplicatePackageLineDiagnosticError> {
+        let manifest = self.final_packages.get(expected).ok_or_else(|| {
+            MvsDuplicatePackageLineDiagnosticError::MissingFinalManifestLocation(Box::new(
+                expected.clone(),
+            ))
+        })?;
+        let Some(header) = manifest.final_package_header.as_ref() else {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::FinalManifestIdentityMismatch {
+                    expected: Box::new(expected.clone()),
+                    found: Box::new(found.clone()),
+                },
+            );
+        };
+        if header.package.as_ref() != found.package() || &header.version != found.version() {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::FinalManifestIdentityMismatch {
+                    expected: Box::new(expected.clone()),
+                    found: Box::new(found.clone()),
+                },
+            );
+        }
+
+        manifest_span_location(
+            manifest,
+            &MvsRequirer::Package(expected.clone()),
+            &header.span,
+        )
+    }
+
     fn register_snapshot(
         &mut self,
         manifest: &MvsManifestLocation,
@@ -550,6 +607,10 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
     FinalManifestRequirementMismatch {
         requiring_package: Box<MvsPackageVersion>,
         span: Range<usize>,
+    },
+    FinalManifestIdentityMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
     },
     MissingSnapshotFile(sai_diagnostics::FileId),
     SnapshotFileIdMismatch {
@@ -1081,8 +1142,9 @@ pub fn mixed_source_identity_failure_diagnostics(
 
 /// Builds source-located diagnostics for final reload failures that have a
 /// safe, package-level classification. Local and Git path-requirement failures
-/// point into their retained final manifest; the original MVS chain remains
-/// bound to the read-time manifests.
+/// point into their retained final manifest, and package identity mismatches
+/// point to the changed final header. The original MVS chain remains bound to
+/// the read-time manifests.
 pub fn mixed_source_reload_failure_diagnostics(
     mixed_source: &MixedSourceMvsOutput,
     audit_plan: &MixedSourceFinalAuditPlan,
@@ -1129,11 +1191,14 @@ pub fn mixed_source_reload_failure_diagnostics(
                 }
                 _ => None,
             };
+            let final_package_identity_mismatch =
+                final_package_identity_mismatch_found(&failure.error);
             Some(ReportableFinalReloadFailure {
                 package_version,
                 code: failure.error.diagnostic_code()?,
                 detail: failure.error.diagnostic_message()?,
                 final_path_requirement,
+                final_package_identity_mismatch,
             })
         })
         .collect::<Vec<_>>();
@@ -1193,6 +1258,11 @@ pub fn mixed_source_reload_failure_diagnostics(
                 )
             })
             .transpose()?;
+        let final_identity_location = failure
+            .final_package_identity_mismatch
+            .as_ref()
+            .map(|found| manifests.final_package_identity_location(package_version, found))
+            .transpose()?;
         let mut diagnostic = Diagnostic::new(
             failure.code,
             Severity::Error,
@@ -1203,11 +1273,14 @@ pub fn mixed_source_reload_failure_diagnostics(
             ),
             final_path_location
                 .clone()
+                .or(final_identity_location.clone())
                 .or(source_location)
                 .or(chain_location),
         );
         diagnostic.primary_label = if final_path_location.is_some() {
             "this path dependency could not be resolved in the final source".to_owned()
+        } else if final_identity_location.is_some() {
+            "the final source declares a different package identity or version".to_owned()
         } else {
             "the selected package's final source could not be reloaded".to_owned()
         };
@@ -1244,6 +1317,43 @@ pub fn mixed_source_reload_failure_diagnostics(
     Ok(diagnostics)
 }
 
+fn final_package_identity_mismatch_found(
+    error: &MixedSourceFinalReloadError,
+) -> Option<MvsPackageVersion> {
+    match error {
+        MixedSourceFinalReloadError::LocalDirectoryIndex(error) => match error.as_ref() {
+            crate::local_source::LocalPackageDirectoryIndexError::PackageVersionMismatch {
+                found_package,
+                found_version,
+                ..
+            } => MvsPackageVersion::new(found_package.clone(), (**found_version).clone()).ok(),
+            _ => None,
+        },
+        MixedSourceFinalReloadError::LocalContract(error) => match error.as_ref() {
+            crate::local_source::LocalPackageContractLoadError::PackageVersionMismatch {
+                found,
+                ..
+            } => Some((**found).clone()),
+            _ => None,
+        },
+        MixedSourceFinalReloadError::GitContract(error) => match error.as_ref() {
+            crate::git_remote::GitRemoteReleaseContractError::PackageVersionMismatch {
+                found,
+                ..
+            } => Some((**found).clone()),
+            _ => None,
+        },
+        MixedSourceFinalReloadError::GitPathDiscovery(error) => match error.as_ref() {
+            crate::git_path_requirements::GitPathRequirementDiscoveryError::RequirerVersionMismatch {
+                found,
+                ..
+            } => Some((**found).clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn sort_and_deduplicate_final_reload_failure_diagnostics(
     failures: &mut Vec<ReportableFinalReloadFailure<'_>>,
 ) {
@@ -1251,9 +1361,19 @@ fn sort_and_deduplicate_final_reload_failure_diagnostics(
         left.package_version
             .cmp(right.package_version)
             .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| {
+                left.final_package_identity_mismatch
+                    .cmp(&right.final_package_identity_mismatch)
+            })
             .then_with(|| left.detail.cmp(&right.detail))
     });
-    failures.dedup_by(|left, right| *left == *right);
+    failures.dedup_by(|left, right| {
+        let same_identity_mismatch = left.package_version == right.package_version
+            && left.code == right.code
+            && left.final_package_identity_mismatch.is_some()
+            && left.final_package_identity_mismatch == right.final_package_identity_mismatch;
+        same_identity_mismatch || *left == *right
+    });
 }
 
 #[cfg(test)]
@@ -3228,6 +3348,28 @@ mod tests {
         let end = location.span.range.end().to_usize();
         assert_eq!(&source.as_bytes()[start..end], requirement.as_bytes());
         assert_eq!(location.file.package.as_deref(), Some("acme:target@1.0.0"));
+        let found_identity = package_version("acme:changed", "9.0.0");
+        let identity_location = manifests
+            .final_package_identity_location(&package, &found_identity)
+            .expect("the final header matches the identity-mismatch error");
+        let identity_start = identity_location.span.range.start().to_usize();
+        let identity_end = identity_location.span.range.end().to_usize();
+        assert_eq!(
+            &source.as_bytes()[identity_start..identity_end],
+            b"package acme:changed @ 9.0.0"
+        );
+        assert_eq!(
+            manifests.final_package_identity_location(
+                &package,
+                &package_version("acme:wrong", "9.0.0"),
+            ),
+            Err(
+                MvsDuplicatePackageLineDiagnosticError::FinalManifestIdentityMismatch {
+                    expected: Box::new(package.clone()),
+                    found: Box::new(package_version("acme:wrong", "9.0.0")),
+                }
+            )
+        );
         assert_eq!(
             manifests.final_path_requirement_location(&package, "acme:secret", "different", &span,),
             Err(
