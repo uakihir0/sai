@@ -1,6 +1,6 @@
 //! Bounded Git release-tag listing and locked-source fetching.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::error::Error as StdError;
 use std::ffi::OsString;
 use std::fmt;
@@ -1577,12 +1577,12 @@ pub(crate) fn verify_git_path_package_identity(
 /// A package's manifest version is checked later when its dependency contract
 /// is built. Path sources are pinned by their requiring commit, so entries
 /// for an older commit are stale and do not provide a checksum floor.
-pub(crate) fn matching_locked_git_path_package<'a>(
+pub(crate) fn matching_locked_git_path_package_from_iter<'a>(
     source_identity: &GitPackageSourceIdentity,
-    locked_packages: &'a HashMap<MvsPackageVersion, LockPackage>,
+    locked_packages: impl IntoIterator<Item = &'a LockPackage>,
 ) -> Result<Option<&'a LockPackage>, GitRemoteReleaseFetchError> {
     let mut matching = None;
-    for package in locked_packages.values() {
+    for package in locked_packages {
         if !package
             .fields
             .iter()
@@ -1603,6 +1603,58 @@ pub(crate) fn matching_locked_git_path_package<'a>(
         {
             return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
                 "duplicate Git path source identity",
+            ));
+        }
+    }
+    Ok(matching)
+}
+
+/// Find the lock entry for the exact release source selected for one package
+/// version. A different source for that version is not a match.
+pub(crate) fn matching_locked_git_release_package_from_iter<'a>(
+    package_version: &MvsPackageVersion,
+    source: &ResolverPackageSource,
+    locked_packages: impl IntoIterator<Item = &'a LockPackage>,
+) -> Result<Option<&'a LockPackage>, GitRemoteReleaseFetchError> {
+    let ResolverPackageSource::Git { url, directory } = source else {
+        return Ok(None);
+    };
+    let canonical_url =
+        canonical_git_url(url).map_err(|_| GitRemoteReleaseFetchError::InvalidGitUrl)?;
+    let directory = directory
+        .as_deref()
+        .map(RepositoryPackageDirectory::parse)
+        .transpose()
+        .map_err(|_| GitRemoteReleaseFetchError::InvalidPackageDirectory)?;
+
+    let mut matching = None;
+    for package in locked_packages {
+        if package.package.as_ref() != package_version.package()
+            || package.version != *package_version.version()
+        {
+            continue;
+        }
+        if !package
+            .fields
+            .iter()
+            .any(|field| matches!(&field.value, LockPackageField::Source(LockSource::Git(_))))
+        {
+            continue;
+        }
+        let request = locked_release_request(package)?;
+        let same_directory = request
+            .directory
+            .as_ref()
+            .map_or(".", RepositoryPackageDirectory::as_str)
+            == directory
+                .as_ref()
+                .map_or(".", RepositoryPackageDirectory::as_str);
+        if request.url.as_ref() == canonical_url
+            && same_directory
+            && matching.replace(package).is_some()
+        {
+            return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                "duplicate Git release source identity",
             ));
         }
     }
@@ -2979,9 +3031,11 @@ mod tests {
     use crate::git_tree::{GitTreeReadError, GitTreeReader};
     use crate::local_source::LocalPackageDirectory;
     use crate::lock::{LockPackage, LockPackageField, LockSource};
+    use crate::lock_conflict::{reconstruct_conflict_sides, validate_conflict_sides};
     use crate::manifest::{PackageRole, Spanned, parse_for_role};
     use crate::mixed_source::{
-        MixedPackageSourceIdentity, resolve_mixed_source_packages_with_fetchers,
+        MixedPackageSourceIdentity, resolve_mixed_source_packages_from_lock_merge_with_fetchers,
+        resolve_mixed_source_packages_with_fetchers,
     };
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::mvs_diagnostics::{
@@ -4312,6 +4366,327 @@ mod tests {
                 .iter()
                 .all(|entry| entry.read_source() == entry.final_source())
         );
+    }
+
+    #[test]
+    fn lock_merge_resolution_reuses_the_record_for_the_selected_git_source() {
+        const SOURCE_A: &str = "https://example.test/acme/dep-a.git";
+        const SOURCE_B: &str = "https://example.test/acme/dep-b.git";
+        let lock_entry = |url: &str, commit: char, checksum: char| {
+            format!(
+                "package acme:dep @ 1.4.0\n    source git \"{url}\"\n    commit \"{}\"\n    checksum \"sai1:{}\"\n    capabilities {{ }}\n",
+                commit.to_string().repeat(40),
+                checksum.to_string().repeat(64),
+            )
+        };
+        let lock_text = format!(
+            "lock 1\n\nroot acme:root @ 1.0.0\n    targets {{ wasm32-core }}\n    requires acme:dep @ >=1.4.0 -> 1.4.0\n<<<<<<< ours\n{}=======\n{}>>>>>>> theirs\n",
+            lock_entry(SOURCE_A, 'a', '1'),
+            lock_entry(SOURCE_B, 'b', '2'),
+        );
+        let conflict_sides = reconstruct_conflict_sides(lock_text.as_bytes())
+            .expect("lock conflict markers are balanced")
+            .expect("the fixture contains both lock sides");
+        let lock_sides = validate_conflict_sides(&conflict_sides, &Default::default())
+            .expect("both source variants are valid lock entries");
+
+        let directory = TestDirectory::new("lock-merge-source-selection");
+        let root_path = directory.0.join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::write(
+            root_path.join("sai.package"),
+            format!(
+                "package acme:root @ 1.0.0\nsource \"src\"\ntargets {{ wasm32-core }}\nrequires {{ acme:dep @ >=1.4.0 from git \"{SOURCE_B}\" }}\n"
+            ),
+        )
+        .unwrap();
+        let remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.4.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(
+                b"package acme:dep @ 1.4.0\n\
+                  source \"src\"\n\
+                  targets { wasm32-core }\n",
+            ),
+        );
+        let mut release = Some(
+            fetch_fixture_with_canonical_url(&remote, Some(&remote.commit_id), None, SOURCE_B)
+                .unwrap(),
+        );
+        let mut fetches = 0;
+        let output = resolve_mixed_source_packages_from_lock_merge_with_fetchers(
+            LocalPackageDirectory::open(&root_path).expect("open the local root package"),
+            &lock_sides,
+            PackageValidationContext::default(),
+            |selection, locked_package| {
+                fetches += 1;
+                assert_eq!(selection.package_version().package(), "acme:dep");
+                assert_eq!(selection.package_version().version().to_string(), "1.4.0");
+                assert!(matches!(
+                    selection.source(),
+                    ResolverPackageSource::Git { url, directory: None }
+                        if url.as_ref() == SOURCE_B
+                ));
+                let locked_package =
+                    locked_package.expect("the selected source has a matching lock record");
+                let expected_commit = "b".repeat(40);
+                assert!(locked_package.fields.iter().any(|field| matches!(
+                    &field.value,
+                    LockPackageField::Source(LockSource::Git(url)) if url.as_ref() == SOURCE_B
+                )));
+                assert!(locked_package.fields.iter().any(|field| matches!(
+                    &field.value,
+                    LockPackageField::Commit(commit) if commit.as_ref() == expected_commit
+                )));
+                Ok(release.take().expect("the dependency is loaded once"))
+            },
+            |_, _| unreachable!("the fixture has no Git-relative package requirements"),
+        )
+        .expect("the selected source resolves from the merged lock");
+
+        assert_eq!(fetches, 1);
+        assert!(release.is_none());
+        assert!(
+            output
+                .plan_final_sources_from_lock()
+                .expect("retained lock sources plan the final graph")
+                .failures()
+                .is_empty()
+        );
+        let audit = output
+            .plan_final_source_audit_from_lock(
+                PackageValidationContext::default(),
+                |_, _| unreachable!("the final source is the source read during MVS"),
+                |_, _| unreachable!("the fixture has no Git-relative package requirements"),
+            )
+            .expect("the lock catalog also supports final-source auditing");
+        assert!(audit.is_equivalent());
+    }
+
+    #[test]
+    fn lock_floor_merge_catalog_reuses_final_source_record_during_audit_reload() {
+        const SOURCE_A: &str = "https://example.test/acme/dep-a.git";
+        const SOURCE_B: &str = "https://example.test/acme/dep-b.git";
+        const HELPER_SOURCE: &str = "https://example.test/acme/z-helper.git";
+        let lock_entry = |url: &str, commit: char, checksum: char| {
+            format!(
+                "package acme:dep @ 1.4.0\n    source git \"{url}\"\n    commit \"{}\"\n    checksum \"sai1:{}\"\n    capabilities {{ }}\n",
+                commit.to_string().repeat(40),
+                checksum.to_string().repeat(64),
+            )
+        };
+        let lock_text = format!(
+            "lock 1\n\nroot acme:root @ 1.0.0\n    targets {{ wasm32-core }}\n<<<<<<< ours\n{}=======\n{}>>>>>>> theirs\n",
+            lock_entry(SOURCE_A, 'a', '1'),
+            lock_entry(SOURCE_B, 'b', '2'),
+        );
+        let conflict_sides = reconstruct_conflict_sides(lock_text.as_bytes())
+            .expect("lock conflict markers are balanced")
+            .expect("the fixture contains both lock sides");
+        let lock_sides = validate_conflict_sides(&conflict_sides, &Default::default())
+            .expect("both source variants are valid lock entries");
+
+        let directory = TestDirectory::new("lock-merge-floor-final-audit-source");
+        let root_path = directory.0.join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::write(
+            root_path.join("sai.package"),
+            format!(
+                "package acme:root @ 1.0.0\n\
+                 source \"src\"\n\
+                 targets {{ wasm32-core }}\n\
+                 requires {{\n\
+                   acme:dep @ ^1 from git \"{SOURCE_A}\"\n\
+                   acme:z-helper @ ^1 from git \"{HELPER_SOURCE}\"\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+
+        let dep_named_manifest = b"package acme:dep @ 1.0.0\n\
+                                  source \"src\"\n\
+                                  targets { wasm32-core }\n";
+        let dep_floor_manifest = b"package acme:dep @ 1.4.0\n\
+                                  source \"src\"\n\
+                                  targets { wasm32-core }\n";
+        let dep_a_named_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(dep_named_manifest),
+        );
+        let dep_a_floor_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.4.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(dep_floor_manifest),
+        );
+        let dep_b_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.4.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(dep_floor_manifest),
+        );
+        let helper_manifest = format!(
+            "package acme:z-helper @ 1.0.0\n\
+             source \"src\"\n\
+             targets {{ wasm32-core }}\n\
+             requires {{ acme:dep @ =1.4.0 from git \"{SOURCE_B}\" }}\n"
+        );
+        let helper_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(helper_manifest.as_bytes()),
+        );
+        let mut dep_a_named_release = Some(
+            fetch_fixture_with_canonical_url(
+                &dep_a_named_remote,
+                Some(&dep_a_named_remote.commit_id),
+                None,
+                SOURCE_A,
+            )
+            .unwrap(),
+        );
+        let mut dep_a_floor_release = Some(
+            fetch_fixture_with_canonical_url(
+                &dep_a_floor_remote,
+                Some(&dep_a_floor_remote.commit_id),
+                None,
+                SOURCE_A,
+            )
+            .unwrap(),
+        );
+        let mut dep_b_release = Some(
+            fetch_fixture_with_canonical_url(
+                &dep_b_remote,
+                Some(&dep_b_remote.commit_id),
+                None,
+                SOURCE_B,
+            )
+            .unwrap(),
+        );
+        let mut helper_release = Some(
+            fetch_fixture_with_canonical_url(
+                &helper_remote,
+                Some(&helper_remote.commit_id),
+                None,
+                HELPER_SOURCE,
+            )
+            .unwrap(),
+        );
+
+        let mut dep_read_fetches = 0;
+        let mut helper_read_fetches = 0;
+        let output = resolve_mixed_source_packages_from_lock_merge_with_fetchers(
+            LocalPackageDirectory::open(&root_path).expect("open the local root package"),
+            &lock_sides,
+            PackageValidationContext::default(),
+            |selection, locked_package| match selection.package_version().package() {
+                "acme:dep" => {
+                    dep_read_fetches += 1;
+                    assert!(matches!(
+                        selection.source(),
+                        ResolverPackageSource::Git { url, directory: None }
+                            if url.as_ref() == SOURCE_A
+                    ));
+                    if selection.package_version().version().to_string() == "1.0.0" {
+                        assert_eq!(selection.reason(), ResolverSourceReason::NamedRequirement);
+                        assert!(locked_package.is_none());
+                        Ok(dep_a_named_release
+                            .take()
+                            .expect("the named candidate is read once"))
+                    } else {
+                        assert_eq!(selection.package_version().version().to_string(), "1.4.0");
+                        assert_eq!(selection.reason(), ResolverSourceReason::LockFloor);
+                        let locked_package =
+                            locked_package.expect("the floor source has its merged lock record");
+                        assert!(locked_package.fields.iter().any(|field| matches!(
+                        &field.value,
+                        LockPackageField::Source(LockSource::Git(url)) if url.as_ref() == SOURCE_A
+                    )));
+                        assert!(locked_package.fields.iter().any(|field| matches!(
+                            &field.value,
+                            LockPackageField::Commit(commit) if commit.as_ref() == "a".repeat(40)
+                        )));
+                        Ok(dep_a_floor_release
+                            .take()
+                            .expect("the floor-selected source is read once"))
+                    }
+                }
+                "acme:z-helper" => {
+                    helper_read_fetches += 1;
+                    assert_eq!(selection.reason(), ResolverSourceReason::NamedRequirement);
+                    assert!(matches!(
+                        selection.source(),
+                        ResolverPackageSource::Git { url, directory: None }
+                            if url.as_ref() == HELPER_SOURCE
+                    ));
+                    assert!(locked_package.is_none());
+                    Ok(helper_release
+                        .take()
+                        .expect("the helper source is read once"))
+                }
+                package => panic!("unexpected Git package request for {package}"),
+            },
+            |_, _| unreachable!("the fixture has no Git-relative package requirements"),
+        )
+        .expect("the lock floor resolves from its canonical source");
+
+        assert_eq!(dep_read_fetches, 2);
+        assert_eq!(helper_read_fetches, 1);
+        let final_sources = output
+            .plan_final_sources_from_lock()
+            .expect("final sources can be planned from both lock sides");
+        let dep_version = expected_package_version("acme:dep", "1.4.0");
+        let dep_final_source = final_sources
+            .entries()
+            .iter()
+            .find(|entry| entry.package_version() == &dep_version)
+            .expect("the selected dependency has a final source");
+        assert_eq!(
+            dep_final_source.read_source().reason(),
+            ResolverSourceReason::LockFloor
+        );
+        assert!(matches!(
+            dep_final_source.final_source().source(),
+            ResolverPackageSource::Git { url, directory: None }
+                if url.as_ref() == SOURCE_B
+        ));
+
+        let mut final_reload_fetches = 0;
+        let audit = output
+            .plan_final_source_audit_from_lock(
+                PackageValidationContext::default(),
+                |selection, locked_package| {
+                    final_reload_fetches += 1;
+                    assert_eq!(selection.package_version(), &dep_version);
+                    assert_eq!(selection.reason(), ResolverSourceReason::NamedRequirement);
+                    assert!(matches!(
+                        selection.source(),
+                        ResolverPackageSource::Git { url, directory: None }
+                            if url.as_ref() == SOURCE_B
+                    ));
+                    let locked_package =
+                        locked_package.expect("the final source has its exact merged lock record");
+                    assert!(locked_package.fields.iter().any(|field| matches!(
+                        &field.value,
+                        LockPackageField::Source(LockSource::Git(url)) if url.as_ref() == SOURCE_B
+                    )));
+                    assert!(locked_package.fields.iter().any(|field| matches!(
+                        &field.value,
+                        LockPackageField::Commit(commit) if commit.as_ref() == "b".repeat(40)
+                    )));
+                    Ok(dep_b_release
+                        .take()
+                        .expect("the final source reload runs once"))
+                },
+                |_, _| unreachable!("the fixture has no Git-relative package requirements"),
+            )
+            .expect("the final source can be reloaded from its matching lock record");
+        assert_eq!(final_reload_fetches, 1);
+        assert!(audit.is_equivalent());
     }
 
     #[test]

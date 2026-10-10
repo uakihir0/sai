@@ -58,6 +58,17 @@ pub fn serialize_canonical(parsed: &LockParseOutput) -> Result<String, LockSeria
     Ok(serialize_valid_lock(&parsed.file))
 }
 
+/// Serializes one previously validated package block in canonical field order.
+///
+/// Conflict-side reconciliation uses this only to choose a stable record when
+/// the same Git content appears on both sides with different resolution
+/// metadata. It does not validate or persist a lock.
+pub(crate) fn serialize_package_for_ordering(package: &LockPackage) -> String {
+    let mut output = String::new();
+    write_package(&mut output, package);
+    output
+}
+
 fn serialize_valid_lock(file: &LockFile) -> String {
     let format_version = file
         .format_version

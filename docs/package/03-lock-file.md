@@ -376,11 +376,11 @@ The layout is designed so that most concurrent changes merge without conflicts: 
 2. **Parse both sides** (§3.3). If the parser can read either side's format version and it is greater than the highest format the toolchain supports, the command fails with `UNSUPPORTED_LOCK_VERSION` (§3.10.2), before syntax or semantic validation. Otherwise, if either side is not a valid lock, the command fails with `LOCK_CORRUPT` and suggests deleting `sai.lock` and running `sai lock`.
 3. **Floors.** For every node `(id, line)` that is not pinned in either side, the floor is the higher of the two versions ([02 §2.10.3](02-resolver.md) rule 1).
 4. **Known content.** A version whose entry appears on both sides with the same source MUST have the same commit and checksums on both. Otherwise the command fails with `LOCK_MERGE_CONFLICT`, naming the version and both commits: the two branches locked different content for one version, which is a tag that moved between the two fetches ([04 §4.3.3](04-distribution-and-security.md)). The user decides which content to keep by taking one side of the file, then runs `sai lock` again.
-5. **Resolve.** The current root contract is resolved in Mode B with these floors. Known commits and checksums from either side are reused as in [02 §2.10.3](02-resolver.md) rule 3.
+5. **Resolve.** The current root contract is resolved in Mode B with these floors. Known commits and checksums from either side are reused as in [02 §2.10.3](02-resolver.md) rule 3. If a selected version was named only as a floor and both sides record it at different Git sources, use the first source in bytewise order of `(canonical URL, normalized directory)`; an absent directory (the repository root) sorts before a present directory. A source clause that names the selected version still takes precedence under [02 §2.8.1](02-resolver.md).
 6. **Approval baseline.** For the capability review ([02 §2.12.3](02-resolver.md)), the previous footprint of a node is the union of its footprints on both sides, and a source is approved if either side records it. Both branches were reviewed when their locks were written.
 7. **Write** the result (§3.7.2).
 
-The result does not depend on which side is *ours*: floors are maxima and known content is equal on both sides, so the procedure is symmetric.
+The result does not depend on which side is *ours*: floors use maxima, same-source known content must agree, and the source tie-break is ordered by canonical identity, so the procedure is symmetric.
 
 ### 3.9.3 Duplicate entries after a clean merge
 

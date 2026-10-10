@@ -12,7 +12,8 @@ use crate::git_remote::{
     FetchedGitPackage, FetchedGitRelease, GitPackagePathError, GitPackageSourceIdentity,
     GitRemoteReleaseContractError, GitRemoteReleaseFetchError, SelectedGitReleaseFetchError,
     fetch_git_package_source_tree_at_commit, fetch_locked_git_path_package_tree,
-    fetch_selected_git_release, matching_locked_git_path_package,
+    fetch_selected_git_release, matching_locked_git_path_package_from_iter,
+    matching_locked_git_release_package_from_iter,
 };
 use crate::git_source_index::{GitPackageSourceIdentityIndex, GitPackageSourceIdentityIndexError};
 use crate::local_source::{
@@ -21,6 +22,7 @@ use crate::local_source::{
     LocalPackagePathPinError, LocalPackageSourceResolveError,
 };
 use crate::lock::LockPackage;
+use crate::lock_conflict::{LockConflictGitSource, ValidatedLockConflictSides};
 use crate::manifest::PackageRole;
 use crate::mvs::{MvsContractRequest, MvsNode, MvsPackageVersion, MvsRequirer};
 use crate::package_path::{DependencyPackagePath, PackagePathError};
@@ -151,6 +153,8 @@ pub struct MixedSourceMvsOutput {
     local_directories: LocalPackageDirectoryIndex,
     git_identities: GitPackageSourceIdentityIndex,
     git_path_requirements: BTreeMap<MvsRequirer, GitPathRequirementIndex>,
+    locked_sources: HashMap<MvsPackageVersion, ResolverPackageSource>,
+    locked_packages: Vec<LockPackage>,
 }
 
 impl MixedSourceMvsOutput {
@@ -193,12 +197,79 @@ impl MixedSourceMvsOutput {
         plan_resolver_final_sources(self.provider.output(), &self.context, locked_sources)
     }
 
+    /// Plan final source choices using the lock input retained by this MVS
+    /// load, including all source variants from a validated lock merge.
+    pub fn plan_final_sources_from_lock(
+        &self,
+    ) -> Result<
+        crate::resolver_source_provider::ResolverFinalSourcePlan,
+        crate::resolver_source_provider::ResolverFinalSourcePlanError,
+    > {
+        self.plan_final_sources(&self.locked_sources)
+    }
+
     /// Resolve final source identities, reload changed sources, and prepare
     /// the contract audit required after MVS range and cycle checks.
     pub fn plan_final_source_audit(
         &self,
         locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
         locked_packages: &HashMap<MvsPackageVersion, LockPackage>,
+        validation_context: PackageValidationContext<'_>,
+        fetch_git_release: impl FnMut(
+            &ResolverSourceSelection,
+            Option<&LockPackage>,
+        )
+            -> Result<FetchedGitRelease, SelectedGitReleaseFetchError>,
+        fetch_git_sibling: impl FnMut(
+            &GitPackageSourceIdentity,
+            Option<&LockPackage>,
+        ) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError>,
+    ) -> Result<
+        MixedSourceFinalAuditPlan,
+        crate::resolver_source_provider::ResolverFinalSourcePlanError,
+    > {
+        let candidates = locked_packages.values().collect::<Vec<_>>();
+        self.plan_final_source_audit_with_candidates(
+            locked_sources,
+            &candidates,
+            validation_context,
+            fetch_git_release,
+            fetch_git_sibling,
+        )
+    }
+
+    /// Resolve final source identities using the lock input retained by this
+    /// MVS load, preserving distinct Git sources for the same package version.
+    pub fn plan_final_source_audit_from_lock(
+        &self,
+        validation_context: PackageValidationContext<'_>,
+        fetch_git_release: impl FnMut(
+            &ResolverSourceSelection,
+            Option<&LockPackage>,
+        )
+            -> Result<FetchedGitRelease, SelectedGitReleaseFetchError>,
+        fetch_git_sibling: impl FnMut(
+            &GitPackageSourceIdentity,
+            Option<&LockPackage>,
+        ) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError>,
+    ) -> Result<
+        MixedSourceFinalAuditPlan,
+        crate::resolver_source_provider::ResolverFinalSourcePlanError,
+    > {
+        let candidates = self.locked_packages.iter().collect::<Vec<_>>();
+        self.plan_final_source_audit_with_candidates(
+            &self.locked_sources,
+            &candidates,
+            validation_context,
+            fetch_git_release,
+            fetch_git_sibling,
+        )
+    }
+
+    fn plan_final_source_audit_with_candidates(
+        &self,
+        locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
+        locked_packages: &[&LockPackage],
         validation_context: PackageValidationContext<'_>,
         mut fetch_git_release: impl FnMut(
             &ResolverSourceSelection,
@@ -357,15 +428,18 @@ impl MixedSourceMvsOutput {
                     }
                 }
                 Some(MixedSourceFinalSnapshot::GitPath(identity)) => {
-                    let fetched = matching_locked_git_path_package(identity, locked_packages)
-                        .and_then(|locked| {
-                            fetch_git_sibling(identity, locked).and_then(|package| {
-                                crate::git_remote::verify_git_path_package_identity(
-                                    identity, &package,
-                                )?;
-                                Ok(package)
-                            })
-                        });
+                    let fetched = matching_locked_git_path_package_from_iter(
+                        identity,
+                        locked_packages.iter().copied(),
+                    )
+                    .and_then(|locked| {
+                        fetch_git_sibling(identity, locked).and_then(|package| {
+                            crate::git_remote::verify_git_path_package_identity(
+                                identity, &package,
+                            )?;
+                            Ok(package)
+                        })
+                    });
                     match fetched {
                         Ok(package) => {
                             if let Err(error) = append_final_git_path_packages(
@@ -1142,7 +1216,7 @@ enum MixedSourceFinalSnapshot {
 struct MixedSourceFinalIdentityContext<'a> {
     root_package: &'a MvsPackageVersion,
     read_identities: &'a ResolverSourceIdentitySnapshot<MixedPackageSourceIdentity>,
-    locked_packages: &'a HashMap<MvsPackageVersion, LockPackage>,
+    locked_packages: &'a [&'a LockPackage],
 }
 
 /// Source identities, reloaded contracts, and comparison context after MVS.
@@ -1246,9 +1320,18 @@ fn resolve_final_mixed_source_identity(
             {
                 return Ok(MixedPackageSourceIdentity::Git(identity.clone()));
             }
-            let fetched =
-                fetch_git_release(selection, context.locked_packages.get(package_version))
-                    .map_err(|error| MixedSourceFinalIdentityError::GitRelease(Box::new(error)))?;
+            let locked_package = matching_locked_git_release_package_from_iter(
+                package_version,
+                selection.source(),
+                context.locked_packages.iter().copied(),
+            )
+            .map_err(|error| {
+                MixedSourceFinalIdentityError::GitRelease(Box::new(
+                    SelectedGitReleaseFetchError::InvalidLockedPackage(Box::new(error)),
+                ))
+            })?;
+            let fetched = fetch_git_release(selection, locked_package)
+                .map_err(|error| MixedSourceFinalIdentityError::GitRelease(Box::new(error)))?;
             if fetched.source_identity().canonical_url() != url.as_ref()
                 || fetched.source_identity().directory() != &selected_directory
             {
@@ -1340,7 +1423,7 @@ fn append_final_git_path_packages(
     source: &impl crate::git_remote::GitPackageSourceView,
     package_version: &MvsPackageVersion,
     root_context: &ResolverContractContext<'_>,
-    locked_packages: &HashMap<MvsPackageVersion, LockPackage>,
+    locked_packages: &[&LockPackage],
     fetch_git_sibling: &mut impl FnMut(
         &GitPackageSourceIdentity,
         Option<&LockPackage>,
@@ -1349,7 +1432,8 @@ fn append_final_git_path_packages(
 ) -> Result<(), Box<GitPathRequirementDiscoveryError<GitRemoteReleaseFetchError>>> {
     let requirer = MvsRequirer::Package(package_version.clone());
     let discovered = discover_git_path_requirements(source, &requirer, root_context, |identity| {
-        let locked = matching_locked_git_path_package(identity, locked_packages)?;
+        let locked =
+            matching_locked_git_path_package_from_iter(identity, locked_packages.iter().copied())?;
         fetch_git_sibling(identity, locked)
     })?;
     destination.extend(discovered.path_packages().clone());
@@ -1442,11 +1526,172 @@ pub fn resolve_mixed_source_packages(
     )
 }
 
+/// Resolve a local root using both validated sides of a lock merge.
+///
+/// If a package version is present with different Git sources on the two
+/// sides and its source is selected only by a lock floor, the canonical
+/// source key order chooses the source. A source named by the current graph
+/// still takes precedence, and its exact lock record is matched independently.
+pub fn resolve_mixed_source_packages_from_lock_merge(
+    root_directory: LocalPackageDirectory,
+    lock_sides: &ValidatedLockConflictSides,
+    validation_context: PackageValidationContext<'_>,
+) -> Result<MixedSourceMvsOutput, MixedSourceMvsError> {
+    resolve_mixed_source_packages_from_lock_merge_with_fetchers(
+        root_directory,
+        lock_sides,
+        validation_context,
+        fetch_selected_git_release,
+        |identity, locked_package| {
+            if let Some(locked_package) = locked_package {
+                fetch_locked_git_path_package_tree(locked_package, identity)
+            } else {
+                fetch_git_package_source_tree_at_commit(
+                    identity.canonical_url(),
+                    identity.commit_id(),
+                    identity.directory(),
+                )
+            }
+        },
+    )
+}
+
+pub(crate) fn resolve_mixed_source_packages_from_lock_merge_with_fetchers(
+    root_directory: LocalPackageDirectory,
+    lock_sides: &ValidatedLockConflictSides,
+    validation_context: PackageValidationContext<'_>,
+    fetch_git_release: impl FnMut(
+        &ResolverSourceSelection,
+        Option<&LockPackage>,
+    ) -> Result<FetchedGitRelease, SelectedGitReleaseFetchError>,
+    fetch_git_sibling: impl FnMut(
+        &GitPackageSourceIdentity,
+        Option<&LockPackage>,
+    ) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError>,
+) -> Result<MixedSourceMvsOutput, MixedSourceMvsError> {
+    let lock_floors = lock_sides
+        .floors()
+        .iter()
+        .map(|(node, version)| (node.clone(), version.clone()))
+        .collect::<HashMap<_, _>>();
+    let locked_sources = lock_merge_source_choices(lock_sides);
+    let locked_packages = lock_sides.known_git_packages().values().collect::<Vec<_>>();
+    resolve_mixed_source_packages_with_lock_candidates(
+        root_directory,
+        &lock_floors,
+        &locked_sources,
+        &locked_packages,
+        validation_context,
+        fetch_git_release,
+        fetch_git_sibling,
+    )
+}
+
+fn lock_merge_source_choices(
+    lock_sides: &ValidatedLockConflictSides,
+) -> HashMap<MvsPackageVersion, ResolverPackageSource> {
+    let mut choices = BTreeMap::new();
+    for (package_version, source) in lock_sides.known_git_packages().keys() {
+        choices
+            .entry(package_version.clone())
+            .or_insert_with(|| lock_conflict_source(source));
+    }
+    choices.into_iter().collect()
+}
+
+fn lock_conflict_source(source: &LockConflictGitSource) -> ResolverPackageSource {
+    ResolverPackageSource::Git {
+        url: source.url.clone(),
+        directory: source.directory.clone(),
+    }
+}
+
+#[cfg(test)]
+mod lock_merge_source_choice_tests {
+    use super::lock_merge_source_choices;
+    use crate::lock_conflict::{reconstruct_conflict_sides, validate_conflict_sides};
+    use crate::resolver_source::ResolverPackageSource;
+    use std::collections::BTreeSet;
+
+    fn merged_lock(
+        first_url: &str,
+        second_url: &str,
+    ) -> crate::lock_conflict::ValidatedLockConflictSides {
+        let entry = |url: &str, commit: char, checksum: char| {
+            format!(
+                "package acme:dep @ 1.4.0\n    source git \"{url}\"\n    commit \"{}\"\n    checksum \"sai1:{}\"\n    capabilities {{ }}\n",
+                commit.to_string().repeat(40),
+                checksum.to_string().repeat(64),
+            )
+        };
+        let source = format!(
+            "lock 1\n\nroot acme:app @ 1.0.0\n    targets {{ wasm32-core }}\n<<<<<<< ours\n{}=======\n{}>>>>>>> theirs\n",
+            entry(first_url, 'a', '1'),
+            entry(second_url, 'b', '2'),
+        );
+        let sides = reconstruct_conflict_sides(source.as_bytes())
+            .expect("the lock conflict markers are balanced")
+            .expect("the fixture contains a lock conflict");
+        validate_conflict_sides(&sides, &BTreeSet::new())
+            .expect("both lock sides are semantically valid")
+    }
+
+    #[test]
+    fn ambiguous_floor_source_uses_the_same_canonical_source_on_either_side_order() {
+        let source_a = "https://example.test/acme/dep-a.git";
+        let source_b = "https://example.test/acme/dep-b.git";
+        let expected = ResolverPackageSource::Git {
+            url: source_a.into(),
+            directory: None,
+        };
+
+        assert_eq!(
+            lock_merge_source_choices(&merged_lock(source_b, source_a))
+                .values()
+                .next(),
+            Some(&expected)
+        );
+        assert_eq!(
+            lock_merge_source_choices(&merged_lock(source_a, source_b))
+                .values()
+                .next(),
+            Some(&expected)
+        );
+    }
+}
+
 pub(crate) fn resolve_mixed_source_packages_with_fetchers(
     root_directory: LocalPackageDirectory,
     lock_floors: &HashMap<MvsNode, Version>,
     locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
     locked_packages: &HashMap<MvsPackageVersion, LockPackage>,
+    validation_context: PackageValidationContext<'_>,
+    fetch_git_release: impl FnMut(
+        &ResolverSourceSelection,
+        Option<&LockPackage>,
+    ) -> Result<FetchedGitRelease, SelectedGitReleaseFetchError>,
+    fetch_git_sibling: impl FnMut(
+        &GitPackageSourceIdentity,
+        Option<&LockPackage>,
+    ) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError>,
+) -> Result<MixedSourceMvsOutput, MixedSourceMvsError> {
+    let locked_packages = locked_packages.values().collect::<Vec<_>>();
+    resolve_mixed_source_packages_with_lock_candidates(
+        root_directory,
+        lock_floors,
+        locked_sources,
+        &locked_packages,
+        validation_context,
+        fetch_git_release,
+        fetch_git_sibling,
+    )
+}
+
+fn resolve_mixed_source_packages_with_lock_candidates(
+    root_directory: LocalPackageDirectory,
+    lock_floors: &HashMap<MvsNode, Version>,
+    locked_sources: &HashMap<MvsPackageVersion, ResolverPackageSource>,
+    locked_packages: &[&LockPackage],
     validation_context: PackageValidationContext<'_>,
     mut fetch_git_release: impl FnMut(
         &ResolverSourceSelection,
@@ -1526,6 +1771,11 @@ pub(crate) fn resolve_mixed_source_packages_with_fetchers(
             local_directories: state.local_directories,
             git_identities: state.git_identities,
             git_path_requirements: state.git_path_requirements,
+            locked_sources: locked_sources.clone(),
+            locked_packages: locked_packages
+                .iter()
+                .map(|package| (*package).clone())
+                .collect(),
         }),
         Err(error) => Err(MixedSourceMvsError::Provider(Box::new(
             MixedSourceMvsProviderFailure {
@@ -1545,7 +1795,7 @@ fn load_mixed_source_candidate(
     selection: &ResolverSourceSelection,
     canonicalized_path_pins: &[MixedPackageSourceIdentity],
     state: &RefCell<MixedSourceLoadState>,
-    locked_packages: &HashMap<MvsPackageVersion, LockPackage>,
+    locked_packages: &[&LockPackage],
     validation_context: PackageValidationContext<'_>,
     fetch_git_release: &mut impl FnMut(
         &ResolverSourceSelection,
@@ -1658,9 +1908,9 @@ fn load_mixed_source_candidate(
                         &requirer,
                         &current_context,
                         |sibling_identity| {
-                            let locked_package = matching_locked_git_path_package(
+                            let locked_package = matching_locked_git_path_package_from_iter(
                                 sibling_identity,
-                                locked_packages,
+                                locked_packages.iter().copied(),
                             )?;
                             fetch_git_sibling(sibling_identity, locked_package)
                         },
@@ -1737,7 +1987,16 @@ fn load_mixed_source_candidate(
             )
         }
         (_, ResolverPackageSource::Git { .. }) => {
-            let locked_package = locked_packages.get(&request.package_version);
+            let locked_package = matching_locked_git_release_package_from_iter(
+                &request.package_version,
+                selection.source(),
+                locked_packages.iter().copied(),
+            )
+            .map_err(|error| {
+                MixedSourceMvsLoadError::GitReleaseFetch(Box::new(
+                    SelectedGitReleaseFetchError::InvalidLockedPackage(Box::new(error)),
+                ))
+            })?;
             let fetched = fetch_git_release(selection, locked_package)
                 .map_err(|error| MixedSourceMvsLoadError::GitReleaseFetch(Box::new(error)))?;
             let identity = MixedPackageSourceIdentity::Git(fetched.source_identity().clone());
@@ -1746,8 +2005,10 @@ fn load_mixed_source_candidate(
                 &requirer,
                 &current_context,
                 |sibling_identity| {
-                    let locked_package =
-                        matching_locked_git_path_package(sibling_identity, locked_packages)?;
+                    let locked_package = matching_locked_git_path_package_from_iter(
+                        sibling_identity,
+                        locked_packages.iter().copied(),
+                    )?;
                     fetch_git_sibling(sibling_identity, locked_package)
                 },
             )

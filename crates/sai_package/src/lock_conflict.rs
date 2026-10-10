@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use crate::lock::{LockPackageField, LockParseOutput, LockSource, parse};
+use crate::lock::{LockPackage, LockPackageField, LockParseOutput, LockSource, parse};
 use crate::lock_validation::{
     LockValidationError, SUPPORTED_LOCK_FORMAT_VERSION, canonical_git_url, validate,
 };
@@ -137,6 +137,7 @@ pub struct ValidatedLockConflictSides {
     floors: BTreeMap<MvsNode, Version>,
     pinned_nodes: BTreeSet<MvsNode>,
     known_git_content: BTreeMap<(MvsNode, Version, LockConflictGitSource), LockConflictGitContent>,
+    known_git_packages: BTreeMap<(MvsPackageVersion, LockConflictGitSource), LockPackage>,
     previous_footprints: BTreeMap<MvsNode, BTreeSet<Box<str>>>,
 }
 
@@ -165,6 +166,18 @@ impl ValidatedLockConflictSides {
         &self,
     ) -> &BTreeMap<(MvsNode, Version, LockConflictGitSource), LockConflictGitContent> {
         &self.known_git_content
+    }
+
+    /// Git package records keyed by exact package version and canonical source.
+    ///
+    /// Records from both sides are deduplicated only after their shared key's
+    /// commit and checksums have been validated as equal. If the remaining
+    /// package metadata differs, the bytewise-smaller canonical package block
+    /// is retained so swapping conflict sides cannot change the catalog.
+    pub const fn known_git_packages(
+        &self,
+    ) -> &BTreeMap<(MvsPackageVersion, LockConflictGitSource), LockPackage> {
+        &self.known_git_packages
     }
 
     /// The union of the recorded capability footprints from both sides,
@@ -442,6 +455,8 @@ fn validate_parsed_conflict_sides(
     let mut floors = BTreeMap::new();
     let mut known_git_content =
         BTreeMap::<(MvsNode, Version, LockConflictGitSource), LockConflictGitContent>::new();
+    let mut known_git_packages =
+        BTreeMap::<(MvsPackageVersion, LockConflictGitSource), LockPackage>::new();
     let mut previous_footprints = BTreeMap::<MvsNode, BTreeSet<Box<str>>>::new();
     for (side, parsed) in [
         (LockConflictSide::Ours, &ours),
@@ -534,6 +549,29 @@ fn validate_parsed_conflict_sides(
             } else {
                 known_git_content.insert(key, content);
             }
+
+            let package_version = MvsPackageVersion::new(
+                package.value.package.clone(),
+                package.value.version.clone(),
+            )
+            .map_err(|_| LockConflictValidationError::InvalidPackageNode {
+                side,
+                package: package.value.package.clone(),
+            })?;
+            let key = (package_version, source);
+            let replace_existing = match known_git_packages.get(&key) {
+                Some(existing) => {
+                    let existing =
+                        crate::lock_serialization::serialize_package_for_ordering(existing);
+                    let candidate =
+                        crate::lock_serialization::serialize_package_for_ordering(&package.value);
+                    candidate.as_bytes() < existing.as_bytes()
+                }
+                None => true,
+            };
+            if replace_existing {
+                known_git_packages.insert(key, package.value.clone());
+            }
         }
     }
 
@@ -543,6 +581,7 @@ fn validate_parsed_conflict_sides(
         floors,
         pinned_nodes,
         known_git_content,
+        known_git_packages,
         previous_footprints,
     })
 }
@@ -832,6 +871,33 @@ mod tests {
             .expect("the second source retains independent known content");
         assert!(content_b.commit.starts_with('b'));
         assert_eq!(merged.known_git_content().len(), 2);
+        assert_eq!(merged.known_git_packages().len(), 2);
+        let package_a = merged
+            .known_git_packages()
+            .get(&(
+                package_version.clone(),
+                super::LockConflictGitSource {
+                    url: "https://example.test/dep-a".into(),
+                    directory: None,
+                },
+            ))
+            .expect("the first source retains its complete lock package");
+        assert_eq!(package_a, &merged.ours().file().packages[0].value);
+        assert_eq!(package_a.package.as_ref(), "acme:dep");
+        assert_eq!(package_a.version, Version::parse("1.4.0").unwrap());
+        let package_b = merged
+            .known_git_packages()
+            .get(&(
+                package_version.clone(),
+                super::LockConflictGitSource {
+                    url: "https://example.test/dep-b".into(),
+                    directory: None,
+                },
+            ))
+            .expect("the second source retains its complete lock package");
+        assert_eq!(package_b, &merged.theirs().file().packages[0].value);
+        assert_eq!(package_b.package.as_ref(), "acme:dep");
+        assert_eq!(package_b.version, Version::parse("1.4.0").unwrap());
         assert!(
             merged
                 .known_git_content_for(
@@ -1054,6 +1120,7 @@ mod tests {
             Version::parse("1.0.0").unwrap().compatibility_line(),
         )
         .unwrap();
+        assert_eq!(merged.known_git_packages().len(), 1);
         assert!(merged.pinned_nodes().contains(&node));
         assert!(!merged.floors().contains_key(&node));
     }
@@ -1232,6 +1299,60 @@ mod tests {
         };
         let merged = validate_conflict_sides(&sides, &BTreeSet::new()).unwrap();
         assert_eq!(merged.known_git_content().len(), 1);
+        assert_eq!(merged.known_git_packages().len(), 1);
+        let package_version =
+            MvsPackageVersion::new("acme:dep", Version::parse("1.4.0").unwrap()).unwrap();
+        let package = merged
+            .known_git_packages()
+            .get(&(
+                package_version,
+                super::LockConflictGitSource {
+                    url: "https://example.test/dep".into(),
+                    directory: None,
+                },
+            ))
+            .expect("identical records share one exact source key");
+        assert_eq!(package.package.as_ref(), "acme:dep");
+        assert_eq!(package.version, Version::parse("1.4.0").unwrap());
+    }
+
+    #[test]
+    fn same_source_record_selection_is_independent_of_conflict_side_order() {
+        let with_requirement = |package: &str| {
+            git_package_entry("1.4.0", 'a', 'a', "alloc").replace(
+                "    compiler ^0.1\n",
+                &format!("    requires {package} @ ^1.0 -> 1.1.0\n    compiler ^0.1\n"),
+            )
+        };
+        let package_a = with_requirement("acme:a");
+        let package_b = with_requirement("acme:b");
+
+        let selected_record = |first: &str, second: &str| {
+            let parsed =
+                parse(clean_merge_lock(&[first.to_string(), second.to_string()]).as_bytes());
+            let merged = validate_clean_merge_duplicates(&parsed, &BTreeSet::new())
+                .unwrap()
+                .expect("same-node entries form a clean merge");
+            let package_version =
+                MvsPackageVersion::new("acme:dep", Version::parse("1.4.0").unwrap()).unwrap();
+            let package = merged
+                .known_git_packages()
+                .get(&(
+                    package_version,
+                    super::LockConflictGitSource {
+                        url: "https://example.test/acme/dep".into(),
+                        directory: None,
+                    },
+                ))
+                .expect("the common Git source has a lock record");
+            crate::lock_serialization::serialize_package_for_ordering(package)
+        };
+
+        let forward = selected_record(&package_a, &package_b);
+        let reversed = selected_record(&package_b, &package_a);
+        assert_eq!(forward, reversed);
+        assert!(forward.contains("requires acme:a @ ^1.0 -> 1.1.0"));
+        assert!(!forward.contains("requires acme:b @ ^1.0 -> 1.1.0"));
     }
 
     #[test]
