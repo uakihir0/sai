@@ -140,6 +140,29 @@ where
     parse_release_tag_refs_with_limits(refs, directory, ListingLimits::SPEC)
 }
 
+/// Construct the tag for one already-selected version and exact advertised ref.
+///
+/// Resolver fetches name the version before contacting the remote, so their
+/// exact-ref path does not apply the aggregate prerelease-identifier limit
+/// used when parsing a tag listing.
+pub(crate) fn parse_exact_release_tag_ref(
+    name: &[u8],
+    object_id: gix::ObjectId,
+    version: &Version,
+    directory: Option<&RepositoryPackageDirectory>,
+) -> Result<Option<GitReleaseTag>, GitReleaseTagListError> {
+    let prefix = release_tag_prefix(directory)?;
+    let expected_name = format!("{prefix}{version}");
+    if name != expected_name.as_bytes() {
+        return Ok(None);
+    }
+    Ok(Some(GitReleaseTag {
+        name: expected_name.into(),
+        version: version.clone(),
+        object_id,
+    }))
+}
+
 fn parse_release_tag_refs_with_limits<I, N>(
     refs: I,
     directory: Option<&RepositoryPackageDirectory>,

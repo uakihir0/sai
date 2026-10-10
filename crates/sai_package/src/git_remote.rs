@@ -14,8 +14,8 @@ use std::time::Duration;
 use gix::bstr::{BStr, BString, ByteSlice};
 
 use crate::git_tags::{
-    GitReleaseTag, GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs,
-    release_tag_prefix,
+    GitReleaseTag, GitReleaseTagListError, GitReleaseTagListLimit, parse_exact_release_tag_ref,
+    parse_release_tag_refs, release_tag_prefix,
 };
 use crate::git_tree::{
     GitPackageArtifactChecksum, GitPackageFile, GitPackageSourceTree, GitTreeReadError,
@@ -38,6 +38,9 @@ use crate::package_path::{
 };
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, build_resolver_contract,
+};
+use crate::resolver_source::{
+    ResolverPackageSource, ResolverSourceReason, ResolverSourceSelection,
 };
 use crate::tree_hash::{TreeHash, TreeHashError};
 use crate::validation::PackageValidationContext;
@@ -789,6 +792,223 @@ pub enum GitRemoteReleaseFetchError {
     },
 }
 
+/// Failure to fetch the Git source selected for a concrete resolver request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectedGitReleaseFetchError {
+    /// The resolver selected a path source or another non-Git source.
+    NotGitSource,
+    /// The selected Git URL is not supported.
+    InvalidGitUrl,
+    /// The selected package directory is invalid.
+    InvalidPackageDirectory,
+    /// A supplied lock package belongs to another package version.
+    LockedPackageVersionMismatch {
+        expected: Box<MvsPackageVersion>,
+        found: Box<MvsPackageVersion>,
+    },
+    /// The supplied lock package is not a valid Git release entry.
+    InvalidLockedPackage(Box<GitRemoteReleaseFetchError>),
+    /// A lock-floor selection has no validated lock package.
+    MissingLockedPackage(Box<MvsPackageVersion>),
+    /// The lock-floor source differs from the selected Git source.
+    LockedSourceMismatch(Box<MvsPackageVersion>),
+    /// Looking up the exact remote release tag failed.
+    TagLookup(Box<GitRemoteTagListError>),
+    /// The selected package version has no matching release tag.
+    VersionNotFound(Box<MvsPackageVersion>),
+    /// Fetching or validating the selected release failed.
+    Fetch(Box<GitRemoteReleaseFetchError>),
+}
+
+impl SelectedGitReleaseFetchError {
+    /// Return the user-facing diagnostic code when this error has one.
+    pub const fn diagnostic_code(&self) -> Option<sai_diagnostics::Code> {
+        match self {
+            Self::NotGitSource => None,
+            Self::InvalidGitUrl => Some(sai_diagnostics::Code::UnsupportedGitUrl),
+            Self::InvalidPackageDirectory => Some(sai_diagnostics::Code::InvalidPackagePath),
+            Self::LockedPackageVersionMismatch { .. }
+            | Self::InvalidLockedPackage(_)
+            | Self::MissingLockedPackage(_)
+            | Self::LockedSourceMismatch(_) => Some(sai_diagnostics::Code::LockCorrupt),
+            Self::TagLookup(error) => Some(error.diagnostic_code()),
+            Self::VersionNotFound(_) => Some(sai_diagnostics::Code::VersionNotFound),
+            Self::Fetch(error) => Some(error.diagnostic_code()),
+        }
+    }
+}
+
+impl fmt::Display for SelectedGitReleaseFetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotGitSource => formatter.write_str("selected package source is not Git"),
+            Self::InvalidGitUrl => formatter.write_str("selected Git URL is not supported"),
+            Self::InvalidPackageDirectory => {
+                formatter.write_str("selected Git package directory is invalid")
+            }
+            Self::LockedPackageVersionMismatch { expected, found } => write!(
+                formatter,
+                "lock entry is for {}@{}, expected {}@{}",
+                found.package(),
+                found.version(),
+                expected.package(),
+                expected.version()
+            ),
+            Self::InvalidLockedPackage(error) | Self::Fetch(error) => {
+                fmt::Display::fmt(error, formatter)
+            }
+            Self::MissingLockedPackage(package_version) => write!(
+                formatter,
+                "lock entry for {}@{} is required by the selected lock floor",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::LockedSourceMismatch(package_version) => write!(
+                formatter,
+                "lock source for {}@{} does not match the selected Git source",
+                package_version.package(),
+                package_version.version()
+            ),
+            Self::TagLookup(error) => fmt::Display::fmt(error, formatter),
+            Self::VersionNotFound(package_version) => write!(
+                formatter,
+                "no Git release tag was found for {}@{}",
+                package_version.package(),
+                package_version.version()
+            ),
+        }
+    }
+}
+
+impl StdError for SelectedGitReleaseFetchError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::InvalidLockedPackage(error) | Self::Fetch(error) => Some(error),
+            Self::TagLookup(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SelectedGitReleaseFetchPlan<'a> {
+    Locked(&'a LockPackage),
+    Tag {
+        url: Box<str>,
+        directory: Option<RepositoryPackageDirectory>,
+        package_version: MvsPackageVersion,
+    },
+}
+
+fn plan_selected_git_release_fetch<'a>(
+    package_version: &MvsPackageVersion,
+    source: &ResolverPackageSource,
+    reason: ResolverSourceReason,
+    locked_package: Option<&'a LockPackage>,
+) -> Result<SelectedGitReleaseFetchPlan<'a>, SelectedGitReleaseFetchError> {
+    let ResolverPackageSource::Git { url, directory } = source else {
+        return Err(SelectedGitReleaseFetchError::NotGitSource);
+    };
+    let canonical_url =
+        canonical_git_url(url).map_err(|()| SelectedGitReleaseFetchError::InvalidGitUrl)?;
+    let directory = directory
+        .as_deref()
+        .map(RepositoryPackageDirectory::parse)
+        .transpose()
+        .map_err(|_| SelectedGitReleaseFetchError::InvalidPackageDirectory)?;
+
+    let matching_lock = if let Some(locked_package) = locked_package {
+        let found = MvsPackageVersion::new(
+            locked_package.package.to_string(),
+            locked_package.version.clone(),
+        )
+        .map_err(|_| {
+            SelectedGitReleaseFetchError::InvalidLockedPackage(Box::new(
+                GitRemoteReleaseFetchError::InvalidLockedPackageField("package identity"),
+            ))
+        })?;
+        if &found != package_version {
+            return Err(SelectedGitReleaseFetchError::LockedPackageVersionMismatch {
+                expected: Box::new(package_version.clone()),
+                found: Box::new(found),
+            });
+        }
+
+        let has_git_source = locked_package
+            .fields
+            .iter()
+            .any(|field| matches!(&field.value, LockPackageField::Source(LockSource::Git(_))));
+        if has_git_source {
+            let locked = locked_release_request(locked_package).map_err(|error| {
+                SelectedGitReleaseFetchError::InvalidLockedPackage(Box::new(error))
+            })?;
+            let same_directory = locked
+                .directory
+                .as_ref()
+                .map_or(".", RepositoryPackageDirectory::as_str)
+                == directory
+                    .as_ref()
+                    .map_or(".", RepositoryPackageDirectory::as_str);
+            (locked.url.as_ref() == canonical_url && same_directory).then_some(locked_package)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(locked_package) = matching_lock {
+        return Ok(SelectedGitReleaseFetchPlan::Locked(locked_package));
+    }
+    if reason == ResolverSourceReason::LockFloor {
+        return Err(if locked_package.is_some() {
+            SelectedGitReleaseFetchError::LockedSourceMismatch(Box::new(package_version.clone()))
+        } else {
+            SelectedGitReleaseFetchError::MissingLockedPackage(Box::new(package_version.clone()))
+        });
+    }
+
+    Ok(SelectedGitReleaseFetchPlan::Tag {
+        url: canonical_url.into(),
+        directory,
+        package_version: package_version.clone(),
+    })
+}
+
+/// Fetch the Git release selected for one concrete MVS request.
+///
+/// A matching validated lock entry is fetched by commit and checksum. A
+/// lock-floor selection requires that entry; other selections without a
+/// matching entry look up and fetch only the exact version tag. Path
+/// selections are handled by the exact-commit sibling source API.
+pub fn fetch_selected_git_release(
+    selection: &ResolverSourceSelection,
+    locked_package: Option<&LockPackage>,
+) -> Result<FetchedGitRelease, SelectedGitReleaseFetchError> {
+    match plan_selected_git_release_fetch(
+        selection.package_version(),
+        selection.source(),
+        selection.reason(),
+        locked_package,
+    )? {
+        SelectedGitReleaseFetchPlan::Locked(package) => fetch_locked_package_tree(package)
+            .map_err(|error| SelectedGitReleaseFetchError::Fetch(Box::new(error))),
+        SelectedGitReleaseFetchPlan::Tag {
+            url,
+            directory,
+            package_version,
+        } => {
+            let tag = find_remote_release_tag(&url, package_version.version(), directory.as_ref())
+                .map_err(|error| SelectedGitReleaseFetchError::TagLookup(Box::new(error)))?;
+            let tag = tag.ok_or_else(|| {
+                SelectedGitReleaseFetchError::VersionNotFound(Box::new(package_version))
+            })?;
+            fetch_remote_release_tree(&url, &tag, directory.as_ref(), None, None)
+                .map_err(|error| SelectedGitReleaseFetchError::Fetch(Box::new(error)))
+        }
+    }
+}
+
 /// Why a locked package source was obtained from the package cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LockedPackageCacheStatus {
@@ -1093,6 +1313,39 @@ pub fn list_remote_release_tags(
     let repository = repository.to_thread_local();
 
     list_release_tags_in_repository(&repository, &canonical_url, &refspec, directory)
+}
+
+fn find_remote_release_tag(
+    url: &str,
+    version: &Version,
+    directory: Option<&RepositoryPackageDirectory>,
+) -> Result<Option<GitReleaseTag>, GitRemoteTagListError> {
+    let tag_name = release_tag_name(version, directory)
+        .map_err(|_| GitRemoteTagListError::InvalidPackageDirectory)?;
+    let refspec = exact_release_tag_refspec_for_name(&tag_name);
+    let canonical_url =
+        canonical_git_url(url).map_err(|()| GitRemoteTagListError::InvalidGitUrl)?;
+    let config_overrides = transport_config_overrides()?;
+    let scratch =
+        TemporaryGitDirectory::create().map_err(|()| GitRemoteTagListError::TemporaryRepository)?;
+    let open_options = gix::open::Options::isolated().config_overrides(config_overrides);
+    let repository = gix::ThreadSafeRepository::init_opts(
+        &scratch.path,
+        gix::create::Kind::Bare,
+        gix::create::Options::default(),
+        open_options,
+    )
+    .map_err(|_| GitRemoteTagListError::TemporaryRepository)?;
+    let repository = repository.to_thread_local();
+
+    find_release_tag_in_repository(
+        &repository,
+        &canonical_url,
+        &refspec,
+        &tag_name,
+        version,
+        directory,
+    )
 }
 
 /// Fetch one release tag, peel it to a commit, and verify its selected source tree.
@@ -2120,7 +2373,11 @@ fn exact_release_tag_refspec(
     if tag.name() != expected_tag_name {
         return Err(GitRemoteReleaseFetchError::InvalidPackageDirectory);
     }
-    Ok(format!("{expected_tag_name}:refs/sai/package-release-tag"))
+    Ok(exact_release_tag_refspec_for_name(&expected_tag_name))
+}
+
+fn exact_release_tag_refspec_for_name(tag_name: &str) -> String {
+    format!("{tag_name}:refs/sai/package-release-tag")
 }
 
 fn release_tag_name(
@@ -2204,6 +2461,46 @@ fn list_release_tags_in_repository(
         Some((name.to_owned(), object_id?.to_owned()))
     });
     parse_release_tag_refs(refs, directory).map_err(GitRemoteTagListError::TagList)
+}
+
+fn find_release_tag_in_repository(
+    repository: &gix::Repository,
+    url: &str,
+    refspec: &str,
+    tag_name: &str,
+    version: &Version,
+    directory: Option<&RepositoryPackageDirectory>,
+) -> Result<Option<GitReleaseTag>, GitRemoteTagListError> {
+    let remote = repository
+        .remote_at_without_url_rewrite(url)
+        .map_err(|_| GitRemoteTagListError::RemoteConfiguration)?
+        .with_refspecs([BString::from(refspec)], gix::remote::Direction::Fetch)
+        .map_err(|_| GitRemoteTagListError::RemoteConfiguration)?
+        .with_fetch_tags(gix::remote::fetch::Tags::None);
+    let transport_options = tag_list_transport_options(repository, url)?;
+    let connection = remote
+        .connect(gix::remote::Direction::Fetch)
+        .map_err(map_transport_error)?
+        .with_transport_options(transport_options);
+    let (ref_map, _) = connection
+        .ref_map(gix::progress::Discard, Default::default())
+        .map_err(map_transport_error)?;
+
+    let mut matching_refs = ref_map.remote_refs.into_iter().filter_map(|reference| {
+        let (name, object_id, _) = reference.unpack();
+        let object_id = object_id?;
+        (name.as_bytes() == tag_name.as_bytes()).then(|| (name.to_owned(), object_id.to_owned()))
+    });
+    let Some((name, object_id)) = matching_refs.next() else {
+        return Ok(None);
+    };
+    let tag = parse_exact_release_tag_ref(name.as_bytes(), object_id, version, directory)
+        .map_err(GitRemoteTagListError::TagList)?
+        .ok_or(GitRemoteTagListError::FetchFailed)?;
+    if matching_refs.next().is_some() {
+        return Err(GitRemoteTagListError::FetchFailed);
+    }
+    Ok(Some(tag))
 }
 
 fn map_transport_error(error: impl StdError + 'static) -> GitRemoteTagListError {
@@ -2526,9 +2823,11 @@ mod tests {
 
     use super::{
         FetchedGitPackage, GitRemoteReleaseContractError, GitRemoteReleaseFetchError,
-        GitRemoteTagListError, TemporaryGitDirectory, credential_overrides_from_file,
-        credential_overrides_from_path, fetch_release_tree_in_repository,
-        list_release_tags_in_repository, map_transport_error, proxy_environment_overrides,
+        GitRemoteTagListError, SelectedGitReleaseFetchError, SelectedGitReleaseFetchPlan,
+        TemporaryGitDirectory, credential_overrides_from_file, credential_overrides_from_path,
+        exact_release_tag_refspec_for_name, fetch_release_tree_in_repository,
+        find_release_tag_in_repository, list_release_tags_in_repository, map_transport_error,
+        plan_selected_git_release_fetch, proxy_environment_overrides, release_tag_name,
         release_tag_refspec, user_credential_config_paths,
     };
     use crate::git_path_requirements::{
@@ -2539,12 +2838,15 @@ mod tests {
     };
     use crate::git_tags::{GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs};
     use crate::git_tree::{GitTreeReadError, GitTreeReader};
-    use crate::manifest::{PackageRole, parse_for_role};
+    use crate::lock::{LockPackage, LockPackageField, LockSource};
+    use crate::manifest::{PackageRole, Spanned, parse_for_role};
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::package_cache::PackageCache;
     use crate::package_path::RepositoryPackageDirectory;
     use crate::resolver_contract::ResolverContractContext;
-    use crate::resolver_source::{ResolverPackageSource, ResolverPathPinSource};
+    use crate::resolver_source::{
+        ResolverPackageSource, ResolverPathPinSource, ResolverSourceReason,
+    };
     use crate::validation::PackageValidationContext;
     use gix::objs::tree::{Entry, EntryKind};
 
@@ -3031,6 +3333,176 @@ mod tests {
         assert_eq!(
             release_tag_refspec(Some(&state_directory)),
             Err(GitRemoteTagListError::InvalidPackageDirectory)
+        );
+    }
+
+    #[test]
+    fn selected_git_release_looks_up_only_the_exact_mvs_version_tag() {
+        let remote = TestDirectory::new("many-release-tags");
+        std::fs::create_dir_all(remote.0.join("refs/tags")).unwrap();
+        std::fs::write(
+            remote.0.join("config"),
+            "[core]\n\tbare = true\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        std::fs::write(remote.0.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let mut refs = (0..=crate::git_tags::MAX_RELEASE_TAGS_PER_LISTING)
+            .map(|patch| {
+                (
+                    format!("refs/tags/v1.2.{patch}"),
+                    format!("{:040x}", patch.saturating_add(1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        refs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        std::fs::write(
+            remote.0.join("packed-refs"),
+            format!(
+                "# pack-refs with: sorted\n{}\n",
+                refs.iter()
+                    .map(|(name, object_id)| format!("{object_id} {name}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(remote.0.join("objects/info")).unwrap();
+        std::fs::create_dir_all(remote.0.join("objects/pack")).unwrap();
+
+        let scratch = TemporaryGitDirectory::create().unwrap();
+        let repository = init_bare_repository(&scratch.path, None);
+        let remote_url = format!("file://{}", remote.0.display());
+        let selected = expected_package_version("acme:sample", "1.2.3");
+        let tag_name = release_tag_name(selected.version(), None).unwrap();
+        let refspec = exact_release_tag_refspec_for_name(&tag_name);
+
+        assert_eq!(refspec, "refs/tags/v1.2.3:refs/sai/package-release-tag");
+        let tag = find_release_tag_in_repository(
+            &repository,
+            &remote_url,
+            &refspec,
+            &tag_name,
+            selected.version(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tag.name(), tag_name);
+        assert_eq!(tag.version(), selected.version());
+        assert_eq!(tag.object_id().to_hex().to_string(), format!("{:040x}", 4));
+
+        assert_eq!(
+            refs.len(),
+            crate::git_tags::MAX_RELEASE_TAGS_PER_LISTING + 1
+        );
+        let missing = expected_package_version("acme:sample", "1.3.0");
+        let missing_name = release_tag_name(missing.version(), None).unwrap();
+        assert_eq!(
+            find_release_tag_in_repository(
+                &repository,
+                &remote_url,
+                &exact_release_tag_refspec_for_name(&missing_name),
+                &missing_name,
+                missing.version(),
+                None,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_git_release_uses_a_matching_lock_and_requires_one_for_lock_floors() {
+        let selected = expected_package_version("acme:sample", "1.2.3");
+        let source = ResolverPackageSource::Git {
+            url: TEST_CANONICAL_GIT_URL.into(),
+            directory: Some("packages/sample".into()),
+        };
+        let commit = gix::ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap();
+        let lock_package = LockPackage {
+            package: "acme:sample".into(),
+            version: crate::version::Version::parse("1.2.3").unwrap(),
+            fields: [
+                LockPackageField::Source(LockSource::Git(TEST_CANONICAL_GIT_URL.into())),
+                LockPackageField::Directory("packages/sample".into()),
+                LockPackageField::Commit(commit.to_hex().to_string().into()),
+                LockPackageField::Checksum(format!("sai1:{}", "a".repeat(64)).into()),
+            ]
+            .into_iter()
+            .map(|value| Spanned { value, span: 0..0 })
+            .collect(),
+        };
+
+        let plan = plan_selected_git_release_fetch(
+            &selected,
+            &source,
+            ResolverSourceReason::LockFloor,
+            Some(&lock_package),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            SelectedGitReleaseFetchPlan::Locked(package) if package == &lock_package
+        ));
+        assert_eq!(
+            plan_selected_git_release_fetch(
+                &selected,
+                &source,
+                ResolverSourceReason::LockFloor,
+                None,
+            ),
+            Err(SelectedGitReleaseFetchError::MissingLockedPackage(
+                Box::new(selected.clone())
+            ))
+        );
+    }
+
+    #[test]
+    fn selected_git_release_does_not_reuse_a_lock_from_another_source() {
+        let selected = expected_package_version("acme:sample", "1.2.3");
+        let lock_package = LockPackage {
+            package: "acme:sample".into(),
+            version: crate::version::Version::parse("1.2.3").unwrap(),
+            fields: [
+                LockPackageField::Source(LockSource::Git(TEST_CANONICAL_GIT_URL.into())),
+                LockPackageField::Commit("0123456789abcdef0123456789abcdef01234567".into()),
+                LockPackageField::Checksum(format!("sai1:{}", "a".repeat(64)).into()),
+            ]
+            .into_iter()
+            .map(|value| Spanned { value, span: 0..0 })
+            .collect(),
+        };
+        let override_source = ResolverPackageSource::Git {
+            url: "https://example.test/acme/fork.git".into(),
+            directory: None,
+        };
+
+        let plan = plan_selected_git_release_fetch(
+            &selected,
+            &override_source,
+            ResolverSourceReason::RootGitOverride,
+            Some(&lock_package),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            SelectedGitReleaseFetchPlan::Tag { url, .. }
+                if url.as_ref() == "https://example.test/acme/fork.git"
+        ));
+    }
+
+    #[test]
+    fn selected_git_release_rejects_path_sources() {
+        let requiring = expected_package_version("acme:client", "2.0.0");
+        let package = expected_package_version("acme:sibling", "1.2.3");
+        let source = ResolverPackageSource::Path {
+            relative_to: requiring,
+            path: "../sibling".into(),
+        };
+
+        assert_eq!(
+            plan_selected_git_release_fetch(&package, &source, ResolverSourceReason::PathPin, None,),
+            Err(SelectedGitReleaseFetchError::NotGitSource)
         );
     }
 
