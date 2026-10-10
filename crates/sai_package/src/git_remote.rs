@@ -32,7 +32,10 @@ use crate::package_cache::{
     PackageCacheError, SourceCacheRemoval, create_staging_activity_lock,
     release_staging_activity_lock, staging_activity_lock_path,
 };
-use crate::package_path::RepositoryPackageDirectory;
+use crate::package_path::{
+    DependencyPackagePath, PackagePathError, RepositoryPackageDirectory,
+    normalize_git_relative_package_directory,
+};
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, build_resolver_contract,
 };
@@ -368,19 +371,47 @@ pub struct FetchedGitRelease {
 /// A package source tree fetched from an exact Git repository commit.
 #[derive(Debug, Eq, PartialEq)]
 pub struct FetchedGitPackage {
-    canonical_url: Box<str>,
-    commit_id: gix::ObjectId,
-    directory: RepositoryPackageDirectory,
+    source_identity: GitPackageSourceIdentity,
     source: GitPackageSourceTree,
 }
 
-impl FetchedGitPackage {
-    /// The canonical repository URL used to fetch the package.
+/// The complete immutable identity of a package directory in a Git commit.
+///
+/// A Git-relative path pin shares the repository and commit while changing
+/// only the normalized repository-relative directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPackageSourceIdentity {
+    canonical_url: Box<str>,
+    commit_id: gix::ObjectId,
+    directory: RepositoryPackageDirectory,
+}
+
+/// A Git-relative package path could not be resolved inside its repository.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitPackagePathError {
+    /// The dependency path violates the portable path syntax.
+    InvalidPackagePath,
+    /// The normalized dependency path leaves the repository root.
+    PathEscapesRepository,
+}
+
+impl GitPackagePathError {
+    /// Return the package diagnostic for this path-resolution failure.
+    pub const fn diagnostic_code(self) -> sai_diagnostics::Code {
+        match self {
+            Self::InvalidPackagePath => sai_diagnostics::Code::InvalidPackagePath,
+            Self::PathEscapesRepository => sai_diagnostics::Code::PathEscapesRepository,
+        }
+    }
+}
+
+impl GitPackageSourceIdentity {
+    /// The canonical repository URL.
     pub fn canonical_url(&self) -> &str {
         &self.canonical_url
     }
 
-    /// The exact repository commit that supplied this package.
+    /// The exact commit containing this package directory.
     pub const fn commit_id(&self) -> &gix::ObjectId {
         &self.commit_id
     }
@@ -388,6 +419,50 @@ impl FetchedGitPackage {
     /// The normalized repository-relative package directory.
     pub const fn directory(&self) -> &RepositoryPackageDirectory {
         &self.directory
+    }
+
+    /// Resolve a dependency path against this package directory in the same
+    /// commit, preserving repository and commit identity.
+    pub fn resolve_dependency_path(&self, path: &str) -> Result<Self, GitPackagePathError> {
+        let dependency_path = DependencyPackagePath::parse(path).map_err(map_git_path_error)?;
+        let directory =
+            normalize_git_relative_package_directory(Some(&self.directory), &dependency_path)
+                .map_err(map_git_path_error)?;
+        Ok(Self {
+            canonical_url: self.canonical_url.clone(),
+            commit_id: self.commit_id,
+            directory,
+        })
+    }
+}
+
+fn map_git_path_error(error: PackagePathError) -> GitPackagePathError {
+    match error {
+        PackagePathError::InvalidPackagePath => GitPackagePathError::InvalidPackagePath,
+        PackagePathError::PathEscapesRepository => GitPackagePathError::PathEscapesRepository,
+    }
+}
+
+impl FetchedGitPackage {
+    /// The canonical repository, commit, and directory that supplied this
+    /// snapshot.
+    pub const fn source_identity(&self) -> &GitPackageSourceIdentity {
+        &self.source_identity
+    }
+
+    /// The canonical repository URL used to fetch the package.
+    pub fn canonical_url(&self) -> &str {
+        self.source_identity.canonical_url()
+    }
+
+    /// The exact repository commit that supplied this package.
+    pub const fn commit_id(&self) -> &gix::ObjectId {
+        self.source_identity.commit_id()
+    }
+
+    /// The normalized repository-relative package directory.
+    pub const fn directory(&self) -> &RepositoryPackageDirectory {
+        self.source_identity.directory()
     }
 
     /// The validated manifest and source files read from this commit.
@@ -600,6 +675,12 @@ pub enum GitRemoteReleaseFetchError {
     InvalidGitUrl,
     /// The package directory or release tag does not belong to its namespace.
     InvalidPackageDirectory,
+    /// A path source contains an invalid repository-relative dependency path.
+    InvalidGitDependencyPath,
+    /// A Git-relative path attempts to leave the requiring package's repository.
+    PathEscapesRepository,
+    /// A Git-relative package directory is absent or has no `sai.package`.
+    PathPackageNotFound,
     /// A temporary repository could not be created or initialized.
     TemporaryRepository,
     /// The remote URL or refspec could not be configured.
@@ -804,13 +885,17 @@ impl GitRemoteReleaseFetchError {
             Self::InvalidLockedPackageField(_) => sai_diagnostics::Code::LockCorrupt,
             Self::InvalidGitUrl => sai_diagnostics::Code::UnsupportedGitUrl,
             Self::InvalidPackageDirectory => sai_diagnostics::Code::InvalidPackagePath,
+            Self::InvalidGitDependencyPath => sai_diagnostics::Code::InvalidPackagePath,
+            Self::PathEscapesRepository => sai_diagnostics::Code::PathEscapesRepository,
+            Self::PathPackageNotFound => sai_diagnostics::Code::PathPackageNotFound,
             Self::TemporaryRepository | Self::RemoteConfiguration | Self::FetchFailed => {
                 sai_diagnostics::Code::FetchFailed
             }
             Self::TransferLimitExceeded { .. } => sai_diagnostics::Code::PackageTooLarge,
-            Self::TagNotFound { .. }
-            | Self::LockedCommitUnavailable { .. }
-            | Self::RepositoryCommitUnavailable { .. } => sai_diagnostics::Code::VersionNotFound,
+            Self::TagNotFound { .. } | Self::LockedCommitUnavailable { .. } => {
+                sai_diagnostics::Code::VersionNotFound
+            }
+            Self::RepositoryCommitUnavailable { .. } => sai_diagnostics::Code::FetchFailed,
             Self::TagList(GitReleaseTagListError::LimitExceeded { .. }) => {
                 sai_diagnostics::Code::PackageTooLarge
             }
@@ -864,11 +949,20 @@ impl fmt::Display for GitRemoteReleaseFetchError {
             Self::InvalidPackageDirectory => {
                 formatter.write_str("Git release tag is outside the package tag namespace")
             }
+            Self::InvalidGitDependencyPath => {
+                formatter.write_str("Git path package dependency path is invalid")
+            }
+            Self::PathEscapesRepository => {
+                formatter.write_str("Git path package leaves its repository")
+            }
+            Self::PathPackageNotFound => {
+                formatter.write_str("Git path package was not found in the repository commit")
+            }
             Self::TemporaryRepository => {
                 formatter.write_str("Could not prepare the temporary Git repository")
             }
             Self::RemoteConfiguration => formatter.write_str("Could not configure the Git remote"),
-            Self::FetchFailed => formatter.write_str("Could not fetch the Git release tag"),
+            Self::FetchFailed => formatter.write_str("Could not fetch the Git source"),
             Self::TransferLimitExceeded { limit_bytes } => write!(
                 formatter,
                 "Git fetch exceeded the {limit_bytes}-byte transfer limit"
@@ -878,10 +972,12 @@ impl fmt::Display for GitRemoteReleaseFetchError {
                 formatter,
                 "Git release tag {name} is missing and locked commit {commit} is unavailable from the source"
             ),
-            Self::RepositoryCommitUnavailable { commit } => write!(
-                formatter,
-                "locked Git repository commit {commit} is unavailable from the source"
-            ),
+            Self::RepositoryCommitUnavailable { commit } => {
+                write!(
+                    formatter,
+                    "Git repository commit {commit} is unavailable from the source"
+                )
+            }
             Self::TagList(error) => error.fmt(formatter),
             Self::InvalidTag(error) => write!(formatter, "invalid Git release tag: {error}"),
             Self::TagMoved {
@@ -1091,6 +1187,76 @@ pub fn fetch_git_package_source_tree_at_commit(
     )
 }
 
+/// Fetch a sibling package by resolving a dependency path inside the exact
+/// Git commit that supplied its requiring package.
+///
+/// The path is joined to the requiring package's normalized repository
+/// directory. The resulting package is fetched at the same commit without
+/// consulting a release tag. A repository escape is reported as
+/// `PATH_ESCAPES_REPOSITORY`.
+pub fn fetch_git_path_package_source_tree(
+    requiring_source: &GitPackageSourceIdentity,
+    dependency_path: &str,
+) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError> {
+    let source = resolve_git_path_package_identity(requiring_source, dependency_path)?;
+    let config_overrides = transport_config_overrides().map_err(map_tag_list_error_for_fetch)?;
+    let scratch = TemporaryGitDirectory::create()
+        .map_err(|()| GitRemoteReleaseFetchError::TemporaryRepository)?;
+    let repository = gix::ThreadSafeRepository::init_opts(
+        &scratch.path,
+        gix::create::Kind::Bare,
+        gix::create::Options {
+            object_hash: Some(source.commit_id.kind()),
+            ..Default::default()
+        },
+        gix::open::Options::isolated().config_overrides(config_overrides),
+    )
+    .map_err(|_| GitRemoteReleaseFetchError::TemporaryRepository)?;
+    let repository = repository.to_thread_local();
+    let transfer_limit =
+        gix_transport::client::blocking_io::FetchTransferLimit::new(MAX_GIT_FETCH_BYTES);
+
+    fetch_git_package_source_identity_in_repository(&repository, &source, &transfer_limit)
+}
+
+fn resolve_git_path_package_identity(
+    requiring_source: &GitPackageSourceIdentity,
+    dependency_path: &str,
+) -> Result<GitPackageSourceIdentity, GitRemoteReleaseFetchError> {
+    requiring_source
+        .resolve_dependency_path(dependency_path)
+        .map_err(|error| match error {
+            GitPackagePathError::InvalidPackagePath => {
+                GitRemoteReleaseFetchError::InvalidGitDependencyPath
+            }
+            GitPackagePathError::PathEscapesRepository => {
+                GitRemoteReleaseFetchError::PathEscapesRepository
+            }
+        })
+}
+
+fn fetch_git_package_source_identity_in_repository(
+    repository: &gix::Repository,
+    source: &GitPackageSourceIdentity,
+    transfer_limit: &gix_transport::client::blocking_io::FetchTransferLimit,
+) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError> {
+    fetch_git_package_source_tree_at_commit_in_repository(
+        repository,
+        source.canonical_url(),
+        source.commit_id(),
+        source.directory(),
+        transfer_limit,
+    )
+    .map_err(|error| match error {
+        GitRemoteReleaseFetchError::SourceTree(
+            GitTreeReadError::MissingPackageDirectory
+            | GitTreeReadError::MissingPackageManifest
+            | GitTreeReadError::PackagePathNotDirectory,
+        ) => GitRemoteReleaseFetchError::PathPackageNotFound,
+        error => error,
+    })
+}
+
 fn fetch_git_package_source_tree_at_commit_in_repository(
     repository: &gix::Repository,
     canonical_url: &str,
@@ -1114,9 +1280,11 @@ fn fetch_git_package_source_tree_at_commit_in_repository(
         .read_commit_repository_package_source_tree(commit_id, directory)
         .map_err(GitRemoteReleaseFetchError::SourceTree)?;
     Ok(FetchedGitPackage {
-        canonical_url: canonical_url.into(),
-        commit_id: *commit_id,
-        directory: directory.clone(),
+        source_identity: GitPackageSourceIdentity {
+            canonical_url: canonical_url.into(),
+            commit_id: *commit_id,
+            directory: directory.clone(),
+        },
         source,
     })
 }
@@ -3191,16 +3359,22 @@ mod tests {
         let commit_id = remote.commit_with_sibling_package();
         std::fs::remove_file(remote.directory.path.join("refs/tags/v1.2.3")).unwrap();
         let directory = RepositoryPackageDirectory::parse("packages/sibling").unwrap();
+        let requiring_directory = RepositoryPackageDirectory::parse("packages/client").unwrap();
+        let requiring_source = super::GitPackageSourceIdentity {
+            canonical_url: remote.url().into(),
+            commit_id,
+            directory: requiring_directory,
+        };
         let scratch = TemporaryGitDirectory::create().unwrap();
         let repository = init_bare_repository(&scratch.path, Some(commit_id.kind()));
         let transfer_limit =
             gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
 
-        let fetched = super::fetch_git_package_source_tree_at_commit_in_repository(
+        let resolved_source =
+            super::resolve_git_path_package_identity(&requiring_source, "../sibling").unwrap();
+        let fetched = super::fetch_git_package_source_identity_in_repository(
             &repository,
-            &remote.url(),
-            &commit_id,
-            &directory,
+            &resolved_source,
             &transfer_limit,
         )
         .unwrap();
@@ -3220,6 +3394,12 @@ mod tests {
         assert_eq!(fetched.commit_id(), &commit_id);
         assert_eq!(fetched.directory(), &directory);
         assert_eq!(fetched.canonical_url(), remote.url());
+        assert_eq!(
+            fetched.source_identity(),
+            &requiring_source
+                .resolve_dependency_path("../sibling")
+                .unwrap()
+        );
         assert!(fetched.source().source_tree().checksum.starts_with("sai1:"));
 
         let contract = fetched
@@ -3234,6 +3414,101 @@ mod tests {
             &expected_package_version("acme:sibling", "1.4.0")
         );
         assert_eq!(contract.role(), PackageRole::Dependency);
+    }
+
+    #[test]
+    fn reports_git_sibling_repository_escape_with_the_specific_diagnostic() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let commit_id = remote.commit_with_sibling_package();
+        let requiring_source = super::GitPackageSourceIdentity {
+            canonical_url: remote.url().into(),
+            commit_id,
+            directory: RepositoryPackageDirectory::parse("packages/client").unwrap(),
+        };
+        let error =
+            super::fetch_git_path_package_source_tree(&requiring_source, "../../../outside")
+                .unwrap_err();
+
+        assert_eq!(error, GitRemoteReleaseFetchError::PathEscapesRepository);
+        assert_eq!(
+            error.diagnostic_code(),
+            sai_diagnostics::Code::PathEscapesRepository
+        );
+    }
+
+    #[test]
+    fn reports_invalid_git_sibling_path_with_path_specific_context() {
+        let requiring_source = super::GitPackageSourceIdentity {
+            canonical_url: "https://example.test/monorepo.git".into(),
+            commit_id: gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff")
+                .unwrap(),
+            directory: RepositoryPackageDirectory::parse("packages/client").unwrap(),
+        };
+
+        let error = super::fetch_git_path_package_source_tree(&requiring_source, "src//helper")
+            .unwrap_err();
+
+        assert_eq!(error, GitRemoteReleaseFetchError::InvalidGitDependencyPath);
+        assert_eq!(
+            error.diagnostic_code(),
+            sai_diagnostics::Code::InvalidPackagePath
+        );
+        assert_eq!(
+            error.to_string(),
+            "Git path package dependency path is invalid"
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_git_sibling_with_path_package_not_found() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let commit_id = remote.commit_with_sibling_package();
+        let requiring_source = super::GitPackageSourceIdentity {
+            canonical_url: remote.url().into(),
+            commit_id,
+            directory: RepositoryPackageDirectory::parse("packages/client").unwrap(),
+        };
+        let resolved_source =
+            super::resolve_git_path_package_identity(&requiring_source, "../missing").unwrap();
+        let scratch = TemporaryGitDirectory::create().unwrap();
+        let repository = init_bare_repository(&scratch.path, Some(commit_id.kind()));
+        let transfer_limit =
+            gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
+
+        let error = super::fetch_git_package_source_identity_in_repository(
+            &repository,
+            &resolved_source,
+            &transfer_limit,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, GitRemoteReleaseFetchError::PathPackageNotFound);
+        assert_eq!(
+            error.diagnostic_code(),
+            sai_diagnostics::Code::PathPackageNotFound
+        );
+    }
+
+    #[test]
+    fn git_sibling_fetch_errors_use_source_neutral_messages() {
+        assert_eq!(
+            GitRemoteReleaseFetchError::FetchFailed.to_string(),
+            "Could not fetch the Git source"
+        );
+
+        let commit = gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let unavailable = GitRemoteReleaseFetchError::RepositoryCommitUnavailable { commit };
+        assert!(
+            unavailable
+                .to_string()
+                .starts_with("Git repository commit ")
+        );
+        assert!(
+            unavailable
+                .to_string()
+                .contains("is unavailable from the source")
+        );
+        assert!(!unavailable.to_string().contains("locked"));
     }
 
     #[test]
@@ -3325,10 +3600,7 @@ mod tests {
                 commit: unavailable
             }
         );
-        assert_eq!(
-            error.diagnostic_code(),
-            sai_diagnostics::Code::VersionNotFound
-        );
+        assert_eq!(error.diagnostic_code(), sai_diagnostics::Code::FetchFailed);
     }
 
     #[test]
