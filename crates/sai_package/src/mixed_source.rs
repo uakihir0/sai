@@ -552,6 +552,131 @@ pub enum MixedSourceFinalReloadError {
     ResolverContext(Box<ResolverContractBuildError>),
 }
 
+impl MixedSourceFinalReloadError {
+    /// Return a package diagnostic code for direct selected-package identity
+    /// mismatches. Failures on newly discovered final-source path edges need
+    /// their own final manifest locations and remain caller-owned.
+    pub fn diagnostic_code(&self) -> Option<sai_diagnostics::Code> {
+        use sai_diagnostics::Code;
+
+        match self {
+            Self::LocalDirectoryIndex(error)
+                if matches!(
+                    error.as_ref(),
+                    LocalPackageDirectoryIndexError::PackageVersionMismatch { .. }
+                ) =>
+            {
+                Some(Code::PackageIdentityMismatch)
+            }
+            Self::LocalContract(error)
+                if matches!(
+                    error.as_ref(),
+                    LocalPackageContractLoadError::PackageVersionMismatch { .. }
+                ) =>
+            {
+                Some(Code::PackageIdentityMismatch)
+            }
+            Self::GitPathDiscovery(error)
+                if matches!(
+                    error.as_ref(),
+                    GitPathRequirementDiscoveryError::RequirerVersionMismatch { .. }
+                ) =>
+            {
+                Some(Code::PackageIdentityMismatch)
+            }
+            Self::GitContract(error) => error.diagnostic_code(),
+            Self::MissingRootDirectory
+            | Self::MissingFinalSourceSnapshot
+            | Self::LocalPathIndex(_)
+            | Self::LocalDirectoryIndex(_)
+            | Self::GitPathFetch(_)
+            | Self::GitPathDiscovery(_)
+            | Self::LocalContract(_)
+            | Self::ResolverContext(_) => None,
+        }
+    }
+
+    /// Return a bounded explanation that does not expose Git URLs, commits, or
+    /// local absolute paths.
+    pub fn diagnostic_message(&self) -> Option<String> {
+        let message = match self {
+            Self::LocalDirectoryIndex(error) => {
+                let LocalPackageDirectoryIndexError::PackageVersionMismatch {
+                    expected,
+                    found_package,
+                    found_version,
+                } = error.as_ref()
+                else {
+                    return None;
+                };
+                format!(
+                    "expected {}@{}, found {}@{}",
+                    expected.package(),
+                    expected.version(),
+                    found_package,
+                    found_version
+                )
+            }
+            Self::LocalContract(error) => {
+                let LocalPackageContractLoadError::PackageVersionMismatch { expected, found } =
+                    error.as_ref()
+                else {
+                    return None;
+                };
+                format!(
+                    "expected {}@{}, found {}@{}",
+                    expected.package(),
+                    expected.version(),
+                    found.package(),
+                    found.version()
+                )
+            }
+            Self::GitPathDiscovery(error) => {
+                let GitPathRequirementDiscoveryError::RequirerVersionMismatch { expected, found } =
+                    error.as_ref()
+                else {
+                    return None;
+                };
+                format!(
+                    "final Git package declares {}@{}, expected {}@{}",
+                    found.package(),
+                    found.version(),
+                    expected.package(),
+                    expected.version()
+                )
+            }
+            Self::GitContract(error) => match error.as_ref() {
+                GitRemoteReleaseContractError::ReleaseTagVersionMismatch {
+                    expected,
+                    tag_version,
+                } => format!(
+                    "Git release tag declares {}@{}, expected {}@{}",
+                    expected.package(),
+                    tag_version,
+                    expected.package(),
+                    expected.version()
+                ),
+                GitRemoteReleaseContractError::PackageVersionMismatch { expected, found } => {
+                    format!(
+                        "Git package declares {}@{}, expected {}@{}",
+                        found.package(),
+                        found.version(),
+                        expected.package(),
+                        expected.version()
+                    )
+                }
+                GitRemoteReleaseContractError::InvalidContract(_) => return None,
+            },
+            Self::MissingRootDirectory
+            | Self::MissingFinalSourceSnapshot
+            | Self::LocalPathIndex(_)
+            | Self::GitPathFetch(_)
+            | Self::ResolverContext(_) => return None,
+        };
+        self.diagnostic_code().map(|_| message)
+    }
+}
+
 /// A changed final source whose path discovery or contract reload failed.
 #[derive(Debug, Eq, PartialEq)]
 pub struct MixedSourceFinalReloadFailure {

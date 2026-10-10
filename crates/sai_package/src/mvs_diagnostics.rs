@@ -7,7 +7,9 @@ use crate::manifest::{
     OverrideSource, PackageDeclaration, PackageParseError, PackageRole, RequirementSource,
     parse_for_role,
 };
-use crate::mixed_source::MixedSourceFinalIdentityError;
+use crate::mixed_source::{
+    MixedSourceFinalAuditPlan, MixedSourceFinalIdentityError, MixedSourceMvsOutput,
+};
 use crate::mvs::{
     MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionErrorKind, MvsSelectionOutput,
 };
@@ -332,6 +334,7 @@ pub struct MvsDuplicatePackageLineDiagnosticContext<'a> {
 /// Invalid input while constructing a duplicate package-line diagnostic.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MvsDuplicatePackageLineDiagnosticError {
+    MixedSourceAuditLoadMismatch,
     InvalidExplanation(Box<MvsExplanationError>),
     InvalidSelectedGraph(Box<MvsSelectedGraphInputError>),
     CycleNotInSelectedGraph(Box<MvsDependencyCycle>),
@@ -790,12 +793,7 @@ pub fn mixed_source_identity_failure_diagnostics(
     if reportable_failures.is_empty() {
         return Ok(Vec::new());
     }
-    let explanations = if selection.is_complete() {
-        MvsExplanationGraph::new(selection)
-    } else {
-        MvsExplanationGraph::new_for_root_cycle_errors(selection)
-    }
-    .map_err(|error| MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error)))?;
+    let explanations = explanation_graph_for_mvs_diagnostics(selection)?;
     validate_root_manifest(&explanations, manifests)?;
 
     let mut diagnostics = Vec::new();
@@ -870,6 +868,138 @@ pub fn mixed_source_identity_failure_diagnostics(
         diagnostics.push(diagnostic);
     }
     Ok(diagnostics)
+}
+
+/// Builds source-located diagnostics for final reload failures that prove a
+/// selected package's identity or version differs from the MVS selection.
+///
+/// Failures on newly discovered edges inside changed final manifests are
+/// omitted until those manifests have source locations of their own.
+pub fn mixed_source_reload_failure_diagnostics(
+    mixed_source: &MixedSourceMvsOutput,
+    audit_plan: &MixedSourceFinalAuditPlan,
+    manifests: &MvsManifestLocations,
+) -> Result<Vec<Diagnostic>, MvsDuplicatePackageLineDiagnosticError> {
+    if !audit_plan.belongs_to(mixed_source) {
+        return Err(MvsDuplicatePackageLineDiagnosticError::MixedSourceAuditLoadMismatch);
+    }
+    let selection = mixed_source.provider().output().selection();
+    let mut reportable_failures = audit_plan
+        .reload_failures()
+        .iter()
+        .filter_map(|failure| {
+            let package_version = failure.package_version.as_ref()?;
+            audit_plan
+                .final_sources()
+                .entries()
+                .iter()
+                .any(|entry| entry.package_version() == package_version)
+                .then_some(())?;
+            Some((
+                package_version,
+                failure.error.diagnostic_code()?,
+                failure.error.diagnostic_message()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    sort_and_deduplicate_reload_failure_diagnostics(&mut reportable_failures);
+    if reportable_failures.is_empty() {
+        return Ok(Vec::new());
+    }
+    let explanations = explanation_graph_for_mvs_diagnostics(selection)?;
+    validate_root_manifest(&explanations, manifests)?;
+
+    let mut diagnostics = Vec::with_capacity(reportable_failures.len());
+    for (package_version, code, detail) in reportable_failures {
+        let source = audit_plan
+            .final_sources()
+            .entries()
+            .iter()
+            .find(|entry| entry.package_version() == package_version)
+            .expect("reportable failures have a final source entry")
+            .final_source();
+        let chain = explanations
+            .chain_to_package_version(package_version)
+            .map_err(|error| {
+                MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+            })?;
+        let source_location = resolver_source_selection_location(source, manifests)?;
+        let chain_location = chain
+            .links
+            .last()
+            .map(|link| {
+                chain_link_location(
+                    manifests,
+                    &link.requirer,
+                    &link.named_target,
+                    &link.requirement,
+                    &link.span,
+                )
+            })
+            .transpose()?;
+        let mut diagnostic = Diagnostic::new(
+            code,
+            Severity::Error,
+            format!(
+                "could not reload selected package {}@{}: {detail}",
+                package_version.package(),
+                package_version.version()
+            ),
+            source_location.or(chain_location),
+        );
+        diagnostic.primary_label =
+            "the final source declares a different package identity or version".to_owned();
+
+        let mut data = ValueObject::new();
+        data.insert(
+            "package".to_owned(),
+            Value::String(package_version.package().to_owned()),
+        );
+        data.insert(
+            "version".to_owned(),
+            Value::String(package_version.version().to_string()),
+        );
+        data.insert(
+            "stage".to_owned(),
+            Value::String("final_source_reload".to_owned()),
+        );
+        data.insert("failure".to_owned(), Value::String(detail));
+        data.insert(
+            "requirement_chain".to_owned(),
+            requirement_chain_data(&chain, manifests)?,
+        );
+        diagnostic.data = data;
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: "the selected package is reached through:".to_owned(),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+        add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
+        diagnostics.push(diagnostic);
+    }
+    Ok(diagnostics)
+}
+
+fn sort_and_deduplicate_reload_failure_diagnostics(
+    failures: &mut Vec<(&MvsPackageVersion, Code, String)>,
+) {
+    failures.sort();
+    failures.dedup();
+}
+
+fn explanation_graph_for_mvs_diagnostics(
+    selection: &MvsSelectionOutput,
+) -> Result<MvsExplanationGraph<'_>, MvsDuplicatePackageLineDiagnosticError> {
+    let explanations = if selection.is_complete() {
+        MvsExplanationGraph::new(selection)
+    } else {
+        MvsExplanationGraph::new_for_root_cycle_errors(selection)
+    };
+    explanations.map_err(|error| {
+        MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+    })
 }
 
 /// Builds the hard `DEPENDENCY_CYCLE` diagnostic for one selected-graph cycle.
@@ -2620,8 +2750,8 @@ mod tests {
     use std::sync::Arc;
 
     use sai_diagnostics::{
-        ChildKind, LevelSource, LintLevel, Related, Relation, Severity, TextRange, TextSize, Value,
-        ValueObject,
+        ChildKind, Code, LevelSource, LintLevel, Related, Relation, Severity, TextRange, TextSize,
+        Value, ValueObject,
     };
     use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
@@ -2630,7 +2760,8 @@ mod tests {
         MvsManifestLocation, MvsManifestLocations, divergent_sources_diagnostic,
         duplicate_package_line_diagnostic, duplicate_package_line_diagnostics,
         mixed_source_identity_failure_diagnostics, resolver_source_selection_location,
-        version_conflict_diagnostic, version_conflict_diagnostics,
+        sort_and_deduplicate_reload_failure_diagnostics, version_conflict_diagnostic,
+        version_conflict_diagnostics,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{
@@ -2661,6 +2792,43 @@ mod tests {
 
     fn package_version(package: &str, version_: &str) -> MvsPackageVersion {
         MvsPackageVersion::new(package, version(version_)).expect("valid package version")
+    }
+
+    #[test]
+    fn reload_failure_diagnostics_deduplicate_only_identical_mismatches() {
+        let first = package_version("acme:first", "1.0.0");
+        let second = package_version("acme:second", "1.0.0");
+        let mut failures = vec![
+            (
+                &first,
+                Code::PackageIdentityMismatch,
+                "expected 1.0.0, found 2.0.0".to_owned(),
+            ),
+            (
+                &first,
+                Code::PackageIdentityMismatch,
+                "expected 1.0.0, found 3.0.0".to_owned(),
+            ),
+            (
+                &first,
+                Code::PackageIdentityMismatch,
+                "expected 1.0.0, found 2.0.0".to_owned(),
+            ),
+            (
+                &second,
+                Code::PackageIdentityMismatch,
+                "expected 1.0.0, found 2.0.0".to_owned(),
+            ),
+        ];
+
+        sort_and_deduplicate_reload_failure_diagnostics(&mut failures);
+
+        assert_eq!(failures.len(), 3);
+        assert_eq!(failures[0].0, &first);
+        assert_eq!(failures[0].2, "expected 1.0.0, found 2.0.0");
+        assert_eq!(failures[1].0, &first);
+        assert_eq!(failures[1].2, "expected 1.0.0, found 3.0.0");
+        assert_eq!(failures[2].0, &second);
     }
 
     fn edge_with_span(
