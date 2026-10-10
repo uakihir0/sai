@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::git_path_requirements::{
     GitPathRequirementDiscoveryError, GitPathRequirementIndex, discover_git_path_requirements,
@@ -291,6 +292,7 @@ impl MixedSourceMvsOutput {
 
         let mut final_path_packages = BTreeMap::new();
         let mut reloaded_git_path_packages = BTreeMap::new();
+        let mut final_manifest_snapshots = BTreeMap::new();
         for entry in final_sources.entries() {
             let package_version = entry.package_version();
             if source_identities
@@ -319,10 +321,18 @@ impl MixedSourceMvsOutput {
                         .index_dependency_path_requirements(package_version, &self.root_context)
                     {
                         Ok(additions) => final_path_packages.extend(additions),
-                        Err(error) => reload_failures.push(MixedSourceFinalReloadFailure {
-                            package_version: Some(package_version.clone()),
-                            error: MixedSourceFinalReloadError::LocalPathIndex(Box::new(error)),
-                        }),
+                        Err(error) => {
+                            if let Some(MixedSourceFinalSnapshot::Local(directory)) =
+                                final_snapshots.get(package_version)
+                            {
+                                final_manifest_snapshots
+                                    .insert(package_version.clone(), directory.manifest_bytes());
+                            }
+                            reload_failures.push(MixedSourceFinalReloadFailure {
+                                package_version: Some(package_version.clone()),
+                                error: MixedSourceFinalReloadError::LocalPathIndex(Box::new(error)),
+                            });
+                        }
                     }
                 }
                 Some(MixedSourceFinalSnapshot::GitRelease(release)) => {
@@ -454,6 +464,7 @@ impl MixedSourceMvsOutput {
             final_context,
             reloaded_contracts,
             reload_failures,
+            final_manifest_snapshots,
         })
     }
 }
@@ -1050,6 +1061,7 @@ pub struct MixedSourceFinalAuditPlan {
         ResolverReloadedSourceContract<'static, MixedPackageSourceIdentity>,
     >,
     reload_failures: Vec<MixedSourceFinalReloadFailure>,
+    final_manifest_snapshots: BTreeMap<MvsPackageVersion, Arc<[u8]>>,
 }
 
 impl MixedSourceFinalAuditPlan {
@@ -1075,6 +1087,13 @@ impl MixedSourceFinalAuditPlan {
 
     pub fn reload_failures(&self) -> &[MixedSourceFinalReloadFailure] {
         &self.reload_failures
+    }
+
+    /// Exact local final-manifest bytes retained for path-index reload
+    /// failures. Git snapshots and failures without a usable local source are
+    /// omitted until they can be bound to their own source files.
+    pub fn final_manifest_snapshots(&self) -> &BTreeMap<MvsPackageVersion, Arc<[u8]>> {
+        &self.final_manifest_snapshots
     }
 
     /// Compare every reloaded contract with the contract read during MVS.

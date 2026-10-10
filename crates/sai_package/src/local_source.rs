@@ -462,6 +462,12 @@ impl LocalPackageDirectory {
         &self.canonical_path
     }
 
+    /// Returns a shared copy of the exact `sai.package` bytes captured when
+    /// this directory was opened.
+    pub fn manifest_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.manifest_source)
+    }
+
     /// Reads and parses this package's manifest using the requested package
     /// role. The caller remains responsible for reporting parse diagnostics
     /// and validating package semantics before resolver use.

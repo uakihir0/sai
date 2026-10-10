@@ -3,12 +3,14 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use crate::local_source::LocalPackagePathIndexError;
 use crate::manifest::{
     OverrideSource, PackageDeclaration, PackageParseError, PackageRole, RequirementSource,
     parse_for_role,
 };
 use crate::mixed_source::{
-    MixedSourceFinalAuditPlan, MixedSourceFinalIdentityError, MixedSourceMvsOutput,
+    MixedSourceFinalAuditPlan, MixedSourceFinalIdentityError, MixedSourceFinalReloadError,
+    MixedSourceMvsOutput,
 };
 use crate::mvs::{
     MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionErrorKind, MvsSelectionOutput,
@@ -207,6 +209,112 @@ impl MvsManifestLocation {
         })
     }
 
+    /// Binds a final-source manifest to a synthetic, snapshot-owned location.
+    ///
+    /// Unlike a read-time MVS manifest, a final source may have changed its
+    /// header or contain syntax errors. The caller supplies the exact retained
+    /// bytes and this constructor records only path-requirement spans when the
+    /// final manifest parses successfully.
+    pub fn from_final_snapshot(
+        snapshot: &sai_diagnostics::WorkspaceSnapshot,
+        file_id: sai_diagnostics::FileId,
+        package_version: &MvsPackageVersion,
+    ) -> Result<Self, MvsDuplicatePackageLineDiagnosticError> {
+        let snapshot_file = snapshot.file(file_id).ok_or(
+            MvsDuplicatePackageLineDiagnosticError::MissingSnapshotFile(file_id),
+        )?;
+        let source_file = snapshot_file.source();
+        if source_file.id() != file_id {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::SnapshotFileIdMismatch {
+                    expected: file_id,
+                    found: source_file.id(),
+                },
+            );
+        }
+
+        if !is_final_manifest_path(snapshot_file.path(), package_version) {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::ManifestPathMismatch {
+                    file_id,
+                    expected: format!(
+                        "dep:{}/.sai/final-source-<ordinal>/sai.package",
+                        package_version_name(package_version)
+                    ),
+                    found: snapshot_file.path().to_owned(),
+                },
+            );
+        }
+
+        let expected_package = package_version_name(package_version);
+        let found_package = snapshot_file.package().map(str::to_owned);
+        if found_package.as_deref() != Some(expected_package.as_str()) {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::ManifestPackageMismatch {
+                    requirer: Box::new(MvsRequirer::Package(package_version.clone())),
+                    expected: expected_package,
+                    found: found_package,
+                },
+            );
+        }
+
+        let parsed = parse_for_role(source_file.raw_bytes(), PackageRole::Dependency);
+        let manifest_digest = *parsed
+            .manifest_digest()
+            .ok_or(MvsDuplicatePackageLineDiagnosticError::FinalManifestTooLarge(file_id))?;
+        let mut requirements = BTreeMap::new();
+        if parsed.is_syntax_valid() {
+            for declaration in &parsed.file().declarations {
+                let PackageDeclaration::Requires { test, entries } = &declaration.value else {
+                    continue;
+                };
+                if *test {
+                    continue;
+                }
+                for entry in entries {
+                    requirements.insert(
+                        (entry.span.start, entry.span.end),
+                        ManifestRequirement {
+                            package: entry.value.package.clone(),
+                            version: entry.value.version.clone(),
+                            source: entry
+                                .value
+                                .source
+                                .as_ref()
+                                .map(|source| source.value.clone()),
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(Self {
+            source: SourceRef {
+                path: snapshot_file.path().to_owned(),
+                package: found_package,
+                snapshot: snapshot_file.document_version(),
+            },
+            file_id,
+            package_version: package_version.clone(),
+            role: PackageRole::Dependency,
+            workspace_snapshot: snapshot.id(),
+            manifest_digest,
+            source_len: source_file.raw_bytes().len(),
+            requirements,
+            overrides: BTreeMap::new(),
+            lint_policies: LintPolicies::default(),
+            manifest_lint_levels: BTreeMap::new(),
+        })
+    }
+
+    /// Returns the canonical synthetic path used for a final-source manifest.
+    pub fn final_snapshot_path(package_version: &MvsPackageVersion, ordinal: u64) -> String {
+        format!(
+            "dep:{}/.sai/final-source-{ordinal}/sai.package",
+            package_version_name(package_version)
+        )
+    }
+
     pub fn source(&self) -> &SourceRef {
         &self.source
     }
@@ -239,7 +347,24 @@ impl MvsManifestLocation {
 pub struct MvsManifestLocations {
     root: Option<MvsManifestLocation>,
     packages: BTreeMap<MvsPackageVersion, MvsManifestLocation>,
+    final_packages: BTreeMap<MvsPackageVersion, MvsManifestLocation>,
     workspace_snapshot: Option<sai_diagnostics::WorkspaceSnapshotId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FinalPathRequirement<'a> {
+    requirement_package: &'a str,
+    path: &'a str,
+    requiring_package: &'a MvsPackageVersion,
+    span: Range<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReportableFinalReloadFailure<'a> {
+    package_version: &'a MvsPackageVersion,
+    code: Code,
+    detail: String,
+    final_path_requirement: Option<FinalPathRequirement<'a>>,
 }
 
 impl MvsManifestLocations {
@@ -288,12 +413,89 @@ impl MvsManifestLocations {
         Ok(())
     }
 
+    /// Adds one changed final-source manifest without replacing its read-time
+    /// MVS manifest, which remains the authority for requirement chains.
+    pub fn insert_final_package(
+        &mut self,
+        manifest: MvsManifestLocation,
+    ) -> Result<(), MvsDuplicatePackageLineDiagnosticError> {
+        if manifest.role != PackageRole::Dependency {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::ManifestRoleMismatch {
+                    expected: PackageRole::Dependency,
+                    found: manifest.role,
+                },
+            );
+        }
+        if self.final_packages.contains_key(&manifest.package_version) {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::DuplicateFinalPackageManifest(Box::new(
+                    manifest.package_version.clone(),
+                )),
+            );
+        }
+        self.register_snapshot(&manifest)?;
+        self.final_packages
+            .insert(manifest.package_version.clone(), manifest);
+        Ok(())
+    }
+
     pub fn root(&self) -> Option<&MvsManifestLocation> {
         self.root.as_ref()
     }
 
     pub fn packages(&self) -> &BTreeMap<MvsPackageVersion, MvsManifestLocation> {
         &self.packages
+    }
+
+    pub fn final_package(
+        &self,
+        package_version: &MvsPackageVersion,
+    ) -> Option<&MvsManifestLocation> {
+        self.final_packages.get(package_version)
+    }
+
+    /// Returns a final-source edge location only when the retained manifest
+    /// has the exact requirement and path recorded by the reload failure.
+    pub fn final_path_requirement_location(
+        &self,
+        requiring_package: &MvsPackageVersion,
+        requirement_package: &str,
+        path: &str,
+        span: &Range<usize>,
+    ) -> Result<sai_diagnostics::Location, MvsDuplicatePackageLineDiagnosticError> {
+        let manifest = self.final_packages.get(requiring_package).ok_or_else(|| {
+            MvsDuplicatePackageLineDiagnosticError::MissingFinalManifestLocation(Box::new(
+                requiring_package.clone(),
+            ))
+        })?;
+        let Some(requirement) = manifest.requirements.get(&(span.start, span.end)) else {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::FinalManifestRequirementMismatch {
+                    requiring_package: Box::new(requiring_package.clone()),
+                    span: span.clone(),
+                },
+            );
+        };
+        if requirement.package.as_ref() != requirement_package
+            || !matches!(
+                requirement.source.as_ref(),
+                Some(RequirementSource::Path(found_path)) if found_path.as_ref() == path
+            )
+        {
+            return Err(
+                MvsDuplicatePackageLineDiagnosticError::FinalManifestRequirementMismatch {
+                    requiring_package: Box::new(requiring_package.clone()),
+                    span: span.clone(),
+                },
+            );
+        }
+
+        manifest_span_location(
+            manifest,
+            &MvsRequirer::Package(requiring_package.clone()),
+            span,
+        )
     }
 
     fn register_snapshot(
@@ -343,6 +545,12 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
     LintConfiguration(Box<crate::validation::PackageLintPolicyError>),
     MissingRootManifest,
     MissingManifestLocation(Box<MvsRequirer>),
+    MissingFinalManifestLocation(Box<MvsPackageVersion>),
+    FinalManifestTooLarge(sai_diagnostics::FileId),
+    FinalManifestRequirementMismatch {
+        requiring_package: Box<MvsPackageVersion>,
+        span: Range<usize>,
+    },
     MissingSnapshotFile(sai_diagnostics::FileId),
     SnapshotFileIdMismatch {
         expected: sai_diagnostics::FileId,
@@ -399,6 +607,7 @@ pub enum MvsDuplicatePackageLineDiagnosticError {
     },
     DuplicateRootManifest,
     DuplicatePackageManifest(Box<MvsPackageVersion>),
+    DuplicateFinalPackageManifest(Box<MvsPackageVersion>),
     RequirementNotInManifest {
         requirer: Box<MvsRequirer>,
         span: Range<usize>,
@@ -871,11 +1080,9 @@ pub fn mixed_source_identity_failure_diagnostics(
 }
 
 /// Builds source-located diagnostics for final reload failures that have a
-/// safe, package-level classification independent of final-manifest spans.
-///
-/// Diagnostics point to the original MVS chain or source selection. Failures
-/// whose useful location is inside a changed final manifest are omitted until
-/// that manifest has a retained source snapshot of its own.
+/// safe, package-level classification. Local path-requirement failures point
+/// into their retained final manifest; the original MVS chain remains bound
+/// to the read-time manifests.
 pub fn mixed_source_reload_failure_diagnostics(
     mixed_source: &MixedSourceMvsOutput,
     audit_plan: &MixedSourceFinalAuditPlan,
@@ -896,14 +1103,33 @@ pub fn mixed_source_reload_failure_diagnostics(
                 .iter()
                 .any(|entry| entry.package_version() == package_version)
                 .then_some(())?;
-            Some((
+            let final_path_requirement = match &failure.error {
+                MixedSourceFinalReloadError::LocalPathIndex(error) => match error.as_ref() {
+                    LocalPackagePathIndexError::PathRequirementDiscovery {
+                        package,
+                        path,
+                        requiring_package,
+                        span,
+                        ..
+                    } => Some(FinalPathRequirement {
+                        requirement_package: package.as_ref(),
+                        path: path.as_ref(),
+                        requiring_package,
+                        span: span.clone(),
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            Some(ReportableFinalReloadFailure {
                 package_version,
-                failure.error.diagnostic_code()?,
-                failure.error.diagnostic_message()?,
-            ))
+                code: failure.error.diagnostic_code()?,
+                detail: failure.error.diagnostic_message()?,
+                final_path_requirement,
+            })
         })
         .collect::<Vec<_>>();
-    sort_and_deduplicate_reload_failure_diagnostics(&mut reportable_failures);
+    sort_and_deduplicate_final_reload_failure_diagnostics(&mut reportable_failures);
     if reportable_failures.is_empty() {
         return Ok(Vec::new());
     }
@@ -911,7 +1137,9 @@ pub fn mixed_source_reload_failure_diagnostics(
     validate_root_manifest(&explanations, manifests)?;
 
     let mut diagnostics = Vec::with_capacity(reportable_failures.len());
-    for (package_version, code, detail) in reportable_failures {
+    for failure in reportable_failures {
+        let package_version = failure.package_version;
+        let detail = failure.detail;
         let source = audit_plan
             .final_sources()
             .entries()
@@ -938,18 +1166,43 @@ pub fn mixed_source_reload_failure_diagnostics(
                 )
             })
             .transpose()?;
+        let final_path_location = failure
+            .final_path_requirement
+            .map(|edge| {
+                if edge.requiring_package != package_version {
+                    return Err(
+                        MvsDuplicatePackageLineDiagnosticError::FinalManifestRequirementMismatch {
+                            requiring_package: Box::new(edge.requiring_package.clone()),
+                            span: edge.span,
+                        },
+                    );
+                }
+                manifests.final_path_requirement_location(
+                    edge.requiring_package,
+                    edge.requirement_package,
+                    edge.path,
+                    &edge.span,
+                )
+            })
+            .transpose()?;
         let mut diagnostic = Diagnostic::new(
-            code,
+            failure.code,
             Severity::Error,
             format!(
                 "could not reload selected package {}@{}: {detail}",
                 package_version.package(),
                 package_version.version()
             ),
-            source_location.or(chain_location),
+            final_path_location
+                .clone()
+                .or(source_location)
+                .or(chain_location),
         );
-        diagnostic.primary_label =
-            "the selected package's final source could not be reloaded".to_owned();
+        diagnostic.primary_label = if final_path_location.is_some() {
+            "this path dependency could not be resolved in the final source".to_owned()
+        } else {
+            "the selected package's final source could not be reloaded".to_owned()
+        };
 
         let mut data = ValueObject::new();
         data.insert(
@@ -983,6 +1236,19 @@ pub fn mixed_source_reload_failure_diagnostics(
     Ok(diagnostics)
 }
 
+fn sort_and_deduplicate_final_reload_failure_diagnostics(
+    failures: &mut Vec<ReportableFinalReloadFailure<'_>>,
+) {
+    failures.sort_by(|left, right| {
+        left.package_version
+            .cmp(right.package_version)
+            .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+    failures.dedup_by(|left, right| *left == *right);
+}
+
+#[cfg(test)]
 fn sort_and_deduplicate_reload_failure_diagnostics(
     failures: &mut Vec<(&MvsPackageVersion, Code, String)>,
 ) {
@@ -1909,6 +2175,22 @@ fn is_manifest_path(path: &str, package_version: &MvsPackageVersion, role: Packa
             path == format!("dep:{}/sai.package", package_version_name(package_version))
         }
     }
+}
+
+fn is_final_manifest_path(path: &str, package_version: &MvsPackageVersion) -> bool {
+    let prefix = format!(
+        "dep:{}/.sai/final-source-",
+        package_version_name(package_version)
+    );
+    let Some(ordinal) = path
+        .strip_prefix(&prefix)
+        .and_then(|path| path.strip_suffix("/sai.package"))
+    else {
+        return false;
+    };
+    !ordinal.is_empty()
+        && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+        && (ordinal == "0" || !ordinal.starts_with('0'))
 }
 
 fn duplicate_lines_data(
@@ -2903,6 +3185,61 @@ mod tests {
             )),
             document_version,
         )
+    }
+
+    #[test]
+    fn final_manifest_locations_require_the_exact_retained_path_edge() {
+        let package = package_version("acme:target", "1.0.0");
+        let source = "package acme:changed @ 9.0.0\n\
+                     requires { acme:secret @ ^1 from path \"private\" }\n";
+        let requirement = "acme:secret @ ^1 from path \"private\"";
+        let start = source.find(requirement).expect("requirement is present");
+        let span = start..start + requirement.len();
+        let file_id = sai_diagnostics::FileId::new(71);
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(file_id, source.as_bytes())
+                    .expect("final manifest fits in a source file"),
+            ),
+            MvsManifestLocation::final_snapshot_path(&package, 3),
+            Some("acme:target@1.0.0".to_owned()),
+            None,
+        )])
+        .expect("the final manifest has a canonical synthetic path");
+        let final_manifest = MvsManifestLocation::from_final_snapshot(&snapshot, file_id, &package)
+            .expect("a changed package header does not invalidate retained source spans");
+        let mut manifests = MvsManifestLocations::default();
+        manifests
+            .insert_final_package(final_manifest)
+            .expect("the final manifest belongs to the snapshot");
+
+        let location = manifests
+            .final_path_requirement_location(&package, "acme:secret", "private", &span)
+            .expect("the exact path edge is snapshot-bound");
+        let start = location.span.range.start().to_usize();
+        let end = location.span.range.end().to_usize();
+        assert_eq!(&source.as_bytes()[start..end], requirement.as_bytes());
+        assert_eq!(location.file.package.as_deref(), Some("acme:target@1.0.0"));
+        assert_eq!(
+            manifests.final_path_requirement_location(&package, "acme:secret", "different", &span,),
+            Err(
+                MvsDuplicatePackageLineDiagnosticError::FinalManifestRequirementMismatch {
+                    requiring_package: Box::new(package.clone()),
+                    span: span.clone(),
+                }
+            )
+        );
+
+        let wrong_span = span.start + 1..span.end;
+        assert!(matches!(
+            manifests.final_path_requirement_location(
+                &package,
+                "acme:secret",
+                "private",
+                &wrong_span,
+            ),
+            Err(MvsDuplicatePackageLineDiagnosticError::FinalManifestRequirementMismatch { .. })
+        ));
     }
 
     fn manifests_for(

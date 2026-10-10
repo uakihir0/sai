@@ -19,10 +19,10 @@ use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
-    PackageSourcePath, SourceText, VfsInputSnapshot, VfsInputUpdate, VfsInputs, WitFilesSnapshot,
-    WorkspaceSnapshot,
+    PackageSourcePath, SnapshotFile, SourceDecodeError, SourceFile, SourceText, VfsInputSnapshot,
+    VfsInputUpdate, VfsInputs, WitFilesSnapshot, WorkspaceSnapshot, WorkspaceSnapshotError,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Owns the query runtime and the session state for the implemented frontend.
@@ -58,12 +58,50 @@ pub enum RootDatabaseError {
     UnexpectedPackageManifest(MvsPackageVersion),
     MixedSourceAuditLoadMismatch,
     MixedSourceManifestContractMismatch(MvsPackageVersion),
+    FinalManifestSourceDecode {
+        package_version: MvsPackageVersion,
+        error: SourceDecodeError,
+    },
+    FinalManifestSnapshot(WorkspaceSnapshotError),
+    FinalManifestFileIdsExhausted,
+    FinalManifestPathOrdinalsExhausted,
     PackageManifestFileKeyMismatch {
         file_id: FileId,
         expected_package_key: String,
         found_package_key: String,
         found_path: String,
     },
+}
+
+/// Reload diagnostics together with the workspace snapshot containing every
+/// source file referenced by their locations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MixedSourceReloadDiagnostics {
+    snapshot: WorkspaceSnapshot,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl MixedSourceReloadDiagnostics {
+    /// The augmented snapshot used to resolve the diagnostics' file IDs.
+    pub fn snapshot(&self) -> &WorkspaceSnapshot {
+        &self.snapshot
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn into_parts(self) -> (WorkspaceSnapshot, Vec<Diagnostic>) {
+        (self.snapshot, self.diagnostics)
+    }
+}
+
+impl std::ops::Deref for MixedSourceReloadDiagnostics {
+    type Target = [Diagnostic];
+
+    fn deref(&self) -> &Self::Target {
+        &self.diagnostics
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +191,71 @@ impl From<MvsDuplicatePackageLineDiagnosticError> for RootDatabaseError {
     fn from(error: MvsDuplicatePackageLineDiagnosticError) -> Self {
         Self::PackageDiagnostics(error)
     }
+}
+
+fn mixed_source_diagnostic_snapshot(
+    snapshot: &WorkspaceSnapshot,
+    audit_plan: &MixedSourceFinalAuditPlan,
+) -> Result<(WorkspaceSnapshot, BTreeMap<MvsPackageVersion, FileId>), RootDatabaseError> {
+    if audit_plan.final_manifest_snapshots().is_empty() {
+        return Ok((snapshot.clone(), BTreeMap::new()));
+    }
+
+    let mut files = snapshot.iter().cloned().collect::<Vec<_>>();
+    let mut used_file_ids = snapshot
+        .iter()
+        .map(|file| file.source().id())
+        .collect::<BTreeSet<_>>();
+    let mut used_paths = snapshot
+        .iter()
+        .map(|file| file.path().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut next_file_id = u32::MAX;
+    let mut next_path_ordinal = 0_u64;
+    let mut final_manifest_file_ids = BTreeMap::new();
+
+    for (package_version, manifest_bytes) in audit_plan.final_manifest_snapshots() {
+        let file_id = loop {
+            let candidate = FileId::new(next_file_id);
+            if used_file_ids.insert(candidate) {
+                break candidate;
+            }
+            next_file_id = next_file_id
+                .checked_sub(1)
+                .ok_or(RootDatabaseError::FinalManifestFileIdsExhausted)?;
+        };
+        let path = loop {
+            let candidate =
+                MvsManifestLocation::final_snapshot_path(package_version, next_path_ordinal);
+            if used_paths.insert(candidate.clone()) {
+                break candidate;
+            }
+            next_path_ordinal = next_path_ordinal
+                .checked_add(1)
+                .ok_or(RootDatabaseError::FinalManifestPathOrdinalsExhausted)?;
+        };
+        let source = SourceFile::decode(file_id, manifest_bytes).map_err(|error| {
+            RootDatabaseError::FinalManifestSourceDecode {
+                package_version: package_version.clone(),
+                error,
+            }
+        })?;
+        files.push(SnapshotFile::new(
+            Arc::new(source),
+            path,
+            Some(format!(
+                "{}@{}",
+                package_version.package(),
+                package_version.version()
+            )),
+            None,
+        ));
+        final_manifest_file_ids.insert(package_version.clone(), file_id);
+    }
+
+    let snapshot =
+        WorkspaceSnapshot::new(files).map_err(RootDatabaseError::FinalManifestSnapshot)?;
+    Ok((snapshot, final_manifest_file_ids))
 }
 
 impl RootDatabase {
@@ -526,7 +629,7 @@ impl RootDatabase {
         root_manifest_file: FileId,
         dependency_manifest_files: &BTreeMap<MvsPackageVersion, FileId>,
     ) -> Result<Vec<Diagnostic>, RootDatabaseError> {
-        let manifests = self.mixed_source_diagnostic_manifests(
+        let (_, manifests) = self.mixed_source_diagnostic_context(
             snapshot,
             mixed_source,
             audit_plan,
@@ -554,7 +657,7 @@ impl RootDatabase {
         dependency_manifest_files: &BTreeMap<MvsPackageVersion, FileId>,
     ) -> Result<Vec<Diagnostic>, RootDatabaseError> {
         let selection = mixed_source.provider().output().selection();
-        let manifests = self.mixed_source_diagnostic_manifests(
+        let (_, manifests) = self.mixed_source_diagnostic_context(
             snapshot,
             mixed_source,
             audit_plan,
@@ -568,13 +671,15 @@ impl RootDatabase {
         )?)
     }
 
-    /// Builds source-bound diagnostics for final reload failures that reveal a
-    /// different identity or version in a selected package's final source.
+    /// Builds source-bound diagnostics for reportable final-source reload
+    /// failures. Local path-requirement failures use their retained final
+    /// manifest for the primary location, while the MVS chain stays attached
+    /// to the original manifests.
     ///
     /// The audit plan must belong to `mixed_source`, and snapshot manifests
-    /// must match the contracts used for the original MVS load. Failures
-    /// inside newly discovered final-manifest edges remain on the audit plan
-    /// until those manifests have snapshot-bound source locations.
+    /// must match the contracts used for the original MVS load. The returned
+    /// value carries the possibly augmented snapshot needed to resolve every
+    /// diagnostic file ID.
     pub fn mixed_source_reload_diagnostics(
         &self,
         snapshot: &WorkspaceSnapshot,
@@ -582,39 +687,49 @@ impl RootDatabase {
         audit_plan: &MixedSourceFinalAuditPlan,
         root_manifest_file: FileId,
         dependency_manifest_files: &BTreeMap<MvsPackageVersion, FileId>,
-    ) -> Result<Vec<Diagnostic>, RootDatabaseError> {
-        let manifests = self.mixed_source_diagnostic_manifests(
+    ) -> Result<MixedSourceReloadDiagnostics, RootDatabaseError> {
+        let (diagnostic_snapshot, manifests) = self.mixed_source_diagnostic_context(
             snapshot,
             mixed_source,
             audit_plan,
             root_manifest_file,
             dependency_manifest_files,
         )?;
-        Ok(mixed_source_reload_failure_diagnostics(
-            mixed_source,
-            audit_plan,
-            &manifests,
-        )?)
+        let diagnostics =
+            mixed_source_reload_failure_diagnostics(mixed_source, audit_plan, &manifests)?;
+        Ok(MixedSourceReloadDiagnostics {
+            snapshot: diagnostic_snapshot,
+            diagnostics,
+        })
     }
 
-    fn mixed_source_diagnostic_manifests(
+    fn mixed_source_diagnostic_context(
         &self,
         snapshot: &WorkspaceSnapshot,
         mixed_source: &MixedSourceMvsOutput,
         audit_plan: &MixedSourceFinalAuditPlan,
         root_manifest_file: FileId,
         dependency_manifest_files: &BTreeMap<MvsPackageVersion, FileId>,
-    ) -> Result<MvsManifestLocations, RootDatabaseError> {
+    ) -> Result<(WorkspaceSnapshot, MvsManifestLocations), RootDatabaseError> {
         if !audit_plan.belongs_to(mixed_source) {
             return Err(RootDatabaseError::MixedSourceAuditLoadMismatch);
         }
+        let (diagnostic_snapshot, final_manifest_file_ids) =
+            mixed_source_diagnostic_snapshot(snapshot, audit_plan)?;
         let selection = mixed_source.provider().output().selection();
-        let manifests = self.mvs_manifest_locations(
-            snapshot,
+        let mut manifests = self.mvs_manifest_locations(
+            &diagnostic_snapshot,
             selection,
             root_manifest_file,
             dependency_manifest_files,
         )?;
+        for (package_version, file_id) in final_manifest_file_ids {
+            manifests.insert_final_package(MvsManifestLocation::from_final_snapshot(
+                &diagnostic_snapshot,
+                file_id,
+                &package_version,
+            )?)?;
+        }
         let provider = mixed_source.provider().output();
         if manifests.root().is_none_or(|manifest| {
             manifest.manifest_digest() != provider.root_contract().manifest_digest()
@@ -646,7 +761,7 @@ impl RootDatabase {
                 ));
             }
         }
-        Ok(manifests)
+        Ok((diagnostic_snapshot, manifests))
     }
 
     fn mvs_manifest_locations(
@@ -1332,6 +1447,10 @@ mod tests {
             .next()
             .expect("one dependency was loaded")
             .clone();
+        assert_eq!(
+            audit_plan.final_manifest_snapshots()[&target_version].as_ref(),
+            final_manifest
+        );
         let diagnostics = database
             .mixed_source_reload_diagnostics(
                 &snapshot,
@@ -1350,16 +1469,50 @@ mod tests {
         );
         assert_eq!(
             diagnostics[0].primary_label,
-            "the selected package's final source could not be reloaded"
+            "this path dependency could not be resolved in the final source"
         );
         let primary = diagnostics[0]
             .primary()
-            .expect("original source-selection location");
-        assert_eq!(primary.file.path, "sai.package");
-        assert_eq!(primary.file.package.as_deref(), Some("acme:root@1.0.0"));
+            .expect("final-manifest path requirement location");
+        assert!(
+            primary
+                .file
+                .path
+                .starts_with("dep:acme:target@1.0.0/.sai/final-source-")
+        );
+        assert_eq!(primary.file.package.as_deref(), Some("acme:target@1.0.0"));
+        let final_source_file = diagnostics
+            .snapshot()
+            .file(primary.span.file)
+            .expect("the returned snapshot contains the final-source file");
+        assert_eq!(final_source_file.source().raw_bytes(), final_manifest);
+        assert_eq!(
+            diagnostics
+                .snapshot()
+                .file(root_file)
+                .expect("the returned snapshot keeps the original MVS files")
+                .source()
+                .raw_bytes(),
+            root_manifest
+        );
+        let start = primary.span.range.start().to_usize();
+        let end = primary.span.range.end().to_usize();
+        assert_eq!(
+            &final_manifest[start..end],
+            b"acme:secret @ ^1 from path \"missing/private-workspace\""
+        );
         assert!(
             diagnostics[0].data.contains_key("requirement_chain"),
             "the original MVS chain remains attached"
+        );
+        assert!(
+            diagnostics[0].children().iter().any(|child| {
+                child.location.as_ref().is_some_and(|location| {
+                    location.file.path == "sai.package"
+                        && location.file.package.as_deref() == Some("acme:root@1.0.0")
+                })
+            }),
+            "the original MVS edge remains attached to the read-time root manifest"
         );
         assert!(
             !diagnostics[0].message.contains("missing/private-workspace"),
