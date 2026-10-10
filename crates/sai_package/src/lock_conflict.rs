@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::lock::{LockPackageField, LockParseOutput, LockSource, parse};
-use crate::lock_validation::{LockValidationError, validate};
+use crate::lock_validation::{LockValidationError, SUPPORTED_LOCK_FORMAT_VERSION, validate};
 use crate::mvs::MvsNode;
-use crate::version::Version;
+use crate::version::{CompatibilityLine, Version};
 
 /// The lock text reconstructed from both sides of a merge conflict.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,7 +57,7 @@ pub enum LockConflictSide {
     Theirs,
 }
 
-/// A reconstructed side could not be used as a merge baseline.
+/// A lock input could not be used as a merge baseline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LockConflictValidationError {
     InvalidSyntax {
@@ -69,6 +69,18 @@ pub enum LockConflictValidationError {
         parsed: Box<LockParseOutput>,
         errors: Vec<LockValidationError>,
     },
+    InvalidCleanMergeSyntax {
+        parsed: Box<LockParseOutput>,
+    },
+    InvalidCleanMergeSemantics {
+        parsed: Box<LockParseOutput>,
+        errors: Vec<LockValidationError>,
+    },
+    UnsupportedFormatVersion {
+        side: Option<LockConflictSide>,
+        version: u64,
+        span: Range<usize>,
+    },
     InvalidPackageNode {
         side: LockConflictSide,
         package: Box<str>,
@@ -77,6 +89,10 @@ pub enum LockConflictValidationError {
         side: LockConflictSide,
         package: Box<str>,
         version: Version,
+    },
+    TooManyCleanMergeEntries {
+        package: Box<str>,
+        line: CompatibilityLine,
     },
     ConflictingKnownContent(Box<LockConflictContentConflict>),
 }
@@ -296,10 +312,98 @@ pub fn validate_conflict_sides(
     root_pinned_nodes: &BTreeSet<MvsNode>,
 ) -> Result<ValidatedLockConflictSides, LockConflictValidationError> {
     let ours = parse(sides.ours());
-    validate_conflict_side(LockConflictSide::Ours, &ours)?;
     let theirs = parse(sides.theirs());
-    validate_conflict_side(LockConflictSide::Theirs, &theirs)?;
+    validate_parsed_conflict_sides(ours, theirs, root_pinned_nodes)
+}
 
+/// Treats duplicate package nodes in a clean textual merge as the two sides
+/// described by package/03 §3.9.3.
+///
+/// Entries that are not duplicated are included on both sides. For a node
+/// with exactly two entries, the first entry in the file is assigned to ours
+/// and the second to theirs. More than two entries for one node are corrupt.
+pub fn validate_clean_merge_duplicates(
+    parsed: &LockParseOutput,
+    root_pinned_nodes: &BTreeSet<MvsNode>,
+) -> Result<Option<ValidatedLockConflictSides>, LockConflictValidationError> {
+    if let Some(error) = unsupported_format_version(parsed, None) {
+        return Err(error);
+    }
+    if !parsed.is_syntax_valid() {
+        return Err(LockConflictValidationError::InvalidCleanMergeSyntax {
+            parsed: Box::new(parsed.clone()),
+        });
+    }
+
+    let mut groups = BTreeMap::<(Box<str>, CompatibilityLine), Vec<usize>>::new();
+    for (index, package) in parsed.file.packages.iter().enumerate() {
+        groups
+            .entry((
+                package.value.package.clone(),
+                package.value.version.compatibility_line(),
+            ))
+            .or_default()
+            .push(index);
+    }
+    let duplicates = groups
+        .into_iter()
+        .filter(|(_, indexes)| indexes.len() > 1)
+        .collect::<Vec<_>>();
+
+    if duplicates.is_empty() {
+        let validation = validate(parsed);
+        if !validation.is_valid() {
+            return Err(LockConflictValidationError::InvalidCleanMergeSemantics {
+                parsed: Box::new(parsed.clone()),
+                errors: validation.errors,
+            });
+        }
+        return Ok(None);
+    }
+
+    if let Some(((package, line), _)) = duplicates.iter().find(|(_, indexes)| indexes.len() > 2) {
+        return Err(LockConflictValidationError::TooManyCleanMergeEntries {
+            package: package.clone(),
+            line: *line,
+        });
+    }
+
+    let mut ours_indices = BTreeSet::new();
+    let mut theirs_indices = BTreeSet::new();
+    for (_, indexes) in duplicates {
+        ours_indices.insert(indexes[0]);
+        theirs_indices.insert(indexes[1]);
+    }
+
+    let mut ours = parsed.clone();
+    let mut theirs = parsed.clone();
+    ours.file.packages.clear();
+    theirs.file.packages.clear();
+    for (index, package) in parsed.file.packages.iter().enumerate() {
+        if ours_indices.contains(&index) || !theirs_indices.contains(&index) {
+            ours.file.packages.push(package.clone());
+        }
+        if theirs_indices.contains(&index) || !ours_indices.contains(&index) {
+            theirs.file.packages.push(package.clone());
+        }
+    }
+
+    validate_parsed_conflict_sides(ours, theirs, root_pinned_nodes).map(Some)
+}
+
+fn validate_parsed_conflict_sides(
+    ours: LockParseOutput,
+    theirs: LockParseOutput,
+    root_pinned_nodes: &BTreeSet<MvsNode>,
+) -> Result<ValidatedLockConflictSides, LockConflictValidationError> {
+    if let Some(error) = unsupported_format_version(&ours, Some(LockConflictSide::Ours)) {
+        return Err(error);
+    }
+    if let Some(error) = unsupported_format_version(&theirs, Some(LockConflictSide::Theirs)) {
+        return Err(error);
+    }
+    validate_conflict_side(LockConflictSide::Ours, &ours)?;
+    validate_conflict_side(LockConflictSide::Theirs, &theirs)?;
     let mut pinned_nodes = root_pinned_nodes.clone();
     add_path_pins(LockConflictSide::Ours, &ours, &mut pinned_nodes)?;
     add_path_pins(LockConflictSide::Theirs, &theirs, &mut pinned_nodes)?;
@@ -433,6 +537,20 @@ fn validate_conflict_side(
     Ok(())
 }
 
+fn unsupported_format_version(
+    parsed: &LockParseOutput,
+    side: Option<LockConflictSide>,
+) -> Option<LockConflictValidationError> {
+    let version = parsed.file.format_version?;
+    (version > SUPPORTED_LOCK_FORMAT_VERSION).then(|| {
+        LockConflictValidationError::UnsupportedFormatVersion {
+            side,
+            version,
+            span: parsed.file.format_version_span.clone().unwrap_or(0..0),
+        }
+    })
+}
+
 fn add_path_pins(
     side: LockConflictSide,
     parsed: &LockParseOutput,
@@ -524,7 +642,8 @@ fn classify_marker(source: &[u8], line: Range<usize>) -> Option<(Marker, Range<u
 mod tests {
     use super::{LockConflictErrorKind, first_conflict_marker, reconstruct_conflict_sides};
     use super::{
-        LockConflictSide, LockConflictSides, LockConflictValidationError, validate_conflict_sides,
+        LockConflictSide, LockConflictSides, LockConflictValidationError,
+        validate_clean_merge_duplicates, validate_conflict_sides,
     };
     use crate::lock::{LockParseErrorKind, parse};
     use crate::mvs::MvsNode;
@@ -559,6 +678,188 @@ mod tests {
             let parsed = parse(side);
             assert!(parsed.is_syntax_valid(), "{:?}", parsed.errors());
         }
+    }
+
+    #[test]
+    fn splits_clean_merge_duplicates_and_combines_their_baselines() {
+        let source = clean_merge_lock(&[
+            git_package_entry("1.2.0", 'a', 'a', "alloc"),
+            git_package_entry("1.4.0", 'b', 'b', "wasi:filesystem"),
+        ]);
+        let parsed = parse(source.as_bytes());
+        assert!(parsed.is_syntax_valid());
+        let merged = validate_clean_merge_duplicates(&parsed, &BTreeSet::new())
+            .unwrap()
+            .expect("duplicate node is treated as a merge");
+
+        assert_eq!(merged.ours().file().packages.len(), 1);
+        assert_eq!(merged.theirs().file().packages.len(), 1);
+        assert_eq!(
+            merged.ours().file().packages[0].value.version,
+            Version::parse("1.2.0").unwrap()
+        );
+        assert_eq!(
+            merged.theirs().file().packages[0].value.version,
+            Version::parse("1.4.0").unwrap()
+        );
+        let node = MvsNode::new(
+            "acme:dep",
+            Version::parse("1.0.0").unwrap().compatibility_line(),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.floors().get(&node),
+            Some(&Version::parse("1.4.0").unwrap())
+        );
+        assert_eq!(
+            merged.previous_footprints().get(&node),
+            Some(&BTreeSet::from([
+                Box::<str>::from("alloc"),
+                Box::<str>::from("wasi:filesystem"),
+            ]))
+        );
+    }
+
+    #[test]
+    fn retains_non_duplicate_entries_on_both_clean_merge_sides() {
+        let source = clean_merge_lock(&[
+            git_package_entry("1.2.0", 'a', 'a', "alloc"),
+            git_package_entry_for("acme:other", "2.1.0", 'c', 'c', "alloc"),
+            git_package_entry("1.4.0", 'b', 'b', "alloc"),
+        ]);
+        let parsed = parse(source.as_bytes());
+        let merged = validate_clean_merge_duplicates(&parsed, &BTreeSet::new())
+            .unwrap()
+            .expect("duplicate node is treated as a merge");
+
+        for side in [merged.ours(), merged.theirs()] {
+            assert_eq!(side.file().packages.len(), 2);
+            assert!(
+                side.file()
+                    .packages
+                    .iter()
+                    .any(|package| package.value.package.as_ref() == "acme:other")
+            );
+        }
+    }
+
+    #[test]
+    fn clean_merge_duplicate_entries_reconcile_known_content() {
+        let source = clean_merge_lock(&[
+            git_package_entry("1.4.0", 'a', 'a', "alloc"),
+            git_package_entry("1.4.0", 'b', 'a', "alloc"),
+        ]);
+        let parsed = parse(source.as_bytes());
+        match validate_clean_merge_duplicates(&parsed, &BTreeSet::new()).unwrap_err() {
+            LockConflictValidationError::ConflictingKnownContent(conflict) => {
+                assert_eq!(conflict.ours.commit, "a".repeat(40).into_boxed_str());
+                assert_eq!(conflict.theirs.commit, "b".repeat(40).into_boxed_str());
+            }
+            other => panic!("expected known-content conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_more_than_two_clean_merge_entries_for_one_node() {
+        let source = clean_merge_lock(&[
+            git_package_entry("1.2.0", 'a', 'a', "alloc"),
+            git_package_entry("1.3.0", 'b', 'b', "alloc"),
+            git_package_entry("1.4.0", 'c', 'c', "alloc"),
+        ]);
+        let parsed = parse(source.as_bytes());
+        assert!(matches!(
+            validate_clean_merge_duplicates(&parsed, &BTreeSet::new()),
+            Err(LockConflictValidationError::TooManyCleanMergeEntries { .. })
+        ));
+    }
+
+    #[test]
+    fn clean_merge_validation_does_not_forge_a_conflict_side() {
+        let syntax_invalid = parse(b"lock 1\n\nroot acme:app @ 1.0.0\n    targets {\n");
+        assert!(matches!(
+            validate_clean_merge_duplicates(&syntax_invalid, &BTreeSet::new()),
+            Err(LockConflictValidationError::InvalidCleanMergeSyntax { .. })
+        ));
+
+        let unsupported_and_syntax_invalid =
+            parse(b"lock 2\n\nroot acme:app @ 1.0.0\n    targets {\n");
+        assert!(!unsupported_and_syntax_invalid.is_syntax_valid());
+        assert!(matches!(
+            validate_clean_merge_duplicates(&unsupported_and_syntax_invalid, &BTreeSet::new()),
+            Err(LockConflictValidationError::UnsupportedFormatVersion {
+                side: None,
+                version: 2,
+                ..
+            })
+        ));
+
+        let semantic_invalid = parse(b"lock 1\n\nroot acme:app @ 1.0.0\n");
+        assert!(semantic_invalid.is_syntax_valid());
+        assert!(matches!(
+            validate_clean_merge_duplicates(&semantic_invalid, &BTreeSet::new()),
+            Err(LockConflictValidationError::InvalidCleanMergeSemantics { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_lock_format_before_clean_merge_duplicate_count() {
+        let source = clean_merge_lock(&[
+            git_package_entry("1.2.0", 'a', 'a', "alloc"),
+            git_package_entry("1.3.0", 'b', 'b', "alloc"),
+            git_package_entry("1.4.0", 'c', 'c', "alloc"),
+        ])
+        .replacen("lock 1", "lock 2", 1);
+        let parsed = parse(source.as_bytes());
+
+        assert!(matches!(
+            validate_clean_merge_duplicates(&parsed, &BTreeSet::new()),
+            Err(LockConflictValidationError::UnsupportedFormatVersion { version: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn preserves_the_side_for_unsupported_conflict_lock_formats() {
+        let source = b"lock 2\n\nroot acme:app @ 1.0.0\n    targets {\n<<<<<<< ours\n=======\n>>>>>>> theirs\n";
+        let sides = reconstruct_conflict_sides(source)
+            .unwrap()
+            .expect("conflict markers present");
+
+        assert!(matches!(
+            validate_conflict_sides(&sides, &BTreeSet::new()),
+            Err(LockConflictValidationError::UnsupportedFormatVersion {
+                side: Some(LockConflictSide::Ours),
+                version: 2,
+                ..
+            })
+        ));
+
+        let source = b"<<<<<<< ours\nlock 1\n\nroot acme:app @ 1.0.0\n    targets {\n=======\nlock 2\n\nroot acme:app @ 1.0.0\n    targets { wasm32-wasi }\n>>>>>>> theirs\n";
+        let sides = reconstruct_conflict_sides(source)
+            .unwrap()
+            .expect("conflict markers present");
+
+        assert!(matches!(
+            validate_conflict_sides(&sides, &BTreeSet::new()),
+            Err(LockConflictValidationError::UnsupportedFormatVersion {
+                side: Some(LockConflictSide::Theirs),
+                version: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn different_compatibility_lines_are_not_clean_merge_duplicates() {
+        let source = clean_merge_lock(&[
+            git_package_entry("0.4.2", 'a', 'a', "alloc"),
+            git_package_entry("1.0.0", 'b', 'b', "alloc"),
+        ]);
+        let parsed = parse(source.as_bytes());
+        assert!(
+            validate_clean_merge_duplicates(&parsed, &BTreeSet::new())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -983,6 +1284,40 @@ mod tests {
     fn path_lock(version: &str) -> String {
         format!(
             "lock 1\n\nroot acme:app @ 1.0.0\n    targets {{ wasm32-wasi }}\n    requires acme:dep @ ^1.0 -> {version}\n\npackage acme:dep @ {version}\n    source path \"../dep\"\n    compiler ^0.1\n",
+        )
+    }
+
+    fn clean_merge_lock(entries: &[String]) -> String {
+        let mut source =
+            "lock 1\n\nroot acme:app @ 1.0.0\n    targets { wasm32-wasi }\n".to_string();
+        for entry in entries {
+            source.push('\n');
+            source.push_str(entry);
+        }
+        source
+    }
+
+    fn git_package_entry(
+        version: &str,
+        commit: char,
+        checksum: char,
+        capabilities: &str,
+    ) -> String {
+        git_package_entry_for("acme:dep", version, commit, checksum, capabilities)
+    }
+
+    fn git_package_entry_for(
+        package: &str,
+        version: &str,
+        commit: char,
+        checksum: char,
+        capabilities: &str,
+    ) -> String {
+        let source_path = package.replace(':', "/");
+        format!(
+            "package {package} @ {version}\n    source git \"https://example.test/{source_path}\"\n    commit \"{}\"\n    checksum \"sai1:{}\"\n    compiler ^0.1\n    capabilities {{ {capabilities} }}\n",
+            commit.to_string().repeat(40),
+            checksum.to_string().repeat(64),
         )
     }
 }

@@ -373,7 +373,7 @@ The layout is designed so that most concurrent changes merge without conflicts: 
 `sai lock` resolves a lock with conflict markers as follows:
 
 1. **Reconstruct the sides.** *Ours* is the text outside the conflict regions plus, for each region, the lines between the `<<<<<<<` line and the next `|||||||` or `=======` line. *Theirs* is the text outside the regions plus the lines between the `=======` line and the `>>>>>>>` line. A base section (between `|||||||` and `=======`, produced by the `diff3` style) is ignored. Nested or unbalanced markers are `LOCK_CORRUPT`.
-2. **Parse both sides** (§3.3). If either side is not a valid lock, the command fails with `LOCK_CORRUPT` and suggests deleting `sai.lock` and running `sai lock`.
+2. **Parse both sides** (§3.3). If the parser can read either side's format version and it is greater than the highest format the toolchain supports, the command fails with `UNSUPPORTED_LOCK_VERSION` (§3.10.2), before syntax or semantic validation. Otherwise, if either side is not a valid lock, the command fails with `LOCK_CORRUPT` and suggests deleting `sai.lock` and running `sai lock`.
 3. **Floors.** For every node `(id, line)` that is not pinned in either side, the floor is the higher of the two versions ([02 §2.10.3](02-resolver.md) rule 1).
 4. **Known content.** A version whose entry appears on both sides with the same source MUST have the same commit and checksums on both. Otherwise the command fails with `LOCK_MERGE_CONFLICT`, naming the version and both commits: the two branches locked different content for one version, which is a tag that moved between the two fetches ([04 §4.3.3](04-distribution-and-security.md)). The user decides which content to keep by taking one side of the file, then runs `sai lock` again.
 5. **Resolve.** The current root contract is resolved in Mode B with these floors. Known commits and checksums from either side are reused as in [02 §2.10.3](02-resolver.md) rule 3.
@@ -384,7 +384,7 @@ The result does not depend on which side is *ours*: floors are maxima and known 
 
 ### 3.9.3 Duplicate entries after a clean merge
 
-A clean textual merge can leave two entries for one node, for example when both branches added the same new dependency at different versions and other entries separate the two blocks. Such a lock is `LOCK_CORRUPT` (§3.3.5 rule 5) for every command except `sai lock`, which treats the duplicate entries as the two sides of a conflict and applies §3.9.2 rules 3 to 7.
+A clean textual merge can leave two entries for one node, for example when both branches added the same new dependency at different versions and other entries separate the two blocks. Such a lock is `LOCK_CORRUPT` (§3.3.5 rule 5) for every command except `sai lock`, which treats the duplicate entries as the two sides of a conflict and applies §3.9.2 rules 3 to 7. The format-version rule in §3.9.2 rule 2 applies before syntax, semantic, and duplicate-count checks. For each duplicated node, the first entry in file order is assigned to *ours* and the second to *theirs*; entries for nodes that are not duplicated are present on both sides. This ordering makes side-specific diagnostics deterministic and does not affect the symmetric resolution result. More than two entries for one node are `LOCK_CORRUPT` because they cannot be reconstructed as exactly two sides without guessing.
 
 ---
 
