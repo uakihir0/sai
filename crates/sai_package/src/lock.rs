@@ -6,6 +6,7 @@ use crate::lexer::{
     PackageLexError, PackagePunctuator, PackageToken, PackageTokenKind, PackageTrivia,
     is_forbidden_non_ascii_whitespace, lex_lock,
 };
+use crate::lock_conflict::first_conflict_marker;
 use crate::manifest::Spanned;
 use crate::version::{Version, VersionParseError};
 use crate::version_req::{VersionReq, VersionReqParseError};
@@ -134,7 +135,7 @@ pub enum LockParseErrorKind {
 /// format, so a conflicted lock is rejected without interpreting either side.
 pub fn parse(source: &[u8]) -> LockParseOutput {
     let empty = LockFile::default();
-    if let Some(span) = find_merge_conflict(source) {
+    if let Some(span) = first_conflict_marker(source) {
         return LockParseOutput {
             file: empty,
             lexical_errors: Vec::new(),
@@ -266,43 +267,6 @@ fn skip_header_trivia(source: &[u8], position: &mut usize, end: usize) -> Option
             return None;
         }
     }
-}
-
-fn find_merge_conflict(source: &[u8]) -> Option<Range<usize>> {
-    let mut offset = 0;
-    while offset < source.len() {
-        let line_length = source[offset..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(source.len() - offset);
-        let line_end = offset + line_length;
-        let line_start = offset;
-        let mut content_start = line_start;
-        if line_start == 0 && source.starts_with(b"\xef\xbb\xbf") {
-            content_start += 3;
-        }
-        let mut content_end = line_end;
-        if content_end > offset && source[content_end - 1] == b'\r' {
-            content_end -= 1;
-        }
-        let content = &source[content_start..content_end];
-        let marker = [b"<<<<<<<".as_slice(), b"|||||||", b">>>>>>>"]
-            .iter()
-            .any(|prefix| {
-                content.starts_with(prefix)
-                    && content.get(prefix.len()).is_none_or(|byte| *byte == b' ')
-            })
-            || content == b"=======";
-        if marker {
-            let marker_start = content_start;
-            return Some(marker_start..marker_start + content.len().min(7));
-        }
-        if line_end == source.len() {
-            break;
-        }
-        offset = line_end + 1;
-    }
-    None
 }
 
 struct Parser<'a> {

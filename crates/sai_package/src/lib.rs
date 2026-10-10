@@ -9,6 +9,7 @@ pub mod identity;
 pub mod lexer;
 pub mod local_source;
 pub mod lock;
+pub mod lock_conflict;
 pub mod lock_graph_validation;
 pub mod lock_root_contract;
 pub mod lock_serialization;
