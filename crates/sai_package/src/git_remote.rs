@@ -364,7 +364,7 @@ pub struct FetchedGitRelease {
     version: Version,
     tag_object_id: Option<gix::ObjectId>,
     tag_missing: bool,
-    commit_id: gix::ObjectId,
+    source_identity: GitPackageSourceIdentity,
     source: GitPackageSourceTree,
 }
 
@@ -489,6 +489,12 @@ impl FetchedGitPackage {
 }
 
 impl FetchedGitRelease {
+    /// The canonical repository, exact commit, and package directory that
+    /// supplied this release.
+    pub const fn source_identity(&self) -> &GitPackageSourceIdentity {
+        &self.source_identity
+    }
+
     /// The complete Git ref name that was fetched.
     pub fn tag_name(&self) -> &str {
         &self.tag_name
@@ -514,7 +520,7 @@ impl FetchedGitRelease {
 
     /// The commit reached by peeling the release tag.
     pub const fn commit_id(&self) -> &gix::ObjectId {
-        &self.commit_id
+        self.source_identity.commit_id()
     }
 
     /// The checksum and warnings for the selected package source tree.
@@ -1090,7 +1096,7 @@ pub fn fetch_remote_release_tree(
     fetch_release_tree_in_repository(
         &repository,
         ReleaseFetchRequest {
-            url: &canonical_url,
+            source_url: GitSourceUrl::canonical(&canonical_url),
             refspec: &refspec,
             tag_name: tag.name(),
             version: tag.version(),
@@ -1137,7 +1143,7 @@ pub fn fetch_locked_release_tree(
 
     fetch_locked_release_tree_in_repository(
         &repository,
-        &canonical_url,
+        GitSourceUrl::canonical(&canonical_url),
         version,
         directory,
         locked_commit,
@@ -1628,7 +1634,7 @@ fn find_verified_source(
 
 fn fetch_locked_release_tree_in_repository(
     repository: &gix::Repository,
-    url: &str,
+    source_url: GitSourceUrl<'_>,
     version: &Version,
     directory: Option<&RepositoryPackageDirectory>,
     locked_commit: &gix::ObjectId,
@@ -1640,7 +1646,7 @@ fn fetch_locked_release_tree_in_repository(
     fetch_release_tree_in_repository(
         repository,
         ReleaseFetchRequest {
-            url,
+            source_url,
             refspec: &refspec,
             tag_name: &tag_name,
             version,
@@ -1653,8 +1659,50 @@ fn fetch_locked_release_tree_in_repository(
     )
 }
 
+#[derive(Clone, Copy)]
+enum GitSourceUrl<'a> {
+    Canonical(&'a str),
+    #[cfg(test)]
+    TestTransport {
+        transport_url: &'a str,
+        canonical_url: &'a str,
+    },
+}
+
+impl GitSourceUrl<'_> {
+    fn transport_url(&self) -> &str {
+        match self {
+            Self::Canonical(url) => url,
+            #[cfg(test)]
+            Self::TestTransport { transport_url, .. } => transport_url,
+        }
+    }
+
+    fn canonical_url(&self) -> &str {
+        match self {
+            Self::Canonical(url) => url,
+            #[cfg(test)]
+            Self::TestTransport { canonical_url, .. } => canonical_url,
+        }
+    }
+}
+
+impl<'a> GitSourceUrl<'a> {
+    fn canonical(url: &'a str) -> Self {
+        Self::Canonical(url)
+    }
+
+    #[cfg(test)]
+    fn test_transport(transport_url: &'a str, canonical_url: &'a str) -> Self {
+        Self::TestTransport {
+            transport_url,
+            canonical_url,
+        }
+    }
+}
+
 struct ReleaseFetchRequest<'a> {
-    url: &'a str,
+    source_url: GitSourceUrl<'a>,
     refspec: &'a str,
     tag_name: &'a str,
     version: &'a Version,
@@ -1670,7 +1718,7 @@ fn fetch_release_tree_in_repository(
     request: ReleaseFetchRequest<'_>,
 ) -> Result<FetchedGitRelease, GitRemoteReleaseFetchError> {
     let ReleaseFetchRequest {
-        url,
+        source_url,
         refspec,
         tag_name,
         version,
@@ -1680,14 +1728,22 @@ fn fetch_release_tree_in_repository(
         expected_locked_checksums,
         transfer_limit,
     } = request;
+    let validated_canonical_url = canonical_git_url(source_url.canonical_url())
+        .map_err(|()| GitRemoteReleaseFetchError::InvalidGitUrl)?;
+    if validated_canonical_url != source_url.canonical_url() {
+        return Err(GitRemoteReleaseFetchError::InvalidGitUrl);
+    }
     let remote = repository
-        .remote_at_without_url_rewrite(url)
+        .remote_at_without_url_rewrite(source_url.transport_url())
         .map_err(|_| GitRemoteReleaseFetchError::RemoteConfiguration)?
         .with_refspecs([BString::from(refspec)], gix::remote::Direction::Fetch)
         .map_err(|_| GitRemoteReleaseFetchError::RemoteConfiguration)?
         .with_fetch_tags(gix::remote::fetch::Tags::None);
-    let transport_options =
-        package_transport_options(repository, url, Some(transfer_limit.clone()))?;
+    let transport_options = package_transport_options(
+        repository,
+        source_url.transport_url(),
+        Some(transfer_limit.clone()),
+    )?;
     let connection = remote
         .connect(gix::remote::Direction::Fetch)
         .map_err(map_transport_error_for_fetch)?
@@ -1734,7 +1790,7 @@ fn fetch_release_tree_in_repository(
         drop(prepared);
         fetch_locked_commit(
             repository,
-            url,
+            source_url.transport_url(),
             expected_commit,
             LockedCommitFetchContext::ReleaseTag(tag_name),
             transfer_limit,
@@ -1781,7 +1837,11 @@ fn fetch_release_tree_in_repository(
         version: version.clone(),
         tag_object_id,
         tag_missing,
-        commit_id,
+        source_identity: GitPackageSourceIdentity {
+            canonical_url: source_url.canonical_url().into(),
+            commit_id,
+            directory: package_directory.clone(),
+        },
         source: package_source_tree,
     })
 }
@@ -2443,6 +2503,8 @@ mod tests {
     use crate::validation::PackageValidationContext;
     use gix::objs::tree::{Entry, EntryKind};
 
+    const TEST_CANONICAL_GIT_URL: &str = "https://example.test/acme/sample.git";
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -2734,6 +2796,20 @@ mod tests {
         expected_commit: Option<&gix::ObjectId>,
         expected_checksum: Option<&str>,
     ) -> Result<super::FetchedGitRelease, GitRemoteReleaseFetchError> {
+        fetch_fixture_with_canonical_url(
+            remote,
+            expected_commit,
+            expected_checksum,
+            TEST_CANONICAL_GIT_URL,
+        )
+    }
+
+    fn fetch_fixture_with_canonical_url(
+        remote: &TestRemote,
+        expected_commit: Option<&gix::ObjectId>,
+        expected_checksum: Option<&str>,
+        canonical_url: &str,
+    ) -> Result<super::FetchedGitRelease, GitRemoteReleaseFetchError> {
         let scratch = TemporaryGitDirectory::create().unwrap();
         let repository = init_bare_repository(&scratch.path, Some(remote.tag.object_id().kind()));
         let refspec = super::exact_release_tag_refspec(&remote.tag, None).unwrap();
@@ -2742,7 +2818,7 @@ mod tests {
         fetch_release_tree_in_repository(
             &repository,
             super::ReleaseFetchRequest {
-                url: &remote.url(),
+                source_url: super::GitSourceUrl::test_transport(&remote.url(), canonical_url),
                 refspec: &refspec,
                 tag_name: remote.tag.name(),
                 version: remote.tag.version(),
@@ -3002,6 +3078,12 @@ mod tests {
         assert_eq!(fetched.tag_object_id(), Some(remote.tag.object_id()));
         assert!(!fetched.tag_missing());
         assert_eq!(fetched.commit_id(), &remote.commit_id);
+        assert_eq!(
+            fetched.source_identity().canonical_url(),
+            TEST_CANONICAL_GIT_URL
+        );
+        assert_eq!(fetched.source_identity().commit_id(), &remote.commit_id);
+        assert_eq!(fetched.source_identity().directory().as_str(), ".");
         assert!(fetched.source_tree().checksum.starts_with("sai1:"));
         assert!(fetched.source_tree().warnings.is_empty());
         assert!(fetched.package_manifest().is_syntax_valid());
@@ -3021,6 +3103,23 @@ mod tests {
               source \"src\"\n\
               targets { wasm32-core }\n"
         );
+    }
+
+    #[test]
+    fn rejects_noncanonical_source_identity_before_using_transport_url() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", true);
+
+        let result = fetch_fixture_with_canonical_url(
+            &remote,
+            Some(&remote.commit_id),
+            None,
+            "https://EXAMPLE.test/acme/sample.git",
+        );
+
+        assert!(matches!(
+            result,
+            Err(GitRemoteReleaseFetchError::InvalidGitUrl)
+        ));
     }
 
     fn root_contract_context() -> ResolverContractContext<'static> {
@@ -3213,7 +3312,10 @@ mod tests {
         let error = fetch_release_tree_in_repository(
             &repository,
             super::ReleaseFetchRequest {
-                url: &remote.url(),
+                source_url: super::GitSourceUrl::test_transport(
+                    &remote.url(),
+                    TEST_CANONICAL_GIT_URL,
+                ),
                 refspec: &refspec,
                 tag_name: remote.tag.name(),
                 version: remote.tag.version(),
@@ -3249,7 +3351,10 @@ mod tests {
         fetch_release_tree_in_repository(
             &repository,
             super::ReleaseFetchRequest {
-                url: &remote.url(),
+                source_url: super::GitSourceUrl::test_transport(
+                    &remote.url(),
+                    TEST_CANONICAL_GIT_URL,
+                ),
                 refspec: &refspec,
                 tag_name: remote.tag.name(),
                 version: remote.tag.version(),
@@ -3337,7 +3442,7 @@ mod tests {
 
         let fetched = super::fetch_locked_release_tree_in_repository(
             &repository,
-            &remote.url(),
+            super::GitSourceUrl::test_transport(&remote.url(), TEST_CANONICAL_GIT_URL),
             &version,
             None,
             &remote.commit_id,
@@ -4117,7 +4222,7 @@ mod tests {
             );
             super::fetch_locked_release_tree_in_repository(
                 &repository,
-                &remote.url(),
+                super::GitSourceUrl::test_transport(&remote.url(), TEST_CANONICAL_GIT_URL),
                 remote.tag.version(),
                 None,
                 &remote.commit_id,
