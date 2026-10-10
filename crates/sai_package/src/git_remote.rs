@@ -2493,13 +2493,17 @@ mod tests {
         fetch_release_tree_in_repository, list_release_tags_in_repository, map_transport_error,
         proxy_environment_overrides, release_tag_refspec, user_credential_config_paths,
     };
+    use crate::git_source_index::{
+        GitPackageSourceIdentityIndex, GitPackageSourceIdentityIndexError,
+    };
     use crate::git_tags::{GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs};
     use crate::git_tree::GitTreeReadError;
     use crate::manifest::{PackageRole, parse_for_role};
-    use crate::mvs::MvsPackageVersion;
+    use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::package_cache::PackageCache;
     use crate::package_path::RepositoryPackageDirectory;
     use crate::resolver_contract::ResolverContractContext;
+    use crate::resolver_source::{ResolverPackageSource, ResolverPathPinSource};
     use crate::validation::PackageValidationContext;
     use gix::objs::tree::{Entry, EntryKind};
 
@@ -3145,6 +3149,157 @@ mod tests {
             crate::version::Version::parse(version).expect("valid package version"),
         )
         .expect("valid package identity")
+    }
+
+    fn git_path_pin(
+        requirer: MvsRequirer,
+        relative_to: MvsPackageVersion,
+        path: &str,
+    ) -> ResolverPathPinSource {
+        ResolverPathPinSource {
+            source: ResolverPackageSource::Path {
+                relative_to,
+                path: path.into(),
+            },
+            requirer,
+            span: 0..1,
+        }
+    }
+
+    #[test]
+    fn git_source_identity_index_canonicalizes_path_pins_from_the_requirers_commit() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", true);
+        let fetched = fetch_fixture(&remote, Some(&remote.commit_id), None).unwrap();
+        let requiring = expected_package_version("acme:sample", "1.2.3");
+        let requiring_edge = MvsRequirer::Package(requiring.clone());
+        let mut index = GitPackageSourceIdentityIndex::default();
+        index
+            .insert(requiring_edge.clone(), fetched.source_identity().clone())
+            .unwrap();
+
+        let resolved = index
+            .canonicalize_path_pin(&git_path_pin(
+                requiring_edge.clone(),
+                requiring.clone(),
+                "modules/shared",
+            ))
+            .unwrap();
+
+        assert_eq!(resolved.canonical_url(), TEST_CANONICAL_GIT_URL);
+        assert_eq!(resolved.commit_id(), &remote.commit_id);
+        assert_eq!(resolved.directory().as_str(), "modules/shared");
+        assert_eq!(index.get(&requiring_edge), Some(fetched.source_identity()));
+
+        let conflicting_identity = resolved.resolve_dependency_path("other").unwrap();
+        assert_eq!(
+            index.insert(requiring_edge.clone(), conflicting_identity),
+            Err(
+                GitPackageSourceIdentityIndexError::ConflictingSourceIdentity(
+                    requiring_edge.clone()
+                )
+            )
+        );
+        let conflicting_version = expected_package_version("acme:sample", "1.2.4");
+        let conflicting_version_edge = MvsRequirer::Package(conflicting_version.clone());
+        assert_eq!(
+            index.insert(
+                conflicting_version_edge.clone(),
+                fetched.source_identity().clone()
+            ),
+            Err(
+                GitPackageSourceIdentityIndexError::ConflictingPackageVersion {
+                    existing: Box::new(requiring),
+                    discovered: Box::new(conflicting_version),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn git_source_identity_index_keeps_root_and_package_identities_separate() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", true);
+        let fetched = fetch_fixture(&remote, Some(&remote.commit_id), None).unwrap();
+        let requiring = expected_package_version("acme:sample", "1.2.3");
+        let root = MvsRequirer::Root(requiring.clone());
+        let dependency = MvsRequirer::Package(requiring.clone());
+        let dependency_identity = fetched
+            .source_identity()
+            .resolve_dependency_path("modules/dependency")
+            .unwrap();
+        let mut index = GitPackageSourceIdentityIndex::default();
+
+        index
+            .insert(root.clone(), fetched.source_identity().clone())
+            .unwrap();
+        index
+            .insert(dependency.clone(), dependency_identity.clone())
+            .unwrap();
+
+        let root_pin = index
+            .canonicalize_path_pin(&git_path_pin(
+                root.clone(),
+                requiring.clone(),
+                "modules/shared",
+            ))
+            .unwrap();
+        let dependency_pin = index
+            .canonicalize_path_pin(&git_path_pin(
+                dependency.clone(),
+                requiring.clone(),
+                "modules/shared",
+            ))
+            .unwrap();
+
+        assert_eq!(index.get(&root), Some(fetched.source_identity()));
+        assert_eq!(index.get(&dependency), Some(&dependency_identity));
+        assert_eq!(root_pin.directory().as_str(), "modules/shared");
+        assert_eq!(
+            dependency_pin.directory().as_str(),
+            "modules/dependency/modules/shared"
+        );
+        assert_eq!(root_pin.canonical_url(), TEST_CANONICAL_GIT_URL);
+        assert_eq!(dependency_pin.canonical_url(), TEST_CANONICAL_GIT_URL);
+        assert_eq!(root_pin.commit_id(), &remote.commit_id);
+        assert_eq!(dependency_pin.commit_id(), &remote.commit_id);
+    }
+
+    #[test]
+    fn git_source_identity_index_rejects_unbound_and_escaping_path_pins() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", true);
+        let fetched = fetch_fixture(&remote, Some(&remote.commit_id), None).unwrap();
+        let requiring = expected_package_version("acme:sample", "1.2.3");
+        let other = expected_package_version("acme:other", "1.0.0");
+        let requiring_edge = MvsRequirer::Package(requiring.clone());
+        let pin = git_path_pin(requiring_edge.clone(), requiring.clone(), "modules/shared");
+        let empty_index = GitPackageSourceIdentityIndex::default();
+        assert_eq!(
+            empty_index.canonicalize_path_pin(&pin),
+            Err(GitPackageSourceIdentityIndexError::MissingRequirer(
+                requiring_edge.clone()
+            ))
+        );
+
+        let mut index = GitPackageSourceIdentityIndex::default();
+        index
+            .insert(requiring_edge.clone(), fetched.source_identity().clone())
+            .unwrap();
+        assert_eq!(
+            index.canonicalize_path_pin(&git_path_pin(
+                requiring_edge.clone(),
+                other.clone(),
+                "modules/shared",
+            )),
+            Err(GitPackageSourceIdentityIndexError::RequirerMismatch {
+                expected: Box::new(requiring.clone()),
+                found: Box::new(other),
+            })
+        );
+        assert_eq!(
+            index.canonicalize_path_pin(&git_path_pin(requiring_edge, requiring, "../outside",)),
+            Err(GitPackageSourceIdentityIndexError::Path(
+                super::GitPackagePathError::PathEscapesRepository
+            ))
+        );
     }
 
     #[test]

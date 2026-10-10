@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod git_remote;
+pub mod git_source_index;
 pub mod git_tags;
 pub mod git_tree;
 pub mod identity;
