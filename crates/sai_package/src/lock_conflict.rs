@@ -4,8 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::lock::{LockPackageField, LockParseOutput, LockSource, parse};
-use crate::lock_validation::{LockValidationError, SUPPORTED_LOCK_FORMAT_VERSION, validate};
+use crate::lock_validation::{
+    LockValidationError, SUPPORTED_LOCK_FORMAT_VERSION, canonical_git_url, validate,
+};
 use crate::mvs::MvsNode;
+use crate::mvs::MvsPackageVersion;
+use crate::package_path::RepositoryPackageDirectory;
+use crate::resolver_source::ResolverPackageSource;
 use crate::version::{CompatibilityLine, Version};
 
 /// The lock text reconstructed from both sides of a merge conflict.
@@ -166,6 +171,32 @@ impl ValidatedLockConflictSides {
     /// including artifact imports, keyed by identity and compatibility line.
     pub const fn previous_footprints(&self) -> &BTreeMap<MvsNode, BTreeSet<Box<str>>> {
         &self.previous_footprints
+    }
+
+    /// Returns the retained content record for this exact package version and
+    /// selected Git source. Distinct sources for one version stay independent.
+    pub fn known_git_content_for(
+        &self,
+        package_version: &MvsPackageVersion,
+        source: &ResolverPackageSource,
+    ) -> Option<&LockConflictGitContent> {
+        let ResolverPackageSource::Git { url, directory } = source else {
+            return None;
+        };
+        let url = canonical_git_url(url).ok()?.into_boxed_str();
+        let directory = directory
+            .as_deref()
+            .map(RepositoryPackageDirectory::parse)
+            .transpose()
+            .ok()?
+            .map(|directory| directory.as_str().to_owned().into_boxed_str())
+            .filter(|directory| directory.as_ref() != ".");
+        let key = (
+            package_version.node(),
+            package_version.version().clone(),
+            LockConflictGitSource { url, directory },
+        );
+        self.known_git_content.get(&key)
     }
 }
 
@@ -646,7 +677,7 @@ mod tests {
         validate_clean_merge_duplicates, validate_conflict_sides,
     };
     use crate::lock::{LockParseErrorKind, parse};
-    use crate::mvs::MvsNode;
+    use crate::mvs::{MvsNode, MvsPackageVersion};
     use crate::version::Version;
     use std::collections::BTreeSet;
 
@@ -757,6 +788,61 @@ mod tests {
             }
             other => panic!("expected known-content conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn looks_up_known_content_by_exact_version_and_git_source() {
+        let ours = git_package_entry("1.4.0", 'a', 'a', "alloc")
+            .replace(
+                "https://example.test/acme/dep",
+                "https://example.test/dep-a",
+            )
+            .replace("    commit ", "    dir \".\"\n    commit ");
+        let theirs = git_package_entry("1.4.0", 'b', 'b', "alloc").replace(
+            "https://example.test/acme/dep",
+            "https://example.test/dep-b",
+        );
+        let parsed = parse(clean_merge_lock(&[ours, theirs]).as_bytes());
+        let merged = validate_clean_merge_duplicates(&parsed, &BTreeSet::new())
+            .unwrap()
+            .expect("distinct source records form two sides");
+        let package_version =
+            MvsPackageVersion::new("acme:dep", Version::parse("1.4.0").expect("valid version"))
+                .expect("valid package version");
+
+        let content_a = merged
+            .known_git_content_for(
+                &package_version,
+                &crate::resolver_source::ResolverPackageSource::Git {
+                    url: "https://example.test/dep-a".into(),
+                    directory: None,
+                },
+            )
+            .expect("repository-root spelling normalizes with an omitted directory");
+        assert!(content_a.commit.starts_with('a'));
+
+        let content_b = merged
+            .known_git_content_for(
+                &package_version,
+                &crate::resolver_source::ResolverPackageSource::Git {
+                    url: "https://example.test/dep-b".into(),
+                    directory: None,
+                },
+            )
+            .expect("the second source retains independent known content");
+        assert!(content_b.commit.starts_with('b'));
+        assert_eq!(merged.known_git_content().len(), 2);
+        assert!(
+            merged
+                .known_git_content_for(
+                    &package_version,
+                    &crate::resolver_source::ResolverPackageSource::Git {
+                        url: "https://example.test/dep-a".into(),
+                        directory: Some("packages/dep".into()),
+                    },
+                )
+                .is_none()
+        );
     }
 
     #[test]
