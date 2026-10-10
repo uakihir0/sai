@@ -35,6 +35,7 @@ sha2 = "0.11.0"
 unicode-general-category = "=1.1.0"
 unicode-ident = "=1.0.18"
 unicode-normalization = "=0.1.24"
+getrandom = "=0.4.3"
 
 [patch.crates-io]
 gix-protocol = { path = "vendor/gix-protocol-0.65.1" }

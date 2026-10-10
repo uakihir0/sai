@@ -3031,6 +3031,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cap-std",
+ "getrandom 0.4.3",
  "gix",
  "gix-pack",
  "gix-transport",
