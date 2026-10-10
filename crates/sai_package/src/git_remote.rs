@@ -1,6 +1,6 @@
 //! Bounded Git release-tag listing and locked-source fetching.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error as StdError;
 use std::ffi::OsString;
 use std::fmt;
@@ -727,6 +727,8 @@ pub enum GitRemoteReleaseFetchError {
     PathEscapesRepository,
     /// A Git-relative package directory is absent or has no `sai.package`.
     PathPackageNotFound,
+    /// The Git path fetcher returned a package from another source identity.
+    GitPathSourceIdentityMismatch,
     /// A temporary repository could not be created or initialized.
     TemporaryRepository,
     /// The remote URL or refspec could not be configured.
@@ -1151,6 +1153,7 @@ impl GitRemoteReleaseFetchError {
             Self::InvalidGitDependencyPath => sai_diagnostics::Code::InvalidPackagePath,
             Self::PathEscapesRepository => sai_diagnostics::Code::PathEscapesRepository,
             Self::PathPackageNotFound => sai_diagnostics::Code::PathPackageNotFound,
+            Self::GitPathSourceIdentityMismatch => sai_diagnostics::Code::FetchFailed,
             Self::TemporaryRepository | Self::RemoteConfiguration | Self::FetchFailed => {
                 sai_diagnostics::Code::FetchFailed
             }
@@ -1220,6 +1223,9 @@ impl fmt::Display for GitRemoteReleaseFetchError {
             }
             Self::PathPackageNotFound => {
                 formatter.write_str("Git path package was not found in the repository commit")
+            }
+            Self::GitPathSourceIdentityMismatch => {
+                formatter.write_str("Git path fetch returned a package from another source")
             }
             Self::TemporaryRepository => {
                 formatter.write_str("Could not prepare the temporary Git repository")
@@ -1481,6 +1487,116 @@ pub fn fetch_git_package_source_tree_at_commit(
         directory,
         &transfer_limit,
     )
+}
+
+/// Fetch a Git path package from its exact identity and verify a matching lock
+/// entry's commit and all recorded checksums.
+///
+/// The lock entry must describe the exact repository, commit, and package
+/// directory in `source_identity`. A stale entry for another identity should
+/// be ignored by the resolver and the current source fetched without a lock.
+pub fn fetch_locked_git_path_package_tree(
+    package: &LockPackage,
+    source_identity: &GitPackageSourceIdentity,
+) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError> {
+    let request = locked_git_path_request(package, source_identity)?;
+    let fetched = fetch_git_package_source_tree_at_commit(
+        source_identity.canonical_url(),
+        source_identity.commit_id(),
+        source_identity.directory(),
+    )?;
+    verify_locked_git_path_package_checksums(&request, source_identity, &fetched)?;
+    Ok(fetched)
+}
+
+fn locked_git_path_request(
+    package: &LockPackage,
+    source_identity: &GitPackageSourceIdentity,
+) -> Result<LockedReleaseRequest, GitRemoteReleaseFetchError> {
+    let request = locked_release_request(package)?;
+    let same_directory = request
+        .directory
+        .as_ref()
+        .map_or(".", RepositoryPackageDirectory::as_str)
+        == source_identity.directory().as_str();
+    if request.url.as_ref() != source_identity.canonical_url()
+        || request.commit != *source_identity.commit_id()
+        || !same_directory
+    {
+        return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+            "Git path source identity",
+        ));
+    }
+    Ok(request)
+}
+
+#[cfg(test)]
+fn verify_locked_git_path_package(
+    package: &LockPackage,
+    source_identity: &GitPackageSourceIdentity,
+    fetched: &FetchedGitPackage,
+) -> Result<(), GitRemoteReleaseFetchError> {
+    let request = locked_git_path_request(package, source_identity)?;
+    verify_locked_git_path_package_checksums(&request, source_identity, fetched)
+}
+
+fn verify_locked_git_path_package_checksums(
+    request: &LockedReleaseRequest,
+    source_identity: &GitPackageSourceIdentity,
+    fetched: &FetchedGitPackage,
+) -> Result<(), GitRemoteReleaseFetchError> {
+    verify_git_path_package_identity(source_identity, fetched)?;
+
+    verify_cached_package_checksums(&request.checksums, &package_checksums(fetched.source()))
+        .map_err(|error| with_locked_checksum_context(request, error))?;
+    Ok(())
+}
+
+pub(crate) fn verify_git_path_package_identity(
+    source_identity: &GitPackageSourceIdentity,
+    fetched: &FetchedGitPackage,
+) -> Result<(), GitRemoteReleaseFetchError> {
+    if fetched.source_identity() != source_identity {
+        return Err(GitRemoteReleaseFetchError::GitPathSourceIdentityMismatch);
+    }
+    Ok(())
+}
+
+/// Find a lock package that describes the exact Git path source identity.
+///
+/// A package's manifest version is checked later when its dependency contract
+/// is built. Path sources are pinned by their requiring commit, so entries
+/// for an older commit are stale and do not provide a checksum floor.
+pub(crate) fn matching_locked_git_path_package<'a>(
+    source_identity: &GitPackageSourceIdentity,
+    locked_packages: &'a HashMap<MvsPackageVersion, LockPackage>,
+) -> Result<Option<&'a LockPackage>, GitRemoteReleaseFetchError> {
+    let mut matching = None;
+    for package in locked_packages.values() {
+        if !package
+            .fields
+            .iter()
+            .any(|field| matches!(&field.value, LockPackageField::Source(LockSource::Git(_))))
+        {
+            continue;
+        }
+        let request = locked_release_request(package)?;
+        let same_directory = request
+            .directory
+            .as_ref()
+            .map_or(".", RepositoryPackageDirectory::as_str)
+            == source_identity.directory().as_str();
+        if request.url.as_ref() == source_identity.canonical_url()
+            && request.commit == *source_identity.commit_id()
+            && same_directory
+            && matching.replace(package).is_some()
+        {
+            return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                "duplicate Git path source identity",
+            ));
+        }
+    }
+    Ok(matching)
 }
 
 /// Fetch a sibling package by resolving a dependency path inside the exact
@@ -1907,6 +2023,18 @@ fn verify_cached_package_checksums(
         }
     }
     Ok(())
+}
+
+fn package_checksums(source: &GitPackageSourceTree) -> CachedPackageChecksums {
+    CachedPackageChecksums {
+        source_checksum: source.source_tree().checksum.clone().into(),
+        wit_checksum: source.wit_tree().map(|tree| tree.checksum.clone().into()),
+        artifact_checksums: source
+            .artifact_checksums()
+            .iter()
+            .map(|artifact| (artifact.target().into(), artifact.checksum().into()))
+            .collect(),
+    }
 }
 
 fn find_verified_source(
@@ -2828,7 +2956,7 @@ mod tests {
         exact_release_tag_refspec_for_name, fetch_release_tree_in_repository,
         find_release_tag_in_repository, list_release_tags_in_repository, map_transport_error,
         plan_selected_git_release_fetch, proxy_environment_overrides, release_tag_name,
-        release_tag_refspec, user_credential_config_paths,
+        release_tag_refspec, user_credential_config_paths, verify_locked_git_path_package,
     };
     use crate::git_path_requirements::{
         GitPathRequirementDiscoveryError, discover_git_path_requirements,
@@ -2838,8 +2966,12 @@ mod tests {
     };
     use crate::git_tags::{GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs};
     use crate::git_tree::{GitTreeReadError, GitTreeReader};
+    use crate::local_source::LocalPackageDirectory;
     use crate::lock::{LockPackage, LockPackageField, LockSource};
     use crate::manifest::{PackageRole, Spanned, parse_for_role};
+    use crate::mixed_source::{
+        MixedPackageSourceIdentity, resolve_mixed_source_packages_with_fetchers,
+    };
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::package_cache::PackageCache;
     use crate::package_path::RepositoryPackageDirectory;
@@ -3003,6 +3135,133 @@ mod tests {
             } else {
                 direct_tag_id
             };
+            let refs = directory.path.join("refs/tags");
+            std::fs::create_dir_all(&refs).unwrap();
+            std::fs::write(
+                refs.join(tag_name.trim_start_matches("refs/tags/")),
+                format!("{tag_id}\n"),
+            )
+            .unwrap();
+            std::fs::write(refs.join("v9.9.9"), format!("{unrequested_tag_id}\n")).unwrap();
+            let branches = directory.path.join("refs/heads");
+            std::fs::create_dir_all(&branches).unwrap();
+            std::fs::write(branches.join("main"), format!("{commit_id}\n")).unwrap();
+            let tag = parse_release_tag_refs([(tag_name, tag_id)], None)
+                .unwrap()
+                .remove(0);
+            Self {
+                directory,
+                tag,
+                commit_id,
+                parent_commit_id,
+                unrequested_tag_id,
+            }
+        }
+
+        fn new_with_sibling_target_manifests(
+            tag_name: &str,
+            requiring_manifest: &[u8],
+            target_manifest: &[u8],
+        ) -> Self {
+            let directory = TemporaryGitDirectory::create().unwrap();
+            let repository = init_bare_repository(&directory.path, Some(gix::hash::Kind::Sha1));
+            let requiring_manifest_id = repository.write_blob(requiring_manifest).unwrap().detach();
+            let requiring_source_id = repository
+                .write_blob(b"pub fn requiring() {}\n")
+                .unwrap()
+                .detach();
+            let requiring_entries = vec![
+                Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: b"main.sai".to_vec().into(),
+                    oid: requiring_source_id,
+                },
+                Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: b"sai.package".to_vec().into(),
+                    oid: requiring_manifest_id,
+                },
+            ];
+            let requiring_tree_id = repository
+                .write_object(gix::objs::Tree {
+                    entries: requiring_entries.clone(),
+                })
+                .unwrap()
+                .detach();
+            let parent_commit_id = repository
+                .write_object(gix::objs::Commit {
+                    tree: requiring_tree_id,
+                    parents: Default::default(),
+                    author: gix::actor::Signature::default(),
+                    committer: gix::actor::Signature::default(),
+                    encoding: None,
+                    message: "fixture parent".into(),
+                    extra_headers: Vec::new(),
+                })
+                .unwrap()
+                .detach();
+
+            let target_manifest_id = repository.write_blob(target_manifest).unwrap().detach();
+            let target_source_id = repository
+                .write_blob(b"pub fn target() {}\n")
+                .unwrap()
+                .detach();
+            let mut target_entries = vec![
+                Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: b"main.sai".to_vec().into(),
+                    oid: target_source_id,
+                },
+                Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: b"sai.package".to_vec().into(),
+                    oid: target_manifest_id,
+                },
+            ];
+            target_entries.sort();
+            let target_tree_id = repository
+                .write_object(gix::objs::Tree {
+                    entries: target_entries,
+                })
+                .unwrap()
+                .detach();
+            let packages_tree_id = repository
+                .write_object(gix::objs::Tree {
+                    entries: vec![Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: b"target".to_vec().into(),
+                        oid: target_tree_id,
+                    }],
+                })
+                .unwrap()
+                .detach();
+            let mut root_entries = requiring_entries;
+            root_entries.push(Entry {
+                mode: EntryKind::Tree.into(),
+                filename: b"packages".to_vec().into(),
+                oid: packages_tree_id,
+            });
+            root_entries.sort();
+            let root_tree_id = repository
+                .write_object(gix::objs::Tree {
+                    entries: root_entries,
+                })
+                .unwrap()
+                .detach();
+            let commit_id = repository
+                .write_object(gix::objs::Commit {
+                    tree: root_tree_id,
+                    parents: vec![parent_commit_id].into(),
+                    author: gix::actor::Signature::default(),
+                    committer: gix::actor::Signature::default(),
+                    encoding: None,
+                    message: "fixture commit with target sibling".into(),
+                    extra_headers: Vec::new(),
+                })
+                .unwrap()
+                .detach();
+            let unrequested_tag_id = write_test_tag(&repository, parent_commit_id, "v9.9.9");
+            let tag_id = write_test_tag(&repository, commit_id, tag_name);
             let refs = directory.path.join("refs/tags");
             std::fs::create_dir_all(&refs).unwrap();
             std::fs::write(
@@ -3228,6 +3487,22 @@ mod tests {
         expected_checksum: Option<&str>,
         canonical_url: &str,
     ) -> Result<super::FetchedGitRelease, GitRemoteReleaseFetchError> {
+        fetch_fixture_at_directory(
+            remote,
+            expected_commit,
+            expected_checksum,
+            canonical_url,
+            None,
+        )
+    }
+
+    fn fetch_fixture_at_directory(
+        remote: &TestRemote,
+        expected_commit: Option<&gix::ObjectId>,
+        expected_checksum: Option<&str>,
+        canonical_url: &str,
+        directory: Option<&RepositoryPackageDirectory>,
+    ) -> Result<super::FetchedGitRelease, GitRemoteReleaseFetchError> {
         let scratch = TemporaryGitDirectory::create().unwrap();
         let repository = init_bare_repository(&scratch.path, Some(remote.tag.object_id().kind()));
         let refspec = super::exact_release_tag_refspec(&remote.tag, None).unwrap();
@@ -3240,7 +3515,7 @@ mod tests {
                 refspec: &refspec,
                 tag_name: remote.tag.name(),
                 version: remote.tag.version(),
-                directory: None,
+                directory,
                 expected_commit,
                 expected_source_checksum: expected_checksum,
                 expected_locked_checksums: None,
@@ -3453,6 +3728,54 @@ mod tests {
             ),
             Err(SelectedGitReleaseFetchError::MissingLockedPackage(
                 Box::new(selected.clone())
+            ))
+        );
+    }
+
+    #[test]
+    fn locked_git_path_package_verifies_identity_and_source_checksum() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let fetched_release = fetch_fixture(&remote, Some(&remote.commit_id), None).unwrap();
+        let identity = fetched_release.source_identity().clone();
+        let source = FetchedGitPackage {
+            source_identity: identity.clone(),
+            source: fetched_release.into_source_tree(),
+        };
+        let lock_package = LockPackage {
+            package: "acme:sample".into(),
+            version: crate::version::Version::parse("1.2.3").unwrap(),
+            fields: [
+                LockPackageField::Source(LockSource::Git(TEST_CANONICAL_GIT_URL.into())),
+                LockPackageField::Commit(identity.commit_id().to_hex().to_string().into()),
+                LockPackageField::Checksum(source.source().source_tree().checksum.clone().into()),
+            ]
+            .into_iter()
+            .map(|value| Spanned { value, span: 0..0 })
+            .collect(),
+        };
+
+        verify_locked_git_path_package(&lock_package, &identity, &source)
+            .expect("matching lock identity and checksum verify");
+
+        let mut bad_checksum = lock_package.clone();
+        let checksum = bad_checksum
+            .fields
+            .iter_mut()
+            .find(|field| matches!(&field.value, LockPackageField::Checksum(_)))
+            .expect("lock contains a source checksum");
+        checksum.value = LockPackageField::Checksum(format!("sai1:{}", "0".repeat(64)).into());
+        assert!(matches!(
+            verify_locked_git_path_package(&bad_checksum, &identity, &source),
+            Err(GitRemoteReleaseFetchError::LockedChecksumMismatch { .. })
+        ));
+
+        let mut wrong_commit_identity = identity.clone();
+        wrong_commit_identity.commit_id =
+            gix::ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(
+            verify_locked_git_path_package(&lock_package, &wrong_commit_identity, &source),
+            Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                "Git path source identity"
             ))
         );
     }
@@ -3751,6 +4074,509 @@ mod tests {
             crate::version::Version::parse(version).expect("valid package version"),
         )
         .expect("valid package identity")
+    }
+
+    #[test]
+    fn mixed_source_resolver_loads_local_git_and_git_sibling_path_packages() {
+        let directory = TestDirectory::new("mixed-source");
+        let workspace = directory.0.join("workspace");
+        let root_path = workspace.join("root");
+        let local_path = workspace.join("local");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::create_dir_all(&local_path).unwrap();
+        std::fs::write(
+            root_path.join("sai.package"),
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              requires {\n\
+                acme:local @ ^1 from path \"../local\"\n\
+                acme:client @ ^2 from git \"https://example.test/acme/sample.git\" dir \"packages/client\"\n\
+              }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            local_path.join("sai.package"),
+            b"package acme:local @ 1.1.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .unwrap();
+
+        let client_manifest = b"package acme:client @ 2.0.0\n\
+                               source \"main.sai\"\n\
+                               targets { wasm32-core }\n\
+                               requires { acme:sibling @ ^1 from path \"../sibling\" }\n";
+        let sibling_manifest = b"package acme:sibling @ 1.4.0\n\
+                                source \"main.sai\"\n\
+                                targets { wasm32-core }\n";
+        let mut remote = TestRemote::new("refs/tags/v2.0.0", false);
+        let commit_id =
+            remote.commit_with_client_and_sibling_packages(client_manifest, sibling_manifest);
+        let repository =
+            gix::open_opts(&remote.directory.path, gix::open::Options::isolated()).unwrap();
+        let tag_id = write_test_tag(&repository, commit_id, "v2.0.0");
+        std::fs::write(
+            remote.directory.path.join("refs/tags/v2.0.0"),
+            format!("{tag_id}\n"),
+        )
+        .unwrap();
+        remote.tag = parse_release_tag_refs([("refs/tags/v2.0.0", tag_id)], None)
+            .unwrap()
+            .remove(0);
+        remote.commit_id = commit_id;
+
+        let client_directory = RepositoryPackageDirectory::parse("packages/client").unwrap();
+        let fetched_release = fetch_fixture_at_directory(
+            &remote,
+            Some(&commit_id),
+            None,
+            TEST_CANONICAL_GIT_URL,
+            Some(&client_directory),
+        )
+        .unwrap();
+        let client_identity = fetched_release.source_identity().clone();
+        let sibling_identity = client_identity
+            .resolve_dependency_path("../sibling")
+            .unwrap();
+        let reader = GitTreeReader::open(
+            repository.git_dir().join("objects"),
+            repository.object_hash(),
+        )
+        .unwrap();
+
+        let root_directory =
+            LocalPackageDirectory::open(&root_path).expect("open local root package");
+        let local_directory =
+            LocalPackageDirectory::open(&local_path).expect("open local dependency");
+        let mut fetched_release = Some(fetched_release);
+        let sibling_source = reader
+            .read_commit_repository_package_source_tree(
+                sibling_identity.commit_id(),
+                sibling_identity.directory(),
+            )
+            .unwrap();
+        let locked_sibling = LockPackage {
+            package: "acme:sibling".into(),
+            version: crate::version::Version::parse("1.4.0").unwrap(),
+            fields: [
+                LockPackageField::Source(LockSource::Git(TEST_CANONICAL_GIT_URL.into())),
+                LockPackageField::Directory("packages/sibling".into()),
+                LockPackageField::Commit(sibling_identity.commit_id().to_hex().to_string().into()),
+                LockPackageField::Checksum(sibling_source.source_tree().checksum.clone().into()),
+            ]
+            .into_iter()
+            .map(|value| Spanned { value, span: 0..0 })
+            .collect(),
+        };
+        let locked_packages = std::collections::HashMap::from([(
+            expected_package_version("acme:sibling", "1.4.0"),
+            locked_sibling,
+        )]);
+        let mut git_release_fetches = 0;
+        let mut sibling_fetches = 0;
+        let output = resolve_mixed_source_packages_with_fetchers(
+            root_directory.clone(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &locked_packages,
+            PackageValidationContext::default(),
+            |selection, locked_package| {
+                git_release_fetches += 1;
+                assert!(locked_package.is_none());
+                assert!(matches!(
+                    selection.source(),
+                    ResolverPackageSource::Git { url, directory }
+                        if url.as_ref() == TEST_CANONICAL_GIT_URL
+                            && directory.as_deref() == Some("packages/client")
+                ));
+                Ok(fetched_release
+                    .take()
+                    .expect("selected Git release is fetched only once"))
+            },
+            |identity, locked_package| {
+                sibling_fetches += 1;
+                let locked_package =
+                    locked_package.expect("the exact Git sibling identity uses its lock entry");
+                assert_eq!(identity, &sibling_identity);
+                let source = reader
+                    .read_commit_repository_package_source_tree(
+                        identity.commit_id(),
+                        identity.directory(),
+                    )
+                    .unwrap();
+                let fetched = FetchedGitPackage {
+                    source_identity: identity.clone(),
+                    source,
+                };
+                super::verify_locked_git_path_package(locked_package, identity, &fetched)?;
+                Ok(fetched)
+            },
+        )
+        .expect("mixed local and Git graph resolves");
+
+        let local_version = expected_package_version("acme:local", "1.1.0");
+        let client_version = expected_package_version("acme:client", "2.0.0");
+        let sibling_version = expected_package_version("acme:sibling", "1.4.0");
+        let selected = output.provider().output().selection().selected();
+        assert_eq!(
+            selected.get(&local_version.node()),
+            Some(local_version.version())
+        );
+        assert_eq!(
+            selected.get(&client_version.node()),
+            Some(client_version.version())
+        );
+        assert_eq!(
+            selected.get(&sibling_version.node()),
+            Some(sibling_version.version())
+        );
+        assert_eq!(git_release_fetches, 1);
+        assert_eq!(sibling_fetches, 1);
+        assert!(fetched_release.is_none());
+
+        let identities = output.provider().source_identities();
+        assert_eq!(
+            identities.get(&MvsRequirer::Root(expected_package_version(
+                "acme:root",
+                "1.0.0"
+            ))),
+            Some(&MixedPackageSourceIdentity::Local(root_directory))
+        );
+        assert_eq!(
+            identities.get(&MvsRequirer::Package(local_version.clone())),
+            Some(&MixedPackageSourceIdentity::Local(local_directory))
+        );
+        assert_eq!(
+            identities.get(&MvsRequirer::Package(client_version.clone())),
+            Some(&MixedPackageSourceIdentity::Git(client_identity.clone()))
+        );
+        assert_eq!(
+            identities.get(&MvsRequirer::Package(sibling_version.clone())),
+            Some(&MixedPackageSourceIdentity::Git(sibling_identity.clone()))
+        );
+        assert_eq!(
+            output
+                .git_identities()
+                .get(&MvsRequirer::Package(client_version.clone())),
+            Some(&client_identity)
+        );
+        assert_eq!(
+            output
+                .git_identities()
+                .get(&MvsRequirer::Package(sibling_version.clone())),
+            Some(&sibling_identity)
+        );
+        let sibling_path_key =
+            crate::resolver_contract::ResolverPathKey::package(client_version, "../sibling");
+        assert_eq!(
+            output
+                .git_path_requirements()
+                .get(&sibling_path_key.requirer)
+                .and_then(|index| index.package_version(&sibling_path_key)),
+            Some(&sibling_version)
+        );
+
+        let final_sources = output
+            .plan_final_sources(&std::collections::HashMap::new())
+            .expect("final sources can be planned");
+        assert!(final_sources.failures().is_empty());
+        assert!(final_sources.root_cycles().is_empty());
+        assert_eq!(final_sources.entries().len(), 3);
+        assert!(
+            final_sources
+                .entries()
+                .iter()
+                .all(|entry| entry.read_source() == entry.final_source())
+        );
+    }
+
+    #[test]
+    fn mixed_source_final_audit_reloads_late_path_pins_and_compares_contracts() {
+        const TARGET_URL: &str = "https://example.test/acme/target.git";
+        const SHARED_URL: &str = "https://example.test/acme/shared.git";
+        const OTHER_SHARED_URL: &str = "https://example.test/acme/other-shared.git";
+        let git_target_manifest = format!(
+            "package acme:target @ 1.0.0\n\
+             source \"main.sai\"\n\
+             targets {{ wasm32-core }}\n\
+             requires {{ acme:shared @ ^1 from git \"{SHARED_URL}\" }}\n"
+        );
+        let shared_manifest = b"package acme:shared @ 1.0.0\n\
+                               source \"main.sai\"\n\
+                               targets { wasm32-core }\n";
+
+        for (case_name, local_shared_url, expected_equivalent) in [
+            ("same-contract", SHARED_URL, true),
+            ("different-contract", OTHER_SHARED_URL, false),
+        ] {
+            let directory = TestDirectory::new(case_name);
+            let workspace = directory.0.join("workspace");
+            let root_path = workspace.join("root");
+            let late_path = workspace.join("z_late");
+            let target_path = workspace.join("target");
+            std::fs::create_dir_all(&root_path).unwrap();
+            std::fs::create_dir_all(&late_path).unwrap();
+            std::fs::create_dir_all(&target_path).unwrap();
+            std::fs::write(
+                root_path.join("sai.package"),
+                format!(
+                    "package acme:root @ 1.0.0\n\
+                     source \"src\"\n\
+                     targets {{ wasm32-core }}\n\
+                     requires {{\n\
+                       acme:target @ ^1 from git \"{TARGET_URL}\"\n\
+                     acme:z-late @ ^1 from path \"../z_late\"\n\
+                     }}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                late_path.join("sai.package"),
+                b"package acme:z-late @ 1.0.0\n\
+                  source \"main.sai\"\n\
+                  targets { wasm32-core }\n\
+                  requires { acme:target @ ^1 from path \"../target\" }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                target_path.join("sai.package"),
+                format!(
+                    "package acme:target @ 1.0.0\n\
+                     source \"main.sai\"\n\
+                     targets {{ wasm32-core }}\n\
+                     requires {{ acme:shared @ ^1 from git \"{local_shared_url}\" }}\n"
+                ),
+            )
+            .unwrap();
+
+            let target_remote = TestRemote::new_with_package_manifest(
+                "refs/tags/v1.0.0",
+                false,
+                gix::hash::Kind::Sha1,
+                Some(git_target_manifest.as_bytes()),
+            );
+            let shared_remote = TestRemote::new_with_package_manifest(
+                "refs/tags/v1.0.0",
+                false,
+                gix::hash::Kind::Sha1,
+                Some(shared_manifest),
+            );
+            let mut target_release = Some(
+                fetch_fixture_with_canonical_url(
+                    &target_remote,
+                    Some(&target_remote.commit_id),
+                    None,
+                    TARGET_URL,
+                )
+                .unwrap(),
+            );
+            let mut shared_release = Some(
+                fetch_fixture_with_canonical_url(
+                    &shared_remote,
+                    Some(&shared_remote.commit_id),
+                    None,
+                    SHARED_URL,
+                )
+                .unwrap(),
+            );
+            let root_directory = LocalPackageDirectory::open(&root_path).unwrap();
+            let output = resolve_mixed_source_packages_with_fetchers(
+                root_directory,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                PackageValidationContext::default(),
+                |selection, locked_package| {
+                    assert!(locked_package.is_none());
+                    match selection.package_version().package() {
+                        "acme:target" => Ok(target_release.take().unwrap()),
+                        "acme:shared" => Ok(shared_release.take().unwrap()),
+                        package => panic!("unexpected Git package request for {package}"),
+                    }
+                },
+                |_, _| unreachable!("this fixture has no Git-relative path requirements"),
+            )
+            .expect("the read-time MVS graph resolves");
+
+            let target_version = expected_package_version("acme:target", "1.0.0");
+            let sources = output
+                .plan_final_sources(&std::collections::HashMap::new())
+                .expect("final source plan is available");
+            let target = sources
+                .entries()
+                .iter()
+                .find(|entry| entry.package_version() == &target_version)
+                .expect("target has a final source entry");
+            assert_eq!(
+                target.read_source().reason(),
+                ResolverSourceReason::NamedRequirement
+            );
+            assert_eq!(
+                target.final_source().reason(),
+                ResolverSourceReason::PathPin
+            );
+            assert_ne!(target.read_source(), target.final_source());
+
+            let audit_plan = output
+                .plan_final_source_audit(
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
+                    PackageValidationContext::default(),
+                    |_, _| unreachable!("the selected Git releases were already captured"),
+                    |_, _| unreachable!("this fixture has no Git-relative path requirements"),
+                )
+                .expect("the final source identities are plannable");
+            assert_eq!(audit_plan.source_identities().reloads().len(), 1);
+            assert!(audit_plan.reload_failures().is_empty());
+            assert!(audit_plan.audit().is_complete());
+            assert_eq!(audit_plan.is_equivalent(), expected_equivalent);
+            assert_eq!(
+                audit_plan.audit().has_divergent_sources(),
+                !expected_equivalent
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_source_final_audit_rejects_a_misrouted_git_path_reload() {
+        const TARGET_URL: &str = "https://example.test/acme/target.git";
+        const LATE_URL: &str = "https://example.test/acme/late.git";
+        const WRONG_URL: &str = "https://example.test/acme/wrong.git";
+        let target_manifest = b"package acme:target @ 1.0.0\n\
+                               source \"main.sai\"\n\
+                               targets { wasm32-core }\n";
+        let late_manifest = b"package acme:z-late @ 1.0.0\n\
+                              source \"main.sai\"\n\
+                              targets { wasm32-core }\n\
+                              requires { acme:target @ ^1 from path \"packages/target\" }\n";
+        let directory = TestDirectory::new("mixed-source-misrouted-git-reload");
+        let workspace = directory.0.join("workspace");
+        let root_path = workspace.join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::write(
+            root_path.join("sai.package"),
+            format!(
+                "package acme:root @ 1.0.0\n\
+                 source \"main.sai\"\n\
+                 targets {{ wasm32-core }}\n\
+                 requires {{\n\
+                   acme:target @ ^1 from git \"{TARGET_URL}\"\n\
+                   acme:z-late @ ^1 from git \"{LATE_URL}\"\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+
+        let target_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(target_manifest),
+        );
+        let late_remote = TestRemote::new_with_sibling_target_manifests(
+            "refs/tags/v1.0.0",
+            late_manifest,
+            target_manifest,
+        );
+        let wrong_remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.0.0",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(target_manifest),
+        );
+        let mut target_release = Some(
+            fetch_fixture_with_canonical_url(
+                &target_remote,
+                Some(&target_remote.commit_id),
+                None,
+                TARGET_URL,
+            )
+            .unwrap(),
+        );
+        let mut late_release = Some(
+            fetch_fixture_with_canonical_url(
+                &late_remote,
+                Some(&late_remote.commit_id),
+                None,
+                LATE_URL,
+            )
+            .unwrap(),
+        );
+        let target_directory = RepositoryPackageDirectory::parse("packages/target").unwrap();
+        let sibling_release = fetch_fixture_at_directory(
+            &late_remote,
+            Some(&late_remote.commit_id),
+            None,
+            LATE_URL,
+            Some(&target_directory),
+        )
+        .unwrap();
+        let sibling_identity = sibling_release.source_identity.clone();
+        let mut sibling_package = Some(super::FetchedGitPackage {
+            source_identity: sibling_release.source_identity,
+            source: sibling_release.source,
+        });
+        let wrong_release = fetch_fixture_with_canonical_url(
+            &wrong_remote,
+            Some(&wrong_remote.commit_id),
+            None,
+            WRONG_URL,
+        )
+        .unwrap();
+        let mut wrong_package = Some(super::FetchedGitPackage {
+            source_identity: wrong_release.source_identity.clone(),
+            source: wrong_release.source,
+        });
+
+        let output = resolve_mixed_source_packages_with_fetchers(
+            LocalPackageDirectory::open(&root_path).unwrap(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            PackageValidationContext::default(),
+            |selection, locked_package| {
+                assert!(locked_package.is_none());
+                match selection.package_version().package() {
+                    "acme:target" => Ok(target_release.take().unwrap()),
+                    "acme:z-late" => Ok(late_release.take().unwrap()),
+                    package => panic!("unexpected Git package request for {package}"),
+                }
+            },
+            |identity, locked_package| {
+                assert!(locked_package.is_none());
+                assert_eq!(identity, &sibling_identity);
+                Ok(sibling_package.take().unwrap())
+            },
+        )
+        .expect("read-time MVS resolves");
+
+        let audit_plan = output
+            .plan_final_source_audit(
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                PackageValidationContext::default(),
+                |_, _| unreachable!("all final sources are path pins"),
+                |_, _| Ok(wrong_package.take().unwrap()),
+            )
+            .expect("the final source plan is available");
+        let target_version = expected_package_version("acme:target", "1.0.0");
+        assert_eq!(audit_plan.source_identities().reloads().len(), 1);
+        let failure = audit_plan
+            .reload_failures()
+            .iter()
+            .find(|failure| failure.package_version.as_ref() == Some(&target_version))
+            .expect("a misrouted Git path reload must be retained as a failure");
+        let crate::mixed_source::MixedSourceFinalReloadError::GitPathFetch(error) = &failure.error
+        else {
+            panic!("misrouted Git path reload should report a fetch error");
+        };
+        assert_eq!(
+            **error,
+            GitRemoteReleaseFetchError::GitPathSourceIdentityMismatch
+        );
+        assert_eq!(error.diagnostic_code(), sai_diagnostics::Code::FetchFailed);
+        assert!(!audit_plan.is_equivalent());
     }
 
     fn git_path_pin(

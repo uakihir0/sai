@@ -14,6 +14,7 @@ pub mod lock_root_contract;
 pub mod lock_serialization;
 pub mod lock_validation;
 pub mod manifest;
+pub mod mixed_source;
 pub mod mvs;
 pub mod mvs_diagnostics;
 pub mod mvs_explanations;
