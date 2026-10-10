@@ -535,7 +535,7 @@ impl StdError for GitRemoteReleaseContractError {
     }
 }
 
-/// Errors while fetching, peeling, and checking one remote release tag.
+/// Errors while fetching a release or a commit-pinned Git package source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitRemoteReleaseFetchError {
     /// A package entry passed to the lock-aware fetch API has invalid fields.
@@ -565,6 +565,11 @@ pub enum GitRemoteReleaseFetchError {
         /// The complete release-tag ref name.
         name: Box<str>,
         /// The commit recorded in the lock.
+        commit: gix::ObjectId,
+    },
+    /// A package-source commit pinned by a Git sibling path is unavailable.
+    RepositoryCommitUnavailable {
+        /// The commit containing the sibling package.
         commit: gix::ObjectId,
     },
     /// A ref advertisement exceeded a bounded Git listing limit.
@@ -747,9 +752,9 @@ impl GitRemoteReleaseFetchError {
                 sai_diagnostics::Code::FetchFailed
             }
             Self::TransferLimitExceeded { .. } => sai_diagnostics::Code::PackageTooLarge,
-            Self::TagNotFound { .. } | Self::LockedCommitUnavailable { .. } => {
-                sai_diagnostics::Code::VersionNotFound
-            }
+            Self::TagNotFound { .. }
+            | Self::LockedCommitUnavailable { .. }
+            | Self::RepositoryCommitUnavailable { .. } => sai_diagnostics::Code::VersionNotFound,
             Self::TagList(GitReleaseTagListError::LimitExceeded { .. }) => {
                 sai_diagnostics::Code::PackageTooLarge
             }
@@ -816,6 +821,10 @@ impl fmt::Display for GitRemoteReleaseFetchError {
             Self::LockedCommitUnavailable { name, commit } => write!(
                 formatter,
                 "Git release tag {name} is missing and locked commit {commit} is unavailable from the source"
+            ),
+            Self::RepositoryCommitUnavailable { commit } => write!(
+                formatter,
+                "locked Git repository commit {commit} is unavailable from the source"
             ),
             Self::TagList(error) => error.fmt(formatter),
             Self::InvalidTag(error) => write!(formatter, "invalid Git release tag: {error}"),
@@ -983,6 +992,71 @@ pub fn fetch_locked_release_tree(
         expected_checksums,
         &transfer_limit,
     )
+}
+
+/// Fetch a package directory from an exact Git commit without consulting a
+/// release tag.
+///
+/// This is used for sibling packages published in the same repository commit.
+/// The caller supplies the requiring package's selected commit (which is
+/// locked when resolving an existing lock) and a normalized repository-relative
+/// directory; the selected tree and its manifest are validated with the same
+/// bounded Git object reader used for releases.
+pub fn fetch_git_package_source_tree_at_commit(
+    url: &str,
+    commit_id: &gix::ObjectId,
+    directory: &RepositoryPackageDirectory,
+) -> Result<GitPackageSourceTree, GitRemoteReleaseFetchError> {
+    let canonical_url =
+        canonical_git_url(url).map_err(|()| GitRemoteReleaseFetchError::InvalidGitUrl)?;
+    let config_overrides = transport_config_overrides().map_err(map_tag_list_error_for_fetch)?;
+    let scratch = TemporaryGitDirectory::create()
+        .map_err(|()| GitRemoteReleaseFetchError::TemporaryRepository)?;
+    let repository = gix::ThreadSafeRepository::init_opts(
+        &scratch.path,
+        gix::create::Kind::Bare,
+        gix::create::Options {
+            object_hash: Some(commit_id.kind()),
+            ..Default::default()
+        },
+        gix::open::Options::isolated().config_overrides(config_overrides),
+    )
+    .map_err(|_| GitRemoteReleaseFetchError::TemporaryRepository)?;
+    let repository = repository.to_thread_local();
+    let transfer_limit =
+        gix_transport::client::blocking_io::FetchTransferLimit::new(MAX_GIT_FETCH_BYTES);
+
+    fetch_git_package_source_tree_at_commit_in_repository(
+        &repository,
+        &canonical_url,
+        commit_id,
+        directory,
+        &transfer_limit,
+    )
+}
+
+fn fetch_git_package_source_tree_at_commit_in_repository(
+    repository: &gix::Repository,
+    url: &str,
+    commit_id: &gix::ObjectId,
+    directory: &RepositoryPackageDirectory,
+    transfer_limit: &gix_transport::client::blocking_io::FetchTransferLimit,
+) -> Result<GitPackageSourceTree, GitRemoteReleaseFetchError> {
+    fetch_locked_commit(
+        repository,
+        url,
+        commit_id,
+        LockedCommitFetchContext::RepositoryPackage,
+        transfer_limit,
+    )?;
+    let reader = GitTreeReader::open(
+        repository.git_dir().join("objects"),
+        repository.object_hash(),
+    )
+    .map_err(GitRemoteReleaseFetchError::SourceTree)?;
+    reader
+        .read_commit_repository_package_source_tree(commit_id, directory)
+        .map_err(GitRemoteReleaseFetchError::SourceTree)
 }
 
 /// Fetch one Git package directly from its validated lock entry.
@@ -1428,7 +1502,13 @@ fn fetch_release_tree_in_repository(
             return Err(GitRemoteReleaseFetchError::FetchFailed);
         }
         drop(prepared);
-        fetch_locked_commit(repository, url, expected_commit, tag_name, transfer_limit)?;
+        fetch_locked_commit(
+            repository,
+            url,
+            expected_commit,
+            LockedCommitFetchContext::ReleaseTag(tag_name),
+            transfer_limit,
+        )?;
         (None, expected_commit.to_owned(), true)
     };
 
@@ -1580,11 +1660,17 @@ fn checksum_mismatch(
     }
 }
 
+#[derive(Clone, Copy)]
+enum LockedCommitFetchContext<'a> {
+    ReleaseTag(&'a str),
+    RepositoryPackage,
+}
+
 fn fetch_locked_commit(
     repository: &gix::Repository,
     url: &str,
     commit_id: &gix::ObjectId,
-    tag_name: &str,
+    context: LockedCommitFetchContext<'_>,
     transfer_limit: &gix_transport::client::blocking_io::FetchTransferLimit,
 ) -> Result<(), GitRemoteReleaseFetchError> {
     let refspec = format!("{commit_id}:refs/sai/locked-package-commit");
@@ -1611,9 +1697,18 @@ fn fetch_locked_commit(
         .map(|_| ())
         .map_err(|error| {
             if is_locked_commit_unavailable(&error) {
-                GitRemoteReleaseFetchError::LockedCommitUnavailable {
-                    name: tag_name.into(),
-                    commit: *commit_id,
+                match context {
+                    LockedCommitFetchContext::ReleaseTag(name) => {
+                        GitRemoteReleaseFetchError::LockedCommitUnavailable {
+                            name: name.into(),
+                            commit: *commit_id,
+                        }
+                    }
+                    LockedCommitFetchContext::RepositoryPackage => {
+                        GitRemoteReleaseFetchError::RepositoryCommitUnavailable {
+                            commit: *commit_id,
+                        }
+                    }
                 }
             } else {
                 map_transport_error_for_fetch(error)
@@ -2295,6 +2390,76 @@ mod tests {
         fn url(&self) -> String {
             format!("file://{}", self.directory.path.display())
         }
+
+        fn commit_with_sibling_package(&self) -> gix::ObjectId {
+            let repository =
+                gix::open_opts(&self.directory.path, gix::open::Options::isolated()).unwrap();
+            let manifest_id = repository
+                .write_blob(b"package acme:sibling @ 1.4.0\n")
+                .unwrap()
+                .detach();
+            let source_id = repository
+                .write_blob(b"pub fn sibling() {}\n")
+                .unwrap()
+                .detach();
+            let mut package_entries = vec![
+                Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: b"main.sai".to_vec().into(),
+                    oid: source_id,
+                },
+                Entry {
+                    mode: EntryKind::Blob.into(),
+                    filename: b"sai.package".to_vec().into(),
+                    oid: manifest_id,
+                },
+            ];
+            package_entries.sort();
+            let package_tree = repository
+                .write_object(gix::objs::Tree {
+                    entries: package_entries,
+                })
+                .unwrap()
+                .detach();
+            let packages_tree = repository
+                .write_object(gix::objs::Tree {
+                    entries: vec![Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: b"sibling".to_vec().into(),
+                        oid: package_tree,
+                    }],
+                })
+                .unwrap()
+                .detach();
+            let root_tree = repository
+                .write_object(gix::objs::Tree {
+                    entries: vec![Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: b"packages".to_vec().into(),
+                        oid: packages_tree,
+                    }],
+                })
+                .unwrap()
+                .detach();
+            let commit_id = repository
+                .write_object(gix::objs::Commit {
+                    tree: root_tree,
+                    parents: vec![self.commit_id].into(),
+                    author: gix::actor::Signature::default(),
+                    committer: gix::actor::Signature::default(),
+                    encoding: None,
+                    message: "fixture sibling commit".into(),
+                    extra_headers: Vec::new(),
+                })
+                .unwrap()
+                .detach();
+            std::fs::write(
+                self.directory.path.join("refs/heads/main"),
+                format!("{commit_id}\n"),
+            )
+            .unwrap();
+            commit_id
+        }
     }
 
     fn init_bare_repository(path: &Path, object_hash: Option<gix::hash::Kind>) -> gix::Repository {
@@ -2952,6 +3117,87 @@ mod tests {
         assert!(fetched.tag_missing());
         assert_eq!(fetched.commit_id(), &remote.commit_id);
         assert_eq!(fetched.source_tree().checksum, checksum);
+    }
+
+    #[test]
+    fn fetches_git_sibling_source_tree_from_its_exact_repository_commit() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let commit_id = remote.commit_with_sibling_package();
+        std::fs::remove_file(remote.directory.path.join("refs/tags/v1.2.3")).unwrap();
+        let directory = RepositoryPackageDirectory::parse("packages/sibling").unwrap();
+        let scratch = TemporaryGitDirectory::create().unwrap();
+        let repository = init_bare_repository(&scratch.path, Some(commit_id.kind()));
+        let transfer_limit =
+            gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
+
+        let source = super::fetch_git_package_source_tree_at_commit_in_repository(
+            &repository,
+            &remote.url(),
+            &commit_id,
+            &directory,
+            &transfer_limit,
+        )
+        .unwrap();
+
+        let manifest = source
+            .files()
+            .iter()
+            .find(|file| file.path() == "sai.package")
+            .unwrap();
+        assert_eq!(manifest.content(), b"package acme:sibling @ 1.4.0\n");
+        assert!(source.source_tree().checksum.starts_with("sai1:"));
+    }
+
+    #[test]
+    fn rejects_local_file_urls_for_git_sibling_fetches() {
+        let commit_id =
+            gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let directory = RepositoryPackageDirectory::parse("packages/sibling").unwrap();
+
+        let error = super::fetch_git_package_source_tree_at_commit(
+            "file:///tmp/sai-test-repository",
+            &commit_id,
+            &directory,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, GitRemoteReleaseFetchError::InvalidGitUrl);
+        assert_eq!(
+            error.diagnostic_code(),
+            sai_diagnostics::Code::UnsupportedGitUrl
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_git_sibling_commit_without_tag_language() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let unavailable =
+            gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let directory = RepositoryPackageDirectory::parse("packages/sibling").unwrap();
+        let scratch = TemporaryGitDirectory::create().unwrap();
+        let repository = init_bare_repository(&scratch.path, Some(unavailable.kind()));
+        let transfer_limit =
+            gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
+
+        let error = super::fetch_git_package_source_tree_at_commit_in_repository(
+            &repository,
+            &remote.url(),
+            &unavailable,
+            &directory,
+            &transfer_limit,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            GitRemoteReleaseFetchError::RepositoryCommitUnavailable {
+                commit: unavailable
+            }
+        );
+        assert_eq!(
+            error.diagnostic_code(),
+            sai_diagnostics::Code::VersionNotFound
+        );
     }
 
     #[test]
