@@ -375,6 +375,19 @@ pub struct FetchedGitPackage {
     source: GitPackageSourceTree,
 }
 
+mod git_package_source_view_sealed {
+    pub trait Sealed {}
+}
+
+/// A fetched Git package source whose manifest is bound to its source identity.
+pub trait GitPackageSourceView: git_package_source_view_sealed::Sealed {
+    /// The immutable Git source identity that supplied this package.
+    fn git_source_identity(&self) -> &GitPackageSourceIdentity;
+
+    /// The parsed dependency-role package manifest from this source snapshot.
+    fn git_package_manifest(&self) -> &PackageParseOutput;
+}
+
 /// The complete immutable identity of a package directory in a Git commit.
 ///
 /// A Git-relative path pin shares the repository and commit while changing
@@ -488,6 +501,18 @@ impl FetchedGitPackage {
     }
 }
 
+impl GitPackageSourceView for FetchedGitPackage {
+    fn git_source_identity(&self) -> &GitPackageSourceIdentity {
+        self.source_identity()
+    }
+
+    fn git_package_manifest(&self) -> &PackageParseOutput {
+        self.source.package_manifest()
+    }
+}
+
+impl git_package_source_view_sealed::Sealed for FetchedGitPackage {}
+
 impl FetchedGitRelease {
     /// The canonical repository, exact commit, and package directory that
     /// supplied this release.
@@ -579,6 +604,18 @@ impl FetchedGitRelease {
         build_git_source_dependency_contract(&self.source, expected, context, validation_context)
     }
 }
+
+impl GitPackageSourceView for FetchedGitRelease {
+    fn git_source_identity(&self) -> &GitPackageSourceIdentity {
+        self.source_identity()
+    }
+
+    fn git_package_manifest(&self) -> &PackageParseOutput {
+        self.package_manifest()
+    }
+}
+
+impl git_package_source_view_sealed::Sealed for FetchedGitRelease {}
 
 fn build_git_source_dependency_contract(
     source: &GitPackageSourceTree,
@@ -2488,16 +2525,20 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use super::{
-        GitRemoteReleaseContractError, GitRemoteReleaseFetchError, GitRemoteTagListError,
-        TemporaryGitDirectory, credential_overrides_from_file, credential_overrides_from_path,
-        fetch_release_tree_in_repository, list_release_tags_in_repository, map_transport_error,
-        proxy_environment_overrides, release_tag_refspec, user_credential_config_paths,
+        FetchedGitPackage, GitRemoteReleaseContractError, GitRemoteReleaseFetchError,
+        GitRemoteTagListError, TemporaryGitDirectory, credential_overrides_from_file,
+        credential_overrides_from_path, fetch_release_tree_in_repository,
+        list_release_tags_in_repository, map_transport_error, proxy_environment_overrides,
+        release_tag_refspec, user_credential_config_paths,
+    };
+    use crate::git_path_requirements::{
+        GitPathRequirementDiscoveryError, discover_git_path_requirements,
     };
     use crate::git_source_index::{
         GitPackageSourceIdentityIndex, GitPackageSourceIdentityIndexError,
     };
     use crate::git_tags::{GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs};
-    use crate::git_tree::GitTreeReadError;
+    use crate::git_tree::{GitTreeReadError, GitTreeReader};
     use crate::manifest::{PackageRole, parse_for_role};
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
     use crate::package_cache::PackageCache;
@@ -2759,6 +2800,77 @@ mod tests {
             )
             .unwrap();
             commit_id
+        }
+
+        fn commit_with_client_and_sibling_packages(
+            &self,
+            client_manifest: &[u8],
+            sibling_manifest: &[u8],
+        ) -> gix::ObjectId {
+            let repository =
+                gix::open_opts(&self.directory.path, gix::open::Options::isolated()).unwrap();
+            let package_tree = |manifest: &[u8], source: &[u8]| {
+                let manifest_id = repository.write_blob(manifest).unwrap().detach();
+                let source_id = repository.write_blob(source).unwrap().detach();
+                let mut entries = vec![
+                    Entry {
+                        mode: EntryKind::Blob.into(),
+                        filename: b"main.sai".to_vec().into(),
+                        oid: source_id,
+                    },
+                    Entry {
+                        mode: EntryKind::Blob.into(),
+                        filename: b"sai.package".to_vec().into(),
+                        oid: manifest_id,
+                    },
+                ];
+                entries.sort();
+                repository
+                    .write_object(gix::objs::Tree { entries })
+                    .unwrap()
+                    .detach()
+            };
+            let client_tree = package_tree(client_manifest, b"pub fn client() {}\n");
+            let sibling_tree = package_tree(sibling_manifest, b"pub fn sibling() {}\n");
+            let packages_tree = repository
+                .write_object(gix::objs::Tree {
+                    entries: vec![
+                        Entry {
+                            mode: EntryKind::Tree.into(),
+                            filename: b"client".to_vec().into(),
+                            oid: client_tree,
+                        },
+                        Entry {
+                            mode: EntryKind::Tree.into(),
+                            filename: b"sibling".to_vec().into(),
+                            oid: sibling_tree,
+                        },
+                    ],
+                })
+                .unwrap()
+                .detach();
+            let root_tree = repository
+                .write_object(gix::objs::Tree {
+                    entries: vec![Entry {
+                        mode: EntryKind::Tree.into(),
+                        filename: b"packages".to_vec().into(),
+                        oid: packages_tree,
+                    }],
+                })
+                .unwrap()
+                .detach();
+            repository
+                .write_object(gix::objs::Commit {
+                    tree: root_tree,
+                    parents: vec![self.commit_id].into(),
+                    author: gix::actor::Signature::default(),
+                    committer: gix::actor::Signature::default(),
+                    encoding: None,
+                    message: "fixture client and sibling packages".into(),
+                    extra_headers: Vec::new(),
+                })
+                .unwrap()
+                .detach()
         }
     }
 
@@ -3143,6 +3255,24 @@ mod tests {
         .into_owned()
     }
 
+    fn path_discovery_root_context() -> ResolverContractContext<'static> {
+        let root = parse_for_role(
+            b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n\
+              overrides { acme:ignored use git \"https://example.test/acme/ignored.git\" }\n",
+            PackageRole::Root,
+        );
+        ResolverContractContext::from_root_manifest(
+            &root,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            PackageValidationContext::default(),
+        )
+        .expect("valid path-discovery root context")
+        .into_owned()
+    }
+
     fn expected_package_version(package: &str, version: &str) -> MvsPackageVersion {
         MvsPackageVersion::new(
             package,
@@ -3261,6 +3391,291 @@ mod tests {
         assert_eq!(dependency_pin.canonical_url(), TEST_CANONICAL_GIT_URL);
         assert_eq!(root_pin.commit_id(), &remote.commit_id);
         assert_eq!(dependency_pin.commit_id(), &remote.commit_id);
+    }
+
+    #[test]
+    fn discovers_only_active_git_path_requirements_and_indexes_a_nested_sibling_snapshot() {
+        let client_manifest = b"package acme:client @ 2.0.0\n\
+                               source \"main.sai\"\n\
+                               targets { wasm32-core }\n\
+                               requires {\n\
+                                 acme:sibling @ ^1 from path \"../sibling\"\n\
+                                 acme:inactive @ ^1 from path \"../inactive\" only { wasm32-wasi }\n\
+                                 acme:ignored @ ^1 from path \"../ignored\"\n\
+                               }\n\
+                               requires test { acme:test-tool @ ^1 from path \"../test-tool\" }\n";
+        let sibling_manifest = b"package acme:sibling @ 1.4.0\n\
+                                source \"main.sai\"\n\
+                                targets { wasm32-core }\n";
+        let remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.2.3",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(b"package acme:sample @ 1.2.3\nsource \"src\"\ntargets { wasm32-core }\n"),
+        );
+        let commit_id =
+            remote.commit_with_client_and_sibling_packages(client_manifest, sibling_manifest);
+        let requiring = expected_package_version("acme:client", "2.0.0");
+        let client_directory = RepositoryPackageDirectory::parse("packages/client").unwrap();
+        let requiring_identity = super::GitPackageSourceIdentity {
+            canonical_url: TEST_CANONICAL_GIT_URL.into(),
+            commit_id,
+            directory: client_directory.clone(),
+        };
+        let repository =
+            gix::open_opts(&remote.directory.path, gix::open::Options::isolated()).unwrap();
+        let reader = GitTreeReader::open(
+            repository.git_dir().join("objects"),
+            repository.object_hash(),
+        )
+        .unwrap();
+        let requiring_source = reader
+            .read_commit_repository_package_source_tree(&commit_id, &client_directory)
+            .unwrap();
+        let fetched = FetchedGitPackage {
+            source_identity: requiring_identity.clone(),
+            source: requiring_source,
+        };
+        let root_context = path_discovery_root_context();
+        let mut fetch_count = 0;
+
+        let index =
+            discover_git_path_requirements(&fetched, &requiring, &root_context, |identity| {
+                fetch_count += 1;
+                assert_eq!(
+                    identity,
+                    &requiring_identity
+                        .resolve_dependency_path("../sibling")
+                        .unwrap()
+                );
+                let source = reader
+                    .read_commit_repository_package_source_tree(
+                        identity.commit_id(),
+                        identity.directory(),
+                    )
+                    .unwrap();
+                Ok::<_, ()>(FetchedGitPackage {
+                    source_identity: identity.clone(),
+                    source,
+                })
+            })
+            .unwrap();
+
+        let path_key =
+            crate::resolver_contract::ResolverPathKey::new(requiring.clone(), "../sibling");
+        let sibling_version = expected_package_version("acme:sibling", "1.4.0");
+        assert_eq!(fetch_count, 1, "only the included sibling is fetched");
+        assert_eq!(
+            index.path_packages(),
+            &BTreeMap::from([(path_key.clone(), sibling_version.clone())])
+        );
+        assert_eq!(index.package_version(&path_key), Some(&sibling_version));
+        assert_eq!(
+            index
+                .package(&path_key)
+                .map(FetchedGitPackage::source_identity),
+            Some(
+                &requiring_identity
+                    .resolve_dependency_path("../sibling")
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn git_path_requirement_discovery_rejects_repository_escape_before_fetch() {
+        let remote = TestRemote::new_with_package_manifest(
+            "refs/tags/v1.2.3",
+            false,
+            gix::hash::Kind::Sha1,
+            Some(
+                b"package acme:sample @ 1.2.3\n\
+                  source \"src\"\n\
+                  targets { wasm32-core }\n\
+                  requires { acme:outside @ ^1 from path \"../../outside\" }\n",
+            ),
+        );
+        let fetched = fetch_fixture(&remote, Some(&remote.commit_id), None).unwrap();
+        let requiring = expected_package_version("acme:sample", "1.2.3");
+
+        let error = discover_git_path_requirements(
+            &fetched,
+            &requiring,
+            &path_discovery_root_context(),
+            |_| -> Result<FetchedGitPackage, ()> { panic!("escaping path must fail before fetch") },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            GitPathRequirementDiscoveryError::DependencyPath {
+                path: "../../outside".into(),
+                error: super::GitPackagePathError::PathEscapesRepository,
+            }
+        );
+    }
+
+    #[test]
+    fn git_path_requirement_discovery_checks_the_requiring_manifest_version() {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let fetched = fetch_fixture(&remote, Some(&remote.commit_id), None).unwrap();
+        let expected = expected_package_version("acme:sample", "1.2.4");
+
+        let error = discover_git_path_requirements(
+            &fetched,
+            &expected,
+            &path_discovery_root_context(),
+            |_| -> Result<FetchedGitPackage, ()> {
+                panic!("invalid requirer must fail before fetch")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            GitPathRequirementDiscoveryError::RequirerVersionMismatch {
+                expected: Box::new(expected),
+                found: Box::new(expected_package_version("acme:sample", "1.2.3")),
+            }
+        );
+    }
+
+    #[test]
+    fn git_path_requirement_discovery_preserves_sibling_manifest_diagnostics() {
+        let client_manifest = b"package acme:client @ 2.0.0\n\
+                               source \"main.sai\"\n\
+                               targets { wasm32-core }\n\
+                               requires { acme:sibling @ ^1 from path \"../sibling\" }\n";
+        let sibling_manifest = b"package acme:sibling @ 1.4.0\n\
+                                source \"main.sai\"\n\
+                                targets { wasm32-core }\n\
+                                requires {\n";
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let commit_id =
+            remote.commit_with_client_and_sibling_packages(client_manifest, sibling_manifest);
+        let requiring = expected_package_version("acme:client", "2.0.0");
+        let client_directory = RepositoryPackageDirectory::parse("packages/client").unwrap();
+        let requiring_identity = super::GitPackageSourceIdentity {
+            canonical_url: TEST_CANONICAL_GIT_URL.into(),
+            commit_id,
+            directory: client_directory.clone(),
+        };
+        let repository =
+            gix::open_opts(&remote.directory.path, gix::open::Options::isolated()).unwrap();
+        let reader = GitTreeReader::open(
+            repository.git_dir().join("objects"),
+            repository.object_hash(),
+        )
+        .unwrap();
+        let requiring_source = reader
+            .read_commit_repository_package_source_tree(&commit_id, &client_directory)
+            .unwrap();
+        let fetched = FetchedGitPackage {
+            source_identity: requiring_identity,
+            source: requiring_source,
+        };
+
+        let error = discover_git_path_requirements(
+            &fetched,
+            &requiring,
+            &path_discovery_root_context(),
+            |identity| {
+                let source = reader
+                    .read_commit_repository_package_source_tree(
+                        identity.commit_id(),
+                        identity.directory(),
+                    )
+                    .unwrap();
+                Ok::<_, ()>(FetchedGitPackage {
+                    source_identity: identity.clone(),
+                    source,
+                })
+            },
+        )
+        .unwrap_err();
+
+        let parsed = error
+            .manifest_parse_output()
+            .expect("sibling parse diagnostics are available on discovery errors");
+        assert!(!parsed.is_syntax_valid());
+        assert!(!parsed.errors().is_empty());
+        assert!(matches!(
+            error,
+            GitPathRequirementDiscoveryError::InvalidSiblingManifest { ref path, .. }
+                if path.as_ref() == "../sibling"
+        ));
+    }
+
+    #[test]
+    fn git_path_requirement_discovery_fetches_a_normalized_source_identity_once() {
+        let client_manifest = b"package acme:client @ 2.0.0\n\
+                               source \"main.sai\"\n\
+                               targets { wasm32-core }\n\
+                               requires {\n\
+                                 acme:sibling @ ^1 from path \"../sibling\"\n\
+                                 acme:other @ ^1 from path \"../alias/../sibling\"\n\
+                               }\n";
+        let sibling_manifest = b"package acme:sibling @ 1.4.0\n\
+                                source \"main.sai\"\n\
+                                targets { wasm32-core }\n";
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let commit_id =
+            remote.commit_with_client_and_sibling_packages(client_manifest, sibling_manifest);
+        let requiring = expected_package_version("acme:client", "2.0.0");
+        let client_directory = RepositoryPackageDirectory::parse("packages/client").unwrap();
+        let requiring_identity = super::GitPackageSourceIdentity {
+            canonical_url: TEST_CANONICAL_GIT_URL.into(),
+            commit_id,
+            directory: client_directory.clone(),
+        };
+        let repository =
+            gix::open_opts(&remote.directory.path, gix::open::Options::isolated()).unwrap();
+        let reader = GitTreeReader::open(
+            repository.git_dir().join("objects"),
+            repository.object_hash(),
+        )
+        .unwrap();
+        let requiring_source = reader
+            .read_commit_repository_package_source_tree(&commit_id, &client_directory)
+            .unwrap();
+        let fetched = FetchedGitPackage {
+            source_identity: requiring_identity,
+            source: requiring_source,
+        };
+        let mut fetch_count = 0;
+
+        let error = discover_git_path_requirements(
+            &fetched,
+            &requiring,
+            &path_discovery_root_context(),
+            |identity| {
+                fetch_count += 1;
+                let source = reader
+                    .read_commit_repository_package_source_tree(
+                        identity.commit_id(),
+                        identity.directory(),
+                    )
+                    .unwrap();
+                Ok::<_, ()>(FetchedGitPackage {
+                    source_identity: identity.clone(),
+                    source,
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            fetch_count, 1,
+            "normalized source identities are fetched once"
+        );
+        assert_eq!(
+            error,
+            GitPathRequirementDiscoveryError::SiblingIdentityMismatch {
+                path: "../alias/../sibling".into(),
+                expected: "acme:other".into(),
+                found: "acme:sibling".into(),
+            }
+        );
     }
 
     #[test]
