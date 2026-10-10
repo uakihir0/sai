@@ -1447,12 +1447,11 @@ fn fetch_release_tree_in_repository(
         });
     }
 
-    let package_directory = match directory.map(RepositoryPackageDirectory::as_str) {
-        None | Some(".") => &[][..],
-        Some(directory) => directory.as_bytes(),
-    };
+    let repository_root = RepositoryPackageDirectory::parse(".")
+        .map_err(|_| GitRemoteReleaseFetchError::InvalidPackageDirectory)?;
+    let package_directory = directory.unwrap_or(&repository_root);
     let package_source_tree = reader
-        .read_commit_package_source_tree(&commit_id, package_directory)
+        .read_commit_repository_package_source_tree(&commit_id, package_directory)
         .map_err(GitRemoteReleaseFetchError::SourceTree)?;
     if let Some(expected_source_checksum) = expected_source_checksum
         && package_source_tree.source_tree().checksum != expected_source_checksum

@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::manifest::{
     MAX_PACKAGE_MANIFEST_BYTES, PackageDeclaration, PackageParseOutput, PackageRole, parse_for_role,
 };
+use crate::package_path::RepositoryPackageDirectory;
 use crate::tree_hash::{
     GitTreeDigestEntry, TreeHash, TreeHashError, TreeHashPurpose, artifact_checksum,
     hash_git_tree_digests, should_skip_path, validate_tree_path,
@@ -514,6 +515,25 @@ impl GitTreeReader {
             package_manifest,
             files,
         })
+    }
+
+    /// Read and validate one package at a normalized repository-relative
+    /// directory in a commit.
+    ///
+    /// The repository root is represented by `.`. Keeping the path typed
+    /// ensures callers cannot pass an absolute, unnormalized, or escaping
+    /// package directory to the Git tree reader.
+    pub fn read_commit_repository_package_source_tree(
+        &self,
+        commit_id: &gix::ObjectId,
+        package_directory: &RepositoryPackageDirectory,
+    ) -> Result<GitPackageSourceTree, GitTreeReadError> {
+        let package_directory = if package_directory.as_str() == "." {
+            &[][..]
+        } else {
+            package_directory.as_str().as_bytes()
+        };
+        self.read_commit_package_source_tree(commit_id, package_directory)
     }
 
     fn hash_commit_tree_internal(
@@ -1037,6 +1057,7 @@ mod tests {
         MAX_PACKAGE_FILE_COUNT, MAX_PACKAGE_MANIFEST_BYTES, MAX_PACKAGE_TREE_ENTRIES,
         MAX_PACKAGE_TREE_PATH_BYTES, MAX_TAG_CHAIN_DEPTH, collect_artifact_checksums_with,
     };
+    use crate::package_path::RepositoryPackageDirectory;
     use crate::tree_hash::{
         GitTreeEntry, TreeHashError, TreeHashPurpose, artifact_checksum, hash_git_tree,
     };
@@ -1236,18 +1257,42 @@ mod tests {
         let git_metadata = write_blob(repository, b"unselected\n");
         let link_target = write_blob(repository, b"../../outside\n");
         let submodule_id = write_blob(repository, b"placeholder oid\n");
+        let state_manifest = write_blob(repository, b"package acme:state @ 1.1.0\n");
+        let state_source = write_blob(repository, b"pub fn state() {}\n");
+        let output_manifest = write_blob(repository, b"package acme:output @ 2.0.0\n");
+        let output_source = write_blob(repository, b"pub fn output() {}\n");
 
         let source_tree = write_tree(
             repository,
             [(b"main.sai".as_slice(), EntryKind::Blob, source)],
         );
+        let state_package = write_tree(
+            repository,
+            [
+                (b"sai.package".as_slice(), EntryKind::Blob, state_manifest),
+                (b"main.sai".as_slice(), EntryKind::Blob, state_source),
+            ],
+        );
         let sai_tree = write_tree(
             repository,
-            [(b"state.json".as_slice(), EntryKind::Blob, state)],
+            [
+                (b"state.json".as_slice(), EntryKind::Blob, state),
+                (b"state-package".as_slice(), EntryKind::Tree, state_package),
+            ],
+        );
+        let output_package = write_tree(
+            repository,
+            [
+                (b"sai.package".as_slice(), EntryKind::Blob, output_manifest),
+                (b"main.sai".as_slice(), EntryKind::Blob, output_source),
+            ],
         );
         let output_tree = write_tree(
             repository,
-            [(b"build.wasm".as_slice(), EntryKind::Blob, output)],
+            [
+                (b"build.wasm".as_slice(), EntryKind::Blob, output),
+                (b"sibling".as_slice(), EntryKind::Tree, output_package),
+            ],
         );
         let git_tree = write_tree(
             repository,
@@ -1370,6 +1415,49 @@ mod tests {
                 .hash_commit_tree(&commit, b"packages/acme", TreeHashPurpose::Source)
                 .unwrap()
                 .checksum
+        );
+    }
+
+    #[test]
+    fn reads_normalized_repository_package_directories_in_reserved_paths() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+        let reader = standard_reader(&repository);
+
+        for (directory, manifest) in [
+            (
+                "packages/acme/.sai/state-package",
+                b"package acme:state @ 1.1.0\n".as_slice(),
+            ),
+            (
+                "packages/acme/out/sibling",
+                b"package acme:output @ 2.0.0\n".as_slice(),
+            ),
+        ] {
+            let directory = RepositoryPackageDirectory::parse(directory)
+                .expect("normalized repository package directory");
+            let source = reader
+                .read_commit_repository_package_source_tree(&commit, &directory)
+                .expect("read sibling package at its repository path");
+            let manifest_file = source
+                .files()
+                .iter()
+                .find(|file| file.path() == "sai.package")
+                .expect("package manifest file");
+            assert_eq!(manifest_file.content(), manifest);
+        }
+    }
+
+    #[test]
+    fn reads_the_repository_root_from_the_typed_dot_directory() {
+        let repository = BareTestRepository::new();
+        let (_, commit) = full_test_tree(&repository.repository);
+        let directory = RepositoryPackageDirectory::parse(".").expect("normalized repository root");
+
+        assert_eq!(
+            standard_reader(&repository)
+                .read_commit_repository_package_source_tree(&commit, &directory),
+            Err(GitTreeReadError::MissingPackageManifest)
         );
     }
 
