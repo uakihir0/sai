@@ -186,6 +186,20 @@ impl<K> ResolverSourceIdentitySnapshot<K> {
         &self.root_package
     }
 
+    /// Return the identity captured for the exact root or dependency requirer.
+    ///
+    /// Root and dependency entries remain distinct when they carry the same
+    /// package version.
+    pub fn get(&self, requirer: &MvsRequirer) -> Option<&K> {
+        match requirer {
+            MvsRequirer::Root(package_version) if package_version == &self.root_package => {
+                self.root_identity.as_ref()
+            }
+            MvsRequirer::Root(_) => None,
+            MvsRequirer::Package(package_version) => self.package_identities.get(package_version),
+        }
+    }
+
     pub const fn root_identity(&self) -> Option<&K> {
         self.root_identity.as_ref()
     }
@@ -1433,7 +1447,10 @@ fn source_base_dependency<K, E>(
                     },
                 ));
             }
-            if identities.root_identity().is_none() {
+            if identities
+                .get(&MvsRequirer::Root(relative_to.clone()))
+                .is_none()
+            {
                 return Err(source_base_identity_failure(
                     ResolverSourceBaseIdentityError::MissingRoot(relative_to),
                 ));
@@ -1457,7 +1474,10 @@ fn source_base_dependency<K, E>(
                         ResolverSourceBaseIdentityError::SelectedUnavailable(relative_to),
                     ))
                 }
-            } else if identities.package_identities.contains_key(&relative_to) {
+            } else if identities
+                .get(&MvsRequirer::Package(relative_to.clone()))
+                .is_some()
+            {
                 Ok(None)
             } else {
                 Err(source_base_identity_failure(
@@ -2345,6 +2365,27 @@ mod tests {
     fn package_version(package: &str, version: &str) -> MvsPackageVersion {
         MvsPackageVersion::new(package, Version::parse(version).expect("valid version"))
             .expect("valid package version")
+    }
+
+    #[test]
+    fn source_identity_snapshot_distinguishes_root_and_package_with_the_same_version() {
+        let requiring = package_version("acme:root", "1.0.0");
+        let other_root = package_version("acme:other", "1.0.0");
+        let snapshot = ResolverSourceIdentitySnapshot {
+            root_package: requiring.clone(),
+            root_identity: Some("root-tree"),
+            package_identities: BTreeMap::from([(requiring.clone(), "dependency-tree")]),
+        };
+
+        assert_eq!(
+            snapshot.get(&MvsRequirer::Root(requiring.clone())),
+            Some(&"root-tree")
+        );
+        assert_eq!(
+            snapshot.get(&MvsRequirer::Package(requiring)),
+            Some(&"dependency-tree")
+        );
+        assert_eq!(snapshot.get(&MvsRequirer::Root(other_root)), None);
     }
 
     fn identified_output_from_map<K: Clone>(
