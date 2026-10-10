@@ -30,6 +30,7 @@ const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_CACHE_RECORD_BYTES: u64 = 16 * 1024;
 const TAG_RECORD_MAGIC: &[u8] = b"SAI-CACHE-TAG-v1\0";
 const SOURCE_RECORD_MAGIC: &[u8] = b"SAI-CACHE-SOURCE-v1\0";
+const PACKAGE_CHECKSUM_RECORD_MAGIC: &[u8] = b"SAI-CACHE-PACKAGE-CHECKSUMS-v1\0";
 const RECORD_DIGEST_BYTES: usize = 32;
 #[cfg(windows)]
 const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
@@ -61,6 +62,10 @@ pub enum PackageCacheError {
     InvalidPackageDirectory,
     /// A cache record was malformed, mismatched, or too large.
     CorruptRecord(PathBuf),
+    /// A package checksum record would exceed the cache record limit.
+    PackageChecksumRecordTooLarge,
+    /// A package checksum set is malformed or contains duplicate targets.
+    InvalidPackageChecksums,
     /// A commit and package directory already have a different recorded checksum.
     ConflictingGitSourceRecord(Box<str>),
     /// A supposedly verified source file had an unsafe relative path.
@@ -100,6 +105,12 @@ impl fmt::Display for PackageCacheError {
                     "package cache record is corrupt at `{}`",
                     path.display()
                 )
+            }
+            Self::PackageChecksumRecordTooLarge => {
+                formatter.write_str("package checksum record exceeds the cache record limit")
+            }
+            Self::InvalidPackageChecksums => {
+                formatter.write_str("invalid or duplicate package checksums")
             }
             Self::ConflictingGitSourceRecord(checksum) => write!(
                 formatter,
@@ -338,15 +349,150 @@ impl PackageCache {
         Ok(Some(checksum.to_owned()))
     }
 
+    /// Read the checksum set computed from one exact Git package snapshot.
+    ///
+    /// The repository, commit, and package directory are part of the record
+    /// key. This matters when `wit` is `"."`: its checksum can differ across
+    /// commits whose source checksums are equal because `.sai` and `out` are
+    /// excluded only from the source checksum.
+    pub(crate) fn cached_package_checksums(
+        &self,
+        canonical_url: &str,
+        commit: &str,
+        directory: Option<&str>,
+    ) -> Result<Option<CachedPackageChecksums>, PackageCacheError> {
+        validate_canonical_git_url(canonical_url)?;
+        validate_git_commit(commit)?;
+        let directory = canonical_package_directory(directory)?;
+        let key = package_checksum_record_key(canonical_url, commit, directory);
+        let target = self
+            .tag_directory
+            .join(format!("package-checksums-{key}.record"));
+        let Some(record) = read_latest_cache_record(&target, PACKAGE_CHECKSUM_RECORD_MAGIC, 6)?
+        else {
+            return Ok(None);
+        };
+        let decoded = decode_cache_record(PACKAGE_CHECKSUM_RECORD_MAGIC, &record.bytes, 6)
+            .map(|(_, fields)| fields)
+            .ok_or_else(|| PackageCacheError::CorruptRecord(target.clone()))?;
+        if decoded[0] != canonical_url.as_bytes()
+            || decoded[1] != commit.as_bytes()
+            || decoded[2] != directory.as_bytes()
+        {
+            return Err(PackageCacheError::CorruptRecord(target));
+        }
+        let source_checksum = std::str::from_utf8(decoded[3])
+            .map_err(|_| PackageCacheError::CorruptRecord(target.clone()))?;
+        source_digest(source_checksum)
+            .map_err(|_| PackageCacheError::CorruptRecord(target.clone()))?;
+        let wit_checksum = if decoded[4].is_empty() {
+            None
+        } else {
+            let checksum = std::str::from_utf8(decoded[4])
+                .map_err(|_| PackageCacheError::CorruptRecord(target.clone()))?;
+            source_digest(checksum)
+                .map_err(|_| PackageCacheError::CorruptRecord(target.clone()))?;
+            Some(checksum.into())
+        };
+        let artifact_checksums = decode_artifact_checksum_list(decoded[5])
+            .ok_or_else(|| PackageCacheError::CorruptRecord(target.clone()))?;
+        Ok(Some(CachedPackageChecksums {
+            source_checksum: source_checksum.into(),
+            wit_checksum,
+            artifact_checksums,
+        }))
+    }
+
+    pub(crate) fn record_verified_package_checksums(
+        &self,
+        canonical_url: &str,
+        commit: &str,
+        directory: Option<&str>,
+        source: &GitPackageSourceTree,
+    ) -> Result<(), PackageCacheError> {
+        let artifacts = source
+            .artifact_checksums()
+            .iter()
+            .map(|artifact| (artifact.target(), artifact.checksum()))
+            .collect::<Vec<_>>();
+        let metadata = PackageChecksumMetadata::new(
+            canonical_url,
+            commit,
+            directory,
+            &source.source_tree().checksum,
+            source.wit_tree().map(|tree| tree.checksum.as_str()),
+            &artifacts,
+        )?;
+        let key = package_checksum_record_key(
+            &metadata.canonical_url,
+            &metadata.commit,
+            &metadata.directory,
+        );
+        let target = self
+            .tag_directory
+            .join(format!("package-checksums-{key}.record"));
+        let fields = metadata.record_fields();
+        let encoded = encode_cache_record(PACKAGE_CHECKSUM_RECORD_MAGIC, 1, &fields);
+        if encoded.len() as u64 > MAX_CACHE_RECORD_BYTES {
+            return Err(PackageCacheError::PackageChecksumRecordTooLarge);
+        }
+        self.replace_cache_record_recovering_corruption(
+            &target,
+            PACKAGE_CHECKSUM_RECORD_MAGIC,
+            &fields,
+        )
+    }
+
     fn replace_cache_record(
         &self,
         target: &Path,
         magic: &[u8],
         fields: &[&[u8]],
     ) -> Result<(), PackageCacheError> {
+        self.replace_cache_record_inner(target, magic, fields, false, false)
+    }
+
+    fn replace_cache_record_recovering_corruption(
+        &self,
+        target: &Path,
+        magic: &[u8],
+        fields: &[&[u8]],
+    ) -> Result<(), PackageCacheError> {
+        self.replace_cache_record_inner(target, magic, fields, true, true)
+    }
+
+    fn replace_cache_record_inner(
+        &self,
+        target: &Path,
+        magic: &[u8],
+        fields: &[&[u8]],
+        repair_corruption: bool,
+        reject_updates: bool,
+    ) -> Result<(), PackageCacheError> {
         self.cleanup_stale_temporary_directories();
         let _lock = CachePublicationLock::acquire(&self.lock_path)?;
-        let existing = read_latest_cache_record(target, magic, fields.len())?;
+        let existing = match read_latest_cache_record(target, magic, fields.len()) {
+            Ok(existing) => existing,
+            Err(PackageCacheError::CorruptRecord(_)) if repair_corruption => {
+                for slot in 0..2 {
+                    let path = cache_record_slot_path(target, slot);
+                    if path_exists_without_following(&path)?
+                        && !remove_file_at_path(&path, &self.root)
+                    {
+                        return Err(PackageCacheError::Io {
+                            operation: "remove corrupt package checksum record",
+                            path,
+                            source: io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "corrupt cache record could not be removed through its verified parent",
+                            ),
+                        });
+                    }
+                }
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let next_generation = if let Some(existing) = &existing {
             let (_, old_fields) = decode_cache_record(magic, &existing.bytes, fields.len())
                 .ok_or_else(|| PackageCacheError::CorruptRecord(target.to_path_buf()))?;
@@ -356,6 +502,9 @@ impl PackageCache {
             }
             if old_fields == fields {
                 return Ok(());
+            }
+            if reject_updates {
+                return Err(PackageCacheError::CorruptRecord(target.to_path_buf()));
             }
             if magic == SOURCE_RECORD_MAGIC {
                 let new_checksum = std::str::from_utf8(fields[3])
@@ -674,6 +823,148 @@ impl PackageCache {
             release_staging_activity_lock(&path, activity_lock, orphaned, &self.root);
         }
     }
+}
+
+struct PackageChecksumMetadata {
+    canonical_url: Box<str>,
+    commit: Box<str>,
+    directory: Box<str>,
+    source_checksum: Box<str>,
+    wit_checksum: Option<Box<str>>,
+    encoded_artifacts: Vec<u8>,
+}
+
+pub(crate) struct CachedPackageChecksums {
+    pub(crate) source_checksum: Box<str>,
+    pub(crate) wit_checksum: Option<Box<str>>,
+    pub(crate) artifact_checksums: Vec<(Box<str>, Box<str>)>,
+}
+
+impl PackageChecksumMetadata {
+    fn new(
+        canonical_url: &str,
+        commit: &str,
+        directory: Option<&str>,
+        source_checksum: &str,
+        wit_checksum: Option<&str>,
+        artifact_checksums: &[(&str, &str)],
+    ) -> Result<Self, PackageCacheError> {
+        validate_canonical_git_url(canonical_url)?;
+        validate_git_commit(commit)?;
+        let directory = canonical_package_directory(directory)?;
+        source_digest(source_checksum)?;
+        if let Some(checksum) = wit_checksum {
+            source_digest(checksum)?;
+        }
+
+        let mut artifacts = artifact_checksums
+            .iter()
+            .map(|(target, checksum)| ((*target).into(), (*checksum).into()))
+            .collect::<Vec<(Box<str>, Box<str>)>>();
+        artifacts.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        for (index, (target, checksum)) in artifacts.iter().enumerate() {
+            if !crate::validation::is_component_target(target)
+                || source_digest(checksum).is_err()
+                || (index > 0 && artifacts[index - 1].0 == *target)
+            {
+                return Err(PackageCacheError::InvalidPackageChecksums);
+            }
+        }
+        Ok(Self {
+            canonical_url: canonical_url.into(),
+            commit: commit.into(),
+            directory: directory.into(),
+            source_checksum: source_checksum.into(),
+            wit_checksum: wit_checksum.map(Into::into),
+            encoded_artifacts: encode_artifact_checksum_list(&artifacts)?,
+        })
+    }
+
+    fn record_fields(&self) -> Vec<&[u8]> {
+        let wit_checksum = self.wit_checksum.as_deref().unwrap_or("");
+        vec![
+            self.canonical_url.as_bytes(),
+            self.commit.as_bytes(),
+            self.directory.as_bytes(),
+            self.source_checksum.as_bytes(),
+            wit_checksum.as_bytes(),
+            self.encoded_artifacts.as_slice(),
+        ]
+    }
+}
+
+fn package_checksum_record_key(canonical_url: &str, commit: &str, directory: &str) -> String {
+    cache_record_key(
+        b"package-checksums",
+        &[
+            canonical_url.as_bytes(),
+            commit.as_bytes(),
+            directory.as_bytes(),
+        ],
+    )
+}
+
+fn encode_artifact_checksum_list(
+    artifacts: &[(Box<str>, Box<str>)],
+) -> Result<Vec<u8>, PackageCacheError> {
+    let count = u32::try_from(artifacts.len())
+        .map_err(|_| PackageCacheError::PackageChecksumRecordTooLarge)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for (target, checksum) in artifacts {
+        let target_length =
+            u32::try_from(target.len()).map_err(|_| PackageCacheError::InvalidPackageChecksums)?;
+        let checksum_length = u32::try_from(checksum.len())
+            .map_err(|_| PackageCacheError::InvalidPackageChecksums)?;
+        encoded.extend_from_slice(&target_length.to_be_bytes());
+        encoded.extend_from_slice(target.as_bytes());
+        encoded.extend_from_slice(&checksum_length.to_be_bytes());
+        encoded.extend_from_slice(checksum.as_bytes());
+        if encoded.len() as u64 > MAX_CACHE_RECORD_BYTES {
+            return Err(PackageCacheError::PackageChecksumRecordTooLarge);
+        }
+    }
+    Ok(encoded)
+}
+
+fn decode_artifact_checksum_list(encoded: &[u8]) -> Option<Vec<(Box<str>, Box<str>)>> {
+    let count = u32::from_be_bytes(encoded.get(..4)?.try_into().ok()?) as usize;
+    if count > encoded.len().saturating_sub(4) / 8 {
+        return None;
+    }
+
+    let mut offset = 4usize;
+    let mut artifacts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let target_length_end = offset.checked_add(4)?;
+        let target_length =
+            u32::from_be_bytes(encoded.get(offset..target_length_end)?.try_into().ok()?) as usize;
+        offset = target_length_end;
+        let target_end = offset.checked_add(target_length)?;
+        let target = std::str::from_utf8(encoded.get(offset..target_end)?).ok()?;
+        offset = target_end;
+
+        let checksum_length_end = offset.checked_add(4)?;
+        let checksum_length =
+            u32::from_be_bytes(encoded.get(offset..checksum_length_end)?.try_into().ok()?) as usize;
+        offset = checksum_length_end;
+        let checksum_end = offset.checked_add(checksum_length)?;
+        let checksum = std::str::from_utf8(encoded.get(offset..checksum_end)?).ok()?;
+        offset = checksum_end;
+
+        if !crate::validation::is_component_target(target)
+            || source_digest(checksum).is_err()
+            || artifacts
+                .last()
+                .is_some_and(|(previous, _): &(Box<str>, Box<str>)| {
+                    previous.as_bytes() >= target.as_bytes()
+                })
+        {
+            return None;
+        }
+        artifacts.push((target.into(), checksum.into()));
+    }
+    (offset == encoded.len()).then_some(artifacts)
 }
 
 /// Result of installing or finding a content-addressed source tree.
@@ -3990,6 +4281,53 @@ mod tests {
                 0o555
             );
         }
+    }
+
+    #[test]
+    fn verified_package_checksums_are_bound_to_url_commit_and_directory() {
+        let temp = TestDirectory::new("package-checksum-record");
+        let cache_root = temp.path().join("cache");
+        let cache = PackageCache::open(&cache_root).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let url = "https://example.com/acme/repo";
+        let commit = "a".repeat(40);
+
+        cache
+            .record_verified_package_checksums(url, &commit, None, &source)
+            .unwrap();
+
+        cache.materialize_source(source).unwrap();
+
+        let metadata = cache
+            .cached_package_checksums(url, &commit, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.source_checksum.as_ref(), checksum.as_str());
+        assert_eq!(metadata.wit_checksum, None);
+        assert!(metadata.artifact_checksums.is_empty());
+        assert!(
+            cache
+                .cached_package_checksums(url, &"b".repeat(40), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .cached_package_checksums(url, &commit, Some("packages/sample"))
+                .unwrap()
+                .is_none()
+        );
+        let reopened = PackageCache::open(&cache_root).unwrap();
+        assert_eq!(
+            reopened
+                .cached_package_checksums(url, &commit, None)
+                .unwrap()
+                .unwrap()
+                .source_checksum
+                .as_ref(),
+            checksum.as_str()
+        );
     }
 
     #[test]
