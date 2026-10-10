@@ -7,6 +7,7 @@ use crate::manifest::{
     OverrideSource, PackageDeclaration, PackageParseError, PackageRole, RequirementSource,
     parse_for_role,
 };
+use crate::mixed_source::MixedSourceFinalIdentityError;
 use crate::mvs::{
     MvsPackageVersion, MvsRequirer, MvsSelectionError, MvsSelectionErrorKind, MvsSelectionOutput,
 };
@@ -23,7 +24,8 @@ use crate::resolver_source::{
     ResolverPackageSource, ResolverSourceProvenance, ResolverSourceReason, ResolverSourceSelection,
 };
 use crate::resolver_source_provider::{
-    ResolverFinalContractAudit, ResolverReloadedContractComparison,
+    ResolverFinalContractAudit, ResolverReloadedContractComparison, ResolverSourceIdentityFailure,
+    ResolverSourceIdentityFailureKind, ResolverSourceIdentitySide,
 };
 use crate::validation::resolve_package_lint_settings_from_parsed;
 use crate::version_req::VersionReq;
@@ -757,6 +759,117 @@ where
         })
         .map(|comparison| divergent_sources_diagnostic(comparison, manifests))
         .collect()
+}
+
+/// Builds source-located diagnostics for reportable final-source identity
+/// failures. Internal provenance mismatches remain on the audit plan for the
+/// package workflow to handle as compiler errors.
+pub fn mixed_source_identity_failure_diagnostics(
+    selection: &MvsSelectionOutput,
+    failures: &[ResolverSourceIdentityFailure<MixedSourceFinalIdentityError>],
+    manifests: &MvsManifestLocations,
+) -> Result<Vec<Diagnostic>, MvsDuplicatePackageLineDiagnosticError> {
+    let mut reportable_failures = failures
+        .iter()
+        .filter_map(|failure| {
+            if failure.side != ResolverSourceIdentitySide::Final {
+                return None;
+            }
+            let ResolverSourceIdentityFailureKind::Canonicalization(error) = &failure.error else {
+                return None;
+            };
+            Some((
+                failure,
+                error.diagnostic_code()?,
+                error.diagnostic_message()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    reportable_failures
+        .sort_by(|(left, ..), (right, ..)| left.package_version.cmp(&right.package_version));
+    if reportable_failures.is_empty() {
+        return Ok(Vec::new());
+    }
+    let explanations = if selection.is_complete() {
+        MvsExplanationGraph::new(selection)
+    } else {
+        MvsExplanationGraph::new_for_root_cycle_errors(selection)
+    }
+    .map_err(|error| MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error)))?;
+    validate_root_manifest(&explanations, manifests)?;
+
+    let mut diagnostics = Vec::new();
+    for (failure, code, detail) in reportable_failures {
+        let chain = explanations
+            .chain_to_package_version(&failure.package_version)
+            .map_err(|error| {
+                MvsDuplicatePackageLineDiagnosticError::InvalidExplanation(Box::new(error))
+            })?;
+        let source_location = failure
+            .source
+            .as_ref()
+            .map(|source| resolver_source_selection_location(source, manifests))
+            .transpose()?
+            .flatten();
+        let chain_location = chain
+            .links
+            .last()
+            .map(|link| {
+                chain_link_location(
+                    manifests,
+                    &link.requirer,
+                    &link.named_target,
+                    &link.requirement,
+                    &link.span,
+                )
+            })
+            .transpose()?;
+        let package_version = &failure.package_version;
+        let mut diagnostic = Diagnostic::new(
+            code,
+            Severity::Error,
+            format!(
+                "could not resolve the final source for {}@{}: {detail}",
+                package_version.package(),
+                package_version.version()
+            ),
+            source_location.or(chain_location),
+        );
+        diagnostic.primary_label = "this selected source could not be resolved".to_owned();
+
+        let mut data = ValueObject::new();
+        data.insert(
+            "package".to_owned(),
+            Value::String(package_version.package().to_owned()),
+        );
+        data.insert(
+            "version".to_owned(),
+            Value::String(package_version.version().to_string()),
+        );
+        data.insert("side".to_owned(), Value::String("final_source".to_owned()));
+        data.insert("failure".to_owned(), Value::String(detail));
+        if let Some(source) = &failure.source {
+            data.insert(
+                "source".to_owned(),
+                Value::String(resolver_package_source_display(source.source())),
+            );
+        }
+        data.insert(
+            "requirement_chain".to_owned(),
+            requirement_chain_data(&chain, manifests)?,
+        );
+        diagnostic.data = data;
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: "the final source is reached through:".to_owned(),
+                location: None,
+            })
+            .expect("a new diagnostic has no snapshot-bound locations");
+        add_requirement_chain_children(&mut diagnostic, &chain, manifests)?;
+        diagnostics.push(diagnostic);
+    }
+    Ok(diagnostics)
 }
 
 /// Builds the hard `DEPENDENCY_CYCLE` diagnostic for one selected-graph cycle.
@@ -2516,8 +2629,8 @@ mod tests {
         MvsDuplicatePackageLineDiagnosticContext, MvsDuplicatePackageLineDiagnosticError,
         MvsManifestLocation, MvsManifestLocations, divergent_sources_diagnostic,
         duplicate_package_line_diagnostic, duplicate_package_line_diagnostics,
-        resolver_source_selection_location, version_conflict_diagnostic,
-        version_conflict_diagnostics,
+        mixed_source_identity_failure_diagnostics, resolver_source_selection_location,
+        version_conflict_diagnostic, version_conflict_diagnostics,
     };
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{
@@ -2535,7 +2648,8 @@ mod tests {
     use crate::resolver_source::select_resolver_source;
     use crate::resolver_source_provider::{
         ResolverFinalContractPathResolutionError, ResolverReloadedContractComparison,
-        ResolverSourceReload,
+        ResolverSourceIdentityFailure, ResolverSourceIdentityFailureKind,
+        ResolverSourceIdentitySide, ResolverSourceReload,
     };
     use crate::validation::{PackageValidationContext, validate};
     use crate::version::Version;
@@ -4789,6 +4903,94 @@ requires { acme:dep @ ^1 from git "https://example.test/read" }
             origin.get("version"),
             Some(&Value::String("1.5.0".to_owned()))
         );
+    }
+
+    #[test]
+    fn final_identity_failure_keeps_its_chain_beside_a_root_cycle() {
+        let (root_source, root_spans) =
+            manifest_source("acme:app", "1.0.0", &[("acme:a", "^1"), ("acme:c", "^1")]);
+        let (a_source, a_spans) = manifest_source("acme:a", "1.0.0", &[("acme:b", "^1")]);
+        let (b_source, b_spans) = manifest_source("acme:b", "1.0.0", &[("acme:app", "^1")]);
+        let (c_source, _) = manifest_source("acme:c", "1.0.0", &[]);
+        let root = MvsContract::new(
+            package_version("acme:app", "1.0.0"),
+            vec![
+                edge_with_span("acme:a", "^1", "1.0.0", root_spans[0].clone()),
+                edge_with_span("acme:c", "^1", "1.0.0", root_spans[1].clone()),
+            ],
+        )
+        .expect("valid root contract");
+        let a = MvsContract::new(
+            package_version("acme:a", "1.0.0"),
+            vec![edge_with_span("acme:b", "^1", "1.0.0", a_spans[0].clone())],
+        )
+        .expect("valid dependency contract");
+        let b = MvsContract::new(
+            package_version("acme:b", "1.0.0"),
+            vec![edge_with_span(
+                "acme:app",
+                "^1",
+                "1.0.0",
+                b_spans[0].clone(),
+            )],
+        )
+        .expect("valid dependency contract");
+        let c = MvsContract::new(package_version("acme:c", "1.0.0"), vec![])
+            .expect("valid independent dependency contract");
+        let contracts = HashMap::from([
+            (a.package_version().clone(), a),
+            (b.package_version().clone(), b),
+            (c.package_version().clone(), c),
+        ]);
+        let selection =
+            select(&root, &contracts, &HashMap::new(), &HashMap::new()).expect("MVS selection");
+        assert!(!selection.is_complete());
+        let manifests = manifests_for(
+            (package_version("acme:app", "1.0.0"), root_source),
+            vec![
+                (package_version("acme:a", "1.0.0"), a_source),
+                (package_version("acme:b", "1.0.0"), b_source),
+                (package_version("acme:c", "1.0.0"), c_source),
+            ],
+        );
+        let failure = ResolverSourceIdentityFailure {
+            package_version: package_version("acme:c", "1.0.0"),
+            side: ResolverSourceIdentitySide::Final,
+            source: None,
+            error: ResolverSourceIdentityFailureKind::Canonicalization(Box::new(
+                crate::mixed_source::MixedSourceFinalIdentityError::LocalPath(
+                    crate::local_source::LocalPackageError::MissingManifest,
+                ),
+            )),
+        };
+
+        let diagnostics =
+            mixed_source_identity_failure_diagnostics(&selection, &[failure], &manifests)
+                .expect("root cycle does not suppress an independent identity failure");
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one identity diagnostic");
+        };
+
+        assert_eq!(diagnostic.code.as_str(), "PATH_PACKAGE_NOT_FOUND");
+        assert_eq!(
+            diagnostic
+                .primary()
+                .expect("requirement edge location")
+                .file
+                .path,
+            "sai.package"
+        );
+        let Value::Object(chain) = diagnostic
+            .data
+            .get("requirement_chain")
+            .expect("identity requirement chain")
+        else {
+            panic!("requirement chain must be an object");
+        };
+        let Value::Array(steps) = chain.get("steps").expect("requirement steps") else {
+            panic!("requirement steps must be an array");
+        };
+        assert_eq!(steps.len(), 1);
     }
 
     #[test]

@@ -474,6 +474,70 @@ pub enum MixedSourceFinalIdentityError {
     },
 }
 
+impl MixedSourceFinalIdentityError {
+    /// Return the user-facing diagnostic code when this failure has a
+    /// package-resolution classification.
+    pub const fn diagnostic_code(&self) -> Option<sai_diagnostics::Code> {
+        use sai_diagnostics::Code;
+
+        match self {
+            Self::InvalidProvenance(_) | Self::MissingRequirer(_) => None,
+            Self::LocalPathSyntax(_) => Some(Code::InvalidPackagePath),
+            Self::LocalPath(
+                LocalPackageError::MissingManifest
+                | LocalPackageError::ManifestNotFile
+                | LocalPackageError::NotDirectory,
+            )
+            | Self::LocalPath(LocalPackageError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) => Some(Code::PathPackageNotFound),
+            Self::LocalPath(LocalPackageError::ManifestTooLarge) => Some(Code::PackageTooLarge),
+            Self::LocalPath(
+                LocalPackageError::RelativeDirectory
+                | LocalPackageError::Io { .. }
+                | LocalPackageError::DirectoryChanged
+                | LocalPackageError::PlatformNotSupported,
+            ) => None,
+            Self::GitDirectory(PackagePathError::InvalidPackagePath) => {
+                Some(Code::InvalidPackagePath)
+            }
+            Self::GitDirectory(PackagePathError::PathEscapesRepository) => {
+                Some(Code::PathEscapesRepository)
+            }
+            Self::GitPath(error) => Some(error.diagnostic_code()),
+            Self::GitRelease(error) => error.diagnostic_code(),
+            Self::GitReleaseIdentityMismatch { .. } => Some(Code::FetchFailed),
+        }
+    }
+
+    /// Return a bounded, path-safe explanation for user-facing failures.
+    pub fn diagnostic_message(&self) -> Option<String> {
+        let message = match self {
+            Self::LocalPathSyntax(_) => "the selected local package path is invalid".to_owned(),
+            Self::LocalPath(error) => error.to_string(),
+            Self::GitDirectory(PackagePathError::InvalidPackagePath) => {
+                "the selected Git package directory is invalid".to_owned()
+            }
+            Self::GitDirectory(PackagePathError::PathEscapesRepository) => {
+                "the selected Git package directory escapes the repository".to_owned()
+            }
+            Self::GitPath(GitPackagePathError::InvalidPackagePath) => {
+                "the selected Git-relative package path is invalid".to_owned()
+            }
+            Self::GitPath(GitPackagePathError::PathEscapesRepository) => {
+                "the selected Git-relative package path escapes the repository".to_owned()
+            }
+            Self::GitRelease(error) => error.to_string(),
+            Self::GitReleaseIdentityMismatch { .. } => {
+                "the fetched package has a different source identity".to_owned()
+            }
+            Self::InvalidProvenance(_) | Self::MissingRequirer(_) => return None,
+        };
+        self.diagnostic_code().map(|_| message)
+    }
+}
+
 /// Why one changed final source could not be reloaded for contract comparison.
 #[derive(Debug, Eq, PartialEq)]
 pub enum MixedSourceFinalReloadError {
