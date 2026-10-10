@@ -973,7 +973,7 @@ fn canonical_git_directory(directory: Option<&str>) -> Result<Option<Box<str>>, 
     match directory {
         None | Some(".") => Ok(None),
         Some(directory) => {
-            crate::package_path::ContentPackagePath::parse(directory).map_err(|_| ())?;
+            crate::package_path::RepositoryPackageDirectory::parse(directory).map_err(|_| ())?;
             Ok(Some(directory.into()))
         }
     }
@@ -2442,7 +2442,7 @@ requires { acme:edge @ ^1 from git "http://example.test/edge" }
             br#"package acme:dep @ 1.0.0
 source "src"
 targets { wasm32-core }
-requires { acme:edge @ ^1 from git "https://example.test/repo" dir "edge" }
+requires { acme:edge @ ^1 from git "https://example.test/repo" dir "out/edge" }
 "#,
             PackageRole::Dependency,
         );

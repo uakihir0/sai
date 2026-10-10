@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::str;
 
-use crate::package_path::DependencyPackagePath;
+use crate::package_path::RepositoryPackageDirectory;
 use crate::version::Version;
 
 /// Maximum number of canonical release tags considered in one listing.
@@ -131,7 +131,7 @@ impl Error for GitReleaseTagListError {}
 /// version precedence.
 pub fn parse_release_tag_refs<I, N>(
     refs: I,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
 ) -> Result<Vec<GitReleaseTag>, GitReleaseTagListError>
 where
     I: IntoIterator<Item = (N, gix::ObjectId)>,
@@ -142,7 +142,7 @@ where
 
 fn parse_release_tag_refs_with_limits<I, N>(
     refs: I,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
     limits: ListingLimits,
 ) -> Result<Vec<GitReleaseTag>, GitReleaseTagListError>
 where
@@ -172,7 +172,7 @@ where
             });
         }
 
-        let Some(version_bytes) = name.strip_prefix(prefix.as_slice()) else {
+        let Some(version_bytes) = name.strip_prefix(prefix.as_bytes()) else {
             continue;
         };
         let Ok(version_text) = str::from_utf8(version_bytes) else {
@@ -222,15 +222,18 @@ where
     Ok(tags.into_values().collect())
 }
 
-fn release_tag_prefix(
-    directory: Option<&DependencyPackagePath>,
-) -> Result<Vec<u8>, GitReleaseTagListError> {
-    match directory.map(DependencyPackagePath::as_str) {
-        None | Some(".") => Ok(b"refs/tags/v".to_vec()),
-        Some(directory) if directory.split('/').any(|component| component == "..") => {
-            Err(GitReleaseTagListError::InvalidPackageDirectory)
+pub(crate) fn release_tag_prefix(
+    directory: Option<&RepositoryPackageDirectory>,
+) -> Result<String, GitReleaseTagListError> {
+    match directory.map(RepositoryPackageDirectory::as_str) {
+        None | Some(".") => Ok("refs/tags/v".to_owned()),
+        Some(directory) => {
+            let prefix = format!("refs/tags/{directory}/v");
+            let probe = format!("{prefix}0.0.0");
+            gix::refs::FullName::try_from(probe)
+                .map_err(|_| GitReleaseTagListError::InvalidPackageDirectory)?;
+            Ok(prefix)
         }
-        Some(directory) => Ok(format!("refs/tags/{directory}/v").into_bytes()),
     }
 }
 
@@ -241,7 +244,7 @@ mod tests {
         MAX_RELEASE_TAG_IDENTIFIERS_PER_LISTING, MAX_RELEASE_TAGS_PER_LISTING,
         parse_release_tag_refs, parse_release_tag_refs_with_limits,
     };
-    use crate::package_path::DependencyPackagePath;
+    use crate::package_path::RepositoryPackageDirectory;
 
     fn object_id(last_nibble: u8) -> gix::ObjectId {
         let mut hex = vec![b'0'; 40];
@@ -272,7 +275,7 @@ mod tests {
 
     #[test]
     fn filters_and_orders_release_tags_for_a_package_directory() {
-        let directory = DependencyPackagePath::parse("packages/core").unwrap();
+        let directory = RepositoryPackageDirectory::parse("packages/core").unwrap();
         let refs = [
             (b"refs/tags/packages/core/v2.0.0".as_slice(), object_id(2)),
             (b"refs/tags/packages/core/v1.0.0".as_slice(), object_id(1)),
@@ -293,7 +296,7 @@ mod tests {
 
     #[test]
     fn treats_dot_directory_as_the_repository_root() {
-        let directory = DependencyPackagePath::parse(".").unwrap();
+        let directory = RepositoryPackageDirectory::parse(".").unwrap();
         let tags = parse_release_tag_refs(
             [(b"refs/tags/v1.0.0".as_slice(), object_id(1))],
             Some(&directory),
@@ -304,16 +307,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_git_directory_that_escapes_the_repository() {
-        let directory = DependencyPackagePath::parse("../shared").unwrap();
+    fn accepts_output_directories_that_form_valid_git_refs() {
+        let directory = RepositoryPackageDirectory::parse("out/debug").unwrap();
+        let tags = parse_release_tag_refs(
+            [(b"refs/tags/out/debug/v1.0.0".as_slice(), object_id(1))],
+            Some(&directory),
+        )
+        .unwrap();
+        assert_eq!(tags.len(), 1);
+    }
 
-        assert_eq!(
-            parse_release_tag_refs(
-                [(b"refs/tags/shared/v1.0.0".as_slice(), object_id(1))],
-                Some(&directory),
-            ),
-            Err(GitReleaseTagListError::InvalidPackageDirectory)
-        );
+    #[test]
+    fn rejects_repository_directories_that_cannot_form_git_refs() {
+        for directory in [".sai/cache", "dir with space"] {
+            let directory = RepositoryPackageDirectory::parse(directory).unwrap();
+            assert_eq!(
+                parse_release_tag_refs(
+                    [(b"refs/tags/v1.0.0".as_slice(), object_id(1))],
+                    Some(&directory),
+                ),
+                Err(GitReleaseTagListError::InvalidPackageDirectory)
+            );
+        }
     }
 
     #[test]

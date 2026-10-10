@@ -21,7 +21,7 @@ use crate::git_tree::{
 };
 use crate::lock_validation::canonical_git_url;
 use crate::manifest::MAX_PACKAGE_MANIFEST_BYTES;
-use crate::package_path::ContentPackagePath;
+use crate::package_path::RepositoryPackageDirectory;
 use crate::tree_hash::{reject_tree_path_collisions, should_skip_path, validate_tree_path};
 
 const CACHE_LAYOUT_VERSION: &str = "v1";
@@ -58,7 +58,7 @@ pub enum PackageCacheError {
     InvalidGitTag,
     /// A Git commit was not a canonical SHA-1 or SHA-256 object ID.
     InvalidGitCommit,
-    /// A package directory was not a normalized content path.
+    /// A package directory was not a normalized repository-relative path.
     InvalidPackageDirectory,
     /// A cache record was malformed, mismatched, or too large.
     CorruptRecord(PathBuf),
@@ -1100,7 +1100,7 @@ fn canonical_package_directory(value: Option<&str>) -> Result<&str, PackageCache
     if value == "." {
         return Ok("");
     }
-    ContentPackagePath::parse(value)
+    RepositoryPackageDirectory::parse(value)
         .map(|_| value)
         .map_err(|_| PackageCacheError::InvalidPackageDirectory)
 }
@@ -4294,13 +4294,13 @@ mod tests {
         let commit = "a".repeat(40);
 
         cache
-            .record_verified_package_checksums(url, &commit, None, &source)
+            .record_verified_package_checksums(url, &commit, Some("out/sample"), &source)
             .unwrap();
 
         cache.materialize_source(source).unwrap();
 
         let metadata = cache
-            .cached_package_checksums(url, &commit, None)
+            .cached_package_checksums(url, &commit, Some("out/sample"))
             .unwrap()
             .unwrap();
         assert_eq!(metadata.source_checksum.as_ref(), checksum.as_str());
@@ -4308,7 +4308,13 @@ mod tests {
         assert!(metadata.artifact_checksums.is_empty());
         assert!(
             cache
-                .cached_package_checksums(url, &"b".repeat(40), None)
+                .cached_package_checksums(url, &"b".repeat(40), Some("out/sample"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .cached_package_checksums(url, &commit, None)
                 .unwrap()
                 .is_none()
         );
@@ -4321,7 +4327,7 @@ mod tests {
         let reopened = PackageCache::open(&cache_root).unwrap();
         assert_eq!(
             reopened
-                .cached_package_checksums(url, &commit, None)
+                .cached_package_checksums(url, &commit, Some("out/sample"))
                 .unwrap()
                 .unwrap()
                 .source_checksum

@@ -15,6 +15,7 @@ use gix::bstr::{BStr, BString, ByteSlice};
 
 use crate::git_tags::{
     GitReleaseTag, GitReleaseTagListError, GitReleaseTagListLimit, parse_release_tag_refs,
+    release_tag_prefix,
 };
 use crate::git_tree::{
     GitPackageArtifactChecksum, GitPackageFile, GitPackageSourceTree, GitTreeReadError,
@@ -31,7 +32,7 @@ use crate::package_cache::{
     PackageCacheError, SourceCacheRemoval, create_staging_activity_lock,
     release_staging_activity_lock, staging_activity_lock_path,
 };
-use crate::package_path::{ContentPackagePath, DependencyPackagePath};
+use crate::package_path::RepositoryPackageDirectory;
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, build_resolver_contract,
 };
@@ -96,7 +97,7 @@ struct LockedReleaseRequest {
     package: Box<str>,
     url: Box<str>,
     version: Version,
-    directory: Option<DependencyPackagePath>,
+    directory: Option<RepositoryPackageDirectory>,
     commit: gix::ObjectId,
     checksums: ExpectedPackageChecksums,
 }
@@ -194,10 +195,8 @@ fn locked_release_request(
         ));
     }
     let directory = if let Some(value) = directory.as_deref() {
-        ContentPackagePath::parse(value)
-            .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("directory"))?;
         Some(
-            DependencyPackagePath::parse(value)
+            RepositoryPackageDirectory::parse(value)
                 .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("directory"))?,
         )
     } else {
@@ -871,7 +870,7 @@ impl StdError for GitRemoteReleaseFetchError {
 /// and environment-based Git overrides are excluded.
 pub fn list_remote_release_tags(
     url: &str,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
 ) -> Result<Vec<GitReleaseTag>, GitRemoteTagListError> {
     let refspec = release_tag_refspec(directory)?;
     let canonical_url =
@@ -903,7 +902,7 @@ pub fn list_remote_release_tags(
 pub fn fetch_remote_release_tree(
     url: &str,
     tag: &GitReleaseTag,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
     expected_commit: Option<&gix::ObjectId>,
     expected_source_checksum: Option<&str>,
 ) -> Result<FetchedGitRelease, GitRemoteReleaseFetchError> {
@@ -952,7 +951,7 @@ pub fn fetch_remote_release_tree(
 pub fn fetch_locked_release_tree(
     url: &str,
     version: &Version,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
     locked_commit: &gix::ObjectId,
     expected_checksums: &ExpectedPackageChecksums,
 ) -> Result<FetchedGitRelease, GitRemoteReleaseFetchError> {
@@ -1049,7 +1048,7 @@ pub fn fetch_locked_package_to_cache(
     let directory = request
         .directory
         .as_ref()
-        .map(DependencyPackagePath::as_str);
+        .map(RepositoryPackageDirectory::as_str);
     let cached_checksums =
         match cache.cached_package_checksums(&request.url, &locked_commit, directory) {
             Ok(checksums) => checksums,
@@ -1327,7 +1326,7 @@ fn fetch_locked_release_tree_in_repository(
     repository: &gix::Repository,
     url: &str,
     version: &Version,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
     locked_commit: &gix::ObjectId,
     expected_checksums: &ExpectedPackageChecksums,
     transfer_limit: &gix_transport::client::blocking_io::FetchTransferLimit,
@@ -1355,7 +1354,7 @@ struct ReleaseFetchRequest<'a> {
     refspec: &'a str,
     tag_name: &'a str,
     version: &'a Version,
-    directory: Option<&'a DependencyPackagePath>,
+    directory: Option<&'a RepositoryPackageDirectory>,
     expected_commit: Option<&'a gix::ObjectId>,
     expected_source_checksum: Option<&'a str>,
     expected_locked_checksums: Option<&'a ExpectedPackageChecksums>,
@@ -1448,11 +1447,8 @@ fn fetch_release_tree_in_repository(
         });
     }
 
-    let package_directory = match directory.map(DependencyPackagePath::as_str) {
+    let package_directory = match directory.map(RepositoryPackageDirectory::as_str) {
         None | Some(".") => &[][..],
-        Some(directory) if directory.split('/').any(|component| component == "..") => {
-            return Err(GitRemoteReleaseFetchError::InvalidPackageDirectory);
-        }
         Some(directory) => directory.as_bytes(),
     };
     let package_source_tree = reader
@@ -1697,7 +1693,7 @@ fn tag_list_transport_options(
 
 fn exact_release_tag_refspec(
     tag: &GitReleaseTag,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
 ) -> Result<String, GitRemoteReleaseFetchError> {
     let expected_tag_name = release_tag_name(tag.version(), directory)?;
     if tag.name() != expected_tag_name {
@@ -1708,15 +1704,10 @@ fn exact_release_tag_refspec(
 
 fn release_tag_name(
     version: &Version,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
 ) -> Result<String, GitRemoteReleaseFetchError> {
-    let prefix = match directory.map(DependencyPackagePath::as_str) {
-        None | Some(".") => "refs/tags/v".to_owned(),
-        Some(directory) if directory.split('/').any(|component| component == "..") => {
-            return Err(GitRemoteReleaseFetchError::InvalidPackageDirectory);
-        }
-        Some(directory) => format!("refs/tags/{directory}/v"),
-    };
+    let prefix = release_tag_prefix(directory)
+        .map_err(|_| GitRemoteReleaseFetchError::InvalidPackageDirectory)?;
     Ok(format!("{prefix}{version}"))
 }
 
@@ -1770,7 +1761,7 @@ fn list_release_tags_in_repository(
     repository: &gix::Repository,
     url: &str,
     refspec: &str,
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
 ) -> Result<Vec<GitReleaseTag>, GitRemoteTagListError> {
     let remote = repository
         .remote_at_without_url_rewrite(url)
@@ -1830,15 +1821,10 @@ fn map_transport_error(error: impl StdError + 'static) -> GitRemoteTagListError 
 }
 
 fn release_tag_refspec(
-    directory: Option<&DependencyPackagePath>,
+    directory: Option<&RepositoryPackageDirectory>,
 ) -> Result<String, GitRemoteTagListError> {
-    let prefix = match directory.map(DependencyPackagePath::as_str) {
-        None | Some(".") => "refs/tags/v".to_owned(),
-        Some(directory) if directory.split('/').any(|component| component == "..") => {
-            return Err(GitRemoteTagListError::InvalidPackageDirectory);
-        }
-        Some(directory) => format!("refs/tags/{directory}/v"),
-    };
+    let prefix = release_tag_prefix(directory)
+        .map_err(|_| GitRemoteTagListError::InvalidPackageDirectory)?;
     Ok(format!("{prefix}*:{prefix}*"))
 }
 
@@ -2128,7 +2114,7 @@ mod tests {
     use crate::manifest::{PackageRole, parse_for_role};
     use crate::mvs::MvsPackageVersion;
     use crate::package_cache::PackageCache;
-    use crate::package_path::DependencyPackagePath;
+    use crate::package_path::RepositoryPackageDirectory;
     use crate::resolver_contract::ResolverContractContext;
     use crate::validation::PackageValidationContext;
     use gix::objs::tree::{Entry, EntryKind};
@@ -2441,18 +2427,19 @@ mod tests {
             release_tag_refspec(None).unwrap(),
             "refs/tags/v*:refs/tags/v*"
         );
-        let directory = DependencyPackagePath::parse("packages/text").unwrap();
+        let directory = RepositoryPackageDirectory::parse("packages/text").unwrap();
         assert_eq!(
             release_tag_refspec(Some(&directory)).unwrap(),
             "refs/tags/packages/text/v*:refs/tags/packages/text/v*"
         );
-    }
-
-    #[test]
-    fn rejects_dependency_directories_that_escape_the_repository() {
-        let directory = DependencyPackagePath::parse("../shared").unwrap();
+        let output_directory = RepositoryPackageDirectory::parse("out/debug").unwrap();
         assert_eq!(
-            release_tag_refspec(Some(&directory)),
+            release_tag_refspec(Some(&output_directory)).unwrap(),
+            "refs/tags/out/debug/v*:refs/tags/out/debug/v*"
+        );
+        let state_directory = RepositoryPackageDirectory::parse(".sai/cache").unwrap();
+        assert_eq!(
+            release_tag_refspec(Some(&state_directory)),
             Err(GitRemoteTagListError::InvalidPackageDirectory)
         );
     }
@@ -3307,7 +3294,7 @@ mod tests {
                     crate::lock::LockPackageField::Source(crate::lock::LockSource::Git(
                         "https://example.com/acme/sample.git".into(),
                     )),
-                    crate::lock::LockPackageField::Directory("out/build".into()),
+                    crate::lock::LockPackageField::Directory("packages/../other".into()),
                     crate::lock::LockPackageField::Commit(commit.clone()),
                     crate::lock::LockPackageField::Checksum(valid_checksum.clone()),
                 ],
@@ -3551,7 +3538,7 @@ mod tests {
     #[test]
     fn exact_fetch_rejects_a_tag_from_another_package_namespace() {
         let remote = TestRemote::new("refs/tags/v1.2.3", false);
-        let directory = DependencyPackagePath::parse("packages/core").unwrap();
+        let directory = RepositoryPackageDirectory::parse("packages/core").unwrap();
 
         assert_eq!(
             super::exact_release_tag_refspec(&remote.tag, Some(&directory)),

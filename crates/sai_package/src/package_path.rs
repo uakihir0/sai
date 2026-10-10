@@ -12,9 +12,16 @@ pub struct DependencyPackagePath {
     value: Box<str>,
 }
 
+/// A normalized package directory inside a Git repository.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RepositoryPackageDirectory {
+    value: Box<str>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackagePathError {
     InvalidPackagePath,
+    PathEscapesRepository,
 }
 
 impl ContentPackagePath {
@@ -43,10 +50,60 @@ impl DependencyPackagePath {
     }
 }
 
+impl RepositoryPackageDirectory {
+    pub fn parse(value: &str) -> Result<Self, PackagePathError> {
+        validate_path(value, PackagePathUse::RepositoryDirectory)?;
+        Ok(Self {
+            value: value.into(),
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Resolve a path dependency inside a Git package to its repository-relative
+/// package directory.
+///
+/// `package_directory` is the requiring package's directory in the repository;
+/// `None` denotes the repository root. The result is normalized lexically and
+/// cannot escape the repository.
+pub fn normalize_git_relative_package_directory(
+    package_directory: Option<&RepositoryPackageDirectory>,
+    dependency_path: &DependencyPackagePath,
+) -> Result<RepositoryPackageDirectory, PackagePathError> {
+    let mut components = package_directory
+        .filter(|directory| directory.as_str() != ".")
+        .map_or_else(Vec::new, |directory| {
+            directory.as_str().split('/').collect()
+        });
+
+    for component in dependency_path.as_str().split('/') {
+        match component {
+            "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(PackagePathError::PathEscapesRepository);
+                }
+            }
+            component => components.push(component),
+        }
+    }
+
+    let normalized = if components.is_empty() {
+        ".".to_owned()
+    } else {
+        components.join("/")
+    };
+    RepositoryPackageDirectory::parse(&normalized)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackagePathUse {
     Content,
     Dependency,
+    RepositoryDirectory,
 }
 
 fn validate_path(value: &str, usage: PackagePathUse) -> Result<(), PackagePathError> {
@@ -119,9 +176,20 @@ impl fmt::Display for DependencyPackagePath {
     }
 }
 
+impl fmt::Display for RepositoryPackageDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.value)
+    }
+}
+
 impl fmt::Display for PackagePathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("invalid path in `sai.package`")
+        match self {
+            Self::InvalidPackagePath => formatter.write_str("invalid path in `sai.package`"),
+            Self::PathEscapesRepository => {
+                formatter.write_str("Git-relative package path escapes the repository")
+            }
+        }
     }
 }
 
@@ -129,7 +197,10 @@ impl std::error::Error for PackagePathError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentPackagePath, DependencyPackagePath, PackagePathError};
+    use super::{
+        ContentPackagePath, DependencyPackagePath, PackagePathError, RepositoryPackageDirectory,
+        normalize_git_relative_package_directory,
+    };
 
     #[test]
     fn accepts_relative_content_and_dependency_paths() {
@@ -151,6 +222,32 @@ mod tests {
                 source
             );
         }
+    }
+
+    #[test]
+    fn accepts_reserved_repository_directories_but_requires_normalization() {
+        for directory in [".", ".sai/dependency", "out/sibling"] {
+            assert_eq!(
+                RepositoryPackageDirectory::parse(directory)
+                    .expect("valid Git repository package directory")
+                    .as_str(),
+                directory
+            );
+        }
+        for directory in ["../sibling", "packages/../sibling"] {
+            assert_eq!(
+                RepositoryPackageDirectory::parse(directory),
+                Err(PackagePathError::InvalidPackagePath)
+            );
+        }
+        assert_eq!(
+            RepositoryPackageDirectory::parse("nested/../out"),
+            Err(PackagePathError::InvalidPackagePath)
+        );
+        assert_eq!(
+            ContentPackagePath::parse("out/sibling"),
+            Err(PackagePathError::InvalidPackagePath)
+        );
     }
 
     #[test]
@@ -228,6 +325,91 @@ mod tests {
         }
         assert!(DependencyPackagePath::parse(".sai").is_ok());
         assert!(DependencyPackagePath::parse("out/cache").is_ok());
+    }
+
+    #[test]
+    fn normalizes_git_relative_package_directories_within_the_repository() {
+        let base = RepositoryPackageDirectory::parse("packages/client").unwrap();
+        let sibling = DependencyPackagePath::parse("../shared").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(Some(&base), &sibling)
+                .unwrap()
+                .as_str(),
+            "packages/shared"
+        );
+
+        let nested = DependencyPackagePath::parse("vendor/../local").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(Some(&base), &nested)
+                .unwrap()
+                .as_str(),
+            "packages/client/local"
+        );
+
+        let root_base = RepositoryPackageDirectory::parse(".").unwrap();
+        let root_relative = DependencyPackagePath::parse("packages/shared").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(None, &root_relative)
+                .unwrap()
+                .as_str(),
+            "packages/shared"
+        );
+        let parent = DependencyPackagePath::parse("..").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(Some(&base), &parent)
+                .unwrap()
+                .as_str(),
+            "packages"
+        );
+        let to_root = DependencyPackagePath::parse("../..").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(Some(&base), &to_root)
+                .unwrap()
+                .as_str(),
+            "."
+        );
+        let current = DependencyPackagePath::parse(".").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(Some(&root_base), &current)
+                .unwrap()
+                .as_str(),
+            "."
+        );
+    }
+
+    #[test]
+    fn rejects_git_relative_paths_that_escape_the_repository() {
+        let base = RepositoryPackageDirectory::parse(".").unwrap();
+        let parent = DependencyPackagePath::parse("..").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(None, &parent),
+            Err(PackagePathError::PathEscapesRepository)
+        );
+
+        let over_parent = DependencyPackagePath::parse("../../shared").unwrap();
+        assert_eq!(
+            normalize_git_relative_package_directory(Some(&base), &over_parent),
+            Err(PackagePathError::PathEscapesRepository)
+        );
+
+        for reserved in [".sai/cache", "out/debug", "nested/../out"] {
+            let path = DependencyPackagePath::parse(reserved).unwrap();
+            assert!(normalize_git_relative_package_directory(None, &path).is_ok());
+        }
+
+        let base = RepositoryPackageDirectory::parse("packages/client").unwrap();
+        for (path, expected) in [
+            ("../../out/sibling", "out/sibling"),
+            ("../../.sai/sibling", ".sai/sibling"),
+        ] {
+            let path = DependencyPackagePath::parse(path).unwrap();
+            assert_eq!(
+                normalize_git_relative_package_directory(Some(&base), &path)
+                    .unwrap()
+                    .as_str(),
+                expected
+            );
+        }
     }
 
     #[test]

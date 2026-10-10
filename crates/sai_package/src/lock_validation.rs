@@ -9,7 +9,7 @@ use crate::lock::{
     LockPackage, LockPackageField, LockParseOutput, LockRoot, LockRootField, LockSource,
 };
 use crate::manifest::Spanned;
-use crate::package_path::{ContentPackagePath, DependencyPackagePath};
+use crate::package_path::{DependencyPackagePath, RepositoryPackageDirectory};
 use crate::version::CompatibilityLine;
 
 pub const SUPPORTED_LOCK_FORMAT_VERSION: u64 = 1;
@@ -211,7 +211,9 @@ impl Validator {
                     Some(LockField::Source)
                 }
                 LockPackageField::Directory(value) => {
-                    if !valid_lock_string(value) || ContentPackagePath::parse(value).is_err() {
+                    if !valid_lock_string(value)
+                        || RepositoryPackageDirectory::parse(value).is_err()
+                    {
                         self.corrupt(LockCorruptionKind::InvalidDirectory, field.span.clone());
                     }
                     Some(LockField::Directory)
@@ -880,10 +882,26 @@ mod tests {
                  dir \"packages/../other\"\n\
                  commit \"0123456789012345678901234567890123456789\"\n\
                  checksum \"sai1:0123456789012345678901234567890123456789012345678901234567890123\"\n\
+             package acme:state @ 1.4.0\n\
+                 source git \"https://github.com/acme/state\"\n\
+                 dir \".sai/cache\"\n\
+                 commit \"2123456789012345678901234567890123456789\"\n\
+                 checksum \"sai1:2123456789012345678901234567890123456789012345678901234567890123\"\n\
+             package acme:output @ 1.5.0\n\
+                 source git \"https://github.com/acme/output\"\n\
+                 dir \"out/debug\"\n\
+                 commit \"3123456789012345678901234567890123456789\"\n\
+                 checksum \"sai1:3123456789012345678901234567890123456789012345678901234567890123\"\n\
                  capabilities { alloc }\n";
         let kinds = corruption_kinds(source);
         assert!(kinds.contains(&LockCorruptionKind::InvalidSourcePath));
-        assert!(kinds.contains(&LockCorruptionKind::InvalidDirectory));
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| matches!(kind, LockCorruptionKind::InvalidDirectory))
+                .count(),
+            1
+        );
     }
 
     #[test]

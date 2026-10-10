@@ -8,7 +8,9 @@ use crate::lexer::{
     PackageLexError, PackageLexErrorKind, PackagePunctuator, PackageToken, PackageTokenKind,
     PackageTrivia, lex,
 };
-use crate::package_path::{ContentPackagePath, DependencyPackagePath, PackagePathError};
+use crate::package_path::{
+    ContentPackagePath, DependencyPackagePath, PackagePathError, RepositoryPackageDirectory,
+};
 use crate::version::{Version, VersionParseError};
 use crate::version_req::{PartialVersion, VersionReq, VersionReqParseError};
 
@@ -171,6 +173,7 @@ pub enum PackageParseErrorKind {
     InvalidPackageVersion(VersionParseError),
     InvalidContentPath(PackagePathError),
     InvalidDependencyPath(PackagePathError),
+    InvalidRepositoryDirectory(PackagePathError),
     ConflictingLintLevel,
     InvalidVersionRequirement(VersionReqParseError),
     ManifestTooLarge,
@@ -679,7 +682,7 @@ impl<'a> Parser<'a> {
             let url = self.parse_string()?;
             let directory = if self.at_word("dir") {
                 self.bump();
-                Some(self.parse_content_path()?)
+                Some(self.parse_repository_package_directory()?)
             } else {
                 None
             };
@@ -807,7 +810,7 @@ impl<'a> Parser<'a> {
                 let url = parser.parse_string()?;
                 let directory = if parser.at_word("dir") {
                     parser.bump();
-                    Some(parser.parse_content_path()?)
+                    Some(parser.parse_repository_package_directory()?)
                 } else {
                     None
                 };
@@ -1249,6 +1252,24 @@ impl<'a> Parser<'a> {
         if DependencyPackagePath::parse(&value).is_err() {
             self.error(
                 PackageParseErrorKind::InvalidDependencyPath(PackagePathError::InvalidPackagePath),
+                self.tokens[token].span.clone(),
+            );
+            return None;
+        }
+        Some(value)
+    }
+
+    fn parse_repository_package_directory(&mut self) -> Option<Box<str>> {
+        let token = self.expect_kind(PackageTokenKind::String, "repository directory")?;
+        if self.token_has_lexical_error(token) {
+            return None;
+        }
+        let value = self.tokens[token].string_value.clone()?;
+        if RepositoryPackageDirectory::parse(&value).is_err() {
+            self.error(
+                PackageParseErrorKind::InvalidRepositoryDirectory(
+                    PackagePathError::InvalidPackagePath,
+                ),
                 self.tokens[token].span.clone(),
             );
             return None;
@@ -1914,6 +1935,36 @@ mod tests {
         assert!(matches!(
             entries[1].value.source.as_ref().map(|value| &value.value),
             Some(RequirementSource::Path(path)) if path.as_ref() == "../local"
+        ));
+    }
+
+    #[test]
+    fn git_repository_directories_may_be_under_tool_state_or_output_names() {
+        let output = parse_valid(
+            "package acme:app @ 1.0.0\n\
+             requires {\n\
+                 acme:output @ ^1 from git \"https://example.test/repo\" dir \"out/sibling\"\n\
+             }\n\
+             overrides {\n\
+                 acme:state use git \"https://example.test/repo\" dir \".sai/sibling\"\n\
+             }\n",
+        );
+        let PackageDeclaration::Requires { entries, .. } = &output.file.declarations[0].value
+        else {
+            panic!("expected requirements");
+        };
+        assert!(matches!(
+            entries[0].value.source.as_ref().map(|value| &value.value),
+            Some(RequirementSource::Git { directory: Some(directory), .. })
+                if directory.as_ref() == "out/sibling"
+        ));
+        let PackageDeclaration::Overrides(overrides) = &output.file.declarations[1].value else {
+            panic!("expected overrides");
+        };
+        assert!(matches!(
+            &overrides[0].value.source,
+            OverrideSource::Git { directory: Some(directory), .. }
+                if directory.as_ref() == ".sai/sibling"
         ));
     }
 
