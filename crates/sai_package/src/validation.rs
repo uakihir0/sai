@@ -1340,6 +1340,36 @@ mod tests {
         );
         assert!(hybrid.errors.is_empty(), "{:?}", hybrid.errors);
 
+        let hybrid_without_artifacts = validate(
+            &parse_text(
+                "package acme:hybrid @ 1.0.0\n\
+                 source \"src\"\n\
+                 wit \"wit\"\n\
+                 export world api\n\
+                 targets { wasm32-wasi }\n\
+                 artifact component {}\n",
+            ),
+            PackageValidationContext::default(),
+        );
+        assert!(
+            hybrid_without_artifacts.errors.is_empty(),
+            "{:?}",
+            hybrid_without_artifacts.errors
+        );
+
+        assert_eq!(
+            kinds(
+                "package acme:artifact @ 1.0.0\n\
+                 wit \"wit\"\n\
+                 export world api\n\
+                 targets { wasm32-wasi }\n\
+                 artifact component {}\n",
+            ),
+            vec![PackageValidationErrorKind::MissingArtifactForTarget(
+                "wasm32-wasi".into()
+            )]
+        );
+
         assert_eq!(
             kinds(
                 "package acme:artifact @ 1.0.0\n\

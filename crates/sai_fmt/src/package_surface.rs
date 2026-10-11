@@ -14,7 +14,8 @@ use crate::package_input::PackageInput;
 const NO_INDEX: u32 = u32::MAX;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PackageSyntaxIndex {
+pub(crate) struct PackageSyntaxIndex<'a> {
+    source: &'a [u8],
     declarations: Vec<Range<u32>>,
     top_level_newlines: Vec<u32>,
     brace_lists: Vec<PackageBraceList>,
@@ -68,8 +69,8 @@ pub(crate) enum PackageSyntaxIndexError {
     IndexOverflow,
 }
 
-impl PackageSyntaxIndex {
-    pub(crate) fn new(input: &PackageInput<'_>) -> Result<Self, PackageSyntaxIndexError> {
+impl<'a> PackageSyntaxIndex<'a> {
+    pub(crate) fn new(input: &'a PackageInput<'_>) -> Result<Self, PackageSyntaxIndexError> {
         std::str::from_utf8(input.source()).map_err(|_| PackageSyntaxIndexError::InvalidUtf8)?;
         let tokens = &input.lexed().tokens;
         let eof_token = tokens
@@ -145,6 +146,7 @@ impl PackageSyntaxIndex {
         }
 
         Ok(Self {
+            source: input.source(),
             declarations,
             top_level_newlines,
             brace_lists,
@@ -166,17 +168,37 @@ impl PackageSyntaxIndex {
         &self.brace_lists
     }
 
-    pub(crate) fn entries(&self, list: &PackageBraceList) -> &[Range<u32>] {
-        &self.brace_entries[list.entry_range.start as usize..list.entry_range.end as usize]
+    pub(crate) fn contains_list(&self, list: &PackageBraceList) -> bool {
+        self.brace_list_index(list).is_some()
     }
 
-    pub(crate) fn separators(&self, list: &PackageBraceList) -> &[u32] {
-        &self.brace_separators
-            [list.separator_range.start as usize..list.separator_range.end as usize]
+    pub(crate) fn matches_input(&self, input: &PackageInput<'_>) -> bool {
+        std::ptr::eq(self.source, input.source())
+    }
+
+    pub(crate) fn entries(&self, list: &PackageBraceList) -> Option<&[Range<u32>]> {
+        self.brace_list_index(list)?;
+        let start = usize::try_from(list.entry_range.start).ok()?;
+        let end = usize::try_from(list.entry_range.end).ok()?;
+        self.brace_entries.get(start..end)
+    }
+
+    pub(crate) fn separators(&self, list: &PackageBraceList) -> Option<&[u32]> {
+        self.brace_list_index(list)?;
+        let start = usize::try_from(list.separator_range.start).ok()?;
+        let end = usize::try_from(list.separator_range.end).ok()?;
+        self.brace_separators.get(start..end)
     }
 
     pub(crate) fn eof_token(&self) -> usize {
         self.eof_token as usize
+    }
+
+    fn brace_list_index(&self, list: &PackageBraceList) -> Option<usize> {
+        self.brace_lists
+            .binary_search_by_key(&list.open_token, |candidate| candidate.open_token)
+            .ok()
+            .filter(|&index| self.brace_lists[index] == *list)
     }
 }
 
@@ -185,7 +207,7 @@ impl PackageBraceList {
         list_kind(self.owner)
     }
 
-    pub(crate) fn parent_open_token(&self, index: &PackageSyntaxIndex) -> Option<u32> {
+    pub(crate) fn parent_open_token(&self, index: &PackageSyntaxIndex<'_>) -> Option<u32> {
         (self.parent_list_index != NO_INDEX)
             .then(|| index.brace_lists[self.parent_list_index as usize].open_token)
     }
@@ -420,29 +442,42 @@ profile small {\n\
 
         assert_eq!(lists[0].kind(), PackageListKind::CommaOrLine);
         assert_eq!(lists[0].owner, PackageBraceOwner::Targets);
-        assert_eq!(index.entries(&lists[0]).len(), 2);
+        assert_eq!(
+            index
+                .entries(&lists[0])
+                .expect("indexed targets list")
+                .len(),
+            2
+        );
         let requires = lists
             .iter()
             .find(|list| list.owner == PackageBraceOwner::Requires)
             .expect("requires is a line-separated entry list");
         assert_eq!(requires.kind(), PackageListKind::LinesOnly);
-        assert_eq!(index.entries(requires).len(), 2);
+        let requires_entries = index.entries(requires).expect("indexed requires list");
+        assert_eq!(requires_entries.len(), 2);
         assert!(
-            index.entries(requires)[0]
+            requires_entries[0]
                 .clone()
                 .any(|token| { tokens_text(source, &input.lexed().tokens[token as usize]) == "," })
         );
         assert!(lists.iter().any(|list| {
-            list.kind() == PackageListKind::LinesOnly && index.entries(list).len() == 1
+            list.kind() == PackageListKind::LinesOnly
+                && index
+                    .entries(list)
+                    .is_some_and(|entries| entries.len() == 1)
         }));
         let requires_test = lists
             .iter()
             .find(|list| list.owner == PackageBraceOwner::RequiresTest)
             .expect("test requirements retain their distinct owner");
         assert_eq!(requires_test.kind(), PackageListKind::LinesOnly);
-        assert_eq!(index.entries(requires_test).len(), 1);
+        let requires_test_entries = index
+            .entries(requires_test)
+            .expect("indexed test requires list");
+        assert_eq!(requires_test_entries.len(), 1);
         assert!(
-            index.entries(requires_test)[0]
+            requires_test_entries[0]
                 .clone()
                 .any(|token| { tokens_text(source, &input.lexed().tokens[token as usize]) == "," })
         );
@@ -488,6 +523,7 @@ profile small {\n\
         }
         let target_comma = index
             .separators(&lists[0])
+            .expect("indexed targets separators")
             .iter()
             .copied()
             .find(|&index| {
@@ -502,9 +538,9 @@ profile small {\n\
     }
 
     #[test]
-    fn indexes_empty_optional_lists_and_rejects_empty_artifact_entries_as_grammar() {
+    fn indexes_empty_package_lists_including_component_artifacts() {
         let input = PackageInput::new(
-            b"package acme:app @ 1.0.0\ntargets {}\nrequires test {}\noverrides {}\n",
+            b"package acme:app @ 1.0.0\ntargets {}\nrequires test {}\noverrides {}\nartifact component {}\n",
         );
         assert!(input.refusals().is_empty());
         let index = PackageSyntaxIndex::new(&input).expect("valid empty package lists");
@@ -512,24 +548,43 @@ profile small {\n\
             PackageBraceOwner::Targets,
             PackageBraceOwner::RequiresTest,
             PackageBraceOwner::Overrides,
+            PackageBraceOwner::ArtifactComponents,
         ] {
             let list = index
                 .brace_lists()
                 .iter()
                 .find(|list| list.owner == owner)
                 .expect("empty list owner is indexed");
-            assert!(index.entries(list).is_empty());
-            assert!(index.separators(list).is_empty());
+            assert!(index.entries(list).expect("indexed empty list").is_empty());
+            assert!(
+                index
+                    .separators(list)
+                    .expect("indexed empty list")
+                    .is_empty()
+            );
         }
+    }
 
-        let input = PackageInput::new(b"package acme:app @ 1.0.0\nartifact component {}\n");
-        assert!(
-            input
-                .refusals()
-                .contains(&crate::package_input::PackageRefusal::Grammar)
-        );
-        let index = PackageSyntaxIndex::new(&input).expect("balanced artifact braces");
-        assert!(index.entries(&index.brace_lists()[0]).is_empty());
+    #[test]
+    fn checked_list_accessors_reject_lists_from_another_index() {
+        let multi_input =
+            PackageInput::new(b"package acme:app @ 1.0.0\ntargets { wasm32-core, wasm32-wasi }\n");
+        let multi_index =
+            PackageSyntaxIndex::new(&multi_input).expect("valid multi-entry target list");
+        let foreign_list = multi_index
+            .brace_lists()
+            .first()
+            .expect("target list is indexed");
+
+        let single_input =
+            PackageInput::new(b"package acme:app @ 1.0.0\ntargets { wasm32-core }\n");
+        let single_index =
+            PackageSyntaxIndex::new(&single_input).expect("valid single-entry target list");
+
+        assert!(!single_index.contains_list(foreign_list));
+        assert!(single_index.entries(foreign_list).is_none());
+        assert!(single_index.separators(foreign_list).is_none());
+        assert!(!multi_index.matches_input(&single_input));
     }
 
     #[test]
@@ -614,12 +669,15 @@ profile release {\n\
             *coverage
                 .last_mut()
                 .expect("brace range contains open and close") += 1;
-            for entry in index.entries(list) {
+            for entry in index.entries(list).expect("indexed brace list") {
                 for token_index in entry.clone() {
                     coverage[token_index as usize - open_token] += 1;
                 }
             }
-            for &separator in index.separators(list) {
+            for &separator in index
+                .separators(list)
+                .expect("indexed brace list separators")
+            {
                 coverage[separator as usize - open_token] += 1;
             }
             assert!(

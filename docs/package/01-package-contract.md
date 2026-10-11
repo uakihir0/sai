@@ -174,7 +174,7 @@ CompilerDecl   ::= "compiler" VersionReq
 (* content *)
 SourceDecl     ::= "source" STRING
 WitDecl        ::= "wit" STRING
-ArtifactDecl   ::= "artifact" "component" '{' nl List<ArtifactEntry, NL> nl '}'
+ArtifactDecl   ::= "artifact" "component" '{' nl List<ArtifactEntry, NL>? nl '}'
 ArtifactEntry  ::= WORD STRING                         (* target name, file path *)
 
 (* targets and world *)

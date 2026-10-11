@@ -614,7 +614,7 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         let entries = self.parse_braced_list_inner(
-            false,
+            true,
             ListSeparator::LinesOnly,
             ListRecovery::ArtifactEntries,
             |parser| {
@@ -2246,6 +2246,25 @@ mod tests {
                 .iter()
                 .any(|declaration| matches!(declaration.value, PackageDeclaration::Source(_)))
         );
+    }
+
+    #[test]
+    fn accepts_an_empty_component_artifact_list() {
+        let output = parse_text(
+            "package acme:app @ 1.0.0\n\
+             artifact component {}\n",
+        );
+        assert!(
+            output.errors.is_empty(),
+            "empty artifact lists are valid syntax: {:?}",
+            output.errors
+        );
+        assert!(output.file.declarations.iter().any(|declaration| {
+            matches!(
+                &declaration.value,
+                PackageDeclaration::ArtifactComponents(entries) if entries.is_empty()
+            )
+        }));
     }
 
     #[test]

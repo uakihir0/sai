@@ -27,7 +27,7 @@ pub(crate) enum PackageDocumentError {
 /// removed commas follow the formatter's token-rehoming rule.
 pub(crate) fn targets_declaration(
     input: &PackageInput<'_>,
-    index: &PackageSyntaxIndex,
+    index: &PackageSyntaxIndex<'_>,
     list: &PackageBraceList,
 ) -> Result<Doc, PackageDocumentError> {
     comma_list_declaration(input, index, list, PackageBraceOwner::Targets)
@@ -35,7 +35,7 @@ pub(crate) fn targets_declaration(
 
 pub(crate) fn capability_declaration(
     input: &PackageInput<'_>,
-    index: &PackageSyntaxIndex,
+    index: &PackageSyntaxIndex<'_>,
     list: &PackageBraceList,
 ) -> Result<Doc, PackageDocumentError> {
     match list.owner {
@@ -48,10 +48,215 @@ pub(crate) fn capability_declaration(
 
 pub(crate) fn authors_declaration(
     input: &PackageInput<'_>,
-    index: &PackageSyntaxIndex,
+    index: &PackageSyntaxIndex<'_>,
     list: &PackageBraceList,
 ) -> Result<Doc, PackageDocumentError> {
     comma_list_declaration(input, index, list, PackageBraceOwner::Authors)
+}
+
+pub(crate) fn artifact_components_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if list.owner != PackageBraceOwner::ArtifactComponents
+        || list.kind() != crate::package_surface::PackageListKind::LinesOnly
+        || !index.contains_list(list)
+        || !index.matches_input(input)
+    {
+        return Err(PackageDocumentError::WrongListOwner);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let opening_brace =
+        usize::try_from(list.open_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let closing_brace =
+        usize::try_from(list.close_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    if opening_brace >= closing_brace {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let keyword_index = opening_brace
+        .checked_sub(2)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let [artifact, component] = tokens
+        .get(keyword_index..opening_brace)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+    else {
+        return Err(PackageDocumentError::InvalidEntry);
+    };
+    if artifact.kind != PackageTokenKind::Word
+        || token_text(input.source(), artifact) != "artifact"
+        || component.kind != PackageTokenKind::Word
+        || token_text(input.source(), component) != "component"
+        || tokens.get(opening_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::LeftBrace)
+        })
+        || tokens.get(closing_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut comments = TokenComments::new(input, tokens, keyword_index, closing_brace);
+    let artifact_leading = comments.take_leading(keyword_index);
+    let artifact_trailing = comments.take_trailing(keyword_index);
+    let component_leading = comments.take_leading(keyword_index + 1);
+    let component_trailing = comments.take_trailing(keyword_index + 1);
+    let opening_leading = comments.take_leading(opening_brace);
+    let opening_trailing = comments.take_trailing(opening_brace);
+    let mut closing_leading = comments.take_leading(closing_brace);
+    let closing_trailing = comments.take_trailing(closing_brace);
+
+    let entries = index
+        .entries(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let mut artifact_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.end.checked_sub(entry.start) != Some(2)
+            || entry.start <= list.open_token
+            || entry.end > list.close_token
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let start = usize::try_from(entry.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let end = usize::try_from(entry.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let [target, path] = tokens
+            .get(start..end)
+            .ok_or(PackageDocumentError::InvalidEntry)?
+        else {
+            return Err(PackageDocumentError::InvalidEntry);
+        };
+        if target.kind != PackageTokenKind::Word || path.kind != PackageTokenKind::String {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        artifact_entries.push(ArtifactEntry {
+            target_index: start,
+            path_index: start + 1,
+            target_leading: comments.take_leading(start),
+            target_trailing: comments.take_trailing(start),
+            path_leading: comments.take_leading(start + 1),
+            path_trailing: comments.take_trailing(start + 1),
+        });
+    }
+
+    if index
+        .separators(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+        .iter()
+        .any(|separator| {
+            tokens
+                .get(*separator as usize)
+                .is_none_or(|token| token.kind != PackageTokenKind::Newline)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    if comments.has_pending(keyword_index, closing_brace) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+
+    let mut document = leading_comments_before(input, &artifact_leading, Some(artifact.span.start));
+    document.push(Doc::text("artifact"));
+    document.push(trailing_comments(input, &artifact_trailing));
+    if component_leading.is_empty() {
+        document.push(Doc::text(" "));
+    } else {
+        document.push(Doc::HardLine);
+        document.extend(leading_comments_before(
+            input,
+            &component_leading,
+            Some(component.span.start),
+        ));
+    }
+    document.push(Doc::text("component"));
+    document.push(trailing_comments(input, &component_trailing));
+    if opening_leading.is_empty() {
+        document.push(Doc::text(" "));
+    } else {
+        document.push(Doc::HardLine);
+        if opening_leading[0].line_breaks_before() > 1 {
+            document.push(Doc::HardLine);
+        }
+        document.extend(leading_comments_before(
+            input,
+            &opening_leading,
+            Some(tokens[opening_brace].span.start),
+        ));
+    }
+    document.push(Doc::text("{"));
+
+    let has_body =
+        !artifact_entries.is_empty() || !opening_trailing.is_empty() || !closing_leading.is_empty();
+    if has_body {
+        let mut body = vec![trailing_comments(input, &opening_trailing)];
+        if !artifact_entries.is_empty() {
+            body.push(Doc::HardLine);
+            for (position, entry) in artifact_entries.iter().enumerate() {
+                if position > 0 {
+                    let previous = &artifact_entries[position - 1];
+                    let previous_end = tokens[previous.path_index].span.end;
+                    let current_start = tokens[entry.target_index].span.start;
+                    let preserve_blank_line = entry.target_leading.first().map_or_else(
+                        || has_blank_line(input, previous_end, current_start),
+                        |comment| comment.line_breaks_before() > 1,
+                    );
+                    body.push(Doc::HardLine);
+                    if preserve_blank_line {
+                        body.push(Doc::HardLine);
+                    }
+                }
+                body.extend(leading_comments_before(
+                    input,
+                    &entry.target_leading,
+                    Some(tokens[entry.target_index].span.start),
+                ));
+                body.push(Doc::text(token_text(
+                    input.source(),
+                    &tokens[entry.target_index],
+                )));
+                if trailing_comments_force_line_break(input, &entry.target_trailing)
+                    || !entry.path_leading.is_empty()
+                {
+                    return Err(PackageDocumentError::InvalidEntry);
+                }
+                body.push(trailing_comments(input, &entry.target_trailing));
+                body.push(Doc::text(" "));
+                body.push(Doc::text(token_text(
+                    input.source(),
+                    &tokens[entry.path_index],
+                )));
+                body.push(trailing_comments(input, &entry.path_trailing));
+            }
+        }
+        if !closing_leading.is_empty() {
+            sort_comments(input, &mut closing_leading);
+            body.push(Doc::HardLine);
+            if !artifact_entries.is_empty()
+                && has_blank_line(
+                    input,
+                    tokens[artifact_entries
+                        .last()
+                        .expect("non-empty artifact entries")
+                        .path_index]
+                        .span
+                        .end,
+                    input.comment_span(closing_leading[0]).start,
+                )
+            {
+                body.push(Doc::HardLine);
+            }
+            body.extend(leading_comments_before(input, &closing_leading, None));
+        }
+        document.push(Doc::indent(Doc::concat(body)));
+        document.push(Doc::HardLine);
+    }
+    document.push(Doc::text("}"));
+    document.push(trailing_comments(input, &closing_trailing));
+    Ok(Doc::concat(document))
 }
 
 pub(crate) fn package_identity_declaration(
@@ -486,7 +691,7 @@ fn trailing_comments_force_line_break(
 
 fn comma_list_declaration(
     input: &PackageInput<'_>,
-    index: &PackageSyntaxIndex,
+    index: &PackageSyntaxIndex<'_>,
     list: &PackageBraceList,
     owner: PackageBraceOwner,
 ) -> Result<Doc, PackageDocumentError> {
@@ -495,6 +700,12 @@ fn comma_list_declaration(
     }
     if list.owner != owner {
         return Err(PackageDocumentError::WrongListOwner);
+    }
+    if !index.contains_list(list) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    if !index.matches_input(input) {
+        return Err(PackageDocumentError::InvalidEntry);
     }
 
     let tokens = &input.lexed().tokens;
@@ -522,7 +733,9 @@ fn comma_list_declaration(
     let mut closing_leading = comments.take_leading(close_token);
     let closing_trailing = comments.take_trailing(close_token);
 
-    let entries = index.entries(list);
+    let entries = index
+        .entries(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
     let mut list_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         if entry.end != entry.start + 1 {
@@ -550,7 +763,10 @@ fn comma_list_declaration(
     }
 
     let mut comma_trailing = vec![Vec::new(); list_entries.len().saturating_sub(1)];
-    for &separator in index.separators(list) {
+    for &separator in index
+        .separators(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+    {
         let separator_index = separator as usize;
         if tokens[separator_index].kind != PackageTokenKind::Punctuator(PackagePunctuator::Comma) {
             continue;
@@ -720,6 +936,15 @@ struct ListEntry<'a> {
     token_index: usize,
     leading: Vec<&'a AttachedComment>,
     trailing: Vec<&'a AttachedComment>,
+}
+
+struct ArtifactEntry<'a> {
+    target_index: usize,
+    path_index: usize,
+    target_leading: Vec<&'a AttachedComment>,
+    target_trailing: Vec<&'a AttachedComment>,
+    path_leading: Vec<&'a AttachedComment>,
+    path_trailing: Vec<&'a AttachedComment>,
 }
 
 #[derive(Default)]
@@ -914,9 +1139,10 @@ mod tests {
     use crate::{GroupId, print, print_with_forced_groups};
 
     use super::{
-        PackageDocumentError, allocator_declaration, authors_declaration, capability_declaration,
-        compiler_declaration, export_world_declaration, package_identity_declaration,
-        string_declaration, targets_declaration, token_text,
+        PackageDocumentError, allocator_declaration, artifact_components_declaration,
+        authors_declaration, capability_declaration, compiler_declaration,
+        export_world_declaration, package_identity_declaration, string_declaration,
+        targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -938,6 +1164,9 @@ mod tests {
                 capability_declaration(&input, &index, list)
             }
             PackageBraceOwner::Authors => authors_declaration(&input, &index, list),
+            PackageBraceOwner::ArtifactComponents => {
+                artifact_components_declaration(&input, &index, list)
+            }
             _ => panic!("unsupported simple-list owner in test helper"),
         }
         .expect("package list document");
@@ -996,7 +1225,7 @@ mod tests {
 
     fn find_declaration(
         input: &PackageInput<'_>,
-        index: &PackageSyntaxIndex,
+        index: &PackageSyntaxIndex<'_>,
         keyword: &str,
     ) -> std::ops::Range<u32> {
         index
@@ -1118,6 +1347,135 @@ mod tests {
                 false
             ),
             "authors {\n    \"Ada\" // retain this\n    \"Grace\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn always_breaks_component_artifact_entries_and_formats_empty_lists() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nartifact component { wasm32-wasi \"dist/app.wasm\" }\n",
+                PackageBraceOwner::ArtifactComponents,
+                false
+            ),
+            "artifact component {\n    wasm32-wasi \"dist/app.wasm\"\n}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nartifact component {\n\
+                    wasm32-wasi \"dist/wasm32.wasm\"\n\
+                    wasm64-wasi \"dist/wasm64.wasm\"\n\
+                }\n",
+                PackageBraceOwner::ArtifactComponents,
+                false
+            ),
+            "artifact component {\n    wasm32-wasi \"dist/wasm32.wasm\"\n    wasm64-wasi \"dist/wasm64.wasm\"\n}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nartifact component {}\n",
+                PackageBraceOwner::ArtifactComponents,
+                false
+            ),
+            "artifact component {}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_artifact_entry_comments_and_blank_lines() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  artifact component { /* opening */\n\
+                      wasm32-wasi /* target */ \"../outside.wasm\" // path\n\
+                      // closing\n\
+                  } // declaration\n",
+                PackageBraceOwner::ArtifactComponents,
+                false
+            ),
+            "artifact component { /* opening */\n    wasm32-wasi /* target */ \"../outside.wasm\" // path\n    // closing\n} // declaration\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nartifact component {\n\
+                    wasm32-wasi \"first.wasm\"\n\
+                    \n\
+                    wasm64-wasi \"second.wasm\"\n\
+                }\n",
+                PackageBraceOwner::ArtifactComponents,
+                false
+            ),
+            "artifact component {\n    wasm32-wasi \"first.wasm\"\n\n    wasm64-wasi \"second.wasm\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_semantically_invalid_artifact_targets_and_paths() {
+        let source =
+            b"package acme:app @ 1.0.0\nartifact component { imaginary-target \"../outside.wasm\" }\n";
+        let input = PackageInput::new(source);
+        assert!(input.refusals().is_empty(), "{:?}", input.refusals());
+        assert!(!input.parsed().errors().is_empty());
+        let index = PackageSyntaxIndex::new(&input).expect("valid package token structure");
+        let list = index
+            .brace_lists()
+            .iter()
+            .find(|list| list.owner == PackageBraceOwner::ArtifactComponents)
+            .expect("artifact list");
+        let doc = artifact_components_declaration(&input, &index, list).expect("artifact document");
+        assert_eq!(
+            print(&doc).expect("print document"),
+            "artifact component {\n    imaginary-target \"../outside.wasm\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn rejects_artifact_lists_from_another_syntax_index() {
+        let multi_input = PackageInput::new(
+            b"package acme:app @ 1.0.0\nartifact component {\n\
+                wasm32-wasi \"first.wasm\"\n\
+                wasm64-wasi \"second.wasm\"\n\
+            }\n",
+        );
+        let multi_index =
+            PackageSyntaxIndex::new(&multi_input).expect("valid multi-entry artifact list");
+        let foreign_list = multi_index
+            .brace_lists()
+            .first()
+            .expect("artifact list is indexed");
+
+        let single_input = PackageInput::new(
+            b"package acme:app @ 1.0.0\nartifact component { wasm32-wasi \"only.wasm\" }\n",
+        );
+        let single_index =
+            PackageSyntaxIndex::new(&single_input).expect("valid single-entry artifact list");
+
+        assert_eq!(
+            artifact_components_declaration(&single_input, &single_index, foreign_list),
+            Err(PackageDocumentError::WrongListOwner)
+        );
+        assert_eq!(
+            artifact_components_declaration(&single_input, &multi_index, foreign_list),
+            Err(PackageDocumentError::WrongListOwner)
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_input_and_index_for_comma_lists() {
+        let multi_input =
+            PackageInput::new(b"package acme:app @ 1.0.0\ntargets { wasm32-core, wasm32-wasi }\n");
+        let multi_index =
+            PackageSyntaxIndex::new(&multi_input).expect("valid multi-entry targets list");
+        let list = multi_index
+            .brace_lists()
+            .first()
+            .expect("targets list is indexed");
+        let single_input =
+            PackageInput::new(b"package acme:app @ 1.0.0\ntargets { wasm32-core }\n");
+
+        assert_eq!(
+            targets_declaration(&single_input, &multi_index, list),
+            Err(PackageDocumentError::InvalidEntry)
         );
     }
 
