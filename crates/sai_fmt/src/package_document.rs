@@ -54,6 +54,525 @@ pub(crate) fn authors_declaration(
     comma_list_declaration(input, index, list, PackageBraceOwner::Authors)
 }
 
+pub(crate) fn budget_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if list.owner != PackageBraceOwner::Budget
+        || list.kind() != crate::package_surface::PackageListKind::CommaOrLine
+        || !index.contains_list(list)
+    {
+        return Err(PackageDocumentError::WrongListOwner);
+    }
+    if !index.matches_input(input) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let opening_brace =
+        usize::try_from(list.open_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let closing_brace =
+        usize::try_from(list.close_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    if opening_brace >= closing_brace {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let keyword_index = opening_brace
+        .checked_sub(1)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let keyword = tokens
+        .get(keyword_index)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if keyword.kind != PackageTokenKind::Word
+        || token_text(input.source(), keyword) != "budget"
+        || tokens.get(opening_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::LeftBrace)
+        })
+        || tokens.get(closing_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut comments = TokenComments::new(input, tokens, keyword_index, closing_brace);
+    let mut keyword_leading = comments.take_leading(keyword_index);
+    let keyword_trailing = comments.take_trailing(keyword_index);
+    let opening_leading = comments.take_leading(opening_brace);
+    let opening_trailing = comments.take_trailing(opening_brace);
+    let mut closing_leading = comments.take_leading(closing_brace);
+    let closing_trailing = comments.take_trailing(closing_brace);
+
+    let entries = index
+        .entries(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let mut budget_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.start <= list.open_token
+            || entry.end > list.close_token
+            || entry.end.checked_sub(entry.start) != Some(4)
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let start = usize::try_from(entry.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let end = usize::try_from(entry.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let entry_tokens = tokens
+            .get(start..end)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let [metric, operator, amount, unit] = entry_tokens else {
+            return Err(PackageDocumentError::InvalidEntry);
+        };
+        if metric.kind != PackageTokenKind::Word
+            || operator.kind != PackageTokenKind::Punctuator(PackagePunctuator::LessEqual)
+            || amount.kind != PackageTokenKind::Integer
+            || unit.kind != PackageTokenKind::UpperWord
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let mut leading = Vec::with_capacity(entry_tokens.len());
+        let mut trailing = Vec::with_capacity(entry_tokens.len());
+        for token_index in start..end {
+            leading.push(comments.take_leading(token_index));
+            trailing.push(comments.take_trailing(token_index));
+        }
+        budget_entries.push(BudgetEntry {
+            token_indices: start..end,
+            leading,
+            trailing,
+        });
+    }
+
+    let mut comma_trailing = vec![Vec::new(); budget_entries.len().saturating_sub(1)];
+    for &separator in index
+        .separators(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+    {
+        let separator_index = separator as usize;
+        match tokens
+            .get(separator_index)
+            .map(|token| token.kind)
+            .ok_or(PackageDocumentError::InvalidEntry)?
+        {
+            PackageTokenKind::Newline => continue,
+            PackageTokenKind::Punctuator(PackagePunctuator::Comma) => {}
+            _ => return Err(PackageDocumentError::InvalidEntry),
+        }
+
+        let next_entry =
+            budget_entries.partition_point(|entry| entry.token_indices.end <= separator_index);
+        let previous_entry = next_entry
+            .checked_sub(1)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let mut leading = comments.take_leading(separator_index);
+        let mut trailing = comments.take_trailing(separator_index);
+        if next_entry < budget_entries.len() {
+            leading.append(&mut budget_entries[next_entry].leading[0]);
+            sort_comments(input, &mut leading);
+            budget_entries[next_entry].leading[0] = leading;
+            comma_trailing[previous_entry].append(&mut trailing);
+            sort_comments(input, &mut comma_trailing[previous_entry]);
+        } else {
+            leading.append(&mut closing_leading);
+            sort_comments(input, &mut leading);
+            closing_leading = leading;
+            budget_entries[previous_entry]
+                .trailing
+                .last_mut()
+                .ok_or(PackageDocumentError::InvalidEntry)?
+                .append(&mut trailing);
+            sort_comments(
+                input,
+                budget_entries[previous_entry]
+                    .trailing
+                    .last_mut()
+                    .ok_or(PackageDocumentError::InvalidEntry)?,
+            );
+        }
+    }
+
+    if comments.has_pending(keyword_index, closing_brace) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+    sort_comments(input, &mut keyword_leading);
+
+    let mut prefix = leading_comments_before(
+        input,
+        &keyword_leading,
+        Some(tokens[keyword_index].span.start),
+    );
+    let needs_group = !budget_entries.is_empty()
+        || !opening_leading.is_empty()
+        || !opening_trailing.is_empty()
+        || !closing_leading.is_empty();
+    if !needs_group {
+        prefix.extend([
+            Doc::text("budget"),
+            trailing_comments(input, &keyword_trailing),
+            Doc::text(" {}"),
+            trailing_comments(input, &closing_trailing),
+        ]);
+        return Ok(Doc::concat(prefix));
+    }
+
+    let group = GroupId(list.open_token);
+    let mut declaration = vec![
+        Doc::text("budget"),
+        trailing_comments(input, &keyword_trailing),
+    ];
+    if opening_leading.is_empty() {
+        declaration.push(Doc::text(" "));
+    } else {
+        declaration.push(Doc::HardLine);
+        if opening_leading[0].line_breaks_before() > 1 {
+            declaration.push(Doc::HardLine);
+        }
+        declaration.extend(leading_comments_before(
+            input,
+            &opening_leading,
+            Some(tokens[opening_brace].span.start),
+        ));
+    }
+    declaration.push(Doc::text("{"));
+
+    let empty_inline_comment = budget_entries.is_empty() && !opening_trailing.is_empty();
+    let mut body = vec![trailing_comments(input, &opening_trailing)];
+    if !budget_entries.is_empty() {
+        body.push(Doc::Line);
+        for position in 0..budget_entries.len() {
+            let previous_end = position.checked_sub(1).map(|previous_position| {
+                tokens[budget_entries[previous_position].token_indices.end - 1]
+                    .span
+                    .end
+            });
+            let entry = &mut budget_entries[position];
+            if position > 0 {
+                let current_start = tokens[entry.token_indices.start].span.start;
+                let has_leading_comment = !entry.leading[0].is_empty();
+                let preserve_blank_line = if has_leading_comment {
+                    entry.leading[0][0].line_breaks_before() > 1
+                } else {
+                    has_blank_line(
+                        input,
+                        previous_end.ok_or(PackageDocumentError::InvalidEntry)?,
+                        current_start,
+                    )
+                };
+
+                let next_token = &tokens[entry.token_indices.start];
+                let mut broken_separator = Vec::new();
+                if is_package_continuation_word(input, next_token) {
+                    broken_separator.push(Doc::text(","));
+                }
+                broken_separator.extend([
+                    trailing_comments(input, &comma_trailing[position - 1]),
+                    Doc::Line,
+                ]);
+                if preserve_blank_line {
+                    broken_separator.push(Doc::Line);
+                }
+                let flat_separator = Doc::concat([
+                    Doc::text(","),
+                    trailing_comments(input, &comma_trailing[position - 1]),
+                    Doc::text(" "),
+                ]);
+                body.push(Doc::if_broken(
+                    group,
+                    Doc::concat(broken_separator),
+                    flat_separator,
+                ));
+            }
+            body.extend(budget_entry_document(input, tokens, entry)?);
+        }
+    }
+    if !closing_leading.is_empty() {
+        sort_comments(input, &mut closing_leading);
+        let gap_start = budget_entries
+            .last()
+            .map(|entry| tokens[entry.token_indices.end - 1].span.end)
+            .unwrap_or(tokens[opening_brace].span.end);
+        body.push(Doc::HardLine);
+        if !budget_entries.is_empty()
+            && has_blank_line(
+                input,
+                gap_start,
+                input.comment_span(closing_leading[0]).start,
+            )
+        {
+            body.push(Doc::HardLine);
+        }
+        body.extend(leading_comments_before(input, &closing_leading, None));
+    }
+
+    let group_doc = Doc::group(
+        group,
+        Doc::concat([
+            Doc::concat(declaration),
+            Doc::indent(Doc::concat(body)),
+            if empty_inline_comment {
+                Doc::HardLine
+            } else if budget_entries.last().is_some_and(|entry| {
+                entry.trailing.last().is_some_and(|comments| {
+                    comments.iter().any(|comment| {
+                        input.comment_kind(comment) == PackageTriviaKind::BlockComment
+                            && !normalized_comment_text(input, comment).contains('\n')
+                    })
+                })
+            }) {
+                Doc::if_broken(group, Doc::Line, Doc::text(""))
+            } else {
+                Doc::Line
+            },
+            Doc::text("}"),
+        ]),
+    );
+    prefix.push(group_doc);
+    prefix.push(trailing_comments(input, &closing_trailing));
+    Ok(Doc::concat(prefix))
+}
+
+pub(crate) fn profile_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if list.owner != PackageBraceOwner::ProfileBody
+        || list.kind() != crate::package_surface::PackageListKind::LinesOnly
+        || !index.contains_list(list)
+    {
+        return Err(PackageDocumentError::WrongListOwner);
+    }
+    if !index.matches_input(input) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let opening_brace =
+        usize::try_from(list.open_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let closing_brace =
+        usize::try_from(list.close_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    if opening_brace >= closing_brace {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let header_start = opening_brace
+        .checked_sub(2)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let [keyword, name] = tokens
+        .get(header_start..opening_brace)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+    else {
+        return Err(PackageDocumentError::InvalidEntry);
+    };
+    if keyword.kind != PackageTokenKind::Word
+        || token_text(input.source(), keyword) != "profile"
+        || name.kind != PackageTokenKind::Word
+        || tokens.get(opening_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::LeftBrace)
+        })
+        || tokens.get(closing_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut comments = TokenComments::new(input, tokens, header_start, closing_brace);
+    let mut keyword_leading = comments.take_leading(header_start);
+    let keyword_trailing = comments.take_trailing(header_start);
+    let name_leading = comments.take_leading(header_start + 1);
+    let name_trailing = comments.take_trailing(header_start + 1);
+    let opening_leading = comments.take_leading(opening_brace);
+    let opening_trailing = comments.take_trailing(opening_brace);
+    let mut closing_leading = comments.take_leading(closing_brace);
+    let closing_trailing = comments.take_trailing(closing_brace);
+
+    let entries = index
+        .entries(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let mut profile_entries = Vec::with_capacity(entries.len());
+    for (entry_number, entry) in entries.iter().enumerate() {
+        if entry.start <= list.open_token
+            || entry.end > list.close_token
+            || entry.start >= entry.end
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let start = usize::try_from(entry.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let end = usize::try_from(entry.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let item_tokens = tokens
+            .get(start..end)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let owner = match item_tokens.first() {
+            Some(token)
+                if token.kind == PackageTokenKind::Word
+                    && token_text(input.source(), token) == "allow" =>
+            {
+                PackageBraceOwner::Allow
+            }
+            Some(token)
+                if token.kind == PackageTokenKind::Word
+                    && token_text(input.source(), token) == "budget" =>
+            {
+                PackageBraceOwner::Budget
+            }
+            _ => return Err(PackageDocumentError::InvalidEntry),
+        };
+        let open_index = start
+            .checked_add(1)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let close_index = end
+            .checked_sub(1)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        if item_tokens.len() < 3
+            || tokens.get(open_index).is_none_or(|token| {
+                token.kind != PackageTokenKind::Punctuator(PackagePunctuator::LeftBrace)
+            })
+            || tokens.get(close_index).is_none_or(|token| {
+                token.kind != PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+            })
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let child_open =
+            u32::try_from(open_index).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let parent_entry =
+            u32::try_from(entry_number).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let child_list = index
+            .brace_lists()
+            .iter()
+            .find(|child| child.open_token == child_open)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        if child_list.owner != owner
+            || child_list.close_token as usize != close_index
+            || child_list.parent_open_token(index) != Some(list.open_token)
+            || child_list.parent_entry() != Some(parent_entry)
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let document = match owner {
+            PackageBraceOwner::Allow => capability_declaration(input, index, child_list)?,
+            PackageBraceOwner::Budget => budget_declaration(input, index, child_list)?,
+            _ => return Err(PackageDocumentError::InvalidEntry),
+        };
+        let mut leading = comments.take_leading(start);
+        for token_index in start..end {
+            if token_index != start {
+                let _ = comments.take_leading(token_index);
+            }
+            let _ = comments.take_trailing(token_index);
+        }
+        sort_comments(input, &mut leading);
+        profile_entries.push(ProfileEntry {
+            token_indices: start..end,
+            leading,
+            document,
+        });
+    }
+
+    if index
+        .separators(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+        .iter()
+        .any(|separator| {
+            tokens
+                .get(*separator as usize)
+                .is_none_or(|token| token.kind != PackageTokenKind::Newline)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    if comments.has_pending(header_start, closing_brace) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+    sort_comments(input, &mut keyword_leading);
+
+    let mut document = leading_comments_before(input, &keyword_leading, Some(keyword.span.start));
+    document.push(Doc::text("profile"));
+    document.push(trailing_comments(input, &keyword_trailing));
+    if name_leading.is_empty() {
+        document.push(Doc::text(" "));
+    } else {
+        document.extend(leading_comments_before(
+            input,
+            &name_leading,
+            Some(name.span.start),
+        ));
+    }
+    document.push(Doc::text(token_text(input.source(), name)));
+    document.push(trailing_comments(input, &name_trailing));
+    if opening_leading.is_empty() {
+        document.push(Doc::text(" "));
+    } else {
+        document.push(Doc::HardLine);
+        if opening_leading[0].line_breaks_before() > 1 {
+            document.push(Doc::HardLine);
+        }
+        document.extend(leading_comments_before(
+            input,
+            &opening_leading,
+            Some(tokens[opening_brace].span.start),
+        ));
+    }
+    document.push(Doc::text("{"));
+
+    let has_body =
+        !profile_entries.is_empty() || !opening_trailing.is_empty() || !closing_leading.is_empty();
+    if has_body {
+        let mut body = vec![trailing_comments(input, &opening_trailing)];
+        if !profile_entries.is_empty() {
+            body.push(Doc::HardLine);
+            for position in 0..profile_entries.len() {
+                if position > 0 {
+                    let previous = &profile_entries[position - 1];
+                    let entry = &profile_entries[position];
+                    let previous_end = tokens[previous.token_indices.end - 1].span.end;
+                    let current_start = tokens[entry.token_indices.start].span.start;
+                    let preserve_blank_line = entry.leading.first().map_or_else(
+                        || has_blank_line(input, previous_end, current_start),
+                        |comment| comment.line_breaks_before() > 1,
+                    );
+                    body.push(Doc::HardLine);
+                    if preserve_blank_line {
+                        body.push(Doc::HardLine);
+                    }
+                }
+                body.push(profile_entries[position].document.clone());
+            }
+        }
+        if !closing_leading.is_empty() {
+            sort_comments(input, &mut closing_leading);
+            body.push(Doc::HardLine);
+            if !profile_entries.is_empty()
+                && has_blank_line(
+                    input,
+                    tokens[profile_entries
+                        .last()
+                        .expect("non-empty profile entries")
+                        .token_indices
+                        .end
+                        - 1]
+                    .span
+                    .end,
+                    input.comment_span(closing_leading[0]).start,
+                )
+            {
+                body.push(Doc::HardLine);
+            }
+            body.extend(leading_comments_before(input, &closing_leading, None));
+        }
+        document.push(Doc::indent(Doc::concat(body)));
+        document.push(Doc::HardLine);
+    }
+    document.push(Doc::text("}"));
+    document.push(trailing_comments(input, &closing_trailing));
+    Ok(Doc::concat(document))
+}
+
 pub(crate) fn artifact_components_declaration(
     input: &PackageInput<'_>,
     index: &PackageSyntaxIndex<'_>,
@@ -1272,6 +1791,19 @@ const fn is_version_requirement_continuation(kind: PackageTokenKind) -> bool {
     )
 }
 
+const fn package_token_ends_line(kind: PackageTokenKind) -> bool {
+    matches!(
+        kind,
+        PackageTokenKind::Word
+            | PackageTokenKind::UpperWord
+            | PackageTokenKind::PackagePath
+            | PackageTokenKind::Integer
+            | PackageTokenKind::Version
+            | PackageTokenKind::String
+            | PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+    )
+}
+
 fn requirement_entry_document(
     input: &PackageInput<'_>,
     index: &PackageSyntaxIndex<'_>,
@@ -1579,6 +2111,75 @@ fn override_entry_document(
     document
 }
 
+fn budget_entry_document(
+    input: &PackageInput<'_>,
+    tokens: &[PackageToken],
+    entry: &mut BudgetEntry<'_>,
+) -> Result<Vec<Doc>, PackageDocumentError> {
+    let mut document = Vec::new();
+    let entry_len = entry.token_indices.len();
+    if entry_len != 4 || entry.leading.len() != entry_len || entry.trailing.len() != entry_len {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    for offset in 0..entry_len {
+        let token_index = entry.token_indices.start + offset;
+        let token = tokens
+            .get(token_index)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let leading = &mut entry.leading[offset];
+        let trailing = &entry.trailing[offset];
+        sort_comments(input, leading);
+
+        if offset == 0 {
+            document.extend(leading_comments_before(
+                input,
+                leading,
+                Some(token.span.start),
+            ));
+        } else {
+            let previous = tokens
+                .get(token_index - 1)
+                .ok_or(PackageDocumentError::InvalidEntry)?;
+            let previous_trailing = &entry.trailing[offset - 1];
+            let requires_break =
+                !leading.is_empty() || trailing_comments_force_line_break(input, previous_trailing);
+            if requires_break {
+                if package_token_ends_line(previous.kind) {
+                    return Err(PackageDocumentError::InvalidEntry);
+                }
+                let mut continuation = vec![Doc::HardLine];
+                if leading.first().is_some_and(|comment| {
+                    previous_trailing.last().is_some_and(|previous| {
+                        has_blank_line(
+                            input,
+                            input.comment_span(previous).end,
+                            input.comment_span(comment).start,
+                        )
+                    })
+                }) {
+                    continuation.push(Doc::HardLine);
+                }
+                continuation.extend(leading_comments_before(
+                    input,
+                    leading,
+                    Some(token.span.start),
+                ));
+                continuation.push(Doc::text(token_text(input.source(), token)));
+                continuation.push(trailing_comments(input, trailing));
+                document.push(Doc::indent(Doc::concat(continuation)));
+                continue;
+            }
+            document.push(Doc::text(" "));
+        }
+
+        document.push(Doc::text(token_text(input.source(), token)));
+        document.push(trailing_comments(input, trailing));
+    }
+
+    Ok(document)
+}
+
 fn valid_version_requirement_tokens(tokens: &[PackageToken]) -> bool {
     if tokens.len() == 1 {
         return matches!(
@@ -1647,6 +2248,14 @@ fn trailing_comments_force_line_break(
             PackageTriviaKind::BlockComment => input.comment_text(comment).contains('\n'),
             _ => false,
         })
+}
+
+fn is_package_continuation_word(input: &PackageInput<'_>, token: &PackageToken) -> bool {
+    token.kind == PackageTokenKind::Word
+        && matches!(
+            token_text(input.source(), token),
+            "from" | "dir" | "only" | "grant"
+        )
 }
 
 fn comma_list_declaration(
@@ -1825,7 +2434,10 @@ fn comma_list_declaration(
                     blank_line_before_entry
                 };
                 let mut broken_separator =
-                    Vec::with_capacity(comma_trailing[position - 1].len() + 2);
+                    Vec::with_capacity(comma_trailing[position - 1].len() + 3);
+                if is_package_continuation_word(input, &tokens[current.token_index]) {
+                    broken_separator.push(Doc::text(","));
+                }
                 broken_separator.push(trailing_comments(input, &comma_trailing[position - 1]));
                 broken_separator.push(Doc::Line);
                 if preserve_blank_line {
@@ -1903,6 +2515,18 @@ struct ListEntry<'a> {
     token_index: usize,
     leading: Vec<&'a AttachedComment>,
     trailing: Vec<&'a AttachedComment>,
+}
+
+struct BudgetEntry<'a> {
+    token_indices: Range<usize>,
+    leading: Vec<Vec<&'a AttachedComment>>,
+    trailing: Vec<Vec<&'a AttachedComment>>,
+}
+
+struct ProfileEntry<'a> {
+    token_indices: Range<usize>,
+    leading: Vec<&'a AttachedComment>,
+    document: Doc,
 }
 
 struct ArtifactEntry<'a> {
@@ -2113,9 +2737,10 @@ mod tests {
 
     use super::{
         PackageDocumentError, allocator_declaration, artifact_components_declaration,
-        authors_declaration, capability_declaration, compiler_declaration,
+        authors_declaration, budget_declaration, capability_declaration, compiler_declaration,
         export_world_declaration, overrides_declaration, package_identity_declaration,
-        requirements_declaration, string_declaration, targets_declaration, token_text,
+        profile_declaration, requirements_declaration, string_declaration, targets_declaration,
+        token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -2137,6 +2762,7 @@ mod tests {
                 capability_declaration(&input, &index, list)
             }
             PackageBraceOwner::Authors => authors_declaration(&input, &index, list),
+            PackageBraceOwner::Budget => budget_declaration(&input, &index, list),
             PackageBraceOwner::ArtifactComponents => {
                 artifact_components_declaration(&input, &index, list)
             }
@@ -2144,6 +2770,7 @@ mod tests {
             PackageBraceOwner::Requires | PackageBraceOwner::RequiresTest => {
                 requirements_declaration(&input, &index, list)
             }
+            PackageBraceOwner::ProfileBody => profile_declaration(&input, &index, list),
             _ => panic!("unsupported simple-list owner in test helper"),
         }
         .expect("package list document");
@@ -2636,6 +3263,121 @@ mod tests {
     }
 
     #[test]
+    fn formats_profile_bodies_and_nested_budget_lists() {
+        let formatted = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              profile release {\n\
+                  allow { alloc, wasi:filesystem }\n\
+                  budget { wasm<=64 KiB, stack <= 1 MiB }\n\
+              }\n",
+            PackageBraceOwner::ProfileBody,
+            false,
+        );
+        assert_eq!(
+            formatted,
+            "profile release {\n    allow { alloc, wasi:filesystem }\n    budget { wasm <= 64 KiB, stack <= 1 MiB }\n}\n"
+        );
+
+        let commented = render_owner(
+            b"package acme:app @ 1.0.0\n\
+                  profile tiny {\n\
+                  // set the memory budget\n\
+                  budget { // keep budget opening comment\n\
+                      wasm <= // retain operator comment\n\
+                          64 KiB, // retain comma comment\n\
+                      stack <= 1 MiB\n\
+                  }\n\
+              }\n",
+            PackageBraceOwner::ProfileBody,
+            false,
+        );
+        assert_eq!(
+            commented,
+            "profile tiny {\n    // set the memory budget\n    budget { // keep budget opening comment\n        wasm <= // retain operator comment\n            64 KiB // retain comma comment\n        stack <= 1 MiB\n    }\n}\n"
+        );
+
+        for formatted in [formatted, commented] {
+            let mut source = b"package acme:app @ 1.0.0\n".to_vec();
+            source.extend_from_slice(formatted.as_bytes());
+            let reparsed = PackageInput::new(&source);
+            assert!(reparsed.refusals().is_empty(), "{:?}", reparsed.refusals());
+            assert!(
+                reparsed.parsed().errors().is_empty(),
+                "{:?}",
+                reparsed.parsed().errors()
+            );
+            assert_eq!(
+                render_owner(formatted.as_bytes(), PackageBraceOwner::ProfileBody, false,),
+                formatted
+            );
+        }
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nprofile tiny { budget {} }\n",
+                PackageBraceOwner::ProfileBody,
+                false
+            ),
+            "profile tiny {\n    budget {}\n}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  profile /* profile keyword */ dev /* profile name */ { allow { alloc } } // profile close\n",
+                PackageBraceOwner::ProfileBody,
+                false
+            ),
+            "profile /* profile keyword */ dev /* profile name */ {\n    allow { alloc }\n} // profile close\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  profile dev { budget { wasm /* metric */ <= /* operator */ 64 KiB } }\n",
+                PackageBraceOwner::ProfileBody,
+                false
+            ),
+            "profile dev {\n    budget { wasm /* metric */ <= /* operator */ 64 KiB }\n}\n"
+        );
+        let budget_continuation = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              profile dev {\n\
+                  budget { wasm <= 64 KiB, // force separator retention\n\
+                      from <= 1 MiB }\n\
+              }\n",
+            PackageBraceOwner::ProfileBody,
+            false,
+        );
+        assert_eq!(
+            budget_continuation,
+            "profile dev {\n    budget {\n        wasm <= 64 KiB, // force separator retention\n        from <= 1 MiB\n    }\n}\n"
+        );
+        let mut source = b"package acme:app @ 1.0.0\n".to_vec();
+        source.extend_from_slice(budget_continuation.as_bytes());
+        let reparsed = PackageInput::new(&source);
+        assert!(reparsed.refusals().is_empty(), "{:?}", reparsed.refusals());
+        assert!(
+            reparsed.parsed().errors().is_empty(),
+            "{:?}",
+            reparsed.parsed().errors()
+        );
+        assert_eq!(
+            render_owner(
+                budget_continuation.as_bytes(),
+                PackageBraceOwner::ProfileBody,
+                false
+            ),
+            budget_continuation
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nprofile dev {}\n",
+                PackageBraceOwner::ProfileBody,
+                false
+            ),
+            "profile dev {}\n"
+        );
+    }
+
+    #[test]
     fn formats_empty_requirement_lists_and_preserves_invalid_version_values() {
         assert_eq!(
             render_owner(
@@ -2976,6 +3718,27 @@ mod tests {
                 false
             ),
             "targets { wasm32-wasi, imaginary, wasm32-wasi }\n"
+        );
+    }
+
+    #[test]
+    fn keeps_commas_before_continuation_words_when_breaking_lists() {
+        let source = b"package acme:app @ 1.0.0\n\
+            targets { wasm32-core, // force a broken list\n\
+                from, grant }\n";
+        let formatted = render(source, false);
+        assert_eq!(
+            formatted,
+            "targets {\n    wasm32-core, // force a broken list\n    from,\n    grant\n}\n"
+        );
+        let mut reparsed_source = b"package acme:app @ 1.0.0\n".to_vec();
+        reparsed_source.extend_from_slice(formatted.as_bytes());
+        let reparsed = PackageInput::new(&reparsed_source);
+        assert!(reparsed.refusals().is_empty(), "{:?}", reparsed.refusals());
+        assert!(
+            reparsed.parsed().errors().is_empty(),
+            "{:?}",
+            reparsed.parsed().errors()
         );
     }
 
