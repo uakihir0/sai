@@ -47,7 +47,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             Item::Interface(declaration) => {
                 interface_document(source, &declaration, &mut expression_group_ids)?
             }
-            Item::Type(declaration) => type_alias_document(source, &declaration)?,
+            Item::Type(declaration) => type_decl_document(source, &declaration)?,
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
         units.push(unit);
@@ -639,7 +639,7 @@ fn interface_document(
                 &ast::IfaceResource::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
                 expression_group_ids,
             ),
-            SyntaxKind::TYPE_DECL => type_alias_document(
+            SyntaxKind::TYPE_DECL => type_decl_document(
                 source,
                 &ast::TypeDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
             ),
@@ -725,7 +725,7 @@ fn iface_resource_document(
     })
 }
 
-fn type_alias_document(
+fn type_decl_document(
     source: &ParsedSource,
     declaration: &ast::TypeDecl,
 ) -> Result<ItemDocument, SourceDocumentError> {
@@ -737,12 +737,16 @@ fn type_alias_document(
         .name()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let generic_params = declaration.generic_params();
-    let alias = declaration
-        .alias_def()
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let ty = alias.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
-    if declaration.struct_def().is_some()
-        || alias.refinement().is_some()
+    let struct_def = declaration.struct_def();
+    let alias_def = declaration.alias_def();
+    let Some(definition) = struct_def
+        .as_ref()
+        .map(|definition| definition.syntax())
+        .or_else(|| alias_def.as_ref().map(|definition| definition.syntax()))
+    else {
+        return Err(SourceDocumentError::UnsupportedShape);
+    };
+    if struct_def.is_some() == alias_def.is_some()
         || direct_token_kinds(declaration.syntax())
             .into_iter()
             .filter(|kind| *kind != SyntaxKind::NEWLINE)
@@ -762,19 +766,7 @@ fn type_alias_document(
                         .as_ref()
                         .map(|params| params.syntax().text_range()),
                 )
-                .chain([alias.syntax().text_range()]))
-        || alias.syntax().children().count() != 1
-        || alias
-            .syntax()
-            .children()
-            .next()
-            .map(|child| child.text_range())
-            != Some(ty.syntax().text_range())
-        || direct_token_kinds(alias.syntax())
-            .into_iter()
-            .filter(|kind| *kind != SyntaxKind::NEWLINE)
-            .collect::<Vec<_>>()
-            != [SyntaxKind::EQ]
+                .chain([definition.text_range()]))
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
@@ -786,10 +778,64 @@ fn type_alias_document(
     if let Some(generic_params) = generic_params {
         documents.push(generic_params_document(source, &generic_params)?);
     }
-    documents.extend([
-        Doc::text(" ="),
-        movable_right_hand_side_document(type_document(source, &ty)?, true, None),
-    ]);
+
+    if let Some(alias) = alias_def {
+        let ty = alias.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+        if alias.refinement().is_some()
+            || alias.syntax().children().count() != 1
+            || alias
+                .syntax()
+                .children()
+                .next()
+                .map(|child| child.text_range())
+                != Some(ty.syntax().text_range())
+            || direct_token_kinds(alias.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>()
+                != [SyntaxKind::EQ]
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.extend([
+            Doc::text(" ="),
+            movable_right_hand_side_document(type_document(source, &ty)?, true, None),
+        ]);
+    } else if let Some(struct_def) = struct_def {
+        let where_clause = struct_def.where_clause();
+        let fields = struct_def
+            .fields()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        let expected_struct_children = where_clause
+            .as_ref()
+            .map(|clause| clause.syntax().text_range())
+            .into_iter()
+            .chain([fields.syntax().text_range()]);
+        if struct_def
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(expected_struct_children)
+            || direct_token_kinds(struct_def.syntax())
+                .into_iter()
+                .any(|kind| kind != SyntaxKind::NEWLINE)
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        if let Some(where_clause) = where_clause {
+            documents.push(Doc::indent(Doc::concat([
+                Doc::HardLine,
+                where_clause_document(source, &where_clause)?,
+            ])));
+            documents.push(Doc::HardLine);
+        } else {
+            documents.push(Doc::text(" "));
+        }
+        documents.push(record_fields_document(source, &fields)?);
+    } else {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
     let document = Doc::concat(documents);
     let range = declaration.syntax().text_range();
     let multiline = crate::print(&document)
@@ -802,6 +848,98 @@ fn type_alias_document(
         end: range.end().to_usize(),
         multiline,
     })
+}
+
+fn record_fields_document(
+    source: &ParsedSource,
+    fields: &ast::FieldList,
+) -> Result<Doc, SourceDocumentError> {
+    let declarations = fields.fields().collect::<Vec<_>>();
+    let tokens = direct_token_kinds(fields.syntax());
+    if tokens.len() < 2
+        || tokens.first() != Some(&SyntaxKind::L_BRACE)
+        || tokens.last() != Some(&SyntaxKind::R_BRACE)
+        || tokens[1..tokens.len() - 1]
+            .iter()
+            .any(|kind| !matches!(kind, SyntaxKind::NEWLINE | SyntaxKind::COMMA))
+        || fields
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(declarations
+                .iter()
+                .map(|declaration| declaration.syntax().text_range()))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let documents = declarations
+        .iter()
+        .map(|declaration| record_field_document(source, declaration))
+        .collect::<Result<Vec<_>, _>>()?;
+    if documents.is_empty() {
+        return Ok(Doc::text("{}"));
+    }
+
+    let mut body = vec![Doc::HardLine];
+    for (index, (declaration, document)) in declarations.iter().zip(documents).enumerate() {
+        if index > 0 {
+            let previous = &declarations[index - 1];
+            let gap = source
+                .text()
+                .get(
+                    previous.syntax().text_range().end().to_usize()
+                        ..declaration.syntax().text_range().start().to_usize(),
+                )
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            body.push(Doc::HardLine);
+            if gap.matches('\n').count() > 1 {
+                body.push(Doc::HardLine);
+            }
+        }
+        body.push(document);
+    }
+    Ok(Doc::concat([
+        Doc::text("{"),
+        Doc::indent(Doc::concat(body)),
+        Doc::HardLine,
+        Doc::text("}"),
+    ]))
+}
+
+fn record_field_document(
+    source: &ParsedSource,
+    field: &ast::FieldDecl,
+) -> Result<Doc, SourceDocumentError> {
+    if field.docs().is_some() || field.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let name = field.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let ty = field.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let tokens = direct_token_kinds(field.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if field
+        .syntax()
+        .children()
+        .map(|child| child.text_range())
+        .ne([name.syntax().text_range(), ty.syntax().text_range()])
+        || (tokens != [SyntaxKind::COLON] && tokens != [SyntaxKind::PUB_KW, SyntaxKind::COLON])
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = Vec::with_capacity(4);
+    if tokens.first() == Some(&SyntaxKind::PUB_KW) {
+        documents.push(Doc::text("pub "));
+    }
+    documents.extend([
+        Doc::text(node_text(source, name.syntax())),
+        Doc::text(": "),
+        type_document(source, &ty)?,
+    ]);
+    Ok(Doc::concat(documents))
 }
 
 fn item_list_body_document(
@@ -5325,6 +5463,42 @@ mod tests {
     }
 
     #[test]
+    fn formats_top_level_and_interface_record_types() {
+        let input = concat!(
+            "pub type Point{x:F64,\n\npub y:F64,\n}\n",
+            "type Pair<T> where T: Clone{left:T\nright:T}\n",
+            "type Marker{}\n",
+            "interface geometry{type Coordinate{x:F64}}\n",
+        );
+        let expected = concat!(
+            "pub type Point {\n",
+            "    x: F64\n",
+            "\n",
+            "    pub y: F64\n",
+            "}\n\n",
+            "type Pair<T>\n",
+            "    where T: Clone\n",
+            "{\n",
+            "    left: T\n",
+            "    right: T\n",
+            "}\n\n",
+            "type Marker {}\n\n",
+            "interface geometry {\n",
+            "    type Coordinate {\n",
+            "        x: F64\n",
+            "    }\n",
+            "}\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("record declarations parse");
+        let output = format_shape(input.as_bytes()).expect("record declarations format");
+
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted records reparse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn moves_long_alias_right_hand_sides_and_separates_following_items() {
         let right_hand_side = "A".repeat(96);
         let input = format!("type T = {right_hand_side}\ntype Next=U32\n");
@@ -5342,10 +5516,6 @@ mod tests {
     #[test]
     fn keeps_unhandled_type_declarations_fail_closed() {
         assert_eq!(
-            format_shape(b"type Point { x: I32 }"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
             format_shape(b"type Positive = I32 where self > 0"),
             Err(SourceDocumentError::UnsupportedShape)
         );
@@ -5355,6 +5525,10 @@ mod tests {
         );
         assert_eq!(
             format_shape(b"interface storage { @allow(UNUSED_IMPORTS) type Entry = Str }"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"type Point { @allow(UNUSED_IMPORTS) x: I32 }"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
@@ -7818,6 +7992,7 @@ mod tests {
                         SyntaxKind::EFFECT_SET
                             | SyntaxKind::BORROWS_CLAUSE
                             | SyntaxKind::MATCH_ARM_LIST
+                            | SyntaxKind::FIELD_LIST
                     ) {
                         elements.retain(
                             |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA),
