@@ -3016,10 +3016,12 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 name = "sai_cli"
 version = "0.1.0"
 dependencies = [
+ "cap-std",
  "sai_diagnostics",
  "sai_driver",
  "sai_fmt",
  "sai_package",
+ "sai_windows_fs",
  "unicode-width",
 ]
 
@@ -3141,6 +3143,7 @@ dependencies = [
 name = "sai_windows_fs"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "windows-sys 0.61.2",
 ]
 

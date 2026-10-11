@@ -13,4 +13,6 @@ sai_diagnostics = { path = "../sai_diagnostics" }
 sai_driver = { path = "../sai_driver" }
 sai_fmt = { path = "../sai_fmt" }
 sai_package = { path = "../sai_package" }
+sai_windows_fs = { path = "../sai_windows_fs" }
+cap-std = "=4.0.3"
 unicode-width.workspace = true
