@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -17,7 +18,10 @@ use sai_driver::CancellationToken;
 use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
 };
+use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 use unicode_width::UnicodeWidthChar;
+
+static NEXT_FMT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
 struct CliDiagnostic {
     code: &'static str,
@@ -68,8 +72,9 @@ struct CliOutputOptions {
 #[derive(Default)]
 struct FmtResult {
     check: bool,
-    changed: bool,
-    refused: bool,
+    files: usize,
+    changed: Vec<String>,
+    refused: Vec<String>,
     output: Option<String>,
 }
 
@@ -85,6 +90,11 @@ struct PendingFmtDiagnostic {
     help: Option<String>,
     data: Option<String>,
     order: usize,
+}
+
+struct FmtDiagnosticSource<'a> {
+    path: &'a str,
+    include_source_line: bool,
 }
 
 struct CliSourceIndex {
@@ -288,23 +298,33 @@ fn run_fmt(
 
     let positionals = collect_command_positionals(command, &None);
     if positionals.len() != 1 || positionals[0].0 != "-" {
-        let feature = if positionals.is_empty() {
-            "sai fmt workspace discovery and file selection"
-        } else {
-            "sai fmt file and directory formatting"
+        if positionals.is_empty() {
+            return report_feature_not_implemented(
+                CliOutputOptions {
+                    format: parsed.globals.format,
+                    quiet: parsed.globals.quiet,
+                    color: parsed.globals.color,
+                    max_errors: parsed.globals.max_errors,
+                },
+                "fmt",
+                3,
+                "sai fmt workspace discovery",
+                stdout,
+                stderr,
+            );
+        }
+        let mut retry_state = FmtPathRetryState {
+            remaining_retries: 8,
+            waiting_reported: false,
         };
-        return report_feature_not_implemented(
-            CliOutputOptions {
-                format: parsed.globals.format,
-                quiet: parsed.globals.quiet,
-                color: parsed.globals.color,
-                max_errors: parsed.globals.max_errors,
-            },
-            "fmt",
-            3,
-            feature,
+        return run_fmt_paths(
+            parsed,
+            command,
+            &positionals,
+            cancellation,
             stdout,
             stderr,
+            &mut retry_state,
         );
     }
 
@@ -391,6 +411,7 @@ fn run_fmt(
             let refused = matches!(error, sai_fmt::PackageFormatError::Refused(_));
             let diagnostics = package_format_diagnostics(
                 &source,
+                "<stdin>",
                 error,
                 parsed.globals.max_errors,
                 parsed.globals.format == OutputFormat::Human,
@@ -404,7 +425,8 @@ fn run_fmt(
                 diagnostics.total_error_count,
                 refused.then_some(FmtResult {
                     check,
-                    refused,
+                    files: 1,
+                    refused: refused.then(|| "<stdin>".to_owned()).into_iter().collect(),
                     ..FmtResult::default()
                 }),
                 stdout,
@@ -419,15 +441,17 @@ fn run_fmt(
     if check && differs {
         return report_fmt_diagnostics(
             parsed,
-            vec![unformatted_stdin_diagnostic(
+            vec![unformatted_file_diagnostic(
                 &source,
                 formatted.as_bytes(),
+                "<stdin>",
                 parsed.globals.format == OutputFormat::Human,
             )],
             1,
             Some(FmtResult {
                 check,
-                changed: true,
+                files: 1,
+                changed: vec!["<stdin>".to_owned()],
                 ..FmtResult::default()
             }),
             stdout,
@@ -451,7 +475,8 @@ fn run_fmt(
                 stdout,
                 FmtResult {
                     check,
-                    changed: differs,
+                    files: 1,
+                    changed: differs.then(|| "<stdin>".to_owned()).into_iter().collect(),
                     output: (!check).then_some(formatted),
                     ..FmtResult::default()
                 },
@@ -463,6 +488,809 @@ fn run_fmt(
             }
         }
     }
+}
+
+struct SelectedFmtFile {
+    path: PathBuf,
+    source_path: String,
+    package_root: Option<PathBuf>,
+    package_root_identity: Option<sai_windows_fs::FileIdentity>,
+    parent: Option<Arc<cap_std::fs::Dir>>,
+    name: OsString,
+    identity: sai_windows_fs::FileIdentity,
+    identity_guard: Option<std::fs::File>,
+}
+
+#[derive(Clone, Debug)]
+struct FmtPackageRoot {
+    path: PathBuf,
+    identity: sai_windows_fs::FileIdentity,
+    _directory: Option<Arc<cap_std::fs::Dir>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FmtPathSelectionSignature {
+    files: Vec<(
+        PathBuf,
+        sai_windows_fs::FileIdentity,
+        sai_windows_fs::FileIdentity,
+    )>,
+    missing: Vec<(usize, PathBuf)>,
+    errors: Vec<(PathBuf, io::ErrorKind, Option<i32>)>,
+}
+
+struct FmtPathRetryState {
+    remaining_retries: usize,
+    waiting_reported: bool,
+}
+
+fn open_fmt_package_root(
+    path: &Path,
+    selected_parent: Option<(&Path, &Arc<cap_std::fs::Dir>, sai_windows_fs::FileIdentity)>,
+) -> io::Result<FmtPackageRoot> {
+    let path = std::fs::canonicalize(path)?;
+    if let Some((parent_path, directory, identity)) = selected_parent {
+        if path == parent_path {
+            return Ok(FmtPackageRoot {
+                path: path.to_path_buf(),
+                identity,
+                _directory: Some(Arc::clone(directory)),
+            });
+        }
+    }
+    let directory = sai_windows_fs::open_directory_path_without_following(&path)?;
+    let identity = sai_windows_fs::file_identity(&directory)?;
+    Ok(FmtPackageRoot {
+        path: path.to_path_buf(),
+        identity,
+        _directory: Some(Arc::new(cap_std::fs::Dir::from_std_file(directory))),
+    })
+}
+
+fn inspect_fmt_package_root(path: &Path) -> io::Result<FmtPackageRoot> {
+    let path = std::fs::canonicalize(path)?;
+    let directory = sai_windows_fs::open_directory_path_without_following(&path)?;
+    let identity = sai_windows_fs::file_identity(&directory)?;
+    Ok(FmtPackageRoot {
+        path: path.to_path_buf(),
+        identity,
+        _directory: None,
+    })
+}
+
+fn normalize_fmt_package_roots(mut roots: Vec<FmtPackageRoot>) -> Vec<FmtPackageRoot> {
+    roots.sort_by(|left, right| {
+        left.path
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.path.as_os_str().as_encoded_bytes())
+    });
+    let mut identities = HashSet::new();
+    roots.retain(|root| identities.insert(root.identity));
+    roots
+}
+
+fn fmt_package_root_signature(
+    roots: &[FmtPackageRoot],
+) -> Vec<(PathBuf, sai_windows_fs::FileIdentity)> {
+    roots
+        .iter()
+        .map(|root| (root.path.clone(), root.identity))
+        .collect()
+}
+
+fn fmt_path_selection_signature(
+    selection: &crate::fmt_paths::FmtPathSelection,
+) -> FmtPathSelectionSignature {
+    FmtPathSelectionSignature {
+        files: selection
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.identity, file.parent_identity))
+            .collect(),
+        missing: selection.missing.clone(),
+        errors: selection
+            .errors
+            .iter()
+            .map(|error| {
+                (
+                    error.path.clone(),
+                    error.source.kind(),
+                    error.source.raw_os_error(),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn open_selected_fmt_file(file: &mut SelectedFmtFile) -> io::Result<cap_std::fs::File> {
+    if let Some(opened_file) = file.identity_guard.as_ref() {
+        return Ok(cap_std::fs::File::from_std(opened_file.try_clone()?));
+    }
+    let parent = file.parent.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "formatter input directory capability was not retained",
+        )
+    })?;
+    let parent_handle = parent.try_clone()?.into_std_file();
+    let parent_path = file.path.parent().unwrap_or(&file.path);
+    sai_windows_fs::open_file_without_following(&parent_handle, parent_path, &file.name)
+        .map(cap_std::fs::File::from_std)
+}
+
+fn run_fmt_paths(
+    parsed: &ParsedArgs,
+    command: &crate::args::ParsedCommand,
+    positionals: &[(OsString, usize)],
+    cancellation: &CancellationToken,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    retry_state: &mut FmtPathRetryState,
+) -> i32 {
+    let check = command_tail(command)
+        .iter()
+        .any(|(argument, _)| argument == "--check");
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            let diagnostic = fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                ".",
+                "could not resolve the current directory",
+                &error,
+            );
+            return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
+        }
+    };
+    let input_paths = positionals
+        .iter()
+        .map(|(path, _)| PathBuf::from(path))
+        .collect::<Vec<_>>();
+    let selection = crate::fmt_paths::select_fmt_paths(&input_paths, &cwd, cancellation);
+    if selection.interrupted {
+        return report_interrupted(parsed, stdout, stderr);
+    }
+    let selection_signature = fmt_path_selection_signature(&selection);
+    let mut diagnostics = Vec::new();
+    let mut total_error_count = 0usize;
+    let mut result = FmtResult {
+        check,
+        files: selection.files.len(),
+        ..FmtResult::default()
+    };
+    let mut human_changed_paths = Vec::new();
+
+    for (input_index, _) in selection.missing {
+        let (argument, command_index) = &positionals[input_index];
+        let argument_index = command
+            .argument_indices
+            .get(*command_index)
+            .map_or(0, |index| index + 1);
+        diagnostics.push(CliDiagnostic {
+            code: "PATH_NOT_FOUND",
+            message: format!("path `{}` does not exist", argument.to_string_lossy()),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: Some(argument_index),
+            argument: argument.to_string_lossy().into_owned(),
+            help: None,
+            data: None,
+        });
+        total_error_count = total_error_count.saturating_add(1);
+    }
+    for error in selection.errors {
+        let source_path = fmt_path_reference(&error.path, &cwd, None);
+        diagnostics.push(fmt_io_diagnostic(
+            "SOURCE_READ_FAILED",
+            &source_path,
+            "could not inspect a formatter input path",
+            &error.source,
+        ));
+        total_error_count = total_error_count.saturating_add(1);
+    }
+
+    let mut files = Vec::with_capacity(selection.files.len());
+    let mut roots_by_path = HashMap::<PathBuf, FmtPackageRoot>::new();
+    let mut blocked_files = HashSet::new();
+    for selected in selection.files {
+        if cancellation.is_cancelled() {
+            return report_interrupted(parsed, stdout, stderr);
+        }
+        let crate::fmt_paths::SelectedFmtPath {
+            path,
+            parent,
+            name,
+            identity,
+            identity_guard,
+            parent_identity,
+        } = selected;
+        let start_directory = path.parent().unwrap_or(&path);
+        let mut package_root_identity = None;
+        let package_root = match crate::package_discovery::find_root_package(start_directory, &cwd)
+        {
+            Ok(root) => {
+                let inspected_root = if let Some(root) = roots_by_path.get(&root) {
+                    Some(root.clone())
+                } else {
+                    let selected_parent = parent
+                        .as_ref()
+                        .map(|directory| (start_directory, directory, parent_identity));
+                    match open_fmt_package_root(&root, selected_parent) {
+                        Ok(root_capability) => {
+                            roots_by_path.insert(root.clone(), root_capability.clone());
+                            Some(root_capability)
+                        }
+                        Err(error) => {
+                            let source_path = fmt_path_reference(&path, &cwd, None);
+                            diagnostics.push(fmt_io_diagnostic(
+                                "WORKSPACE_LOCK_FAILED",
+                                &source_path,
+                                "could not identify the package lock for a formatter input",
+                                &error,
+                            ));
+                            total_error_count = total_error_count.saturating_add(1);
+                            blocked_files.insert(path.clone());
+                            None
+                        }
+                    }
+                };
+                package_root_identity = inspected_root.map(|root| root.identity);
+                Some(root)
+            }
+            Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound { .. }) => None,
+            Err(_error) => {
+                let source_path = fmt_path_reference(&path, &cwd, None);
+                diagnostics.push(fmt_io_diagnostic(
+                    "WORKSPACE_LOCK_FAILED",
+                    &source_path,
+                    "could not identify the package lock for a formatter input",
+                    &io::Error::other("package discovery failed"),
+                ));
+                total_error_count = total_error_count.saturating_add(1);
+                blocked_files.insert(path.clone());
+                None
+            }
+        };
+        files.push(SelectedFmtFile {
+            path,
+            source_path: String::new(),
+            package_root,
+            package_root_identity,
+            parent,
+            name,
+            identity,
+            identity_guard,
+        });
+    }
+    let roots = normalize_fmt_package_roots(roots_by_path.into_values().collect());
+    let locked_roots = fmt_package_root_signature(&roots);
+    let workspace_root = crate::package_discovery::find_root_package(&cwd, &cwd).ok();
+    for file in &mut files {
+        let source_root = workspace_root
+            .as_deref()
+            .filter(|root| file.path.starts_with(root))
+            .or_else(|| {
+                (roots.len() == 1)
+                    .then_some(file.package_root.as_deref())
+                    .flatten()
+            });
+        file.source_path = fmt_path_reference(&file.path, &cwd, source_root);
+    }
+    files.sort_by(|left, right| {
+        left.path
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.path.as_os_str().as_encoded_bytes())
+    });
+
+    let lock_mode = if check {
+        WorkspaceLockMode::Shared
+    } else {
+        WorkspaceLockMode::Exclusive
+    };
+    let mut held_locks = Vec::with_capacity(roots.len());
+    let mut failed_roots = HashSet::new();
+    for root in &roots {
+        loop {
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+            match WorkspaceLockGuard::try_acquire(&root.path, lock_mode) {
+                Ok(Some(guard)) => {
+                    held_locks.push(guard);
+                    break;
+                }
+                Ok(None) => {
+                    if !retry_state.waiting_reported
+                        && parsed.globals.format == OutputFormat::Human
+                        && !parsed.globals.quiet
+                    {
+                        if let Err(error) = stderr.write_all(b"waiting for .sai/lock\n") {
+                            return report_stderr_failure(error);
+                        }
+                        retry_state.waiting_reported = true;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_error) => {
+                    let package_path =
+                        fmt_path_reference(&root.path.join("sai.package"), &cwd, Some(&root.path));
+                    diagnostics.push(fmt_io_diagnostic(
+                        "WORKSPACE_LOCK_FAILED",
+                        &package_path,
+                        "could not acquire the package workspace lock",
+                        &io::Error::other("workspace lock is unavailable"),
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                    failed_roots.insert(root.identity);
+                    break;
+                }
+            }
+        }
+    }
+
+    let current_selection =
+        crate::fmt_paths::select_fmt_paths_for_comparison(&input_paths, &cwd, cancellation);
+    if current_selection.interrupted || cancellation.is_cancelled() {
+        return report_interrupted(parsed, stdout, stderr);
+    }
+    let mut current_roots_by_path = HashMap::new();
+    let mut current_discovery_failed = false;
+    for selected in &current_selection.files {
+        let path = &selected.path;
+        match crate::package_discovery::find_root_package(path.parent().unwrap_or(path), &cwd) {
+            Ok(root) => match current_roots_by_path.entry(root) {
+                std::collections::hash_map::Entry::Occupied(_) => {}
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    match inspect_fmt_package_root(entry.key()) {
+                        Ok(root_capability) => {
+                            entry.insert(root_capability);
+                        }
+                        Err(_) => current_discovery_failed = true,
+                    }
+                }
+            },
+            Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound { .. }) => {}
+            Err(_) => current_discovery_failed = true,
+        }
+    }
+    let current_roots = normalize_fmt_package_roots(current_roots_by_path.into_values().collect());
+    if current_discovery_failed
+        || fmt_package_root_signature(&current_roots) != locked_roots
+        || fmt_path_selection_signature(&current_selection) != selection_signature
+    {
+        drop(files);
+        drop(current_selection);
+        drop(held_locks);
+        if retry_state.remaining_retries > 0 {
+            retry_state.remaining_retries -= 1;
+            return run_fmt_paths(
+                parsed,
+                command,
+                positionals,
+                cancellation,
+                stdout,
+                stderr,
+                retry_state,
+            );
+        }
+        let diagnostic = fmt_io_diagnostic(
+            "SOURCE_READ_FAILED",
+            ".",
+            "formatter inputs kept changing while package locks were acquired",
+            &io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "formatter input set did not stabilize",
+            ),
+        );
+        return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
+    }
+    drop(current_selection);
+
+    let max_errors = if parsed.globals.max_errors == 0 {
+        usize::MAX
+    } else {
+        parsed.globals.max_errors
+    };
+    for mut file in files {
+        if cancellation.is_cancelled() {
+            return report_interrupted(parsed, stdout, stderr);
+        }
+        if blocked_files.contains(&file.path)
+            || file.package_root.as_ref().is_some_and(|_| {
+                file.package_root_identity
+                    .is_some_and(|identity| failed_roots.contains(&identity))
+            })
+        {
+            result.refused.push(file.source_path);
+            continue;
+        }
+        if file
+            .path
+            .file_name()
+            .is_some_and(|name| name == "sai.package")
+        {
+            let source_file = match open_selected_fmt_file(&mut file) {
+                Ok(file) => file,
+                Err(error) => {
+                    diagnostics.push(fmt_io_diagnostic(
+                        "SOURCE_READ_FAILED",
+                        &file.source_path,
+                        "could not open formatter input",
+                        &error,
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                    continue;
+                }
+            };
+            let permissions = match source_file.metadata() {
+                Ok(metadata) => metadata.permissions(),
+                Err(error) => {
+                    diagnostics.push(fmt_io_diagnostic(
+                        "SOURCE_READ_FAILED",
+                        &file.source_path,
+                        "could not inspect formatter input permissions",
+                        &error,
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                    continue;
+                }
+            };
+            let source = match read_file_limited(
+                source_file,
+                sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES,
+                cancellation,
+            ) {
+                Ok(source) => source,
+                Err(StdinReadError::Interrupted) => {
+                    return report_interrupted(parsed, stdout, stderr);
+                }
+                Err(StdinReadError::Io(error)) => {
+                    diagnostics.push(fmt_io_diagnostic(
+                        "SOURCE_READ_FAILED",
+                        &file.source_path,
+                        "could not read formatter input",
+                        &error,
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                    continue;
+                }
+            };
+            let source: Arc<[u8]> = source.into();
+            let formatting_result = sai_fmt::format_package_with_error_limit(&source, max_errors);
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+            let formatted = match formatting_result {
+                Ok(formatted) => formatted,
+                Err(error) => {
+                    let refused = matches!(error, sai_fmt::PackageFormatError::Refused(_));
+                    if refused {
+                        result.refused.push(file.source_path.clone());
+                    }
+                    let batch = package_format_diagnostics(
+                        &source,
+                        &file.source_path,
+                        error,
+                        parsed.globals.max_errors,
+                        parsed.globals.format == OutputFormat::Human,
+                    );
+                    total_error_count = total_error_count.saturating_add(batch.total_error_count);
+                    diagnostics.extend(batch.diagnostics);
+                    continue;
+                }
+            };
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+            let differs = source.as_ref() != formatted.as_bytes();
+            if differs {
+                if !check {
+                    if cancellation.is_cancelled() {
+                        return report_interrupted(parsed, stdout, stderr);
+                    }
+                    match write_file_atomically_in_directory(
+                        file.parent
+                            .as_deref()
+                            .expect("package manifest retains its parent directory"),
+                        &file.name,
+                        file.identity,
+                        source.as_ref(),
+                        permissions,
+                        formatted.as_bytes(),
+                    ) {
+                        Ok(()) => {
+                            result.changed.push(file.source_path.clone());
+                            human_changed_paths.push(human_file_path(&file.path.to_string_lossy()));
+                        }
+                        Err(error) => {
+                            if error.installed {
+                                result.changed.push(file.source_path.clone());
+                                human_changed_paths
+                                    .push(human_file_path(&file.path.to_string_lossy()));
+                            }
+                            diagnostics.push(fmt_io_diagnostic(
+                                "OUTPUT_WRITE_FAILED",
+                                &file.source_path,
+                                "could not write formatted file",
+                                &error.source,
+                            ));
+                            total_error_count = total_error_count.saturating_add(1);
+                        }
+                    }
+                } else {
+                    result.changed.push(file.source_path.clone());
+                    diagnostics.push(unformatted_file_diagnostic(
+                        &source,
+                        formatted.as_bytes(),
+                        &file.source_path,
+                        parsed.globals.format == OutputFormat::Human,
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                }
+            }
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+        } else {
+            result.refused.push(file.source_path.clone());
+            diagnostics.push(fmt_source_not_implemented_diagnostic(&file.source_path));
+            total_error_count = total_error_count.saturating_add(1);
+        }
+    }
+    if cancellation.is_cancelled() {
+        return report_interrupted(parsed, stdout, stderr);
+    }
+
+    if parsed.globals.format == OutputFormat::Human && !parsed.globals.quiet {
+        for path in human_changed_paths {
+            if check {
+                continue;
+            }
+            let line = format!("formatted {path}\n");
+            let line = escape_terminal_controls(&line);
+            if let Err(error) = stderr.write_all(line.as_bytes()) {
+                report_stderr_failure(error);
+                return 4;
+            }
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        return report_fmt_diagnostics(
+            parsed,
+            diagnostics,
+            total_error_count,
+            Some(result),
+            stdout,
+            stderr,
+        );
+    }
+    match parsed.globals.format {
+        OutputFormat::Human => 0,
+        OutputFormat::Json => {
+            if let Err(error) = write_json_fmt_success(stdout, result) {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn fmt_path_reference(path: &Path, cwd: &Path, package_root: Option<&Path>) -> String {
+    let relative = package_root
+        .and_then(|root| relative_path(root, path))
+        .or_else(|| relative_path(cwd, path));
+    relative.map_or_else(
+        || {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        },
+        |relative| format_relative_path(&relative),
+    )
+}
+
+fn fmt_io_diagnostic(
+    code: &'static str,
+    path: &str,
+    message: &str,
+    error: &io::Error,
+) -> CliDiagnostic {
+    CliDiagnostic {
+        code,
+        message: format!("{message}: {}", error),
+        primary: None,
+        primary_label: String::new(),
+        argument_index: None,
+        argument: path.to_owned(),
+        help: None,
+        data: Some(format!(
+            "{{\"path\":\"{}\",\"reason\":\"{}\"}}",
+            escape_json(path),
+            escape_json(&error.to_string())
+        )),
+    }
+}
+
+fn fmt_source_not_implemented_diagnostic(path: &str) -> CliDiagnostic {
+    let mut source = CliSourceIndex::new(Arc::from([]));
+    CliDiagnostic {
+        code: "FEATURE_NOT_IMPLEMENTED",
+        message: "stage 0 feature `sai fmt source files` is not implemented".to_owned(),
+        primary: Some(source.location(path, 0..0, false)),
+        primary_label: String::new(),
+        argument_index: None,
+        argument: path.to_owned(),
+        help: None,
+        data: Some("{\"stage\":0,\"feature\":\"sai fmt source files\"}".to_owned()),
+    }
+}
+
+fn read_file_limited(
+    mut file: impl Read,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, StdinReadError> {
+    let max_bytes = limit.saturating_add(1);
+    let mut source = Vec::with_capacity(max_bytes.min(8192));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(StdinReadError::Interrupted);
+        }
+        let remaining = max_bytes.saturating_sub(source.len());
+        if remaining == 0 {
+            return Ok(source);
+        }
+        let read_len = remaining.min(buffer.len());
+        match file.read(&mut buffer[..read_len]) {
+            Ok(0) => return Ok(source),
+            Ok(bytes_read) => source.extend_from_slice(&buffer[..bytes_read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(StdinReadError::Io(error)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AtomicFmtWriteError {
+    source: io::Error,
+    installed: bool,
+}
+
+fn write_file_atomically_in_directory(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    expected_identity: sai_windows_fs::FileIdentity,
+    expected_contents: &[u8],
+    permissions: cap_std::fs::Permissions,
+    contents: &[u8],
+) -> Result<(), AtomicFmtWriteError> {
+    for _ in 0..8 {
+        let serial = NEXT_FMT_TEMPORARY_FILE.fetch_add(1, AtomicOrdering::Relaxed);
+        let temporary_name =
+            OsString::from(format!(".sai-fmt-{}-{serial}.tmp", std::process::id()));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let temporary_parent = parent.try_clone().map_err(|source| AtomicFmtWriteError {
+            source,
+            installed: false,
+        })?;
+        let mut temporary_file = match parent.open_with(&temporary_name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(AtomicFmtWriteError {
+                    source,
+                    installed: false,
+                });
+            }
+        };
+        let mut temporary = TemporaryFmtFile {
+            parent: temporary_parent,
+            name: temporary_name.clone(),
+            published: false,
+        };
+        temporary_file
+            .write_all(contents)
+            .map_err(|source| AtomicFmtWriteError {
+                source,
+                installed: false,
+            })?;
+        temporary_file
+            .set_permissions(permissions.clone())
+            .map_err(|source| AtomicFmtWriteError {
+                source,
+                installed: false,
+            })?;
+        temporary_file
+            .sync_all()
+            .map_err(|source| AtomicFmtWriteError {
+                source,
+                installed: false,
+            })?;
+        drop(temporary_file);
+        let parent_handle = parent
+            .try_clone()
+            .map_err(|source| AtomicFmtWriteError {
+                source,
+                installed: false,
+            })?
+            .into_std_file();
+        sai_windows_fs::replace_file_in_directory_if_unchanged(
+            &parent_handle,
+            &temporary_name,
+            name,
+            expected_identity,
+            expected_contents,
+        )
+        .map_err(|source| AtomicFmtWriteError {
+            source,
+            installed: false,
+        })?;
+        temporary.published = true;
+        sync_fmt_parent_directory(parent).map_err(|source| AtomicFmtWriteError {
+            source,
+            installed: true,
+        })?;
+        return Ok(());
+    }
+    Err(AtomicFmtWriteError {
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a unique formatter temporary file",
+        ),
+        installed: false,
+    })
+}
+
+struct TemporaryFmtFile {
+    parent: cap_std::fs::Dir,
+    name: OsString,
+    published: bool,
+}
+
+impl Drop for TemporaryFmtFile {
+    fn drop(&mut self) {
+        if !self.published {
+            if let Ok(parent) = self.parent.try_clone() {
+                let _ =
+                    sai_windows_fs::remove_file_in_directory(&parent.into_std_file(), &self.name);
+            }
+        }
+    }
+}
+
+fn sync_fmt_parent_directory(parent: &cap_std::fs::Dir) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        match parent
+            .try_clone()
+            .map(|directory| directory.into_std_file())
+            .and_then(|directory| directory.sync_all())
+        {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -665,6 +1493,14 @@ fn report_fmt_diagnostics(
     stderr: &mut impl Write,
 ) -> i32 {
     diagnostics.sort_by(|left, right| {
+        let left_path = left
+            .primary
+            .as_ref()
+            .map_or_else(|| left.argument.clone(), |location| location.path.clone());
+        let right_path = right
+            .primary
+            .as_ref()
+            .map_or_else(|| right.argument.clone(), |location| location.path.clone());
         let left_offset = left
             .primary
             .as_ref()
@@ -673,8 +1509,10 @@ fn report_fmt_diagnostics(
             .primary
             .as_ref()
             .map_or(usize::MAX, |location| location.start.byte);
-        left_offset
-            .cmp(&right_offset)
+        left_path
+            .as_bytes()
+            .cmp(right_path.as_bytes())
+            .then_with(|| left_offset.cmp(&right_offset))
             .then_with(|| left.code.cmp(right.code))
             .then_with(|| left.message.cmp(&right.message))
     });
@@ -684,6 +1522,11 @@ fn report_fmt_diagnostics(
         .any(|diagnostic| diagnostic.code == "INTERNAL_COMPILER_ERROR")
     {
         101
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "OUTPUT_WRITE_FAILED")
+    {
+        4
     } else {
         1
     };
@@ -720,23 +1563,26 @@ fn report_fmt_diagnostics(
 }
 
 fn json_fmt_result(result: &FmtResult) -> String {
-    let changed = if result.changed {
-        "[\"<stdin>\"]"
-    } else {
-        "[]"
-    };
-    let refused = if result.refused {
-        "[\"<stdin>\"]"
-    } else {
-        "[]"
-    };
+    let changed = json_string_array(&result.changed);
+    let refused = json_string_array(&result.refused);
     let output = result.output.as_ref().map_or_else(
         || "null".to_owned(),
         |text| format!("\"{}\"", escape_json(text)),
     );
     format!(
-        "{{\"type\":\"result\",\"kind\":\"fmt\",\"data\":{{\"check\":{},\"files\":1,\"changed\":{},\"refused\":{},\"output\":{}}}}}",
-        result.check, changed, refused, output
+        "{{\"type\":\"result\",\"kind\":\"fmt\",\"data\":{{\"check\":{},\"files\":{},\"changed\":{},\"refused\":{},\"output\":{}}}}}",
+        result.check, result.files, changed, refused, output
+    )
+}
+
+fn json_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -757,6 +1603,7 @@ fn write_json_fmt_diagnostics(
 
 fn package_format_diagnostics(
     source: &Arc<[u8]>,
+    source_path: &str,
     error: sai_fmt::PackageFormatError,
     max_errors: usize,
     include_source_lines: bool,
@@ -807,12 +1654,15 @@ fn package_format_diagnostics(
                 .map(|pending| {
                     cli_source_diagnostic(
                         &mut source_index,
+                        FmtDiagnosticSource {
+                            path: source_path,
+                            include_source_line: include_source_lines,
+                        },
                         pending.code,
                         pending.message.into_owned(),
                         pending.span,
                         pending.data,
                         pending.help,
-                        include_source_lines,
                     )
                 })
                 .collect();
@@ -833,7 +1683,7 @@ fn package_format_diagnostics(
             };
             let mut source_index = CliSourceIndex::new(Arc::clone(source));
             let primary = failure.input_byte_offset.map(|offset| {
-                source_index.location("<stdin>", offset..offset, include_source_lines)
+                source_index.location(source_path, offset..offset, include_source_lines)
             });
             FmtDiagnosticBatch {
                 diagnostics: vec![internal_fmt_diagnostic(
@@ -1020,17 +1870,21 @@ fn internal_fmt_diagnostic(description: String, primary: Option<CliLocation>) ->
 
 fn cli_source_diagnostic(
     source: &mut CliSourceIndex,
+    source_location: FmtDiagnosticSource<'_>,
     code: &'static str,
     message: String,
     span: std::ops::Range<usize>,
     data: Option<String>,
     help: Option<String>,
-    include_source_line: bool,
 ) -> CliDiagnostic {
     CliDiagnostic {
         code,
         message,
-        primary: Some(source.location("<stdin>", span, include_source_line)),
+        primary: Some(source.location(
+            source_location.path,
+            span,
+            source_location.include_source_line,
+        )),
         primary_label: String::new(),
         argument_index: None,
         argument: String::new(),
@@ -1648,9 +2502,10 @@ fn display_width_after(mut bytes: &[u8], mut width: usize) -> usize {
     width
 }
 
-fn unformatted_stdin_diagnostic(
+fn unformatted_file_diagnostic(
     source: &Arc<[u8]>,
     formatted: &[u8],
+    source_path: &str,
     include_source_line: bool,
 ) -> CliDiagnostic {
     let mut input_lines = source.split_inclusive(|byte| *byte == b'\n');
@@ -1669,11 +2524,11 @@ fn unformatted_stdin_diagnostic(
     CliDiagnostic {
         code: "UNFORMATTED_FILE",
         message: "file is not formatted".to_owned(),
-        primary: Some(source_index.location("<stdin>", start..end, include_source_line)),
+        primary: Some(source_index.location(source_path, start..end, include_source_line)),
         primary_label: String::new(),
         argument_index: None,
         argument: String::new(),
-        help: Some("run `sai fmt --stdin-kind package -` to format this file".to_owned()),
+        help: Some("run `sai fmt <path>` to format this file".to_owned()),
         data: Some(format!(
             "{{\"line\":{},\"expected\":{}}}",
             line_index + 1,
@@ -3667,9 +4522,10 @@ mod tests {
 
     use super::{
         CancellationAwareStdin, CliDiagnostic, CliSourceIndex, EXPLAIN_CODE_SUMMARIES,
-        RenderedSourceLine, StdinBroker, StdinReadError, cli_position, human_file_path,
-        internal_fmt_diagnostic, parse_args, relative_path, report_fmt_diagnostics, run,
-        run_new_with_creator, run_with_cancellation, run_with_cancellation_and_input,
+        RenderedSourceLine, StdinBroker, StdinReadError, cli_position,
+        fmt_path_selection_signature, human_file_path, internal_fmt_diagnostic, parse_args,
+        relative_path, report_fmt_diagnostics, run, run_new_with_creator, run_with_cancellation,
+        run_with_cancellation_and_input, write_file_atomically_in_directory,
         write_human_diagnostics,
     };
     use sai_driver::CancellationToken;
@@ -4076,6 +4932,66 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fmt_selection_signature_detects_same_path_directory_and_file_replacements() {
+        let directory = TestDirectory::new();
+        let package = directory.child("package");
+        let moved = directory.child("moved");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("sai.package"), b"package acme:app@1.0.0\n").unwrap();
+
+        let initial = crate::fmt_paths::select_fmt_paths(
+            std::slice::from_ref(&package),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        let initial_signature = fmt_path_selection_signature(&initial);
+
+        fs::rename(&package, &moved).unwrap();
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("sai.package"), b"package acme:app@1.0.0\n").unwrap();
+        let directory_replacement = crate::fmt_paths::select_fmt_paths(
+            std::slice::from_ref(&package),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert_ne!(
+            fmt_path_selection_signature(&directory_replacement),
+            initial_signature
+        );
+
+        let file_signature = fmt_path_selection_signature(&directory_replacement);
+        let manifest = package.join("sai.package");
+        let moved_manifest = package.join("old.sai.package");
+        fs::rename(&manifest, &moved_manifest).unwrap();
+        fs::write(&manifest, b"package acme:app@1.0.0\n").unwrap();
+        let file_replacement = crate::fmt_paths::select_fmt_paths(
+            std::slice::from_ref(&package),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert_ne!(
+            fmt_path_selection_signature(&file_replacement),
+            file_signature
+        );
+    }
+
+    #[test]
+    fn formatter_package_roots_deduplicate_physical_aliases_deterministically() {
+        let directory = TestDirectory::new();
+        let physical = super::open_fmt_package_root(&directory.0, None).unwrap();
+        let mut first_alias = physical.clone();
+        first_alias.path = directory.0.join("z-alias");
+        let mut second_alias = physical;
+        second_alias.path = directory.0.join("a-alias");
+
+        let roots = super::normalize_fmt_package_roots(vec![first_alias, second_alias]);
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, directory.0.join("a-alias"));
+    }
+
     #[test]
     fn fmt_formats_package_stdin_and_emits_the_json_result_contract() {
         let source = b"package acme:app@1.0.0\nsource\"src\"\n";
@@ -4097,6 +5013,345 @@ mod tests {
         assert!(stdout.contains("\"check\":false,\"files\":1,\"changed\":[\"<stdin>\"]"));
         assert!(stdout.contains("\"output\":\"package acme:app @ 1.0.0\\nsource \\\"src\\\"\\n\""));
         assert!(stdout.contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn fmt_atomically_formats_an_explicit_package_path() {
+        let directory = TestDirectory::new();
+        let manifest = directory.child("sai.package");
+        fs::write(&manifest, b"package acme:app@1.0.0\nsource\"src\"\n").unwrap();
+        let manifest = manifest.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", manifest]);
+
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            fs::read(directory.child("sai.package")).unwrap(),
+            b"package acme:app @ 1.0.0\nsource \"src\"\n"
+        );
+        assert!(stdout.contains("\"kind\":\"fmt\""));
+        assert!(stdout.contains("\"files\":1,\"changed\":[\"sai.package\"]"));
+        assert!(stdout.contains("\"refused\":[]"));
+        assert!(stdout.contains("\"exit_code\":0"));
+        assert!(directory.child(".sai/lock").is_file());
+    }
+
+    #[test]
+    fn fmt_reports_human_progress_to_stderr_and_quiet_suppresses_it() {
+        let directory = TestDirectory::new();
+        let manifest = directory.child("sai.package");
+        fs::write(&manifest, b"package acme:app@1.0.0\nsource\"src\"\n").unwrap();
+        let manifest = manifest.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&["fmt", manifest]);
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.starts_with("formatted "));
+        assert!(stderr.ends_with("/sai.package\n"));
+
+        fs::write(
+            directory.child("sai.package"),
+            b"package acme:app@1.0.0\nsource\"src\"\n",
+        )
+        .unwrap();
+        let (exit_code, stdout, stderr) = invoke(&["fmt", "--quiet", manifest]);
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_atomic_replacement_stays_in_the_selected_directory_after_path_swap() {
+        let directory = TestDirectory::new();
+        let package = directory.child("package");
+        let moved = directory.child("moved");
+        let outside = directory.child("outside");
+        fs::create_dir(&package).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(package.join("sai.package"), b"old").unwrap();
+        fs::write(outside.join("sai.package"), b"outside").unwrap();
+
+        let selection = crate::fmt_paths::select_fmt_paths(
+            std::slice::from_ref(&package),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert_eq!(selection.files.len(), 1);
+        let selected = &selection.files[0];
+        let parent = selected.parent.as_ref().unwrap();
+        let parent_handle = parent.try_clone().unwrap().into_std_file();
+        let source = sai_windows_fs::open_file_without_following(
+            &parent_handle,
+            selected.path.parent().unwrap(),
+            &selected.name,
+        )
+        .unwrap();
+        let permissions = cap_std::fs::File::from_std(source)
+            .metadata()
+            .unwrap()
+            .permissions();
+
+        fs::rename(&package, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &package).unwrap();
+
+        write_file_atomically_in_directory(
+            parent,
+            &selected.name,
+            selected.identity,
+            b"old",
+            permissions,
+            b"formatted",
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(moved.join("sai.package")).unwrap(), b"formatted");
+        assert_eq!(fs::read(outside.join("sai.package")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn fmt_input_read_uses_the_selected_handle_after_path_replacement() {
+        let directory = TestDirectory::new();
+        let package = directory.child("package");
+        fs::create_dir(&package).unwrap();
+        let manifest = package.join("sai.package");
+        fs::write(&manifest, b"selected bytes").unwrap();
+        let selected = crate::fmt_paths::select_fmt_paths(
+            std::slice::from_ref(&manifest),
+            &directory.0,
+            &CancellationToken::default(),
+        )
+        .files
+        .into_iter()
+        .next()
+        .unwrap();
+        let mut file = super::SelectedFmtFile {
+            path: selected.path,
+            source_path: "sai.package".to_owned(),
+            package_root: None,
+            package_root_identity: None,
+            parent: selected.parent,
+            name: selected.name,
+            identity: selected.identity,
+            identity_guard: selected.identity_guard,
+        };
+
+        fs::rename(&manifest, package.join("previous")).unwrap();
+        fs::write(&manifest, b"replacement bytes").unwrap();
+
+        let mut selected_contents = Vec::new();
+        super::open_selected_fmt_file(&mut file)
+            .unwrap()
+            .read_to_end(&mut selected_contents)
+            .unwrap();
+
+        assert_eq!(selected_contents, b"selected bytes");
+        assert_eq!(fs::read(manifest).unwrap(), b"replacement bytes");
+        assert!(file.identity_guard.is_some());
+    }
+
+    #[test]
+    fn fmt_atomic_write_refuses_a_replaced_selected_file() {
+        let directory = TestDirectory::new();
+        let package = directory.child("package");
+        fs::create_dir(&package).unwrap();
+        let manifest = package.join("sai.package");
+        fs::write(&manifest, b"selected").unwrap();
+        let selection = crate::fmt_paths::select_fmt_paths(
+            std::slice::from_ref(&manifest),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert_eq!(selection.files.len(), 1);
+        let selected = &selection.files[0];
+        let parent = selected.parent.as_ref().unwrap();
+        let expected_identity = selected.identity;
+        let name = selected.name.clone();
+        let parent_handle = parent.try_clone().unwrap().into_std_file();
+        let source = sai_windows_fs::open_file_without_following(
+            &parent_handle,
+            selected.path.parent().unwrap(),
+            &selected.name,
+        )
+        .unwrap();
+        let permissions = cap_std::fs::File::from_std(source)
+            .metadata()
+            .unwrap()
+            .permissions();
+
+        fs::rename(&manifest, package.join("previous")).unwrap();
+        fs::write(&manifest, b"editor change").unwrap();
+
+        let error = write_file_atomically_in_directory(
+            parent,
+            &name,
+            expected_identity,
+            b"selected",
+            permissions,
+            b"formatted stale input",
+        )
+        .unwrap_err();
+
+        assert!(!error.installed);
+        assert_eq!(error.source.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(manifest).unwrap(), b"editor change");
+    }
+
+    #[test]
+    fn fmt_atomic_write_refuses_in_place_edits_to_the_selected_file() {
+        let directory = TestDirectory::new();
+        let package = directory.child("package");
+        fs::create_dir(&package).unwrap();
+        let manifest = package.join("sai.package");
+        fs::write(&manifest, b"selected").unwrap();
+        let selection = crate::fmt_paths::select_fmt_paths(
+            std::slice::from_ref(&manifest),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert_eq!(selection.files.len(), 1);
+        let selected = &selection.files[0];
+        let parent = selected.parent.as_ref().unwrap();
+        let expected_identity = selected.identity;
+        let name = selected.name.clone();
+        let parent_handle = parent.try_clone().unwrap().into_std_file();
+        let source = sai_windows_fs::open_file_without_following(
+            &parent_handle,
+            selected.path.parent().unwrap(),
+            &selected.name,
+        )
+        .unwrap();
+        let permissions = cap_std::fs::File::from_std(source)
+            .metadata()
+            .unwrap()
+            .permissions();
+
+        fs::write(&manifest, b"editor changed same file").unwrap();
+
+        let error = write_file_atomically_in_directory(
+            parent,
+            &name,
+            expected_identity,
+            b"selected",
+            permissions,
+            b"formatted stale input",
+        )
+        .unwrap_err();
+
+        assert!(!error.installed);
+        assert_eq!(error.source.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(manifest).unwrap(), b"editor changed same file");
+    }
+
+    #[test]
+    fn fmt_check_reports_the_file_location_without_changing_the_file() {
+        let directory = TestDirectory::new();
+        let manifest = directory.child("sai.package");
+        let original = b"package acme:app@1.0.0\nsource\"src\"\n";
+        fs::write(&manifest, original).unwrap();
+        let manifest = manifest.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", "--check", manifest]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(fs::read(directory.child("sai.package")).unwrap(), original);
+        assert!(stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+        assert!(stdout.contains("\"path\":\"sai.package\""));
+        assert!(stdout.contains("\"line\":1"));
+        assert!(stdout.contains("\"files\":1,\"changed\":[\"sai.package\"]"));
+        assert!(stdout.contains("\"exit_code\":1"));
+    }
+
+    #[test]
+    fn fmt_directory_processes_package_files_and_reports_unimplemented_sources() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(directory.child("src")).unwrap();
+        fs::create_dir_all(directory.child("out")).unwrap();
+        fs::write(
+            directory.child("sai.package"),
+            b"package acme:app@1.0.0\nsource\"src\"\n",
+        )
+        .unwrap();
+        fs::write(directory.child("src/lib.sai"), b"pub fn main() {}\n").unwrap();
+        fs::write(directory.child("out/generated.sai"), b"ignored").unwrap();
+        let root = directory.0.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", root]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            fs::read(directory.child("sai.package")).unwrap(),
+            b"package acme:app @ 1.0.0\nsource \"src\"\n"
+        );
+        assert!(stdout.contains("\"kind\":\"fmt\""));
+        assert!(stdout.contains("\"files\":2"));
+        assert!(stdout.contains("\"path\":\"src/lib.sai\""));
+        assert!(stdout.contains("\"feature\":\"sai fmt source files\""));
+        assert!(stdout.contains("\"changed\":[\"sai.package\"]"));
+        assert!(stdout.contains("\"refused\":[\"src/lib.sai\"]"));
+        assert!(!stdout.contains("generated.sai"));
+        assert!(stdout.contains("\"exit_code\":1"));
+    }
+
+    #[test]
+    fn fmt_multiple_package_roots_keep_distinct_json_paths() {
+        let directory = TestDirectory::new();
+        for package in ["a", "b"] {
+            let package_directory = directory.child(&format!("packages/{package}"));
+            fs::create_dir_all(&package_directory).unwrap();
+            fs::write(
+                package_directory.join("sai.package"),
+                b"package acme:app@1.0.0\nsource\"src\"\n",
+            )
+            .unwrap();
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let expected = ["a", "b"]
+            .map(|package| {
+                let manifest =
+                    fs::canonicalize(directory.child(&format!("packages/{package}/sai.package")))
+                        .unwrap();
+                super::fmt_path_reference(&manifest, &cwd, None)
+            })
+            .map(|path| format!("\"{}\"", super::escape_json(&path)))
+            .join(",");
+        let root = directory.0.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", root]);
+
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains(&format!("\"changed\":[{expected}]")));
+        assert!(stdout.contains("\"files\":2"));
+        assert!(stdout.contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn fmt_missing_paths_are_reported_and_other_paths_continue() {
+        let directory = TestDirectory::new();
+        let manifest = directory.child("sai.package");
+        fs::write(&manifest, b"package acme:app@1.0.0\nsource\"src\"\n").unwrap();
+        let manifest = manifest.to_str().expect("temporary path is UTF-8");
+        let missing = directory
+            .child("missing.sai")
+            .to_str()
+            .expect("temporary path is UTF-8")
+            .to_owned();
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", &missing, manifest]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"PATH_NOT_FOUND\""));
+        assert!(stdout.contains("\"argument\":\""));
+        assert!(stdout.contains("\"files\":1,\"changed\":[\"sai.package\"]"));
+        assert_eq!(
+            fs::read(directory.child("sai.package")).unwrap(),
+            b"package acme:app @ 1.0.0\nsource \"src\"\n"
+        );
     }
 
     #[test]

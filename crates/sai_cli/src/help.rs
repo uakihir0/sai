@@ -295,7 +295,7 @@ fn command_options(name: &str) -> String {
             "  --seed <n>               Set the default property-test seed.\n",
         ),
         "fmt" => concat!(
-            "  --check                  Report files that need formatting; write nothing.\n",
+            "  --check                  Report files that need formatting; do not rewrite source files.\n",
             "  --stdin-kind <kind>      Format stdin as `source` or `package`.\n",
         ),
         "add" => concat!(

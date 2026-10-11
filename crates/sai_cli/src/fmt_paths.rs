@@ -1,0 +1,939 @@
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use cap_std::fs::Dir;
+use sai_driver::CancellationToken;
+
+/// The result of expanding the explicit paths passed to `sai fmt`.
+#[derive(Debug, Default)]
+pub(crate) struct FmtPathSelection {
+    /// Unique physical files, sorted by their platform path encoding.
+    pub files: Vec<SelectedFmtPath>,
+    /// Input paths that do not exist, paired with their input position.
+    pub missing: Vec<(usize, PathBuf)>,
+    /// Filesystem paths that could not be inspected during traversal.
+    pub errors: Vec<FmtPathSelectionError>,
+    /// Traversal stopped because cancellation was requested.
+    pub interrupted: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SelectedFmtPath {
+    pub path: PathBuf,
+    pub parent: Option<Arc<Dir>>,
+    pub name: OsString,
+    pub identity: sai_windows_fs::FileIdentity,
+    pub parent_identity: sai_windows_fs::FileIdentity,
+    pub identity_guard: Option<fs::File>,
+}
+
+/// A filesystem error encountered while selecting formatter inputs.
+#[derive(Debug)]
+pub(crate) struct FmtPathSelectionError {
+    pub path: PathBuf,
+    pub source: io::Error,
+}
+
+enum PendingDirectory {
+    Opened(Arc<Dir>, PathBuf),
+    Child {
+        parent: Arc<Dir>,
+        name: OsString,
+        path: PathBuf,
+    },
+}
+
+struct DirectoryWalker<'a> {
+    selection: &'a mut FmtPathSelection,
+    selected_files: &'a mut HashSet<PathBuf>,
+    selected_identities: &'a mut HashSet<(
+        sai_windows_fs::FileIdentity,
+        sai_windows_fs::FileIdentity,
+        OsString,
+    )>,
+    visited_directories: &'a mut HashSet<PathBuf>,
+    cancellation: &'a CancellationToken,
+    retain_capabilities: bool,
+}
+
+/// Expands explicit file and directory arguments using the `sai fmt` rules.
+///
+/// Directory traversal does not follow symbolic links, skips hidden
+/// directories, and skips a sibling `out` directory when the parent contains
+/// a regular `sai.package` file. Explicit symbolic links to regular files are
+/// accepted and resolved to their physical target before deduplication.
+pub(crate) fn select_fmt_paths(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_paths_inner(paths, current_directory, cancellation, true)
+}
+
+pub(crate) fn select_fmt_paths_for_comparison(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_paths_inner(paths, current_directory, cancellation, false)
+}
+
+fn select_fmt_paths_inner(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+    retain_capabilities: bool,
+) -> FmtPathSelection {
+    let mut selection = FmtPathSelection::default();
+    let mut selected_files = HashSet::new();
+    let mut selected_identities = HashSet::new();
+    let mut visited_directories = HashSet::new();
+    let mut explicit_parent_directories = HashMap::new();
+
+    let mut ordered_paths = paths
+        .iter()
+        .enumerate()
+        .map(|(input_index, requested_path)| {
+            let absolute_path = if requested_path.is_absolute() {
+                requested_path.clone()
+            } else {
+                current_directory.join(requested_path)
+            };
+            (input_index, requested_path, absolute_path)
+        })
+        .collect::<Vec<_>>();
+    ordered_paths.sort_by(|left, right| {
+        left.2
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.2.as_os_str().as_encoded_bytes())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    for (input_index, requested_path, absolute_path) in ordered_paths {
+        if cancellation.is_cancelled() {
+            selection.interrupted = true;
+            break;
+        }
+        let metadata = match fs::symlink_metadata(&absolute_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                selection
+                    .missing
+                    .push((input_index, requested_path.clone()));
+                continue;
+            }
+            Err(source) => {
+                selection.errors.push(FmtPathSelectionError {
+                    path: absolute_path,
+                    source,
+                });
+                continue;
+            }
+        };
+
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            match fs::metadata(&absolute_path) {
+                Ok(target_metadata) if target_metadata.is_file() => {
+                    push_explicit_file(
+                        &absolute_path,
+                        &mut selection,
+                        &mut selected_files,
+                        &mut selected_identities,
+                        &mut explicit_parent_directories,
+                        retain_capabilities,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    selection
+                        .missing
+                        .push((input_index, requested_path.clone()));
+                }
+                Err(source) => selection.errors.push(FmtPathSelectionError {
+                    path: absolute_path,
+                    source,
+                }),
+            }
+        } else if file_type.is_file() {
+            push_explicit_file(
+                &absolute_path,
+                &mut selection,
+                &mut selected_files,
+                &mut selected_identities,
+                &mut explicit_parent_directories,
+                retain_capabilities,
+            );
+        } else if file_type.is_dir() {
+            let (root_directory, root) = match open_explicit_directory(&absolute_path) {
+                Ok(root) => root,
+                Err(source) => {
+                    selection.errors.push(FmtPathSelectionError {
+                        path: absolute_path,
+                        source,
+                    });
+                    continue;
+                }
+            };
+            if should_skip_root_directory(&root) {
+                continue;
+            }
+            DirectoryWalker {
+                selection: &mut selection,
+                selected_files: &mut selected_files,
+                selected_identities: &mut selected_identities,
+                visited_directories: &mut visited_directories,
+                cancellation,
+                retain_capabilities,
+            }
+            .walk(root_directory, root);
+            if selection.interrupted {
+                break;
+            }
+        } else {
+            selection.errors.push(FmtPathSelectionError {
+                path: absolute_path,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "formatter input is not a regular file or directory",
+                ),
+            });
+        }
+    }
+
+    selection.files.sort_by(|left, right| {
+        left.path
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.path.as_os_str().as_encoded_bytes())
+    });
+    selection.missing.sort_by(|left, right| {
+        left.1
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.1.as_os_str().as_encoded_bytes())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    selection.errors.sort_by(|left, right| {
+        left.path
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.path.as_os_str().as_encoded_bytes())
+    });
+    selection
+}
+
+impl DirectoryWalker<'_> {
+    fn walk(&mut self, root_directory: Dir, root: PathBuf) {
+        let mut pending = vec![PendingDirectory::Opened(Arc::new(root_directory), root)];
+        while let Some(pending_directory) = pending.pop() {
+            let (directory, directory_path) = match pending_directory {
+                PendingDirectory::Opened(directory, path) => (directory, path),
+                PendingDirectory::Child { parent, name, path } => {
+                    let opened = parent
+                        .try_clone()
+                        .map(|parent| parent.into_std_file())
+                        .and_then(|parent| {
+                            sai_windows_fs::open_child_directory_without_following(
+                                &parent,
+                                path.parent().unwrap_or(&path),
+                                &name,
+                            )
+                        });
+                    match opened {
+                        Ok(child) => (Arc::new(Dir::from_std_file(child)), path),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(source) => {
+                            self.selection
+                                .errors
+                                .push(FmtPathSelectionError { path, source });
+                            continue;
+                        }
+                    }
+                }
+            };
+            if self.cancellation.is_cancelled() {
+                self.selection.interrupted = true;
+                return;
+            }
+            if !self.visited_directories.insert(directory_path.clone()) {
+                continue;
+            }
+
+            let entries = match directory.entries() {
+                Ok(entries) => entries,
+                Err(source) => {
+                    self.selection.errors.push(FmtPathSelectionError {
+                        path: directory_path,
+                        source,
+                    });
+                    continue;
+                }
+            };
+            let mut ordered_entries = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => ordered_entries.push(entry),
+                    Err(source) => self.selection.errors.push(FmtPathSelectionError {
+                        path: directory_path.clone(),
+                        source,
+                    }),
+                }
+            }
+            ordered_entries.sort_by(|left, right| {
+                left.file_name()
+                    .as_encoded_bytes()
+                    .cmp(right.file_name().as_encoded_bytes())
+            });
+            let mut child_directories = Vec::new();
+            for entry in ordered_entries {
+                if self.cancellation.is_cancelled() {
+                    self.selection.interrupted = true;
+                    return;
+                }
+                let name = entry.file_name();
+                let path = directory_path.join(&name);
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(source) => {
+                        self.selection
+                            .errors
+                            .push(FmtPathSelectionError { path, source });
+                        continue;
+                    }
+                };
+
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if should_skip_directory(&directory, &name) {
+                        continue;
+                    }
+                    child_directories.push(PendingDirectory::Child {
+                        parent: Arc::clone(&directory),
+                        name,
+                        path,
+                    });
+                    continue;
+                }
+                if file_type.is_file() && is_formatter_file(&path) {
+                    push_selected_file(
+                        path,
+                        Arc::clone(&directory),
+                        name,
+                        self.selection,
+                        self.selected_files,
+                        self.selected_identities,
+                        self.retain_capabilities,
+                    );
+                }
+            }
+            pending.extend(child_directories.into_iter().rev());
+        }
+    }
+}
+
+fn open_explicit_directory(path: &Path) -> io::Result<(Dir, PathBuf)> {
+    let name = path.file_name();
+    let Some(name) = name else {
+        let root_path = fs::canonicalize(path)?;
+        let root = sai_windows_fs::open_directory_path_without_following(&root_path)?;
+        return Ok((Dir::from_std_file(root), root_path));
+    };
+    let parent_path = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory path has no parent component",
+        )
+    })?;
+    let parent_path = fs::canonicalize(parent_path)?;
+    let parent = sai_windows_fs::open_directory_path_without_following(&parent_path)?;
+    let root = sai_windows_fs::open_child_directory_without_following(&parent, &parent_path, name)?;
+    let root_identity = sai_windows_fs::file_identity(&root)?;
+    let root_path = fs::canonicalize(path)?;
+    let canonical_root = sai_windows_fs::open_directory_path_without_following(&root_path)?;
+    if sai_windows_fs::file_identity(&canonical_root)? != root_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "directory changed while resolving its canonical path",
+        ));
+    }
+    Ok((Dir::from_std_file(root), root_path))
+}
+
+fn directory_identity(directory: &Dir) -> io::Result<sai_windows_fs::FileIdentity> {
+    sai_windows_fs::file_identity(&directory.try_clone()?.into_std_file())
+}
+
+fn should_skip_root_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    if is_hidden_directory_name(name) {
+        return true;
+    }
+    if name != "out" {
+        return false;
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    fs::symlink_metadata(parent.join("sai.package"))
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn should_skip_directory(parent: &Dir, name: &OsStr) -> bool {
+    if is_hidden_directory_name(name) {
+        return true;
+    }
+    name == "out"
+        && parent
+            .symlink_metadata("sai.package")
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn is_hidden_directory_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b".")
+}
+
+fn is_formatter_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == "sai.package" || path.extension().is_some_and(|extension| extension == "sai")
+    })
+}
+
+fn push_explicit_file(
+    path: &Path,
+    selection: &mut FmtPathSelection,
+    selected_files: &mut HashSet<PathBuf>,
+    selected_identities: &mut HashSet<(
+        sai_windows_fs::FileIdentity,
+        sai_windows_fs::FileIdentity,
+        OsString,
+    )>,
+    parent_directories: &mut HashMap<PathBuf, Arc<Dir>>,
+    retain_capabilities: bool,
+) {
+    let canonical_path = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(source) => {
+            selection.errors.push(FmtPathSelectionError {
+                path: path.to_path_buf(),
+                source,
+            });
+            return;
+        }
+    };
+    let Some(name) = canonical_path.file_name().map(OsStr::to_os_string) else {
+        selection.errors.push(FmtPathSelectionError {
+            path: canonical_path,
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "formatter input has no file name",
+            ),
+        });
+        return;
+    };
+    let Some(parent_path) = canonical_path.parent() else {
+        selection.errors.push(FmtPathSelectionError {
+            path: canonical_path,
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "formatter input has no parent directory",
+            ),
+        });
+        return;
+    };
+    let opened = (|| {
+        let parent_path = fs::canonicalize(parent_path)?;
+        let retain_parent_directory = retain_capabilities && name == "sai.package";
+        let parent = if retain_parent_directory {
+            if let Some(parent) = parent_directories.get(&parent_path) {
+                Arc::clone(parent)
+            } else {
+                let parent = Arc::new(Dir::from_std_file(
+                    sai_windows_fs::open_directory_path_without_following(&parent_path)?,
+                ));
+                parent_directories.insert(parent_path.clone(), Arc::clone(&parent));
+                parent
+            }
+        } else {
+            Arc::new(Dir::from_std_file(
+                sai_windows_fs::open_directory_path_without_following(&parent_path)?,
+            ))
+        };
+        Ok::<_, io::Error>((parent_path, parent))
+    })();
+    match opened {
+        Ok((parent_path, parent)) => {
+            let physical_path = parent_path.join(&name);
+            push_selected_file(
+                physical_path,
+                parent,
+                name,
+                selection,
+                selected_files,
+                selected_identities,
+                retain_capabilities,
+            );
+        }
+        Err(source) => selection.errors.push(FmtPathSelectionError {
+            path: canonical_path,
+            source,
+        }),
+    }
+}
+
+fn push_selected_file(
+    path: PathBuf,
+    parent: Arc<Dir>,
+    name: OsString,
+    selection: &mut FmtPathSelection,
+    selected_files: &mut HashSet<PathBuf>,
+    selected_identities: &mut HashSet<(
+        sai_windows_fs::FileIdentity,
+        sai_windows_fs::FileIdentity,
+        OsString,
+    )>,
+    retain_capabilities: bool,
+) {
+    if path.to_str().is_none() {
+        selection.errors.push(FmtPathSelectionError {
+            path,
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "formatter paths must be valid UTF-8 to appear in CLI output",
+            ),
+        });
+        return;
+    }
+    if selected_files.contains(&path) {
+        return;
+    }
+    let parent_identity = match directory_identity(&parent) {
+        Ok(identity) => identity,
+        Err(source) => {
+            selection
+                .errors
+                .push(FmtPathSelectionError { path, source });
+            return;
+        }
+    };
+    let parent_handle = match parent.try_clone() {
+        Ok(parent) => parent.into_std_file(),
+        Err(source) => {
+            selection
+                .errors
+                .push(FmtPathSelectionError { path, source });
+            return;
+        }
+    };
+    let input = match sai_windows_fs::open_file_without_following(
+        &parent_handle,
+        path.parent().unwrap_or(&path),
+        &name,
+    ) {
+        Ok(input) => input,
+        Err(source) => {
+            selection
+                .errors
+                .push(FmtPathSelectionError { path, source });
+            return;
+        }
+    };
+    let identity = match sai_windows_fs::file_identity(&input) {
+        Ok(identity) => identity,
+        Err(source) => {
+            selection
+                .errors
+                .push(FmtPathSelectionError { path, source });
+            return;
+        }
+    };
+    if !selected_identities.insert((identity, parent_identity, name.clone())) {
+        return;
+    }
+    selected_files.insert(path.clone());
+    let retain_manifest_capabilities = name == "sai.package" && retain_capabilities;
+    let identity_guard = retain_manifest_capabilities.then_some(input);
+    selection.files.push(SelectedFmtPath {
+        path,
+        parent: retain_manifest_capabilities.then_some(parent),
+        name,
+        identity,
+        parent_identity,
+        identity_guard,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use sai_driver::CancellationToken;
+
+    use super::select_fmt_paths as select_fmt_paths_with_cancellation;
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn select_fmt_paths(paths: &[PathBuf], current_directory: &Path) -> super::FmtPathSelection {
+        select_fmt_paths_with_cancellation(paths, current_directory, &CancellationToken::default())
+    }
+
+    fn selected_paths(selection: &super::FmtPathSelection) -> Vec<PathBuf> {
+        selection
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("sai-fmt-paths-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temporary test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn directory_search_selects_only_package_and_source_files_in_sorted_order() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(directory.0.join("src/nested")).unwrap();
+        fs::write(directory.0.join("sai.package"), b"").unwrap();
+        fs::write(directory.0.join("src/z.sai"), b"").unwrap();
+        fs::write(directory.0.join("src/nested/a.sai"), b"").unwrap();
+        fs::write(directory.0.join("README.md"), b"").unwrap();
+
+        let selection = select_fmt_paths(std::slice::from_ref(&directory.0), &directory.0);
+        let canonical_directory = fs::canonicalize(&directory.0).unwrap();
+        let relative = selection
+            .files
+            .iter()
+            .map(|file| file.path.strip_prefix(&canonical_directory).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relative,
+            [
+                PathBuf::from("sai.package"),
+                PathBuf::from("src/nested/a.sai"),
+                PathBuf::from("src/z.sai"),
+            ]
+        );
+        assert!(selection.missing.is_empty());
+        assert!(selection.errors.is_empty());
+    }
+
+    #[test]
+    fn directory_search_skips_hidden_out_and_symbolic_link_directories() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(directory.0.join(".hidden")).unwrap();
+        fs::create_dir_all(directory.0.join("out")).unwrap();
+        fs::create_dir_all(directory.0.join("visible")).unwrap();
+        fs::write(directory.0.join("sai.package"), b"").unwrap();
+        fs::write(directory.0.join(".hidden/hidden.sai"), b"").unwrap();
+        fs::write(directory.0.join("out/generated.sai"), b"").unwrap();
+        fs::write(directory.0.join("visible/ok.sai"), b"").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(directory.0.join("visible"), directory.0.join("linked"))
+            .unwrap();
+
+        let selection = select_fmt_paths(std::slice::from_ref(&directory.0), &directory.0);
+        let canonical_directory = fs::canonicalize(&directory.0).unwrap();
+        let relative = selection
+            .files
+            .iter()
+            .map(|file| file.path.strip_prefix(&canonical_directory).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relative,
+            [
+                PathBuf::from("sai.package"),
+                PathBuf::from("visible/ok.sai")
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_paths_and_explicit_files_are_deduplicated() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("src.sai");
+        fs::write(&source, b"").unwrap();
+
+        let selection = select_fmt_paths(
+            &[directory.0.clone(), source.clone(), directory.0.clone()],
+            &directory.0,
+        );
+        assert_eq!(
+            selected_paths(&selection),
+            [fs::canonicalize(source).unwrap()]
+        );
+    }
+
+    #[test]
+    fn distinct_hard_link_names_are_selected_as_distinct_paths() {
+        let directory = TestDirectory::new();
+        let first = directory.0.join("first.sai");
+        let second = directory.0.join("second.sai");
+        fs::write(&first, b"same inode").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let selection = select_fmt_paths(std::slice::from_ref(&directory.0), &directory.0);
+
+        assert_eq!(
+            selected_paths(&selection),
+            [
+                fs::canonicalize(first).unwrap(),
+                fs::canonicalize(second).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_files_retain_only_processable_manifest_capabilities() {
+        let directory = TestDirectory::new();
+        let manifest = directory.0.join("sai.package");
+        let source = directory.0.join("src.sai");
+        fs::write(&manifest, b"").unwrap();
+        fs::write(&source, b"").unwrap();
+
+        let selection = select_fmt_paths(&[source, manifest], &directory.0);
+
+        assert_eq!(selection.files.len(), 2);
+        let manifest = selection
+            .files
+            .iter()
+            .find(|file| file.name == "sai.package")
+            .unwrap();
+        let source = selection
+            .files
+            .iter()
+            .find(|file| file.name == "src.sai")
+            .unwrap();
+        assert!(manifest.parent.is_some());
+        assert!(source.parent.is_none());
+        assert_eq!(
+            selection
+                .files
+                .iter()
+                .filter(|file| file.identity_guard.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn comparison_selection_drops_all_path_capabilities_after_identity_sampling() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("sai.package"), b"").unwrap();
+        fs::write(directory.0.join("src.sai"), b"").unwrap();
+
+        let selection = super::select_fmt_paths_for_comparison(
+            std::slice::from_ref(&directory.0),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(selection.files.len(), 2);
+        assert!(
+            selection
+                .files
+                .iter()
+                .all(|file| file.parent.is_none() && file.identity_guard.is_none())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_file_symlinks_resolve_to_their_target() {
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target.txt");
+        let link = directory.0.join("link.txt");
+        fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let selection = select_fmt_paths(&[link], &directory.0);
+
+        assert_eq!(
+            selected_paths(&selection),
+            [fs::canonicalize(target).unwrap()]
+        );
+        assert!(selection.missing.is_empty());
+        assert!(selection.errors.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_directory_symlinks_are_skipped() {
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target");
+        let link = directory.0.join("link");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("source.sai"), b"").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let selection = select_fmt_paths(std::slice::from_ref(&link), &directory.0);
+
+        assert!(selection.files.is_empty());
+        assert!(selection.missing.is_empty());
+        assert!(selection.errors.is_empty());
+    }
+
+    #[test]
+    fn explicit_directory_paths_use_the_filesystem_canonical_spelling() {
+        let directory = TestDirectory::new();
+        let canonical = directory.0.join("Package");
+        let alias = directory.0.join("PACKAGE");
+        fs::create_dir(&canonical).unwrap();
+        fs::write(canonical.join("sai.package"), b"").unwrap();
+        if fs::symlink_metadata(&alias).is_err() {
+            return;
+        }
+
+        let canonical_selection = select_fmt_paths(std::slice::from_ref(&canonical), &directory.0);
+        let alias_selection = select_fmt_paths(std::slice::from_ref(&alias), &directory.0);
+
+        assert_eq!(
+            selected_paths(&canonical_selection),
+            selected_paths(&alias_selection)
+        );
+    }
+
+    #[test]
+    fn missing_paths_are_kept_and_sorted_for_diagnostics() {
+        let directory = TestDirectory::new();
+        let selection = select_fmt_paths(
+            &[PathBuf::from("z.missing"), PathBuf::from("a.missing")],
+            &directory.0,
+        );
+        assert!(selection.files.is_empty());
+        assert_eq!(
+            selection
+                .missing
+                .iter()
+                .map(|(_, path)| path.as_path())
+                .collect::<Vec<_>>(),
+            [
+                std::path::Path::new("a.missing"),
+                std::path::Path::new("z.missing")
+            ]
+        );
+    }
+
+    #[test]
+    fn canceled_traversal_stops_before_selecting_paths() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("source.sai"), b"").unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let selection = select_fmt_paths_with_cancellation(
+            std::slice::from_ref(&directory.0),
+            &directory.0,
+            &cancellation,
+        );
+
+        assert!(selection.interrupted);
+        assert!(selection.files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_file_parent_handle_survives_path_replacement() {
+        use std::io::Read;
+
+        let directory = TestDirectory::new();
+        let package = directory.0.join("package");
+        let moved = directory.0.join("moved");
+        let outside = directory.0.join("outside");
+        fs::create_dir(&package).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(package.join("sai.package"), b"original").unwrap();
+        fs::write(outside.join("sai.package"), b"outside").unwrap();
+
+        let selection = select_fmt_paths(std::slice::from_ref(&package), &directory.0);
+        assert_eq!(selection.files.len(), 1);
+
+        fs::rename(&package, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &package).unwrap();
+
+        let selected = &selection.files[0];
+        let parent = selected
+            .parent
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap()
+            .into_std_file();
+        let mut input = sai_windows_fs::open_file_without_following(
+            &parent,
+            selected.path.parent().unwrap(),
+            &selected.name,
+        )
+        .unwrap();
+        let mut contents = Vec::new();
+        input.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"original");
+        assert_eq!(fs::read(outside.join("sai.package")).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_paths_are_rejected_without_lossy_deduplication() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = TestDirectory::new();
+        let mut selection = super::FmtPathSelection::default();
+        let mut selected_files = std::collections::HashSet::new();
+        let mut selected_identities = std::collections::HashSet::new();
+        let parent = std::sync::Arc::new(
+            cap_std::fs::Dir::open_ambient_dir(&directory.0, cap_std::ambient_authority()).unwrap(),
+        );
+        for byte in [0x80, 0x81] {
+            let name = std::ffi::OsString::from_vec(vec![b'p', byte]);
+            let child = directory.0.join(&name).join("sai.package");
+            super::push_selected_file(
+                child,
+                std::sync::Arc::clone(&parent),
+                name,
+                &mut selection,
+                &mut selected_files,
+                &mut selected_identities,
+                true,
+            );
+        }
+
+        assert!(selection.files.is_empty());
+        assert_eq!(selection.errors.len(), 2);
+        assert!(
+            selection
+                .errors
+                .iter()
+                .all(|error| error.source.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        assert_ne!(
+            selection.errors[0].path.as_os_str().as_encoded_bytes(),
+            selection.errors[1].path.as_os_str().as_encoded_bytes()
+        );
+    }
+}
