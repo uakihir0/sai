@@ -54,6 +54,22 @@ pub(crate) fn authors_declaration(
     comma_list_declaration(input, index, list, PackageBraceOwner::Authors)
 }
 
+pub(crate) fn policy_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    comma_list_declaration(input, index, list, PackageBraceOwner::Policy)
+}
+
+pub(crate) fn lints_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    comma_list_declaration(input, index, list, PackageBraceOwner::Lints)
+}
+
 pub(crate) fn budget_declaration(
     input: &PackageInput<'_>,
     index: &PackageSyntaxIndex<'_>,
@@ -2270,7 +2286,9 @@ fn comma_list_declaration(
     if list.owner != owner {
         return Err(PackageDocumentError::WrongListOwner);
     }
-    if !index.contains_list(list) {
+    if list.kind() != crate::package_surface::PackageListKind::CommaOrLine
+        || !index.contains_list(list)
+    {
         return Err(PackageDocumentError::InvalidEntry);
     }
     if !index.matches_input(input) {
@@ -2285,6 +2303,8 @@ fn comma_list_declaration(
         PackageBraceOwner::Authors => "authors",
         PackageBraceOwner::Only => "only",
         PackageBraceOwner::Grant => "grant",
+        PackageBraceOwner::Policy => "policy",
+        PackageBraceOwner::Lints => "lints",
         _ => return Err(PackageDocumentError::WrongListOwner),
     };
     let keyword_index = (list.open_token as usize)
@@ -2309,33 +2329,47 @@ fn comma_list_declaration(
         .ok_or(PackageDocumentError::InvalidEntry)?;
     let mut list_entries = Vec::with_capacity(entries.len());
     for entry in entries {
-        if entry.end != entry.start + 1 {
+        let start = usize::try_from(entry.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let end = usize::try_from(entry.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        if start >= end {
             return Err(PackageDocumentError::InvalidEntry);
         }
-        let token_index = entry.start as usize;
-        let token = &tokens[token_index];
-        let valid_entry = match owner {
-            PackageBraceOwner::Targets => token.kind == PackageTokenKind::Word,
-            PackageBraceOwner::Allow | PackageBraceOwner::Deny => matches!(
+        let entry_tokens = tokens
+            .get(start..end)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let valid_entry = match (owner, entry_tokens) {
+            (PackageBraceOwner::Targets, [token]) => token.kind == PackageTokenKind::Word,
+            (PackageBraceOwner::Allow | PackageBraceOwner::Deny, [token]) => matches!(
                 token.kind,
                 PackageTokenKind::Word | PackageTokenKind::PackagePath
             ),
-            PackageBraceOwner::Authors => token.kind == PackageTokenKind::String,
-            PackageBraceOwner::Only => token.kind == PackageTokenKind::Word,
-            PackageBraceOwner::Grant => matches!(
+            (PackageBraceOwner::Authors, [token]) => token.kind == PackageTokenKind::String,
+            (PackageBraceOwner::Only, [token]) => token.kind == PackageTokenKind::Word,
+            (PackageBraceOwner::Grant, [token]) => matches!(
                 token.kind,
                 PackageTokenKind::Word | PackageTokenKind::PackagePath
             ),
+            (PackageBraceOwner::Policy, [level, item]) => {
+                level.kind == PackageTokenKind::Word
+                    && token_text(input.source(), level) == "deny"
+                    && item.kind == PackageTokenKind::Word
+            }
+            (PackageBraceOwner::Lints, [level, code]) => {
+                level.kind == PackageTokenKind::Word
+                    && matches!(token_text(input.source(), level), "allow" | "warn" | "deny")
+                    && code.kind == PackageTokenKind::UpperWord
+            }
             _ => false,
         };
         if !valid_entry {
             return Err(PackageDocumentError::InvalidEntry);
         }
-        list_entries.push(ListEntry {
-            token_index,
-            leading: comments.take_leading(token_index),
-            trailing: comments.take_trailing(token_index),
-        });
+        list_entries.push(list_entry_document(
+            input,
+            tokens,
+            &mut comments,
+            start..end,
+        )?);
     }
 
     let mut comma_trailing = vec![Vec::new(); list_entries.len().saturating_sub(1)];
@@ -2422,7 +2456,7 @@ fn comma_list_declaration(
             if position > 0 {
                 let previous = &list_entries[position - 1];
                 let current = &list_entries[position];
-                let previous_end = tokens[previous.token_index].span.end;
+                let previous_end = tokens[previous.token_end - 1].span.end;
                 let current_start = tokens[current.token_index].span.start;
                 let blank_line_before_entry = current
                     .leading
@@ -2459,10 +2493,7 @@ fn comma_list_declaration(
                 &entry.leading,
                 Some(tokens[entry.token_index].span.start),
             ));
-            body.push(Doc::text(token_text(
-                input.source(),
-                &tokens[entry.token_index],
-            )));
+            body.push(entry.document.clone());
             body.push(trailing_comments(input, &entry.trailing));
         }
     }
@@ -2471,7 +2502,7 @@ fn comma_list_declaration(
         sort_comments(input, &mut closing_leading);
         let gap_start = list_entries
             .last()
-            .map(|entry| tokens[entry.token_index].span.end)
+            .map(|entry| tokens[entry.token_end - 1].span.end)
             .unwrap_or(tokens[opening_brace].span.end);
         body.push(Doc::HardLine);
         let preserve_blank_line = !list_entries.is_empty()
@@ -2511,9 +2542,82 @@ fn comma_list_declaration(
     Ok(Doc::concat(prefix))
 }
 
+fn list_entry_document<'a>(
+    input: &PackageInput<'_>,
+    tokens: &[PackageToken],
+    comments: &mut TokenComments<'a>,
+    token_indices: Range<usize>,
+) -> Result<ListEntry<'a>, PackageDocumentError> {
+    if token_indices.start >= token_indices.end {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let first_token = tokens
+        .get(token_indices.start)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let mut leading = comments.take_leading(token_indices.start);
+    sort_comments(input, &mut leading);
+    let mut document = vec![Doc::text(token_text(input.source(), first_token))];
+    let mut previous_trailing = comments.take_trailing(token_indices.start);
+    sort_comments(input, &mut previous_trailing);
+
+    for token_index in token_indices.start + 1..token_indices.end {
+        let token = tokens
+            .get(token_index)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let mut token_leading = comments.take_leading(token_index);
+        let mut token_trailing = comments.take_trailing(token_index);
+        sort_comments(input, &mut token_leading);
+        sort_comments(input, &mut token_trailing);
+        let requires_break = !token_leading.is_empty()
+            || trailing_comments_force_line_break(input, &previous_trailing);
+        if requires_break {
+            if !is_package_continuation_word(input, token) {
+                return Err(PackageDocumentError::InvalidEntry);
+            }
+            let mut continuation = vec![Doc::HardLine];
+            if token_leading.first().is_some_and(|comment| {
+                previous_trailing.last().is_some_and(|previous| {
+                    has_blank_line(
+                        input,
+                        input.comment_span(previous).end,
+                        input.comment_span(comment).start,
+                    )
+                }) || previous_trailing.is_empty() && comment.line_breaks_before() > 1
+            }) {
+                continuation.push(Doc::HardLine);
+            }
+            continuation.extend(leading_comments_before(
+                input,
+                &token_leading,
+                Some(token.span.start),
+            ));
+            continuation.push(Doc::text(token_text(input.source(), token)));
+            document.push(trailing_comments(input, &previous_trailing));
+            document.push(Doc::indent(Doc::concat(continuation)));
+        } else {
+            document.extend([
+                trailing_comments(input, &previous_trailing),
+                Doc::text(" "),
+                Doc::text(token_text(input.source(), token)),
+            ]);
+        }
+        previous_trailing = token_trailing;
+    }
+
+    Ok(ListEntry {
+        token_index: token_indices.start,
+        token_end: token_indices.end,
+        leading,
+        document: Doc::concat(document),
+        trailing: previous_trailing,
+    })
+}
+
 struct ListEntry<'a> {
     token_index: usize,
+    token_end: usize,
     leading: Vec<&'a AttachedComment>,
+    document: Doc,
     trailing: Vec<&'a AttachedComment>,
 }
 
@@ -2738,9 +2842,9 @@ mod tests {
     use super::{
         PackageDocumentError, allocator_declaration, artifact_components_declaration,
         authors_declaration, budget_declaration, capability_declaration, compiler_declaration,
-        export_world_declaration, overrides_declaration, package_identity_declaration,
-        profile_declaration, requirements_declaration, string_declaration, targets_declaration,
-        token_text,
+        export_world_declaration, lints_declaration, overrides_declaration,
+        package_identity_declaration, policy_declaration, profile_declaration,
+        requirements_declaration, string_declaration, targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -2763,6 +2867,8 @@ mod tests {
             }
             PackageBraceOwner::Authors => authors_declaration(&input, &index, list),
             PackageBraceOwner::Budget => budget_declaration(&input, &index, list),
+            PackageBraceOwner::Policy => policy_declaration(&input, &index, list),
+            PackageBraceOwner::Lints => lints_declaration(&input, &index, list),
             PackageBraceOwner::ArtifactComponents => {
                 artifact_components_declaration(&input, &index, list)
             }
@@ -3374,6 +3480,103 @@ mod tests {
                 false
             ),
             "profile dev {}\n"
+        );
+    }
+
+    #[test]
+    fn formats_policy_and_lint_entries_with_comments_and_semantic_errors() {
+        let policy = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              policy { deny unsafe, deny ambient_imports }\n",
+            PackageBraceOwner::Policy,
+            false,
+        );
+        assert_eq!(policy, "policy { deny unsafe, deny ambient_imports }\n");
+
+        let continued_policy = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              policy { deny // preserve the contextual value\n\
+                  from }\n",
+            PackageBraceOwner::Policy,
+            false,
+        );
+        assert_eq!(
+            continued_policy,
+            "policy {\n    deny // preserve the contextual value\n        from\n}\n"
+        );
+
+        let leading_continuation_policy = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              policy { deny\n\
+                  // keep the policy value comment\n\
+                  from }\n",
+            PackageBraceOwner::Policy,
+            false,
+        );
+        assert_eq!(
+            leading_continuation_policy,
+            "policy {\n    deny\n        // keep the policy value comment\n        from\n}\n"
+        );
+
+        let lints = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              lints { warn /* retain code comment */ NAMING_CONVENTION, deny CONTRACT_RUNTIME_CHECK }\n",
+            PackageBraceOwner::Lints,
+            false,
+        );
+        assert_eq!(
+            lints,
+            "lints { warn /* retain code comment */ NAMING_CONVENTION, deny CONTRACT_RUNTIME_CHECK }\n"
+        );
+
+        let broken_lints = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              lints { warn NAMING_CONVENTION, // force the list to break\n\
+                  deny UNKNOWN_LINT }\n",
+            PackageBraceOwner::Lints,
+            false,
+        );
+        assert_eq!(
+            broken_lints,
+            "lints {\n    warn NAMING_CONVENTION // force the list to break\n    deny UNKNOWN_LINT\n}\n"
+        );
+
+        for (formatted, owner) in [
+            (policy.as_str(), PackageBraceOwner::Policy),
+            (continued_policy.as_str(), PackageBraceOwner::Policy),
+            (
+                leading_continuation_policy.as_str(),
+                PackageBraceOwner::Policy,
+            ),
+            (lints.as_str(), PackageBraceOwner::Lints),
+            (broken_lints.as_str(), PackageBraceOwner::Lints),
+        ] {
+            let mut source = b"package acme:app @ 1.0.0\n".to_vec();
+            source.extend_from_slice(formatted.as_bytes());
+            let reparsed = PackageInput::new(&source);
+            assert!(reparsed.refusals().is_empty(), "{:?}", reparsed.refusals());
+            assert!(
+                reparsed.parsed().errors().is_empty(),
+                "{:?}",
+                reparsed.parsed().errors()
+            );
+            assert_eq!(render_owner(formatted.as_bytes(), owner, false), formatted);
+        }
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\npolicy {}\n",
+                PackageBraceOwner::Policy,
+                false
+            ),
+            "policy {}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nlints {}\n",
+                PackageBraceOwner::Lints,
+                false
+            ),
+            "lints {}\n"
         );
     }
 
