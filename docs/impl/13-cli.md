@@ -217,7 +217,7 @@ $ sai --version --verbose
 sai 0.1.0
 language 0.1.0
 wasi 0.2.3
-targets wasm32-core wasm64-core wasm32-wasi wasm64-wasi
+targets wasm32-core wasm64-core wasm32-wasi
 ```
 
 ---
