@@ -453,7 +453,7 @@ fn push_explicit_file(
     };
     let opened = (|| {
         let parent_path = fs::canonicalize(parent_path)?;
-        let retain_parent_directory = retain_capabilities && name == "sai.package";
+        let retain_parent_directory = retain_capabilities;
         let parent = if retain_parent_directory {
             if let Some(parent) = parent_directories.get(&parent_path) {
                 Arc::clone(parent)
@@ -561,11 +561,10 @@ fn push_selected_file(
         return;
     }
     selected_files.insert(path.clone());
-    let retain_manifest_capabilities = name == "sai.package" && retain_capabilities;
-    let identity_guard = retain_manifest_capabilities.then_some(input);
+    let identity_guard = (name == "sai.package" && retain_capabilities).then_some(input);
     selection.files.push(SelectedFmtPath {
         path,
-        parent: retain_manifest_capabilities.then_some(parent),
+        parent: retain_capabilities.then_some(parent),
         name,
         identity,
         parent_identity,
@@ -710,16 +709,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_files_retain_only_processable_manifest_capabilities() {
+    fn explicit_files_share_parent_capabilities_and_guard_manifests() {
         let directory = TestDirectory::new();
         let manifest = directory.0.join("sai.package");
         let source = directory.0.join("src.sai");
+        let second_source = directory.0.join("other.sai");
         fs::write(&manifest, b"").unwrap();
         fs::write(&source, b"").unwrap();
+        fs::write(&second_source, b"").unwrap();
 
-        let selection = select_fmt_paths(&[source, manifest], &directory.0);
+        let selection = select_fmt_paths(&[source, second_source, manifest], &directory.0);
 
-        assert_eq!(selection.files.len(), 2);
+        assert_eq!(selection.files.len(), 3);
         let manifest = selection
             .files
             .iter()
@@ -730,8 +731,19 @@ mod tests {
             .iter()
             .find(|file| file.name == "src.sai")
             .unwrap();
+        let second_source = selection
+            .files
+            .iter()
+            .find(|file| file.name == "other.sai")
+            .unwrap();
         assert!(manifest.parent.is_some());
-        assert!(source.parent.is_none());
+        assert!(source.parent.is_some());
+        assert!(std::sync::Arc::ptr_eq(
+            source.parent.as_ref().unwrap(),
+            second_source.parent.as_ref().unwrap()
+        ));
+        assert!(manifest.identity_guard.is_some());
+        assert!(source.identity_guard.is_none());
         assert_eq!(
             selection
                 .files

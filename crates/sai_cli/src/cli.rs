@@ -495,12 +495,12 @@ fn run_fmt_source_stdin(
     stdout_is_terminal: bool,
     check: bool,
 ) -> i32 {
-    let source = match read_source_stdin(stdin, sai_vfs::MAX_SOURCE_BYTES, cancellation) {
+    let source = match read_source_limited(stdin, sai_vfs::MAX_SOURCE_BYTES, cancellation) {
         Ok(source) => source,
-        Err(SourceStdinReadError::Interrupted) => {
+        Err(SourceInputReadError::Interrupted) => {
             return report_interrupted(parsed, stdout, stderr);
         }
-        Err(SourceStdinReadError::Io(error)) => {
+        Err(SourceInputReadError::Io(error)) => {
             let diagnostic = CliDiagnostic {
                 code: "SOURCE_READ_FAILED",
                 message: "could not read standard input".to_owned(),
@@ -516,8 +516,8 @@ fn run_fmt_source_stdin(
             };
             return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
         }
-        Err(SourceStdinReadError::TooLarge(byte_len)) => {
-            let diagnostic = source_stdin_limit_diagnostic(byte_len);
+        Err(SourceInputReadError::TooLarge(byte_len)) => {
+            let diagnostic = source_limit_diagnostic(byte_len, "<stdin>");
             return report_fmt_diagnostics(
                 parsed,
                 vec![diagnostic],
@@ -555,6 +555,7 @@ fn run_fmt_source_stdin(
                 &source,
                 "<stdin>",
                 error,
+                parsed.globals.max_errors,
                 parsed.globals.format == OutputFormat::Human,
             );
             if cancellation.is_cancelled() {
@@ -629,6 +630,7 @@ fn source_format_diagnostics(
     source: &Arc<[u8]>,
     source_path: &str,
     error: sai_fmt::SourceFormatError,
+    max_errors: usize,
     include_source_lines: bool,
 ) -> FmtDiagnosticBatch {
     match error {
@@ -638,45 +640,52 @@ fn source_format_diagnostics(
                 .len()
                 .saturating_add(refusal.lexical_errors.len())
                 .saturating_add(refusal.syntax_errors.len());
-            let mut source_index = CliSourceIndex::new(Arc::clone(source));
-            let decoded_source = sai_vfs::SourceFile::decode(sai_vfs::FileId::new(0), source).ok();
-            let diagnostics = refusal
+            let mut selected = BinaryHeap::new();
+            let mut order = 0usize;
+            for diagnostic in refusal
                 .input_errors
                 .into_iter()
                 .chain(refusal.lexical_errors)
                 .chain(refusal.syntax_errors)
+            {
+                let span = diagnostic.primary().map_or(0..0, |location| {
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                });
+                let data = (!diagnostic.data.is_empty())
+                    .then(|| source_value_object_json(&diagnostic.data));
+                retain_pending_fmt_diagnostic(
+                    &mut selected,
+                    PendingFmtDiagnostic {
+                        code: diagnostic.code.as_str(),
+                        message: Cow::Owned(diagnostic.message),
+                        span,
+                        help: None,
+                        data,
+                        order,
+                    },
+                    max_errors,
+                );
+                order = order.saturating_add(1);
+            }
+            let decoded_source = sai_vfs::SourceFile::decode(sai_vfs::FileId::new(0), source).ok();
+            let mut source_index = CliSourceIndex::new(Arc::clone(source));
+            let diagnostics = selected
+                .into_sorted_vec()
+                .into_iter()
                 .map(|diagnostic| {
-                    let decoded_span = diagnostic.primary().map_or(0..0, |location| {
-                        location.span.range.start().to_usize()..location.span.range.end().to_usize()
-                    });
-                    let span = decoded_source
-                        .as_ref()
-                        .map_or(decoded_span.clone(), |file| {
-                            let Some(start) = sai_vfs::TextSize::from_usize(decoded_span.start)
-                                .and_then(|offset| file.to_original_offset(offset))
-                            else {
-                                return decoded_span;
-                            };
-                            let Some(end) = sai_vfs::TextSize::from_usize(decoded_span.end)
-                                .and_then(|offset| file.to_original_offset(offset))
-                            else {
-                                return decoded_span;
-                            };
-                            start.to_usize()..end.to_usize()
-                        });
-                    let data = (!diagnostic.data.is_empty())
-                        .then(|| source_value_object_json(&diagnostic.data));
+                    let span =
+                        decoded_source_range_to_original(decoded_source.as_ref(), diagnostic.span);
                     cli_source_diagnostic(
                         &mut source_index,
                         FmtDiagnosticSource {
                             path: source_path,
                             include_source_line: include_source_lines,
                         },
-                        diagnostic.code.as_str(),
-                        diagnostic.message,
+                        diagnostic.code,
+                        diagnostic.message.into_owned(),
                         span,
-                        data,
-                        None,
+                        diagnostic.data,
+                        diagnostic.help,
                     )
                 })
                 .collect();
@@ -727,6 +736,26 @@ fn source_format_diagnostics(
             total_error_count: 1,
         },
     }
+}
+
+fn decoded_source_range_to_original(
+    decoded_source: Option<&sai_vfs::SourceFile>,
+    decoded_span: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let Some(decoded_source) = decoded_source else {
+        return decoded_span;
+    };
+    let Some(start) = sai_vfs::TextSize::from_usize(decoded_span.start)
+        .and_then(|offset| decoded_source.to_original_offset(offset))
+    else {
+        return decoded_span;
+    };
+    let Some(end) = sai_vfs::TextSize::from_usize(decoded_span.end)
+        .and_then(|offset| decoded_source.to_original_offset(offset))
+    else {
+        return decoded_span;
+    };
+    start.to_usize()..end.to_usize()
 }
 
 fn fmt_unsupported_source_shape_diagnostic(
@@ -889,6 +918,12 @@ fn fmt_path_selection_signature(
 
 fn open_selected_fmt_file(file: &mut SelectedFmtFile) -> io::Result<cap_std::fs::File> {
     if let Some(opened_file) = file.identity_guard.as_ref() {
+        if sai_windows_fs::file_identity(opened_file)? != file.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "formatter input identity changed after selection",
+            ));
+        }
         return Ok(cap_std::fs::File::from_std(opened_file.try_clone()?));
     }
     let parent = file.parent.as_ref().ok_or_else(|| {
@@ -899,8 +934,15 @@ fn open_selected_fmt_file(file: &mut SelectedFmtFile) -> io::Result<cap_std::fs:
     })?;
     let parent_handle = parent.try_clone()?.into_std_file();
     let parent_path = file.path.parent().unwrap_or(&file.path);
-    sai_windows_fs::open_file_without_following(&parent_handle, parent_path, &file.name)
-        .map(cap_std::fs::File::from_std)
+    let opened_file =
+        sai_windows_fs::open_file_without_following(&parent_handle, parent_path, &file.name)?;
+    if sai_windows_fs::file_identity(&opened_file)? != file.identity {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "formatter input identity changed after selection",
+        ));
+    }
+    Ok(cap_std::fs::File::from_std(opened_file))
 }
 
 fn run_fmt_paths(
@@ -1318,9 +1360,126 @@ fn run_fmt_paths(
                 return report_interrupted(parsed, stdout, stderr);
             }
         } else {
-            result.refused.push(file.source_path.clone());
-            diagnostics.push(fmt_source_not_implemented_diagnostic(&file.source_path));
-            total_error_count = total_error_count.saturating_add(1);
+            let source_file = match open_selected_fmt_file(&mut file) {
+                Ok(file) => file,
+                Err(error) => {
+                    diagnostics.push(fmt_io_diagnostic(
+                        "SOURCE_READ_FAILED",
+                        &file.source_path,
+                        "could not open formatter input",
+                        &error,
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                    continue;
+                }
+            };
+            let permissions = match source_file.metadata() {
+                Ok(metadata) => metadata.permissions(),
+                Err(error) => {
+                    diagnostics.push(fmt_io_diagnostic(
+                        "SOURCE_READ_FAILED",
+                        &file.source_path,
+                        "could not inspect formatter input permissions",
+                        &error,
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                    continue;
+                }
+            };
+            let source =
+                match read_source_limited(source_file, sai_vfs::MAX_SOURCE_BYTES, cancellation) {
+                    Ok(source) => source,
+                    Err(SourceInputReadError::Interrupted) => {
+                        return report_interrupted(parsed, stdout, stderr);
+                    }
+                    Err(SourceInputReadError::Io(error)) => {
+                        diagnostics.push(fmt_io_diagnostic(
+                            "SOURCE_READ_FAILED",
+                            &file.source_path,
+                            "could not read formatter input",
+                            &error,
+                        ));
+                        total_error_count = total_error_count.saturating_add(1);
+                        continue;
+                    }
+                    Err(SourceInputReadError::TooLarge(byte_len)) => {
+                        result.refused.push(file.source_path.clone());
+                        diagnostics.push(source_limit_diagnostic(byte_len, &file.source_path));
+                        total_error_count = total_error_count.saturating_add(1);
+                        continue;
+                    }
+                };
+            let source: Arc<[u8]> = source.into();
+            let formatted = match sai_fmt::format_source(&source) {
+                Ok(formatted) => formatted,
+                Err(error) => {
+                    if matches!(error, sai_fmt::SourceFormatError::Refused(_)) {
+                        result.refused.push(file.source_path.clone());
+                    }
+                    let batch = source_format_diagnostics(
+                        &source,
+                        &file.source_path,
+                        error,
+                        parsed.globals.max_errors,
+                        parsed.globals.format == OutputFormat::Human,
+                    );
+                    total_error_count = total_error_count.saturating_add(batch.total_error_count);
+                    diagnostics.extend(batch.diagnostics);
+                    continue;
+                }
+            };
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+            let differs = source.as_ref() != formatted.as_bytes();
+            if differs {
+                if !check {
+                    if cancellation.is_cancelled() {
+                        return report_interrupted(parsed, stdout, stderr);
+                    }
+                    match write_file_atomically_in_directory(
+                        file.parent
+                            .as_deref()
+                            .expect("source file retains its parent directory"),
+                        &file.name,
+                        file.identity,
+                        source.as_ref(),
+                        permissions,
+                        formatted.as_bytes(),
+                    ) {
+                        Ok(()) => {
+                            result.changed.push(file.source_path.clone());
+                            human_changed_paths.push(human_file_path(&file.path.to_string_lossy()));
+                        }
+                        Err(error) => {
+                            if error.installed {
+                                result.changed.push(file.source_path.clone());
+                                human_changed_paths
+                                    .push(human_file_path(&file.path.to_string_lossy()));
+                            }
+                            diagnostics.push(fmt_io_diagnostic(
+                                "OUTPUT_WRITE_FAILED",
+                                &file.source_path,
+                                "could not write formatted file",
+                                &error.source,
+                            ));
+                            total_error_count = total_error_count.saturating_add(1);
+                        }
+                    }
+                } else {
+                    result.changed.push(file.source_path.clone());
+                    diagnostics.push(unformatted_file_diagnostic(
+                        &source,
+                        formatted.as_bytes(),
+                        &file.source_path,
+                        parsed.globals.format == OutputFormat::Human,
+                    ));
+                    total_error_count = total_error_count.saturating_add(1);
+                }
+            }
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
         }
     }
     if cancellation.is_cancelled() {
@@ -1398,20 +1557,6 @@ fn fmt_io_diagnostic(
             escape_json(path),
             escape_json(&error.to_string())
         )),
-    }
-}
-
-fn fmt_source_not_implemented_diagnostic(path: &str) -> CliDiagnostic {
-    let mut source = CliSourceIndex::new(Arc::from([]));
-    CliDiagnostic {
-        code: "FEATURE_NOT_IMPLEMENTED",
-        message: "stage 0 feature `sai fmt source files` is not implemented".to_owned(),
-        primary: Some(source.location(path, 0..0, false)),
-        primary_label: String::new(),
-        argument_index: None,
-        argument: path.to_owned(),
-        help: None,
-        data: Some("{\"stage\":0,\"feature\":\"sai fmt source files\"}".to_owned()),
     }
 }
 
@@ -1632,33 +1777,33 @@ fn read_stdin_limited(
     }
 }
 
-enum SourceStdinReadError {
+enum SourceInputReadError {
     Interrupted,
     Io(io::Error),
     TooLarge(usize),
 }
 
-fn read_source_stdin(
-    stdin: &mut impl Read,
+fn read_source_limited(
+    mut input: impl Read,
     limit: usize,
     cancellation: &CancellationToken,
-) -> Result<Vec<u8>, SourceStdinReadError> {
-    let mut source = Vec::with_capacity(limit);
+) -> Result<Vec<u8>, SourceInputReadError> {
+    let mut source = Vec::with_capacity(limit.min(8192));
     let mut total_bytes = 0usize;
     let mut oversized = false;
     let mut buffer = [0_u8; 8192];
 
     loop {
         if cancellation.is_cancelled() {
-            return Err(SourceStdinReadError::Interrupted);
+            return Err(SourceInputReadError::Interrupted);
         }
-        match stdin.read(&mut buffer) {
+        match input.read(&mut buffer) {
             Ok(0) => {
                 if cancellation.is_cancelled() {
-                    return Err(SourceStdinReadError::Interrupted);
+                    return Err(SourceInputReadError::Interrupted);
                 }
                 return if oversized {
-                    Err(SourceStdinReadError::TooLarge(total_bytes))
+                    Err(SourceInputReadError::TooLarge(total_bytes))
                 } else {
                     Ok(source)
                 };
@@ -1670,31 +1815,31 @@ fn read_source_stdin(
                 source.extend_from_slice(&buffer[..retained_bytes]);
                 oversized |= retained_bytes < bytes_read;
                 if cancellation.is_cancelled() {
-                    return Err(SourceStdinReadError::Interrupted);
+                    return Err(SourceInputReadError::Interrupted);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 if cancellation.is_cancelled() {
-                    return Err(SourceStdinReadError::Interrupted);
+                    return Err(SourceInputReadError::Interrupted);
                 }
             }
             Err(error) => {
                 if cancellation.is_cancelled() {
-                    return Err(SourceStdinReadError::Interrupted);
+                    return Err(SourceInputReadError::Interrupted);
                 }
-                return Err(SourceStdinReadError::Io(error));
+                return Err(SourceInputReadError::Io(error));
             }
         }
     }
 }
 
-fn source_stdin_limit_diagnostic(byte_len: usize) -> CliDiagnostic {
+fn source_limit_diagnostic(byte_len: usize, source_path: &str) -> CliDiagnostic {
     let limit_mib = sai_vfs::MAX_SOURCE_BYTES / (1024 * 1024);
     let mut source_index = CliSourceIndex::new(Arc::from([]));
     cli_source_diagnostic(
         &mut source_index,
         FmtDiagnosticSource {
-            path: "<stdin>",
+            path: source_path,
             include_source_line: false,
         },
         "IMPLEMENTATION_LIMIT_EXCEEDED",
@@ -5401,7 +5546,10 @@ mod tests {
 
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
-        assert!(stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+        assert!(
+            stdout.contains("\"code\":\"UNFORMATTED_FILE\""),
+            "unexpected --check output: {stdout}"
+        );
         assert!(stdout.contains("\"path\":\"<stdin>\""));
         assert!(stdout.contains("\"line\":1,\"expected\":\"fn f() {}\""));
         assert!(stdout.contains(
@@ -5438,6 +5586,29 @@ mod tests {
         assert!(stdout.contains(
             "\"kind\":\"fmt\",\"data\":{\"check\":false,\"files\":1,\"changed\":[],\"refused\":[],\"output\":null}"
         ));
+    }
+
+    #[test]
+    fn fmt_source_max_errors_bounds_retained_diagnostics_and_keeps_the_total() {
+        let source = format!("// {}\nfn f() {{}}\n", "\u{202e}".repeat(128));
+        let expected_errors = match sai_fmt::parse_source(source.as_bytes()).unwrap_err() {
+            sai_fmt::SourceInputError::Refused(refusal) => refusal
+                .input_errors
+                .len()
+                .saturating_add(refusal.lexical_errors.len())
+                .saturating_add(refusal.syntax_errors.len()),
+            sai_fmt::SourceInputError::InternalError => panic!("source refusal was expected"),
+        };
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &["--format=json", "--max-errors=1", "fmt", "-"],
+            source.as_bytes(),
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains(&format!("\"errors\":{expected_errors}")));
+        assert!(stdout.contains("\"shown_errors\":1"));
+        assert_eq!(stdout.matches("\"type\":\"diagnostic\"").count(), 1);
     }
 
     #[test]
@@ -5522,6 +5693,101 @@ mod tests {
         assert!(stdout.contains("\"refused\":[]"));
         assert!(stdout.contains("\"exit_code\":0"));
         assert!(directory.child(".sai/lock").is_file());
+    }
+
+    #[test]
+    fn fmt_check_and_atomic_write_support_an_explicit_source_path() {
+        let directory = TestDirectory::new();
+        let source = directory.child("source.sai");
+        let original = b"fn greet(name:Str){}";
+        fs::write(&source, original).unwrap();
+        let source_path = source.to_str().expect("temporary path is UTF-8");
+        let canonical_source = fs::canonicalize(&source).unwrap();
+        let source_reference =
+            super::fmt_path_reference(&canonical_source, &std::env::current_dir().unwrap(), None);
+        let source_reference_json = super::escape_json(&source_reference);
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", "--check", source_path]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(
+            stdout.contains("\"code\":\"UNFORMATTED_FILE\""),
+            "unexpected source --check output: {stdout}"
+        );
+        assert!(stdout.contains(&format!("\"file\":{{\"path\":\"{source_reference_json}\"")));
+        assert!(stdout.contains(&format!(
+            "\"files\":1,\"changed\":[\"{source_reference_json}\"]"
+        )));
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", source_path]);
+
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(fs::read(&source).unwrap(), b"fn greet(name: Str) {}\n");
+        assert!(stdout.contains(&format!("\"changed\":[\"{source_reference_json}\"]")));
+        assert!(stdout.contains("\"refused\":[]"));
+    }
+
+    #[test]
+    fn fmt_source_paths_distinguish_refusals_from_unsupported_shapes() {
+        let directory = TestDirectory::new();
+        let comment = directory.child("comment.sai");
+        let broken = directory.child("source.sai");
+        let comment_source = b"fn f() {} // trailing";
+        let broken_source = b"\xef\xbb\xbffn broken(";
+        fs::write(&comment, comment_source).unwrap();
+        fs::write(&broken, broken_source).unwrap();
+        let comment_path = comment.to_str().expect("temporary path is UTF-8");
+        let broken_path = broken.to_str().expect("temporary path is UTF-8");
+        let working_directory = std::env::current_dir().unwrap();
+        let canonical_broken = fs::canonicalize(&broken).unwrap();
+        let broken_reference =
+            super::fmt_path_reference(&canonical_broken, &working_directory, None);
+        let broken_reference_json = super::escape_json(&broken_reference);
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "fmt", comment_path, broken_path]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(fs::read(comment).unwrap(), comment_source);
+        assert_eq!(fs::read(broken).unwrap(), broken_source);
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unexpected explicit source-path output: {stdout}"
+        );
+        assert!(stdout.contains("\"feature\":\"sai fmt source syntax\""));
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(stdout.contains(&format!("\"file\":{{\"path\":\"{broken_reference_json}\"")));
+        assert!(stdout.contains("\"start\":{\"byte\":13"));
+        assert!(stdout.contains(&format!("\"refused\":[\"{broken_reference_json}\"]")));
+        assert!(stdout.contains("\"exit_code\":1"));
+    }
+
+    #[test]
+    fn fmt_source_path_reports_the_actual_oversized_input_length() {
+        let directory = TestDirectory::new();
+        let source = directory.child("large.sai");
+        let byte_len = sai_vfs::MAX_SOURCE_BYTES + 37;
+        fs::write(&source, vec![b'x'; byte_len]).unwrap();
+        let source_path = source.to_str().expect("temporary path is UTF-8");
+        let source_reference = super::fmt_path_reference(
+            &fs::canonicalize(&source).unwrap(),
+            &std::env::current_dir().unwrap(),
+            None,
+        );
+        let source_reference_json = super::escape_json(&source_reference);
+
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", source_path]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(fs::metadata(source).unwrap().len(), byte_len as u64);
+        assert!(stdout.contains("\"code\":\"IMPLEMENTATION_LIMIT_EXCEEDED\""));
+        assert!(stdout.contains(&format!("\"value\":{byte_len}")));
+        assert!(stdout.contains(&format!("\"refused\":[\"{source_reference_json}\"]")));
     }
 
     #[test]
@@ -5752,7 +6018,7 @@ mod tests {
     }
 
     #[test]
-    fn fmt_directory_processes_package_files_and_reports_unimplemented_sources() {
+    fn fmt_directory_processes_package_and_source_files() {
         let directory = TestDirectory::new();
         fs::create_dir_all(directory.child("src")).unwrap();
         fs::create_dir_all(directory.child("out")).unwrap();
@@ -5761,26 +6027,31 @@ mod tests {
             b"package acme:app@1.0.0\nsource\"src\"\n",
         )
         .unwrap();
-        fs::write(directory.child("src/lib.sai"), b"pub fn main() {}\n").unwrap();
+        fs::write(directory.child("src/lib.sai"), b"pub fn main(){}").unwrap();
         fs::write(directory.child("out/generated.sai"), b"ignored").unwrap();
         let root = directory.0.to_str().expect("temporary path is UTF-8");
 
         let (exit_code, stdout, stderr) = invoke(&["--format=json", "fmt", root]);
 
-        assert_eq!(exit_code, 1);
+        assert_eq!(
+            exit_code, 0,
+            "unexpected directory result: {stdout}{stderr}"
+        );
         assert!(stderr.is_empty());
         assert_eq!(
             fs::read(directory.child("sai.package")).unwrap(),
             b"package acme:app @ 1.0.0\nsource \"src\"\n"
         );
+        assert_eq!(
+            fs::read(directory.child("src/lib.sai")).unwrap(),
+            b"pub fn main() {}\n"
+        );
         assert!(stdout.contains("\"kind\":\"fmt\""));
         assert!(stdout.contains("\"files\":2"));
-        assert!(stdout.contains("\"path\":\"src/lib.sai\""));
-        assert!(stdout.contains("\"feature\":\"sai fmt source files\""));
-        assert!(stdout.contains("\"changed\":[\"sai.package\"]"));
-        assert!(stdout.contains("\"refused\":[\"src/lib.sai\"]"));
+        assert!(stdout.contains("\"changed\":[\"sai.package\",\"src/lib.sai\"]"));
+        assert!(stdout.contains("\"refused\":[]"));
         assert!(!stdout.contains("generated.sai"));
-        assert!(stdout.contains("\"exit_code\":1"));
+        assert!(stdout.contains("\"exit_code\":0"));
     }
 
     #[test]
