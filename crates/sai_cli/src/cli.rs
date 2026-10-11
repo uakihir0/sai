@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::args::{ColorChoice, OutputFormat, ParsedArgs, UsageError, UsageErrorKind, parse_args};
 use crate::help::{render_command_help, render_top_level_help, render_version};
 use crate::new_package::parse_new_command;
-use sai_diagnostics::EXPLAIN_CODE_SUMMARIES;
+use sai_diagnostics::{EXPLAIN_CODE_SUMMARIES, Value, ValueObject};
 use sai_driver::CancellationToken;
 use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
@@ -353,18 +353,14 @@ fn run_fmt(
         index += 1;
     }
     if stdin_kind == "source" {
-        return report_feature_not_implemented(
-            CliOutputOptions {
-                format: parsed.globals.format,
-                quiet: parsed.globals.quiet,
-                color: parsed.globals.color,
-                max_errors: parsed.globals.max_errors,
-            },
-            "fmt",
-            0,
-            "sai fmt source input",
+        return run_fmt_source_stdin(
+            parsed,
+            cancellation,
+            stdin,
             stdout,
             stderr,
+            stdout_is_terminal,
+            check,
         );
     }
 
@@ -487,6 +483,294 @@ fn run_fmt(
                 0
             }
         }
+    }
+}
+
+fn run_fmt_source_stdin(
+    parsed: &ParsedArgs,
+    cancellation: &CancellationToken,
+    stdin: &mut impl Read,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    stdout_is_terminal: bool,
+    check: bool,
+) -> i32 {
+    let source = match read_source_stdin(stdin, sai_vfs::MAX_SOURCE_BYTES, cancellation) {
+        Ok(source) => source,
+        Err(SourceStdinReadError::Interrupted) => {
+            return report_interrupted(parsed, stdout, stderr);
+        }
+        Err(SourceStdinReadError::Io(error)) => {
+            let diagnostic = CliDiagnostic {
+                code: "SOURCE_READ_FAILED",
+                message: "could not read standard input".to_owned(),
+                primary: None,
+                primary_label: String::new(),
+                argument_index: None,
+                argument: String::new(),
+                help: Some(error.to_string()),
+                data: Some(format!(
+                    "{{\"path\":\"<stdin>\",\"reason\":\"{}\"}}",
+                    escape_json(&error.to_string())
+                )),
+            };
+            return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
+        }
+        Err(SourceStdinReadError::TooLarge(byte_len)) => {
+            let diagnostic = source_stdin_limit_diagnostic(byte_len);
+            return report_fmt_diagnostics(
+                parsed,
+                vec![diagnostic],
+                1,
+                Some(FmtResult {
+                    check,
+                    files: 1,
+                    refused: vec!["<stdin>".to_owned()],
+                    ..FmtResult::default()
+                }),
+                stdout,
+                stderr,
+            );
+        }
+    };
+    let source: Arc<[u8]> = source.into();
+    let formatted = match sai_fmt::format_source(&source) {
+        Ok(formatted) => formatted,
+        Err(error) => {
+            let result = match &error {
+                sai_fmt::SourceFormatError::Refused(_) => Some(FmtResult {
+                    check,
+                    files: 1,
+                    refused: vec!["<stdin>".to_owned()],
+                    ..FmtResult::default()
+                }),
+                sai_fmt::SourceFormatError::UnsupportedShape => Some(FmtResult {
+                    check,
+                    files: 1,
+                    ..FmtResult::default()
+                }),
+                _ => None,
+            };
+            let batch = source_format_diagnostics(
+                &source,
+                "<stdin>",
+                error,
+                parsed.globals.format == OutputFormat::Human,
+            );
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+            return report_fmt_diagnostics(
+                parsed,
+                batch.diagnostics,
+                batch.total_error_count,
+                result,
+                stdout,
+                stderr,
+            );
+        }
+    };
+    if cancellation.is_cancelled() {
+        return report_interrupted(parsed, stdout, stderr);
+    }
+    let differs = source.as_ref() != formatted.as_bytes();
+    if check && differs {
+        return report_fmt_diagnostics(
+            parsed,
+            vec![unformatted_file_diagnostic(
+                &source,
+                formatted.as_bytes(),
+                "<stdin>",
+                parsed.globals.format == OutputFormat::Human,
+            )],
+            1,
+            Some(FmtResult {
+                check,
+                files: 1,
+                changed: vec!["<stdin>".to_owned()],
+                ..FmtResult::default()
+            }),
+            stdout,
+            stderr,
+        );
+    }
+    match parsed.globals.format {
+        OutputFormat::Human => {
+            if check {
+                0
+            } else if stdout_is_terminal {
+                let safe_output = escape_terminal_controls(&formatted);
+                write_stdout_text(stdout, &safe_output, stderr)
+            } else {
+                write_stdout_text(stdout, &formatted, stderr)
+            }
+        }
+        OutputFormat::Json => {
+            if let Err(error) = write_json_fmt_success(
+                stdout,
+                FmtResult {
+                    check,
+                    files: 1,
+                    changed: differs.then(|| "<stdin>".to_owned()).into_iter().collect(),
+                    output: (!check).then_some(formatted),
+                    ..FmtResult::default()
+                },
+            ) {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn source_format_diagnostics(
+    source: &Arc<[u8]>,
+    source_path: &str,
+    error: sai_fmt::SourceFormatError,
+    include_source_lines: bool,
+) -> FmtDiagnosticBatch {
+    match error {
+        sai_fmt::SourceFormatError::Refused(refusal) => {
+            let total_error_count = refusal
+                .input_errors
+                .len()
+                .saturating_add(refusal.lexical_errors.len())
+                .saturating_add(refusal.syntax_errors.len());
+            let mut source_index = CliSourceIndex::new(Arc::clone(source));
+            let decoded_source = sai_vfs::SourceFile::decode(sai_vfs::FileId::new(0), source).ok();
+            let diagnostics = refusal
+                .input_errors
+                .into_iter()
+                .chain(refusal.lexical_errors)
+                .chain(refusal.syntax_errors)
+                .map(|diagnostic| {
+                    let decoded_span = diagnostic.primary().map_or(0..0, |location| {
+                        location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                    });
+                    let span = decoded_source
+                        .as_ref()
+                        .map_or(decoded_span.clone(), |file| {
+                            let Some(start) = sai_vfs::TextSize::from_usize(decoded_span.start)
+                                .and_then(|offset| file.to_original_offset(offset))
+                            else {
+                                return decoded_span;
+                            };
+                            let Some(end) = sai_vfs::TextSize::from_usize(decoded_span.end)
+                                .and_then(|offset| file.to_original_offset(offset))
+                            else {
+                                return decoded_span;
+                            };
+                            start.to_usize()..end.to_usize()
+                        });
+                    let data = (!diagnostic.data.is_empty())
+                        .then(|| source_value_object_json(&diagnostic.data));
+                    cli_source_diagnostic(
+                        &mut source_index,
+                        FmtDiagnosticSource {
+                            path: source_path,
+                            include_source_line: include_source_lines,
+                        },
+                        diagnostic.code.as_str(),
+                        diagnostic.message,
+                        span,
+                        data,
+                        None,
+                    )
+                })
+                .collect();
+            FmtDiagnosticBatch {
+                diagnostics,
+                total_error_count,
+            }
+        }
+        sai_fmt::SourceFormatError::UnsupportedShape => FmtDiagnosticBatch {
+            diagnostics: vec![fmt_unsupported_source_shape_diagnostic(
+                source,
+                source_path,
+                include_source_lines,
+            )],
+            total_error_count: 1,
+        },
+        sai_fmt::SourceFormatError::VerificationFailed(failure) => {
+            let check = match failure.check {
+                sai_fmt::SourceVerificationCheck::OutputSyntax => "output does not parse",
+                sai_fmt::SourceVerificationCheck::SyntaxTreePreservation => "syntax tree changed",
+                sai_fmt::SourceVerificationCheck::CommentPreservation => "comments changed",
+                sai_fmt::SourceVerificationCheck::Idempotency => "formatting is not idempotent",
+            };
+            let mut source_index = CliSourceIndex::new(Arc::clone(source));
+            let primary = failure.input_byte_offset.map(|offset| {
+                source_index.location(source_path, offset..offset, include_source_lines)
+            });
+            FmtDiagnosticBatch {
+                diagnostics: vec![internal_fmt_diagnostic(
+                    format!("formatter verification failed: {check}"),
+                    primary,
+                )],
+                total_error_count: 1,
+            }
+        }
+        sai_fmt::SourceFormatError::InternalError => FmtDiagnosticBatch {
+            diagnostics: vec![internal_fmt_diagnostic(
+                "source formatter could not render input".to_owned(),
+                None,
+            )],
+            total_error_count: 1,
+        },
+        sai_fmt::SourceFormatError::Print(error) => FmtDiagnosticBatch {
+            diagnostics: vec![internal_fmt_diagnostic(
+                format!("source formatter printer failed: {error:?}"),
+                None,
+            )],
+            total_error_count: 1,
+        },
+    }
+}
+
+fn fmt_unsupported_source_shape_diagnostic(
+    source: &Arc<[u8]>,
+    source_path: &str,
+    include_source_lines: bool,
+) -> CliDiagnostic {
+    let mut source_index = CliSourceIndex::new(Arc::clone(source));
+    CliDiagnostic {
+        code: "FEATURE_NOT_IMPLEMENTED",
+        message: "this SAI source syntax is not supported yet".to_owned(),
+        primary: Some(source_index.location(source_path, 0..0, include_source_lines)),
+        primary_label: String::new(),
+        argument_index: None,
+        argument: source_path.to_owned(),
+        help: None,
+        data: Some("{\"stage\":0,\"feature\":\"sai fmt source syntax\"}".to_owned()),
+    }
+}
+
+fn source_value_object_json(object: &ValueObject) -> String {
+    let members = object
+        .iter()
+        .map(|(key, value)| format!("\"{}\":{}", escape_json(key), source_value_json(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{members}}}")
+}
+
+fn source_value_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(value) => value.to_string(),
+        Value::Integer(value) => value.to_string(),
+        Value::String(value) => format!("\"{}\"", escape_json(value)),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(source_value_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(object) => source_value_object_json(object),
     }
 }
 
@@ -1346,6 +1630,81 @@ fn read_stdin_limited(
             }
         }
     }
+}
+
+enum SourceStdinReadError {
+    Interrupted,
+    Io(io::Error),
+    TooLarge(usize),
+}
+
+fn read_source_stdin(
+    stdin: &mut impl Read,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, SourceStdinReadError> {
+    let mut source = Vec::with_capacity(limit);
+    let mut total_bytes = 0usize;
+    let mut oversized = false;
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(SourceStdinReadError::Interrupted);
+        }
+        match stdin.read(&mut buffer) {
+            Ok(0) => {
+                if cancellation.is_cancelled() {
+                    return Err(SourceStdinReadError::Interrupted);
+                }
+                return if oversized {
+                    Err(SourceStdinReadError::TooLarge(total_bytes))
+                } else {
+                    Ok(source)
+                };
+            }
+            Ok(bytes_read) => {
+                total_bytes = total_bytes.saturating_add(bytes_read);
+                let remaining = limit.saturating_sub(source.len());
+                let retained_bytes = bytes_read.min(remaining);
+                source.extend_from_slice(&buffer[..retained_bytes]);
+                oversized |= retained_bytes < bytes_read;
+                if cancellation.is_cancelled() {
+                    return Err(SourceStdinReadError::Interrupted);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if cancellation.is_cancelled() {
+                    return Err(SourceStdinReadError::Interrupted);
+                }
+            }
+            Err(error) => {
+                if cancellation.is_cancelled() {
+                    return Err(SourceStdinReadError::Interrupted);
+                }
+                return Err(SourceStdinReadError::Io(error));
+            }
+        }
+    }
+}
+
+fn source_stdin_limit_diagnostic(byte_len: usize) -> CliDiagnostic {
+    let limit_mib = sai_vfs::MAX_SOURCE_BYTES / (1024 * 1024);
+    let mut source_index = CliSourceIndex::new(Arc::from([]));
+    cli_source_diagnostic(
+        &mut source_index,
+        FmtDiagnosticSource {
+            path: "<stdin>",
+            include_source_line: false,
+        },
+        "IMPLEMENTATION_LIMIT_EXCEEDED",
+        format!("source file is {byte_len} bytes, exceeding the {limit_mib} MiB limit"),
+        0..0,
+        Some(format!(
+            "{{\"limit\":\"size of a source file\",\"value\":{byte_len}}}"
+        )),
+        None,
+    )
 }
 
 impl StdinBroker {
@@ -4528,6 +4887,7 @@ mod tests {
         run_with_cancellation_and_input, write_file_atomically_in_directory,
         write_human_diagnostics,
     };
+    use sai_diagnostics::{Value, ValueObject};
     use sai_driver::CancellationToken;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -5013,6 +5373,133 @@ mod tests {
         assert!(stdout.contains("\"check\":false,\"files\":1,\"changed\":[\"<stdin>\"]"));
         assert!(stdout.contains("\"output\":\"package acme:app @ 1.0.0\\nsource \\\"src\\\"\\n\""));
         assert!(stdout.contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn fmt_formats_source_stdin_and_emits_the_json_result_contract() {
+        let source = b"fn greet(name:Str){}";
+        let expected = "fn greet(name: Str) {}\n";
+        let (exit_code, stdout, stderr) = invoke_with_stdin(&["fmt", "-"], source);
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+
+        let (exit_code, stdout, stderr) = invoke_with_stdin(&["--format=json", "fmt", "-"], source);
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"kind\":\"fmt\""));
+        assert!(stdout.contains("\"check\":false,\"files\":1,\"changed\":[\"<stdin>\"]"));
+        assert!(stdout.contains("\"output\":\"fn greet(name: Str) {}\\n\""));
+        assert!(stdout.contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn fmt_check_reports_the_first_differing_source_stdin_line() {
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["--format=json", "fmt", "--check", "-"], b"fn f(){}");
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+        assert!(stdout.contains("\"path\":\"<stdin>\""));
+        assert!(stdout.contains("\"line\":1,\"expected\":\"fn f() {}\""));
+        assert!(stdout.contains(
+            "\"kind\":\"fmt\",\"data\":{\"check\":true,\"files\":1,\"changed\":[\"<stdin>\"],\"refused\":[],\"output\":null}"
+        ));
+        assert!(stdout.contains("\"exit_code\":1"));
+
+        let canonical = b"fn f() {}\n";
+        let (exit_code, stdout, stderr) = invoke_with_stdin(&["fmt", "--check", "-"], canonical);
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn fmt_reports_source_stdin_refusals_and_unsupported_shapes() {
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["--format=json", "fmt", "-"], b"fn broken(");
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(stdout.contains("\"path\":\"<stdin>\""));
+        assert!(stdout.contains(
+            "\"kind\":\"fmt\",\"data\":{\"check\":false,\"files\":1,\"changed\":[],\"refused\":[\"<stdin>\"],\"output\":null}"
+        ));
+
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["--format=json", "fmt", "-"], b"fn f() {} // trailing");
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(stdout.contains("\"feature\":\"sai fmt source syntax\""));
+        assert!(stdout.contains(
+            "\"kind\":\"fmt\",\"data\":{\"check\":false,\"files\":1,\"changed\":[],\"refused\":[],\"output\":null}"
+        ));
+    }
+
+    #[test]
+    fn fmt_maps_source_stdin_diagnostics_back_to_original_bytes() {
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["--format=json", "fmt", "-"], b"\xef\xbb\xbffn broken(");
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(stdout.contains("\"start\":{\"byte\":13"));
+        assert!(stdout.contains("\"end\":{\"byte\":13"));
+
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["--format=json", "fmt", "-"], b"\xef\xbb\xbf\xff");
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"INVALID_UTF8\""));
+        assert!(stdout.contains("\"start\":{\"byte\":3"));
+        assert!(stdout.contains("\"end\":{\"byte\":4"));
+    }
+
+    #[test]
+    fn fmt_source_stdin_reports_the_actual_oversized_input_length() {
+        let byte_len = sai_vfs::MAX_SOURCE_BYTES + 37;
+        let source = vec![b'x'; byte_len];
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["--format=json", "fmt", "-"], &source);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"IMPLEMENTATION_LIMIT_EXCEEDED\""));
+        assert!(stdout.contains(&format!("\"value\":{byte_len}")));
+        assert!(stdout.contains("\"refused\":[\"<stdin>\"]"));
+    }
+
+    #[test]
+    fn source_diagnostic_data_serializes_nested_json_values() {
+        let data = ValueObject::from([
+            (
+                "feature".to_owned(),
+                Value::String("quoted \"text\"".to_owned()),
+            ),
+            (
+                "items".to_owned(),
+                Value::Array(vec![
+                    Value::Bool(true),
+                    Value::Null,
+                    Value::Object(ValueObject::from([(
+                        "nested".to_owned(),
+                        Value::Integer(2),
+                    )])),
+                ]),
+            ),
+            ("stage".to_owned(), Value::Integer(1)),
+        ]);
+
+        assert_eq!(
+            super::source_value_object_json(&data),
+            r#"{"feature":"quoted \"text\"","items":[true,null,{"nested":2}],"stage":1}"#
+        );
     }
 
     #[test]
