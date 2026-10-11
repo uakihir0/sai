@@ -23,8 +23,14 @@ pub use printer::{Doc, GroupId, PrintError, print, print_with_forced_groups};
 pub struct Refusal {
     /// Lexical errors reported by the package lexer.
     pub lexical_errors: Vec<PackageLexError>,
+    /// Total lexical error count, including diagnostics omitted by a bounded
+    /// formatting call.
+    pub lexical_error_count: usize,
     /// Grammar errors and parser-limit errors reported by the package parser.
     pub syntax_errors: Vec<PackageParseError>,
+    /// Total formatter-refusing parser errors, including errors omitted by a
+    /// bounded formatting call.
+    pub syntax_error_count: usize,
 }
 
 /// The package-format verification check that failed.
@@ -70,8 +76,7 @@ impl fmt::Display for PackageFormatError {
             Self::Refused(refusal) => write!(
                 formatter,
                 "package input contains {} lexical and {} syntax errors",
-                refusal.lexical_errors.len(),
-                refusal.syntax_errors.len()
+                refusal.lexical_error_count, refusal.syntax_error_count
             ),
             Self::InternalError => formatter.write_str("package formatter could not render input"),
             Self::Print(error) => write!(formatter, "package formatter printer failed: {error:?}"),
@@ -91,8 +96,20 @@ impl Error for PackageFormatError {}
 /// The result is parsed and checked for token, diagnostic, and comment
 /// preservation. It is formatted a second time to verify idempotency.
 pub fn format_package(source: &[u8]) -> Result<String, PackageFormatError> {
-    let formatted = format_package_once(source)?;
-    let repeated = format_package_once(formatted.as_bytes())?;
+    format_package_with_error_limit(source, usize::MAX)
+}
+
+/// Format one package file while retaining at most `max_errors` lexical and
+/// parser diagnostics. The formatter still processes the complete input and
+/// preserves exact error totals in [`Refusal`]. A zero limit retains no
+/// detailed records; the CLI translates its `--max-errors=0` convention to
+/// `usize::MAX` before calling this API.
+pub fn format_package_with_error_limit(
+    source: &[u8],
+    max_errors: usize,
+) -> Result<String, PackageFormatError> {
+    let formatted = format_package_once(source, max_errors)?;
+    let repeated = format_package_once(formatted.as_bytes(), max_errors)?;
     if formatted != repeated {
         return Err(verification_failure(
             PackageVerificationCheck::Idempotency,
@@ -102,12 +119,14 @@ pub fn format_package(source: &[u8]) -> Result<String, PackageFormatError> {
     Ok(formatted)
 }
 
-fn format_package_once(source: &[u8]) -> Result<String, PackageFormatError> {
-    let input = PackageInput::new(source);
+fn format_package_once(source: &[u8], max_errors: usize) -> Result<String, PackageFormatError> {
+    let input = PackageInput::with_error_limit(source, max_errors);
     if !input.refusals().is_empty() {
         return Err(PackageFormatError::Refused(Refusal {
             lexical_errors: input.lexed().errors.clone(),
+            lexical_error_count: input.parsed().lexical_error_count(),
             syntax_errors: input.refusing_parse_errors(),
+            syntax_error_count: input.parsed().refusing_error_count(),
         }));
     }
     let index = PackageSyntaxIndex::new(&input).map_err(|_| PackageFormatError::InternalError)?;
@@ -115,7 +134,7 @@ fn format_package_once(source: &[u8]) -> Result<String, PackageFormatError> {
         .map_err(|_| PackageFormatError::InternalError)?;
     let formatted = print(&document).map_err(PackageFormatError::Print)?;
 
-    let formatted_input = PackageInput::new(formatted.as_bytes());
+    let formatted_input = PackageInput::with_error_limit(formatted.as_bytes(), max_errors);
     if !formatted_input.refusals().is_empty() {
         let output_offset = first_refusal_offset(&formatted_input).unwrap_or(formatted.len());
         let output_index = PackageSyntaxIndex::new(&formatted_input).ok();
@@ -318,7 +337,10 @@ fn package_diagnostics_match(
             });
         }
     }
-    if left_errors.len() != right_errors.len() {
+    if left.parsed().error_count() != right.parsed().error_count()
+        || left.parsed().error_fingerprint() != right.parsed().error_fingerprint()
+        || left_errors.len() != right_errors.len()
+    {
         return Err(PackageMismatch {
             input_byte_offset: left_errors
                 .get(right_errors.len())
@@ -379,8 +401,8 @@ mod tests {
     use super::{
         PackageFormatError, PackageInput, PackageSyntaxIndex, PackageVerificationCheck,
         PackageVerificationFailure, first_refusal_offset, format_package,
-        package_diagnostics_match, package_output_offset_to_input, package_token_forms_match,
-        verification_failure,
+        format_package_with_error_limit, package_diagnostics_match, package_output_offset_to_input,
+        package_token_forms_match, verification_failure,
     };
     use sai_package::manifest::{MAX_PACKAGE_MANIFEST_BYTES, PackageParseErrorKind, parse};
 
@@ -499,6 +521,55 @@ authors { \"A. Author\", \"B. Author\" }\n\
                         [error] if error.kind == PackageParseErrorKind::ManifestTooLarge
                     )
         ));
+    }
+
+    #[test]
+    fn bounded_refusal_keeps_structural_errors_after_non_refusing_parser_errors() {
+        let mut source = String::from("package acme:app @ 1.0.0\n");
+        for _ in 0..32 {
+            source.push_str("compiler > 1.0.0\n");
+        }
+        source.push_str("future {}\n");
+        let parsed = sai_package::manifest::parse_for_role_with_error_limit(
+            source.as_bytes(),
+            sai_package::manifest::PackageRole::Root,
+            1,
+        );
+
+        let error = format_package_with_error_limit(source.as_bytes(), 1)
+            .expect_err("unknown declarations must refuse formatting");
+        assert!(matches!(
+            error,
+            PackageFormatError::Refused(ref refusal)
+                if refusal.syntax_errors.len() == 1
+                    && refusal.syntax_error_count == parsed.refusing_error_count()
+                    && refusal.syntax_error_count > refusal.syntax_errors.len()
+                    && matches!(
+                        refusal.syntax_errors[0].kind,
+                        PackageParseErrorKind::UnknownDeclaration { .. }
+                    )
+        ));
+    }
+
+    #[test]
+    fn bounded_diagnostic_verification_checks_the_full_error_stream() {
+        let first =
+            b"package acme:app @ 1.0.0\ncompiler > 1.0.0\nsource \"../outside\"\ncompiler > 1.0.0\n";
+        let second =
+            b"package acme:app @ 1.0.0\ncompiler > 1.0.0\nsource \"../outside\"\ncompiler 1.0.0\n";
+        let first = PackageInput::with_error_limit(first, 2);
+        let second = PackageInput::with_error_limit(second, 2);
+
+        assert_eq!(first.parsed().errors(), second.parsed().errors());
+        assert_eq!(first.parsed().error_count(), second.parsed().error_count());
+        assert_ne!(
+            first.parsed().error_fingerprint(),
+            second.parsed().error_fingerprint()
+        );
+        assert!(
+            package_diagnostics_match(&first, &second).is_err(),
+            "a changed diagnostic after the retained prefix must fail verification"
+        );
     }
 
     #[test]

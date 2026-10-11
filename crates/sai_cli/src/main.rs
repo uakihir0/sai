@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<OsString>>();
@@ -13,7 +13,12 @@ fn main() {
         }
     };
     let cancellation = interrupt_handler.cancellation_token();
-    let exit_code =
-        sai_cli::cli::run_with_cancellation(&arguments, &cancellation, &mut stdout, &mut stderr);
+    let exit_code = sai_cli::cli::run_with_cancellation_and_terminal(
+        &arguments,
+        &cancellation,
+        stdout.is_terminal(),
+        &mut stdout,
+        &mut stderr,
+    );
     std::process::exit(exit_code);
 }

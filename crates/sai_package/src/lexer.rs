@@ -42,6 +42,8 @@ pub struct PackageToken {
     pub span: Range<usize>,
     /// Decoded string value for `String` tokens.
     pub string_value: Option<Box<str>>,
+    /// Whether a lexical error was reported inside this token.
+    pub has_lexical_error: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -87,6 +89,11 @@ pub struct PackageLexOutput {
     pub tokens: Vec<PackageToken>,
     pub trivia: Vec<PackageTrivia>,
     pub errors: Vec<PackageLexError>,
+    /// Whether the input could not be decoded as UTF-8.
+    pub invalid_utf8: bool,
+    /// Total number of lexical errors, including any that a bounded lexer call
+    /// did not retain in `errors`.
+    pub error_count: usize,
 }
 
 /// Lexes either a package contract or lock file.
@@ -94,7 +101,13 @@ pub struct PackageLexOutput {
 /// The two formats share tokenization. Package contracts and lock files use
 /// their own contextual newline continuation sets.
 pub fn lex(source: &[u8]) -> PackageLexOutput {
-    lex_with_mode(source, LexMode::Package, true)
+    lex_with_mode(source, LexMode::Package, true, usize::MAX)
+}
+
+/// Lexes a package contract while retaining at most `max_errors` diagnostics.
+/// The lexer still processes the complete input and reports the exact total.
+pub fn lex_with_error_limit(source: &[u8], max_errors: usize) -> PackageLexOutput {
+    lex_with_mode(source, LexMode::Package, true, max_errors)
 }
 
 /// Lexes a package contract without retaining whitespace and comment trivia.
@@ -102,15 +115,27 @@ pub fn lex(source: &[u8]) -> PackageLexOutput {
 /// This is useful when a parser already owns the trivia stream and a consumer
 /// needs a separate token stream for formatting or source analysis.
 pub fn lex_tokens(source: &[u8]) -> PackageLexOutput {
-    lex_with_mode(source, LexMode::Package, false)
+    lex_with_mode(source, LexMode::Package, false, usize::MAX)
+}
+
+/// Tokenizes a package contract while retaining at most `max_errors`
+/// diagnostics. The lexer still processes the complete input and reports the
+/// exact total.
+pub fn lex_tokens_with_error_limit(source: &[u8], max_errors: usize) -> PackageLexOutput {
+    lex_with_mode(source, LexMode::Package, false, max_errors)
 }
 
 /// Lexes a lock file using its field-aware newline continuation set.
 pub(crate) fn lex_lock(source: &[u8]) -> PackageLexOutput {
-    lex_with_mode(source, LexMode::Lock, true)
+    lex_with_mode(source, LexMode::Lock, true, usize::MAX)
 }
 
-fn lex_with_mode(source: &[u8], mode: LexMode, retain_trivia: bool) -> PackageLexOutput {
+fn lex_with_mode(
+    source: &[u8],
+    mode: LexMode,
+    retain_trivia: bool,
+    max_errors: usize,
+) -> PackageLexOutput {
     let text = match std::str::from_utf8(source) {
         Ok(text) => text,
         Err(error) => {
@@ -118,21 +143,29 @@ fn lex_with_mode(source: &[u8], mode: LexMode, retain_trivia: bool) -> PackageLe
             let end = error
                 .error_len()
                 .map_or(source.len(), |length| start + length);
+            let errors = if max_errors == 0 {
+                Vec::new()
+            } else {
+                vec![PackageLexError {
+                    kind: PackageLexErrorKind::InvalidUtf8,
+                    span: start..end,
+                }]
+            };
             return PackageLexOutput {
                 tokens: vec![PackageToken {
                     kind: PackageTokenKind::Eof,
                     span: source.len()..source.len(),
                     string_value: None,
+                    has_lexical_error: false,
                 }],
                 trivia: Vec::new(),
-                errors: vec![PackageLexError {
-                    kind: PackageLexErrorKind::InvalidUtf8,
-                    span: start..end,
-                }],
+                errors,
+                invalid_utf8: true,
+                error_count: 1,
             };
         }
     };
-    Lexer::new(text, mode, retain_trivia).run()
+    Lexer::new(text, mode, retain_trivia, max_errors).run()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,12 +182,16 @@ struct Lexer<'a> {
     tokens: Vec<PackageToken>,
     trivia: Vec<PackageTrivia>,
     errors: Vec<PackageLexError>,
+    error_count: usize,
+    max_errors: usize,
+    active_token_start: Option<usize>,
+    active_token_has_error: bool,
     previous: Option<PackageTokenKind>,
     pending_newline: Option<Range<usize>>,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(text: &'a str, mode: LexMode, retain_trivia: bool) -> Self {
+    fn new(text: &'a str, mode: LexMode, retain_trivia: bool, max_errors: usize) -> Self {
         Self {
             text,
             mode,
@@ -163,6 +200,10 @@ impl<'a> Lexer<'a> {
             tokens: Vec::new(),
             trivia: Vec::new(),
             errors: Vec::new(),
+            error_count: 0,
+            max_errors,
+            active_token_start: None,
+            active_token_has_error: false,
             previous: None,
             pending_newline: None,
         }
@@ -192,7 +233,11 @@ impl<'a> Lexer<'a> {
                 self.push_token(PackageTokenKind::Newline, newline, None);
             }
 
-            let token = self.lex_token();
+            self.active_token_start = Some(self.pos);
+            self.active_token_has_error = false;
+            let mut token = self.lex_token();
+            token.has_lexical_error = self.active_token_has_error;
+            self.active_token_start = None;
             self.previous = Some(token.kind);
             self.tokens.push(token);
         }
@@ -201,6 +246,8 @@ impl<'a> Lexer<'a> {
             tokens: self.tokens,
             trivia: self.trivia,
             errors: self.errors,
+            invalid_utf8: false,
+            error_count: self.error_count,
         }
     }
 
@@ -226,6 +273,7 @@ impl<'a> Lexer<'a> {
             kind,
             span,
             string_value,
+            has_lexical_error: false,
         });
     }
 
@@ -236,7 +284,20 @@ impl<'a> Lexer<'a> {
     }
 
     fn error(&mut self, kind: PackageLexErrorKind, span: Range<usize>) {
-        self.errors.push(PackageLexError { kind, span });
+        self.error_count = self.error_count.saturating_add(1);
+        if self
+            .active_token_start
+            .is_some_and(|token_start| span.start >= token_start)
+        {
+            self.active_token_has_error = true;
+        }
+        if self.errors.len() < self.max_errors {
+            self.errors.push(PackageLexError { kind, span });
+        }
+    }
+
+    fn comment_error(&mut self, kind: PackageLexErrorKind, span: Range<usize>) {
+        self.error(kind, span);
     }
 
     fn lex_trivia(&mut self) {
@@ -286,7 +347,7 @@ impl<'a> Lexer<'a> {
             let character_start = self.pos;
             self.pos += character.len_utf8();
             if is_bidi_control(character) || is_forbidden_non_ascii_whitespace(character) {
-                self.error(
+                self.comment_error(
                     PackageLexErrorKind::ForbiddenCharacter,
                     character_start..self.pos,
                 );
@@ -316,7 +377,7 @@ impl<'a> Lexer<'a> {
                 let character = self.peek().expect("not at end of input");
                 self.pos += character.len_utf8();
                 if is_bidi_control(character) || is_forbidden_non_ascii_whitespace(character) {
-                    self.error(
+                    self.comment_error(
                         PackageLexErrorKind::ForbiddenCharacter,
                         character_start..self.pos,
                     );
@@ -379,6 +440,7 @@ impl<'a> Lexer<'a> {
                 kind: PackageTokenKind::PackagePath,
                 span: start..end,
                 string_value: None,
+                has_lexical_error: false,
             };
         }
         if let Some(end) = scan_word(self.text, self.pos) {
@@ -387,6 +449,7 @@ impl<'a> Lexer<'a> {
                 kind: PackageTokenKind::Word,
                 span: start..end,
                 string_value: None,
+                has_lexical_error: false,
             };
         }
         if let Some(end) = scan_upper_word(self.text, self.pos) {
@@ -395,6 +458,7 @@ impl<'a> Lexer<'a> {
                 kind: PackageTokenKind::UpperWord,
                 span: start..end,
                 string_value: None,
+                has_lexical_error: false,
             };
         }
         if self
@@ -413,6 +477,7 @@ impl<'a> Lexer<'a> {
                 kind,
                 span: start..self.pos,
                 string_value: None,
+                has_lexical_error: false,
             };
         }
 
@@ -428,6 +493,7 @@ impl<'a> Lexer<'a> {
             kind: PackageTokenKind::Error,
             span: start..self.pos,
             string_value: None,
+            has_lexical_error: false,
         }
     }
 
@@ -731,6 +797,7 @@ impl<'a> Lexer<'a> {
             kind,
             span: start..self.pos,
             string_value,
+            has_lexical_error: false,
         }
     }
 }
@@ -976,7 +1043,7 @@ fn punctuator_at(text: &str, start: usize) -> Option<(PackagePunctuator, usize)>
 mod tests {
     use super::{
         PackageLexErrorKind as ErrorKind, PackagePunctuator as Punct, PackageTokenKind as Kind,
-        lex, lex_lock, lex_tokens,
+        lex, lex_lock, lex_tokens, lex_with_error_limit,
     };
 
     fn token_text(source: &str, kind: Kind, index: usize) -> &str {
@@ -1369,6 +1436,53 @@ mod tests {
                 ErrorKind::ForbiddenCharacter,
             ]
         );
+    }
+
+    #[test]
+    fn bounded_lexical_errors_keep_the_total_and_first_spans() {
+        let source = format!("// {}\n", "\u{00a0}".repeat(100));
+        let output = lex_with_error_limit(source.as_bytes(), 3);
+
+        assert_eq!(output.error_count, 100);
+        assert_eq!(output.errors.len(), 3);
+        assert_eq!(output.errors[0].span, 3..5);
+        assert_eq!(output.errors[1].span, 5..7);
+        assert_eq!(output.errors[2].span, 7..9);
+    }
+
+    #[test]
+    fn bounded_lexical_errors_cover_tokens_and_comments_without_stopping_the_scan() {
+        let source = format!(";\n;\n//{}\n?", "\u{00a0}".repeat(10));
+        let output = lex_with_error_limit(source.as_bytes(), 3);
+
+        assert_eq!(output.error_count, 13);
+        assert_eq!(output.errors.len(), 3);
+        assert_eq!(
+            output
+                .errors
+                .iter()
+                .map(|error| error.kind)
+                .collect::<Vec<_>>(),
+            [
+                ErrorKind::NoSemicolon,
+                ErrorKind::NoSemicolon,
+                ErrorKind::ForbiddenCharacter,
+            ]
+        );
+        assert_eq!(
+            output.tokens.last().map(|token| token.kind),
+            Some(Kind::Eof)
+        );
+        assert!(output.tokens.iter().any(|token| token.has_lexical_error));
+    }
+
+    #[test]
+    fn zero_error_limit_still_marks_invalid_utf8_and_counts_it() {
+        let output = super::lex_with_error_limit(b"\xff", 0);
+
+        assert!(output.invalid_utf8);
+        assert_eq!(output.error_count, 1);
+        assert!(output.errors.is_empty());
     }
 
     #[test]

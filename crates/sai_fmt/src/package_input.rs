@@ -5,10 +5,12 @@
 use std::ops::Range;
 
 use sai_package::lexer::{
-    PackageLexOutput, PackageToken, PackageTokenKind, PackageTrivia, PackageTriviaKind, lex_tokens,
+    PackageLexOutput, PackageToken, PackageTokenKind, PackageTrivia, PackageTriviaKind,
+    lex_tokens_with_error_limit,
 };
 use sai_package::manifest::{
-    MAX_PACKAGE_MANIFEST_BYTES, PackageParseError, PackageParseErrorKind, PackageParseOutput, parse,
+    MAX_PACKAGE_MANIFEST_BYTES, PackageParseError, PackageParseOutput, PackageRole,
+    parse_for_role_with_error_limit,
 };
 
 /// Keeps the package parser's semantic projection beside the original input
@@ -48,14 +50,35 @@ pub(crate) struct AttachedComment {
 
 impl<'a> PackageInput<'a> {
     pub(crate) fn new(source: &'a [u8]) -> Self {
-        let parsed = parse(source);
-        let lexed = if source.len() <= MAX_PACKAGE_MANIFEST_BYTES {
-            lex_tokens(source)
+        Self::build(source, usize::MAX, false)
+    }
+
+    pub(crate) fn with_error_limit(source: &'a [u8], max_errors: usize) -> Self {
+        Self::build(source, max_errors, true)
+    }
+
+    fn build(source: &'a [u8], max_errors: usize, skip_tokenization_when_refused: bool) -> Self {
+        let parsed = parse_for_role_with_error_limit(source, PackageRole::Root, max_errors);
+        let already_refused = parsed.lexical_error_count() > 0
+            || parsed.refusing_error_count() > 0
+            || source.len() > MAX_PACKAGE_MANIFEST_BYTES;
+        let should_retain_tokens = source.len() <= MAX_PACKAGE_MANIFEST_BYTES
+            && !(skip_tokenization_when_refused && already_refused);
+        let lexed = if should_retain_tokens {
+            lex_tokens_with_error_limit(source, max_errors)
         } else {
-            PackageLexOutput::default()
+            PackageLexOutput {
+                errors: parsed.lexical_errors().to_vec(),
+                error_count: parsed.lexical_error_count(),
+                ..PackageLexOutput::default()
+            }
         };
-        let comments = attach_comments(source, &lexed.tokens, &parsed.file().trivia);
-        let refusals = classify_refusals(&lexed, &parsed);
+        let refusals = classify_refusals(&parsed, source.len() > MAX_PACKAGE_MANIFEST_BYTES);
+        let comments = if refusals.is_empty() {
+            attach_comments(source, &lexed.tokens, &parsed.file().trivia)
+        } else {
+            Vec::new()
+        };
         Self {
             source,
             lexed,
@@ -104,46 +127,21 @@ impl<'a> PackageInput<'a> {
     }
 
     pub(crate) fn refusing_parse_errors(&self) -> Vec<PackageParseError> {
-        self.parsed
-            .errors()
-            .iter()
-            .filter(|error| {
-                error.kind == PackageParseErrorKind::ManifestTooLarge
-                    || is_refusing_parse_error(&error.kind)
-            })
-            .cloned()
-            .collect()
+        self.parsed.refusing_errors().to_vec()
     }
 }
 
-fn classify_refusals(lexed: &PackageLexOutput, parsed: &PackageParseOutput) -> Vec<PackageRefusal> {
-    let mut refusals = lexed
-        .errors
-        .iter()
-        .map(|_| PackageRefusal::Lexical)
-        .collect::<Vec<_>>();
-    refusals.extend(parsed.errors().iter().filter_map(|error| {
-        if error.kind == PackageParseErrorKind::ManifestTooLarge {
-            Some(PackageRefusal::ParserLimit)
-        } else if is_refusing_parse_error(&error.kind) {
-            Some(PackageRefusal::Grammar)
-        } else {
-            None
-        }
-    }));
+fn classify_refusals(parsed: &PackageParseOutput, manifest_too_large: bool) -> Vec<PackageRefusal> {
+    let mut refusals = Vec::new();
+    if parsed.lexical_error_count() > 0 {
+        refusals.push(PackageRefusal::Lexical);
+    }
+    if manifest_too_large {
+        refusals.push(PackageRefusal::ParserLimit);
+    } else if parsed.refusing_error_count() > 0 {
+        refusals.push(PackageRefusal::Grammar);
+    }
     refusals
-}
-
-pub(crate) fn is_refusing_parse_error(kind: &PackageParseErrorKind) -> bool {
-    matches!(
-        kind,
-        PackageParseErrorKind::UnknownDeclaration { .. }
-            | PackageParseErrorKind::UnknownArtifactKind(_)
-            | PackageParseErrorKind::ExpectedToken(_)
-            | PackageParseErrorKind::ExpectedListSeparator(_)
-            | PackageParseErrorKind::ExpectedDeclaration
-            | PackageParseErrorKind::ExpectedProfileItem
-    )
 }
 
 impl AttachedComment {

@@ -1,14 +1,15 @@
 //! Parsing for the `sai.package` package contract.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Write as _};
 use std::ops::Range;
 
 use sha2::{Digest, Sha256};
 
 use crate::identity::{PackageIdentity, PackageIdentityError};
 use crate::lexer::{
-    PackageLexError, PackageLexErrorKind, PackagePunctuator, PackageToken, PackageTokenKind,
-    PackageTrivia, lex,
+    PackageLexError, PackagePunctuator, PackageToken, PackageTokenKind, PackageTrivia,
+    lex_with_error_limit,
 };
 use crate::package_path::{
     ContentPackagePath, DependencyPackagePath, PackagePathError, RepositoryPackageDirectory,
@@ -181,6 +182,33 @@ pub enum PackageParseErrorKind {
     ManifestTooLarge,
 }
 
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl fmt::Write for Sha256Writer<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0.update(text.as_bytes());
+        Ok(())
+    }
+}
+
+fn add_error_fingerprint(hasher: &mut Sha256, kind: &PackageParseErrorKind) {
+    {
+        let mut writer = Sha256Writer(hasher);
+        let _ = write!(&mut writer, "{kind:?}");
+    }
+    hasher.update([0xff]);
+}
+
+fn fingerprint_for_error(kind: &PackageParseErrorKind) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    add_error_fingerprint(&mut hasher, kind);
+    hasher.finalize().into()
+}
+
+fn empty_error_fingerprint() -> [u8; 32] {
+    Sha256::digest(b"").into()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageParseWarning {
     pub kind: PackageParseWarningKind,
@@ -201,7 +229,12 @@ pub struct PackageParseOutput {
     /// duplicate diagnostics.
     role: PackageRole,
     pub(crate) lexical_errors: Vec<PackageLexError>,
+    lexical_error_count: usize,
     pub(crate) errors: Vec<PackageParseError>,
+    error_count: usize,
+    refusing_errors: Vec<PackageParseError>,
+    refusing_error_count: usize,
+    error_fingerprint: [u8; 32],
     pub(crate) warnings: Vec<PackageParseWarning>,
 }
 
@@ -210,7 +243,12 @@ impl PartialEq for PackageParseOutput {
         self.file == other.file
             && self.role == other.role
             && self.lexical_errors == other.lexical_errors
+            && self.lexical_error_count == other.lexical_error_count
             && self.errors == other.errors
+            && self.error_count == other.error_count
+            && self.refusing_errors == other.refusing_errors
+            && self.refusing_error_count == other.refusing_error_count
+            && self.error_fingerprint == other.error_fingerprint
             && self.warnings == other.warnings
     }
 }
@@ -238,8 +276,39 @@ impl PackageParseOutput {
         &self.lexical_errors
     }
 
+    /// Total number of lexical errors, including errors omitted by a bounded
+    /// parse.
+    pub const fn lexical_error_count(&self) -> usize {
+        self.lexical_error_count
+    }
+
     pub fn errors(&self) -> &[PackageParseError] {
         &self.errors
+    }
+
+    /// Total number of parser errors, including errors omitted by a bounded
+    /// parse call.
+    pub const fn error_count(&self) -> usize {
+        self.error_count
+    }
+
+    /// Parser errors that make a lossless formatter refuse this input.
+    pub fn refusing_errors(&self) -> &[PackageParseError] {
+        &self.refusing_errors
+    }
+
+    /// Total number of parser errors that make a lossless formatter refuse
+    /// this input, including errors omitted by a bounded parse call.
+    pub const fn refusing_error_count(&self) -> usize {
+        self.refusing_error_count
+    }
+
+    /// SHA-256 fingerprint of all parser error kinds in parser emission order.
+    ///
+    /// Spans are excluded because formatting is allowed to move diagnostics
+    /// while preserving the parsed tokens and error kinds.
+    pub const fn error_fingerprint(&self) -> &[u8; 32] {
+        &self.error_fingerprint
     }
 
     pub fn warnings(&self) -> &[PackageParseWarning] {
@@ -251,7 +320,7 @@ impl PackageParseOutput {
     /// Package-wide semantic checks such as target and capability validation
     /// are performed by later validation stages.
     pub fn is_syntax_valid(&self) -> bool {
-        self.lexical_errors.is_empty() && self.errors.is_empty()
+        self.lexical_error_count == 0 && self.error_count == 0
     }
 }
 
@@ -275,51 +344,81 @@ pub fn parse(source: &[u8]) -> PackageParseOutput {
 /// [`MAX_PACKAGE_MANIFEST_BYTES`] return one `ManifestTooLarge` error without
 /// lexing the file.
 pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
+    parse_for_role_with_error_limit(source, role, usize::MAX)
+}
+
+/// Parses one package file while retaining at most `max_errors` lexical and
+/// parser diagnostics. The complete input is still lexed and parsed, and exact
+/// diagnostic totals remain available from the returned value.
+pub fn parse_for_role_with_error_limit(
+    source: &[u8],
+    role: PackageRole,
+    max_errors: usize,
+) -> PackageParseOutput {
     if source.len() > MAX_PACKAGE_MANIFEST_BYTES {
+        let error = PackageParseError {
+            kind: PackageParseErrorKind::ManifestTooLarge,
+            span: 0..0,
+        };
+        let retained_errors = if max_errors == 0 {
+            Vec::new()
+        } else {
+            vec![error.clone()]
+        };
         return PackageParseOutput {
             file: PackageFile::default(),
             manifest_digest: None,
             role,
             lexical_errors: Vec::new(),
-            errors: vec![PackageParseError {
-                kind: PackageParseErrorKind::ManifestTooLarge,
-                span: 0..0,
-            }],
+            lexical_error_count: 0,
+            errors: retained_errors.clone(),
+            error_count: 1,
+            refusing_errors: retained_errors,
+            refusing_error_count: 1,
+            error_fingerprint: fingerprint_for_error(&error.kind),
             warnings: Vec::new(),
         };
     }
 
     let manifest_digest = Some(Sha256::digest(source).into());
-    let lexed = lex(source);
+    let lexed = lex_with_error_limit(source, max_errors);
+    let lexical_error_count = lexed.error_count;
     let mut file = PackageFile {
         trivia: lexed.trivia,
         ..PackageFile::default()
     };
     let lexical_errors = lexed.errors;
-    if lexical_errors
-        .iter()
-        .any(|error| error.kind == PackageLexErrorKind::InvalidUtf8)
-    {
+    if lexed.invalid_utf8 {
         return PackageParseOutput {
             file,
             manifest_digest,
             role,
             lexical_errors,
+            lexical_error_count,
             errors: Vec::new(),
+            error_count: 0,
+            refusing_errors: Vec::new(),
+            refusing_error_count: 0,
+            error_fingerprint: empty_error_fingerprint(),
             warnings: Vec::new(),
         };
     }
 
     let text = std::str::from_utf8(source).expect("lexer only returns tokens for UTF-8 input");
-    let mut parser = Parser::new(text, lexed.tokens, &lexical_errors, role);
+    let mut parser = Parser::new(text, lexed.tokens, role, max_errors);
     parser.parse_file(&mut file);
-    collect_list_diagnostics(&file, role, &mut parser.warnings, &mut parser.errors);
+    collect_list_diagnostics(&file, role, &mut parser);
     PackageParseOutput {
         file,
         manifest_digest,
         role,
         lexical_errors,
+        lexical_error_count,
         errors: parser.errors,
+        error_count: parser.error_count,
+        refusing_errors: parser.refusing_errors,
+        refusing_error_count: parser.refusing_error_count,
+        error_fingerprint: parser.error_hasher.finalize().into(),
         warnings: parser.warnings,
     }
 }
@@ -327,9 +426,13 @@ pub fn parse_for_role(source: &[u8], role: PackageRole) -> PackageParseOutput {
 struct Parser<'a> {
     text: &'a str,
     tokens: Vec<PackageToken>,
-    lexical_error_spans: Vec<Range<usize>>,
     position: usize,
     errors: Vec<PackageParseError>,
+    error_count: usize,
+    refusing_errors: Vec<PackageParseError>,
+    refusing_error_count: usize,
+    max_errors: usize,
+    error_hasher: Sha256,
     warnings: Vec<PackageParseWarning>,
     declaration_keys: HashSet<DeclarationKey>,
     role: PackageRole,
@@ -338,21 +441,17 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(
-        text: &'a str,
-        tokens: Vec<PackageToken>,
-        lexical_errors: &[PackageLexError],
-        role: PackageRole,
-    ) -> Self {
+    fn new(text: &'a str, tokens: Vec<PackageToken>, role: PackageRole, max_errors: usize) -> Self {
         Self {
             text,
             tokens,
-            lexical_error_spans: lexical_errors
-                .iter()
-                .map(|error| error.span.clone())
-                .collect(),
             position: 0,
             errors: Vec::new(),
+            error_count: 0,
+            refusing_errors: Vec::new(),
+            refusing_error_count: 0,
+            max_errors,
+            error_hasher: Sha256::new(),
             warnings: Vec::new(),
             declaration_keys: HashSet::new(),
             role,
@@ -1310,10 +1409,7 @@ impl<'a> Parser<'a> {
     }
 
     fn token_has_lexical_error(&self, token: usize) -> bool {
-        let token_span = &self.tokens[token].span;
-        self.lexical_error_spans.iter().any(|error_span| {
-            token_span.start < error_span.end && error_span.start < token_span.end
-        })
+        self.tokens[token].has_lexical_error
     }
 
     fn expect_word(&mut self, word: &str) -> Option<usize> {
@@ -1445,8 +1541,31 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, kind: PackageParseErrorKind, span: Range<usize>) {
-        self.errors.push(PackageParseError { kind, span });
+        self.error_count = self.error_count.saturating_add(1);
+        add_error_fingerprint(&mut self.error_hasher, &kind);
+        let error = PackageParseError { kind, span };
+        if is_formatting_refusal_error(&error.kind) {
+            self.refusing_error_count = self.refusing_error_count.saturating_add(1);
+            if self.refusing_errors.len() < self.max_errors {
+                self.refusing_errors.push(error.clone());
+            }
+        }
+        if self.errors.len() < self.max_errors {
+            self.errors.push(error);
+        }
     }
+}
+
+fn is_formatting_refusal_error(kind: &PackageParseErrorKind) -> bool {
+    matches!(
+        kind,
+        PackageParseErrorKind::UnknownDeclaration { .. }
+            | PackageParseErrorKind::UnknownArtifactKind(_)
+            | PackageParseErrorKind::ExpectedToken(_)
+            | PackageParseErrorKind::ExpectedListSeparator(_)
+            | PackageParseErrorKind::ExpectedDeclaration
+            | PackageParseErrorKind::ExpectedProfileItem
+    )
 }
 
 fn version_requirement_error_span(
@@ -1539,32 +1658,35 @@ fn version_requirement_error_span(
     }
 }
 
-fn collect_list_diagnostics(
-    file: &PackageFile,
-    role: PackageRole,
-    warnings: &mut Vec<PackageParseWarning>,
-    errors: &mut Vec<PackageParseError>,
-) {
+fn collect_list_diagnostics(file: &PackageFile, role: PackageRole, parser: &mut Parser<'_>) {
     for declaration in &file.declarations {
         match &declaration.value {
             PackageDeclaration::Targets(items)
             | PackageDeclaration::Allow(items)
             | PackageDeclaration::Deny(items)
             | PackageDeclaration::Authors(items) => {
-                add_duplicate_text_warnings(items, |value| value, warnings);
+                add_duplicate_text_warnings(items, |value| value, &mut parser.warnings);
             }
             PackageDeclaration::Policy(items) => {
-                add_duplicate_policy_warnings(items, role, warnings);
+                add_duplicate_policy_warnings(items, role, &mut parser.warnings);
             }
             PackageDeclaration::Requires { test, entries }
                 if !(*test && role == PackageRole::Dependency) =>
             {
                 for entry in entries {
                     if let Some(only) = &entry.value.only {
-                        add_duplicate_text_warnings(&only.value, |value| value, warnings);
+                        add_duplicate_text_warnings(
+                            &only.value,
+                            |value| value,
+                            &mut parser.warnings,
+                        );
                     }
                     if let Some(grant) = &entry.value.grant {
-                        add_duplicate_text_warnings(&grant.value, |value| value, warnings);
+                        add_duplicate_text_warnings(
+                            &grant.value,
+                            |value| value,
+                            &mut parser.warnings,
+                        );
                     }
                 }
             }
@@ -1572,12 +1694,12 @@ fn collect_list_diagnostics(
                 let mut seen = HashSet::new();
                 for entry in entries {
                     if !seen.insert(entry.value.target.as_ref()) {
-                        errors.push(PackageParseError {
-                            kind: PackageParseErrorKind::DuplicateDeclaration(
+                        parser.error(
+                            PackageParseErrorKind::DuplicateDeclaration(
                                 format!("artifact target {}", entry.value.target).into_boxed_str(),
                             ),
-                            span: entry.span.clone(),
-                        });
+                            entry.span.clone(),
+                        );
                     }
                 }
             }
@@ -1587,15 +1709,15 @@ fn collect_list_diagnostics(
                     let code = item.value.code.as_ref();
                     if let Some((level, _)) = seen.get(code) {
                         if *level == item.value.level {
-                            warnings.push(PackageParseWarning {
+                            parser.warnings.push(PackageParseWarning {
                                 kind: PackageParseWarningKind::DuplicateListItem,
                                 span: item.span.clone(),
                             });
                         } else {
-                            errors.push(PackageParseError {
-                                kind: PackageParseErrorKind::ConflictingLintLevel,
-                                span: item.span.clone(),
-                            });
+                            parser.error(
+                                PackageParseErrorKind::ConflictingLintLevel,
+                                item.span.clone(),
+                            );
                         }
                     } else {
                         seen.insert(code, (item.value.level, item.span.clone()));
@@ -1606,13 +1728,17 @@ fn collect_list_diagnostics(
                 for item in items {
                     match &item.value {
                         ProfileItem::Allow(capabilities) => {
-                            add_duplicate_text_warnings(capabilities, |value| value, warnings);
+                            add_duplicate_text_warnings(
+                                capabilities,
+                                |value| value,
+                                &mut parser.warnings,
+                            );
                         }
                         ProfileItem::Budget(budgets) => {
                             add_duplicate_text_warnings(
                                 budgets,
                                 |value| value.metric.as_ref(),
-                                warnings,
+                                &mut parser.warnings,
                             );
                         }
                     }
@@ -1818,7 +1944,7 @@ mod tests {
     use super::{
         LintLevel, MAX_PACKAGE_MANIFEST_BYTES, OverrideSource, PackageDeclaration,
         PackageIdentityError, PackageParseErrorKind, PackageRole, ProfileItem, RequirementSource,
-        parse, parse_for_role,
+        parse, parse_for_role, parse_for_role_with_error_limit,
     };
 
     fn parse_text(source: &str) -> super::PackageParseOutput {
@@ -1843,6 +1969,47 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first.manifest_digest(), second.manifest_digest());
+    }
+
+    #[test]
+    fn bounded_parser_retains_refusals_after_other_errors_and_counts_all_errors() {
+        let source = "package acme:app @ 1.0.0\n\
+                      compiler > 1.0.0\n\
+                      future {}\n";
+        let output = parse_for_role_with_error_limit(source.as_bytes(), PackageRole::Root, 1);
+
+        assert_eq!(output.errors().len(), 1);
+        assert!(matches!(
+            output.errors()[0].kind,
+            PackageParseErrorKind::InvalidVersionRequirement(_)
+        ));
+        assert!(output.error_count() >= 2);
+        assert_eq!(output.refusing_error_count(), 2);
+        assert!(matches!(
+            output.refusing_errors()[0].kind,
+            PackageParseErrorKind::UnknownDeclaration { .. }
+        ));
+        assert!(!output.is_syntax_valid());
+    }
+
+    #[test]
+    fn zero_diagnostic_limit_keeps_exact_parse_counts_and_utf8_state() {
+        let output = parse_for_role_with_error_limit(
+            b"package acme:app @ 1.0.0\nfuture {}\n",
+            PackageRole::Root,
+            0,
+        );
+        assert!(output.errors().is_empty());
+        assert!(output.refusing_errors().is_empty());
+        assert!(output.error_count() > 0);
+        assert!(output.refusing_error_count() > 0);
+        assert!(!output.is_syntax_valid());
+
+        let invalid_utf8 = parse_for_role_with_error_limit(b"\xff", PackageRole::Root, 0);
+        assert_eq!(invalid_utf8.lexical_error_count(), 1);
+        assert!(invalid_utf8.lexical_errors().is_empty());
+        assert!(invalid_utf8.errors().is_empty());
+        assert!(!invalid_utf8.is_syntax_valid());
     }
 
     #[test]

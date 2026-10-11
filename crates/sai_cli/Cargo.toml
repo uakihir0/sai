@@ -11,3 +11,6 @@ path = "src/main.rs"
 [dependencies]
 sai_diagnostics = { path = "../sai_diagnostics" }
 sai_driver = { path = "../sai_driver" }
+sai_fmt = { path = "../sai_fmt" }
+sai_package = { path = "../sai_package" }
+unicode-width.workspace = true

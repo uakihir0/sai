@@ -503,6 +503,9 @@ fn invalid_value_argument(
 }
 
 pub(crate) fn is_option(argument: &OsStr) -> bool {
+    if argument == OsStr::new("-") {
+        return false;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

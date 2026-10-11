@@ -38,6 +38,7 @@ sha2 = "0.11.0"
 unicode-general-category = "=1.1.0"
 unicode-ident = "=1.0.18"
 unicode-normalization = "=0.1.24"
+unicode-width = "0.2.1"
 getrandom = "=0.4.3"
 
 [patch.crates-io]

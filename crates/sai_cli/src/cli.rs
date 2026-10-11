@@ -1,7 +1,13 @@
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::ffi::OsString;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use crate::args::{ColorChoice, OutputFormat, ParsedArgs, UsageError, UsageErrorKind, parse_args};
 use crate::help::{render_command_help, render_top_level_help, render_version};
@@ -11,14 +17,44 @@ use sai_driver::CancellationToken;
 use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
 };
+use unicode_width::UnicodeWidthChar;
 
 struct CliDiagnostic {
     code: &'static str,
     message: String,
+    primary: Option<CliLocation>,
+    primary_label: String,
     argument_index: Option<usize>,
     argument: String,
     help: Option<String>,
     data: Option<String>,
+}
+
+struct CliLocation {
+    path: String,
+    start: CliPosition,
+    end: CliPosition,
+    source_line: Option<Arc<RenderedSourceLine>>,
+    additional_source_lines: Vec<CliAdditionalSnippetRow>,
+    start_display_col: usize,
+    end_display_col: usize,
+}
+
+enum CliAdditionalSnippetRow {
+    Gap,
+    Source {
+        line_number: usize,
+        source_line: Arc<RenderedSourceLine>,
+        annotation: Option<(usize, usize)>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct CliPosition {
+    byte: usize,
+    line: usize,
+    col: usize,
+    utf16_col: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -28,6 +64,86 @@ struct CliOutputOptions {
     color: ColorChoice,
     max_errors: usize,
 }
+
+#[derive(Default)]
+struct FmtResult {
+    check: bool,
+    changed: bool,
+    refused: bool,
+    output: Option<String>,
+}
+
+struct FmtDiagnosticBatch {
+    diagnostics: Vec<CliDiagnostic>,
+    total_error_count: usize,
+}
+
+struct PendingFmtDiagnostic {
+    code: &'static str,
+    message: Cow<'static, str>,
+    span: std::ops::Range<usize>,
+    help: Option<String>,
+    data: Option<String>,
+    order: usize,
+}
+
+struct CliSourceIndex {
+    source: Arc<[u8]>,
+    line_starts: Vec<u32>,
+    line_ends: HashMap<u32, u32>,
+    utf16_checkpoints: HashMap<u32, Vec<(u32, usize)>>,
+    rendered_lines: HashMap<u32, Arc<RenderedSourceLine>>,
+}
+
+struct RenderedSourceLine {
+    text: String,
+    checkpoints: Vec<(u32, usize)>,
+    window_checkpoints: Vec<(usize, usize)>,
+    display_width: usize,
+    first_non_whitespace_display_col: usize,
+}
+
+impl PartialEq for PendingFmtDiagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PendingFmtDiagnostic {}
+
+impl PartialOrd for PendingFmtDiagnostic {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingFmtDiagnostic {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.span
+            .start
+            .cmp(&other.span.start)
+            .then_with(|| self.code.cmp(other.code))
+            .then_with(|| self.message.cmp(&other.message))
+            .then_with(|| self.order.cmp(&other.order))
+    }
+}
+
+struct StdinBroker {
+    request_sender: SyncSender<usize>,
+    receiver: Receiver<io::Result<Vec<u8>>>,
+    pending: Vec<u8>,
+    pending_offset: usize,
+    request_pending: bool,
+    eof: bool,
+    startup_error: Option<io::Error>,
+}
+
+struct CancellationAwareStdin {
+    broker: Option<Arc<Mutex<StdinBroker>>>,
+    cancellation: CancellationToken,
+}
+
+static STDIN_BROKER: OnceLock<Arc<Mutex<StdinBroker>>> = OnceLock::new();
 
 /// Runs the implemented CLI commands and writes their output to the supplied streams.
 ///
@@ -43,6 +159,40 @@ pub fn run_with_cancellation(
     cancellation: &CancellationToken,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
+) -> i32 {
+    run_with_cancellation_and_terminal(arguments, cancellation, false, stdout, stderr)
+}
+
+/// Runs the CLI while recording whether stdout is a terminal for safe rendering
+/// of source text returned by commands such as `fmt -`.
+pub fn run_with_cancellation_and_terminal(
+    arguments: &[OsString],
+    cancellation: &CancellationToken,
+    stdout_is_terminal: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let mut stdin = CancellationAwareStdin {
+        broker: None,
+        cancellation: cancellation.clone(),
+    };
+    run_with_cancellation_and_input(
+        arguments,
+        cancellation,
+        &mut stdin,
+        stdout,
+        stderr,
+        stdout_is_terminal,
+    )
+}
+
+fn run_with_cancellation_and_input(
+    arguments: &[OsString],
+    cancellation: &CancellationToken,
+    stdin: &mut impl Read,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    stdout_is_terminal: bool,
 ) -> i32 {
     if arguments.is_empty() && !cancellation.is_cancelled() {
         return match stderr.write_all(render_top_level_help().as_bytes()) {
@@ -68,6 +218,15 @@ pub fn run_with_cancellation(
     let command_name = command.name.to_string_lossy().into_owned();
     match command_name.as_str() {
         "new" => run_new(&parsed, command, cancellation, stdout, stderr),
+        "fmt" => run_fmt(
+            &parsed,
+            command,
+            cancellation,
+            stdin,
+            stdout,
+            stderr,
+            stdout_is_terminal,
+        ),
         "explain" => run_explain(&parsed, command, stdout, stderr),
         "help" => {
             let help = command_help(&parsed);
@@ -110,6 +269,1443 @@ pub fn run_with_cancellation(
             }
         }
     }
+}
+
+fn run_fmt(
+    parsed: &ParsedArgs,
+    command: &crate::args::ParsedCommand,
+    cancellation: &CancellationToken,
+    stdin: &mut impl Read,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    stdout_is_terminal: bool,
+) -> i32 {
+    let mut usage_errors = parsed.usage_errors.clone();
+    usage_errors.extend(validate_known_command_options(command));
+    if !usage_errors.is_empty() {
+        return report_usage_errors(parsed, "fmt", usage_errors, stdout, stderr);
+    }
+
+    let positionals = collect_command_positionals(command, &None);
+    if positionals.len() != 1 || positionals[0].0 != "-" {
+        let feature = if positionals.is_empty() {
+            "sai fmt workspace discovery and file selection"
+        } else {
+            "sai fmt file and directory formatting"
+        };
+        return report_feature_not_implemented(
+            CliOutputOptions {
+                format: parsed.globals.format,
+                quiet: parsed.globals.quiet,
+                color: parsed.globals.color,
+                max_errors: parsed.globals.max_errors,
+            },
+            "fmt",
+            3,
+            feature,
+            stdout,
+            stderr,
+        );
+    }
+
+    let tail = command_tail(command);
+    let check = tail.iter().any(|(argument, _)| argument == "--check");
+    let mut stdin_kind = "source";
+    let mut index = 0;
+    while index < tail.len() {
+        let argument = tail[index].0.to_string_lossy();
+        if let Some(value) = argument.strip_prefix("--stdin-kind=") {
+            stdin_kind = if value == "package" {
+                "package"
+            } else {
+                "source"
+            };
+        } else if argument == "--stdin-kind" {
+            if let Some((value, _)) = tail.get(index + 1) {
+                stdin_kind = if value == "package" {
+                    "package"
+                } else {
+                    "source"
+                };
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    if stdin_kind == "source" {
+        return report_feature_not_implemented(
+            CliOutputOptions {
+                format: parsed.globals.format,
+                quiet: parsed.globals.quiet,
+                color: parsed.globals.color,
+                max_errors: parsed.globals.max_errors,
+            },
+            "fmt",
+            0,
+            "sai fmt source input",
+            stdout,
+            stderr,
+        );
+    }
+
+    let source = match read_stdin_limited(
+        stdin,
+        sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES,
+        cancellation,
+    ) {
+        Ok(source) => source,
+        Err(StdinReadError::Interrupted) => {
+            return report_interrupted(parsed, stdout, stderr);
+        }
+        Err(StdinReadError::Io(error)) => {
+            let diagnostic = CliDiagnostic {
+                code: "SOURCE_READ_FAILED",
+                message: "could not read standard input".to_owned(),
+                primary: None,
+                primary_label: String::new(),
+                argument_index: None,
+                argument: String::new(),
+                help: Some(error.to_string()),
+                data: Some(format!(
+                    "{{\"path\":\"<stdin>\",\"reason\":\"{}\"}}",
+                    escape_json(&error.to_string())
+                )),
+            };
+            return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
+        }
+    };
+    let source: Arc<[u8]> = source.into();
+
+    let max_errors = if parsed.globals.max_errors == 0 {
+        usize::MAX
+    } else {
+        parsed.globals.max_errors
+    };
+    let formatting_result = sai_fmt::format_package_with_error_limit(&source, max_errors);
+    if cancellation.is_cancelled() {
+        return report_interrupted(parsed, stdout, stderr);
+    }
+    let formatted = match formatting_result {
+        Ok(formatted) => formatted,
+        Err(error) => {
+            let refused = matches!(error, sai_fmt::PackageFormatError::Refused(_));
+            let diagnostics = package_format_diagnostics(
+                &source,
+                error,
+                parsed.globals.max_errors,
+                parsed.globals.format == OutputFormat::Human,
+            );
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+            return report_fmt_diagnostics(
+                parsed,
+                diagnostics.diagnostics,
+                diagnostics.total_error_count,
+                refused.then_some(FmtResult {
+                    check,
+                    refused,
+                    ..FmtResult::default()
+                }),
+                stdout,
+                stderr,
+            );
+        }
+    };
+    if cancellation.is_cancelled() {
+        return report_interrupted(parsed, stdout, stderr);
+    }
+    let differs = source.as_ref() != formatted.as_bytes();
+    if check && differs {
+        return report_fmt_diagnostics(
+            parsed,
+            vec![unformatted_stdin_diagnostic(
+                &source,
+                formatted.as_bytes(),
+                parsed.globals.format == OutputFormat::Human,
+            )],
+            1,
+            Some(FmtResult {
+                check,
+                changed: true,
+                ..FmtResult::default()
+            }),
+            stdout,
+            stderr,
+        );
+    }
+
+    match parsed.globals.format {
+        OutputFormat::Human => {
+            if check {
+                0
+            } else if stdout_is_terminal {
+                let safe_output = escape_terminal_controls(&formatted);
+                write_stdout_text(stdout, &safe_output, stderr)
+            } else {
+                write_stdout_text(stdout, &formatted, stderr)
+            }
+        }
+        OutputFormat::Json => {
+            if let Err(error) = write_json_fmt_success(
+                stdout,
+                FmtResult {
+                    check,
+                    changed: differs,
+                    output: (!check).then_some(formatted),
+                    ..FmtResult::default()
+                },
+            ) {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                0
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StdinReadError {
+    Interrupted,
+    Io(io::Error),
+}
+
+fn read_stdin_limited(
+    stdin: &mut impl Read,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, StdinReadError> {
+    let mut source = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let max_bytes = limit.saturating_add(1);
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(StdinReadError::Interrupted);
+        }
+        let remaining = max_bytes.saturating_sub(source.len());
+        let read_len = remaining.min(buffer.len());
+        if read_len == 0 {
+            return Ok(source);
+        }
+        match stdin.read(&mut buffer[..read_len]) {
+            Ok(0) => {
+                if cancellation.is_cancelled() {
+                    return Err(StdinReadError::Interrupted);
+                }
+                return Ok(source);
+            }
+            Ok(bytes_read) => {
+                source.extend_from_slice(&buffer[..bytes_read]);
+                if cancellation.is_cancelled() {
+                    return Err(StdinReadError::Interrupted);
+                }
+                if source.len() >= max_bytes {
+                    return Ok(source);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if cancellation.is_cancelled() {
+                    return Err(StdinReadError::Interrupted);
+                }
+            }
+            Err(error) => {
+                if cancellation.is_cancelled() {
+                    return Err(StdinReadError::Interrupted);
+                }
+                return Err(StdinReadError::Io(error));
+            }
+        }
+    }
+}
+
+impl StdinBroker {
+    fn spawn(input: Box<dyn Read + Send>) -> Self {
+        let (request_sender, request_receiver) = mpsc::sync_channel::<usize>(1);
+        let (sender, receiver) = mpsc::sync_channel::<io::Result<Vec<u8>>>(1);
+        let spawn_result = thread::Builder::new()
+            .name("sai-stdin-reader".to_owned())
+            .spawn(move || {
+                let mut input = input;
+                loop {
+                    let Ok(requested_len) = request_receiver.recv() else {
+                        return;
+                    };
+                    let mut buffer = vec![0_u8; requested_len.min(8192)];
+                    loop {
+                        match input.read(&mut buffer) {
+                            Ok(0) => {
+                                let _ = sender.send(Ok(Vec::new()));
+                                return;
+                            }
+                            Ok(bytes_read) => {
+                                if sender.send(Ok(buffer[..bytes_read].to_vec())).is_err() {
+                                    return;
+                                }
+                                break;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => {
+                                let _ = sender.send(Err(error));
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+
+        Self {
+            request_sender,
+            receiver,
+            pending: Vec::new(),
+            pending_offset: 0,
+            request_pending: false,
+            eof: false,
+            startup_error: spawn_result.err(),
+        }
+    }
+}
+
+impl Read for CancellationAwareStdin {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.cancellation.is_cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if self.broker.is_none() {
+            self.broker = Some(Arc::clone(STDIN_BROKER.get_or_init(|| {
+                Arc::new(Mutex::new(StdinBroker::spawn(Box::new(io::stdin()))))
+            })));
+        }
+        let broker = Arc::clone(self.broker.as_ref().expect("stdin broker is initialized"));
+
+        loop {
+            if self.cancellation.is_cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let mut broker = broker
+                .lock()
+                .map_err(|_| io::Error::other("standard-input reader state was poisoned"))?;
+            if let Some(error) = broker.startup_error.take() {
+                return Err(error);
+            }
+            if broker.pending_offset < broker.pending.len() {
+                let remaining = broker.pending.len() - broker.pending_offset;
+                let bytes_read = buffer.len().min(remaining);
+                let pending_offset = broker.pending_offset;
+                buffer[..bytes_read]
+                    .copy_from_slice(&broker.pending[pending_offset..pending_offset + bytes_read]);
+                broker.pending_offset += bytes_read;
+                if broker.pending_offset == broker.pending.len() {
+                    broker.pending.clear();
+                    broker.pending_offset = 0;
+                }
+                return Ok(bytes_read);
+            }
+            if broker.eof {
+                return Ok(0);
+            }
+
+            if !broker.request_pending {
+                broker
+                    .request_sender
+                    .send(buffer.len().min(8192))
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "standard-input reader stopped unexpectedly",
+                        )
+                    })?;
+                broker.request_pending = true;
+            }
+            match broker.receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(Ok(chunk)) if chunk.is_empty() => {
+                    broker.request_pending = false;
+                    broker.eof = true;
+                    return Ok(0);
+                }
+                Ok(Ok(chunk)) => {
+                    broker.request_pending = false;
+                    broker.pending = chunk;
+                    broker.pending_offset = 0;
+                }
+                Ok(Err(error)) => {
+                    broker.request_pending = false;
+                    return Err(error);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    drop(broker);
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "standard-input reader stopped unexpectedly",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn write_json_fmt_success(writer: &mut impl Write, result: FmtResult) -> io::Result<()> {
+    write_json_success_header(writer, "fmt")?;
+    writeln!(writer, "{}", json_fmt_result(&result))?;
+    write_json_summary(writer, 0, 0, 0)
+}
+
+fn report_fmt_diagnostics(
+    parsed: &ParsedArgs,
+    mut diagnostics: Vec<CliDiagnostic>,
+    total_error_count: usize,
+    result: Option<FmtResult>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    diagnostics.sort_by(|left, right| {
+        let left_offset = left
+            .primary
+            .as_ref()
+            .map_or(usize::MAX, |location| location.start.byte);
+        let right_offset = right
+            .primary
+            .as_ref()
+            .map_or(usize::MAX, |location| location.start.byte);
+        left_offset
+            .cmp(&right_offset)
+            .then_with(|| left.code.cmp(right.code))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    let total = total_error_count;
+    let exit_code = if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "INTERNAL_COMPILER_ERROR")
+    {
+        101
+    } else {
+        1
+    };
+    if parsed.globals.max_errors != 0 {
+        diagnostics.truncate(parsed.globals.max_errors);
+    }
+    match parsed.globals.format {
+        OutputFormat::Human => {
+            if let Err(error) = write_human_diagnostics(
+                stderr,
+                "fmt",
+                &diagnostics,
+                !parsed.globals.quiet,
+                color_enabled(parsed.globals.color, io::stderr().is_terminal()),
+                total,
+                parsed.globals.max_errors,
+            ) {
+                report_stderr_failure(error)
+            } else {
+                exit_code
+            }
+        }
+        OutputFormat::Json => {
+            if let Err(error) =
+                write_json_fmt_diagnostics(stdout, &diagnostics, total, exit_code, result.as_ref())
+            {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                exit_code
+            }
+        }
+    }
+}
+
+fn json_fmt_result(result: &FmtResult) -> String {
+    let changed = if result.changed {
+        "[\"<stdin>\"]"
+    } else {
+        "[]"
+    };
+    let refused = if result.refused {
+        "[\"<stdin>\"]"
+    } else {
+        "[]"
+    };
+    let output = result.output.as_ref().map_or_else(
+        || "null".to_owned(),
+        |text| format!("\"{}\"", escape_json(text)),
+    );
+    format!(
+        "{{\"type\":\"result\",\"kind\":\"fmt\",\"data\":{{\"check\":{},\"files\":1,\"changed\":{},\"refused\":{},\"output\":{}}}}}",
+        result.check, changed, refused, output
+    )
+}
+
+fn write_json_fmt_diagnostics(
+    writer: &mut impl Write,
+    diagnostics: &[CliDiagnostic],
+    total_error_count: usize,
+    exit_code: i32,
+    result: Option<&FmtResult>,
+) -> io::Result<()> {
+    write_json_success_header(writer, "fmt")?;
+    write_json_diagnostic_records(writer, diagnostics)?;
+    if let Some(result) = result {
+        writeln!(writer, "{}", json_fmt_result(result))?;
+    }
+    write_json_summary(writer, total_error_count, diagnostics.len(), exit_code)
+}
+
+fn package_format_diagnostics(
+    source: &Arc<[u8]>,
+    error: sai_fmt::PackageFormatError,
+    max_errors: usize,
+    include_source_lines: bool,
+) -> FmtDiagnosticBatch {
+    match error {
+        sai_fmt::PackageFormatError::Refused(refusal) => {
+            let total_error_count = refusal
+                .lexical_error_count
+                .saturating_add(refusal.syntax_error_count);
+            let mut selected = BinaryHeap::new();
+            let mut order = 0usize;
+            for error in refusal.lexical_errors {
+                let (code, message) = package_lex_error_fields(error.kind);
+                retain_pending_fmt_diagnostic(
+                    &mut selected,
+                    PendingFmtDiagnostic {
+                        code,
+                        message: Cow::Borrowed(message),
+                        span: error.span,
+                        help: None,
+                        data: None,
+                        order,
+                    },
+                    max_errors,
+                );
+                order = order.saturating_add(1);
+            }
+            for error in refusal.syntax_errors {
+                let (code, message, data) = package_parse_error_fields(&error.kind);
+                retain_pending_fmt_diagnostic(
+                    &mut selected,
+                    PendingFmtDiagnostic {
+                        code,
+                        message,
+                        span: error.span,
+                        help: None,
+                        data,
+                        order,
+                    },
+                    max_errors,
+                );
+                order = order.saturating_add(1);
+            }
+            let mut source_index = CliSourceIndex::new(Arc::clone(source));
+            let diagnostics = selected
+                .into_sorted_vec()
+                .into_iter()
+                .map(|pending| {
+                    cli_source_diagnostic(
+                        &mut source_index,
+                        pending.code,
+                        pending.message.into_owned(),
+                        pending.span,
+                        pending.data,
+                        pending.help,
+                        include_source_lines,
+                    )
+                })
+                .collect();
+            FmtDiagnosticBatch {
+                diagnostics,
+                total_error_count,
+            }
+        }
+        sai_fmt::PackageFormatError::VerificationFailed(failure) => {
+            let check = match failure.check {
+                sai_fmt::PackageVerificationCheck::OutputSyntax => "output does not parse",
+                sai_fmt::PackageVerificationCheck::TokenPreservation => "token sequence changed",
+                sai_fmt::PackageVerificationCheck::DiagnosticPreservation => {
+                    "parser diagnostics changed"
+                }
+                sai_fmt::PackageVerificationCheck::CommentPreservation => "comments changed",
+                sai_fmt::PackageVerificationCheck::Idempotency => "formatting is not idempotent",
+            };
+            let mut source_index = CliSourceIndex::new(Arc::clone(source));
+            let primary = failure.input_byte_offset.map(|offset| {
+                source_index.location("<stdin>", offset..offset, include_source_lines)
+            });
+            FmtDiagnosticBatch {
+                diagnostics: vec![internal_fmt_diagnostic(
+                    format!("formatter verification failed: {check}"),
+                    primary,
+                )],
+                total_error_count: 1,
+            }
+        }
+        sai_fmt::PackageFormatError::InternalError => FmtDiagnosticBatch {
+            diagnostics: vec![internal_fmt_diagnostic(
+                "package formatter could not render input".to_owned(),
+                None,
+            )],
+            total_error_count: 1,
+        },
+        sai_fmt::PackageFormatError::Print(error) => FmtDiagnosticBatch {
+            diagnostics: vec![internal_fmt_diagnostic(
+                format!("package formatter printer failed: {error:?}"),
+                None,
+            )],
+            total_error_count: 1,
+        },
+    }
+}
+
+fn package_lex_error_fields(
+    kind: sai_package::lexer::PackageLexErrorKind,
+) -> (&'static str, &'static str) {
+    use sai_package::lexer::PackageLexErrorKind as Kind;
+    match kind {
+        Kind::InvalidUtf8 => ("INVALID_UTF8", "manifest is not valid UTF-8"),
+        Kind::InvalidLineEnding => ("INVALID_LINE_ENDING", "lone carriage return"),
+        Kind::ForbiddenCharacter => ("FORBIDDEN_CHARACTER", "forbidden character in manifest"),
+        Kind::UnexpectedCharacter => ("UNEXPECTED_CHARACTER", "unexpected character in manifest"),
+        Kind::UnterminatedComment => ("UNTERMINATED_COMMENT", "unterminated comment"),
+        Kind::UnterminatedString => ("UNTERMINATED_STRING", "unterminated string"),
+        Kind::InvalidEscape => ("INVALID_ESCAPE", "invalid string escape"),
+        Kind::UnsupportedStringForm => (
+            "UNSUPPORTED_STRING_FORM",
+            "unsupported string form in manifest",
+        ),
+        Kind::InvalidVersion => ("INVALID_VERSION", "invalid package version"),
+        Kind::BuildMetadataNotAllowed => (
+            "BUILD_METADATA_NOT_ALLOWED",
+            "build metadata is not allowed in a package version",
+        ),
+        Kind::NoSemicolon => ("NO_SEMICOLON", "semicolons are not allowed in manifests"),
+    }
+}
+
+fn retain_pending_fmt_diagnostic(
+    selected: &mut BinaryHeap<PendingFmtDiagnostic>,
+    diagnostic: PendingFmtDiagnostic,
+    max_errors: usize,
+) {
+    if max_errors == 0 || selected.len() < max_errors {
+        selected.push(diagnostic);
+    } else if selected.peek().is_some_and(|largest| diagnostic < *largest) {
+        selected.pop();
+        selected.push(diagnostic);
+    }
+}
+
+fn package_parse_error_fields(
+    kind: &sai_package::manifest::PackageParseErrorKind,
+) -> (&'static str, Cow<'static, str>, Option<String>) {
+    use sai_package::manifest::PackageParseErrorKind as Kind;
+    match kind {
+        Kind::MissingPackageDeclaration => (
+            "MISSING_PACKAGE_DECL",
+            Cow::Borrowed("missing `package` declaration"),
+            None,
+        ),
+        Kind::PackageDeclarationNotFirst => (
+            "PACKAGE_DECL_NOT_FIRST",
+            Cow::Borrowed("`package` declaration must be first"),
+            None,
+        ),
+        Kind::DuplicateDeclaration(name) => (
+            "DUPLICATE_DECLARATION",
+            Cow::Owned(format!("duplicate `{name}` declaration")),
+            None,
+        ),
+        Kind::UnknownDeclaration { name, .. } => (
+            "UNKNOWN_DECLARATION",
+            Cow::Owned(format!("unknown package declaration `{name}`")),
+            None,
+        ),
+        Kind::UnknownArtifactKind(name) => (
+            "UNKNOWN_ARTIFACT_KIND",
+            Cow::Owned(format!("unknown artifact kind `{name}`")),
+            None,
+        ),
+        Kind::ExpectedToken(token) => {
+            let expected = if token.as_ref() == "newline between declarations" {
+                "NEWLINE".to_owned()
+            } else {
+                token.to_string()
+            };
+            (
+                "EXPECTED_TOKEN",
+                Cow::Owned(format!("expected {token}")),
+                Some(format!(
+                    "{{\"expected_tokens\":[\"{}\"]}}",
+                    escape_json(&expected)
+                )),
+            )
+        }
+        Kind::ExpectedListSeparator(tokens) => (
+            "EXPECTED_TOKEN",
+            Cow::Borrowed("expected a list separator"),
+            Some(format!(
+                "{{\"expected_tokens\":[{}]}}",
+                tokens
+                    .iter()
+                    .map(|token| format!("\"{}\"", escape_json(token)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+        ),
+        Kind::ExpectedDeclaration => (
+            "EXPECTED_TOKEN",
+            Cow::Borrowed("expected a package declaration"),
+            Some("{\"expected_tokens\":[\"package\",\"compiler\",\"source\",\"wit\",\"artifact\",\"targets\",\"export\",\"requires\",\"allow\",\"deny\",\"policy\",\"lints\",\"profile\",\"allocator\",\"overrides\",\"description\",\"license\",\"authors\",\"repository\"]}".to_owned()),
+        ),
+        Kind::ExpectedProfileItem => (
+            "EXPECTED_TOKEN",
+            Cow::Borrowed("expected a profile item"),
+            Some("{\"expected_tokens\":[\"allow\",\"budget\"]}".to_owned()),
+        ),
+        Kind::InvalidPackageIdentity(_) => (
+            "INVALID_PACKAGE_NAME",
+            Cow::Borrowed("invalid package identity"),
+            None,
+        ),
+        Kind::InvalidPackageVersion(_) => (
+            "INVALID_VERSION",
+            Cow::Borrowed("invalid package version"),
+            None,
+        ),
+        Kind::InvalidContentPath(_)
+        | Kind::InvalidDependencyPath(_)
+        | Kind::InvalidRepositoryDirectory(_) => (
+            "INVALID_PACKAGE_PATH",
+            Cow::Borrowed("invalid package path"),
+            None,
+        ),
+        Kind::ConflictingLintLevel => (
+            "CONFLICTING_LINT_LEVEL",
+            Cow::Borrowed("conflicting lint levels"),
+            None,
+        ),
+        Kind::InvalidVersionRequirement(_) => (
+            "INVALID_VERSION_REQUIREMENT",
+            Cow::Borrowed("invalid version requirement"),
+            None,
+        ),
+        Kind::ManifestTooLarge => (
+            "PACKAGE_TOO_LARGE",
+            Cow::Borrowed("package manifest exceeds the supported size limit"),
+            None,
+        ),
+    }
+}
+
+fn internal_fmt_diagnostic(description: String, primary: Option<CliLocation>) -> CliDiagnostic {
+    let data = format!(
+        "{{\"component\":\"sai_fmt\",\"panic_message\":\"{}\",\"query_stack\":[],\"compiler_version\":\"{}\"}}",
+        escape_json(&description),
+        env!("CARGO_PKG_VERSION")
+    );
+    CliDiagnostic {
+        code: "INTERNAL_COMPILER_ERROR",
+        message: format!("internal compiler error: {description}"),
+        primary,
+        primary_label: String::new(),
+        argument_index: None,
+        argument: String::new(),
+        help: None,
+        data: Some(data),
+    }
+}
+
+fn cli_source_diagnostic(
+    source: &mut CliSourceIndex,
+    code: &'static str,
+    message: String,
+    span: std::ops::Range<usize>,
+    data: Option<String>,
+    help: Option<String>,
+    include_source_line: bool,
+) -> CliDiagnostic {
+    CliDiagnostic {
+        code,
+        message,
+        primary: Some(source.location("<stdin>", span, include_source_line)),
+        primary_label: String::new(),
+        argument_index: None,
+        argument: String::new(),
+        help,
+        data,
+    }
+}
+
+#[cfg(test)]
+fn cli_position(source: &[u8], offset: usize) -> CliPosition {
+    let mut index = CliSourceIndex::new(Arc::from(source));
+    index.position(offset)
+}
+
+impl CliSourceIndex {
+    fn new(source: Arc<[u8]>) -> Self {
+        let bom_len = usize::from(source.starts_with(b"\xef\xbb\xbf")) * 3;
+        let mut line_starts = vec![u32::try_from(bom_len).unwrap_or(0)];
+        let mut cursor = bom_len;
+        while cursor < source.len() {
+            match source[cursor] {
+                b'\n' => {
+                    cursor += 1;
+                    line_starts.push(u32::try_from(cursor).unwrap_or(u32::MAX));
+                }
+                b'\r' if source.get(cursor + 1) == Some(&b'\n') => {
+                    cursor += 2;
+                    line_starts.push(u32::try_from(cursor).unwrap_or(u32::MAX));
+                }
+                b'\r' => {
+                    cursor += 1;
+                    line_starts.push(u32::try_from(cursor).unwrap_or(u32::MAX));
+                }
+                _ => cursor += 1,
+            }
+        }
+        Self {
+            source,
+            line_starts,
+            line_ends: HashMap::new(),
+            utf16_checkpoints: HashMap::new(),
+            rendered_lines: HashMap::new(),
+        }
+    }
+
+    fn position(&mut self, offset: usize) -> CliPosition {
+        let offset = offset.min(self.source.len());
+        let line_index = self
+            .line_starts
+            .partition_point(|start| (*start as usize) <= offset)
+            .saturating_sub(1);
+        let line_start = self.line_starts[line_index] as usize;
+        let next_line_start = self
+            .line_starts
+            .get(line_index + 1)
+            .copied()
+            .map_or(self.source.len(), |start| start as usize);
+        let utf16_col = if offset <= line_start {
+            1
+        } else {
+            let line = &self.source[line_start..next_line_start];
+            let checkpoints = self
+                .utf16_checkpoints
+                .entry(line_start as u32)
+                .or_insert_with(|| build_utf16_checkpoints(line));
+            let relative_offset = offset.saturating_sub(line_start);
+            let checkpoint_index = checkpoints
+                .partition_point(|(byte, _)| (*byte as usize) <= relative_offset)
+                .saturating_sub(1);
+            let (checkpoint_byte, checkpoint_width) = checkpoints[checkpoint_index];
+            let checkpoint_byte = checkpoint_byte as usize;
+            let suffix_end = relative_offset.min(line.len());
+            1 + checkpoint_width
+                + utf16_column_width(&line[checkpoint_byte.min(suffix_end)..suffix_end])
+        };
+        CliPosition {
+            byte: offset,
+            line: line_index + 1,
+            col: offset.saturating_sub(line_start) + 1,
+            utf16_col,
+        }
+    }
+
+    fn line_bounds(&mut self, offset: usize) -> (usize, u32, u32) {
+        let offset = offset.min(self.source.len());
+        let line_index = self
+            .line_starts
+            .partition_point(|start| (*start as usize) <= offset)
+            .saturating_sub(1);
+        let line_start = self.line_starts[line_index];
+        let content_end = if let Some(end) = self.line_ends.get(&line_start) {
+            *end
+        } else {
+            let start = line_start as usize;
+            let end = self.source[start..]
+                .iter()
+                .position(|byte| matches!(*byte, b'\r' | b'\n'))
+                .map_or(self.source.len(), |relative| start + relative);
+            let end = u32::try_from(end).unwrap_or(u32::MAX);
+            self.line_ends.insert(line_start, end);
+            end
+        };
+        (line_index + 1, line_start, content_end)
+    }
+
+    fn rendered_line(&mut self, line_start: u32, content_end: u32) -> Arc<RenderedSourceLine> {
+        if let Some(line) = self.rendered_lines.get(&line_start) {
+            return Arc::clone(line);
+        }
+        let rendered_start =
+            if line_start == self.line_starts[0] && self.source.starts_with(b"\xef\xbb\xbf") {
+                0
+            } else {
+                line_start as usize
+            };
+        let content_end = content_end as usize;
+        let content_end = if self.source.get(content_end) == Some(&b'\r')
+            && self.source.get(content_end + 1) != Some(&b'\n')
+        {
+            content_end + 1
+        } else {
+            content_end
+        };
+        let line = Arc::new(RenderedSourceLine::new(
+            &self.source[rendered_start..content_end],
+        ));
+        self.rendered_lines.insert(line_start, Arc::clone(&line));
+        line
+    }
+
+    fn location(
+        &mut self,
+        path: &str,
+        span: std::ops::Range<usize>,
+        include_source_line: bool,
+    ) -> CliLocation {
+        let start = span.start.min(self.source.len());
+        let end = span.end.max(start).min(self.source.len());
+        let lone_cr_span = end == start.saturating_add(1)
+            && self.source.get(start) == Some(&b'\r')
+            && self.source.get(end) != Some(&b'\n');
+        let (start_line, line_start, content_end) = self.line_bounds(start);
+        let start_position = self.position(start);
+        let end_position = self.position(end);
+        let mut additional_source_lines = Vec::new();
+        let (source_line, start_display_col, end_display_col) = if include_source_line {
+            let rendered_content_end = if lone_cr_span {
+                content_end.saturating_add(1).min(self.source.len() as u32)
+            } else {
+                content_end
+            };
+            let line = self.rendered_line(line_start, rendered_content_end);
+            let rendered_start =
+                if line_start == self.line_starts[0] && self.source.starts_with(b"\xef\xbb\xbf") {
+                    0
+                } else {
+                    line_start as usize
+                };
+            let start_prefix_end = start.min(content_end as usize);
+            let start_display_col = line
+                .display_column(&self.source[rendered_start..start_prefix_end.max(rendered_start)]);
+            let end_display_col = if lone_cr_span {
+                line.display_column(&self.source[rendered_start..end])
+            } else if end_position.line == start_line {
+                line.display_column(
+                    &self.source[rendered_start..end.min(content_end as usize).max(rendered_start)],
+                )
+            } else {
+                let end_line_index = end_position.line.saturating_sub(1);
+                let end_line_start = self.line_starts[end_line_index];
+                let (_, end_line_start, end_content_end) =
+                    self.line_bounds(end_line_start as usize);
+                let end_line = self.rendered_line(end_line_start, end_content_end);
+                let end_rendered_start = if end_line_start == self.line_starts[0]
+                    && self.source.starts_with(b"\xef\xbb\xbf")
+                {
+                    0
+                } else {
+                    end_line_start as usize
+                };
+                let end_prefix_end = end.min(end_content_end as usize).max(end_rendered_start);
+                let end_display_col =
+                    end_line.display_column(&self.source[end_rendered_start..end_prefix_end]);
+                let middle_line_count = end_position
+                    .line
+                    .saturating_sub(start_line)
+                    .saturating_sub(1);
+                if middle_line_count > 2 {
+                    additional_source_lines.push(CliAdditionalSnippetRow::Gap);
+                } else {
+                    for line_number in (start_line + 1)..end_position.line {
+                        let line_start = self.line_starts[line_number - 1];
+                        let (_, line_start, content_end) = self.line_bounds(line_start as usize);
+                        let source_line = self.rendered_line(line_start, content_end);
+                        additional_source_lines.push(CliAdditionalSnippetRow::Source {
+                            line_number,
+                            source_line,
+                            annotation: None,
+                        });
+                    }
+                }
+                additional_source_lines.push(CliAdditionalSnippetRow::Source {
+                    line_number: end_position.line,
+                    annotation: Some((
+                        end_line.first_non_whitespace_display_col(),
+                        end_display_col,
+                    )),
+                    source_line: end_line,
+                });
+                end_display_col
+            };
+            (Some(line), start_display_col, end_display_col)
+        } else {
+            (None, 0, 0)
+        };
+        CliLocation {
+            path: path.to_owned(),
+            start: start_position,
+            end: end_position,
+            source_line,
+            additional_source_lines,
+            start_display_col,
+            end_display_col,
+        }
+    }
+}
+
+fn build_utf16_checkpoints(source: &[u8]) -> Vec<(u32, usize)> {
+    let mut checkpoints = vec![(0, 0)];
+    let mut byte_offset = 0usize;
+    let mut utf16_width = 0usize;
+    let mut last_checkpoint = 0usize;
+
+    while byte_offset < source.len() {
+        let remaining = &source[byte_offset..];
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                for character in valid.chars() {
+                    byte_offset += character.len_utf8();
+                    utf16_width += character.len_utf16();
+                    if byte_offset.saturating_sub(last_checkpoint) >= 256 {
+                        checkpoints
+                            .push((u32::try_from(byte_offset).unwrap_or(u32::MAX), utf16_width));
+                        last_checkpoint = byte_offset;
+                    }
+                }
+                break;
+            }
+            Err(error) if error.valid_up_to() > 0 => {
+                let valid = std::str::from_utf8(&remaining[..error.valid_up_to()])
+                    .expect("valid_up_to identifies a valid UTF-8 prefix");
+                for character in valid.chars() {
+                    byte_offset += character.len_utf8();
+                    utf16_width += character.len_utf16();
+                    if byte_offset.saturating_sub(last_checkpoint) >= 256 {
+                        checkpoints
+                            .push((u32::try_from(byte_offset).unwrap_or(u32::MAX), utf16_width));
+                        last_checkpoint = byte_offset;
+                    }
+                }
+            }
+            Err(error) => {
+                let invalid_len = error.error_len().unwrap_or(remaining.len());
+                byte_offset = byte_offset.saturating_add(invalid_len);
+                utf16_width = utf16_width.saturating_add(invalid_len);
+                if byte_offset.saturating_sub(last_checkpoint) >= 256 {
+                    checkpoints.push((u32::try_from(byte_offset).unwrap_or(u32::MAX), utf16_width));
+                    last_checkpoint = byte_offset;
+                }
+            }
+        }
+    }
+    checkpoints
+}
+
+impl RenderedSourceLine {
+    fn new(source: &[u8]) -> Self {
+        let mut text = String::with_capacity(source.len());
+        let mut checkpoints = vec![(0, 0)];
+        let mut window_checkpoints = vec![(0, 0)];
+        let mut byte_offset = 0usize;
+        let mut display_width = 0usize;
+        let mut last_checkpoint = 0usize;
+
+        while byte_offset < source.len() {
+            match std::str::from_utf8(&source[byte_offset..]) {
+                Ok(valid) => {
+                    for character in valid.chars() {
+                        append_source_storage(character, &mut text, &mut display_width);
+                        byte_offset += character.len_utf8();
+                        add_display_checkpoint(
+                            &mut checkpoints,
+                            &mut window_checkpoints,
+                            &mut last_checkpoint,
+                            byte_offset,
+                            display_width,
+                            text.len(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let valid_len = error.valid_up_to();
+                    if valid_len > 0 {
+                        let valid =
+                            std::str::from_utf8(&source[byte_offset..byte_offset + valid_len])
+                                .expect("valid_up_to identifies a valid UTF-8 prefix");
+                        for character in valid.chars() {
+                            append_source_storage(character, &mut text, &mut display_width);
+                            byte_offset += character.len_utf8();
+                            add_display_checkpoint(
+                                &mut checkpoints,
+                                &mut window_checkpoints,
+                                &mut last_checkpoint,
+                                byte_offset,
+                                display_width,
+                                text.len(),
+                            );
+                        }
+                    }
+                    let invalid_len = error
+                        .error_len()
+                        .unwrap_or_else(|| source.len().saturating_sub(byte_offset));
+                    append_source_storage('\u{fffd}', &mut text, &mut display_width);
+                    byte_offset = byte_offset.saturating_add(invalid_len);
+                    add_display_checkpoint(
+                        &mut checkpoints,
+                        &mut window_checkpoints,
+                        &mut last_checkpoint,
+                        byte_offset,
+                        display_width,
+                        text.len(),
+                    );
+                }
+            }
+        }
+        if last_checkpoint != byte_offset {
+            checkpoints.push((
+                u32::try_from(byte_offset).unwrap_or(u32::MAX),
+                display_width,
+            ));
+            window_checkpoints.push((display_width, text.len()));
+        }
+        let first_non_whitespace_display_col = first_non_whitespace_display_col(&text);
+        Self {
+            text,
+            checkpoints,
+            window_checkpoints,
+            display_width,
+            first_non_whitespace_display_col,
+        }
+    }
+
+    fn display_column(&self, mut prefix: &[u8]) -> usize {
+        let prefix_len = prefix.len();
+        let checkpoint_index = self
+            .checkpoints
+            .partition_point(|(byte, _)| (*byte as usize) <= prefix_len)
+            .saturating_sub(1);
+        let (checkpoint_byte, checkpoint_width) = self.checkpoints[checkpoint_index];
+        prefix = &prefix[checkpoint_byte as usize..];
+        display_width_after(prefix, checkpoint_width)
+    }
+
+    fn first_non_whitespace_display_col(&self) -> usize {
+        self.first_non_whitespace_display_col
+    }
+
+    fn window(
+        &self,
+        annotation_start: usize,
+        annotation_end: usize,
+    ) -> (String, usize, bool, bool, usize) {
+        const MAX_DISPLAY_WIDTH: usize = 140;
+        if self.display_width <= MAX_DISPLAY_WIDTH {
+            let text = self.slice_display_columns(0, self.display_width);
+            return (text, 0, false, false, self.display_width);
+        }
+        let max_start = self.display_width - MAX_DISPLAY_WIDTH;
+        let mut start = annotation_start.saturating_sub(20);
+        let annotation_last = annotation_end.saturating_sub(1);
+        start = start.max(annotation_last.saturating_sub(MAX_DISPLAY_WIDTH - 1));
+        start = start.min(max_start);
+        start = self.round_down_to_display_boundary(start);
+        let mut content_end = (start + MAX_DISPLAY_WIDTH).min(self.display_width);
+        if annotation_end > content_end {
+            start = self.round_up_to_display_boundary(start.saturating_add(1));
+            content_end = (start + MAX_DISPLAY_WIDTH).min(self.display_width);
+        }
+        let left_clipped = start > 0;
+        let right_clipped = content_end < self.display_width;
+        let text = self.slice_display_columns(start, content_end);
+        let width = display_width_after(text.as_bytes(), 0);
+        (text, start, left_clipped, right_clipped, width)
+    }
+
+    fn round_down_to_display_boundary(&self, target: usize) -> usize {
+        let (mut column, text_offset) = self.window_checkpoint_before(target);
+        for character in self.text[text_offset..].chars() {
+            let next = column.saturating_add(source_character_width(character, column));
+            if next > target {
+                return column;
+            }
+            column = next;
+        }
+        column
+    }
+
+    fn round_up_to_display_boundary(&self, target: usize) -> usize {
+        let (mut column, text_offset) = self.window_checkpoint_before(target);
+        for character in self.text[text_offset..].chars() {
+            column = column.saturating_add(source_character_width(character, column));
+            if column >= target {
+                return column;
+            }
+        }
+        column
+    }
+
+    fn slice_display_columns(&self, start: usize, end: usize) -> String {
+        if end <= start {
+            return String::new();
+        }
+        let (mut column, text_offset) = self.window_checkpoint_before(start);
+        let mut output = String::new();
+        for character in self.text[text_offset..].chars() {
+            let width = source_character_width(character, column);
+            let next_column = column.saturating_add(width);
+            if width == 0 {
+                let at_visible_eof = column == end && end >= self.display_width;
+                if column >= start && (column < end || at_visible_eof) {
+                    output.push(character);
+                }
+            } else {
+                if column >= end {
+                    break;
+                }
+                if column >= start && next_column <= end {
+                    let mut rendered_column = column;
+                    append_source_character(character, &mut output, &mut rendered_column);
+                }
+            }
+            column = next_column;
+        }
+        output
+    }
+
+    fn window_checkpoint_before(&self, target: usize) -> (usize, usize) {
+        let checkpoint_index = self
+            .window_checkpoints
+            .partition_point(|(column, _)| *column < target)
+            .saturating_sub(1);
+        self.window_checkpoints[checkpoint_index]
+    }
+}
+
+fn first_non_whitespace_display_col(text: &str) -> usize {
+    let mut column = 0usize;
+    for character in text.chars() {
+        if !character.is_whitespace() || is_forbidden_display_character(character) {
+            return column;
+        }
+        column = column.saturating_add(source_character_width(character, column));
+    }
+    column
+}
+
+fn source_character_width(character: char, display_column: usize) -> usize {
+    if character == '\t' {
+        4 - (display_column % 4)
+    } else if is_forbidden_display_character(character) {
+        format!("<U+{:04X}>", character as u32).len()
+    } else {
+        character_width(character)
+    }
+}
+
+fn append_source_storage(character: char, text: &mut String, display_width: &mut usize) {
+    text.push(character);
+    *display_width += source_character_width(character, *display_width);
+}
+
+fn escape_terminal_controls(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(|character| {
+        !matches!(character, '\t' | '\n') && is_forbidden_display_character(character)
+    }) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '\t' | '\n') || !is_forbidden_display_character(character) {
+            safe.push(character);
+        } else {
+            safe.push_str(&format!("<U+{:04X}>", character as u32));
+        }
+    }
+    Cow::Owned(safe)
+}
+
+fn utf16_column_width(mut bytes: &[u8]) -> usize {
+    let mut width = 0usize;
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                width += valid.encode_utf16().count();
+                break;
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                if valid_len > 0 {
+                    let valid = std::str::from_utf8(&bytes[..valid_len])
+                        .expect("valid_up_to identifies a valid UTF-8 prefix");
+                    width += valid.encode_utf16().count();
+                }
+                let invalid_len = error
+                    .error_len()
+                    .unwrap_or_else(|| bytes.len().saturating_sub(valid_len));
+                width += invalid_len;
+                bytes = &bytes[valid_len + invalid_len..];
+            }
+        }
+    }
+    width
+}
+
+fn add_display_checkpoint(
+    checkpoints: &mut Vec<(u32, usize)>,
+    window_checkpoints: &mut Vec<(usize, usize)>,
+    last_checkpoint: &mut usize,
+    byte_offset: usize,
+    display_width: usize,
+    text_byte_offset: usize,
+) {
+    if byte_offset.saturating_sub(*last_checkpoint) >= 256 {
+        checkpoints.push((
+            u32::try_from(byte_offset).unwrap_or(u32::MAX),
+            display_width,
+        ));
+        window_checkpoints.push((display_width, text_byte_offset));
+        *last_checkpoint = byte_offset;
+    }
+}
+
+fn append_source_character(character: char, text: &mut String, display_width: &mut usize) {
+    if character == '\t' {
+        let spaces = 4 - (*display_width % 4);
+        text.extend(std::iter::repeat_n(' ', spaces));
+        *display_width += spaces;
+    } else if is_forbidden_display_character(character) {
+        let visible = format!("<U+{:04X}>", character as u32);
+        *display_width += visible.len();
+        text.push_str(&visible);
+    } else {
+        text.push(character);
+        *display_width += character_width(character);
+    }
+}
+
+fn is_forbidden_display_character(character: char) -> bool {
+    character.is_control()
+        || character == '\u{200b}'
+        || character == '\u{feff}'
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{206f}'
+        )
+        || (character.is_whitespace() && !matches!(character, ' ' | '\t' | '\n' | '\r'))
+}
+
+fn character_width(character: char) -> usize {
+    UnicodeWidthChar::width(character).unwrap_or(1)
+}
+
+fn display_width_after(mut bytes: &[u8], mut width: usize) -> usize {
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                for character in valid.chars() {
+                    if character == '\t' {
+                        width += 4 - (width % 4);
+                    } else if is_forbidden_display_character(character) {
+                        width += format!("<U+{:04X}>", character as u32).len();
+                    } else {
+                        width += character_width(character);
+                    }
+                }
+                break;
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                if valid_len > 0 {
+                    let valid = std::str::from_utf8(&bytes[..valid_len])
+                        .expect("valid_up_to identifies a valid UTF-8 prefix");
+                    for character in valid.chars() {
+                        if character == '\t' {
+                            width += 4 - (width % 4);
+                        } else if is_forbidden_display_character(character) {
+                            width += format!("<U+{:04X}>", character as u32).len();
+                        } else {
+                            width += character_width(character);
+                        }
+                    }
+                }
+                let invalid_len = error
+                    .error_len()
+                    .unwrap_or_else(|| bytes.len().saturating_sub(valid_len));
+                width += character_width('\u{fffd}');
+                bytes = &bytes[valid_len + invalid_len..];
+            }
+        }
+    }
+    width
+}
+
+fn unformatted_stdin_diagnostic(
+    source: &Arc<[u8]>,
+    formatted: &[u8],
+    include_source_line: bool,
+) -> CliDiagnostic {
+    let mut input_lines = source.split_inclusive(|byte| *byte == b'\n');
+    let mut output_lines = formatted.split_inclusive(|byte| *byte == b'\n');
+    let mut line_index = 0;
+    let expected = loop {
+        match (input_lines.next(), output_lines.next()) {
+            (Some(input), Some(output)) if input == output => line_index += 1,
+            (_, output) => break output,
+        }
+    };
+    let (start, end) = source_line_span(source, line_index);
+    let expected = expected
+        .map(|line| String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(line)).into_owned());
+    let mut source_index = CliSourceIndex::new(Arc::clone(source));
+    CliDiagnostic {
+        code: "UNFORMATTED_FILE",
+        message: "file is not formatted".to_owned(),
+        primary: Some(source_index.location("<stdin>", start..end, include_source_line)),
+        primary_label: String::new(),
+        argument_index: None,
+        argument: String::new(),
+        help: Some("run `sai fmt --stdin-kind package -` to format this file".to_owned()),
+        data: Some(format!(
+            "{{\"line\":{},\"expected\":{}}}",
+            line_index + 1,
+            expected.map_or_else(
+                || "null".to_owned(),
+                |line| format!("\"{}\"", escape_json(&line))
+            )
+        )),
+    }
+}
+
+fn source_line_span(source: &[u8], line_index: usize) -> (usize, usize) {
+    let mut start = 0;
+    for _ in 0..line_index {
+        let Some(newline) = source[start..].iter().position(|byte| *byte == b'\n') else {
+            return (source.len(), source.len());
+        };
+        start += newline + 1;
+    }
+    if start >= source.len() {
+        return (source.len(), source.len());
+    }
+    let end = source[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(source.len(), |index| start + index);
+    let content_end = if end > start && source[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    };
+    (start, content_end)
 }
 
 fn run_explain(
@@ -230,6 +1826,8 @@ fn report_unknown_diagnostic_code(
     let diagnostic = CliDiagnostic {
         code: "UNKNOWN_DIAGNOSTIC_CODE",
         message: format!("unknown diagnostic code `{safe_name}`"),
+        primary: None,
+        primary_label: String::new(),
         argument_index: None,
         argument: String::new(),
         help: candidates
@@ -1310,6 +2908,8 @@ fn report_feature_not_implemented(
     let diagnostic = CliDiagnostic {
         code: "FEATURE_NOT_IMPLEMENTED",
         message: format!("stage {stage} feature `{feature}` is not implemented"),
+        primary: None,
+        primary_label: String::new(),
         argument_index: None,
         argument: String::new(),
         help: None,
@@ -1393,6 +2993,8 @@ fn report_new_error(
             CliDiagnostic {
                 code: "DESTINATION_NOT_EMPTY",
                 message: "destination is not an empty directory".to_owned(),
+                primary: None,
+                primary_label: String::new(),
                 argument_index: None,
                 argument: String::new(),
                 help: None,
@@ -1404,6 +3006,8 @@ fn report_new_error(
             CliDiagnostic {
                 code: "OUTPUT_WRITE_FAILED",
                 message: "could not write the new package".to_owned(),
+                primary: None,
+                primary_label: String::new(),
                 argument_index: None,
                 argument: String::new(),
                 help: Some(source.to_string()),
@@ -1415,6 +3019,8 @@ fn report_new_error(
             CliDiagnostic {
                 code: "INVALID_OPTION_VALUE",
                 message: other.to_string(),
+                primary: None,
+                primary_label: String::new(),
                 argument_index: None,
                 argument: String::new(),
                 help: None,
@@ -1593,6 +3199,8 @@ fn usage_diagnostic(
     CliDiagnostic {
         code,
         message,
+        primary: None,
+        primary_label: String::new(),
         argument_index: Some(error.argument_index),
         argument,
         help,
@@ -1651,6 +3259,61 @@ fn write_human_diagnostics(
             write!(writer, "error[{}]: ", diagnostic.code)?;
         }
         writeln!(writer, "{}", diagnostic.message)?;
+        if let Some(location) = &diagnostic.primary {
+            writeln!(
+                writer,
+                "  --> {}:{}:{}",
+                location.path, location.start.line, location.start.col
+            )?;
+            writeln!(writer, "   |")?;
+            if let Some(source_line) = &location.source_line {
+                let number_width = location
+                    .additional_source_lines
+                    .iter()
+                    .filter_map(|row| match row {
+                        CliAdditionalSnippetRow::Source { line_number, .. } => {
+                            Some(line_number.to_string().len())
+                        }
+                        CliAdditionalSnippetRow::Gap => None,
+                    })
+                    .fold(location.start.line.to_string().len(), usize::max);
+                let start_end_col = if location.end.line == location.start.line {
+                    location.end_display_col
+                } else {
+                    source_line.display_width
+                };
+                write_human_source_line(
+                    writer,
+                    location.start.line,
+                    source_line,
+                    Some((location.start_display_col, start_end_col)),
+                    number_width,
+                    (location.end.line == location.start.line)
+                        .then_some(diagnostic.primary_label.as_str()),
+                )?;
+                for row in &location.additional_source_lines {
+                    match row {
+                        CliAdditionalSnippetRow::Gap => writeln!(writer, "...")?,
+                        CliAdditionalSnippetRow::Source {
+                            line_number,
+                            source_line,
+                            annotation,
+                        } => {
+                            write_human_source_line(
+                                writer,
+                                *line_number,
+                                source_line,
+                                *annotation,
+                                number_width,
+                                (*line_number == location.end.line)
+                                    .then_some(diagnostic.primary_label.as_str()),
+                            )?;
+                        }
+                    }
+                }
+                writeln!(writer, "   |")?;
+            }
+        }
         if let Some(help) = &diagnostic.help {
             writeln!(writer, "  = help: {help}")?;
         }
@@ -1672,6 +3335,53 @@ fn write_human_diagnostics(
         } else {
             writeln!(writer, "{command_name} failed: {error_count} {noun}{more}")?;
         }
+    }
+    Ok(())
+}
+
+fn write_human_source_line(
+    writer: &mut impl Write,
+    line_number: usize,
+    source_line: &RenderedSourceLine,
+    annotation: Option<(usize, usize)>,
+    number_width: usize,
+    label: Option<&str>,
+) -> io::Result<()> {
+    let (annotation_start, annotation_end) = annotation.unwrap_or_default();
+    let (row, window_start, left_clipped, right_clipped, row_width) =
+        source_line.window(annotation_start, annotation_end);
+    let left_marker = if left_clipped { "..." } else { "" };
+    let right_marker = if right_clipped { "..." } else { "" };
+    writeln!(
+        writer,
+        "{:>width$} | {left_marker}{row}{right_marker}",
+        line_number,
+        width = number_width
+    )?;
+    if let Some((annotation_start, annotation_end)) = annotation {
+        write!(writer, "{:>width$} | ", "", width = number_width)?;
+        let start_col = annotation_start.max(window_start);
+        let row_end = window_start + row_width;
+        let visible_end = annotation_end.min(row_end);
+        let mark_col = start_col.saturating_sub(window_start).min(row_width);
+        let mark_width = if annotation_start == annotation_end {
+            1
+        } else {
+            visible_end
+                .saturating_sub(start_col)
+                .max(1)
+                .min(row_width.saturating_sub(mark_col).max(1))
+        };
+        for _ in 0..(usize::from(left_clipped) * 3 + mark_col) {
+            writer.write_all(b" ")?;
+        }
+        for _ in 0..mark_width {
+            writer.write_all(b"^")?;
+        }
+        if let Some(label) = label.filter(|label| !label.is_empty()) {
+            write!(writer, " {label}")?;
+        }
+        writeln!(writer)?;
     }
     Ok(())
 }
@@ -1720,6 +3430,14 @@ fn write_json_diagnostics(
     exit_code: i32,
 ) -> io::Result<()> {
     write_json_success_header(writer, command_name)?;
+    write_json_diagnostic_records(writer, diagnostics)?;
+    write_json_summary(writer, total_error_count, diagnostics.len(), exit_code)
+}
+
+fn write_json_diagnostic_records(
+    writer: &mut impl Write,
+    diagnostics: &[CliDiagnostic],
+) -> io::Result<()> {
     for diagnostic in diagnostics {
         let data = if let Some(argument_index) = diagnostic.argument_index {
             format!(
@@ -1740,20 +3458,50 @@ fn write_json_diagnostics(
                 )
             },
         );
+        let primary = diagnostic
+            .primary
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), json_location);
         writeln!(
             writer,
-            "{{\"type\":\"diagnostic\",\"code\":\"{}\",\"severity\":\"error\",\"level\":null,\"message\":\"{}\",\"primary\":null,\"primary_label\":\"\",\"labels\":[],\"children\":{},\"fixes\":[],\"related\":[],\"data\":{},\"node\":null,\"symbol\":null,\"package\":null}}",
+            "{{\"type\":\"diagnostic\",\"code\":\"{}\",\"severity\":\"error\",\"level\":null,\"message\":\"{}\",\"primary\":{},\"primary_label\":\"{}\",\"labels\":[],\"children\":{},\"fixes\":[],\"related\":[],\"data\":{},\"node\":null,\"symbol\":null,\"package\":null}}",
             diagnostic.code,
             escape_json(&diagnostic.message),
+            primary,
+            escape_json(&diagnostic.primary_label),
             children,
             data
         )?;
     }
+    Ok(())
+}
+
+fn write_json_summary(
+    writer: &mut impl Write,
+    total_error_count: usize,
+    shown_error_count: usize,
+    exit_code: i32,
+) -> io::Result<()> {
     writeln!(
         writer,
         "{{\"type\":\"summary\",\"errors\":{},\"warnings\":0,\"infos\":0,\"shown_errors\":{},\"suppressed\":{{\"cascade\":0,\"duplicate\":0,\"dependency\":0}},\"exit_code\":{exit_code}}}",
-        total_error_count,
-        diagnostics.len()
+        total_error_count, shown_error_count
+    )
+}
+
+fn json_location(location: &CliLocation) -> String {
+    format!(
+        "{{\"file\":{{\"path\":\"{}\",\"package\":null,\"snapshot\":null}},\"start\":{},\"end\":{}}}",
+        escape_json(&location.path),
+        json_position(location.start),
+        json_position(location.end)
+    )
+}
+
+fn json_position(position: CliPosition) -> String {
+    format!(
+        "{{\"byte\":{},\"line\":{},\"col\":{},\"utf16_col\":{}}}",
+        position.byte, position.line, position.col, position.utf16_col
     )
 }
 
@@ -1911,17 +3659,63 @@ fn color_enabled(choice: ColorChoice, stream_is_terminal: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io;
+    use std::io::{self, Read};
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        EXPLAIN_CODE_SUMMARIES, human_file_path, relative_path, run, run_new_with_creator,
-        run_with_cancellation,
+        CancellationAwareStdin, CliDiagnostic, CliSourceIndex, EXPLAIN_CODE_SUMMARIES,
+        RenderedSourceLine, StdinBroker, StdinReadError, cli_position, human_file_path,
+        internal_fmt_diagnostic, parse_args, relative_path, report_fmt_diagnostics, run,
+        run_new_with_creator, run_with_cancellation, run_with_cancellation_and_input,
+        write_human_diagnostics,
     };
     use sai_driver::CancellationToken;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    struct CancellingReader {
+        cancellation: CancellationToken,
+        reads: usize,
+    }
+
+    impl std::io::Read for CancellingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 1 {
+                buffer[0] = b'p';
+                self.cancellation.cancel();
+                Ok(1)
+            } else {
+                Err(io::Error::other("read after cancellation"))
+            }
+        }
+    }
+
+    struct BlockingReader {
+        started: Option<mpsc::Sender<()>>,
+        released: mpsc::Receiver<()>,
+        finished: Option<mpsc::Sender<()>>,
+    }
+
+    impl std::io::Read for BlockingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            self.released
+                .recv()
+                .map_err(|_| io::Error::other("blocking reader release was dropped"))?;
+            if let Some(finished) = self.finished.take() {
+                let _ = finished.send(());
+            }
+            Ok(0)
+        }
+    }
 
     struct BrokenPipeWriter;
 
@@ -1967,6 +3761,29 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit_code = run(&arguments, &mut stdout, &mut stderr);
+        (
+            exit_code,
+            String::from_utf8(stdout).expect("CLI stdout is UTF-8"),
+            String::from_utf8(stderr).expect("CLI stderr is UTF-8"),
+        )
+    }
+
+    fn invoke_with_stdin(arguments: &[&str], stdin: &[u8]) -> (i32, String, String) {
+        let arguments = arguments
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        let mut input = io::Cursor::new(stdin);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = run_with_cancellation_and_input(
+            &arguments,
+            &CancellationToken::default(),
+            &mut input,
+            &mut stdout,
+            &mut stderr,
+            false,
+        );
         (
             exit_code,
             String::from_utf8(stdout).expect("CLI stdout is UTF-8"),
@@ -2257,6 +4074,731 @@ mod tests {
             );
             assert!(!stdout.contains("FEATURE_NOT_IMPLEMENTED"), "{arguments:?}");
         }
+    }
+
+    #[test]
+    fn fmt_formats_package_stdin_and_emits_the_json_result_contract() {
+        let source = b"package acme:app@1.0.0\nsource\"src\"\n";
+        let expected = "package acme:app @ 1.0.0\nsource \"src\"\n";
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["fmt", "--stdin-kind", "package", "-"], source);
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, expected);
+        assert!(stderr.is_empty());
+
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &["--format=json", "fmt", "--stdin-kind=package", "-"],
+            source,
+        );
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"kind\":\"fmt\""));
+        assert!(stdout.contains("\"check\":false,\"files\":1,\"changed\":[\"<stdin>\"]"));
+        assert!(stdout.contains("\"output\":\"package acme:app @ 1.0.0\\nsource \\\"src\\\"\\n\""));
+        assert!(stdout.contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn fmt_escapes_terminal_controls_only_for_terminal_output() {
+        let source = b"// \x1b]0;unsafe\x07\npackage acme:app @ 1.0.0\n";
+        let arguments = ["fmt", "--stdin-kind=package", "-"].map(std::ffi::OsString::from);
+        let mut input = io::Cursor::new(source);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_with_cancellation_and_input(
+            &arguments,
+            &CancellationToken::default(),
+            &mut input,
+            &mut stdout,
+            &mut stderr,
+            true,
+        );
+
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert!(!stdout.contains(&0x1b));
+        assert!(!stdout.contains(&0x07));
+        let stdout = String::from_utf8(stdout).expect("formatted output is UTF-8");
+        assert!(stdout.contains("// <U+001B>]0;unsafe<U+0007>"));
+    }
+
+    #[test]
+    fn fmt_check_reports_the_first_differing_stdin_line() {
+        let source = b"package acme:app@1.0.0\nsource\"src\"\n";
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &[
+                "--format=json",
+                "fmt",
+                "--check",
+                "--stdin-kind=package",
+                "-",
+            ],
+            source,
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+        assert!(stdout.contains("\"path\":\"<stdin>\""));
+        assert!(stdout.contains("\"line\":1,\"expected\":\"package acme:app @ 1.0.0\""));
+        assert!(stdout.contains("\"start\":{\"byte\":0,\"line\":1,\"col\":1,\"utf16_col\":1}"));
+        assert!(stdout.contains(
+            "\"kind\":\"fmt\",\"data\":{\"check\":true,\"files\":1,\"changed\":[\"<stdin>\"],\"refused\":[],\"output\":null}"
+        ));
+        assert!(stdout.contains("\"exit_code\":1"));
+
+        let canonical = b"package acme:app @ 1.0.0\nsource \"src\"\n";
+        let (exit_code, stdout, stderr) =
+            invoke_with_stdin(&["fmt", "--check", "--stdin-kind=package", "-"], canonical);
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &[
+                "--format=json",
+                "fmt",
+                "--check",
+                "--stdin-kind=package",
+                "-",
+            ],
+            canonical,
+        );
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains(
+            "\"kind\":\"fmt\",\"data\":{\"check\":true,\"files\":1,\"changed\":[],\"refused\":[],\"output\":null}"
+        ));
+    }
+
+    #[test]
+    fn fmt_reports_package_refusals_with_source_locations() {
+        let source = b"package acme:app@1.0.0\ntargets { wasm32-core\n";
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &["--format=json", "fmt", "--stdin-kind=package", "-"],
+            source,
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(stdout.contains("\"path\":\"<stdin>\""));
+        assert!(stdout.contains("\"expected_tokens\":[\"`}`\"]"));
+        assert!(stdout.contains(
+            "\"kind\":\"fmt\",\"data\":{\"check\":false,\"files\":1,\"changed\":[],\"refused\":[\"<stdin>\"],\"output\":null}"
+        ));
+        assert_eq!(stdout.lines().count(), 4);
+    }
+
+    #[test]
+    fn fmt_cancellation_during_stdin_read_returns_interrupted_status() {
+        let arguments =
+            ["--format=json", "fmt", "--stdin-kind=package", "-"].map(std::ffi::OsString::from);
+        let cancellation = CancellationToken::default();
+        let mut stdin = CancellingReader {
+            cancellation: cancellation.clone(),
+            reads: 0,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run_with_cancellation_and_input(
+            &arguments,
+            &cancellation,
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            false,
+        );
+
+        assert_eq!(exit_code, 130);
+        assert!(stderr.is_empty());
+        let stdout = String::from_utf8(stdout).expect("JSON stdout is UTF-8");
+        assert!(stdout.contains("\"exit_code\":130"));
+        assert!(!stdout.contains("\"kind\":\"fmt\""));
+        assert_eq!(stdin.reads, 1);
+    }
+
+    #[test]
+    fn cancellation_aware_stdin_returns_while_the_underlying_reader_is_blocked() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let cancellation = CancellationToken::default();
+        let reader_cancellation = cancellation.clone();
+        let broker = Arc::new(Mutex::new(StdinBroker::spawn(Box::new(BlockingReader {
+            started: Some(started_sender),
+            released: release_receiver,
+            finished: Some(finished_sender),
+        }))));
+        let reader_thread = thread::spawn(move || {
+            let mut stdin = CancellationAwareStdin {
+                broker: Some(broker),
+                cancellation: reader_cancellation,
+            };
+            stdin.read(&mut [0_u8; 1])
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader started and is blocked");
+        cancellation.cancel();
+        let error = reader_thread
+            .join()
+            .expect("stdin reader call completes")
+            .expect_err("cancellation interrupts the CLI read");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        release_sender.send(()).expect("release background reader");
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("background reader exits after release");
+    }
+
+    #[test]
+    fn fmt_internal_failures_use_the_ice_exit_and_omit_the_result_record() {
+        let arguments =
+            ["--format=json", "fmt", "--stdin-kind=package", "-"].map(std::ffi::OsString::from);
+        let parsed = parse_args(&arguments);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = report_fmt_diagnostics(
+            &parsed,
+            vec![internal_fmt_diagnostic(
+                "formatter verification failed: token sequence changed".to_owned(),
+                None,
+            )],
+            1,
+            None,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit_code, 101);
+        assert!(stderr.is_empty());
+        let stdout = String::from_utf8(stdout).expect("JSON stdout is UTF-8");
+        assert!(stdout.contains(
+            "\"message\":\"internal compiler error: formatter verification failed: token sequence changed\""
+        ));
+        assert!(stdout.contains("\"query_stack\":[]"));
+        assert!(stdout.contains("\"compiler_version\":\""));
+        assert!(!stdout.contains("\"kind\":\"fmt\""));
+        assert!(stdout.contains("\"exit_code\":101"));
+        assert_eq!(stdout.lines().count(), 3);
+    }
+
+    #[test]
+    fn fmt_failures_before_a_result_omit_the_json_result_record() {
+        let arguments =
+            ["--format=json", "fmt", "--stdin-kind=package", "-"].map(std::ffi::OsString::from);
+        let parsed = parse_args(&arguments);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = report_fmt_diagnostics(
+            &parsed,
+            vec![super::CliDiagnostic {
+                code: "SOURCE_READ_FAILED",
+                message: "could not read standard input".to_owned(),
+                primary: None,
+                primary_label: String::new(),
+                argument_index: None,
+                argument: String::new(),
+                help: None,
+                data: None,
+            }],
+            1,
+            None,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let stdout = String::from_utf8(stdout).expect("JSON stdout is UTF-8");
+        assert!(stdout.contains("\"type\":\"header\""));
+        assert!(stdout.contains("\"code\":\"SOURCE_READ_FAILED\""));
+        assert!(!stdout.contains("\"kind\":\"fmt\""));
+        assert!(stdout.contains("\"exit_code\":1"));
+        assert_eq!(stdout.lines().count(), 3);
+    }
+
+    #[test]
+    fn cli_positions_follow_raw_bytes_boms_line_endings_and_invalid_utf8() {
+        let source = b"\xef\xbb\xbfa\xc3\xa9\xf0\x9f\x98\x80\r\nz\ry";
+        assert_eq!(cli_position(source, 0).line, 1);
+        assert_eq!(cli_position(source, 0).col, 1);
+        assert_eq!(cli_position(source, 0).utf16_col, 1);
+        assert_eq!(
+            (
+                cli_position(source, 10).line,
+                cli_position(source, 10).col,
+                cli_position(source, 10).utf16_col,
+            ),
+            (1, 8, 5)
+        );
+        assert_eq!(
+            (
+                cli_position(source, 12).line,
+                cli_position(source, 12).col,
+                cli_position(source, 12).utf16_col,
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (
+                cli_position(source, 14).line,
+                cli_position(source, 14).col,
+                cli_position(source, 14).utf16_col,
+            ),
+            (3, 1, 1)
+        );
+
+        let invalid = [b'a', 0xff, 0xfe, b'b'];
+        assert_eq!(
+            (
+                cli_position(&invalid, 3).line,
+                cli_position(&invalid, 3).col,
+                cli_position(&invalid, 3).utf16_col,
+            ),
+            (1, 4, 4)
+        );
+    }
+
+    #[test]
+    fn cli_positions_use_checkpoints_after_long_utf8_prefixes() {
+        let source = format!("{}\u{1f600}z", "a".repeat(300));
+        let emoji_end = 300 + "\u{1f600}".len();
+
+        assert_eq!(
+            (
+                cli_position(source.as_bytes(), emoji_end).col,
+                cli_position(source.as_bytes(), emoji_end).utf16_col,
+            ),
+            (305, 303)
+        );
+        assert_eq!(
+            (
+                cli_position(source.as_bytes(), emoji_end + 1).col,
+                cli_position(source.as_bytes(), emoji_end + 1).utf16_col,
+            ),
+            (306, 304)
+        );
+    }
+
+    #[test]
+    fn human_source_snippets_escape_controls_and_align_tabs_and_wide_characters() {
+        let source = Arc::<[u8]>::from("// 日本\t\u{200b}".as_bytes());
+        let forbidden_start = source.len() - "\u{200b}".len();
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", forbidden_start..source.len(), true);
+
+        assert_eq!(
+            location
+                .source_line
+                .as_ref()
+                .expect("human location has a source line")
+                .window(location.start_display_col, location.end_display_col)
+                .0,
+            "// 日本 <U+200B>"
+        );
+        assert_eq!(location.start_display_col, 8);
+        assert_eq!(location.end_display_col, 16);
+
+        let diagnostic = CliDiagnostic {
+            code: "FORBIDDEN_CHARACTER",
+            message: "forbidden character in manifest".to_owned(),
+            primary: Some(location),
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        };
+        let mut rendered = Vec::new();
+        write_human_diagnostics(&mut rendered, "sai fmt", &[diagnostic], true, false, 1, 50)
+            .expect("render human diagnostic");
+        let rendered = String::from_utf8(rendered).expect("diagnostic is UTF-8");
+
+        assert!(rendered.contains("1 | // 日本 <U+200B>"));
+        assert!(rendered.contains("  |         ^^^^^^^^\n"));
+
+        let source = Arc::<[u8]>::from(&b"\x1b"[..]);
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", 0..1, true);
+        let diagnostic = CliDiagnostic {
+            code: "FORBIDDEN_CHARACTER",
+            message: "forbidden character in manifest".to_owned(),
+            primary: Some(location),
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        };
+        let mut rendered = Vec::new();
+        write_human_diagnostics(&mut rendered, "sai fmt", &[diagnostic], true, false, 1, 50)
+            .expect("render escaped control diagnostic");
+
+        assert!(!rendered.contains(&0x1b));
+        assert!(
+            String::from_utf8(rendered)
+                .expect("diagnostic is UTF-8")
+                .contains("<U+001B>")
+        );
+
+        let rendered =
+            RenderedSourceLine::new("\u{061c}\u{200e}\u{200f}\u{202e}\u{2066}\u{206a}".as_bytes());
+        assert_eq!(
+            rendered.window(0, rendered.display_width).0,
+            "<U+061C><U+200E><U+200F><U+202E><U+2066><U+206A>"
+        );
+    }
+
+    #[test]
+    fn human_source_snippets_show_a_bom_without_counting_it_as_a_column() {
+        let source = Arc::<[u8]>::from(&b"\xef\xbb\xbfx"[..]);
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", 3..4, true);
+
+        assert_eq!(location.start.col, 1);
+        assert_eq!(location.start.utf16_col, 1);
+        assert_eq!(location.start_display_col, 8);
+        assert_eq!(
+            location
+                .source_line
+                .as_ref()
+                .expect("human location has a source line")
+                .window(0, 8)
+                .0,
+            "<U+FEFF>x"
+        );
+
+        let bom_location = source_index.location("<stdin>", 0..3, true);
+        assert_eq!(bom_location.start.col, 1);
+        assert_eq!(bom_location.end.col, 1);
+        assert_eq!(bom_location.start_display_col, 0);
+        assert_eq!(bom_location.end_display_col, 8);
+    }
+
+    #[test]
+    fn json_locations_do_not_render_or_copy_source_lines() {
+        let source = Arc::<[u8]>::from(vec![b'a'; 128 * 1024]);
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", 120_000..120_001, false);
+
+        assert!(location.source_line.is_none());
+        assert_eq!(location.start.col, 120_001);
+        assert_eq!(location.start_display_col, 0);
+    }
+
+    #[test]
+    fn human_source_snippets_clip_long_lines_around_the_diagnostic() {
+        let source = Arc::<[u8]>::from(vec![b'a'; 300]);
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", 140..145, true);
+        let (row, window_start, left_clipped, right_clipped, row_width) = location
+            .source_line
+            .as_ref()
+            .expect("human location has a source line")
+            .window(location.start_display_col, location.end_display_col);
+
+        assert!(left_clipped);
+        assert!(right_clipped);
+        assert_eq!(window_start, 120);
+        assert_eq!(row_width, 140);
+        assert_eq!(row.len(), 140);
+    }
+
+    #[test]
+    fn human_source_snippet_draws_an_empty_eof_range_after_the_last_character() {
+        let line = RenderedSourceLine::new(&vec![b'a'; 300]);
+        let mut rendered = Vec::new();
+        super::write_human_source_line(
+            &mut rendered,
+            1,
+            &line,
+            Some((line.display_width, line.display_width)),
+            1,
+            None,
+        )
+        .expect("render empty end-of-line annotation");
+        let rendered = String::from_utf8(rendered).expect("diagnostic is UTF-8");
+        let mut rows = rendered.lines();
+        let source_row = rows.next().expect("source row");
+        let annotation_row = rows.next().expect("annotation row");
+
+        assert_eq!(
+            annotation_row.rfind('^'),
+            source_row.rfind('a').map(|column| column + 1)
+        );
+    }
+
+    #[test]
+    fn human_source_snippet_keeps_a_clipped_eof_annotation_visible_after_a_wide_character() {
+        let line =
+            RenderedSourceLine::new(format!("{}界{}", "a".repeat(19), "b".repeat(139)).as_bytes());
+        let (row, window_start, left_clipped, right_clipped, row_width) =
+            line.window(line.display_width, line.display_width);
+
+        assert_eq!(window_start, 21);
+        assert!(left_clipped);
+        assert!(!right_clipped);
+        assert_eq!(row_width, 139);
+        assert!(row.ends_with(&"b".repeat(139)));
+    }
+
+    #[test]
+    fn human_source_snippet_windows_never_split_a_wide_character() {
+        let line =
+            RenderedSourceLine::new(format!("{}界{}", "a".repeat(139), "b".repeat(10)).as_bytes());
+        let (row, window_start, left_clipped, right_clipped, row_width) = line.window(20, 21);
+
+        assert_eq!(window_start, 0);
+        assert!(!left_clipped);
+        assert!(right_clipped);
+        assert_eq!(row_width, 139);
+        assert!(!row.contains('界'));
+    }
+
+    #[test]
+    fn human_source_snippet_window_keeps_a_wide_diagnostic_character_visible() {
+        let line =
+            RenderedSourceLine::new(format!("{}界{}", "a".repeat(139), "b".repeat(20)).as_bytes());
+        let (row, window_start, left_clipped, right_clipped, row_width) = line.window(0, 141);
+
+        assert_eq!(window_start, 1);
+        assert!(left_clipped);
+        assert!(right_clipped);
+        assert_eq!(row_width, 140);
+        assert!(row.starts_with(&"a".repeat(138)));
+        assert!(row.contains('界'));
+    }
+
+    #[test]
+    fn human_source_snippet_stores_controls_without_expanding_the_full_line() {
+        let source = vec![0; 1024 * 1024];
+        let line = RenderedSourceLine::new(&source);
+        let (row, _, _, _, row_width) = line.window(0, 1);
+
+        assert_eq!(line.text.len(), source.len());
+        assert_eq!(row_width, 136);
+        assert_eq!(row.matches("<U+0000>").count(), 17);
+    }
+
+    #[test]
+    fn human_source_snippet_keeps_trailing_zero_width_marks_on_the_line() {
+        let line = RenderedSourceLine::new("a\u{0301}".as_bytes());
+        let (row, _, _, _, row_width) = line.window(0, line.display_width);
+
+        assert_eq!(row, "a\u{0301}");
+        assert_eq!(row_width, 1);
+    }
+
+    #[test]
+    fn fmt_reports_utf16_columns_for_diagnostics_at_the_end_of_a_long_line() {
+        let source = format!(
+            "// {}\u{202e}\npackage acme:app @ 1.0.0\n",
+            "a".repeat(1024 * 1024)
+        );
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &[
+                "--format=json",
+                "--max-errors=1",
+                "fmt",
+                "--stdin-kind=package",
+                "-",
+            ],
+            source.as_bytes(),
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains(
+            "\"start\":{\"byte\":1048579,\"line\":1,\"col\":1048580,\"utf16_col\":1048580}"
+        ));
+    }
+
+    #[test]
+    fn human_source_snippets_show_both_ends_of_multiline_diagnostics() {
+        let source = Arc::<[u8]>::from("begin\n  middle\n    end".as_bytes());
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", 0..source.len(), true);
+        let diagnostic = CliDiagnostic {
+            code: "UNTERMINATED_COMMENT",
+            message: "unterminated block comment".to_owned(),
+            primary: Some(location),
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        };
+        let mut rendered = Vec::new();
+        write_human_diagnostics(&mut rendered, "sai fmt", &[diagnostic], true, false, 1, 50)
+            .expect("render multiline diagnostic");
+        let rendered = String::from_utf8(rendered).expect("diagnostic is UTF-8");
+
+        assert!(rendered.contains("1 | begin"));
+        assert!(rendered.contains("  | ^^^^^\n"));
+        assert!(rendered.contains("2 |   middle"));
+        assert!(rendered.contains("3 |     end"));
+        assert!(rendered.contains("  |     ^^^\n"));
+    }
+
+    #[test]
+    fn human_source_snippets_show_a_lone_cr_as_the_diagnosed_character() {
+        let source = Arc::<[u8]>::from(b"before\rafter".as_slice());
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", 6..7, true);
+        let diagnostic = CliDiagnostic {
+            code: "INVALID_LINE_ENDING",
+            message: "use LF line endings".to_owned(),
+            primary: Some(location),
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        };
+        let mut rendered = Vec::new();
+        write_human_diagnostics(&mut rendered, "sai fmt", &[diagnostic], true, false, 1, 50)
+            .expect("render lone-CR diagnostic");
+        let rendered = String::from_utf8(rendered).expect("diagnostic is UTF-8");
+
+        assert!(rendered.contains("1 | before<U+000D>"));
+        assert!(rendered.contains("  |       ^^^^^^^^\n"));
+        assert!(!rendered.contains("2 | after"));
+    }
+
+    #[test]
+    fn cached_source_snippets_keep_a_lone_cr_visible_for_later_diagnostics() {
+        let source = Arc::<[u8]>::from("before\u{202e}\rafter".as_bytes());
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let _earlier_location = source_index.location("<stdin>", 6..9, true);
+        let cr_location = source_index.location("<stdin>", 9..10, true);
+        let (row, _, _, _, _) = cr_location
+            .source_line
+            .as_ref()
+            .expect("human location has a source line")
+            .window(cr_location.start_display_col, cr_location.end_display_col);
+
+        assert!(row.contains("<U+000D>"));
+    }
+
+    #[test]
+    fn fmt_max_errors_limits_expensive_diagnostic_rendering_and_keeps_the_total() {
+        let source = format!("package acme:app @ 1.0.0\n// {}\n", "\u{202e}".repeat(1000));
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &[
+                "--format=json",
+                "--max-errors=1",
+                "fmt",
+                "--stdin-kind=package",
+                "-",
+            ],
+            source.as_bytes(),
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout.lines().count(), 4);
+        assert!(stdout.contains("\"errors\":1000"));
+        assert!(stdout.contains("\"shown_errors\":1"));
+        assert!(stdout.contains("\"code\":\"FORBIDDEN_CHARACTER\""));
+    }
+
+    #[test]
+    fn fmt_max_errors_bounds_retained_comment_diagnostics_and_keeps_exact_total() {
+        let source = format!("// {}\npackage acme:app @ 1.0.0\n", "\u{00a0}".repeat(8192));
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &[
+                "--format=json",
+                "--max-errors=1",
+                "fmt",
+                "--stdin-kind=package",
+                "-",
+            ],
+            source.as_bytes(),
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout.lines().count(), 4);
+        assert!(stdout.contains("\"errors\":8192"));
+        assert!(stdout.contains("\"shown_errors\":1"));
+        assert_eq!(
+            stdout.matches("\"code\":\"FORBIDDEN_CHARACTER\"").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fmt_max_errors_bounds_parser_diagnostics_and_keeps_exact_total() {
+        let mut source = String::from("package acme:app @ 1.0.0\n");
+        for _ in 0..32 {
+            source.push_str("compiler > 1.0.0\n");
+        }
+        source.push_str("future {}\n");
+        let parsed = sai_package::manifest::parse_for_role_with_error_limit(
+            source.as_bytes(),
+            sai_package::manifest::PackageRole::Root,
+            1,
+        );
+        let expected_errors = parsed.refusing_error_count();
+        let (exit_code, stdout, stderr) = invoke_with_stdin(
+            &[
+                "--format=json",
+                "--max-errors=1",
+                "fmt",
+                "--stdin-kind=package",
+                "-",
+            ],
+            source.as_bytes(),
+        );
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains(&format!("\"errors\":{expected_errors}")));
+        assert!(stdout.contains("\"shown_errors\":1"));
+        assert_eq!(stdout.matches("\"type\":\"diagnostic\"").count(), 1);
+        assert!(stdout.contains("\"code\":\"UNKNOWN_DECLARATION\""));
+    }
+
+    #[test]
+    fn stdin_size_limit_reads_only_one_byte_past_the_manifest_limit() {
+        let cancellation = CancellationToken::default();
+        let mut input = io::Cursor::new(vec![
+            b'x';
+            sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES
+                + 100
+        ]);
+
+        let source = super::read_stdin_limited(
+            &mut input,
+            sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES,
+            &cancellation,
+        )
+        .expect("stdin read succeeds");
+
+        assert_eq!(
+            source.len(),
+            sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES + 1
+        );
+        assert_eq!(
+            input.position(),
+            (sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES + 1) as u64
+        );
+        assert!(matches!(
+            super::read_stdin_limited(&mut io::empty(), 1, &{
+                let cancelled = CancellationToken::default();
+                cancelled.cancel();
+                cancelled
+            }),
+            Err(StdinReadError::Interrupted)
+        ));
     }
 
     #[test]
