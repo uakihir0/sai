@@ -19,6 +19,7 @@ pub(crate) struct PackageInput<'a> {
     lexed: PackageLexOutput,
     parsed: PackageParseOutput,
     comments: Vec<AttachedComment>,
+    refusals: Vec<PackageRefusal>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,11 +55,13 @@ impl<'a> PackageInput<'a> {
             PackageLexOutput::default()
         };
         let comments = attach_comments(source, &lexed.tokens, &parsed.file().trivia);
+        let refusals = classify_refusals(&lexed, &parsed);
         Self {
             source,
             lexed,
             parsed,
             comments,
+            refusals,
         }
     }
 
@@ -88,43 +91,50 @@ impl<'a> PackageInput<'a> {
             .expect("package comment spans point to valid UTF-8")
     }
 
+    pub(crate) fn comment_span(&self, comment: &AttachedComment) -> Range<usize> {
+        self.parsed.file().trivia[comment.trivia_index].span.clone()
+    }
+
     /// Refusal is deliberately narrower than `PackageParseOutput::is_syntax_valid`:
     /// duplicate and missing declarations are structural diagnostics, while
     /// malformed values are retained in the original token stream for later
     /// formatting and verification.
-    pub(crate) fn refusals(&self) -> Vec<PackageRefusal> {
-        let mut refusals = self
-            .lexed
-            .errors
-            .iter()
-            .map(|_| PackageRefusal::Lexical)
-            .collect::<Vec<_>>();
-        refusals.extend(
-            self.parsed
-                .errors()
-                .iter()
-                .filter_map(|error| match &error.kind {
-                    PackageParseErrorKind::UnknownDeclaration { .. }
-                    | PackageParseErrorKind::UnknownArtifactKind(_)
-                    | PackageParseErrorKind::ExpectedToken(_)
-                    | PackageParseErrorKind::ExpectedListSeparator(_)
-                    | PackageParseErrorKind::ExpectedDeclaration
-                    | PackageParseErrorKind::ExpectedProfileItem => Some(PackageRefusal::Grammar),
-                    PackageParseErrorKind::ManifestTooLarge => Some(PackageRefusal::ParserLimit),
-                    PackageParseErrorKind::MissingPackageDeclaration
-                    | PackageParseErrorKind::PackageDeclarationNotFirst
-                    | PackageParseErrorKind::DuplicateDeclaration(_)
-                    | PackageParseErrorKind::InvalidPackageIdentity(_)
-                    | PackageParseErrorKind::InvalidPackageVersion(_)
-                    | PackageParseErrorKind::InvalidContentPath(_)
-                    | PackageParseErrorKind::InvalidDependencyPath(_)
-                    | PackageParseErrorKind::InvalidRepositoryDirectory(_)
-                    | PackageParseErrorKind::ConflictingLintLevel
-                    | PackageParseErrorKind::InvalidVersionRequirement(_) => None,
-                }),
-        );
-        refusals
+    pub(crate) fn refusals(&self) -> &[PackageRefusal] {
+        &self.refusals
     }
+}
+
+fn classify_refusals(lexed: &PackageLexOutput, parsed: &PackageParseOutput) -> Vec<PackageRefusal> {
+    let mut refusals = lexed
+        .errors
+        .iter()
+        .map(|_| PackageRefusal::Lexical)
+        .collect::<Vec<_>>();
+    refusals.extend(
+        parsed
+            .errors()
+            .iter()
+            .filter_map(|error| match &error.kind {
+                PackageParseErrorKind::UnknownDeclaration { .. }
+                | PackageParseErrorKind::UnknownArtifactKind(_)
+                | PackageParseErrorKind::ExpectedToken(_)
+                | PackageParseErrorKind::ExpectedListSeparator(_)
+                | PackageParseErrorKind::ExpectedDeclaration
+                | PackageParseErrorKind::ExpectedProfileItem => Some(PackageRefusal::Grammar),
+                PackageParseErrorKind::ManifestTooLarge => Some(PackageRefusal::ParserLimit),
+                PackageParseErrorKind::MissingPackageDeclaration
+                | PackageParseErrorKind::PackageDeclarationNotFirst
+                | PackageParseErrorKind::DuplicateDeclaration(_)
+                | PackageParseErrorKind::InvalidPackageIdentity(_)
+                | PackageParseErrorKind::InvalidPackageVersion(_)
+                | PackageParseErrorKind::InvalidContentPath(_)
+                | PackageParseErrorKind::InvalidDependencyPath(_)
+                | PackageParseErrorKind::InvalidRepositoryDirectory(_)
+                | PackageParseErrorKind::ConflictingLintLevel
+                | PackageParseErrorKind::InvalidVersionRequirement(_) => None,
+            }),
+    );
+    refusals
 }
 
 impl AttachedComment {
