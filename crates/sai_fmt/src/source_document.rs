@@ -590,6 +590,187 @@ fn for_expression_document(
     Ok(Doc::concat(documents))
 }
 
+fn closure_parameter_document(
+    source: &ParsedSource,
+    parameter: ast::ClosureParam,
+) -> Result<Doc, SourceDocumentError> {
+    let name = parameter
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let ty = parameter.ty();
+    let mutable = direct_token_kinds(parameter.syntax()).contains(&SyntaxKind::VAR_KW);
+    let mut expected_tokens = Vec::with_capacity(2);
+    if mutable {
+        expected_tokens.push(SyntaxKind::VAR_KW);
+    }
+    if ty.is_some() {
+        expected_tokens.push(SyntaxKind::COLON);
+    }
+    if parameter.syntax().children().count() != 1 + usize::from(ty.is_some())
+        || direct_token_kinds(parameter.syntax()) != expected_tokens
+        || name.syntax().children().count() != 0
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let token = name.token().ok_or(SourceDocumentError::UnsupportedShape)?;
+    if direct_token_kinds(name.syntax()) != [token.kind()] {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = Vec::with_capacity(4);
+    match token.kind() {
+        SyntaxKind::UNDERSCORE if !mutable && ty.is_none() => {
+            return Ok(Doc::text("_"));
+        }
+        SyntaxKind::LIDENT => {
+            if mutable {
+                documents.push(Doc::text("var "));
+            }
+            documents.push(Doc::text(node_text(source, name.syntax())));
+        }
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    }
+    if let Some(ty) = ty {
+        documents.extend([Doc::text(": "), type_document(source, &ty)?]);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn closure_parameter_list_document(
+    source: &ParsedSource,
+    parameters: &ast::ClosureParamList,
+) -> Result<Doc, SourceDocumentError> {
+    let params = parameters.params().collect::<Vec<_>>();
+    if parameters.syntax().children().count() != params.len()
+        || !comma_delimited_tokens_match(
+            parameters.syntax(),
+            SyntaxKind::L_PAREN,
+            SyntaxKind::R_PAREN,
+            params.len(),
+        )
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let documents = params
+        .into_iter()
+        .map(|parameter| closure_parameter_document(source, parameter))
+        .collect::<Result<Vec<_>, _>>()?;
+    let group = GroupId(parameters.syntax().text_range().start().raw());
+    Ok(delimited_list_document(group, "(", ")", documents, false))
+}
+
+fn closure_header_document(
+    source: &ParsedSource,
+    closure: &ast::ClosureExpr,
+) -> Result<Doc, SourceDocumentError> {
+    let parameters = closure
+        .params()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let return_type = closure.ret_type();
+    let body = closure
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let tokens = direct_token_kinds(closure.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let move_prefix = match tokens.as_slice() {
+        [SyntaxKind::FN_KW] => "",
+        [SyntaxKind::MOVE_KW, SyntaxKind::FN_KW] => "move ",
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    if closure.syntax().children().count() != 2 + usize::from(return_type.is_some()) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![
+        Doc::text(move_prefix),
+        Doc::text("fn"),
+        closure_parameter_list_document(source, &parameters)?,
+    ];
+    if let Some(return_type) = return_type {
+        let ty = return_type
+            .ty()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        if return_type.syntax().children().count() != 1
+            || direct_token_kinds(return_type.syntax()) != [SyntaxKind::THIN_ARROW]
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.extend([Doc::text(" -> "), type_document(source, &ty)?]);
+    }
+    if body.syntax().kind() != SyntaxKind::BLOCK {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn closure_expression_document(
+    source: &ParsedSource,
+    closure: &ast::ClosureExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let body = closure
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let header = closure_header_document(source, closure)?;
+    let broken_block = block_document(source, &body, expression_group_ids)?;
+    let statements = body.statements().collect::<Vec<_>>();
+    if let [Stmt::Expr(statement)] = statements.as_slice() {
+        let flat_statement =
+            statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
+        if flat_document_width(&header).is_some() && flat_document_width(&flat_statement).is_some()
+        {
+            return Ok(Doc::choice([
+                Doc::concat([
+                    Doc::flat(first_choice_layout(&header)),
+                    Doc::text(" { "),
+                    Doc::flat(first_choice_layout(&flat_statement)),
+                    Doc::text(" }"),
+                ]),
+                Doc::concat([header, Doc::text(" "), broken_block]),
+            ]));
+        }
+    }
+    Ok(Doc::concat([header, Doc::text(" "), broken_block]))
+}
+
+fn closure_body_forces_break(
+    source: &ParsedSource,
+    closure: &ast::ClosureExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<bool, SourceDocumentError> {
+    let body = closure
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let statements = body.statements().collect::<Vec<_>>();
+    if statements.is_empty() {
+        return Ok(false);
+    }
+    if let [Stmt::Expr(statement)] = statements.as_slice() {
+        let document =
+            statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
+        return Ok(flat_document_width(&document).is_none());
+    }
+    Ok(true)
+}
+
+fn call_arguments_force_member_chain_break(
+    source: &ParsedSource,
+    arguments: &ast::ArgList,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<bool, SourceDocumentError> {
+    for closure in arguments
+        .syntax()
+        .descendants()
+        .filter_map(ast::ClosureExpr::cast)
+    {
+        if closure_body_forces_break(source, &closure, expression_group_ids)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn async_block_expression_document(
     source: &ParsedSource,
     async_block: &ast::AsyncBlockExpr,
@@ -1213,6 +1394,9 @@ fn expression_document(
             while_expression_document(source, while_expr, expression_group_ids)
         }
         Expr::For(for_expr) => for_expression_document(source, for_expr, expression_group_ids),
+        Expr::Closure(closure) => {
+            closure_expression_document(source, closure, expression_group_ids)
+        }
         Expr::Region(region_expr) => {
             region_expression_document(source, region_expr, expression_group_ids)
         }
@@ -1821,6 +2005,7 @@ fn member_chain_document(
     struct Operation {
         kind: OperationKind,
         document: Doc,
+        forces_chain_break: bool,
     }
 
     let mut head = expression.clone();
@@ -1846,6 +2031,11 @@ fn member_chain_document(
                 {
                     return Err(SourceDocumentError::UnsupportedShape);
                 }
+                let forces_chain_break = call_arguments_force_member_chain_break(
+                    source,
+                    &arguments,
+                    expression_group_ids,
+                )?;
                 reverse_operations.push(Operation {
                     kind: if joins_previous {
                         OperationKind::JoinPrevious
@@ -1856,6 +2046,7 @@ fn member_chain_document(
                         field_suffix_document(source, &field)?,
                         call_arguments_document(source, &arguments, expression_group_ids)?,
                     ]),
+                    forces_chain_break,
                 });
                 head = base;
             }
@@ -1870,6 +2061,7 @@ fn member_chain_document(
                 reverse_operations.push(Operation {
                     kind,
                     document: field_suffix_document(source, field)?,
+                    forces_chain_break: false,
                 });
                 head = base;
             }
@@ -1880,6 +2072,7 @@ fn member_chain_document(
                 reverse_operations.push(Operation {
                     kind: OperationKind::AwaitSegment,
                     document: await_suffix_document(await_expr)?,
+                    forces_chain_break: false,
                 });
                 head = operand;
             }
@@ -1890,6 +2083,7 @@ fn member_chain_document(
                 reverse_operations.push(Operation {
                     kind: OperationKind::TupleIndexSegment,
                     document: tuple_index_suffix_document(tuple_index)?,
+                    forces_chain_break: false,
                 });
                 head = base;
             }
@@ -1900,6 +2094,7 @@ fn member_chain_document(
                 reverse_operations.push(Operation {
                     kind: OperationKind::AttachPrevious,
                     document: index_suffix_document(source, index_expr, expression_group_ids)?,
+                    forces_chain_break: false,
                 });
                 head = base;
             }
@@ -1910,6 +2105,7 @@ fn member_chain_document(
                 reverse_operations.push(Operation {
                     kind: OperationKind::AttachPrevious,
                     document: try_suffix_document(try_expr)?,
+                    forces_chain_break: false,
                 });
                 head = operand;
             }
@@ -1944,9 +2140,48 @@ fn member_chain_document(
     } else {
         first_call_segment
     };
+    let last_segment = reverse_operations
+        .iter()
+        .enumerate()
+        .rfind(|(_, operation)| {
+            matches!(
+                operation.kind,
+                OperationKind::Segment
+                    | OperationKind::CallSegment
+                    | OperationKind::AwaitSegment
+                    | OperationKind::TupleIndexSegment
+            )
+        })
+        .map(|(index, _)| index)
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let head_forces_chain_break = head
+        .syntax()
+        .descendants()
+        .filter_map(ast::ClosureExpr::cast)
+        .try_fold(false, |found, closure| {
+            if found {
+                Ok(true)
+            } else {
+                closure_body_forces_break(source, &closure, expression_group_ids)
+            }
+        })?;
     let mut head_suffixes = Vec::new();
     let mut segments = Vec::with_capacity(reverse_operations.len() - first_segment);
+    let mut active_segment = None;
+    let mut force_chain_break = head_forces_chain_break;
     for (index, operation) in reverse_operations.into_iter().enumerate() {
+        if matches!(
+            operation.kind,
+            OperationKind::Segment
+                | OperationKind::CallSegment
+                | OperationKind::AwaitSegment
+                | OperationKind::TupleIndexSegment
+        ) {
+            active_segment = Some(index);
+        }
+        if operation.forces_chain_break && active_segment != Some(last_segment) {
+            force_chain_break = true;
+        }
         if index < first_segment {
             head_suffixes.push(operation.document);
             continue;
@@ -1976,15 +2211,21 @@ fn member_chain_document(
     )?];
     chain.extend(head_suffixes);
     let mut suffixes = Vec::with_capacity(segments.len() * 2);
+    let chain_group = expression_group_ids.next();
     for segment in segments {
-        suffixes.push(Doc::SoftLine);
-        suffixes.push(segment);
+        suffixes.push(Doc::indent(if force_chain_break {
+            Doc::HardLine
+        } else {
+            Doc::SoftLine
+        }));
+        suffixes.push(Doc::if_broken(
+            chain_group,
+            Doc::indent(segment.clone()),
+            segment,
+        ));
     }
-    chain.push(Doc::indent(Doc::concat(suffixes)));
-    Ok(Some(Doc::group(
-        expression_group_ids.next(),
-        Doc::concat(chain),
-    )))
+    chain.push(Doc::concat(suffixes));
+    Ok(Some(Doc::group(chain_group, Doc::concat(chain))))
 }
 
 fn field_suffix_document(
@@ -2013,6 +2254,7 @@ fn call_arguments_document(
     let argument_count = arguments.syntax().children().count();
     let mut documents = Vec::with_capacity(argument_count);
     let mut has_trailing_record_update = false;
+    let mut final_closure = None;
     for node in arguments.syntax().children() {
         if has_trailing_record_update {
             return Err(SourceDocumentError::UnsupportedShape);
@@ -2028,6 +2270,10 @@ fn call_arguments_document(
                 {
                     return Err(SourceDocumentError::UnsupportedShape);
                 }
+                final_closure = match &expression {
+                    Expr::Closure(closure) => Some((Doc::text(""), closure.clone())),
+                    _ => None,
+                };
                 expression_document(
                     source,
                     &expression,
@@ -2049,9 +2295,14 @@ fn call_arguments_document(
                 {
                     return Err(SourceDocumentError::UnsupportedShape);
                 }
+                let prefix =
+                    Doc::concat([Doc::text(node_text(source, name.syntax())), Doc::text(": ")]);
+                final_closure = match &expression {
+                    Expr::Closure(closure) => Some((prefix.clone(), closure.clone())),
+                    _ => None,
+                };
                 Doc::concat([
-                    Doc::text(node_text(source, name.syntax())),
-                    Doc::text(": "),
+                    prefix,
                     expression_document(
                         source,
                         &expression,
@@ -2072,6 +2323,7 @@ fn call_arguments_document(
                     return Err(SourceDocumentError::UnsupportedShape);
                 }
                 has_trailing_record_update = true;
+                final_closure = None;
                 Doc::concat([
                     Doc::text(".."),
                     expression_document(
@@ -2112,7 +2364,7 @@ fn call_arguments_document(
             contents.push(Doc::if_broken(group, Doc::text(","), Doc::text("")));
         }
     }
-    Ok(Doc::group(
+    let ordinary = Doc::group(
         group,
         Doc::concat([
             Doc::text("("),
@@ -2120,7 +2372,47 @@ fn call_arguments_document(
             Doc::SoftLine,
             Doc::text(")"),
         ]),
-    ))
+    );
+    let Some((closure_prefix, closure)) = final_closure else {
+        return Ok(ordinary);
+    };
+
+    let mut alternatives = Vec::with_capacity(3);
+    if flat_document_width(&ordinary).is_some() {
+        alternatives.push(Doc::flat(first_choice_layout(&ordinary)));
+    }
+
+    let closure_header = closure_header_document(source, &closure)?;
+    let closure_body = closure
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if flat_document_width(&closure_header).is_some()
+        && documents[..documents.len() - 1]
+            .iter()
+            .all(|(document, _)| flat_document_width(document).is_some())
+    {
+        let closure_body = block_document(source, &closure_body, expression_group_ids)?;
+        let mut hugged = vec![Doc::text("(")];
+        for (index, (document, _)) in documents[..documents.len() - 1].iter().enumerate() {
+            if index > 0 {
+                hugged.push(Doc::text(", "));
+            }
+            hugged.push(Doc::flat(first_choice_layout(document)));
+        }
+        if documents.len() > 1 {
+            hugged.push(Doc::text(", "));
+        }
+        hugged.extend([
+            closure_prefix,
+            Doc::flat(first_choice_layout(&closure_header)),
+            Doc::text(" "),
+            closure_body,
+            Doc::text(")"),
+        ]);
+        alternatives.push(Doc::concat(hugged));
+    }
+    alternatives.push(ordinary);
+    Ok(Doc::choice(alternatives))
 }
 
 fn generic_params_document(
@@ -4439,6 +4731,176 @@ mod tests {
     fn keeps_while_let_conditions_with_unsupported_patterns_fail_closed() {
         assert_eq!(
             format_shape(b"fn f(){while let (left,right)=pair {consume(left)}}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn formats_closures_with_supported_parameters_and_body_layouts() {
+        for (input, expected) in [
+            (
+                b"fn f(){fn(x){x+1}}".as_slice(),
+                "fn f() {\n    fn(x) { x + 1 }\n}\n",
+            ),
+            (
+                b"fn f(){move fn(var value:I32,other:Str)->I32{value}}".as_slice(),
+                "fn f() {\n    move fn(var value: I32, other: Str) -> I32 { value }\n}\n",
+            ),
+            (b"fn f(){fn(){}}", "fn f() {\n    fn() {}\n}\n"),
+            (
+                b"fn f(){consume(fn(value){value})}".as_slice(),
+                "fn f() {\n    consume(fn(value) { value })\n}\n",
+            ),
+            (
+                b"fn f(){fn(x){let y=x\ny}}".as_slice(),
+                "fn f() {\n    fn(x) {\n        let y = x\n        y\n    }\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("closure expression parses");
+            let output = format_shape(input).expect("closure expression is supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted closure parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn breaks_a_long_single_expression_closure_body() {
+        let left = format!("left_{}", "a".repeat(43));
+        let right = format!("right_{}", "b".repeat(42));
+        let input = format!("fn f(){{fn(x){{{left} and {right}}}}}");
+        let expected = format!(
+            "fn f() {{\n    fn(x) {{\n        (\n            {left}\n            and {right}\n        )\n    }}\n}}\n"
+        );
+
+        parse_source(input.as_bytes()).expect("long closure body parses");
+        let output = format_shape(input.as_bytes()).expect("long closure body formats");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        parse_source(output.as_bytes()).expect("broken closure body reparses");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn hugs_a_broken_last_closure_argument_to_the_call_line() {
+        let input = b"fn f(){collect(items,fn(x){let y=x\ny})}";
+        let expected =
+            "fn f() {\n    collect(items, fn(x) {\n        let y = x\n        y\n    })\n}\n";
+        let parsed = parse_source(input).expect("hugged closure argument parses");
+        let output = format_shape(input).expect("hugged closure argument formats");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("hugged closure reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn hugs_a_single_expression_closure_when_only_its_body_breaks() {
+        let left = format!("left_{}", "a".repeat(43));
+        let right = format!("right_{}", "b".repeat(42));
+        let input = format!("fn f(){{collect(items,fn(x){{{left} and {right}}})}}");
+        let expected = format!(
+            "fn f() {{\n    collect(items, fn(x) {{\n        (\n            {left}\n            and {right}\n        )\n    }})\n}}\n"
+        );
+
+        parse_source(input.as_bytes()).expect("long closure argument parses");
+        let output = format_shape(input.as_bytes()).expect("long closure argument formats");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        parse_source(output.as_bytes()).expect("hugged long closure reparses");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn hugs_a_named_last_closure_argument_but_not_an_earlier_one() {
+        for (input, expected) in [
+            (
+                b"fn f(){collect(items,callback:fn(x){let y=x\ny})}".as_slice(),
+                "fn f() {\n    collect(items, callback: fn(x) {\n        let y = x\n        y\n    })\n}\n",
+            ),
+            (
+                b"fn f(){collect(fn(x){let y=x\ny},items)}".as_slice(),
+                "fn f() {\n    collect(\n        fn(x) {\n            let y = x\n            y\n        },\n        items,\n    )\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("closure argument parses");
+            let output = format_shape(input).expect("closure argument formats");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted call reparses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn falls_back_to_broken_arguments_when_a_hugged_header_would_overflow() {
+        let argument = format!("argument_{}", "a".repeat(90));
+        let input = format!("fn f(){{collect({argument},fn(x){{let y=x\ny}})}}");
+        let expected = format!(
+            "fn f() {{\n    collect(\n        {argument},\n        fn(x) {{\n            let y = x\n            y\n        }},\n    )\n}}\n"
+        );
+
+        parse_source(input.as_bytes()).expect("overlong call head parses");
+        let output = format_shape(input.as_bytes()).expect("overlong call head formats");
+        assert_eq!(output, expected);
+        parse_source(output.as_bytes()).expect("broken closure argument reparses");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn forces_member_chain_breaks_for_a_multiline_nonfinal_closure() {
+        let input = b"fn f(){items.map(fn(x){let y=x\ny}).filter(fn(y){y>0})}";
+        let expected = "fn f() {\n    items\n        .map(fn(x) {\n            let y = x\n            y\n        })\n        .filter(fn(y) { y > 0 })\n}\n";
+        let parsed = parse_source(input).expect("closure member chain parses");
+        let output = format_shape(input).expect("closure member chain formats");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted member chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn does_not_force_member_chain_breaks_for_a_multiline_final_closure() {
+        let input = b"fn f(){items.map(fn(x){x+1}).filter(fn(y){let z=y\nz})}";
+        let expected = "fn f() {\n    items.map(fn(x) { x + 1 }).filter(fn(y) {\n        let z = y\n        z\n    })\n}\n";
+        let parsed = parse_source(input).expect("final closure member chain parses");
+        let output = format_shape(input).expect("final closure member chain formats");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted chain reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn forces_member_chain_breaks_for_a_multiline_closure_in_the_head_call() {
+        let input = b"fn f(){factory(fn(x){let y=x\ny}).first().second()}";
+        let expected = "fn f() {\n    factory(fn(x) {\n        let y = x\n        y\n    })\n        .first()\n        .second()\n}\n";
+        let parsed = parse_source(input).expect("head closure member chain parses");
+        let output = format_shape(input).expect("head closure member chain formats");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted head chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn forces_parenthesized_head_member_chains_for_a_multiline_closure() {
+        let input = b"fn f(){(factory(fn(x){let y=x\ny})).first().second()}";
+        let expected = "fn f() {\n    (factory(fn(x) {\n            let y = x\n            y\n        }))\n        .first()\n        .second()\n}\n";
+        let parsed = parse_source(input).expect("parenthesized head closure chain parses");
+        let output = format_shape(input).expect("parenthesized head closure chain formats");
+        assert_eq!(output, expected);
+        let reparsed =
+            parse_source(output.as_bytes()).expect("formatted parenthesized chain reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn keeps_malformed_closure_parameters_fail_closed() {
+        assert_eq!(
+            format_shape(b"fn f(){fn(var _){}}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
