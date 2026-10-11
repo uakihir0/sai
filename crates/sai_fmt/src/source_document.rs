@@ -46,6 +46,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             }
             Item::Distinct(declaration) => distinct_decl_document(source, &declaration)?,
             Item::Enum(declaration) => enum_decl_document(source, &declaration)?,
+            Item::Resource(declaration) => resource_decl_document(source, &declaration)?,
             Item::Interface(declaration) => {
                 interface_document(source, &declaration, &mut expression_group_ids)?
             }
@@ -937,6 +938,54 @@ fn distinct_decl_document(
 
     let document = Doc::concat(documents);
     let range = declaration.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn resource_decl_document(
+    source: &ParsedSource,
+    resource: &ast::ResourceDecl,
+) -> Result<ItemDocument, SourceDocumentError> {
+    if resource.docs().is_some() || resource.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let visibility_prefix = visibility_prefix(resource.visibility())?;
+    let name = resource
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let fields = resource.fields();
+    if !has_contextual_token(source, resource.syntax(), "resource")?
+        || resource
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(resource
+                .visibility()
+                .map(|visibility| visibility.syntax().text_range())
+                .into_iter()
+                .chain([name.syntax().text_range()])
+                .chain(fields.as_ref().map(|fields| fields.syntax().text_range())))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = vec![Doc::text(format!(
+        "{visibility_prefix}resource {}",
+        node_text(source, name.syntax())
+    ))];
+    if let Some(fields) = fields {
+        documents.extend([Doc::text(" "), record_fields_document(source, &fields)?]);
+    }
+    let document = Doc::concat(documents);
+    let range = resource.syntax().text_range();
     let multiline = crate::print(&document)
         .map_err(|_| SourceDocumentError::UnsupportedShape)?
         .trim_end_matches('\n')
@@ -6025,6 +6074,33 @@ mod tests {
     }
 
     #[test]
+    fn formats_top_level_resources_with_optional_field_lists() {
+        let input = concat!(
+            "pub resource File{pub name:Str\n",
+            "\n",
+            "owner:U32}\n",
+            "resource Empty{}\n",
+            "resource Opaque\n",
+        );
+        let expected = concat!(
+            "pub resource File {\n",
+            "    pub name: Str\n",
+            "\n",
+            "    owner: U32\n",
+            "}\n\n",
+            "resource Empty {}\n",
+            "resource Opaque\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("resource declarations parse");
+        let output = format_shape(input.as_bytes()).expect("resource declarations format");
+
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted resources reparse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn keeps_unhandled_type_declarations_fail_closed() {
         assert_eq!(
             format_shape(b"type Positive = I32 where self > 0"),
@@ -6044,6 +6120,14 @@ mod tests {
         );
         assert_eq!(
             format_shape(b"type Point { @allow(UNUSED_IMPORTS) x: I32 }"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"@allow(UNUSED_IMPORTS) resource Handle"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"/// A resource.\nresource Handle"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
