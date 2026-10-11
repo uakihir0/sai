@@ -44,13 +44,17 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             Item::Trait(declaration) => {
                 trait_document(source, &declaration, &mut expression_group_ids)?
             }
-            Item::Distinct(declaration) => distinct_decl_document(source, &declaration)?,
+            Item::Distinct(declaration) => {
+                distinct_decl_document(source, &declaration, &mut expression_group_ids)?
+            }
             Item::Enum(declaration) => enum_decl_document(source, &declaration)?,
             Item::Resource(declaration) => resource_decl_document(source, &declaration)?,
             Item::Interface(declaration) => {
                 interface_document(source, &declaration, &mut expression_group_ids)?
             }
-            Item::Type(declaration) => type_decl_document(source, &declaration)?,
+            Item::Type(declaration) => {
+                type_decl_document(source, &declaration, &mut expression_group_ids)?
+            }
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
         units.push(unit);
@@ -645,6 +649,7 @@ fn interface_document(
             SyntaxKind::TYPE_DECL => type_decl_document(
                 source,
                 &ast::TypeDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+                expression_group_ids,
             ),
             SyntaxKind::ENUM_DECL => enum_decl_document(
                 source,
@@ -735,6 +740,7 @@ fn iface_resource_document(
 fn type_decl_document(
     source: &ParsedSource,
     declaration: &ast::TypeDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<ItemDocument, SourceDocumentError> {
     if declaration.docs().is_some() || declaration.attrs().next().is_some() {
         return Err(SourceDocumentError::UnsupportedShape);
@@ -788,14 +794,17 @@ fn type_decl_document(
 
     if let Some(alias) = alias_def {
         let ty = alias.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
-        if alias.refinement().is_some()
-            || alias.syntax().children().count() != 1
-            || alias
-                .syntax()
-                .children()
-                .next()
-                .map(|child| child.text_range())
-                != Some(ty.syntax().text_range())
+        let refinement = alias.refinement();
+        let expected_alias_children = std::iter::once(ty.syntax().text_range()).chain(
+            refinement
+                .as_ref()
+                .map(|clause| clause.syntax().text_range()),
+        );
+        if alias
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(expected_alias_children)
             || direct_token_kinds(alias.syntax())
                 .into_iter()
                 .filter(|kind| *kind != SyntaxKind::NEWLINE)
@@ -804,10 +813,16 @@ fn type_decl_document(
         {
             return Err(SourceDocumentError::UnsupportedShape);
         }
-        documents.extend([
-            Doc::text(" ="),
-            movable_right_hand_side_document(type_document(source, &ty)?, true, None),
-        ]);
+        let rhs = type_document(source, &ty)?;
+        let rhs = if let Some(refinement) = refinement {
+            refined_right_hand_side_document(
+                rhs,
+                refinement_clause_document(source, &refinement, expression_group_ids)?,
+            )
+        } else {
+            movable_right_hand_side_document(rhs, true, None)
+        };
+        documents.extend([Doc::text(" ="), rhs]);
     } else if let Some(struct_def) = struct_def {
         let where_clause = struct_def.where_clause();
         let fields = struct_def
@@ -860,11 +875,9 @@ fn type_decl_document(
 fn distinct_decl_document(
     source: &ParsedSource,
     declaration: &ast::DistinctDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<ItemDocument, SourceDocumentError> {
-    if declaration.docs().is_some()
-        || declaration.attrs().next().is_some()
-        || declaration.refinement().is_some()
-    {
+    if declaration.docs().is_some() || declaration.attrs().next().is_some() {
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let visibility_prefix = visibility_prefix(declaration.visibility())?;
@@ -875,6 +888,7 @@ fn distinct_decl_document(
     let base_type = declaration
         .base_type()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let refinement = declaration.refinement();
     let inner_pub = declaration.inner_pub_token();
     let expected_children = declaration
         .visibility()
@@ -886,7 +900,12 @@ fn distinct_decl_document(
                 .as_ref()
                 .map(|params| params.syntax().text_range()),
         )
-        .chain([base_type.syntax().text_range()]);
+        .chain([base_type.syntax().text_range()])
+        .chain(
+            refinement
+                .as_ref()
+                .map(|clause| clause.syntax().text_range()),
+        );
     let direct_tokens = declaration
         .syntax()
         .children_with_tokens()
@@ -931,10 +950,16 @@ fn distinct_decl_document(
         rhs.push(Doc::text("pub "));
     }
     rhs.push(type_document(source, &base_type)?);
-    documents.extend([
-        Doc::text(" ="),
-        movable_right_hand_side_document(Doc::concat(rhs), true, None),
-    ]);
+    let rhs = Doc::concat(rhs);
+    let rhs = if let Some(refinement) = refinement {
+        refined_right_hand_side_document(
+            rhs,
+            refinement_clause_document(source, &refinement, expression_group_ids)?,
+        )
+    } else {
+        movable_right_hand_side_document(rhs, true, None)
+    };
+    documents.extend([Doc::text(" ="), rhs]);
 
     let document = Doc::concat(documents);
     let range = declaration.syntax().text_range();
@@ -996,6 +1021,38 @@ fn resource_decl_document(
         end: range.end().to_usize(),
         multiline,
     })
+}
+
+fn refinement_clause_document(
+    source: &ParsedSource,
+    refinement: &ast::RefinementClause,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let expression = refinement
+        .expression()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if refinement
+        .syntax()
+        .children()
+        .map(|child| child.text_range())
+        .ne([expression.syntax().text_range()])
+        || direct_token_kinds(refinement.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::WHERE_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat([
+        Doc::text("where "),
+        expression_document(
+            source,
+            &expression,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?,
+    ]))
 }
 
 fn record_fields_document(
@@ -3211,6 +3268,45 @@ fn movable_right_hand_side_document(document: Doc, allow_move: bool, suffix: Opt
     }
     alternatives.push(with_suffix(vec![Doc::text(" "), document]));
     Doc::choice(alternatives)
+}
+
+fn refined_right_hand_side_document(document: Doc, refinement: Doc) -> Doc {
+    let same_line = Doc::concat([
+        Doc::text(" "),
+        Doc::flat(document.clone()),
+        Doc::text(" "),
+        Doc::flat(refinement.clone()),
+    ]);
+    let same_type_moved_refinement = Doc::concat([
+        Doc::text(" "),
+        Doc::flat(document.clone()),
+        Doc::indent(Doc::concat([Doc::HardLine, refinement.clone()])),
+    ]);
+    let moved_type_moved_refinement = Doc::indent(Doc::concat([
+        Doc::HardLine,
+        Doc::flat(document.clone()),
+        Doc::HardLine,
+        refinement.clone(),
+    ]));
+    let same_line_broken = Doc::concat([
+        Doc::text(" "),
+        document.clone(),
+        Doc::indent(Doc::concat([Doc::HardLine, refinement.clone()])),
+    ]);
+    let moved_broken = Doc::indent(Doc::concat([
+        Doc::HardLine,
+        document.clone(),
+        Doc::HardLine,
+        refinement.clone(),
+    ]));
+    Doc::choice([
+        same_line,
+        same_type_moved_refinement,
+        moved_type_moved_refinement,
+        same_line_broken.clone(),
+        moved_broken,
+        same_line_broken,
+    ])
 }
 
 fn where_clause_document(
@@ -6059,6 +6155,186 @@ mod tests {
     }
 
     #[test]
+    fn formats_refined_aliases_and_distinct_types() {
+        let input = concat!(
+            "type Percentage=I32\n",
+            "where self>=0 and self<=100\n",
+            "type TrimmedLabel=Str where self.len()>0 and not self.starts_with(\" \") and not self.ends_with(\" \")\n",
+            "type RefinedAlias<T>=T where self==self\n",
+            "distinct Age=U8 where self<=150\n",
+            "pub distinct Money=pub I64 where self>=0\n",
+            "distinct Refined<T>=T where self==self\n",
+        );
+        let expected = concat!(
+            "type Percentage = I32 where self >= 0 and self <= 100\n",
+            "\n",
+            "type TrimmedLabel = Str\n",
+            "    where self.len() > 0 and not self.starts_with(\" \") and not self.ends_with(\" \")\n",
+            "\n",
+            "type RefinedAlias<T> = T where self == self\n",
+            "distinct Age = U8 where self <= 150\n",
+            "pub distinct Money = pub I64 where self >= 0\n",
+            "distinct Refined<T> = T where self == self\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("refined declarations parse");
+        let output = format_shape(input.as_bytes()).expect("refined declarations format");
+
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted refinements reparse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn moves_long_refined_bases_and_separates_following_items() {
+        let base_type = "BaseType".repeat(11);
+        let input =
+            format!("distinct Measurement = {base_type} where self > 0\nfn following() {{}}\n");
+        let expected = format!(
+            "distinct Measurement =\n    {base_type}\n    where self > 0\n\nfn following() {{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("long refined base parses");
+        let output = format_shape(input.as_bytes()).expect("long refined base formats");
+
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted refined base reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn keeps_refinement_on_the_line_at_the_width_limit() {
+        let exact_name = "A".repeat(70);
+        let exact_input = format!("type {exact_name} = I32 where self == self\n");
+        let exact_output = format_shape(exact_input.as_bytes()).expect("exact-width alias formats");
+        let exact_line = exact_output.lines().next().expect("formatted alias line");
+
+        assert_eq!(exact_line.chars().count(), 100);
+        assert_eq!(exact_output, exact_input);
+        assert_eq!(
+            format_shape(exact_output.as_bytes()),
+            Ok(exact_output.clone())
+        );
+
+        let over_name = "A".repeat(71);
+        let over_input = format!("type {over_name} = I32 where self == self\n");
+        let over_expected = format!("type {over_name} = I32\n    where self == self\n");
+        let over_output = format_shape(over_input.as_bytes()).expect("over-width alias formats");
+
+        assert_eq!(over_output, over_expected);
+        assert!(over_output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(over_output.as_bytes()).expect("formatted alias reparses");
+        assert_eq!(
+            syntax_shape(
+                parse_source(over_input.as_bytes())
+                    .expect("over-width alias parses")
+                    .root()
+            ),
+            syntax_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(over_output.as_bytes()), Ok(over_output));
+    }
+
+    #[test]
+    fn formats_refined_alias_syntax_inside_interfaces() {
+        let input = "interface storage { type Entry = Str where self != \"\" }\n";
+        let expected = concat!(
+            "interface storage {\n",
+            "    type Entry = Str where self != \"\"\n",
+            "}\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("interface alias parses");
+        let output = format_shape(input.as_bytes()).expect("interface alias formats");
+
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted interface reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_refined_rhs_before_its_continuation_clause() {
+        let first = "AlphaAlphaAlphaAlphaAlphaAlphaAlphaAlpha";
+        let second = "BravoBravoBravoBravoBravoBravoBravoBravo";
+        let third = "CharlieCharlieCharlieCharlieCharlieCharlie";
+        let tuple_input = format!("type T = ({first}, {second}, {third}) where true\n");
+        let tuple_expected =
+            format!("type T = (\n    {first},\n    {second},\n    {third},\n)\n    where true\n");
+        let tuple_output =
+            format_shape(tuple_input.as_bytes()).expect("broken tuple refinement formats");
+
+        assert_eq!(tuple_output, tuple_expected);
+        let reparsed =
+            parse_source(tuple_output.as_bytes()).expect("formatted tuple refinement reparses");
+        assert_eq!(
+            syntax_shape(
+                parse_source(tuple_input.as_bytes())
+                    .expect("tuple refinement parses")
+                    .root()
+            ),
+            syntax_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(tuple_output.as_bytes()), Ok(tuple_output));
+    }
+
+    #[test]
+    fn moves_broken_refined_rhs_and_allows_unavoidable_overflow() {
+        let long_path = "A".repeat(93);
+        let moved_input = format!("type T = {long_path}<Alpha, Beta> where true\n");
+        let moved_expected = format!(
+            "type T =\n    {long_path}<\n        Alpha,\n        Beta,\n    >\n    where true\n"
+        );
+        let moved_output =
+            format_shape(moved_input.as_bytes()).expect("moved broken refinement formats");
+
+        assert_eq!(moved_output, moved_expected);
+        assert!(moved_output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(moved_output.as_bytes()).expect("moved refinement reparses");
+        assert_eq!(
+            syntax_shape(
+                parse_source(moved_input.as_bytes())
+                    .expect("moved refinement input parses")
+                    .root()
+            ),
+            syntax_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(moved_output.as_bytes()), Ok(moved_output));
+
+        let unbreakable_path = "B".repeat(98);
+        let overflow_input = format!("type T = {unbreakable_path} where true\n");
+        let overflow_expected = format!("type T = {unbreakable_path}\n    where true\n");
+        let overflow_output =
+            format_shape(overflow_input.as_bytes()).expect("unbreakable refinement formats");
+
+        assert_eq!(overflow_output, overflow_expected);
+        assert_eq!(
+            overflow_output
+                .lines()
+                .next()
+                .expect("formatted declaration line")
+                .chars()
+                .count(),
+            107
+        );
+        let reparsed =
+            parse_source(overflow_output.as_bytes()).expect("overflow refinement reparses");
+        assert_eq!(
+            syntax_shape(
+                parse_source(overflow_input.as_bytes())
+                    .expect("overflow refinement input parses")
+                    .root()
+            ),
+            syntax_shape(reparsed.root())
+        );
+        assert_eq!(
+            format_shape(overflow_output.as_bytes()),
+            Ok(overflow_output)
+        );
+    }
+
+    #[test]
     fn moves_long_distinct_bases_and_separates_following_items() {
         let base_type = "BaseType".repeat(11);
         let input = format!("distinct T = {base_type}\nfn following() {{}}\n");
@@ -6102,14 +6378,6 @@ mod tests {
 
     #[test]
     fn keeps_unhandled_type_declarations_fail_closed() {
-        assert_eq!(
-            format_shape(b"type Positive = I32 where self > 0"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
-            format_shape(b"distinct Positive = I32 where self > 0"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
         assert_eq!(
             format_shape(b"@allow(UNUSED_IMPORTS) type Scalar = U32"),
             Err(SourceDocumentError::UnsupportedShape)
