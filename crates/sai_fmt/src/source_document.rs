@@ -109,7 +109,6 @@ fn function_document(
         || function.unsafe_token().is_some()
         || function.async_token().is_some()
         || function.generic_params().is_some()
-        || function.ret_type().is_some()
         || function.where_clause().is_some()
         || function.borrows_clause().is_some()
         || function.effects_clause().is_some()
@@ -122,6 +121,17 @@ fn function_document(
         .params()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let parameters = parameter_list_document(source, &params)?;
+    let return_type = function
+        .ret_type()
+        .map(|return_type| {
+            let ty = return_type
+                .ty()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            simple_path_type_text(source, &ty)
+        })
+        .transpose()?
+        .map(|type_name| Doc::text(format!(" -> {type_name}")))
+        .unwrap_or_else(|| Doc::text(""));
     let block = function
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -208,6 +218,7 @@ fn function_document(
     let document = Doc::concat([
         Doc::text(format!("fn {name}")),
         parameters,
+        return_type,
         Doc::text(" "),
         body,
     ]);
@@ -262,11 +273,23 @@ fn parameter_document(
     source: &ParsedSource,
     param: ast::Param,
 ) -> Result<Doc, SourceDocumentError> {
-    if param.is_mutable() || param.attrs().next().is_some() {
+    if param.attrs().next().is_some() {
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let name = param.name().ok_or(SourceDocumentError::UnsupportedShape)?;
     let ty = param.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let type_name = simple_path_type_text(source, &ty)?;
+    let mutable = if param.is_mutable() { "var " } else { "" };
+    Ok(Doc::text(format!(
+        "{mutable}{}: {type_name}",
+        node_text(source, name.syntax())
+    )))
+}
+
+fn simple_path_type_text<'a>(
+    source: &'a ParsedSource,
+    ty: &ast::Type,
+) -> Result<&'a str, SourceDocumentError> {
     let ast::Type::PathType(path) = ty else {
         return Err(SourceDocumentError::UnsupportedShape);
     };
@@ -280,11 +303,7 @@ fn parameter_document(
     let type_name = segment
         .name()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    Ok(Doc::text(format!(
-        "{}: {}",
-        node_text(source, name.syntax()),
-        node_text(source, type_name.syntax())
-    )))
+    Ok(node_text(source, type_name.syntax()))
 }
 
 fn node_text<'a>(source: &'a ParsedSource, node: &sai_syntax::SyntaxNode) -> &'a str {
@@ -391,6 +410,39 @@ mod tests {
     }
 
     #[test]
+    fn formats_var_parameters_and_simple_return_types() {
+        let input = b"fn f(var value:I32, _:U32)\n->Bool {}";
+        let expected = "fn f(var value: I32, _: U32) -> Bool {}\n";
+        let parsed_input = parse_source(input).expect("input parses");
+        let output = format_shape(input).expect("simple signature is supported");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted signature parses");
+        assert_eq!(
+            syntax_shape(parsed_input.root()),
+            syntax_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        assert_eq!(
+            format_shape(b"fn f(var _:I32){}"),
+            Ok("fn f(var _: I32) {}\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn return_type_width_can_break_a_parameter_list() {
+        let first = "a".repeat(39);
+        let second = "b".repeat(39);
+        let no_return_type = format!("fn f({first}:I32,{second}:U32){{}}");
+        let flat = format_shape(no_return_type.as_bytes()).expect("flat signature is supported");
+        assert_eq!(flat, format!("fn f({first}: I32, {second}: U32) {{}}\n"));
+        assert!(flat.lines().all(|line| line.chars().count() <= 100));
+
+        let input = format!("fn f({first}:I32,{second}:U32)->Bool{{}}");
+        let expected = format!("fn f(\n    {first}: I32,\n    {second}: U32,\n) -> Bool {{}}\n");
+        assert_eq!(format_shape(input.as_bytes()), Ok(expected));
+    }
+
+    #[test]
     fn supported_output_is_a_fixed_point() {
         let once = format_shape(b"fn f(){let x=1\nx}").expect("supported shape");
         assert_eq!(format_shape(once.as_bytes()), Ok(once));
@@ -479,11 +531,15 @@ mod tests {
     #[test]
     fn unsupported_shapes_and_comments_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f(var a: I32) {}"),
+            format_shape(b"fn f(x: Foo.Bar) {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
             format_shape(b"fn f(a: Vec<I32>) {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f() -> Vec<I32> {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
