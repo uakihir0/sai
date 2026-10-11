@@ -44,6 +44,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             Item::Trait(declaration) => {
                 trait_document(source, &declaration, &mut expression_group_ids)?
             }
+            Item::Distinct(declaration) => distinct_decl_document(source, &declaration)?,
             Item::Enum(declaration) => enum_decl_document(source, &declaration)?,
             Item::Interface(declaration) => {
                 interface_document(source, &declaration, &mut expression_group_ids)?
@@ -840,6 +841,99 @@ fn type_decl_document(
     } else {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+
+    let document = Doc::concat(documents);
+    let range = declaration.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn distinct_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::DistinctDecl,
+) -> Result<ItemDocument, SourceDocumentError> {
+    if declaration.docs().is_some()
+        || declaration.attrs().next().is_some()
+        || declaration.refinement().is_some()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let visibility_prefix = visibility_prefix(declaration.visibility())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let generic_params = declaration.generic_params();
+    let base_type = declaration
+        .base_type()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let inner_pub = declaration.inner_pub_token();
+    let expected_children = declaration
+        .visibility()
+        .map(|visibility| visibility.syntax().text_range())
+        .into_iter()
+        .chain([name.syntax().text_range()])
+        .chain(
+            generic_params
+                .as_ref()
+                .map(|params| params.syntax().text_range()),
+        )
+        .chain([base_type.syntax().text_range()]);
+    let direct_tokens = declaration
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() != SyntaxKind::NEWLINE => Some(token),
+            SyntaxElement::Token(_) | SyntaxElement::Node(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(keyword) = direct_tokens.first() else {
+        return Err(SourceDocumentError::UnsupportedShape);
+    };
+    if keyword.kind() != SyntaxKind::LIDENT || token_text(source, keyword)? != "distinct" {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut expected_tokens = vec![SyntaxKind::LIDENT, SyntaxKind::EQ];
+    if inner_pub.is_some() {
+        expected_tokens.push(SyntaxKind::PUB_KW);
+    }
+    if declaration
+        .syntax()
+        .children()
+        .map(|child| child.text_range())
+        .ne(expected_children)
+        || direct_tokens
+            .iter()
+            .map(|token| token.kind())
+            .collect::<Vec<_>>()
+            != expected_tokens
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = vec![Doc::text(format!(
+        "{visibility_prefix}distinct {}",
+        node_text(source, name.syntax())
+    ))];
+    if let Some(generic_params) = generic_params {
+        documents.push(generic_params_document(source, &generic_params)?);
+    }
+    let mut rhs = Vec::new();
+    if inner_pub.is_some() {
+        rhs.push(Doc::text("pub "));
+    }
+    rhs.push(type_document(source, &base_type)?);
+    documents.extend([
+        Doc::text(" ="),
+        movable_right_hand_side_document(Doc::concat(rhs), true, None),
+    ]);
 
     let document = Doc::concat(documents);
     let range = declaration.syntax().text_range();
@@ -5895,9 +5989,49 @@ mod tests {
     }
 
     #[test]
+    fn formats_top_level_distinct_types_and_inner_visibility() {
+        let input = concat!(
+            "distinct UserId=U64\n",
+            "pub distinct Money<T>=pub I64\n",
+            "distinct Meters<T>=T\n",
+        );
+        let expected = concat!(
+            "distinct UserId = U64\n",
+            "pub distinct Money<T> = pub I64\n",
+            "distinct Meters<T> = T\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("distinct declarations parse");
+        let output = format_shape(input.as_bytes()).expect("distinct declarations format");
+
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted distincts reparse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn moves_long_distinct_bases_and_separates_following_items() {
+        let base_type = "BaseType".repeat(11);
+        let input = format!("distinct T = {base_type}\nfn following() {{}}\n");
+        let expected = format!("distinct T =\n    {base_type}\n\nfn following() {{}}\n");
+        let parsed = parse_source(input.as_bytes()).expect("long distinct base parses");
+        let output = format_shape(input.as_bytes()).expect("long distinct base formats");
+
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted distinct reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn keeps_unhandled_type_declarations_fail_closed() {
         assert_eq!(
             format_shape(b"type Positive = I32 where self > 0"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"distinct Positive = I32 where self > 0"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
