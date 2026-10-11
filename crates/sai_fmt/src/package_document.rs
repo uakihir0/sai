@@ -21,6 +21,204 @@ pub(crate) enum PackageDocumentError {
     UnknownCommentAnchor,
 }
 
+pub(crate) fn package_document(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if !index.matches_input(input) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let declarations = index.declarations();
+    let declaration_lists = declaration_lists(index, declarations)?;
+    let leading_comment_starts = leading_comment_starts(input, declarations)?;
+    let mut document = Vec::with_capacity(declarations.len().saturating_mul(2) + 1);
+    for (position, declaration) in declarations.iter().enumerate() {
+        let start =
+            usize::try_from(declaration.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let first = tokens
+            .get(start)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        if position > 0 {
+            let previous = &declarations[position - 1];
+            let previous_end =
+                usize::try_from(previous.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+            let previous_last = tokens
+                .get(
+                    previous_end
+                        .checked_sub(1)
+                        .ok_or(PackageDocumentError::InvalidEntry)?,
+                )
+                .ok_or(PackageDocumentError::InvalidEntry)?;
+            document.push(Doc::HardLine);
+            let declaration_start = leading_comment_starts[position].unwrap_or(first.span.start);
+            if has_blank_line(input, previous_last.span.end, declaration_start) {
+                document.push(Doc::HardLine);
+            }
+        }
+        document.push(package_declaration_document(
+            input,
+            index,
+            declaration.clone(),
+            declaration_lists[position],
+        )?);
+    }
+
+    let eof_comments = input
+        .comments()
+        .iter()
+        .filter(|comment| comment.attachment() == CommentAttachment::EndOfFile)
+        .collect::<Vec<_>>();
+    if !eof_comments.is_empty() {
+        if let Some(last_declaration) = declarations.last() {
+            let end = usize::try_from(last_declaration.end)
+                .map_err(|_| PackageDocumentError::InvalidEntry)?;
+            let last_token = tokens
+                .get(
+                    end.checked_sub(1)
+                        .ok_or(PackageDocumentError::InvalidEntry)?,
+                )
+                .ok_or(PackageDocumentError::InvalidEntry)?;
+            document.push(Doc::HardLine);
+            if has_blank_line(
+                input,
+                last_token.span.end,
+                input.comment_span(eof_comments[0]).start,
+            ) {
+                document.push(Doc::HardLine);
+            }
+        }
+        for (position, comment) in eof_comments.iter().enumerate() {
+            if position > 0 {
+                document.push(Doc::HardLine);
+                if has_blank_line(
+                    input,
+                    input.comment_span(eof_comments[position - 1]).end,
+                    input.comment_span(comment).start,
+                ) {
+                    document.push(Doc::HardLine);
+                }
+            }
+            document.push(comment_text_doc(input, comment));
+        }
+    }
+    if document.is_empty() {
+        document.push(Doc::HardLine);
+    }
+    Ok(Doc::concat(document))
+}
+
+fn declaration_lists<'a>(
+    index: &'a PackageSyntaxIndex<'_>,
+    declarations: &[Range<u32>],
+) -> Result<Vec<Option<&'a PackageBraceList>>, PackageDocumentError> {
+    let mut declaration_lists = vec![None; declarations.len()];
+    let mut declaration_position = 0;
+    for list in index
+        .brace_lists()
+        .iter()
+        .filter(|list| list.parent_open_token(index).is_none())
+    {
+        while declarations
+            .get(declaration_position)
+            .is_some_and(|declaration| declaration.end <= list.open_token)
+        {
+            declaration_position += 1;
+        }
+        let declaration = declarations
+            .get(declaration_position)
+            .filter(|declaration| declaration.contains(&list.open_token))
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let slot = declaration_lists
+            .get_mut(declaration_position)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        if slot.replace(list).is_some() || declaration.start > list.open_token {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+    }
+    Ok(declaration_lists)
+}
+
+fn leading_comment_starts(
+    input: &PackageInput<'_>,
+    declarations: &[Range<u32>],
+) -> Result<Vec<Option<usize>>, PackageDocumentError> {
+    let mut starts = vec![None; declarations.len()];
+    for comment in input.comments() {
+        let CommentAttachment::Leading(token_index) = comment.attachment() else {
+            continue;
+        };
+        let token_index =
+            u32::try_from(token_index).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let Ok(position) = declarations.binary_search_by_key(&token_index, |range| range.start)
+        else {
+            continue;
+        };
+        if starts[position].is_none() {
+            starts[position] = Some(input.comment_span(comment).start);
+        }
+    }
+    Ok(starts)
+}
+
+fn package_declaration_document(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    declaration: Range<u32>,
+    root_list: Option<&PackageBraceList>,
+) -> Result<Doc, PackageDocumentError> {
+    let start =
+        usize::try_from(declaration.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let end = usize::try_from(declaration.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    if start >= end || end > input.lexed().tokens.len() {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let keyword = input
+        .lexed()
+        .tokens
+        .get(start)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if keyword.kind != PackageTokenKind::Word {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    match token_text(input.source(), keyword) {
+        "package" => package_identity_declaration(input, declaration),
+        "compiler" => compiler_declaration(input, declaration),
+        "source" | "wit" | "description" | "license" | "repository" => {
+            string_declaration(input, declaration)
+        }
+        "allocator" => allocator_declaration(input, declaration),
+        "export" => export_world_declaration(input, declaration),
+        _ => {
+            let list = root_list.ok_or(PackageDocumentError::InvalidEntry)?;
+            match list.owner {
+                PackageBraceOwner::Targets => targets_declaration(input, index, list),
+                PackageBraceOwner::Requires | PackageBraceOwner::RequiresTest => {
+                    requirements_declaration(input, index, list)
+                }
+                PackageBraceOwner::ArtifactComponents => {
+                    artifact_components_declaration(input, index, list)
+                }
+                PackageBraceOwner::Overrides => overrides_declaration(input, index, list),
+                PackageBraceOwner::ProfileBody => profile_declaration(input, index, list),
+                PackageBraceOwner::Allow | PackageBraceOwner::Deny => {
+                    capability_declaration(input, index, list)
+                }
+                PackageBraceOwner::Policy => policy_declaration(input, index, list),
+                PackageBraceOwner::Lints => lints_declaration(input, index, list),
+                PackageBraceOwner::Authors => authors_declaration(input, index, list),
+                PackageBraceOwner::Only | PackageBraceOwner::Grant | PackageBraceOwner::Budget => {
+                    Err(PackageDocumentError::WrongListOwner)
+                }
+            }
+        }
+    }
+}
+
 /// Build a canonical document for one syntactically valid `targets` list.
 ///
 /// Comments attached to the declaration are retained. Comments attached to

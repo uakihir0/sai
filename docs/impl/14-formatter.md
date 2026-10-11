@@ -16,14 +16,31 @@ The formatter is the library crate `sai_fmt`. It has two entry points.
 
 ```rust
 pub fn format_source(text: &[u8]) -> Result<String, Refusal>;
-pub fn format_package(text: &[u8]) -> Result<String, Refusal>;
+pub fn format_package(text: &[u8]) -> Result<String, PackageFormatError>;
 
 pub struct Refusal {
-    pub diagnostics: Vec<Diagnostic>,   // the diagnostics that caused the refusal (§14.2.2)
+    pub lexical_errors: Vec<sai_package::lexer::PackageLexError>,
+    pub syntax_errors: Vec<sai_package::manifest::PackageParseError>,
+}
+
+pub enum PackageFormatError {
+    Refused(Refusal),
+    InternalError,
+    Print(PrintError),
+    VerificationFailed(PackageVerificationFailure),
+}
+
+pub struct PackageVerificationFailure {
+    pub check: PackageVerificationCheck,
+    pub input_byte_offset: Option<usize>,
 }
 ```
 
 - `format_source` formats a SAI source file. `format_package` formats a `sai.package` file (§14.12).
+- `PackageFormatError::Refused` carries only lexer errors and parser errors that cause refusal; structural and value diagnostics remain formatable (§14.12.1).
+- `PackageFormatError::VerificationFailed` carries the failed check and, when available, the first differing byte offset in the original input (§14.11.2).
+- The package entry point receives bytes without a file identity, so its refusal returns the parser's byte-spanned error records. The CLI maps those records to file diagnostics after it supplies the source location.
+- The package entry point is implemented before `format_source`; source formatting is still pending.
 - The input is the raw file content. The output is UTF-8 text without a BOM.
 - Neither function reads anything other than its argument: no configuration file, no environment variable, no locale, and no clock. The output is a function of the input bytes and of the toolchain version.
 - `sai fmt` ([13-cli.md](13-cli.md) §13.6.7), the language server ([12-semantic-tooling.md](12-semantic-tooling.md) §12.10), structured fixes ([11-diagnostics.md](11-diagnostics.md) §11.7.3), and every tool that writes SAI text use this crate. A tool never produces source text by any other means, so generated text is canonical by construction.
@@ -921,9 +938,11 @@ The **normal form** `N(t)` of a CST `t` is the tree obtained by applying the fol
 
 Check 3 compares multisets, not sequences, because the formatter legitimately moves comments together with the `use` declarations and clauses that it reorders. The position of each comment relative to its token is guaranteed by construction (§14.6.1) and tested by the conformance suite (§14.11.3), not checked at run time. This choice is part of N-H-46.
 
+The package formatter uses the same normalization principle over its lossless token stream: it compares token kinds and source spellings in order after dropping `NEWLINE`, EOF, and only the commas indexed as brace-list separators. It retains comparator commas in version requirements. It also compares parser error and warning kinds and the ordered comment texts after line-ending normalization and removal of trailing whitespace. Package declarations and comments are not reordered, so this comment-sequence check is stricter than the multiset check above. The public package entry point formats the result again and requires a byte-identical fixed point on every call.
+
 ### 14.11.2 Verification failure
 
-If any check of §14.11.1 fails, the formatter has a bug. It reports the hard error `INTERNAL_COMPILER_ERROR` ([11-diagnostics.md](11-diagnostics.md) §11.4.6) with `component` `"sai_fmt"`, a `panic_message` that names the failed check (`"formatter verification failed: output does not parse"`, `"…: syntax tree changed"`, or `"…: comments changed"`), and a primary location at the first token, in the input, where the normal forms differ (or `null` for check 3). The file is left unchanged, and the command stops with exit code 101 ([13-cli.md](13-cli.md) §13.3.4). Files already written by the same `sai fmt` run keep their new content: each of them passed its own verification (N-H-46).
+If any check of §14.11.1 fails, the formatter has a bug. The library retains the failed check and the first differing byte offset in the input when one exists. The command reports the hard error `INTERNAL_COMPILER_ERROR` ([11-diagnostics.md](11-diagnostics.md) §11.4.6) with `component` `"sai_fmt"`, a `panic_message` that names the failed check (`"formatter verification failed: output does not parse"`, `"…: syntax tree changed"`, or `"…: comments changed"`), and a primary location at the first token, in the input, where the normal forms differ (or `null` for check 3). The file is left unchanged, and the command stops with exit code 101 ([13-cli.md](13-cli.md) §13.3.4). Files already written by the same `sai fmt` run keep their new content: each of them passed its own verification (N-H-46).
 
 Rationale: a formatter that silently changes a program is worse than one that fails. Verification costs one extra parse of each formatted file, which is small compared with the formatting itself (P2, P9).
 

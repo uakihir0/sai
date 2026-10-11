@@ -8,7 +8,7 @@ use sai_package::lexer::{
     PackageLexOutput, PackageToken, PackageTokenKind, PackageTrivia, PackageTriviaKind, lex_tokens,
 };
 use sai_package::manifest::{
-    MAX_PACKAGE_MANIFEST_BYTES, PackageParseErrorKind, PackageParseOutput, parse,
+    MAX_PACKAGE_MANIFEST_BYTES, PackageParseError, PackageParseErrorKind, PackageParseOutput, parse,
 };
 
 /// Keeps the package parser's semantic projection beside the original input
@@ -102,6 +102,18 @@ impl<'a> PackageInput<'a> {
     pub(crate) fn refusals(&self) -> &[PackageRefusal] {
         &self.refusals
     }
+
+    pub(crate) fn refusing_parse_errors(&self) -> Vec<PackageParseError> {
+        self.parsed
+            .errors()
+            .iter()
+            .filter(|error| {
+                error.kind == PackageParseErrorKind::ManifestTooLarge
+                    || is_refusing_parse_error(&error.kind)
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 fn classify_refusals(lexed: &PackageLexOutput, parsed: &PackageParseOutput) -> Vec<PackageRefusal> {
@@ -110,31 +122,28 @@ fn classify_refusals(lexed: &PackageLexOutput, parsed: &PackageParseOutput) -> V
         .iter()
         .map(|_| PackageRefusal::Lexical)
         .collect::<Vec<_>>();
-    refusals.extend(
-        parsed
-            .errors()
-            .iter()
-            .filter_map(|error| match &error.kind {
-                PackageParseErrorKind::UnknownDeclaration { .. }
-                | PackageParseErrorKind::UnknownArtifactKind(_)
-                | PackageParseErrorKind::ExpectedToken(_)
-                | PackageParseErrorKind::ExpectedListSeparator(_)
-                | PackageParseErrorKind::ExpectedDeclaration
-                | PackageParseErrorKind::ExpectedProfileItem => Some(PackageRefusal::Grammar),
-                PackageParseErrorKind::ManifestTooLarge => Some(PackageRefusal::ParserLimit),
-                PackageParseErrorKind::MissingPackageDeclaration
-                | PackageParseErrorKind::PackageDeclarationNotFirst
-                | PackageParseErrorKind::DuplicateDeclaration(_)
-                | PackageParseErrorKind::InvalidPackageIdentity(_)
-                | PackageParseErrorKind::InvalidPackageVersion(_)
-                | PackageParseErrorKind::InvalidContentPath(_)
-                | PackageParseErrorKind::InvalidDependencyPath(_)
-                | PackageParseErrorKind::InvalidRepositoryDirectory(_)
-                | PackageParseErrorKind::ConflictingLintLevel
-                | PackageParseErrorKind::InvalidVersionRequirement(_) => None,
-            }),
-    );
+    refusals.extend(parsed.errors().iter().filter_map(|error| {
+        if error.kind == PackageParseErrorKind::ManifestTooLarge {
+            Some(PackageRefusal::ParserLimit)
+        } else if is_refusing_parse_error(&error.kind) {
+            Some(PackageRefusal::Grammar)
+        } else {
+            None
+        }
+    }));
     refusals
+}
+
+pub(crate) fn is_refusing_parse_error(kind: &PackageParseErrorKind) -> bool {
+    matches!(
+        kind,
+        PackageParseErrorKind::UnknownDeclaration { .. }
+            | PackageParseErrorKind::UnknownArtifactKind(_)
+            | PackageParseErrorKind::ExpectedToken(_)
+            | PackageParseErrorKind::ExpectedListSeparator(_)
+            | PackageParseErrorKind::ExpectedDeclaration
+            | PackageParseErrorKind::ExpectedProfileItem
+    )
 }
 
 impl AttachedComment {
