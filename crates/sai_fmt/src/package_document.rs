@@ -259,6 +259,181 @@ pub(crate) fn artifact_components_declaration(
     Ok(Doc::concat(document))
 }
 
+pub(crate) fn overrides_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if list.owner != PackageBraceOwner::Overrides
+        || list.kind() != crate::package_surface::PackageListKind::LinesOnly
+        || !index.contains_list(list)
+    {
+        return Err(PackageDocumentError::WrongListOwner);
+    }
+    if !index.matches_input(input) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let opening_brace =
+        usize::try_from(list.open_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let closing_brace =
+        usize::try_from(list.close_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    if opening_brace >= closing_brace {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let keyword_index = opening_brace
+        .checked_sub(1)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let keyword = tokens
+        .get(keyword_index)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if keyword.kind != PackageTokenKind::Word
+        || token_text(input.source(), keyword) != "overrides"
+        || tokens.get(opening_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::LeftBrace)
+        })
+        || tokens.get(closing_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut comments = TokenComments::new(input, tokens, keyword_index, closing_brace);
+    let keyword_leading = comments.take_leading(keyword_index);
+    let keyword_trailing = comments.take_trailing(keyword_index);
+    let opening_leading = comments.take_leading(opening_brace);
+    let opening_trailing = comments.take_trailing(opening_brace);
+    let mut closing_leading = comments.take_leading(closing_brace);
+    let closing_trailing = comments.take_trailing(closing_brace);
+
+    let entries = index
+        .entries(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let mut override_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry
+            .end
+            .checked_sub(entry.start)
+            .is_none_or(|length| length < 3)
+            || entry.start <= list.open_token
+            || entry.end > list.close_token
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let start = usize::try_from(entry.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let end = usize::try_from(entry.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let entry_tokens = tokens
+            .get(start..end)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        if !valid_override_entry(input.source(), entry_tokens) {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let mut leading = Vec::with_capacity(entry_tokens.len());
+        let mut trailing = Vec::with_capacity(entry_tokens.len());
+        for token_index in start..end {
+            leading.push(comments.take_leading(token_index));
+            trailing.push(comments.take_trailing(token_index));
+        }
+        override_entries.push(OverrideEntry {
+            token_indices: start..end,
+            leading,
+            trailing,
+        });
+    }
+
+    if index
+        .separators(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+        .iter()
+        .any(|separator| {
+            tokens
+                .get(*separator as usize)
+                .is_none_or(|token| token.kind != PackageTokenKind::Newline)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    if comments.has_pending(keyword_index, closing_brace) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+
+    let mut document = leading_comments_before(input, &keyword_leading, Some(keyword.span.start));
+    document.extend([
+        Doc::text("overrides"),
+        trailing_comments(input, &keyword_trailing),
+    ]);
+    if opening_leading.is_empty() {
+        document.push(Doc::text(" "));
+    } else {
+        document.push(Doc::HardLine);
+        if opening_leading[0].line_breaks_before() > 1 {
+            document.push(Doc::HardLine);
+        }
+        document.extend(leading_comments_before(
+            input,
+            &opening_leading,
+            Some(tokens[opening_brace].span.start),
+        ));
+    }
+    document.push(Doc::text("{"));
+
+    let has_body =
+        !override_entries.is_empty() || !opening_trailing.is_empty() || !closing_leading.is_empty();
+    if has_body {
+        let mut body = vec![trailing_comments(input, &opening_trailing)];
+        if !override_entries.is_empty() {
+            body.push(Doc::HardLine);
+            for (position, entry) in override_entries.iter().enumerate() {
+                if position > 0 {
+                    let previous = &override_entries[position - 1];
+                    let current_start = tokens[entry.token_indices.start].span.start;
+                    let previous_end = tokens[previous.token_indices.end - 1].span.end;
+                    let preserve_blank_line = entry.leading[0].first().map_or_else(
+                        || has_blank_line(input, previous_end, current_start),
+                        |comment| comment.line_breaks_before() > 1,
+                    );
+                    body.push(Doc::HardLine);
+                    if preserve_blank_line {
+                        body.push(Doc::HardLine);
+                    }
+                }
+                body.extend(override_entry_document(input, tokens, entry));
+            }
+        }
+        if !closing_leading.is_empty() {
+            sort_comments(input, &mut closing_leading);
+            body.push(Doc::HardLine);
+            if !override_entries.is_empty()
+                && has_blank_line(
+                    input,
+                    tokens[override_entries
+                        .last()
+                        .expect("non-empty override entries")
+                        .token_indices
+                        .end
+                        - 1]
+                    .span
+                    .end,
+                    input.comment_span(closing_leading[0]).start,
+                )
+            {
+                body.push(Doc::HardLine);
+            }
+            body.extend(leading_comments_before(input, &closing_leading, None));
+        }
+        document.push(Doc::indent(Doc::concat(body)));
+        document.push(Doc::HardLine);
+    }
+    document.push(Doc::text("}"));
+    document.push(trailing_comments(input, &closing_trailing));
+    Ok(Doc::concat(document))
+}
+
 pub(crate) fn package_identity_declaration(
     input: &PackageInput<'_>,
     declaration: Range<u32>,
@@ -619,6 +794,107 @@ fn value_declaration(
     Ok(Doc::concat(document))
 }
 
+fn valid_override_entry(source: &[u8], tokens: &[PackageToken]) -> bool {
+    let Some((package, remainder)) = tokens.split_first() else {
+        return false;
+    };
+    if package.kind != PackageTokenKind::PackagePath
+        || remainder.first().is_none_or(|token| {
+            token.kind != PackageTokenKind::Word || token_text(source, token) != "use"
+        })
+    {
+        return false;
+    }
+
+    match remainder.get(1..) {
+        Some([artifact])
+            if artifact.kind == PackageTokenKind::Word
+                && token_text(source, artifact) == "artifact" =>
+        {
+            true
+        }
+        Some([kind, path])
+            if kind.kind == PackageTokenKind::Word
+                && token_text(source, kind) == "path"
+                && path.kind == PackageTokenKind::String =>
+        {
+            true
+        }
+        Some([kind, url])
+            if kind.kind == PackageTokenKind::Word
+                && token_text(source, kind) == "git"
+                && url.kind == PackageTokenKind::String =>
+        {
+            true
+        }
+        Some([kind, url, directory, path])
+            if kind.kind == PackageTokenKind::Word
+                && token_text(source, kind) == "git"
+                && url.kind == PackageTokenKind::String
+                && directory.kind == PackageTokenKind::Word
+                && token_text(source, directory) == "dir"
+                && path.kind == PackageTokenKind::String =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn override_entry_document(
+    input: &PackageInput<'_>,
+    tokens: &[PackageToken],
+    entry: &OverrideEntry<'_>,
+) -> Vec<Doc> {
+    let mut document = Vec::new();
+    for offset in 0..entry.token_indices.len() {
+        let token_index = entry.token_indices.start + offset;
+        let token = &tokens[token_index];
+        let leading = &entry.leading[offset];
+        let trailing = &entry.trailing[offset];
+        if offset == 0 {
+            document.extend(leading_comments_before(
+                input,
+                leading,
+                Some(token.span.start),
+            ));
+            document.push(Doc::text(token_text(input.source(), token)));
+            document.push(trailing_comments(input, trailing));
+            continue;
+        }
+
+        let previous_trailing = &entry.trailing[offset - 1];
+        let requires_break =
+            !leading.is_empty() || trailing_comments_force_line_break(input, previous_trailing);
+        if requires_break {
+            let mut continuation = vec![Doc::HardLine];
+            if leading
+                .first()
+                .is_some_and(|comment| comment.line_breaks_before() > 1)
+            {
+                continuation.push(Doc::HardLine);
+            }
+            continuation.extend(leading_comments_before(
+                input,
+                leading,
+                Some(token.span.start),
+            ));
+            continuation.extend([
+                Doc::text(token_text(input.source(), token)),
+                trailing_comments(input, trailing),
+            ]);
+            document.push(Doc::indent(Doc::concat(continuation)));
+        } else {
+            document.extend([
+                Doc::text(" "),
+                Doc::text(token_text(input.source(), token)),
+                trailing_comments(input, trailing),
+            ]);
+        }
+    }
+    document
+}
+
 fn valid_version_requirement_tokens(tokens: &[PackageToken]) -> bool {
     if tokens.len() == 1 {
         return matches!(
@@ -947,6 +1223,12 @@ struct ArtifactEntry<'a> {
     path_trailing: Vec<&'a AttachedComment>,
 }
 
+struct OverrideEntry<'a> {
+    token_indices: Range<usize>,
+    leading: Vec<Vec<&'a AttachedComment>>,
+    trailing: Vec<Vec<&'a AttachedComment>>,
+}
+
 #[derive(Default)]
 struct TokenComments<'a> {
     leading: HashMap<usize, Vec<&'a AttachedComment>>,
@@ -1141,8 +1423,8 @@ mod tests {
     use super::{
         PackageDocumentError, allocator_declaration, artifact_components_declaration,
         authors_declaration, capability_declaration, compiler_declaration,
-        export_world_declaration, package_identity_declaration, string_declaration,
-        targets_declaration, token_text,
+        export_world_declaration, overrides_declaration, package_identity_declaration,
+        string_declaration, targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -1167,6 +1449,7 @@ mod tests {
             PackageBraceOwner::ArtifactComponents => {
                 artifact_components_declaration(&input, &index, list)
             }
+            PackageBraceOwner::Overrides => overrides_declaration(&input, &index, list),
             _ => panic!("unsupported simple-list owner in test helper"),
         }
         .expect("package list document");
@@ -1476,6 +1759,78 @@ mod tests {
         assert_eq!(
             targets_declaration(&single_input, &multi_index, list),
             Err(PackageDocumentError::InvalidEntry)
+        );
+    }
+
+    #[test]
+    fn always_breaks_override_entries_and_formats_empty_lists() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  overrides { acme:image use artifact\n\
+                      acme:local use path \"../local\"\n\
+                      acme:fork use git \"https://example.com/fork\"\n\
+                      acme:subdir use git \"https://example.com/mono\" dir \"image\"\n\
+                  }\n",
+                PackageBraceOwner::Overrides,
+                false
+            ),
+            "overrides {\n    acme:image use artifact\n    acme:local use path \"../local\"\n    acme:fork use git \"https://example.com/fork\"\n    acme:subdir use git \"https://example.com/mono\" dir \"image\"\n}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\noverrides {}\n",
+                PackageBraceOwner::Overrides,
+                false
+            ),
+            "overrides {}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_override_comments_and_safe_dir_continuations() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  overrides { acme:image/* package */ use/* source */artifact // default\n\
+                      acme:fork use git \"https://example.com/fork\" // repository\n\
+                      dir \"image\"\n\
+                  }\n",
+                PackageBraceOwner::Overrides,
+                false
+            ),
+            "overrides {\n    acme:image /* package */ use /* source */ artifact // default\n    acme:fork use git \"https://example.com/fork\" // repository\n        dir \"image\"\n}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  overrides {\n\
+                      acme:fork use git \"https://example.com/fork\"\n\
+                      // selects a repository subdirectory\n\
+                      dir \"image\"\n\
+                  }\n",
+                PackageBraceOwner::Overrides,
+                false
+            ),
+            "overrides {\n    acme:fork use git \"https://example.com/fork\"\n        // selects a repository subdirectory\n        dir \"image\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_blank_lines_between_override_entries_and_invalid_paths() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  overrides {\n\
+                      acme:local use path \"../../outside\"\n\
+                      \n\
+                      \n\
+                      acme:image use artifact\n\
+                  }\n",
+                PackageBraceOwner::Overrides,
+                false
+            ),
+            "overrides {\n    acme:local use path \"../../outside\"\n\n    acme:image use artifact\n}\n"
         );
     }
 
