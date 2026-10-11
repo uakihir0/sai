@@ -23,6 +23,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 blake3 = "1.8.7"
+ctrlc = "=3.5.0"
 glob = "0.3.3"
 toml = "0.8.23"
 siphasher = "1.0.4"

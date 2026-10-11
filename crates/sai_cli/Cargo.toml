@@ -3,3 +3,10 @@ name = "sai_cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[[bin]]
+name = "sai"
+path = "src/main.rs"
+
+[dependencies]
+sai_driver = { path = "../sai_driver" }

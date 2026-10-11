@@ -49,6 +49,41 @@ use crate::version::Version;
 const SSH_TAG_LIST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_GIT_FETCH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Reports whether `value` uses a Git URL supported by package sources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitUrlValidationError {
+    Insecure,
+    Unsupported,
+    Credentials,
+}
+
+pub fn validate_git_url(value: &str) -> Result<(), GitUrlValidationError> {
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return Err(GitUrlValidationError::Unsupported);
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if matches!(scheme.as_str(), "http" | "git") {
+        return Err(GitUrlValidationError::Insecure);
+    }
+    if !matches!(scheme.as_str(), "https" | "ssh") {
+        return Err(GitUrlValidationError::Unsupported);
+    }
+
+    let authority = remainder.split('/').next().unwrap_or_default();
+    if let Some((userinfo, _)) = authority.rsplit_once('@')
+        && (scheme == "https" || userinfo.contains(':') || userinfo.contains('@'))
+    {
+        return Err(GitUrlValidationError::Credentials);
+    }
+    canonical_git_url(value)
+        .map(|_| ())
+        .map_err(|()| GitUrlValidationError::Unsupported)
+}
+
+pub fn is_supported_git_url(value: &str) -> bool {
+    validate_git_url(value).is_ok()
+}
+
 /// An artifact checksum expected from the lock file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedArtifactChecksum {

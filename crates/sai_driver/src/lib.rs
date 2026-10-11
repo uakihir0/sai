@@ -45,6 +45,115 @@ pub struct RootDatabase {
     symbols: Interner,
 }
 
+/// Owns the CLI's cancellation state and installs the process interrupt handler.
+pub struct InterruptHandler {
+    cancellation: CancellationToken,
+}
+
+pub type CancellationToken = sai_query::CancellationToken;
+
+impl InterruptHandler {
+    /// Installs SIGINT/Ctrl-C handling. Every interrupt requests cancellation;
+    /// filesystem owners then unwind through their cleanup paths.
+    pub fn install() -> Result<Self, ctrlc::Error> {
+        let cancellation = CancellationToken::default();
+        let handler_cancellation = cancellation.clone();
+        ctrlc::set_handler(move || {
+            handler_cancellation.cancel();
+        })?;
+        Ok(Self { cancellation })
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+/// The package creation operations used by the command-line frontend.
+///
+/// Keeping this small facade in the driver lets `sai_cli` depend on only one
+/// runtime crate while package filesystem work remains owned by `sai_package`.
+pub mod new_package {
+    use sai_query::CancellationToken;
+    use std::path::Path;
+
+    pub use sai_package::new_package::{
+        NewPackageError, NewPackageFile, NewPackageReceipt, create_new_package,
+        validate_new_package_identity,
+    };
+
+    /// Creates a package while honoring the driver's interrupt token at
+    /// filesystem safe points.
+    pub fn create_new_package_with_cancellation(
+        destination: &Path,
+        identity: &str,
+        targets: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<NewPackageReceipt, NewPackageError> {
+        sai_package::new_package::create_new_package_with_cancel_check(
+            destination,
+            identity,
+            targets,
+            || cancellation.is_cancelled(),
+        )
+    }
+}
+
+/// The package value validators exposed to command-line argument handling.
+pub mod package_validation {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum GitUrlValidationError {
+        Insecure,
+        Unsupported,
+        Credentials,
+    }
+
+    pub fn is_valid_identity(value: &str) -> bool {
+        sai_package::identity::PackageIdentity::parse(value).is_ok()
+    }
+
+    pub fn is_standard_package_identity(value: &str) -> bool {
+        matches!(
+            value,
+            "sai:collections"
+                | "sai:text"
+                | "sai:fmt"
+                | "sai:io"
+                | "sai:fs"
+                | "sai:net"
+                | "sai:http"
+                | "sai:async"
+                | "sai:process"
+        )
+    }
+
+    pub fn is_valid_exact_version(value: &str) -> bool {
+        sai_package::version::Version::parse(value).is_ok()
+    }
+
+    pub fn is_valid_version_requirement(value: &str) -> bool {
+        sai_package::version_req::VersionReq::parse(value).is_ok()
+    }
+
+    pub fn is_supported_git_url(value: &str) -> bool {
+        validate_git_url(value).is_ok()
+    }
+
+    pub fn validate_git_url(value: &str) -> Result<(), GitUrlValidationError> {
+        sai_package::git_remote::validate_git_url(value).map_err(|error| match error {
+            sai_package::git_remote::GitUrlValidationError::Insecure => {
+                GitUrlValidationError::Insecure
+            }
+            sai_package::git_remote::GitUrlValidationError::Unsupported => {
+                GitUrlValidationError::Unsupported
+            }
+            sai_package::git_remote::GitUrlValidationError::Credentials => {
+                GitUrlValidationError::Credentials
+            }
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RootDatabaseError {
     Query(QueryError),

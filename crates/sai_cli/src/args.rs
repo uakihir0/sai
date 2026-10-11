@@ -50,6 +50,8 @@ impl Default for GlobalOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedCommand {
     pub name: OsString,
+    /// Zero-based position of the command in the original argv.
+    pub command_index: usize,
     /// Original tokens after the command and before `--`, in their original
     /// order. Global options remain here so command-specific value parsing
     /// cannot accidentally skip over them.
@@ -57,15 +59,27 @@ pub struct ParsedCommand {
     /// Zero-based positions in `arguments` occupied by global option tokens
     /// and any separate values consumed by those options.
     pub global_argument_indices: Vec<usize>,
+    /// Zero-based positions in the original argv (excluding argv[0]) for
+    /// each corresponding token in `arguments`.
+    pub argument_indices: Vec<usize>,
     pub passthrough: Vec<OsString>,
+    /// Zero-based positions in the original argv for `passthrough`.
+    pub passthrough_indices: Vec<usize>,
+    /// Zero-based position of `--` in the original argv, when present.
+    pub separator_index: Option<usize>,
 }
 
 /// Usage errors found while parsing the shared command-line syntax.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UsageErrorKind {
+    UnknownCommand,
     UnknownOption,
     MissingArgument,
     InvalidOptionValue,
+    InsecureGitUrl,
+    UnsupportedGitUrl,
+    CredentialsInUrl,
+    UnexpectedArgument,
     ConflictingOptions,
 }
 
@@ -120,7 +134,11 @@ pub fn parse_args(arguments: &[OsString]) -> ParsedArgs {
     let mut command = None;
     let mut command_arguments = Vec::new();
     let mut global_argument_indices = Vec::new();
+    let mut argument_indices = Vec::new();
     let mut passthrough = Vec::new();
+    let mut passthrough_indices = Vec::new();
+    let mut separator_index = None;
+    let mut command_index = None;
     let mut after_separator = false;
     let mut index = 0;
 
@@ -129,35 +147,49 @@ pub fn parse_args(arguments: &[OsString]) -> ParsedArgs {
         if after_separator {
             if command.is_some() {
                 passthrough.push(argument.clone());
+                passthrough_indices.push(index);
             }
             index += 1;
             continue;
         }
         if argument == OsStr::new("--") {
+            if command.is_some() {
+                separator_index = Some(index);
+            }
             after_separator = true;
             index += 1;
             continue;
         }
 
         if is_option(argument) {
-            let parsed_global = split_os_option(argument).and_then(|(name, inline_value)| {
-                parse_global_option(
-                    &name,
-                    inline_value.as_deref(),
-                    index,
-                    arguments,
-                    &mut parsed,
-                    &mut seen_values,
-                    &mut quiet_index,
-                    &mut verbose_index,
-                    &mut quiet_verbose_conflict_reported,
-                )
-            });
+            // `add --version` selects a package requirement. In this
+            // command-specific position, its meaning takes precedence over
+            // the otherwise global version display flag.
+            let add_version_requirement = command.as_deref() == Some(OsStr::new("add"))
+                && split_os_option(argument).is_some_and(|(name, _)| name == "--version");
+            let parsed_global = if add_version_requirement {
+                None
+            } else {
+                split_os_option(argument).and_then(|(name, inline_value)| {
+                    parse_global_option(
+                        &name,
+                        inline_value.as_deref(),
+                        index,
+                        arguments,
+                        &mut parsed,
+                        &mut seen_values,
+                        &mut quiet_index,
+                        &mut verbose_index,
+                        &mut quiet_verbose_conflict_reported,
+                    )
+                })
+            };
             if let Some(consumed) = parsed_global {
                 if command.is_some() {
                     let start = command_arguments.len();
                     command_arguments.extend_from_slice(&arguments[index..index + consumed]);
                     global_argument_indices.extend(start..command_arguments.len());
+                    argument_indices.extend(index..index + consumed);
                 }
                 index += consumed;
                 continue;
@@ -170,6 +202,7 @@ pub fn parse_args(arguments: &[OsString]) -> ParsedArgs {
                 });
             } else {
                 command_arguments.push(argument.clone());
+                argument_indices.push(index);
             }
             index += 1;
             continue;
@@ -177,8 +210,10 @@ pub fn parse_args(arguments: &[OsString]) -> ParsedArgs {
 
         if command.is_none() {
             command = Some(argument.clone());
+            command_index = Some(index);
         } else {
             command_arguments.push(argument.clone());
+            argument_indices.push(index);
         }
         index += 1;
     }
@@ -186,9 +221,13 @@ pub fn parse_args(arguments: &[OsString]) -> ParsedArgs {
     if let Some(name) = command {
         parsed.command = Some(ParsedCommand {
             name,
+            command_index: command_index.expect("a parsed command has a position"),
             arguments: command_arguments,
             global_argument_indices,
+            argument_indices,
             passthrough,
+            passthrough_indices,
+            separator_index,
         });
     } else if !parsed.globals.help && !parsed.globals.version {
         parsed.usage_errors.push(UsageError {
@@ -463,7 +502,7 @@ fn invalid_value_argument(
     }
 }
 
-fn is_option(argument: &OsStr) -> bool {
+pub(crate) fn is_option(argument: &OsStr) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -480,7 +519,7 @@ fn is_option(argument: &OsStr) -> bool {
     }
 }
 
-fn split_os_option(argument: &OsStr) -> Option<(String, Option<OsString>)> {
+pub(crate) fn split_os_option(argument: &OsStr) -> Option<(String, Option<OsString>)> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -598,11 +637,13 @@ mod tests {
         assert!(parsed.globals.quiet);
         let command = parsed.command.unwrap();
         assert_eq!(command.name, "check");
+        assert_eq!(command.command_index, 3);
         assert_eq!(
             command.arguments,
             args(&["--color", "always", "--max-errors=12", "-q"])
         );
         assert_eq!(command.global_argument_indices, vec![0, 1, 2, 3]);
+        assert_eq!(command.argument_indices, vec![4, 5, 6, 7]);
     }
 
     #[test]
@@ -614,6 +655,18 @@ mod tests {
             command.arguments,
             args(&["--target", "wasm32-core", "src/main.sai"])
         );
+        assert_eq!(command.command_index, 0);
+        assert_eq!(command.argument_indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn add_version_option_is_a_requirement_after_the_command() {
+        let parsed = parse_args(&args(&["add", "--version", "^1.2"]));
+        let command = parsed.command.as_ref().unwrap();
+
+        assert!(parsed.usage_errors.is_empty());
+        assert!(!parsed.globals.version);
+        assert_eq!(command.arguments, args(&["--version", "^1.2"]));
     }
 
     #[test]
@@ -624,6 +677,9 @@ mod tests {
         assert_eq!(command.arguments, args(&["--quiet"]));
         assert_eq!(command.global_argument_indices, vec![0]);
         assert_eq!(command.passthrough, args(&["--help", "arg"]));
+        assert_eq!(command.argument_indices, vec![1]);
+        assert_eq!(command.passthrough_indices, vec![3, 4]);
+        assert_eq!(command.separator_index, Some(2));
         assert!(parsed.globals.quiet);
     }
 
