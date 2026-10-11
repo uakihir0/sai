@@ -1,8 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/sai_cli",
     "crates/sai_diagnostics",
     "crates/sai_driver",
+    "crates/sai_cli",
     "crates/sai_hir",
     "crates/sai_intern",
     "crates/sai_package",
