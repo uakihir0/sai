@@ -619,6 +619,59 @@ fn region_expression_document(
     ]))
 }
 
+fn first_choice_layout(document: &Doc) -> Doc {
+    match document {
+        Doc::Text(text) => Doc::text(text.clone()),
+        Doc::Line => Doc::Line,
+        Doc::SoftLine => Doc::SoftLine,
+        Doc::HardLine => Doc::HardLine,
+        Doc::Indent(child) => Doc::indent(first_choice_layout(child)),
+        Doc::Group(id, child) => Doc::group(*id, first_choice_layout(child)),
+        Doc::IfBroken(id, broken, flat) => {
+            Doc::if_broken(*id, first_choice_layout(broken), first_choice_layout(flat))
+        }
+        Doc::LineSuffix(child) => Doc::line_suffix(first_choice_layout(child)),
+        Doc::Choice(alternatives) => alternatives
+            .first()
+            .map(first_choice_layout)
+            .unwrap_or_else(|| Doc::choice([])),
+        Doc::Flat(child) => Doc::flat(first_choice_layout(child)),
+        Doc::Verbatim(text) => Doc::verbatim(text.clone()),
+        Doc::Concat(documents) => Doc::concat(documents.iter().map(first_choice_layout)),
+    }
+}
+
+fn unsafe_block_expression_document(
+    source: &ParsedSource,
+    unsafe_block: &ast::UnsafeBlockExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let body = unsafe_block
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if unsafe_block.syntax().children().count() != 1
+        || direct_token_kinds(unsafe_block.syntax()) != [SyntaxKind::UNSAFE_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let statements = body.statements().collect::<Vec<_>>();
+    let broken_block = block_document(source, &body, expression_group_ids)?;
+    if let [Stmt::Expr(statement)] = statements.as_slice() {
+        let flat_statement =
+            statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
+        let flat_statement = first_choice_layout(&flat_statement);
+        return Ok(Doc::choice([
+            Doc::concat([
+                Doc::text("unsafe { "),
+                Doc::flat(flat_statement),
+                Doc::text(" }"),
+            ]),
+            Doc::concat([Doc::text("unsafe "), broken_block]),
+        ]));
+    }
+    Ok(Doc::concat([Doc::text("unsafe "), broken_block]))
+}
+
 fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
@@ -1115,6 +1168,9 @@ fn expression_document(
         Expr::Tuple(tuple) => tuple_expression_document(source, tuple, expression_group_ids),
         Expr::Array(array) => array_expression_document(source, array, expression_group_ids),
         Expr::Block(block) => block_expression_document(source, block, expression_group_ids),
+        Expr::UnsafeBlock(unsafe_block) => {
+            unsafe_block_expression_document(source, unsafe_block, expression_group_ids)
+        }
         Expr::AsyncBlock(async_block) => {
             async_block_expression_document(source, async_block, expression_group_ids)
         }
@@ -4358,6 +4414,57 @@ mod tests {
             assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
             assert_eq!(format_shape(output.as_bytes()), Ok(output));
         }
+    }
+
+    #[test]
+    fn formats_unsafe_blocks_flat_only_for_one_fitting_expression() {
+        for (input, expected) in [
+            (
+                b"fn f(){unsafe{}}".as_slice(),
+                "fn f() {\n    unsafe {}\n}\n",
+            ),
+            (
+                b"fn f(){unsafe{operate()}}".as_slice(),
+                "fn f() {\n    unsafe { operate() }\n}\n",
+            ),
+            (
+                b"fn f(){unsafe{unsafe{operate()}}}".as_slice(),
+                "fn f() {\n    unsafe { unsafe { operate() } }\n}\n",
+            ),
+            (
+                b"fn f(){unsafe{let value=1}}".as_slice(),
+                "fn f() {\n    unsafe {\n        let value = 1\n    }\n}\n",
+            ),
+            (
+                b"fn f(){unsafe{one()\ntwo()}}".as_slice(),
+                "fn f() {\n    unsafe {\n        one()\n        two()\n    }\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("unsafe block parses");
+            let output = format_shape(input).expect("unsafe block is supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted unsafe block parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+
+        let operation = format!("operation_{}", "x".repeat(101));
+        let input = format!("fn f(){{unsafe{{{operation}}}}}");
+        let expected = format!("fn f() {{\n    unsafe {{\n        {operation}\n    }}\n}}\n");
+        let output = format_shape(input.as_bytes()).expect("overlong unsafe expression formats");
+        assert_eq!(output, expected);
+        parse_source(output.as_bytes()).expect("broken unsafe block reparses");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let nested_operation = format!("nested_{}", "y".repeat(92));
+        let input = format!("fn f(){{unsafe{{unsafe{{{nested_operation}}}}}}}");
+        let expected = format!(
+            "fn f() {{\n    unsafe {{\n        unsafe {{\n            {nested_operation}\n        }}\n    }}\n}}\n"
+        );
+        let output = format_shape(input.as_bytes()).expect("nested overlong unsafe block formats");
+        assert_eq!(output, expected);
+        parse_source(output.as_bytes()).expect("nested broken unsafe block reparses");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
