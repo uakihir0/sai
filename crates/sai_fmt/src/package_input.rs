@@ -78,6 +78,16 @@ impl<'a> PackageInput<'a> {
         &self.comments
     }
 
+    pub(crate) fn comment_kind(&self, comment: &AttachedComment) -> PackageTriviaKind {
+        self.parsed.file().trivia[comment.trivia_index].kind
+    }
+
+    pub(crate) fn comment_text<'b>(&'b self, comment: &AttachedComment) -> &'b str {
+        let span = &self.parsed.file().trivia[comment.trivia_index].span;
+        std::str::from_utf8(&self.source[span.clone()])
+            .expect("package comment spans point to valid UTF-8")
+    }
+
     /// Refusal is deliberately narrower than `PackageParseOutput::is_syntax_valid`:
     /// duplicate and missing declarations are structural diagnostics, while
     /// malformed values are retained in the original token stream for later
@@ -114,6 +124,20 @@ impl<'a> PackageInput<'a> {
                 }),
         );
         refusals
+    }
+}
+
+impl AttachedComment {
+    pub(crate) const fn attachment(&self) -> CommentAttachment {
+        self.attachment
+    }
+
+    pub(crate) const fn physical_line(&self) -> usize {
+        self.physical_line
+    }
+
+    pub(crate) const fn line_breaks_before(&self) -> usize {
+        self.line_breaks_before
     }
 }
 
