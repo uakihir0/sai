@@ -54,6 +54,72 @@ pub(crate) fn authors_declaration(
     comma_list_declaration(input, index, list, PackageBraceOwner::Authors)
 }
 
+pub(crate) fn package_identity_declaration(
+    input: &PackageInput<'_>,
+    declaration: Range<u32>,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if declaration.end.checked_sub(declaration.start) != Some(4) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let first =
+        usize::try_from(declaration.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let end = usize::try_from(declaration.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let declaration_tokens = tokens
+        .get(first..end)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let [keyword, package_path, at, version] = declaration_tokens else {
+        return Err(PackageDocumentError::InvalidEntry);
+    };
+    if keyword.kind != PackageTokenKind::Word
+        || token_text(input.source(), keyword) != "package"
+        || package_path.kind != PackageTokenKind::PackagePath
+        || at.kind != PackageTokenKind::Punctuator(PackagePunctuator::At)
+        || version.kind != PackageTokenKind::Version
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut comments = TokenComments::new(input, tokens, first, end - 1);
+    let mut document = Vec::new();
+    let mut leading = comments.take_leading(first);
+    sort_comments(input, &mut leading);
+    document.extend(leading_comments_before(
+        input,
+        &leading,
+        Some(keyword.span.start),
+    ));
+
+    for (offset, token) in declaration_tokens.iter().enumerate() {
+        let token_index = first + offset;
+        let mut leading = comments.take_leading(token_index);
+        let trailing = comments.take_trailing(token_index);
+        sort_comments(input, &mut leading);
+        if token_index > first {
+            if leading.is_empty() {
+                document.push(Doc::text(" "));
+            } else {
+                document.extend(leading_comments_before(
+                    input,
+                    &leading,
+                    Some(token.span.start),
+                ));
+            }
+        }
+        document.push(Doc::text(token_text(input.source(), token)));
+        document.push(trailing_comments(input, &trailing));
+    }
+
+    if comments.has_pending(first, end - 1) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+    Ok(Doc::concat(document))
+}
+
 pub(crate) fn string_declaration(
     input: &PackageInput<'_>,
     declaration: Range<u32>,
@@ -678,7 +744,8 @@ mod tests {
 
     use super::{
         PackageDocumentError, allocator_declaration, authors_declaration, capability_declaration,
-        export_world_declaration, string_declaration, targets_declaration, token_text,
+        export_world_declaration, package_identity_declaration, string_declaration,
+        targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -734,6 +801,16 @@ mod tests {
         let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
         let declaration = find_declaration(&input, &index, "export");
         let doc = export_world_declaration(&input, declaration).expect("export world document");
+        print(&doc).expect("print document")
+    }
+
+    fn render_package_identity(source: &[u8]) -> String {
+        let input = PackageInput::new(source);
+        assert!(input.refusals().is_empty(), "{:?}", input.refusals());
+        let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
+        let declaration = find_declaration(&input, &index, "package");
+        let doc =
+            package_identity_declaration(&input, declaration).expect("package identity document");
         print(&doc).expect("print document")
     }
 
@@ -953,6 +1030,28 @@ mod tests {
                 b"package acme:app @ 1.0.0\nexport/* selected */world api/server // world\n"
             ),
             "export /* selected */ world api/server // world\n"
+        );
+    }
+
+    #[test]
+    fn formats_package_identity_with_canonical_at_spacing() {
+        assert_eq!(
+            render_package_identity(b"package acme:app@1.0.0\n"),
+            "package acme:app @ 1.0.0\n"
+        );
+        assert_eq!(
+            render_package_identity(b"package acme:invalid/path @ 1.0.0\n"),
+            "package acme:invalid/path @ 1.0.0\n"
+        );
+    }
+
+    #[test]
+    fn retains_comments_around_package_identity_tokens() {
+        assert_eq!(
+            render_package_identity(
+                b"package/* identity */acme:app/* version */@/* release */1.0.0\n"
+            ),
+            "package /* identity */ acme:app /* version */ @ /* release */ 1.0.0\n"
         );
     }
 
