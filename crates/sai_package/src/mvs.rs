@@ -193,11 +193,11 @@ impl MvsEdge {
         self.span.clone()
     }
 
-    const fn is_path_pin(&self) -> bool {
+    pub(crate) const fn is_path_pin(&self) -> bool {
         self.path_pin
     }
 
-    const fn is_root_override_pin(&self) -> bool {
+    pub(crate) const fn is_root_override_pin(&self) -> bool {
         self.root_override_pin
     }
 

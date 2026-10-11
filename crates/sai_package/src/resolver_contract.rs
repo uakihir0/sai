@@ -340,13 +340,15 @@ pub struct ResolverRequirement {
 #[derive(Clone, Debug)]
 pub struct ResolverContract {
     pub mvs: MvsContract,
+    manifest_package_version: MvsPackageVersion,
     role: PackageRole,
+    root_targets: BTreeSet<Box<str>>,
     /// Retained for exact workspace-snapshot provenance checks. Excluded
     /// from resolver-contract equality; semantic fields below define Eq.
     manifest_digest: [u8; 32],
     /// Root requirements include test edges. Dependency test requirements are
     /// omitted as required by resolver §2.5.1.
-    pub(crate) requirements: Vec<ResolverRequirement>,
+    requirements: Vec<ResolverRequirement>,
     pub parse_warnings: Vec<PackageParseWarning>,
     pub validation_warnings: Vec<PackageValidationWarning>,
     context_binding: Option<Arc<u8>>,
@@ -355,7 +357,9 @@ pub struct ResolverContract {
 impl PartialEq for ResolverContract {
     fn eq(&self, other: &Self) -> bool {
         self.mvs == other.mvs
+            && self.manifest_package_version == other.manifest_package_version
             && self.role == other.role
+            && self.root_targets == other.root_targets
             && self.requirements == other.requirements
             && self.parse_warnings == other.parse_warnings
             && self.validation_warnings == other.validation_warnings
@@ -370,6 +374,23 @@ impl ResolverContract {
         self.role
     }
 
+    /// Package identity and version declared by the validated manifest.
+    ///
+    /// This remains separate from the public MVS value so graph assembly can
+    /// detect callers that replace that value with another package.
+    pub(crate) fn manifest_package_version(&self) -> &MvsPackageVersion {
+        &self.manifest_package_version
+    }
+
+    /// Returns the root package's declared targets used to filter requirements.
+    ///
+    /// Every contract in one resolver context carries the same set. Lock
+    /// construction uses it to record the root contract that produced the
+    /// selected graph.
+    pub fn root_targets(&self) -> &BTreeSet<Box<str>> {
+        &self.root_targets
+    }
+
     /// SHA-256 digest of the exact manifest bytes adapted into this contract.
     pub const fn manifest_digest(&self) -> &[u8; 32] {
         &self.manifest_digest
@@ -379,8 +400,22 @@ impl ResolverContract {
         &self.requirements
     }
 
+    #[cfg(test)]
+    pub(crate) fn requirements_mut_for_test(&mut self) -> &mut [ResolverRequirement] {
+        &mut self.requirements
+    }
+
     pub(crate) fn mvs_metadata_is_consistent(&self) -> bool {
-        contract_edges_match_mvs(self)
+        self.mvs.package_version() == &self.manifest_package_version
+            && contract_edges_match_mvs(self)
+    }
+
+    #[allow(dead_code)] // Used by the crate-private lock builder.
+    pub(crate) fn shares_root_context_with(&self, other: &Self) -> bool {
+        self.context_binding
+            .as_ref()
+            .zip(other.context_binding.as_ref())
+            .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
     }
 }
 
@@ -835,15 +870,23 @@ fn contract_edges_match_mvs(contract: &ResolverContract) -> bool {
         .into_iter()
         .zip(contract.mvs.edges())
         .all(|(requirement, edge)| {
-            let ResolverRequirementResolution::Included { named_version, .. } =
+            let ResolverRequirementResolution::Included { named_version, pin } =
                 &requirement.resolution
             else {
                 return false;
+            };
+            let pin_matches = match pin {
+                ResolverPinKind::Minimum => !edge.is_path_pin() && !edge.is_root_override_pin(),
+                ResolverPinKind::Path => edge.is_path_pin() && !edge.is_root_override_pin(),
+                ResolverPinKind::RootPathOverride => {
+                    !edge.is_path_pin() && edge.is_root_override_pin()
+                }
             };
             requirement.package.as_ref() == edge.package()
                 && requirement.version == *edge.requirement()
                 && requirement.span == edge.span()
                 && named_version == edge.named_version()
+                && pin_matches
         })
 }
 
@@ -1217,12 +1260,14 @@ pub fn build_resolver_contract(
         }
     }
     requirements.sort_by(|left, right| left.package.as_bytes().cmp(right.package.as_bytes()));
-    let mvs = MvsContract::new(package_version, mvs_edges)
+    let mvs = MvsContract::new(package_version.clone(), mvs_edges)
         .map_err(ResolverContractBuildError::MvsInput)?;
 
     Ok(ResolverContract {
         mvs,
+        manifest_package_version: package_version,
         role: parsed.role(),
+        root_targets: context.root_targets.clone(),
         manifest_digest: *parsed
             .manifest_digest()
             .expect("validated manifest is within the parser size limit"),

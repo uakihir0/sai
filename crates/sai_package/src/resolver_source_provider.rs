@@ -2608,8 +2608,8 @@ requires { acme:dep @ ^1 from path "../dep" }
         let mut root_contract =
             build_resolver_contract(&root, &context, PackageValidationContext::default())
                 .expect("root resolver contract is valid");
-        let pin_span = root_contract.requirements[0].span.clone();
-        root_contract.requirements[0].source = None;
+        let pin_span = root_contract.requirements()[0].span.clone();
+        root_contract.requirements_mut_for_test()[0].source = None;
 
         let result = select_with_source_provider(
             &root_contract,
@@ -4332,7 +4332,7 @@ requires { acme:b @ ^1 from git "https://example.test/b-from-late" }
             .dependency_contracts
             .get_mut(&late)
             .expect("late contract was loaded")
-            .requirements
+            .requirements_mut_for_test()
             .iter_mut()
             .find(|requirement| requirement.package.as_ref() == "acme:b")
             .expect("late edge metadata exists")
@@ -4674,7 +4674,7 @@ requires { acme:dep @ ^1 from git "https://example.test/dep" }
                 .expect("root resolver contract is valid");
         let root_version = root_contract.mvs.package_version().clone();
         let requirement = root_contract
-            .requirements
+            .requirements()
             .iter()
             .find(|requirement| requirement.package.as_ref() == "acme:dep")
             .expect("root dependency metadata exists");
