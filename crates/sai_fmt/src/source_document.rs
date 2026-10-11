@@ -603,49 +603,150 @@ fn expression_document(
             ]))
         }
         Expr::Binary(binary) => {
-            let lhs = binary.lhs().ok_or(SourceDocumentError::UnsupportedShape)?;
-            let rhs = binary.rhs().ok_or(SourceDocumentError::UnsupportedShape)?;
-            let (operator, kind) = binary.op().ok_or(SourceDocumentError::UnsupportedShape)?;
-            if !matches!(
-                kind,
-                ast::BinOp::Eq
-                    | ast::BinOp::Ne
-                    | ast::BinOp::Lt
-                    | ast::BinOp::Le
-                    | ast::BinOp::Gt
-                    | ast::BinOp::Ge
-            ) || binary.syntax().children().count() != 2
-                || direct_token_kinds(binary.syntax()) != [operator.kind()]
-            {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            let group_id = expression_group_ids.next();
-            let left = expression_document(source, &lhs, context, expression_group_ids)?;
-            let right = expression_document(source, &rhs, context, expression_group_ids)?;
-            let operator_text = token_text(source, &operator)?;
-            let operator_and_right =
-                Doc::concat([Doc::Line, Doc::text(operator_text), Doc::text(" "), right]);
-            match context {
-                ExpressionContext::Protected => Ok(Doc::group(
-                    group_id,
-                    Doc::concat([left, Doc::indent(operator_and_right)]),
-                )),
-                ExpressionContext::ParenthesizedWhole => {
-                    Ok(Doc::concat([left, operator_and_right]))
-                }
-                ExpressionContext::Unprotected => Ok(Doc::group(
-                    group_id,
-                    Doc::concat([
-                        Doc::if_broken(group_id, Doc::text("("), Doc::text("")),
-                        Doc::indent(Doc::concat([Doc::SoftLine, left, operator_and_right])),
-                        Doc::SoftLine,
-                        Doc::if_broken(group_id, Doc::text(")"), Doc::text("")),
-                    ]),
-                )),
-            }
+            operator_chain_document(source, binary, context, expression_group_ids)
         }
         _ => Err(SourceDocumentError::UnsupportedShape),
     }
+}
+
+fn operator_chain_document(
+    source: &ParsedSource,
+    binary: &ast::BinExpr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let (_, _, _, root_operator) = binary_parts(binary)?;
+    let precedence = binary_precedence(root_operator);
+    let is_comparison = matches!(
+        root_operator,
+        ast::BinOp::Eq
+            | ast::BinOp::Ne
+            | ast::BinOp::Lt
+            | ast::BinOp::Le
+            | ast::BinOp::Gt
+            | ast::BinOp::Ge
+    );
+    let mut operands = Vec::new();
+    let mut operators = Vec::new();
+    collect_binary_chain(
+        &Expr::Binary(binary.clone()),
+        precedence,
+        &mut operands,
+        &mut operators,
+    )?;
+    if operands.len() != operators.len() + 1 || (is_comparison && operators.len() != 1) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut operand_documents = operands
+        .iter()
+        .map(|operand| {
+            expression_document(
+                source,
+                operand,
+                ExpressionContext::Protected,
+                expression_group_ids,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = operand_documents
+        .drain(..1)
+        .next()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let mut suffixes = Vec::with_capacity(operators.len() * 4);
+    for (operator, operand) in operators.iter().zip(operand_documents) {
+        suffixes.push(Doc::Line);
+        suffixes.push(Doc::text(token_text(source, operator)?.to_owned()));
+        suffixes.push(Doc::text(" "));
+        suffixes.push(operand);
+    }
+
+    let group_id = expression_group_ids.next();
+    match context {
+        ExpressionContext::Protected => Ok(Doc::group(
+            group_id,
+            Doc::concat([first, Doc::indent(Doc::concat(suffixes))]),
+        )),
+        ExpressionContext::ParenthesizedWhole => Ok(Doc::group(
+            group_id,
+            Doc::concat([first, Doc::concat(suffixes)]),
+        )),
+        ExpressionContext::Unprotected => Ok(Doc::group(
+            group_id,
+            Doc::concat([
+                Doc::if_broken(group_id, Doc::text("("), Doc::text("")),
+                Doc::indent(Doc::concat([Doc::SoftLine, first, Doc::concat(suffixes)])),
+                Doc::SoftLine,
+                Doc::if_broken(group_id, Doc::text(")"), Doc::text("")),
+            ]),
+        )),
+    }
+}
+
+fn binary_parts(
+    binary: &ast::BinExpr,
+) -> Result<(Expr, SyntaxToken, Expr, ast::BinOp), SourceDocumentError> {
+    let lhs = binary.lhs().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let rhs = binary.rhs().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let (operator, kind) = binary.op().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let token_kinds = direct_token_kinds(binary.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if binary.syntax().children().count() != 2 || token_kinds != [operator.kind()] {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok((lhs, operator, rhs, kind))
+}
+
+fn binary_precedence(operator: ast::BinOp) -> u8 {
+    match operator {
+        ast::BinOp::Or => 1,
+        ast::BinOp::And => 2,
+        ast::BinOp::Eq
+        | ast::BinOp::Ne
+        | ast::BinOp::Lt
+        | ast::BinOp::Le
+        | ast::BinOp::Gt
+        | ast::BinOp::Ge => 3,
+        ast::BinOp::BitOr => 4,
+        ast::BinOp::BitXor => 5,
+        ast::BinOp::BitAnd => 6,
+        ast::BinOp::Shl | ast::BinOp::Shr => 7,
+        ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::WrappingAdd | ast::BinOp::WrappingSub => 8,
+        ast::BinOp::Mul | ast::BinOp::Div | ast::BinOp::Rem | ast::BinOp::WrappingMul => 9,
+    }
+}
+
+fn collect_binary_chain(
+    expression: &Expr,
+    precedence: u8,
+    operands: &mut Vec<Expr>,
+    operators: &mut Vec<SyntaxToken>,
+) -> Result<(), SourceDocumentError> {
+    enum WorkItem {
+        Expression(Expr),
+        Operator(SyntaxToken),
+    }
+
+    let mut pending = vec![WorkItem::Expression(expression.clone())];
+    while let Some(item) = pending.pop() {
+        match item {
+            WorkItem::Operator(operator) => operators.push(operator),
+            WorkItem::Expression(Expr::Binary(binary)) => {
+                let (lhs, operator, rhs, kind) = binary_parts(&binary)?;
+                if binary_precedence(kind) == precedence {
+                    pending.push(WorkItem::Expression(rhs));
+                    pending.push(WorkItem::Operator(operator));
+                    pending.push(WorkItem::Expression(lhs));
+                } else {
+                    operands.push(Expr::Binary(binary));
+                }
+            }
+            WorkItem::Expression(operand) => operands.push(operand),
+        }
+    }
+    Ok(())
 }
 
 fn member_chain_document(
@@ -1929,6 +2030,106 @@ mod tests {
         let output = format_shape(input).expect("contract clauses are supported");
         assert_eq!(output, expected);
         parse_source(output.as_bytes()).expect("canonical clauses parse");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_binary_operators_by_precedence_and_source_order() {
+        for (input, expected) in [
+            (
+                b"fn f() requires a+b*c>=limit {}".as_slice(),
+                "fn f()\n    requires a + b * c >= limit\n{}\n",
+            ),
+            (
+                b"fn f() ensures a-b+c==d {}",
+                "fn f()\n    ensures a - b + c == d\n{}\n",
+            ),
+            (
+                b"fn f() requires a or b and c {}",
+                "fn f()\n    requires a or b and c\n{}\n",
+            ),
+            (
+                b"fn f() requires a<<b|c {}",
+                "fn f()\n    requires a << b | c\n{}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("binary operator expression parses");
+            let output = format_shape(input).expect("binary operator expression is supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted expression parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn breaks_operator_chains_with_context_appropriate_parentheses() {
+        let first = "first".repeat(8);
+        let second = "second".repeat(7);
+        let third = "third".repeat(5);
+
+        let input = format!("fn f() requires {first}+{second}+{third} {{}}");
+        let expected = format!(
+            "fn f()\n    requires (\n        {first}\n        + {second}\n        + {third}\n    )\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("top-level chain parses");
+        let output = format_shape(input.as_bytes()).expect("top-level chain is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped chain parses");
+        assert_eq!(
+            contract_expression_shape(parsed.root()),
+            contract_expression_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let input = format!("fn f() requires check({first}+{second}+{third}) {{}}");
+        let expected = format!(
+            "fn f()\n    requires check(\n        {first}\n            + {second}\n            + {third},\n    )\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("protected chain parses");
+        let output = format_shape(input.as_bytes()).expect("protected chain is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("protected chain parses again");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let input = format!("fn f() requires ({first}+{second}+{third}) {{}}");
+        let expected = format!(
+            "fn f()\n    requires (\n        {first}\n        + {second}\n        + {third}\n    )\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("explicit chain parses");
+        let output = format_shape(input.as_bytes()).expect("explicit chain is supported");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("explicit chain reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_long_operator_chains_without_recursive_flattening() {
+        let term_count = 4096;
+        let terms = (0..term_count)
+            .map(|index| format!("value{index}"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let input = format!("fn f() requires {terms} {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("long operator chain parses");
+        let output = format_shape(input.as_bytes()).expect("long operator chain is supported");
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.trim_start().starts_with("+ "))
+                .count(),
+            term_count - 1
+        );
+        let reparsed = parse_source(output.as_bytes()).expect("formatted long chain parses");
+        assert_eq!(
+            contract_expression_shape(parsed.root()),
+            contract_expression_shape(reparsed.root())
+        );
         assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
