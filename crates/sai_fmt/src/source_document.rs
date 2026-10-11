@@ -320,17 +320,29 @@ fn generic_param_document(
 ) -> Result<Doc, SourceDocumentError> {
     match parameter {
         ast::GenericParam::Type(parameter) => {
+            let bounds = parameter
+                .bounds()
+                .map(|bounds| bound_list_document(source, &bounds))
+                .transpose()?;
+            let expected_tokens = if bounds.is_some() {
+                vec![SyntaxKind::COLON]
+            } else {
+                Vec::new()
+            };
             if parameter.attrs().next().is_some()
-                || parameter.bounds().is_some()
-                || parameter.syntax().children().count() != 1
-                || !direct_token_kinds(parameter.syntax()).is_empty()
+                || parameter.syntax().children().count() != 1 + usize::from(bounds.is_some())
+                || direct_token_kinds(parameter.syntax()) != expected_tokens
             {
                 return Err(SourceDocumentError::UnsupportedShape);
             }
             let name = parameter
                 .name()
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
-            Ok(Doc::text(node_text(source, name.syntax())))
+            let mut documents = vec![Doc::text(node_text(source, name.syntax()))];
+            if let Some(bounds) = bounds {
+                documents.extend([Doc::text(": "), bounds]);
+            }
+            Ok(Doc::concat(documents))
         }
         ast::GenericParam::Const(parameter) => {
             if parameter.attrs().next().is_some()
@@ -354,6 +366,113 @@ fn generic_param_document(
             ]))
         }
     }
+}
+
+fn bound_list_document(
+    source: &ParsedSource,
+    bound_list: &ast::BoundList,
+) -> Result<Doc, SourceDocumentError> {
+    let bounds = bound_list.bounds().collect::<Vec<_>>();
+    let syntax = bound_list.syntax();
+    if bounds.is_empty()
+        || syntax.children().count() != bounds.len()
+        || direct_token_kinds(syntax) != vec![SyntaxKind::PLUS; bounds.len() - 1]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let documents = bounds
+        .into_iter()
+        .map(|bound| bound_document(source, bound))
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = syntax.text_range();
+    let mut list = Vec::with_capacity(documents.len() * 2 - 1);
+    for (index, bound) in documents.into_iter().enumerate() {
+        if index > 0 {
+            list.extend([
+                Doc::text(" "),
+                Doc::text("+"),
+                Doc::indent(Doc::concat([Doc::Line, bound])),
+            ]);
+        } else {
+            list.push(bound);
+        }
+    }
+    Ok(Doc::group(GroupId(range.start().raw()), Doc::concat(list)))
+}
+
+fn bound_document(source: &ParsedSource, bound: ast::Bound) -> Result<Doc, SourceDocumentError> {
+    match bound {
+        ast::Bound::Trait(bound) => {
+            let path = bound.path().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let effects = bound.effects();
+            if bound.syntax().children().count() != 1 + usize::from(effects.is_some())
+                || !direct_token_kinds(bound.syntax()).is_empty()
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut documents = vec![type_document(source, &ast::Type::PathType(path))?];
+            if let Some(effects) = effects {
+                documents.extend([Doc::text(" "), effects_clause_document(source, &effects)?]);
+            }
+            Ok(Doc::concat(documents))
+        }
+        ast::Bound::FnSugar(bound) => fn_sugar_bound_document(source, &bound),
+    }
+}
+
+fn fn_sugar_bound_document(
+    source: &ParsedSource,
+    bound: &ast::FnSugarBound,
+) -> Result<Doc, SourceDocumentError> {
+    let name = bound.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let parameters = bound.params().collect::<Vec<_>>();
+    let return_type = bound.ret_type();
+    let effects = bound.effects();
+    let mut expected_tokens = vec![SyntaxKind::L_PAREN];
+    expected_tokens.extend(std::iter::repeat_n(
+        SyntaxKind::COMMA,
+        parameters.len().saturating_sub(1),
+    ));
+    expected_tokens.push(SyntaxKind::R_PAREN);
+    if return_type.is_some() {
+        expected_tokens.push(SyntaxKind::THIN_ARROW);
+    }
+    let direct_tokens = direct_token_kinds(bound.syntax());
+    if !parameters.is_empty() && direct_tokens.get(parameters.len()) == Some(&SyntaxKind::COMMA) {
+        expected_tokens.insert(parameters.len(), SyntaxKind::COMMA);
+    }
+    if bound.syntax().children().count()
+        != 1 + parameters.len()
+            + usize::from(return_type.is_some())
+            + usize::from(effects.is_some())
+        || direct_tokens != expected_tokens
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let parameter_documents = parameters
+        .iter()
+        .map(|parameter| type_document(source, parameter))
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = bound.syntax().text_range();
+    let mut documents = vec![
+        Doc::text(node_text(source, name.syntax())),
+        delimited_list_document(
+            GroupId(range.start().raw()),
+            "(",
+            ")",
+            parameter_documents,
+            false,
+        ),
+    ];
+    if let Some(return_type) = return_type {
+        documents.extend([Doc::text(" -> "), type_document(source, &return_type)?]);
+    }
+    if let Some(effects) = effects {
+        documents.extend([Doc::text(" "), effects_clause_document(source, &effects)?]);
+    }
+    Ok(Doc::concat(documents))
 }
 
 fn flat_document_width(document: &Doc) -> Option<usize> {
@@ -1090,6 +1209,53 @@ mod tests {
     }
 
     #[test]
+    fn formats_function_generic_trait_and_function_bounds() {
+        for (input, expected) in [
+            (
+                b"fn f<T:Copy+Clone>(){}".as_slice(),
+                "fn f<T: Copy + Clone>() {}\n",
+            ),
+            (
+                b"fn f<T:Iterator<Item=U32>+Clone>(){}",
+                "fn f<T: Iterator<Item = U32> + Clone>() {}\n",
+            ),
+            (
+                b"fn f<T:Fn(I32)->I32 effects{io}>(){}",
+                "fn f<T: Fn(I32) -> I32 effects { io }>() {}\n",
+            ),
+            (b"fn f<T:Fn(I32,)>(){}", "fn f<T: Fn(I32)>() {}\n"),
+            (b"fn f<T:Fn(I32,Str,)>(){}", "fn f<T: Fn(I32, Str)>() {}\n"),
+            (
+                b"fn f<T:Clone effects{io}>(){}",
+                "fn f<T: Clone effects { io }>() {}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("input parses");
+            let output = format_shape(input)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", String::from_utf8_lossy(input)));
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("output parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn breaks_long_function_generic_bounds_after_plus() {
+        let first = format!("Trait{}", "A".repeat(42));
+        let second = format!("Clone{}", "B".repeat(42));
+        let input = format!("fn f<T:{first}+{second}>(){{}}");
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("long generic bounds are supported");
+        let expected = format!("fn f<\n    T: {first} +\n        {second},\n>() {{}}\n");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped bounds parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn keeps_short_generics_flat_when_function_parameters_wrap() {
         let first = "first".repeat(9);
         let second = "second".repeat(8);
@@ -1480,10 +1646,6 @@ mod tests {
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
-            format_shape(b"fn f<T: Clone>() {}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
             format_shape(b"fn f(self: Foo) {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
@@ -1560,9 +1722,9 @@ mod tests {
                         );
                     } else {
                         let trailing_comma_close = match node.kind() {
-                            SyntaxKind::PARAM_LIST | SyntaxKind::FN_PTR_TYPE => {
-                                Some(SyntaxKind::R_PAREN)
-                            }
+                            SyntaxKind::PARAM_LIST
+                            | SyntaxKind::FN_PTR_TYPE
+                            | SyntaxKind::FN_SUGAR_BOUND => Some(SyntaxKind::R_PAREN),
                             SyntaxKind::GENERIC_ARG_LIST | SyntaxKind::GENERIC_PARAM_LIST => {
                                 Some(SyntaxKind::GT)
                             }
