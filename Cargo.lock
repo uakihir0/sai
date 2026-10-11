@@ -3048,6 +3048,7 @@ dependencies = [
 name = "sai_fmt"
 version = "0.1.0"
 dependencies = [
+ "sai_package",
  "sai_syntax",
 ]
 

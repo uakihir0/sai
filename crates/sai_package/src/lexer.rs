@@ -94,15 +94,23 @@ pub struct PackageLexOutput {
 /// The two formats share tokenization. Package contracts and lock files use
 /// their own contextual newline continuation sets.
 pub fn lex(source: &[u8]) -> PackageLexOutput {
-    lex_with_mode(source, LexMode::Package)
+    lex_with_mode(source, LexMode::Package, true)
+}
+
+/// Lexes a package contract without retaining whitespace and comment trivia.
+///
+/// This is useful when a parser already owns the trivia stream and a consumer
+/// needs a separate token stream for formatting or source analysis.
+pub fn lex_tokens(source: &[u8]) -> PackageLexOutput {
+    lex_with_mode(source, LexMode::Package, false)
 }
 
 /// Lexes a lock file using its field-aware newline continuation set.
 pub(crate) fn lex_lock(source: &[u8]) -> PackageLexOutput {
-    lex_with_mode(source, LexMode::Lock)
+    lex_with_mode(source, LexMode::Lock, true)
 }
 
-fn lex_with_mode(source: &[u8], mode: LexMode) -> PackageLexOutput {
+fn lex_with_mode(source: &[u8], mode: LexMode, retain_trivia: bool) -> PackageLexOutput {
     let text = match std::str::from_utf8(source) {
         Ok(text) => text,
         Err(error) => {
@@ -124,7 +132,7 @@ fn lex_with_mode(source: &[u8], mode: LexMode) -> PackageLexOutput {
             };
         }
     };
-    Lexer::new(text, mode).run()
+    Lexer::new(text, mode, retain_trivia).run()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +144,7 @@ enum LexMode {
 struct Lexer<'a> {
     text: &'a str,
     mode: LexMode,
+    retain_trivia: bool,
     pos: usize,
     tokens: Vec<PackageToken>,
     trivia: Vec<PackageTrivia>,
@@ -145,10 +154,11 @@ struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    fn new(text: &'a str, mode: LexMode) -> Self {
+    fn new(text: &'a str, mode: LexMode, retain_trivia: bool) -> Self {
         Self {
             text,
             mode,
+            retain_trivia,
             pos: 0,
             tokens: Vec::new(),
             trivia: Vec::new(),
@@ -220,7 +230,9 @@ impl<'a> Lexer<'a> {
     }
 
     fn push_trivia(&mut self, kind: PackageTriviaKind, span: Range<usize>) {
-        self.trivia.push(PackageTrivia { kind, span });
+        if self.retain_trivia {
+            self.trivia.push(PackageTrivia { kind, span });
+        }
     }
 
     fn error(&mut self, kind: PackageLexErrorKind, span: Range<usize>) {
@@ -964,7 +976,7 @@ fn punctuator_at(text: &str, start: usize) -> Option<(PackagePunctuator, usize)>
 mod tests {
     use super::{
         PackageLexErrorKind as ErrorKind, PackagePunctuator as Punct, PackageTokenKind as Kind,
-        lex, lex_lock,
+        lex, lex_lock, lex_tokens,
     };
 
     fn token_text(source: &str, kind: Kind, index: usize) -> &str {
@@ -1001,6 +1013,22 @@ mod tests {
             "acme:json/client_v2"
         );
         assert_eq!(token_text(source, Kind::Version, 4), "1.2.3");
+    }
+
+    #[test]
+    fn token_only_lexing_preserves_tokens_and_errors_without_trivia() {
+        for source in [
+            b"\xef\xbb\xbfpackage acme:app @ 1.0.0 // note\r\ntargets { wasm32-core }\n".as_slice(),
+            b"package acme:app @ 1.0.0\n$\n".as_slice(),
+            b"package acme:app @ 1.0.0\n\xff".as_slice(),
+        ] {
+            let with_trivia = lex(source);
+            let token_only = lex_tokens(source);
+
+            assert_eq!(token_only.tokens, with_trivia.tokens);
+            assert_eq!(token_only.errors, with_trivia.errors);
+            assert!(token_only.trivia.is_empty());
+        }
     }
 
     #[test]
