@@ -235,13 +235,27 @@ fn parameter_list_document(
     source: &ParsedSource,
     params: &ast::ParamList,
 ) -> Result<Doc, SourceDocumentError> {
-    if params.self_param().is_some() {
+    let mut parameters = Vec::new();
+    let mut self_params = params.syntax().children().filter_map(ast::SelfParam::cast);
+    let self_param = self_params.next();
+    if self_params.next().is_some() {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let parameters = params
-        .params()
-        .map(|param| parameter_document(source, param))
-        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(self_param) = self_param {
+        if params.params().next().is_some_and(|param| {
+            self_param.syntax().text_range().start().raw()
+                > param.syntax().text_range().start().raw()
+        }) {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        parameters.push(self_parameter_document(self_param)?);
+    }
+    parameters.extend(
+        params
+            .params()
+            .map(|param| parameter_document(source, param))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     if parameters.is_empty() {
         return Ok(Doc::text("()"));
     }
@@ -284,6 +298,34 @@ fn parameter_document(
         "{mutable}{}: {type_name}",
         node_text(source, name.syntax())
     )))
+}
+
+fn self_parameter_document(param: ast::SelfParam) -> Result<Doc, SourceDocumentError> {
+    if param.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let ty = param.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let type_name = match ty {
+        ast::Type::SelfType(self_type) if self_type.segments().next().is_none() => {
+            "Self".to_owned()
+        }
+        ast::Type::BorrowType(borrow_type)
+            if matches!(
+                borrow_type.ty(),
+                Some(ast::Type::SelfType(self_type)) if self_type.segments().next().is_none()
+            ) =>
+        {
+            let mutable = if borrow_type.mut_token().is_some() {
+                "mut "
+            } else {
+                ""
+            };
+            format!("borrow {mutable}Self")
+        }
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    let mutable = if param.is_mutable() { "var " } else { "" };
+    Ok(Doc::text(format!("{mutable}self: {type_name}")))
 }
 
 fn simple_path_type_text<'a>(
@@ -429,6 +471,49 @@ mod tests {
     }
 
     #[test]
+    fn formats_supported_self_parameter_types() {
+        for (input, expected) in [
+            (b"fn f(self:Self){}".as_slice(), "fn f(self: Self) {}\n"),
+            (b"fn f(var self:Self){}", "fn f(var self: Self) {}\n"),
+            (
+                b"fn f(self:borrow mut Self){}",
+                "fn f(self: borrow mut Self) {}\n",
+            ),
+            (
+                b"fn f(var self:borrow Self){}",
+                "fn f(var self: borrow Self) {}\n",
+            ),
+            (
+                b"fn f(var self:borrow mut Self,x:I32){}",
+                "fn f(var self: borrow mut Self, x: I32) {}\n",
+            ),
+            (
+                b"fn f(self:borrow   Self){}",
+                "fn f(self: borrow Self) {}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("input parses");
+            let output = format_shape(input).expect("receiver form is supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("output parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+
+        let first = "a".repeat(39);
+        let second = "b".repeat(39);
+        let without_receiver = format!("fn f({first}:I32,{second}:U32){{}}");
+        let flat = format_shape(without_receiver.as_bytes()).expect("signature is supported");
+        assert_eq!(flat, format!("fn f({first}: I32, {second}: U32) {{}}\n"));
+        assert!(flat.lines().all(|line| line.chars().count() <= 100));
+
+        let input = format!("fn f(self:Self,{first}:I32,{second}:U32){{}}");
+        let expected =
+            format!("fn f(\n    self: Self,\n    {first}: I32,\n    {second}: U32,\n) {{}}\n");
+        assert_eq!(format_shape(input.as_bytes()), Ok(expected));
+    }
+
+    #[test]
     fn return_type_width_can_break_a_parameter_list() {
         let first = "a".repeat(39);
         let second = "b".repeat(39);
@@ -540,6 +625,30 @@ mod tests {
         );
         assert_eq!(
             format_shape(b"fn f() -> Vec<I32> {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(self: Foo) {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(self: Self.Item) {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(self: borrow Self.Item) {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(x: I32, self: Self) {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(self: Self, self: Self) {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(self: Self, x: I32, self: Self) {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
