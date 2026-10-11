@@ -1,5 +1,5 @@
 use sai_syntax::{
-    SyntaxKind, TriviaKind,
+    GreenElement, GreenNode, GreenTrivia, TriviaKind,
     ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Pattern, Stmt},
 };
 
@@ -14,43 +14,11 @@ pub(super) enum SourceDocumentError {
 /// Build a document for the deliberately small source-formatting foundation.
 ///
 /// The builder is private and fail-closed while source-formatting coverage is
-/// being implemented. Its first unit is a function with no parameters or
-/// clauses, one literal `let`, and a final name expression.
+/// being implemented. It accepts files made only of unannotated, zero-argument
+/// functions with empty bodies or one single-line literal `let` and a final
+/// name expression.
 pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocumentError> {
-    if source.lexed().trivia.iter().any(|trivia| {
-        matches!(
-            trivia.kind,
-            TriviaKind::LineComment | TriviaKind::BlockComment | TriviaKind::Shebang
-        )
-    }) {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
-
-    let tokens = source
-        .lexed()
-        .tokens
-        .iter()
-        .filter(|token| !matches!(token.kind, SyntaxKind::NEWLINE | SyntaxKind::EOF))
-        .collect::<Vec<_>>();
-    let expected = [
-        SyntaxKind::FN_KW,
-        SyntaxKind::LIDENT,
-        SyntaxKind::L_PAREN,
-        SyntaxKind::R_PAREN,
-        SyntaxKind::L_BRACE,
-        SyntaxKind::LET_KW,
-        SyntaxKind::LIDENT,
-        SyntaxKind::EQ,
-        SyntaxKind::INT,
-        SyntaxKind::LIDENT,
-        SyntaxKind::R_BRACE,
-    ];
-    if tokens.len() != expected.len()
-        || !tokens
-            .iter()
-            .zip(expected)
-            .all(|(token, expected)| token.kind == expected)
-    {
+    if has_comment_trivia(source.root().green()) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
 
@@ -60,15 +28,86 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let items = file.items().collect::<Vec<_>>();
-    if items.len() != 1 {
+    if source.root().children().count() != items.len() {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let Item::Function(function) = items.into_iter().next().expect("one source item") else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
+    let mut functions = Vec::with_capacity(items.len());
+    for item in items {
+        let Item::Function(function) = item else {
+            return Err(SourceDocumentError::UnsupportedShape);
+        };
+        functions.push(function_document(source, &function)?);
+    }
+    if functions.is_empty() {
+        return Ok(Doc::concat([]));
+    }
+
+    let mut document = Vec::with_capacity(functions.len() * 2 - 1);
+    for (index, function) in functions.iter().enumerate() {
+        if index > 0 {
+            let previous = &functions[index - 1];
+            let gap = source
+                .text()
+                .get(previous.end..function.start)
+                .unwrap_or_default();
+            let preserve_blank_line = gap.matches('\n').count() > 1;
+            let separate_with_blank_line =
+                previous.multiline || function.multiline || preserve_blank_line;
+            document.push(Doc::HardLine);
+            if separate_with_blank_line {
+                document.push(Doc::HardLine);
+            }
+        }
+        document.push(function.document.clone());
+    }
+    Ok(Doc::concat(document))
+}
+
+fn has_comment_trivia(root: &GreenNode) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        for child in node.children() {
+            match child {
+                GreenElement::Node(child) => pending.push(child),
+                GreenElement::Token(token) => {
+                    if token
+                        .leading_trivia()
+                        .iter()
+                        .chain(token.trailing_trivia())
+                        .any(is_comment_trivia)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_comment_trivia(trivia: &GreenTrivia) -> bool {
+    matches!(
+        trivia.kind(),
+        TriviaKind::LineComment | TriviaKind::BlockComment | TriviaKind::Shebang
+    )
+}
+
+struct FunctionDocument {
+    document: Doc,
+    start: usize,
+    end: usize,
+    multiline: bool,
+}
+
+fn function_document(
+    source: &ParsedSource,
+    function: &ast::FnDecl,
+) -> Result<FunctionDocument, SourceDocumentError> {
     if function.docs().is_some()
         || function.attrs().next().is_some()
         || function.visibility().is_some()
+        || function.unsafe_token().is_some()
+        || function.async_token().is_some()
         || function.generic_params().is_some()
         || function.ret_type().is_some()
         || function.where_clause().is_some()
@@ -88,98 +127,94 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
     let block = function
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let mut statements = block.statements();
-    let Some(Stmt::Let(binding_stmt)) = statements.next() else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
-    let Some(Stmt::Expr(tail_stmt)) = statements.next() else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
-    if statements.next().is_some() {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
-
-    let pattern = binding_stmt
-        .pattern()
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let Pattern::Binding(pattern) = pattern else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
-    if pattern.mode().is_some() {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
     let name = function
         .name()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let binding = pattern
-        .name()
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let initializer = binding_stmt
-        .initializer()
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let Expr::Literal(initializer) = initializer else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
-    let Some(LiteralToken::Int(literal)) = initializer.token() else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
-    let tail = tail_stmt
-        .expression()
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let Expr::Path(tail) = tail else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
-    if tail.generic_args().is_some() {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
-    let tail_name = tail.name().ok_or(SourceDocumentError::UnsupportedShape)?;
-
     let name = node_text(source, name.syntax());
-    let binding = node_text(source, binding.syntax());
-    let literal = token_text(source.text(), literal.syntax());
-    let literal = normalize_integer_literal(literal);
-    let tail = node_text(source, tail_name.syntax());
-    let statement_separator = source
-        .text()
-        .get(
-            binding_stmt.syntax().text_range().end().to_usize()
-                ..tail_stmt.syntax().text_range().start().to_usize(),
-        )
-        .unwrap_or_default();
-    let blank_line = statement_separator.matches('\n').count() > 1;
-
-    let rhs = Doc::choice([
-        Doc::concat([Doc::text(" "), Doc::flat(Doc::text(literal.clone()))]),
-        Doc::indent(Doc::concat([
-            Doc::HardLine,
-            Doc::flat(Doc::text(literal.clone())),
-        ])),
-        Doc::concat([Doc::text(" "), Doc::text(literal)]),
-    ]);
-    let separator = if blank_line {
-        Doc::concat([Doc::HardLine, Doc::HardLine])
-    } else {
-        Doc::HardLine
+    let statements = block.statements().collect::<Vec<_>>();
+    let body = match statements.as_slice() {
+        [] => Doc::text("{}"),
+        [Stmt::Let(binding_stmt), Stmt::Expr(tail_stmt)] => {
+            let pattern = binding_stmt
+                .pattern()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let Pattern::Binding(pattern) = pattern else {
+                return Err(SourceDocumentError::UnsupportedShape);
+            };
+            if pattern.mode().is_some()
+                || binding_stmt.ty().is_some()
+                || binding_stmt.else_clause().is_some()
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let name = pattern
+                .name()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let initializer = binding_stmt
+                .initializer()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let Expr::Literal(initializer) = initializer else {
+                return Err(SourceDocumentError::UnsupportedShape);
+            };
+            let literal = initializer
+                .token()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let literal = normalize_literal(source, literal)?;
+            let tail = tail_stmt
+                .expression()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let Expr::Path(tail) = tail else {
+                return Err(SourceDocumentError::UnsupportedShape);
+            };
+            if tail.generic_args().is_some() {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let tail_name = tail.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let name_text = node_text(source, name.syntax());
+            let tail_text = node_text(source, tail_name.syntax());
+            let statement_separator = source
+                .text()
+                .get(
+                    binding_stmt.syntax().text_range().end().to_usize()
+                        ..tail_stmt.syntax().text_range().start().to_usize(),
+                )
+                .unwrap_or_default();
+            let separator = if statement_separator.matches('\n').count() > 1 {
+                Doc::concat([Doc::HardLine, Doc::HardLine])
+            } else {
+                Doc::HardLine
+            };
+            let rhs = Doc::choice([
+                Doc::concat([Doc::text(" "), Doc::flat(Doc::text(literal.clone()))]),
+                Doc::indent(Doc::concat([
+                    Doc::HardLine,
+                    Doc::flat(Doc::text(literal.clone())),
+                ])),
+                Doc::concat([Doc::text(" "), Doc::text(literal)]),
+            ]);
+            Doc::concat([
+                Doc::text("{"),
+                Doc::indent(Doc::concat([
+                    Doc::HardLine,
+                    Doc::text(format!("let {name_text} =")),
+                    rhs,
+                    separator,
+                    Doc::text(tail_text),
+                ])),
+                Doc::HardLine,
+                Doc::text("}"),
+            ])
+        }
+        _ => return Err(SourceDocumentError::UnsupportedShape),
     };
-    Ok(Doc::concat([
-        Doc::text(format!("fn {name}() {{")),
-        Doc::indent(Doc::concat([
-            Doc::HardLine,
-            Doc::text(format!("let {binding} =")),
-            rhs,
-            separator,
-            Doc::text(tail),
-        ])),
-        Doc::HardLine,
-        Doc::text("}"),
-    ]))
-}
-
-fn token_text<'a>(source: &'a str, token: &sai_syntax::SyntaxToken) -> &'a str {
-    let range = token.text_range();
-    source
-        .get(range.start().to_usize()..range.end().to_usize())
-        .unwrap_or_default()
+    let document = Doc::concat([Doc::text(format!("fn {name}() ")), body]);
+    let range = function.syntax().text_range();
+    Ok(FunctionDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline: !statements.is_empty(),
+    })
 }
 
 fn node_text<'a>(source: &'a ParsedSource, node: &sai_syntax::SyntaxNode) -> &'a str {
@@ -196,6 +231,31 @@ fn normalize_integer_literal(literal: &str) -> String {
     } else {
         literal.to_owned()
     }
+}
+
+fn normalize_literal(
+    source: &ParsedSource,
+    literal: LiteralToken,
+) -> Result<String, SourceDocumentError> {
+    let token = literal.syntax();
+    let range = token.text_range();
+    let text = source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if text.contains(['\r', '\n']) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(match literal {
+        LiteralToken::Int(_) => normalize_integer_literal(text),
+        LiteralToken::Float(_) => text.replace('E', "e"),
+        LiteralToken::String(_)
+        | LiteralToken::ByteString(_)
+        | LiteralToken::Char(_)
+        | LiteralToken::Byte(_)
+        | LiteralToken::True(_)
+        | LiteralToken::False(_) => text.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -225,6 +285,55 @@ mod tests {
     fn supported_output_is_a_fixed_point() {
         let once = format_shape(b"fn f(){let x=1\nx}").expect("supported shape");
         assert_eq!(format_shape(once.as_bytes()), Ok(once));
+    }
+
+    #[test]
+    fn formats_empty_functions_and_preserves_top_level_blank_lines() {
+        assert_eq!(format_shape(b""), Ok(String::new()));
+        assert_eq!(format_shape(b"fn f(){}"), Ok("fn f() {}\n".to_owned()));
+        assert_eq!(
+            format_shape(b"fn f(){}\nfn g(){}"),
+            Ok("fn f() {}\nfn g() {}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f(){}\n\nfn g(){}"),
+            Ok("fn f() {}\n\nfn g() {}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f(){let x=1\nx}\nfn g(){}"),
+            Ok("fn f() {\n    let x = 1\n    x\n}\n\nfn g() {}\n".to_owned())
+        );
+
+        let input = parse_source(b"fn f(){let x=1\nx}\nfn g(){}").expect("input parses");
+        let output = format_shape(b"fn f(){let x=1\nx}\nfn g(){}").expect("supported file");
+        let reparsed = parse_source(output.as_bytes()).expect("formatted file parses");
+        assert_eq!(syntax_shape(input.root()), syntax_shape(reparsed.root()));
+    }
+
+    #[test]
+    fn normalizes_float_literals_and_formats_other_simple_literal_kinds() {
+        assert_eq!(
+            format_shape(b"fn f(){let x=1.5E-3\nx}"),
+            Ok("fn f() {\n    let x = 1.5e-3\n    x\n}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f(){let x=true\nx}"),
+            Ok("fn f() {\n    let x = true\n    x\n}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f(){let x=\"value\"\nx}"),
+            Ok("fn f() {\n    let x = \"value\"\n    x\n}\n".to_owned())
+        );
+
+        for source in [
+            b"fn f(){}".as_slice(),
+            b"fn f(){}\n\nfn g(){}",
+            b"fn f(){let x=false\nx}",
+            b"fn f(){let x=1.5E-3\nx}",
+        ] {
+            let once = format_shape(source).expect("source has a supported shape");
+            assert_eq!(format_shape(once.as_bytes()), Ok(once));
+        }
     }
 
     #[test]
@@ -269,7 +378,19 @@ mod tests {
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
+            format_shape(b"fn f(){} // trailing"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(){} /* trailing */"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
             format_shape(b"fn f(){let x=1\nx\nx}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(){}\n/// trailing"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
@@ -308,10 +429,10 @@ mod tests {
                 }
                 Work::Token(token) => {
                     if !matches!(token.kind(), SyntaxKind::NEWLINE | SyntaxKind::EOF) {
-                        let text = if token.kind() == SyntaxKind::INT {
-                            super::normalize_integer_literal(token.text())
-                        } else {
-                            token.text().to_owned()
+                        let text = match token.kind() {
+                            SyntaxKind::INT => super::normalize_integer_literal(token.text()),
+                            SyntaxKind::FLOAT => token.text().replace('E', "e"),
+                            _ => token.text().to_owned(),
                         };
                         shape.push(ShapeElement::Token(token.kind(), text));
                     }
