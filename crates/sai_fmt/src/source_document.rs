@@ -605,8 +605,128 @@ fn expression_document(
         Expr::Binary(binary) => {
             operator_chain_document(source, binary, context, expression_group_ids)
         }
+        Expr::Prefix(prefix) => {
+            prefix_expression_document(source, prefix, context, expression_group_ids)
+        }
+        Expr::Range(range) => {
+            range_expression_document(source, range, context, expression_group_ids)
+        }
         _ => Err(SourceDocumentError::UnsupportedShape),
     }
+}
+
+fn prefix_expression_document(
+    source: &ParsedSource,
+    prefix: &ast::PrefixExpr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let mut operators = Vec::new();
+    let mut expression = Expr::Prefix(prefix.clone());
+    while let Expr::Prefix(prefix) = expression {
+        let (operator, kind) = prefix.op().ok_or(SourceDocumentError::UnsupportedShape)?;
+        let operand = prefix
+            .operand()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        let expected_tokens = match kind {
+            ast::PrefixOp::Neg => vec![SyntaxKind::MINUS],
+            ast::PrefixOp::BitNot => vec![SyntaxKind::TILDE],
+            ast::PrefixOp::Deref => vec![SyntaxKind::STAR],
+            ast::PrefixOp::Borrow => vec![SyntaxKind::BORROW_KW],
+            ast::PrefixOp::BorrowMut => vec![SyntaxKind::BORROW_KW, SyntaxKind::MUT_KW],
+            ast::PrefixOp::Not => vec![SyntaxKind::NOT_KW],
+        };
+        let direct_tokens = direct_token_kinds(prefix.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>();
+        if prefix.syntax().children().count() != 1
+            || direct_tokens != expected_tokens
+            || expected_tokens.first() != Some(&operator.kind())
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let text = match kind {
+            ast::PrefixOp::Neg | ast::PrefixOp::BitNot | ast::PrefixOp::Deref => {
+                token_text(source, &operator)?.to_owned()
+            }
+            ast::PrefixOp::Borrow => "borrow ".to_owned(),
+            ast::PrefixOp::BorrowMut => "borrow mut ".to_owned(),
+            ast::PrefixOp::Not => "not ".to_owned(),
+        };
+        operators.push(text);
+        expression = operand;
+    }
+
+    let operand_context = match context {
+        ExpressionContext::ParenthesizedWhole => ExpressionContext::Protected,
+        context => context,
+    };
+    let mut document =
+        expression_document(source, &expression, operand_context, expression_group_ids)?;
+    for operator in operators.into_iter().rev() {
+        document = Doc::concat([Doc::text(operator), document]);
+    }
+    Ok(document)
+}
+
+fn range_expression_document(
+    source: &ParsedSource,
+    range: &ast::RangeExpr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let start = range.start();
+    let end = range.end();
+    let direct_tokens = direct_token_kinds(range.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let operators = direct_tokens
+        .iter()
+        .copied()
+        .filter(|kind| matches!(kind, SyntaxKind::DOT2 | SyntaxKind::DOT2EQ))
+        .collect::<Vec<_>>();
+    let children = usize::from(start.is_some()) + usize::from(end.is_some());
+    if range.syntax().children().count() != children
+        || operators.len() != 1
+        || direct_tokens != operators
+        || (operators[0] == SyntaxKind::DOT2EQ && end.is_none())
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let operator = range
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == operators[0] => Some(token),
+            SyntaxElement::Node(_) | SyntaxElement::Token(_) => None,
+        })
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let endpoint_context = match context {
+        ExpressionContext::ParenthesizedWhole => ExpressionContext::Protected,
+        context => context,
+    };
+
+    let mut documents = Vec::with_capacity(3);
+    if let Some(start) = start {
+        documents.push(expression_document(
+            source,
+            &start,
+            endpoint_context,
+            expression_group_ids,
+        )?);
+    }
+    documents.push(Doc::text(token_text(source, &operator)?.to_owned()));
+    if let Some(end) = end {
+        documents.push(expression_document(
+            source,
+            &end,
+            endpoint_context,
+            expression_group_ids,
+        )?);
+    }
+    Ok(Doc::concat(documents))
 }
 
 fn operator_chain_document(
@@ -1784,7 +1904,7 @@ mod tests {
     use crate::{parse_source, print};
     use sai_syntax::{
         SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
-        ast::{AstNode, Expr, Type},
+        ast::{AstNode, Expr, RangeExpr, Type},
     };
 
     fn format_shape(source: &[u8]) -> Result<String, SourceDocumentError> {
@@ -2060,6 +2180,140 @@ mod tests {
             assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
             assert_eq!(format_shape(output.as_bytes()), Ok(output));
         }
+    }
+
+    #[test]
+    fn formats_prefix_operators_with_canonical_spacing() {
+        for (expression, expected_expression) in [
+            ("-value", "-value"),
+            ("~ value", "~value"),
+            ("* value", "*value"),
+            ("borrow value", "borrow value"),
+            ("borrow   mut   value", "borrow mut value"),
+            ("not value", "not value"),
+            ("not not value", "not not value"),
+            ("-~value", "-~value"),
+        ] {
+            let input = format!("fn f() requires {expression} {{}}");
+            let expected = format!("fn f()\n    requires {expected_expression}\n{{}}\n");
+            let parsed = parse_source(input.as_bytes()).expect("prefix expression parses");
+            let output = format_shape(input.as_bytes()).expect("prefix expression is supported");
+            assert_eq!(output, expected);
+            let reparsed =
+                parse_source(output.as_bytes()).expect("formatted prefix expression parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn formats_long_prefix_chains_iteratively() {
+        let prefix_count = 256;
+        let expression = format!("{}value", "-".repeat(prefix_count));
+        let input = format!("fn f() requires {expression} {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("long prefix chain parses");
+        let output = format_shape(input.as_bytes()).expect("long prefix chain is supported");
+        assert_eq!(output, format!("fn f()\n    requires {expression}\n{{}}\n"));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted prefix chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_ranges_without_spaces_and_preserves_endpoint_precedence() {
+        for (expression, expected_expression) in [
+            ("start..end", "start..end"),
+            ("start ..= end", "start..=end"),
+            ("..end", "..end"),
+            ("check(start..)", "check(start..)"),
+            ("(..)", "(..)"),
+            ("start+step..end*factor", "start + step..end * factor"),
+            ("start..end>=limit", "start..end >= limit"),
+        ] {
+            let input = format!("fn f() requires {expression} {{}}");
+            let expected = format!("fn f()\n    requires {expected_expression}\n{{}}\n");
+            let parsed = parse_source(input.as_bytes())
+                .unwrap_or_else(|error| panic!("{expression}: {error:?}"));
+            let output = format_shape(input.as_bytes())
+                .unwrap_or_else(|error| panic!("{expression}: {error:?}"));
+            assert_eq!(output, expected);
+            let reparsed =
+                parse_source(output.as_bytes()).expect("formatted range expression parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn range_endpoints_can_break_without_breaking_the_range_operator() {
+        let first = "first".repeat(9);
+        let second = "second".repeat(8);
+        let third = "third".repeat(6);
+        let expression = format!("{first}+{second}+{third}..limit");
+        let input = format!("fn f() requires {expression} {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("long range endpoint parses");
+        let output = format_shape(input.as_bytes()).expect("long range endpoint is supported");
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        assert!(output.contains(")..limit\n"));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted range parses");
+        let original_range = parsed
+            .root()
+            .descendants()
+            .find_map(RangeExpr::cast)
+            .expect("original range expression exists");
+        let formatted_range = reparsed
+            .root()
+            .descendants()
+            .find_map(RangeExpr::cast)
+            .expect("formatted range expression exists");
+        let original_start = original_range.start().expect("original range start");
+        let formatted_start = formatted_range.start().expect("formatted range start");
+        let formatted_start = match formatted_start {
+            Expr::Paren(paren) => paren
+                .expression()
+                .expect("formatter-inserted parentheses retain the endpoint"),
+            expression => expression,
+        };
+        assert_eq!(
+            syntax_shape(original_start.syntax()),
+            syntax_shape(formatted_start.syntax())
+        );
+        assert_eq!(
+            syntax_shape(original_range.end().expect("original range end").syntax()),
+            syntax_shape(formatted_range.end().expect("formatted range end").syntax())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn parenthesized_prefix_and_range_operands_use_protected_chain_layout() {
+        let first = "first".repeat(8);
+        let second = "second".repeat(7);
+        let third = "third".repeat(5);
+
+        let input = format!("fn f() requires (not {first}+{second}+{third}) {{}}");
+        let expected = format!(
+            "fn f()\n    requires (\n        not {first}\n            + {second}\n            + {third}\n    )\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("parenthesized prefix parses");
+        let output = format_shape(input.as_bytes()).expect("parenthesized prefix is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted prefix parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let input = format!("fn f() requires ({first}+{second}+{third}..limit) {{}}");
+        let expected = format!(
+            "fn f()\n    requires (\n        {first}\n            + {second}\n            + {third}..limit\n    )\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("parenthesized range parses");
+        let output = format_shape(input.as_bytes()).expect("parenthesized range is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted range parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
