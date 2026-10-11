@@ -434,6 +434,222 @@ pub(crate) fn overrides_declaration(
     Ok(Doc::concat(document))
 }
 
+pub(crate) fn requirements_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if !matches!(
+        list.owner,
+        PackageBraceOwner::Requires | PackageBraceOwner::RequiresTest
+    ) || list.kind() != crate::package_surface::PackageListKind::LinesOnly
+        || !index.contains_list(list)
+    {
+        return Err(PackageDocumentError::WrongListOwner);
+    }
+    if !index.matches_input(input) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let opening_brace =
+        usize::try_from(list.open_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let closing_brace =
+        usize::try_from(list.close_token).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    if opening_brace >= closing_brace
+        || tokens.get(opening_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::LeftBrace)
+        })
+        || tokens.get(closing_brace).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let header_len = if list.owner == PackageBraceOwner::RequiresTest {
+        2
+    } else {
+        1
+    };
+    let header_start = opening_brace
+        .checked_sub(header_len)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let header = tokens
+        .get(header_start..opening_brace)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let valid_header = match (list.owner, header) {
+        (PackageBraceOwner::Requires, [keyword]) => {
+            keyword.kind == PackageTokenKind::Word
+                && token_text(input.source(), keyword) == "requires"
+        }
+        (PackageBraceOwner::RequiresTest, [keyword, test]) => {
+            keyword.kind == PackageTokenKind::Word
+                && token_text(input.source(), keyword) == "requires"
+                && test.kind == PackageTokenKind::Word
+                && token_text(input.source(), test) == "test"
+        }
+        _ => false,
+    };
+    if !valid_header {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut comments = TokenComments::new(input, tokens, header_start, closing_brace);
+    let mut header_comments = Vec::with_capacity(header_len);
+    for token_index in header_start..opening_brace {
+        header_comments.push((
+            comments.take_leading(token_index),
+            comments.take_trailing(token_index),
+        ));
+    }
+    let opening_leading = comments.take_leading(opening_brace);
+    let opening_trailing = comments.take_trailing(opening_brace);
+    let mut closing_leading = comments.take_leading(closing_brace);
+    let closing_trailing = comments.take_trailing(closing_brace);
+
+    let indexed_entries = index
+        .entries(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let mut entries = Vec::with_capacity(indexed_entries.len());
+    for range in indexed_entries {
+        if range.start <= list.open_token
+            || range.end > list.close_token
+            || range.start >= range.end
+        {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let start = usize::try_from(range.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let end = usize::try_from(range.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+        let entry_tokens = tokens
+            .get(start..end)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let parts = requirement_entry_parts(input.source(), start, entry_tokens)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let mut leading = Vec::with_capacity(entry_tokens.len());
+        let mut trailing = Vec::with_capacity(entry_tokens.len());
+        for token_index in start..end {
+            leading.push(comments.take_leading(token_index));
+            trailing.push(comments.take_trailing(token_index));
+        }
+        entries.push(RequirementEntry {
+            token_indices: start..end,
+            version: parts.version,
+            from: parts.from,
+            leading,
+            trailing,
+        });
+    }
+
+    if index
+        .separators(list)
+        .ok_or(PackageDocumentError::InvalidEntry)?
+        .iter()
+        .any(|separator| {
+            tokens
+                .get(*separator as usize)
+                .is_none_or(|token| token.kind != PackageTokenKind::Newline)
+        })
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    if comments.has_pending(header_start, closing_brace) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+
+    let mut document = Vec::new();
+    for (position, token_index) in (header_start..opening_brace).enumerate() {
+        let token = &tokens[token_index];
+        let (leading, trailing) = header_comments
+            .get_mut(position)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        if position > 0 {
+            document.push(Doc::text(" "));
+        }
+        sort_comments(input, &mut leading[..]);
+        document.extend(leading_comments_before(
+            input,
+            leading,
+            Some(token.span.start),
+        ));
+        document.push(Doc::text(token_text(input.source(), token)));
+        document.push(trailing_comments(input, trailing));
+    }
+    if opening_leading.is_empty() {
+        document.push(Doc::text(" "));
+    } else {
+        document.push(Doc::HardLine);
+        if opening_leading[0].line_breaks_before() > 1 {
+            document.push(Doc::HardLine);
+        }
+        document.extend(leading_comments_before(
+            input,
+            &opening_leading,
+            Some(tokens[opening_brace].span.start),
+        ));
+    }
+    document.push(Doc::text("{"));
+
+    let has_body =
+        !entries.is_empty() || !opening_trailing.is_empty() || !closing_leading.is_empty();
+    if has_body {
+        let mut body = vec![trailing_comments(input, &opening_trailing)];
+        if !entries.is_empty() {
+            body.push(Doc::HardLine);
+            for position in 0..entries.len() {
+                if position > 0 {
+                    let previous = &entries[position - 1];
+                    let entry = &entries[position];
+                    let previous_end = tokens[previous.token_indices.end - 1].span.end;
+                    let current_start = tokens[entry.token_indices.start].span.start;
+                    let preserve_blank_line = entry.leading[0].first().map_or_else(
+                        || has_blank_line(input, previous_end, current_start),
+                        |comment| comment.line_breaks_before() > 1,
+                    );
+                    body.push(Doc::HardLine);
+                    if preserve_blank_line {
+                        body.push(Doc::HardLine);
+                    }
+                }
+                body.extend(requirement_entry_document(
+                    input,
+                    tokens,
+                    &mut entries[position],
+                )?);
+            }
+        }
+        if !closing_leading.is_empty() {
+            sort_comments(input, &mut closing_leading);
+            body.push(Doc::HardLine);
+            if !entries.is_empty()
+                && has_blank_line(
+                    input,
+                    tokens[entries
+                        .last()
+                        .expect("non-empty requirement entries")
+                        .token_indices
+                        .end
+                        - 1]
+                    .span
+                    .end,
+                    input.comment_span(closing_leading[0]).start,
+                )
+            {
+                body.push(Doc::HardLine);
+            }
+            body.extend(leading_comments_before(input, &closing_leading, None));
+        }
+        document.push(Doc::indent(Doc::concat(body)));
+        document.push(Doc::HardLine);
+    }
+    document.push(Doc::text("}"));
+    document.push(trailing_comments(input, &closing_trailing));
+    Ok(Doc::concat(document))
+}
+
 pub(crate) fn package_identity_declaration(
     input: &PackageInput<'_>,
     declaration: Range<u32>,
@@ -839,6 +1055,372 @@ fn valid_override_entry(source: &[u8], tokens: &[PackageToken]) -> bool {
         }
         _ => false,
     }
+}
+
+struct RequirementEntry<'a> {
+    token_indices: Range<usize>,
+    version: Range<usize>,
+    from: Option<Range<usize>>,
+    leading: Vec<Vec<&'a AttachedComment>>,
+    trailing: Vec<Vec<&'a AttachedComment>>,
+}
+
+struct RequirementParts {
+    version: Range<usize>,
+    from: Option<Range<usize>>,
+}
+
+fn requirement_entry_parts(
+    source: &[u8],
+    start: usize,
+    tokens: &[PackageToken],
+) -> Option<RequirementParts> {
+    let [package, at, remainder @ ..] = tokens else {
+        return None;
+    };
+    if package.kind != PackageTokenKind::PackagePath
+        || at.kind != PackageTokenKind::Punctuator(PackagePunctuator::At)
+        || remainder.is_empty()
+    {
+        return None;
+    }
+
+    let clause_start = remainder
+        .iter()
+        .position(|token| {
+            token.kind == PackageTokenKind::Word
+                && matches!(token_text(source, token), "from" | "only" | "grant")
+        })
+        .map_or(tokens.len(), |offset| offset + 2);
+    let version_tokens = tokens.get(2..clause_start)?;
+    if version_tokens.is_empty()
+        || version_tokens
+            .iter()
+            .any(|token| !is_version_requirement_piece(token.kind))
+    {
+        return None;
+    }
+    let version = start.checked_add(2)?..start.checked_add(clause_start)?;
+
+    let from = if clause_start == tokens.len() {
+        None
+    } else {
+        let clause = tokens.get(clause_start..)?;
+        if clause.first().is_none_or(|token| {
+            token.kind != PackageTokenKind::Word || token_text(source, token) != "from"
+        }) {
+            // `only` and `grant` are added by the nested-clause formatter step.
+            return None;
+        }
+        let valid_source = match clause {
+            [from, kind, path]
+                if from.kind == PackageTokenKind::Word
+                    && kind.kind == PackageTokenKind::Word
+                    && matches!(token_text(source, kind), "path" | "git")
+                    && path.kind == PackageTokenKind::String =>
+            {
+                token_text(source, from) == "from"
+            }
+            [from, kind, url, dir, path]
+                if from.kind == PackageTokenKind::Word
+                    && token_text(source, from) == "from"
+                    && kind.kind == PackageTokenKind::Word
+                    && token_text(source, kind) == "git"
+                    && url.kind == PackageTokenKind::String
+                    && dir.kind == PackageTokenKind::Word
+                    && token_text(source, dir) == "dir"
+                    && path.kind == PackageTokenKind::String =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if !valid_source {
+            return None;
+        }
+        Some(start.checked_add(clause_start)?..start.checked_add(tokens.len())?)
+    };
+
+    Some(RequirementParts { version, from })
+}
+
+const fn is_version_requirement_piece(kind: PackageTokenKind) -> bool {
+    matches!(
+        kind,
+        PackageTokenKind::Integer
+            | PackageTokenKind::Version
+            | PackageTokenKind::Punctuator(
+                PackagePunctuator::Comma
+                    | PackagePunctuator::Caret
+                    | PackagePunctuator::Tilde
+                    | PackagePunctuator::Equal
+                    | PackagePunctuator::Greater
+                    | PackagePunctuator::GreaterEqual
+                    | PackagePunctuator::Less
+                    | PackagePunctuator::LessEqual
+            )
+    )
+}
+
+const fn is_version_requirement_continuation(kind: PackageTokenKind) -> bool {
+    matches!(
+        kind,
+        PackageTokenKind::Punctuator(
+            PackagePunctuator::Comma
+                | PackagePunctuator::Caret
+                | PackagePunctuator::Tilde
+                | PackagePunctuator::Equal
+                | PackagePunctuator::Greater
+                | PackagePunctuator::GreaterEqual
+                | PackagePunctuator::Less
+                | PackagePunctuator::LessEqual
+        )
+    )
+}
+
+fn requirement_entry_document(
+    input: &PackageInput<'_>,
+    tokens: &[PackageToken],
+    entry: &mut RequirementEntry<'_>,
+) -> Result<Vec<Doc>, PackageDocumentError> {
+    let package_index = entry.token_indices.start;
+    let package = tokens
+        .get(package_index)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let at_index = package_index
+        .checked_add(1)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let at = tokens
+        .get(at_index)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if package.kind != PackageTokenKind::PackagePath
+        || at.kind != PackageTokenKind::Punctuator(PackagePunctuator::At)
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut document = Vec::new();
+    sort_comments(input, &mut entry.leading[0]);
+    document.extend(leading_comments_before(
+        input,
+        &entry.leading[0],
+        Some(package.span.start),
+    ));
+    document.push(Doc::text(token_text(input.source(), package)));
+    document.push(trailing_comments(input, &entry.trailing[0]));
+    if !entry.leading[1].is_empty() || trailing_comments_force_line_break(input, &entry.trailing[0])
+    {
+        // A physical break before `@` is not in the package continuation set.
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    document.extend([
+        Doc::text(" "),
+        Doc::text(token_text(input.source(), at)),
+        trailing_comments(input, &entry.trailing[1]),
+    ]);
+    let version_start = entry
+        .version
+        .start
+        .checked_sub(entry.token_indices.start)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let version_end = entry
+        .version
+        .end
+        .checked_sub(entry.token_indices.start)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if version_start != 2 || version_end > entry.token_indices.len() {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let first_version_has_leading_comment = entry
+        .leading
+        .get(version_start)
+        .is_some_and(|comments| !comments.is_empty());
+    let at_forces_break = trailing_comments_force_line_break(input, &entry.trailing[1]);
+    if !first_version_has_leading_comment && !at_forces_break {
+        document.push(Doc::text(" "));
+    }
+    for token_index in entry.version.clone() {
+        let offset = token_index
+            .checked_sub(entry.token_indices.start)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let token = tokens
+            .get(token_index)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let previous_index = token_index.checked_sub(1);
+        let previous = previous_index.and_then(|index| tokens.get(index));
+        let previous_offset = offset.checked_sub(1);
+        let previous_trailing = previous_offset.and_then(|index| entry.trailing.get(index));
+        let previous_forces_break = previous_trailing
+            .is_some_and(|comments| trailing_comments_force_line_break(input, comments));
+        let has_leading = entry
+            .leading
+            .get(offset)
+            .is_some_and(|comments| !comments.is_empty());
+        let after_comma = previous.is_some_and(|previous| {
+            previous.kind == PackageTokenKind::Punctuator(PackagePunctuator::Comma)
+        });
+
+        if token.kind == PackageTokenKind::Punctuator(PackagePunctuator::Comma) && has_leading {
+            return Err(PackageDocumentError::InvalidEntry);
+        }
+        let forced_break = has_leading || previous_forces_break;
+        if forced_break {
+            let safe_previous = previous.is_some_and(|previous| {
+                previous.kind == PackageTokenKind::Punctuator(PackagePunctuator::At)
+                    || is_version_requirement_continuation(previous.kind)
+            });
+            if !safe_previous {
+                return Err(PackageDocumentError::InvalidEntry);
+            }
+            let mut continuation = Vec::new();
+            if has_leading {
+                let leading = entry
+                    .leading
+                    .get_mut(offset)
+                    .ok_or(PackageDocumentError::InvalidEntry)?;
+                sort_comments(input, leading);
+                continuation.extend(leading_comments_before(
+                    input,
+                    leading,
+                    Some(token.span.start),
+                ));
+            }
+            continuation.push(Doc::text(token_text(input.source(), token)));
+            if let Some(trailing) = entry.trailing.get(offset) {
+                continuation.push(trailing_comments(input, trailing));
+            }
+            document.push(Doc::indent(Doc::concat([
+                Doc::HardLine,
+                Doc::concat(continuation),
+            ])));
+        } else {
+            if token_index > entry.version.start {
+                if after_comma {
+                    document.push(Doc::text(" "));
+                } else if token.kind != PackageTokenKind::Punctuator(PackagePunctuator::Comma)
+                    && previous.is_some_and(|previous| {
+                        matches!(
+                            previous.kind,
+                            PackageTokenKind::Punctuator(
+                                PackagePunctuator::Caret
+                                    | PackagePunctuator::Tilde
+                                    | PackagePunctuator::Equal
+                                    | PackagePunctuator::Greater
+                                    | PackagePunctuator::GreaterEqual
+                                    | PackagePunctuator::Less
+                                    | PackagePunctuator::LessEqual
+                            )
+                        )
+                    })
+                {
+                    // Comparator and version remain adjacent.
+                } else if token.kind != PackageTokenKind::Punctuator(PackagePunctuator::Comma)
+                    && previous.is_some()
+                {
+                    document.push(Doc::text(" "));
+                }
+            }
+            document.push(Doc::text(token_text(input.source(), token)));
+            document.push(trailing_comments(
+                input,
+                entry
+                    .trailing
+                    .get(offset)
+                    .ok_or(PackageDocumentError::InvalidEntry)?,
+            ));
+        }
+    }
+
+    if let Some(from_range) = entry.from.clone() {
+        document.extend(requirement_from_document(input, tokens, entry, from_range)?);
+    }
+    Ok(document)
+}
+
+fn requirement_from_document(
+    input: &PackageInput<'_>,
+    tokens: &[PackageToken],
+    entry: &mut RequirementEntry<'_>,
+    from_range: Range<usize>,
+) -> Result<Vec<Doc>, PackageDocumentError> {
+    let start_offset = from_range
+        .start
+        .checked_sub(entry.token_indices.start)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let end_offset = from_range
+        .end
+        .checked_sub(entry.token_indices.start)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if start_offset < 2 || end_offset > entry.token_indices.len() || start_offset >= end_offset {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut clause = Vec::new();
+    for token_index in from_range.clone() {
+        let offset = token_index
+            .checked_sub(entry.token_indices.start)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let token = tokens
+            .get(token_index)
+            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let previous_offset = offset.checked_sub(1);
+        let previous =
+            previous_offset.and_then(|previous| tokens.get(entry.token_indices.start + previous));
+        let forced_break = previous_offset.is_some_and(|previous| {
+            entry
+                .trailing
+                .get(previous)
+                .is_some_and(|comments| trailing_comments_force_line_break(input, comments))
+        });
+        let has_leading = entry
+            .leading
+            .get(offset)
+            .is_some_and(|comments| !comments.is_empty());
+        let is_dir =
+            token.kind == PackageTokenKind::Word && token_text(input.source(), token) == "dir";
+        if offset == start_offset {
+            let leading = entry
+                .leading
+                .get_mut(offset)
+                .ok_or(PackageDocumentError::InvalidEntry)?;
+            sort_comments(input, leading);
+            clause.extend(leading_comments_before(
+                input,
+                leading,
+                Some(token.span.start),
+            ));
+        } else if has_leading || forced_break {
+            if !is_dir {
+                // Only `dir` is a continuation word inside a source clause.
+                return Err(PackageDocumentError::InvalidEntry);
+            }
+            let mut continuation = Vec::new();
+            let leading = entry
+                .leading
+                .get_mut(offset)
+                .ok_or(PackageDocumentError::InvalidEntry)?;
+            sort_comments(input, leading);
+            continuation.extend(leading_comments_before(
+                input,
+                leading,
+                Some(token.span.start),
+            ));
+            continuation.push(Doc::text(token_text(input.source(), token)));
+            continuation.push(trailing_comments(input, &entry.trailing[offset]));
+            clause.push(Doc::HardLine);
+            clause.extend(continuation);
+            continue;
+        } else if previous.is_some() {
+            clause.push(Doc::text(" "));
+        }
+        clause.push(Doc::text(token_text(input.source(), token)));
+        clause.push(trailing_comments(input, &entry.trailing[offset]));
+    }
+
+    Ok(vec![Doc::indent(Doc::concat([
+        Doc::HardLine,
+        Doc::concat(clause),
+    ]))])
 }
 
 fn override_entry_document(
@@ -1424,7 +2006,7 @@ mod tests {
         PackageDocumentError, allocator_declaration, artifact_components_declaration,
         authors_declaration, capability_declaration, compiler_declaration,
         export_world_declaration, overrides_declaration, package_identity_declaration,
-        string_declaration, targets_declaration, token_text,
+        requirements_declaration, string_declaration, targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -1450,6 +2032,9 @@ mod tests {
                 artifact_components_declaration(&input, &index, list)
             }
             PackageBraceOwner::Overrides => overrides_declaration(&input, &index, list),
+            PackageBraceOwner::Requires | PackageBraceOwner::RequiresTest => {
+                requirements_declaration(&input, &index, list)
+            }
             _ => panic!("unsupported simple-list owner in test helper"),
         }
         .expect("package list document");
@@ -1832,6 +2417,115 @@ mod tests {
             ),
             "overrides {\n    acme:local use path \"../../outside\"\n\n    acme:image use artifact\n}\n"
         );
+    }
+
+    #[test]
+    fn formats_requires_and_test_requirements_with_canonical_version_and_source_layout() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  requires { sai:http@^1.4,< 2.0 from git \"https://example.com/http\"\n\
+                      acme:local @ ~0.3 from path \"../local\" }\n",
+                PackageBraceOwner::Requires,
+                false
+            ),
+            "requires {\n    sai:http @ ^1.4, <2.0\n        from git \"https://example.com/http\"\n    acme:local @ ~0.3\n        from path \"../local\"\n}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nrequires test { acme:test @ >=1.2 }\n",
+                PackageBraceOwner::RequiresTest,
+                false
+            ),
+            "requires test {\n    acme:test @ >=1.2\n}\n"
+        );
+    }
+
+    #[test]
+    fn formats_empty_requirement_lists_and_preserves_invalid_version_values() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nrequires { }\n",
+                PackageBraceOwner::Requires,
+                false
+            ),
+            "requires {}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nrequires test {}\n",
+                PackageBraceOwner::RequiresTest,
+                false
+            ),
+            "requires test {}\n"
+        );
+        let source = b"package acme:app @ 1.0.0\nrequires { acme:bad @ > 1.0.0 }\n";
+        let input = PackageInput::new(source);
+        assert!(input.refusals().is_empty(), "{:?}", input.refusals());
+        assert!(!input.parsed().errors().is_empty());
+        let index = PackageSyntaxIndex::new(&input).expect("valid package token structure");
+        let list = index
+            .brace_lists()
+            .iter()
+            .find(|list| list.owner == PackageBraceOwner::Requires)
+            .expect("requires list");
+        let doc = requirements_declaration(&input, &index, list).expect("requirements document");
+        assert_eq!(
+            print(&doc).expect("print document"),
+            "requires {\n    acme:bad @ >1.0.0\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_requirement_comments_and_blank_lines() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\n\
+                  requires { /* open */\n\
+                      acme:http /* identity */ @ ^1.4, // lower bound\n\
+                          <2.0\n\
+                          from git \"https://example.com/http\" // source\n\
+                      \n\
+                      \n\
+                      // local dependency\n\
+                      acme:local @ ^0.2\n\
+                          from path \"../local\"\n\
+                      // close\n\
+                  } // declaration\n",
+                PackageBraceOwner::Requires,
+                false
+            ),
+            "requires { /* open */\n    acme:http /* identity */ @ ^1.4, // lower bound\n        <2.0\n        from git \"https://example.com/http\" // source\n\n    // local dependency\n    acme:local @ ^0.2\n        from path \"../local\"\n    // close\n} // declaration\n"
+        );
+    }
+
+    #[test]
+    fn keeps_comment_forced_requirement_continuations_safe_and_attached() {
+        let formatted = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              requires {\n\
+                  acme:minimum @\n\
+                      // minimum version\n\
+                      ^1.2\n\
+                  acme:at-comment @ // at comment\n\
+                      ^1.2\n\
+                  acme:operator @ ^ // comparator note\n\
+                      1.2\n\
+                  acme:range @ ^1, // next bound\n\
+                      <2\n\
+                  acme:directory @ ^1\n\
+                      from git \"https://example.test/repo\" // repository\n\
+                      dir \"dep\"\n\
+              }\n",
+            PackageBraceOwner::Requires,
+            false,
+        );
+        assert_eq!(
+            formatted,
+            "requires {\n    acme:minimum @\n        // minimum version\n        ^1.2\n    acme:at-comment @ // at comment\n        ^1.2\n    acme:operator @ ^ // comparator note\n        1.2\n    acme:range @ ^1, // next bound\n        <2\n    acme:directory @ ^1\n        from git \"https://example.test/repo\" // repository\n        dir \"dep\"\n}\n"
+        );
+        let reparsed = PackageInput::new(formatted.as_bytes());
+        assert!(reparsed.refusals().is_empty(), "{:?}", reparsed.refusals());
     }
 
     #[test]
