@@ -3,7 +3,7 @@ use sai_syntax::{
     ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Pattern, Stmt},
 };
 
-use crate::{Doc, GroupId, ParsedSource};
+use crate::{Doc, GroupId, ParsedSource, printer::MAX_LINE_WIDTH};
 
 /// Syntax shapes that the source document builder does not support yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,7 +108,6 @@ fn function_document(
         || function.visibility().is_some()
         || function.unsafe_token().is_some()
         || function.async_token().is_some()
-        || function.generic_params().is_some()
         || function.where_clause().is_some()
         || function.requires_clauses().next().is_some()
         || function.ensures_clauses().next().is_some()
@@ -144,6 +143,28 @@ fn function_document(
         .name()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let name = node_text(source, name.syntax());
+    let generic_params = function
+        .generic_params()
+        .map(|params| {
+            let document = generic_params_document(source, &params)?;
+            let prefix_width = flat_document_width(&document)
+                .and_then(|generic_width| {
+                    "fn "
+                        .chars()
+                        .count()
+                        .checked_add(name.chars().count())?
+                        .checked_add(generic_width)?
+                        .checked_add(1)
+                })
+                .unwrap_or(usize::MAX);
+            Ok(if prefix_width <= MAX_LINE_WIDTH {
+                Doc::flat(document)
+            } else {
+                document
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| Doc::text(""));
     let statements = block.statements().collect::<Vec<_>>();
     let body = match statements.as_slice() {
         [] => Doc::text("{}"),
@@ -220,7 +241,12 @@ fn function_document(
         }
         _ => return Err(SourceDocumentError::UnsupportedShape),
     };
-    let head = Doc::concat([Doc::text(format!("fn {name}")), parameters, return_type]);
+    let head = Doc::concat([
+        Doc::text(format!("fn {name}")),
+        generic_params,
+        parameters,
+        return_type,
+    ]);
     let has_clauses = !clauses.is_empty();
     let document = if clauses.is_empty() {
         Doc::concat([head, Doc::text(" "), body])
@@ -246,6 +272,121 @@ fn function_document(
         end: range.end().to_usize(),
         multiline: has_clauses || !statements.is_empty(),
     })
+}
+
+fn generic_params_document(
+    source: &ParsedSource,
+    params: &ast::GenericParamList,
+) -> Result<Doc, SourceDocumentError> {
+    let parameters = params.params().collect::<Vec<_>>();
+    let token_kinds = direct_token_kinds(params.syntax());
+    if parameters.is_empty()
+        || params.syntax().children().count() != parameters.len()
+        || token_kinds.first() != Some(&SyntaxKind::LT)
+        || token_kinds.last() != Some(&SyntaxKind::GT)
+        || token_kinds[1..token_kinds.len() - 1]
+            .iter()
+            .any(|kind| !matches!(kind, SyntaxKind::COMMA | SyntaxKind::NEWLINE))
+        || token_kinds
+            .iter()
+            .filter(|kind| **kind == SyntaxKind::COMMA)
+            .count()
+            < parameters.len() - 1
+        || token_kinds
+            .iter()
+            .filter(|kind| **kind == SyntaxKind::COMMA)
+            .count()
+            > parameters.len()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let documents = parameters
+        .into_iter()
+        .map(|parameter| generic_param_document(source, parameter))
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = params.syntax().text_range();
+    Ok(delimited_list_document(
+        GroupId(range.start().raw()),
+        "<",
+        ">",
+        documents,
+        false,
+    ))
+}
+
+fn generic_param_document(
+    source: &ParsedSource,
+    parameter: ast::GenericParam,
+) -> Result<Doc, SourceDocumentError> {
+    match parameter {
+        ast::GenericParam::Type(parameter) => {
+            if parameter.attrs().next().is_some()
+                || parameter.bounds().is_some()
+                || parameter.syntax().children().count() != 1
+                || !direct_token_kinds(parameter.syntax()).is_empty()
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let name = parameter
+                .name()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            Ok(Doc::text(node_text(source, name.syntax())))
+        }
+        ast::GenericParam::Const(parameter) => {
+            if parameter.attrs().next().is_some()
+                || parameter.syntax().children().count() != 2
+                || direct_token_kinds(parameter.syntax())
+                    != [SyntaxKind::CONST_KW, SyntaxKind::COLON]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let name = parameter
+                .name()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let ty = parameter
+                .ty()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            Ok(Doc::concat([
+                Doc::text("const "),
+                Doc::text(node_text(source, name.syntax())),
+                Doc::text(": "),
+                type_document(source, &ty)?,
+            ]))
+        }
+    }
+}
+
+fn flat_document_width(document: &Doc) -> Option<usize> {
+    let mut width = 0usize;
+    let mut pending = vec![document];
+    while let Some(document) = pending.pop() {
+        let added_width = match document {
+            Doc::Text(text) => text.chars().count(),
+            Doc::Line => 1,
+            Doc::SoftLine | Doc::LineSuffix(_) => 0,
+            Doc::HardLine => return None,
+            Doc::Indent(child) | Doc::Group(_, child) | Doc::Flat(child) => {
+                pending.push(child);
+                continue;
+            }
+            Doc::IfBroken(_, _, flat) => {
+                pending.push(flat);
+                continue;
+            }
+            Doc::Choice(alternatives) => {
+                pending.push(alternatives.first()?);
+                continue;
+            }
+            Doc::Verbatim(text) if !text.contains(['\r', '\n']) => text.chars().count(),
+            Doc::Verbatim(_) => return None,
+            Doc::Concat(documents) => {
+                pending.extend(documents.iter().rev());
+                continue;
+            }
+        };
+        width = width.checked_add(added_width)?;
+    }
+    Some(width)
 }
 
 fn parameter_list_document(
@@ -909,6 +1050,74 @@ mod tests {
     }
 
     #[test]
+    fn formats_function_type_and_const_generic_parameters() {
+        for (input, expected) in [
+            (
+                b"fn identity<T>(value:T)->T{}".as_slice(),
+                "fn identity<T>(value: T) -> T {}\n",
+            ),
+            (
+                b"fn make<const N:USize,T>(value:Array<T,N>)->Array<T,N>{}",
+                "fn make<const N: USize, T>(value: Array<T, N>) -> Array<T, N> {}\n",
+            ),
+            (
+                b"fn f<T,>(value:T)borrows{value}effects{io}{}",
+                "fn f<T>(value: T)\n    borrows { value }\n    effects { io }\n{}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("input parses");
+            let output = format_shape(input).expect("function generics are supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("output parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn breaks_long_function_generic_parameter_lists() {
+        let first = "A".repeat(48);
+        let second = "B".repeat(48);
+        let input = format!("fn f<{first},{second}>(){{}}");
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("generic parameters are supported");
+        let expected = format!("fn f<\n    {first},\n    {second},\n>() {{}}\n");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped generics parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn keeps_short_generics_flat_when_function_parameters_wrap() {
+        let first = "first".repeat(9);
+        let second = "second".repeat(8);
+        let input = format!("fn f<T>({first}:I32,{second}:U32){{}}");
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("generic signature is supported");
+        let expected = format!("fn f<T>(\n    {first}: I32,\n    {second}: U32,\n) {{}}\n");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped parameters parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn keeps_short_generics_flat_when_return_type_overflows() {
+        let return_type = "R".repeat(92);
+        let input = format!("fn f<T>()->{return_type}{{}}");
+        let expected = format!("fn f<T>() -> {return_type} {{}}\n");
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("generic signature is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().next().unwrap().chars().count() > 100);
+        let reparsed = parse_source(output.as_bytes()).expect("output parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn formats_compound_parameter_and_return_types() {
         for (input, expected) in [
             (
@@ -1271,7 +1480,7 @@ mod tests {
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
-            format_shape(b"fn f<T>() {}"),
+            format_shape(b"fn f<T: Clone>() {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
@@ -1354,7 +1563,9 @@ mod tests {
                             SyntaxKind::PARAM_LIST | SyntaxKind::FN_PTR_TYPE => {
                                 Some(SyntaxKind::R_PAREN)
                             }
-                            SyntaxKind::GENERIC_ARG_LIST => Some(SyntaxKind::GT),
+                            SyntaxKind::GENERIC_ARG_LIST | SyntaxKind::GENERIC_PARAM_LIST => {
+                                Some(SyntaxKind::GT)
+                            }
                             SyntaxKind::TUPLE_TYPE
                                 if node.children().filter_map(Type::cast).count() != 1 =>
                             {

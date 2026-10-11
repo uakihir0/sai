@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const INDENT_WIDTH: usize = 4;
-const MAX_LINE_WIDTH: usize = 100;
+pub(super) const MAX_LINE_WIDTH: usize = 100;
 static NEXT_PERSISTENT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
