@@ -342,6 +342,7 @@ fn statement_document(
                     &initializer,
                     ExpressionContext::Unprotected,
                     expression_group_ids,
+                    true,
                 )?,
             ]);
             Ok(Doc::concat(binding))
@@ -387,6 +388,7 @@ fn statement_document(
                     &initializer,
                     ExpressionContext::Unprotected,
                     expression_group_ids,
+                    true,
                 )?,
             ]);
             Ok(Doc::concat(binding))
@@ -422,6 +424,7 @@ fn statement_document(
                     &rhs,
                     ExpressionContext::Unprotected,
                     expression_group_ids,
+                    true,
                 )?,
             ]))
         }
@@ -485,6 +488,7 @@ fn right_hand_side_document(
     expression: &Expr,
     context: ExpressionContext,
     expression_group_ids: &mut ExpressionGroupIds,
+    allow_move: bool,
 ) -> Result<Doc, SourceDocumentError> {
     let document = expression_document(source, expression, context, expression_group_ids)?;
     let inline = Doc::concat([Doc::text(" "), Doc::flat(document.clone())]);
@@ -502,14 +506,14 @@ fn right_hand_side_document(
             | SyntaxKind::REGION_EXPR
     );
     let mut alternatives = vec![inline.clone()];
-    if !block_like {
+    if !block_like && allow_move {
         alternatives.push(Doc::indent(Doc::concat([
             Doc::HardLine,
             Doc::flat(document.clone()),
         ])));
     }
     alternatives.push(Doc::concat([Doc::text(" "), document.clone()]));
-    if !block_like {
+    if !block_like && allow_move {
         alternatives.push(Doc::indent(Doc::concat([Doc::HardLine, document.clone()])));
     }
     alternatives.push(Doc::concat([Doc::text(" "), document]));
@@ -868,6 +872,81 @@ fn expression_document(
                 expression_document(source, &base, context, expression_group_ids)?,
                 index_suffix_document(source, index_expr, expression_group_ids)?,
             ]))
+        }
+        Expr::Return(return_expr) => {
+            let value = return_expr.value();
+            let tokens = direct_token_kinds(return_expr.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>();
+            if return_expr.syntax().children().count() != usize::from(value.is_some())
+                || tokens != [SyntaxKind::RETURN_KW]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut documents = vec![Doc::text("return")];
+            if let Some(value) = value {
+                documents.push(right_hand_side_document(
+                    source,
+                    &value,
+                    context,
+                    expression_group_ids,
+                    false,
+                )?);
+            }
+            Ok(Doc::concat(documents))
+        }
+        Expr::Break(break_expr) => {
+            let label = break_expr.label();
+            let value = break_expr.value();
+            let tokens = direct_token_kinds(break_expr.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>();
+            let mut expected_tokens = vec![SyntaxKind::BREAK_KW];
+            if label.is_some() {
+                expected_tokens.push(SyntaxKind::LABEL);
+            }
+            if break_expr.syntax().children().count() != usize::from(value.is_some())
+                || tokens != expected_tokens
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut documents = vec![Doc::text("break")];
+            if let Some(label) = label {
+                documents.push(Doc::text(" "));
+                documents.push(Doc::text(label.syntax().text().to_string()));
+            }
+            if let Some(value) = value {
+                documents.push(right_hand_side_document(
+                    source,
+                    &value,
+                    context,
+                    expression_group_ids,
+                    false,
+                )?);
+            }
+            Ok(Doc::concat(documents))
+        }
+        Expr::Continue(continue_expr) => {
+            let label = continue_expr.label();
+            let tokens = direct_token_kinds(continue_expr.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>();
+            let mut expected_tokens = vec![SyntaxKind::CONTINUE_KW];
+            if label.is_some() {
+                expected_tokens.push(SyntaxKind::LABEL);
+            }
+            if continue_expr.syntax().children().count() != 0 || tokens != expected_tokens {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut documents = vec![Doc::text("continue")];
+            if let Some(label) = label {
+                documents.push(Doc::text(" "));
+                documents.push(Doc::text(label.syntax().text().to_string()));
+            }
+            Ok(Doc::concat(documents))
         }
         Expr::Binary(binary) => {
             operator_chain_document(source, binary, context, expression_group_ids)
@@ -3663,6 +3742,45 @@ mod tests {
         assert!(output.lines().all(|line| line.chars().count() <= 100));
         let reparsed = parse_source(output.as_bytes()).expect("moved rhs parses");
         assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_return_break_and_continue_expressions() {
+        let input = concat!(
+            "fn f() {\n",
+            "return\n",
+            "return result\n",
+            "break\n",
+            "break 'outer result\n",
+            "continue\n",
+            "continue 'outer\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn f() {\n",
+            "    return\n",
+            "    return result\n",
+            "    break\n",
+            "    break 'outer result\n",
+            "    continue\n",
+            "    continue 'outer\n",
+            "}\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("control expressions parse");
+        let output = format_shape(input.as_bytes()).expect("control expressions are supported");
+        assert_eq!(output, expected);
+        let reparsed =
+            parse_source(output.as_bytes()).expect("formatted control expressions parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let value = format!("result_{}", "r".repeat(88));
+        let input = format!("fn f() {{ return {value}\n}}\n");
+        let expected = format!("fn f() {{\n    return {value}\n}}\n");
+        let output = format_shape(input.as_bytes()).expect("long return value is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().any(|line| line.chars().count() > 100));
         assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
