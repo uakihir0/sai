@@ -208,81 +208,7 @@ fn function_document(
         .transpose()?
         .unwrap_or_else(|| Doc::text(""));
     let statements = block.statements().collect::<Vec<_>>();
-    let body = match statements.as_slice() {
-        [] => Doc::text("{}"),
-        [Stmt::Let(binding_stmt), Stmt::Expr(tail_stmt)] => {
-            let pattern = binding_stmt
-                .pattern()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            let Pattern::Binding(pattern) = pattern else {
-                return Err(SourceDocumentError::UnsupportedShape);
-            };
-            if pattern.mode().is_some()
-                || binding_stmt.ty().is_some()
-                || binding_stmt.else_clause().is_some()
-            {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            let name = pattern
-                .name()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            let initializer = binding_stmt
-                .initializer()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            let Expr::Literal(initializer) = initializer else {
-                return Err(SourceDocumentError::UnsupportedShape);
-            };
-            let literal = initializer
-                .token()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            let literal = normalize_literal(source, literal)?;
-            let tail = tail_stmt
-                .expression()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            let Expr::Path(tail) = tail else {
-                return Err(SourceDocumentError::UnsupportedShape);
-            };
-            if tail.generic_args().is_some() {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            let tail_name = tail.name().ok_or(SourceDocumentError::UnsupportedShape)?;
-            let name_text = node_text(source, name.syntax());
-            let tail_text = node_text(source, tail_name.syntax());
-            let statement_separator = source
-                .text()
-                .get(
-                    binding_stmt.syntax().text_range().end().to_usize()
-                        ..tail_stmt.syntax().text_range().start().to_usize(),
-                )
-                .unwrap_or_default();
-            let separator = if statement_separator.matches('\n').count() > 1 {
-                Doc::concat([Doc::HardLine, Doc::HardLine])
-            } else {
-                Doc::HardLine
-            };
-            let rhs = Doc::choice([
-                Doc::concat([Doc::text(" "), Doc::flat(Doc::text(literal.clone()))]),
-                Doc::indent(Doc::concat([
-                    Doc::HardLine,
-                    Doc::flat(Doc::text(literal.clone())),
-                ])),
-                Doc::concat([Doc::text(" "), Doc::text(literal)]),
-            ]);
-            Doc::concat([
-                Doc::text("{"),
-                Doc::indent(Doc::concat([
-                    Doc::HardLine,
-                    Doc::text(format!("let {name_text} =")),
-                    rhs,
-                    separator,
-                    Doc::text(tail_text),
-                ])),
-                Doc::HardLine,
-                Doc::text("}"),
-            ])
-        }
-        _ => return Err(SourceDocumentError::UnsupportedShape),
-    };
+    let body = block_document(source, &block, expression_group_ids)?;
     let head = Doc::concat([
         Doc::text(format!("fn {name}")),
         generic_params,
@@ -314,6 +240,280 @@ fn function_document(
         end: range.end().to_usize(),
         multiline: has_clauses || !statements.is_empty(),
     })
+}
+
+fn block_document(
+    source: &ParsedSource,
+    block: &ast::Block,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let statements = block.statements().collect::<Vec<_>>();
+    if block.syntax().children().count() != statements.len()
+        || direct_token_kinds(block.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::L_BRACE, SyntaxKind::R_BRACE]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    if statements.is_empty() {
+        return Ok(Doc::text("{}"));
+    }
+
+    let mut body = vec![Doc::HardLine];
+    for (index, statement) in statements.iter().enumerate() {
+        if index > 0 {
+            let previous_end = statements[index - 1].syntax().text_range().end().to_usize();
+            let next_start = statement.syntax().text_range().start().to_usize();
+            let separator = source
+                .text()
+                .get(previous_end..next_start)
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            body.push(Doc::HardLine);
+            if separator.matches('\n').count() > 1 {
+                body.push(Doc::HardLine);
+            }
+        }
+        body.push(statement_document(source, statement, expression_group_ids)?);
+    }
+    Ok(Doc::concat([
+        Doc::text("{"),
+        Doc::indent(Doc::concat(body)),
+        Doc::HardLine,
+        Doc::text("}"),
+    ]))
+}
+
+fn statement_document(
+    source: &ParsedSource,
+    statement: &Stmt,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    match statement {
+        Stmt::Let(statement) => {
+            let pattern = statement
+                .pattern()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let Pattern::Binding(pattern) = pattern else {
+                return Err(SourceDocumentError::UnsupportedShape);
+            };
+            let name = pattern
+                .name()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let ty = statement.ty();
+            let initializer = statement
+                .initializer()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let type_tokens = direct_token_kinds(statement.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>();
+            let mut expected_tokens = vec![SyntaxKind::LET_KW];
+            if ty.is_some() {
+                expected_tokens.push(SyntaxKind::COLON);
+            }
+            expected_tokens.push(SyntaxKind::EQ);
+            if pattern.mode().is_some()
+                || pattern.syntax().children().count() != 1
+                || !direct_token_kinds(pattern.syntax()).is_empty()
+                || name.syntax().children().count() != 0
+                || !matches!(
+                    direct_token_kinds(name.syntax()).as_slice(),
+                    [SyntaxKind::LIDENT]
+                )
+                || statement.else_clause().is_some()
+                || statement.syntax().children().count() != 2 + usize::from(ty.is_some())
+                || type_tokens != expected_tokens
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut binding = vec![
+                Doc::text("let "),
+                Doc::text(node_text(source, name.syntax())),
+            ];
+            if let Some(ty) = ty {
+                binding.extend([Doc::text(": "), type_document(source, &ty)?]);
+            }
+            binding.extend([
+                Doc::text(" ="),
+                right_hand_side_document(
+                    source,
+                    &initializer,
+                    ExpressionContext::Unprotected,
+                    expression_group_ids,
+                )?,
+            ]);
+            Ok(Doc::concat(binding))
+        }
+        Stmt::Var(statement) => {
+            let name = statement
+                .name()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let ty = statement.ty();
+            let initializer = statement
+                .initializer()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let type_tokens = direct_token_kinds(statement.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>();
+            let mut expected_tokens = vec![SyntaxKind::VAR_KW];
+            if ty.is_some() {
+                expected_tokens.push(SyntaxKind::COLON);
+            }
+            expected_tokens.push(SyntaxKind::EQ);
+            if name.syntax().children().count() != 0
+                || !matches!(
+                    direct_token_kinds(name.syntax()).as_slice(),
+                    [SyntaxKind::LIDENT]
+                )
+                || statement.syntax().children().count() != 2 + usize::from(ty.is_some())
+                || type_tokens != expected_tokens
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut binding = vec![
+                Doc::text("var "),
+                Doc::text(node_text(source, name.syntax())),
+            ];
+            if let Some(ty) = ty {
+                binding.extend([Doc::text(": "), type_document(source, &ty)?]);
+            }
+            binding.extend([
+                Doc::text(" ="),
+                right_hand_side_document(
+                    source,
+                    &initializer,
+                    ExpressionContext::Unprotected,
+                    expression_group_ids,
+                )?,
+            ]);
+            Ok(Doc::concat(binding))
+        }
+        Stmt::Assign(statement) => {
+            let lhs = statement
+                .lhs()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let rhs = statement
+                .rhs()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let (operator, _) = statement
+                .op()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let operator_tokens = direct_token_kinds(statement.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>();
+            if statement.syntax().children().count() != 2 || operator_tokens != [operator.kind()] {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            Ok(Doc::concat([
+                expression_document(
+                    source,
+                    &lhs,
+                    ExpressionContext::Protected,
+                    expression_group_ids,
+                )?,
+                Doc::text(" "),
+                Doc::text(operator.text()),
+                right_hand_side_document(
+                    source,
+                    &rhs,
+                    ExpressionContext::Unprotected,
+                    expression_group_ids,
+                )?,
+            ]))
+        }
+        Stmt::Assert(statement) => {
+            let condition = statement
+                .condition()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let message = statement.message();
+            let mut expected_tokens = vec![SyntaxKind::ASSERT_KW];
+            if message.is_some() {
+                expected_tokens.push(SyntaxKind::COMMA);
+            }
+            if statement.syntax().children().count() != 1 + usize::from(message.is_some())
+                || direct_token_kinds(statement.syntax()) != expected_tokens
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut documents = vec![
+                Doc::text("assert "),
+                expression_document(
+                    source,
+                    &condition,
+                    ExpressionContext::Unprotected,
+                    expression_group_ids,
+                )?,
+            ];
+            if let Some(message) = message {
+                documents.extend([
+                    Doc::text(", "),
+                    expression_document(
+                        source,
+                        &message,
+                        ExpressionContext::Unprotected,
+                        expression_group_ids,
+                    )?,
+                ]);
+            }
+            Ok(Doc::concat(documents))
+        }
+        Stmt::Expr(statement) => {
+            let expression = statement
+                .expression()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            if statement.syntax().children().count() != 1
+                || !direct_token_kinds(statement.syntax()).is_empty()
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            expression_document(
+                source,
+                &expression,
+                ExpressionContext::Unprotected,
+                expression_group_ids,
+            )
+        }
+    }
+}
+
+fn right_hand_side_document(
+    source: &ParsedSource,
+    expression: &Expr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let document = expression_document(source, expression, context, expression_group_ids)?;
+    let inline = Doc::concat([Doc::text(" "), Doc::flat(document.clone())]);
+    let block_like = matches!(
+        expression.syntax().kind(),
+        SyntaxKind::BLOCK_EXPR
+            | SyntaxKind::UNSAFE_BLOCK_EXPR
+            | SyntaxKind::ASYNC_BLOCK_EXPR
+            | SyntaxKind::IF_EXPR
+            | SyntaxKind::MATCH_EXPR
+            | SyntaxKind::LOOP_EXPR
+            | SyntaxKind::WHILE_EXPR
+            | SyntaxKind::FOR_EXPR
+            | SyntaxKind::CLOSURE_EXPR
+            | SyntaxKind::REGION_EXPR
+    );
+    let mut alternatives = vec![inline.clone()];
+    if !block_like {
+        alternatives.push(Doc::indent(Doc::concat([
+            Doc::HardLine,
+            Doc::flat(document.clone()),
+        ])));
+    }
+    alternatives.push(Doc::concat([Doc::text(" "), document.clone()]));
+    if !block_like {
+        alternatives.push(Doc::indent(Doc::concat([Doc::HardLine, document.clone()])));
+    }
+    alternatives.push(Doc::concat([Doc::text(" "), document]));
+    Ok(Doc::choice(alternatives))
 }
 
 fn where_clause_document(
@@ -3421,6 +3621,52 @@ mod tests {
     }
 
     #[test]
+    fn formats_all_basic_statement_forms_and_preserves_one_blank_line() {
+        let input = concat!(
+            "fn f() {\n",
+            "let value:I32=\n1\n",
+            "var current:I32=2\n\n",
+            "current+=\nvalue\n",
+            "assert current>value,\"message\"\n",
+            "consume(current)\n",
+            "current\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn f() {\n",
+            "    let value: I32 = 1\n",
+            "    var current: I32 = 2\n",
+            "\n",
+            "    current += value\n",
+            "    assert current > value, \"message\"\n",
+            "    consume(current)\n",
+            "    current\n",
+            "}\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("statement forms parse");
+        let output = format_shape(input.as_bytes()).expect("statement forms are supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted statements parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn moves_a_short_statement_rhs_to_the_next_line_when_it_fits() {
+        let name = format!("binding_{}", "x".repeat(81));
+        let input = format!("fn f() {{ let {name}=1\n{name}\n}}\n");
+        let expected = format!("fn f() {{\n    let {name} =\n        1\n    {name}\n}}\n");
+        let parsed = parse_source(input.as_bytes()).expect("long binding name parses");
+        let output = format_shape(input.as_bytes()).expect("long binding name is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("moved rhs parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn normalizes_float_literals_and_formats_other_simple_literal_kinds() {
         assert_eq!(
             format_shape(b"fn f(){let x=1.5E-3\nx}"),
@@ -3516,7 +3762,7 @@ mod tests {
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
-            format_shape(b"fn f(){let x=1\nx\nx}"),
+            format_shape(b"fn f(){let (x,y)=pair\nx}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
