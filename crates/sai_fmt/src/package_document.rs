@@ -45,6 +45,14 @@ pub(crate) fn capability_declaration(
     }
 }
 
+pub(crate) fn authors_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    comma_list_declaration(input, index, list, PackageBraceOwner::Authors)
+}
+
 fn comma_list_declaration(
     input: &PackageInput<'_>,
     index: &PackageSyntaxIndex,
@@ -63,6 +71,7 @@ fn comma_list_declaration(
         PackageBraceOwner::Targets => "targets",
         PackageBraceOwner::Allow => "allow",
         PackageBraceOwner::Deny => "deny",
+        PackageBraceOwner::Authors => "authors",
         _ => return Err(PackageDocumentError::WrongListOwner),
     };
     let keyword_index = (list.open_token as usize)
@@ -96,6 +105,7 @@ fn comma_list_declaration(
                 token.kind,
                 PackageTokenKind::Word | PackageTokenKind::PackagePath
             ),
+            PackageBraceOwner::Authors => token.kind == PackageTokenKind::String,
             _ => false,
         };
         if !valid_entry {
@@ -472,7 +482,9 @@ mod tests {
     use crate::package_surface::{PackageBraceOwner, PackageSyntaxIndex};
     use crate::{GroupId, print, print_with_forced_groups};
 
-    use super::{PackageDocumentError, capability_declaration, targets_declaration};
+    use super::{
+        PackageDocumentError, authors_declaration, capability_declaration, targets_declaration,
+    };
 
     fn render(source: &[u8], force_break: bool) -> String {
         render_owner(source, PackageBraceOwner::Targets, force_break)
@@ -492,6 +504,7 @@ mod tests {
             PackageBraceOwner::Allow | PackageBraceOwner::Deny => {
                 capability_declaration(&input, &index, list)
             }
+            PackageBraceOwner::Authors => authors_declaration(&input, &index, list),
             _ => panic!("unsupported simple-list owner in test helper"),
         }
         .expect("package list document");
@@ -578,6 +591,38 @@ mod tests {
                 true
             ),
             "deny {\n    wasi:filesystem\n    alloc\n}\n"
+        );
+    }
+
+    #[test]
+    fn formats_authors_as_source_spelling_string_lists() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nauthors{\"Ada\\tExample\",\"Grace Hopper\"}\n",
+                PackageBraceOwner::Authors,
+                false
+            ),
+            "authors { \"Ada\\tExample\", \"Grace Hopper\" }\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nauthors {}\n",
+                PackageBraceOwner::Authors,
+                false
+            ),
+            "authors {}\n"
+        );
+    }
+
+    #[test]
+    fn breaks_author_lists_with_comments_without_rewriting_string_contents() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nauthors { \"Ada\", // retain this\n \"Grace\" }\n",
+                PackageBraceOwner::Authors,
+                false
+            ),
+            "authors {\n    \"Ada\" // retain this\n    \"Grace\"\n}\n"
         );
     }
 
