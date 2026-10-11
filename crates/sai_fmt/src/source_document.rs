@@ -394,9 +394,8 @@ fn type_document(source: &ParsedSource, ty: &ast::Type) -> Result<Doc, SourceDoc
         ast::Type::InferType(infer_type) if infer_type.syntax().children().next().is_none() => {
             Ok(Doc::text("_"))
         }
-        ast::Type::InferType(_) | ast::Type::FnPtrType(_) => {
-            Err(SourceDocumentError::UnsupportedShape)
-        }
+        ast::Type::FnPtrType(fn_ptr_type) => fn_ptr_type_document(source, fn_ptr_type),
+        ast::Type::InferType(_) => Err(SourceDocumentError::UnsupportedShape),
     }
 }
 
@@ -562,6 +561,146 @@ fn delimited_list_document(
             Doc::text(close),
         ]),
     )
+}
+
+fn fn_ptr_type_document(
+    source: &ParsedSource,
+    fn_ptr_type: &ast::FnPtrType,
+) -> Result<Doc, SourceDocumentError> {
+    let params = fn_ptr_type.params().collect::<Vec<_>>();
+    let return_type = fn_ptr_type.ret_type();
+    let effects = fn_ptr_type.effects();
+    if fn_ptr_type.syntax().children().count()
+        != params.len() + return_type.is_some() as usize + effects.is_some() as usize
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let token_kinds = direct_token_kinds(fn_ptr_type.syntax());
+    let unsafe_prefix = token_kinds.first() == Some(&SyntaxKind::UNSAFE_KW);
+    let prefix = if unsafe_prefix {
+        &[
+            SyntaxKind::UNSAFE_KW,
+            SyntaxKind::FN_KW,
+            SyntaxKind::L_PAREN,
+        ][..]
+    } else {
+        &[SyntaxKind::FN_KW, SyntaxKind::L_PAREN][..]
+    };
+    if !token_kinds.starts_with(prefix)
+        || token_kinds.iter().any(|kind| {
+            !matches!(
+                kind,
+                SyntaxKind::UNSAFE_KW
+                    | SyntaxKind::FN_KW
+                    | SyntaxKind::L_PAREN
+                    | SyntaxKind::R_PAREN
+                    | SyntaxKind::COMMA
+                    | SyntaxKind::THIN_ARROW
+                    | SyntaxKind::NEWLINE
+            )
+        })
+        || return_type.is_some() != token_kinds.contains(&SyntaxKind::THIN_ARROW)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let params = params
+        .iter()
+        .map(|param| type_document(source, param))
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = fn_ptr_type.syntax().text_range();
+    let params = if params.is_empty() {
+        Doc::text("()")
+    } else {
+        delimited_list_document(GroupId(range.start().raw()), "(", ")", params, false)
+    };
+    let mut documents = vec![
+        Doc::text(if unsafe_prefix { "unsafe fn" } else { "fn" }),
+        params,
+    ];
+    if let Some(return_type) = return_type {
+        documents.push(Doc::text(" -> "));
+        documents.push(type_document(source, &return_type)?);
+    }
+    if let Some(effects) = effects {
+        documents.push(Doc::text(" "));
+        documents.push(effects_clause_document(source, &effects)?);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn effects_clause_document(
+    source: &ParsedSource,
+    clause: &ast::EffectsClause,
+) -> Result<Doc, SourceDocumentError> {
+    let has_effects_keyword = clause
+        .syntax()
+        .children_with_tokens()
+        .any(|element| matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::LIDENT && token.text() == "effects"));
+    if clause.syntax().children().count() != 1
+        || direct_token_kinds(clause.syntax()) != [SyntaxKind::LIDENT]
+        || !has_effects_keyword
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let set = clause.set().ok_or(SourceDocumentError::UnsupportedShape)?;
+    effect_set_document(source, &set).map(|set| Doc::concat([Doc::text("effects "), set]))
+}
+
+fn effect_set_document(
+    source: &ParsedSource,
+    set: &ast::EffectSet,
+) -> Result<Doc, SourceDocumentError> {
+    let effects = set.effects().collect::<Vec<_>>();
+    if set.syntax().children().count() != effects.len() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    if effects.is_empty() {
+        return Ok(Doc::text("{}"));
+    }
+    let documents = effects
+        .iter()
+        .map(|effect| effect_ref_document(source, effect))
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = set.syntax().text_range();
+    let group = GroupId(range.start().raw());
+    let mut contents = Vec::with_capacity(documents.len() * 2 + 2);
+    contents.push(Doc::Line);
+    for (index, effect) in documents.into_iter().enumerate() {
+        if index > 0 {
+            contents.push(Doc::if_broken(group, Doc::text(""), Doc::text(",")));
+            contents.push(Doc::Line);
+        }
+        contents.push(effect);
+    }
+    Ok(Doc::group(
+        group,
+        Doc::concat([
+            Doc::text("{"),
+            Doc::indent(Doc::concat(contents)),
+            Doc::Line,
+            Doc::text("}"),
+        ]),
+    ))
+}
+
+fn effect_ref_document(
+    source: &ParsedSource,
+    effect: &ast::EffectRef,
+) -> Result<Doc, SourceDocumentError> {
+    let segments = effect.segments().collect::<Vec<_>>();
+    if segments.is_empty() || effect.syntax().children().count() != segments.len() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = Vec::with_capacity(segments.len() * 2 - 1);
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            documents.push(Doc::text("."));
+        }
+        documents.push(Doc::text(node_text(source, segment.syntax())));
+    }
+    Ok(Doc::concat(documents))
 }
 
 fn node_text<'a>(source: &'a ParsedSource, node: &sai_syntax::SyntaxNode) -> &'a str {
@@ -791,6 +930,57 @@ mod tests {
     }
 
     #[test]
+    fn formats_function_pointer_types_and_effect_sets() {
+        for (input, expected) in [
+            (
+                b"fn f(cb:fn(I32,borrow Vec<User>)->Bool effects {alloc,net.http}){}".as_slice(),
+                "fn f(cb: fn(I32, borrow Vec<User>) -> Bool effects { alloc, net.http }) {}\n",
+            ),
+            (
+                b"fn f(cb:unsafe fn(I32)->Str effects {net.http,alloc}){}",
+                "fn f(cb: unsafe fn(I32) -> Str effects { net.http, alloc }) {}\n",
+            ),
+            (
+                b"fn f(cb:fn()effects{}){}",
+                "fn f(cb: fn() effects {}) {}\n",
+            ),
+            (
+                b"fn f(cb:fn(I32)\n->Bool effects {alloc}){}",
+                "fn f(cb: fn(I32) -> Bool effects { alloc }) {}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("input parses");
+            let output = format_shape(input)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", String::from_utf8_lossy(input)));
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("output parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn breaks_long_function_pointer_parameters_and_effect_sets() {
+        let first_type = format!("T{}", "A".repeat(60));
+        let second_type = format!("U{}", "B".repeat(60));
+        let first_effect = format!("network.{}", "a".repeat(40));
+        let second_effect = format!("memory.{}", "b".repeat(40));
+        let input = format!(
+            "fn f(callback:fn({first_type},{second_type}) effects {{{first_effect},{second_effect}}}){{}}"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("long function pointer is supported");
+        assert!(output.contains("callback: fn(\n"));
+        assert!(output.contains(&format!("        {first_type},\n")));
+        assert!(output.contains(") effects {\n"));
+        assert!(output.contains(&format!("        {first_effect}\n")));
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped output parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn formats_supported_self_parameter_types() {
         for (input, expected) in [
             (b"fn f(self:Self){}".as_slice(), "fn f(self: Self) {}\n"),
@@ -936,7 +1126,11 @@ mod tests {
     #[test]
     fn unsupported_shapes_and_comments_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f(callback: fn(I32) -> I32) {}"),
+            format_shape(b"fn f() effects {io} {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f() requires true {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
@@ -1007,23 +1201,31 @@ mod tests {
                     shape.push(ShapeElement::NodeStart(node.kind()));
                     pending.push(Work::NodeEnd);
                     let mut elements = node.children_with_tokens().collect::<Vec<_>>();
-                    let trailing_comma_close = match node.kind() {
-                        SyntaxKind::PARAM_LIST => Some(SyntaxKind::R_PAREN),
-                        SyntaxKind::GENERIC_ARG_LIST => Some(SyntaxKind::GT),
-                        SyntaxKind::TUPLE_TYPE
-                            if node.children().filter_map(Type::cast).count() != 1 =>
-                        {
-                            Some(SyntaxKind::R_PAREN)
-                        }
-                        _ => None,
-                    };
-                    if let Some(close) = trailing_comma_close {
-                        let trailing_comma = elements.windows(2).position(|pair| {
-                            matches!(&pair[0], SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA)
-                                && matches!(&pair[1], SyntaxElement::Token(token) if token.kind() == close)
-                        });
-                        if let Some(index) = trailing_comma {
-                            elements.remove(index);
+                    if node.kind() == SyntaxKind::EFFECT_SET {
+                        elements.retain(
+                            |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA),
+                        );
+                    } else {
+                        let trailing_comma_close = match node.kind() {
+                            SyntaxKind::PARAM_LIST | SyntaxKind::FN_PTR_TYPE => {
+                                Some(SyntaxKind::R_PAREN)
+                            }
+                            SyntaxKind::GENERIC_ARG_LIST => Some(SyntaxKind::GT),
+                            SyntaxKind::TUPLE_TYPE
+                                if node.children().filter_map(Type::cast).count() != 1 =>
+                            {
+                                Some(SyntaxKind::R_PAREN)
+                            }
+                            _ => None,
+                        };
+                        if let Some(close) = trailing_comma_close {
+                            let trailing_comma = elements.windows(2).position(|pair| {
+                                matches!(&pair[0], SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA)
+                                    && matches!(&pair[1], SyntaxElement::Token(token) if token.kind() == close)
+                            });
+                            if let Some(index) = trailing_comma {
+                                elements.remove(index);
+                            }
                         }
                     }
                     pending.extend(elements.into_iter().rev().map(|element| match element {

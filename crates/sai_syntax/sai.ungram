@@ -330,6 +330,7 @@ child AssocTypeBinding name NameRef 0
 child AssocTypeBinding ty Type 0
 children_before FnPtrType params Type THIN_ARROW
 child_after FnPtrType ret_type Type THIN_ARROW 0
+child FnPtrType effects EffectsClause 0
 children OrPat alternatives Pattern
 child_before AtPat binding BindingPat AT 0
 child_after AtPat pattern Pattern AT 0
