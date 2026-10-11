@@ -74,7 +74,7 @@ Workspace members are dependencies in every other respect. In particular, their 
 
 ### 13.2.3 Paths printed by the CLI
 
-Paths in human output are relative to the current directory if the file lies inside the workspace root, and otherwise use the forms of [11-diagnostics.md](11-diagnostics.md) §11.5.4. Paths in JSON output always use the forms of §11.5.4. Separators are `/` on every host.
+Paths in human output are relative to the current directory if the file lies inside the workspace root, and otherwise use the forms of [11-diagnostics.md](11-diagnostics.md) §11.5.4. Paths in JSON output always use the forms of §11.5.4, except `sai new`'s `directory` field, which echoes its explicit path argument as specified in §13.6.1. Separators are `/` on every host.
 
 ---
 
@@ -92,6 +92,7 @@ Parsing rules (N-H-21):
 2. Long options have the form `--name` or `--name <value>`. The form `--name=<value>` is also accepted and means the same thing. Option names are lowercase ASCII words separated by `-`.
 3. Short options exist only as aliases of these four options: `-h` (`--help`), `-q` (`--quiet`), `-v` (`--verbose`), and `-C` (`--directory`). Short options cannot be combined (`-qv` is `UNKNOWN_OPTION`).
 4. Global options may appear before or after the command. Command options must appear after the command.
+   When an option spelling is defined both globally and for the selected command, the command-specific meaning takes precedence after that command. In v0.1, `add --version <requirement>` selects a package version; `--version` before the command prints toolchain version information.
 5. An argument `--` ends option processing. Everything after it is passed to the program (`sai run`), to the test filter (`sai test`), or is `UNEXPECTED_ARGUMENT` for other commands.
 6. A boolean option given twice is accepted. A value option given twice is `CONFLICTING_OPTIONS`, except where a command says the option is repeatable.
 7. Option values that name enumerations (`--format`, `--color`, `--target`, `--profile`, and so on) are matched exactly and are case-sensitive.
@@ -107,7 +108,7 @@ Global options:
 | `-v`, `--verbose` | — | off | print progress lines for every package, not only for the root (§13.3.6) |
 | `--max-errors <n>` | an integer `>= 0` | `50` | see §13.4.5. Accepted by every command. |
 | `-h`, `--help` | — | — | print help for the command and exit with 0 (§13.3.7) |
-| `--version` | — | — | print the version and exit with 0 (§13.3.7) |
+| `--version` | — | — | print the version and exit with 0 (§13.3.7), except for the command-specific `sai add --version <requirement>` form |
 
 `--quiet` and `--verbose` together are `CONFLICTING_OPTIONS`.
 
@@ -346,6 +347,7 @@ A build is determined by the source of all packages in the graph, `sai.package`,
 
 - Every file the toolchain writes (outputs, `sai.package`, `sai.lock`, source files changed by `fmt`, `--fix`, `add`, `remove`, `update`, and `edit`) is written to a temporary file in the same directory and then renamed over the target. A reader never sees a partially written file.
 - A command that writes to `out/`, `.sai/`, `sai.package`, `sai.lock`, or source files holds an exclusive lock on `.sai/lock` for its whole duration. Commands that only read hold a shared lock. A command that has to wait writes the progress line `waiting for .sai/lock` once and then blocks. The LSP server holds a shared lock and takes the exclusive lock only while it writes.
+- `sai new` is the exception: it does not discover or modify an existing package, so it cannot acquire that package's `.sai/lock`. It claims a new destination with atomic directory creation, or an existing empty destination by atomically creating `src`; a concurrent invocation that loses this claim fails with `DESTINATION_NOT_EMPTY`. It writes each file to a same-directory temporary file, publishes it with a no-replace rename, and writes `sai.package` last as the package-discovery marker. On failure or interruption, it removes files whose identities still match the files it published. It does not synchronize with commands operating on an enclosing package; the new package is not part of that package's graph unless explicitly required.
 - A command that changes `sai.package` edits the CST it parsed. The declarations it changes are written in the canonical layout of [package/01-package-contract.md](../package/01-package-contract.md) §1.3.1 rule 6, and the rest of the file, including comments, is kept byte for byte.
 - Locking of the global package cache is owned by [package/04-distribution-and-security.md](../package/04-distribution-and-security.md).
 
@@ -423,10 +425,10 @@ Human output: three progress lines `wrote <path> (<n> bytes)`, in the order `sai
 JSON result: one record of kind `new`.
 
 ```json
-{"type":"result","kind":"new","data":{"package":"acme:image@0.1.0","directory":"image","files":[{"path":"image/sai.package","bytes":79,"sha256":"…"},{"path":"image/.gitignore","bytes":13,"sha256":"…"},{"path":"image/src/lib.sai","bytes":107,"sha256":"…"}]}}
+{"type":"result","kind":"new","data":{"package":"acme:image@0.1.0","directory":"image","files":[{"path":"sai.package","bytes":79,"sha256":"…"},{"path":".gitignore","bytes":13,"sha256":"…"},{"path":"src/lib.sai","bytes":107,"sha256":"…"}]}}
 ```
 
-`directory` is `<path>` as given, with `/` separators and without a trailing `/`. The file paths are `directory` joined with the file name. The files appear in the order of item 2.
+`directory` is `<path>` as given, with `/` separators and without a trailing `/`; an absolute path supplied by the caller is echoed here. Each `files[].path` is relative to the new package directory, with `/` separators and no `.` or `..` segments. The files appear in the order of item 2. Human progress paths are relative to the current directory.
 
 Exit codes: 0 on success; 1 for `DESTINATION_NOT_EMPTY`.
 

@@ -288,7 +288,7 @@ Reverse mapping (LSP position to byte offset) clamps a `character` beyond the en
 
 The WIT files of the WASI packages shipped with the toolchain are in none of these forms. A location in them is not reported: a chain step whose location would be there has `location` `null` and is rendered without ` at <location>` ([08-effect-and-capability-analysis.md](08-effect-and-capability-analysis.md) §8.6.4).
 
-JSON output MUST NOT contain absolute file system paths, so it is identical across machines (draft §72). The human renderer uses the same strings, except that form 1 paths are shown relative to the current directory when the current directory is inside the workspace (§11.10.3).
+JSON source references and generated-file path fields MUST NOT contain absolute file system paths, so these paths are identical across machines (draft §72). A command may echo an explicit path argument only where its command-specific result contract says to do so; for example, `sai new` echoes the supplied destination in `directory` while its generated-file paths remain package-relative ([13-cli.md](13-cli.md) §13.6.1). The human renderer uses the same source-reference strings, except that form 1 paths are shown relative to the current directory when the current directory is inside the workspace (§11.10.3).
 
 ### 11.5.5 Position objects
 
