@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use sai_package::lexer::{PackagePunctuator, PackageToken, PackageTokenKind, PackageTriviaKind};
 
@@ -51,6 +52,70 @@ pub(crate) fn authors_declaration(
     list: &PackageBraceList,
 ) -> Result<Doc, PackageDocumentError> {
     comma_list_declaration(input, index, list, PackageBraceOwner::Authors)
+}
+
+pub(crate) fn string_declaration(
+    input: &PackageInput<'_>,
+    declaration: Range<u32>,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if declaration.end.checked_sub(declaration.start) != Some(2) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let keyword_index = declaration.start as usize;
+    let value_index = keyword_index + 1;
+    let keyword_token = tokens
+        .get(keyword_index)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let value_token = tokens
+        .get(value_index)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let valid_token_shape = keyword_token.kind == PackageTokenKind::Word
+        && value_token.kind == PackageTokenKind::String;
+    if !valid_token_shape {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let keyword = token_text(input.source(), keyword_token);
+    if !matches!(
+        keyword,
+        "source" | "wit" | "description" | "license" | "repository"
+    ) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let mut comments = TokenComments::new(input, tokens, keyword_index, value_index);
+    let mut keyword_leading = comments.take_leading(keyword_index);
+    let keyword_trailing = comments.take_trailing(keyword_index);
+    let mut value_leading = comments.take_leading(value_index);
+    let value_trailing = comments.take_trailing(value_index);
+    if comments.has_pending(keyword_index, value_index) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+    sort_comments(input, &mut keyword_leading);
+    sort_comments(input, &mut value_leading);
+
+    let mut document =
+        leading_comments_before(input, &keyword_leading, Some(keyword_token.span.start));
+    document.extend([
+        Doc::text(keyword),
+        trailing_comments(input, &keyword_trailing),
+    ]);
+    document.extend(leading_comments_before(
+        input,
+        &value_leading,
+        Some(value_token.span.start),
+    ));
+    document.extend([
+        Doc::text(" "),
+        Doc::text(token_text(input.source(), value_token)),
+        trailing_comments(input, &value_trailing),
+    ]);
+    Ok(Doc::concat(document))
 }
 
 fn comma_list_declaration(
@@ -483,7 +548,8 @@ mod tests {
     use crate::{GroupId, print, print_with_forced_groups};
 
     use super::{
-        PackageDocumentError, authors_declaration, capability_declaration, targets_declaration,
+        PackageDocumentError, authors_declaration, capability_declaration, string_declaration,
+        targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -513,6 +579,22 @@ mod tests {
         } else {
             print(&doc).expect("print document")
         }
+    }
+
+    fn render_string(source: &[u8], keyword: &str) -> String {
+        let input = PackageInput::new(source);
+        assert!(input.refusals().is_empty(), "{:?}", input.refusals());
+        let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
+        let declaration = index
+            .declarations()
+            .iter()
+            .find(|declaration| {
+                let token = &input.lexed().tokens[declaration.start as usize];
+                token_text(input.source(), token) == keyword
+            })
+            .expect("expected string declaration");
+        let doc = string_declaration(&input, declaration.clone()).expect("string document");
+        print(&doc).expect("print document")
     }
 
     #[test]
@@ -623,6 +705,50 @@ mod tests {
                 false
             ),
             "authors {\n    \"Ada\" // retain this\n    \"Grace\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn formats_string_declarations_with_canonical_spacing_and_source_escapes() {
+        assert_eq!(
+            render_string(
+                b"package acme:app @ 1.0.0\ndescription\"A\\tservice\"\n",
+                "description"
+            ),
+            "description \"A\\tservice\"\n"
+        );
+        assert_eq!(
+            render_string(
+                b"package acme:app @ 1.0.0\nlicense \"MIT OR Apache-2.0\"\n",
+                "license"
+            ),
+            "license \"MIT OR Apache-2.0\"\n"
+        );
+        assert_eq!(
+            render_string(
+                b"package acme:app @ 1.0.0\nrepository \"https://example.com/project\"\n",
+                "repository"
+            ),
+            "repository \"https://example.com/project\"\n"
+        );
+        assert_eq!(
+            render_string(b"package acme:app @ 1.0.0\nsource \"src\"\n", "source"),
+            "source \"src\"\n"
+        );
+        assert_eq!(
+            render_string(b"package acme:app @ 1.0.0\nwit \"wit\"\n", "wit"),
+            "wit \"wit\"\n"
+        );
+    }
+
+    #[test]
+    fn retains_comments_around_string_declarations() {
+        assert_eq!(
+            render_string(
+                b"package acme:app @ 1.0.0\ndescription/* field note */\"A service\" // docs\n",
+                "description"
+            ),
+            "description /* field note */ \"A service\" // docs\n"
         );
     }
 
