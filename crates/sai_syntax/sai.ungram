@@ -298,6 +298,7 @@ children TupleExpr elements Expr
 children ArrayExpr elements Expr
 child FieldExpr base Expr 0
 child FieldExpr name NameRef 0
+child FieldExpr generic_args GenericArgList 0
 child TupleIndexExpr base Expr 0
 child CallExpr callee Expr 0
 child CallExpr args ArgList 0

@@ -1,5 +1,5 @@
 use sai_syntax::{
-    GreenElement, GreenNode, GreenTrivia, SyntaxElement, SyntaxKind, TriviaKind,
+    GreenElement, GreenNode, GreenTrivia, SyntaxElement, SyntaxKind, SyntaxToken, TriviaKind,
     ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Pattern, Stmt},
 };
 
@@ -32,11 +32,16 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let mut functions = Vec::with_capacity(items.len());
+    let mut expression_group_ids = ExpressionGroupIds::default();
     for item in items {
         let Item::Function(function) = item else {
             return Err(SourceDocumentError::UnsupportedShape);
         };
-        functions.push(function_document(source, &function)?);
+        functions.push(function_document(
+            source,
+            &function,
+            &mut expression_group_ids,
+        )?);
     }
     if functions.is_empty() {
         return Ok(Doc::concat([]));
@@ -99,21 +104,44 @@ struct FunctionDocument {
     multiline: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ExpressionContext {
+    Unprotected,
+    Protected,
+    ParenthesizedWhole,
+}
+
+#[derive(Default)]
+struct ExpressionGroupIds {
+    next_id: u32,
+}
+
+impl ExpressionGroupIds {
+    fn next(&mut self) -> GroupId {
+        // Source-offset groups stay below the 16 MiB input limit; expression
+        // groups use this disjoint namespace and a per-document sequence.
+        const EXPRESSION_GROUP_START: u32 = 1 << 31;
+        debug_assert!(self.next_id < EXPRESSION_GROUP_START);
+        let group = GroupId(EXPRESSION_GROUP_START | self.next_id);
+        self.next_id += 1;
+        group
+    }
+}
+
 fn function_document(
     source: &ParsedSource,
     function: &ast::FnDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<FunctionDocument, SourceDocumentError> {
     if function.docs().is_some()
         || function.attrs().next().is_some()
         || function.visibility().is_some()
         || function.unsafe_token().is_some()
         || function.async_token().is_some()
-        || function.requires_clauses().next().is_some()
-        || function.ensures_clauses().next().is_some()
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let mut clauses = Vec::with_capacity(3);
+    let mut clauses = Vec::with_capacity(7);
     if let Some(clause) = function.where_clause() {
         clauses.push(where_clause_document(source, &clause)?);
     }
@@ -123,6 +151,18 @@ fn function_document(
     if let Some(clause) = function.effects_clause() {
         clauses.push(effects_clause_document(source, &clause)?);
     }
+    clauses.extend(
+        function
+            .requires_clauses()
+            .map(|clause| requires_clause_document(source, &clause, expression_group_ids))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    clauses.extend(
+        function
+            .ensures_clauses()
+            .map(|clause| ensures_clause_document(source, &clause, expression_group_ids))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     let params = function
         .params()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -418,6 +458,376 @@ fn where_predicate_document(
     Ok(Doc::group(
         GroupId(range.start().raw()),
         Doc::concat(contents),
+    ))
+}
+
+fn requires_clause_document(
+    source: &ParsedSource,
+    clause: &ast::RequiresClause,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    contract_clause_document(source, clause.syntax(), "requires", expression_group_ids)
+}
+
+fn ensures_clause_document(
+    source: &ParsedSource,
+    clause: &ast::EnsuresClause,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    contract_clause_document(source, clause.syntax(), "ensures", expression_group_ids)
+}
+
+fn contract_clause_document(
+    source: &ParsedSource,
+    clause: &sai_syntax::SyntaxNode,
+    keyword: &str,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let expression = clause
+        .children()
+        .filter_map(Expr::cast)
+        .next()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let token = clause
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) => Some(token),
+            SyntaxElement::Node(_) => None,
+        })
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if clause.children().count() != 1
+        || direct_token_kinds(clause) != [SyntaxKind::LIDENT]
+        || token_text(source, &token)? != keyword
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat([
+        Doc::text(format!("{keyword} ")),
+        expression_document(
+            source,
+            &expression,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?,
+    ]))
+}
+
+fn expression_document(
+    source: &ParsedSource,
+    expression: &Expr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    if let Some(chain) = member_chain_document(source, expression, context, expression_group_ids)? {
+        return Ok(chain);
+    }
+    match expression {
+        Expr::Literal(literal) => {
+            let token = literal
+                .token()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            Ok(Doc::text(normalize_literal(source, token)?))
+        }
+        Expr::FormatString(format_string) => Ok(Doc::Verbatim(
+            node_text(source, format_string.syntax()).to_owned(),
+        )),
+        Expr::Path(path) => {
+            let name = path.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let generic_args = path.generic_args();
+            if path.syntax().children().count() != 1 + usize::from(generic_args.is_some())
+                || !direct_token_kinds(path.syntax()).is_empty()
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let mut documents = vec![Doc::text(node_text(source, name.syntax()))];
+            if let Some(generic_args) = generic_args {
+                documents.push(generic_args_document(source, &generic_args)?);
+            }
+            Ok(Doc::concat(documents))
+        }
+        Expr::SelfValue(value) => {
+            if value.syntax().children().count() != 0
+                || direct_token_kinds(value.syntax()) != [SyntaxKind::SELF_KW]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            Ok(Doc::text(node_text(source, value.syntax())))
+        }
+        Expr::Field(field) => {
+            let base = field.base().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let documents = vec![
+                expression_document(source, &base, context, expression_group_ids)?,
+                field_suffix_document(source, field)?,
+            ];
+            Ok(Doc::concat(documents))
+        }
+        Expr::Paren(paren) => {
+            let expression = paren
+                .expression()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            if paren.syntax().children().count() != 1
+                || direct_token_kinds(paren.syntax()) != [SyntaxKind::L_PAREN, SyntaxKind::R_PAREN]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let group_id = expression_group_ids.next();
+            Ok(Doc::group(
+                group_id,
+                Doc::concat([
+                    Doc::text("("),
+                    Doc::indent(Doc::concat([
+                        Doc::SoftLine,
+                        expression_document(
+                            source,
+                            &expression,
+                            ExpressionContext::ParenthesizedWhole,
+                            expression_group_ids,
+                        )?,
+                    ])),
+                    Doc::SoftLine,
+                    Doc::text(")"),
+                ]),
+            ))
+        }
+        Expr::Call(call) => {
+            let callee = call.callee().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let arguments = call.args().ok_or(SourceDocumentError::UnsupportedShape)?;
+            if call.syntax().children().count() != 2
+                || !direct_token_kinds(call.syntax()).is_empty()
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            Ok(Doc::concat([
+                expression_document(source, &callee, context, expression_group_ids)?,
+                call_arguments_document(source, &arguments, expression_group_ids)?,
+            ]))
+        }
+        Expr::Binary(binary) => {
+            let lhs = binary.lhs().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let rhs = binary.rhs().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let (operator, kind) = binary.op().ok_or(SourceDocumentError::UnsupportedShape)?;
+            if !matches!(
+                kind,
+                ast::BinOp::Eq
+                    | ast::BinOp::Ne
+                    | ast::BinOp::Lt
+                    | ast::BinOp::Le
+                    | ast::BinOp::Gt
+                    | ast::BinOp::Ge
+            ) || binary.syntax().children().count() != 2
+                || direct_token_kinds(binary.syntax()) != [operator.kind()]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let group_id = expression_group_ids.next();
+            let left = expression_document(source, &lhs, context, expression_group_ids)?;
+            let right = expression_document(source, &rhs, context, expression_group_ids)?;
+            let operator_text = token_text(source, &operator)?;
+            let operator_and_right =
+                Doc::concat([Doc::Line, Doc::text(operator_text), Doc::text(" "), right]);
+            match context {
+                ExpressionContext::Protected => Ok(Doc::group(
+                    group_id,
+                    Doc::concat([left, Doc::indent(operator_and_right)]),
+                )),
+                ExpressionContext::ParenthesizedWhole => {
+                    Ok(Doc::concat([left, operator_and_right]))
+                }
+                ExpressionContext::Unprotected => Ok(Doc::group(
+                    group_id,
+                    Doc::concat([
+                        Doc::if_broken(group_id, Doc::text("("), Doc::text("")),
+                        Doc::indent(Doc::concat([Doc::SoftLine, left, operator_and_right])),
+                        Doc::SoftLine,
+                        Doc::if_broken(group_id, Doc::text(")"), Doc::text("")),
+                    ]),
+                )),
+            }
+        }
+        _ => Err(SourceDocumentError::UnsupportedShape),
+    }
+}
+
+fn member_chain_document(
+    source: &ParsedSource,
+    expression: &Expr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Option<Doc>, SourceDocumentError> {
+    let mut head = expression.clone();
+    let mut reverse_segments = Vec::new();
+    let mut call_segment_count = 0;
+
+    loop {
+        match &head {
+            Expr::Call(call) => {
+                let callee = call.callee().ok_or(SourceDocumentError::UnsupportedShape)?;
+                let Expr::Field(field) = callee else {
+                    break;
+                };
+                let name = field.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+                let joins_previous = match direct_token_kinds(name.syntax()).as_slice() {
+                    [SyntaxKind::LIDENT] => false,
+                    [SyntaxKind::UIDENT] => true,
+                    _ => break,
+                };
+                let arguments = call.args().ok_or(SourceDocumentError::UnsupportedShape)?;
+                let base = field.base().ok_or(SourceDocumentError::UnsupportedShape)?;
+                if call.syntax().children().count() != 2
+                    || !direct_token_kinds(call.syntax()).is_empty()
+                {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                reverse_segments.push((
+                    Doc::concat([
+                        field_suffix_document(source, &field)?,
+                        call_arguments_document(source, &arguments, expression_group_ids)?,
+                    ]),
+                    joins_previous,
+                ));
+                if !joins_previous {
+                    call_segment_count += 1;
+                }
+                head = base;
+            }
+            Expr::Field(_) => {
+                let mut probe = head.clone();
+                let mut fields = Vec::new();
+                while let Expr::Field(field) = &probe {
+                    let name = field.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+                    let kind = direct_token_kinds(name.syntax());
+                    let joins_previous = match kind.as_slice() {
+                        [SyntaxKind::LIDENT] => false,
+                        [SyntaxKind::UIDENT] => true,
+                        _ => return Err(SourceDocumentError::UnsupportedShape),
+                    };
+                    fields.push((field_suffix_document(source, field)?, joins_previous));
+                    probe = field.base().ok_or(SourceDocumentError::UnsupportedShape)?;
+                }
+                let has_previous_member_call = match &probe {
+                    Expr::Call(call) => {
+                        match call.callee().ok_or(SourceDocumentError::UnsupportedShape)? {
+                            Expr::Field(field) => {
+                                let name =
+                                    field.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+                                matches!(
+                                    direct_token_kinds(name.syntax()).as_slice(),
+                                    [SyntaxKind::LIDENT | SyntaxKind::UIDENT]
+                                )
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if !has_previous_member_call {
+                    break;
+                }
+                reverse_segments.extend(fields);
+                head = probe;
+            }
+            _ => break,
+        }
+    }
+
+    if call_segment_count < 2 {
+        return Ok(None);
+    }
+
+    reverse_segments.reverse();
+    let mut segments = Vec::with_capacity(reverse_segments.len());
+    let mut head_suffixes = Vec::new();
+    for (document, joins_previous) in reverse_segments {
+        if joins_previous {
+            if let Some(previous) = segments.pop() {
+                segments.push(Doc::concat([previous, document]));
+            } else {
+                head_suffixes.push(document);
+            }
+        } else {
+            segments.push(document);
+        }
+    }
+    let mut chain = vec![expression_document(
+        source,
+        &head,
+        context,
+        expression_group_ids,
+    )?];
+    chain.extend(head_suffixes);
+    let mut suffixes = Vec::with_capacity(segments.len() * 2);
+    for segment in segments {
+        suffixes.push(Doc::SoftLine);
+        suffixes.push(segment);
+    }
+    chain.push(Doc::indent(Doc::concat(suffixes)));
+    Ok(Some(Doc::group(
+        expression_group_ids.next(),
+        Doc::concat(chain),
+    )))
+}
+
+fn field_suffix_document(
+    source: &ParsedSource,
+    field: &ast::FieldExpr,
+) -> Result<Doc, SourceDocumentError> {
+    let name = field.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let generic_args = field.generic_args();
+    if field.syntax().children().count() != 2 + usize::from(generic_args.is_some())
+        || direct_token_kinds(field.syntax()) != [SyntaxKind::DOT]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text("."), Doc::text(node_text(source, name.syntax()))];
+    if let Some(generic_args) = generic_args {
+        documents.push(generic_args_document(source, &generic_args)?);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn call_arguments_document(
+    source: &ParsedSource,
+    arguments: &ast::ArgList,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    if arguments.named_args().next().is_some() || arguments.base_args().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let positional_arguments = arguments.positional_args().collect::<Vec<_>>();
+    if positional_arguments
+        .iter()
+        .any(|argument| argument.syntax().children().count() != 1)
+        || arguments.syntax().children().count() != positional_arguments.len()
+        || !comma_delimited_tokens_match(
+            arguments.syntax(),
+            SyntaxKind::L_PAREN,
+            SyntaxKind::R_PAREN,
+            positional_arguments.len(),
+        )
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let argument_documents = positional_arguments
+        .iter()
+        .map(|argument| {
+            let expression = argument
+                .expression()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            expression_document(
+                source,
+                &expression,
+                ExpressionContext::Protected,
+                expression_group_ids,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = arguments.syntax().text_range();
+    Ok(delimited_list_document(
+        GroupId(range.start().raw()),
+        "(",
+        ")",
+        argument_documents,
+        false,
     ))
 }
 
@@ -951,6 +1361,28 @@ fn direct_token_kinds(node: &sai_syntax::SyntaxNode) -> Vec<SyntaxKind> {
         .collect()
 }
 
+fn comma_delimited_tokens_match(
+    node: &sai_syntax::SyntaxNode,
+    open: SyntaxKind,
+    close: SyntaxKind,
+    item_count: usize,
+) -> bool {
+    let direct_tokens = direct_token_kinds(node)
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let mut expected = vec![open];
+    expected.extend(std::iter::repeat_n(
+        SyntaxKind::COMMA,
+        item_count.saturating_sub(1),
+    ));
+    expected.push(close);
+    if item_count > 0 && direct_tokens.get(item_count) == Some(&SyntaxKind::COMMA) {
+        expected.insert(item_count, SyntaxKind::COMMA);
+    }
+    direct_tokens == expected
+}
+
 fn delimited_list_document(
     group: GroupId,
     open: &str,
@@ -958,6 +1390,9 @@ fn delimited_list_document(
     items: Vec<Doc>,
     keep_singleton_comma: bool,
 ) -> Doc {
+    if items.is_empty() {
+        return Doc::concat([Doc::text(open), Doc::text(close)]);
+    }
     let mut contents = Vec::with_capacity(items.len() * 2 + 2);
     contents.push(Doc::SoftLine);
     for (index, item) in items.iter().cloned().enumerate() {
@@ -1198,6 +1633,17 @@ fn node_text<'a>(source: &'a ParsedSource, node: &sai_syntax::SyntaxNode) -> &'a
         .unwrap_or_default()
 }
 
+fn token_text<'a>(
+    source: &'a ParsedSource,
+    token: &SyntaxToken,
+) -> Result<&'a str, SourceDocumentError> {
+    let range = token.text_range();
+    source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())
+        .ok_or(SourceDocumentError::UnsupportedShape)
+}
+
 fn normalize_integer_literal(literal: &str) -> String {
     if let Some(digits) = literal.strip_prefix("0x") {
         format!("0x{}", digits.to_ascii_uppercase())
@@ -1237,7 +1683,7 @@ mod tests {
     use crate::{parse_source, print};
     use sai_syntax::{
         SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
-        ast::{AstNode, Type},
+        ast::{AstNode, Expr, Type},
     };
 
     fn format_shape(source: &[u8]) -> Result<String, SourceDocumentError> {
@@ -1465,6 +1911,227 @@ mod tests {
         assert_eq!(format_shape(input), Ok(expected.to_owned()));
         parse_source(expected.as_bytes()).expect("canonical output parses");
         assert_eq!(format_shape(expected.as_bytes()), Ok(expected.to_owned()));
+    }
+
+    #[test]
+    fn formats_requires_and_ensures_clauses_in_canonical_order() {
+        let input =
+            b"fn f() ensures result>=Money(0) requires amount<=balance requires true ensures false {}";
+        let expected = concat!(
+            "fn f()\n",
+            "    requires amount <= balance\n",
+            "    requires true\n",
+            "    ensures result >= Money(0)\n",
+            "    ensures false\n",
+            "{}\n",
+        );
+        parse_source(input).expect("input parses with a clause-order diagnostic");
+        let output = format_shape(input).expect("contract clauses are supported");
+        assert_eq!(output, expected);
+        parse_source(output.as_bytes()).expect("canonical clauses parse");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_long_contract_comparisons_with_safe_parentheses() {
+        let lhs = "left".repeat(12);
+        let rhs = "right".repeat(10);
+        let input = format!("fn f() requires {lhs}=={rhs} {{}}");
+        let expected =
+            format!("fn f()\n    requires (\n        {lhs}\n        == {rhs}\n    )\n{{}}\n");
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("comparison contract is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped contract parses");
+        assert!(reparsed.diagnostics().is_empty());
+        assert_eq!(
+            contract_expression_shape(parsed.root()),
+            contract_expression_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn preserves_protected_and_explicitly_parenthesized_comparisons() {
+        let lhs = "left".repeat(12);
+        let rhs = "right".repeat(10);
+
+        let input = format!("fn f() requires check({lhs}=={rhs}) {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("protected comparison parses");
+        let output = format_shape(input.as_bytes()).expect("protected comparison is supported");
+        let reparsed = parse_source(output.as_bytes()).expect("formatted call parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let chain_rhs = "right".repeat(18);
+        let input = format!("fn f() requires root.first().second()=={chain_rhs} {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("comparison with a chain parses");
+        let output = format_shape(input.as_bytes()).expect("comparison with a chain is supported");
+        assert_eq!(
+            output,
+            format!(
+                "fn f()\n    requires (\n        root.first().second()\n        == {chain_rhs}\n    )\n{{}}\n"
+            )
+        );
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped chain comparison parses");
+        assert_eq!(
+            contract_expression_shape(parsed.root()),
+            contract_expression_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let input = format!("fn f() requires ({lhs}=={rhs}) {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("parenthesized comparison parses");
+        let output = format_shape(input.as_bytes()).expect("parenthesized comparison is supported");
+        let reparsed = parse_source(output.as_bytes()).expect("formatted parentheses parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_field_and_call_contract_expressions() {
+        for (input, expected) in [
+            (
+                b"fn f() requires user.active {}".as_slice(),
+                "fn f()\n    requires user.active\n{}\n",
+            ),
+            (
+                b"fn f() requires user.is_active() {}".as_slice(),
+                "fn f()\n    requires user.is_active()\n{}\n",
+            ),
+            (
+                b"fn f() ensures check(user.value,amount,) {}".as_slice(),
+                "fn f()\n    ensures check(user.value, amount)\n{}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("contract input parses");
+            let output = format_shape(input).expect("field and call expressions are supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted contract parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn formats_generic_method_calls_and_format_string_contracts() {
+        for (input, expected) in [
+            (
+                b"fn f() requires user.check<I32>(value) {}".as_slice(),
+                "fn f()\n    requires user.check<I32>(value)\n{}\n",
+            ),
+            (
+                b"fn f() requires f\"hello {name}\" {}",
+                "fn f()\n    requires f\"hello {name}\"\n{}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("contract input parses");
+            let output = format_shape(input).expect("supported contract expression is formatted");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted contract parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn keeps_empty_call_arguments_inline_after_a_long_callee() {
+        let callee = "a".repeat(100);
+        let input = format!("fn f() requires {callee}() {{}}");
+        let output = format_shape(input.as_bytes()).expect("empty call is supported");
+        assert!(output.contains(&format!("{callee}()")));
+        assert!(!output.contains("(\n\n)"));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted empty call parses");
+        assert!(reparsed.diagnostics().is_empty());
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_long_method_chains_before_every_call_segment() {
+        let first = format!("first{}", "a".repeat(45));
+        let second = format!("second{}", "b".repeat(45));
+        let input = format!("fn f() requires root.{first}().{second}() {{}}");
+        let expected =
+            format!("fn f()\n    requires root\n        .{first}()\n        .{second}()\n{{}}\n");
+        let parsed = parse_source(input.as_bytes()).expect("method chain parses");
+        let output = format_shape(input.as_bytes()).expect("method chain is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("broken method chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn keeps_intermediate_fields_in_broken_member_chains() {
+        let middle = "middle".repeat(12);
+        let input = format!("fn f() requires root.first().{middle}.second() {{}}");
+        let expected = format!(
+            "fn f()\n    requires root\n        .first()\n        .{middle}\n        .second()\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("member chain parses");
+        let output = format_shape(input.as_bytes()).expect("member chain is supported");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("broken member chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_trailing_fields_and_joins_uppercase_members_to_the_prior_segment() {
+        let trailing = "trailing".repeat(10);
+        let input = format!("fn f() requires root.first().second().{trailing} {{}}");
+        let expected = format!(
+            "fn f()\n    requires root\n        .first()\n        .second()\n        .{trailing}\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("trailing field chain parses");
+        let output = format_shape(input.as_bytes()).expect("trailing field chain is supported");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("broken trailing field chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let first = "first".repeat(5);
+        let second = "second".repeat(5);
+        let last = "last".repeat(5);
+        let input = format!("fn f() requires root.{first}().Variant.{second}().{last}() {{}}");
+        let expected = format!(
+            "fn f()\n    requires root\n        .{first}().Variant\n        .{second}()\n        .{last}()\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("uppercase field chain parses");
+        let output = format_shape(input.as_bytes()).expect("uppercase field joins prior segment");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted uppercase chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let input =
+            format!("fn f() requires root.{first}().Variant(payload).{second}().{last}() {{}}");
+        let expected = format!(
+            "fn f()\n    requires root\n        .{first}().Variant(payload)\n        .{second}()\n        .{last}()\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("uppercase call chain parses");
+        let output = format_shape(input.as_bytes()).expect("uppercase call joins prior segment");
+        assert_eq!(output, expected);
+        let reparsed =
+            parse_source(output.as_bytes()).expect("formatted uppercase call chain parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let first = "first".repeat(18);
+        let input = format!("fn f() requires root.{first}().Variant(payload) {{}}");
+        let expected = format!(
+            "fn f()\n    requires root.{first}().Variant(\n        payload,\n    )\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("single call segment parses");
+        let output = format_shape(input.as_bytes()).expect("one segment stays attached");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("single call segment reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
@@ -1846,14 +2513,6 @@ mod tests {
     #[test]
     fn unsupported_shapes_and_comments_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f() requires true {}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
-            format_shape(b"fn f() ensures true {}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
             format_shape(b"fn f(self: Foo) {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
@@ -1931,6 +2590,7 @@ mod tests {
                     } else {
                         let trailing_comma_close = match node.kind() {
                             SyntaxKind::PARAM_LIST
+                            | SyntaxKind::ARG_LIST
                             | SyntaxKind::FN_PTR_TYPE
                             | SyntaxKind::FN_SUGAR_BOUND => Some(SyntaxKind::R_PAREN),
                             SyntaxKind::GENERIC_ARG_LIST | SyntaxKind::GENERIC_PARAM_LIST => {
@@ -1972,5 +2632,23 @@ mod tests {
             }
         }
         shape
+    }
+
+    fn contract_expression_shape(root: &SyntaxNode) -> Vec<ShapeElement> {
+        let clause = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::REQUIRES_CLAUSE)
+            .expect("requires clause exists");
+        let expression = clause
+            .children()
+            .find_map(Expr::cast)
+            .expect("requires expression exists");
+        match expression {
+            Expr::Paren(paren) => {
+                let inner = paren.expression().expect("parenthesized expression exists");
+                syntax_shape(inner.syntax())
+            }
+            expression => syntax_shape(expression.syntax()),
+        }
     }
 }
