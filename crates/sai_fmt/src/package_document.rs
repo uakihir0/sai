@@ -58,6 +58,35 @@ pub(crate) fn string_declaration(
     input: &PackageInput<'_>,
     declaration: Range<u32>,
 ) -> Result<Doc, PackageDocumentError> {
+    value_declaration(
+        input,
+        declaration,
+        &[
+            ("source", PackageTokenKind::String),
+            ("wit", PackageTokenKind::String),
+            ("description", PackageTokenKind::String),
+            ("license", PackageTokenKind::String),
+            ("repository", PackageTokenKind::String),
+        ],
+    )
+}
+
+pub(crate) fn allocator_declaration(
+    input: &PackageInput<'_>,
+    declaration: Range<u32>,
+) -> Result<Doc, PackageDocumentError> {
+    value_declaration(
+        input,
+        declaration,
+        &[("allocator", PackageTokenKind::PackagePath)],
+    )
+}
+
+fn value_declaration(
+    input: &PackageInput<'_>,
+    declaration: Range<u32>,
+    accepted_keywords: &[(&str, PackageTokenKind)],
+) -> Result<Doc, PackageDocumentError> {
     if !input.refusals().is_empty() {
         return Err(PackageDocumentError::InputRefused);
     }
@@ -74,17 +103,16 @@ pub(crate) fn string_declaration(
     let value_token = tokens
         .get(value_index)
         .ok_or(PackageDocumentError::InvalidEntry)?;
-    let valid_token_shape = keyword_token.kind == PackageTokenKind::Word
-        && value_token.kind == PackageTokenKind::String;
-    if !valid_token_shape {
+    if keyword_token.kind != PackageTokenKind::Word {
         return Err(PackageDocumentError::InvalidEntry);
     }
 
     let keyword = token_text(input.source(), keyword_token);
-    if !matches!(
-        keyword,
-        "source" | "wit" | "description" | "license" | "repository"
-    ) {
+    let expected_value_kind = accepted_keywords
+        .iter()
+        .find_map(|(accepted_keyword, kind)| (*accepted_keyword == keyword).then_some(*kind))
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if value_token.kind != expected_value_kind {
         return Err(PackageDocumentError::InvalidEntry);
     }
 
@@ -548,8 +576,8 @@ mod tests {
     use crate::{GroupId, print, print_with_forced_groups};
 
     use super::{
-        PackageDocumentError, authors_declaration, capability_declaration, string_declaration,
-        targets_declaration, token_text,
+        PackageDocumentError, allocator_declaration, authors_declaration, capability_declaration,
+        string_declaration, targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -585,16 +613,34 @@ mod tests {
         let input = PackageInput::new(source);
         assert!(input.refusals().is_empty(), "{:?}", input.refusals());
         let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
-        let declaration = index
+        let declaration = find_declaration(&input, &index, keyword);
+        let doc = string_declaration(&input, declaration.clone()).expect("string document");
+        print(&doc).expect("print document")
+    }
+
+    fn render_allocator(source: &[u8]) -> String {
+        let input = PackageInput::new(source);
+        assert!(input.refusals().is_empty(), "{:?}", input.refusals());
+        let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
+        let declaration = find_declaration(&input, &index, "allocator");
+        let doc = allocator_declaration(&input, declaration).expect("allocator document");
+        print(&doc).expect("print document")
+    }
+
+    fn find_declaration(
+        input: &PackageInput<'_>,
+        index: &PackageSyntaxIndex,
+        keyword: &str,
+    ) -> std::ops::Range<u32> {
+        index
             .declarations()
             .iter()
             .find(|declaration| {
                 let token = &input.lexed().tokens[declaration.start as usize];
                 token_text(input.source(), token) == keyword
             })
-            .expect("expected string declaration");
-        let doc = string_declaration(&input, declaration.clone()).expect("string document");
-        print(&doc).expect("print document")
+            .cloned()
+            .expect("expected package declaration")
     }
 
     #[test]
@@ -749,6 +795,28 @@ mod tests {
                 "description"
             ),
             "description /* field note */ \"A service\" // docs\n"
+        );
+    }
+
+    #[test]
+    fn formats_allocator_as_a_single_line_package_path_declaration() {
+        assert_eq!(
+            render_allocator(b"package acme:app @ 1.0.0\nallocator acme:bump-alloc\n"),
+            "allocator acme:bump-alloc\n"
+        );
+        assert_eq!(
+            render_allocator(b"package acme:app @ 1.0.0\nallocator acme:unknown-alloc\n"),
+            "allocator acme:unknown-alloc\n"
+        );
+    }
+
+    #[test]
+    fn retains_comments_around_allocator_declarations() {
+        assert_eq!(
+            render_allocator(
+                b"package acme:app @ 1.0.0\nallocator/* selected allocator */acme:bump-alloc // build choice\n"
+            ),
+            "allocator /* selected allocator */ acme:bump-alloc // build choice\n"
         );
     }
 
