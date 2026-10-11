@@ -47,6 +47,7 @@ pub enum LockWriteError {
 #[derive(Debug)]
 pub enum WorkspaceLockWriteError {
     WorkspaceLockNotExclusive(WorkspaceLockMode),
+    DestinationAlreadyExists(PathBuf),
     LockWrite(LockWriteError),
 }
 
@@ -55,6 +56,9 @@ impl fmt::Display for WorkspaceLockWriteError {
         match self {
             Self::WorkspaceLockNotExclusive(_) => {
                 formatter.write_str("an exclusive workspace lock is required to write sai.lock")
+            }
+            Self::DestinationAlreadyExists(path) => {
+                write!(formatter, "sai.lock already exists: {path:?}")
             }
             Self::LockWrite(error) => error.fmt(formatter),
         }
@@ -65,6 +69,7 @@ impl Error for WorkspaceLockWriteError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::WorkspaceLockNotExclusive(_) => None,
+            Self::DestinationAlreadyExists(_) => None,
             Self::LockWrite(error) => Some(error),
         }
     }
@@ -193,6 +198,37 @@ pub fn write_workspace_lock_atomically(
         ));
     }
     let path = guard.package_directory().join(LOCK_FILE_NAME);
+    write_canonical_lock_atomically(&path, parsed).map_err(WorkspaceLockWriteError::LockWrite)
+}
+
+/// Create `sai.lock` only when no directory entry with that name exists.
+///
+/// The caller must hold the package's exclusive workspace lock. Participating
+/// processes are serialized by that guard; unrelated filesystem mutation is
+/// outside the workspace lock's coordination contract.
+pub fn create_workspace_lock_atomically(
+    guard: &WorkspaceLockGuard,
+    parsed: &LockParseOutput,
+) -> Result<LockWriteOutcome, WorkspaceLockWriteError> {
+    if guard.mode() != WorkspaceLockMode::Exclusive {
+        return Err(WorkspaceLockWriteError::WorkspaceLockNotExclusive(
+            guard.mode(),
+        ));
+    }
+    let path = guard.package_directory().join(LOCK_FILE_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(WorkspaceLockWriteError::DestinationAlreadyExists(path));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(WorkspaceLockWriteError::LockWrite(LockWriteError::Io {
+                operation: "inspect lock destination",
+                path,
+                source,
+            }));
+        }
+    }
     write_canonical_lock_atomically(&path, parsed).map_err(WorkspaceLockWriteError::LockWrite)
 }
 
@@ -430,7 +466,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        LockWriteError, LockWriteOutcome, WorkspaceLockWriteError, write_canonical_lock_atomically,
+        LockWriteError, LockWriteOutcome, WorkspaceLockWriteError,
+        create_workspace_lock_atomically, write_canonical_lock_atomically,
         write_workspace_lock_atomically,
     };
     use crate::lock::parse;
@@ -544,6 +581,67 @@ mod tests {
             WorkspaceLockGuard::try_acquire(&directory.0, WorkspaceLockMode::Exclusive)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_creator_creates_once_and_preserves_an_existing_lock() {
+        let directory = TestDirectory::new();
+        let canonical_lock_path = fs::canonicalize(&directory.0).unwrap().join("sai.lock");
+        let parsed = parse(CANONICAL);
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert_eq!(
+            create_workspace_lock_atomically(&guard, &parsed).unwrap(),
+            LockWriteOutcome::Written {
+                bytes: CANONICAL.len()
+            }
+        );
+        assert!(matches!(
+            create_workspace_lock_atomically(&guard, &parse(b"not a lock")),
+            Err(WorkspaceLockWriteError::DestinationAlreadyExists(path))
+                if path == canonical_lock_path
+        ));
+        assert_eq!(fs::read(directory.lock_path()).unwrap(), CANONICAL);
+    }
+
+    #[test]
+    fn workspace_creator_requires_an_exclusive_lock_before_touching_the_destination() {
+        let directory = TestDirectory::new();
+        let guard = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Shared).unwrap();
+
+        assert!(matches!(
+            create_workspace_lock_atomically(&guard, &parse(CANONICAL)),
+            Err(WorkspaceLockWriteError::WorkspaceLockNotExclusive(
+                WorkspaceLockMode::Shared
+            ))
+        ));
+        assert!(!directory.lock_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_creator_rejects_a_broken_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let target = directory.0.join("missing-target");
+        symlink(&target, directory.lock_path()).unwrap();
+        let canonical_lock_path = fs::canonicalize(&directory.0).unwrap().join("sai.lock");
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert!(matches!(
+            create_workspace_lock_atomically(&guard, &parse(CANONICAL)),
+            Err(WorkspaceLockWriteError::DestinationAlreadyExists(path))
+                if path == canonical_lock_path
+        ));
+        assert!(
+            fs::symlink_metadata(directory.lock_path())
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

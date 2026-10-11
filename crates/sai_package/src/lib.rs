@@ -9,9 +9,9 @@ pub mod identity;
 pub mod lexer;
 pub mod local_source;
 pub mod lock;
-// This crate-private assembly layer awaits the audited-content integration.
-#[allow(dead_code)]
-pub(crate) mod lock_build;
+// The root-only creation entry point is safe to expose before the audited
+// dependency-content assembly path is integrated.
+pub mod lock_build;
 pub mod lock_conflict;
 pub mod lock_graph_validation;
 pub mod lock_root_contract;

@@ -5,9 +5,14 @@
 //! contracts and checked against the selected graph, so callers cannot persist
 //! edges from a different resolution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
 use std::ops::Range;
+use std::path::PathBuf;
+
+use sha2::{Digest, Sha256};
 
 use crate::lock::{
     LockFile, LockPackage, LockPackageField, LockParseOutput, LockRequirement, LockRoot,
@@ -19,10 +24,17 @@ use crate::lock_graph_validation::{
 use crate::lock_validation::{
     LockValidationError, SUPPORTED_LOCK_FORMAT_VERSION, validate as validate_lock,
 };
-use crate::manifest::{PackageRole, Spanned};
-use crate::mvs::{MvsPackageVersion, MvsRequirer};
-use crate::mvs_graph_validation::{MvsDependencyCycle, MvsSelectedGraph, MvsVersionConflict};
+use crate::lock_writer::{
+    LockWriteOutcome, WorkspaceLockWriteError, create_workspace_lock_atomically,
+};
+use crate::manifest::{MAX_PACKAGE_MANIFEST_BYTES, PackageRole, Spanned};
+use crate::mvs::{MvsInputError, MvsPackageVersion, MvsRequirer, select};
+use crate::mvs_graph_validation::{
+    MvsDependencyCycle, MvsSelectedGraph, MvsSelectedGraphInputError, MvsVersionConflict,
+    check_selected_graph,
+};
 use crate::resolver_contract::{ResolverContract, ResolverPinKind, ResolverRequirementResolution};
+use crate::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 
 /// Content-derived lock fields for one selected package version.
 ///
@@ -37,7 +49,7 @@ pub(crate) struct LockPackageMetadata {
 
 /// Failure to construct a lock that represents the supplied final graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LockBuildError {
+pub enum LockBuildError {
     RootRoleMismatch(PackageRole),
     RootPackageMismatch {
         contract: Box<MvsPackageVersion>,
@@ -83,6 +95,185 @@ impl fmt::Display for LockBuildError {
 }
 
 impl std::error::Error for LockBuildError {}
+
+/// Failure while initializing a lock for a root package with no active
+/// requirements.
+#[derive(Debug)]
+pub enum RootOnlyLockCreationError {
+    RootHasRequirements(MvsPackageVersion),
+    RootManifestRead {
+        path: PathBuf,
+        source: io::Error,
+    },
+    RootManifestNotRegularFile(PathBuf),
+    RootManifestTooLarge(PathBuf),
+    RootManifestMismatch {
+        expected_digest: [u8; 32],
+        actual_digest: [u8; 32],
+    },
+    Selection(Vec<MvsInputError>),
+    SelectedGraph(MvsSelectedGraphInputError),
+    Build(LockBuildError),
+    Write(WorkspaceLockWriteError),
+}
+
+impl fmt::Display for RootOnlyLockCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootHasRequirements(root) => write!(
+                formatter,
+                "cannot create a root-only lock for {root:?}: it has active requirements"
+            ),
+            Self::RootManifestRead { path, source } => {
+                write!(formatter, "could not read root manifest {path:?}: {source}")
+            }
+            Self::RootManifestNotRegularFile(path) => {
+                write!(formatter, "root manifest is not a regular file: {path:?}")
+            }
+            Self::RootManifestTooLarge(path) => write!(
+                formatter,
+                "root manifest exceeds the {MAX_PACKAGE_MANIFEST_BYTES}-byte limit: {path:?}"
+            ),
+            Self::RootManifestMismatch { .. } => {
+                formatter.write_str("root contract does not match the workspace sai.package")
+            }
+            Self::Selection(errors) => {
+                write!(formatter, "could not select the root graph: {errors:?}")
+            }
+            Self::SelectedGraph(error) => {
+                write!(
+                    formatter,
+                    "could not construct the selected root graph: {error:?}"
+                )
+            }
+            Self::Build(error) => error.fmt(formatter),
+            Self::Write(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RootOnlyLockCreationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RootManifestRead { source, .. } => Some(source),
+            Self::Build(error) => Some(error),
+            Self::Write(error) => Some(error),
+            Self::RootHasRequirements(_)
+            | Self::RootManifestNotRegularFile(_)
+            | Self::RootManifestTooLarge(_)
+            | Self::RootManifestMismatch { .. }
+            | Self::Selection(_)
+            | Self::SelectedGraph(_) => None,
+        }
+    }
+}
+
+/// Build and atomically create a root-only `sai.lock`.
+///
+/// The root contract must describe the validated `sai.package` in the guarded
+/// package directory, with no active requirements. This function rereads the
+/// manifest while the guard is held and compares its SHA-256 digest to the
+/// contract. `guard` must hold the package directory's exclusive workspace
+/// lock. The operation refuses to replace any existing `sai.lock` directory
+/// entry, including a symlink or a non-regular file.
+pub fn create_root_only_lock_if_missing(
+    guard: &WorkspaceLockGuard,
+    root_contract: &ResolverContract,
+) -> Result<LockWriteOutcome, RootOnlyLockCreationError> {
+    if guard.mode() != WorkspaceLockMode::Exclusive {
+        return Err(RootOnlyLockCreationError::Write(
+            WorkspaceLockWriteError::WorkspaceLockNotExclusive(guard.mode()),
+        ));
+    }
+    if !root_contract.mvs.edges().is_empty() {
+        return Err(RootOnlyLockCreationError::RootHasRequirements(
+            root_contract.manifest_package_version().clone(),
+        ));
+    }
+
+    let manifest_bytes = read_guarded_root_manifest(guard)?;
+    let actual_digest: [u8; 32] = Sha256::digest(&manifest_bytes).into();
+    let expected_digest = *root_contract.manifest_digest();
+    if actual_digest != expected_digest {
+        return Err(RootOnlyLockCreationError::RootManifestMismatch {
+            expected_digest,
+            actual_digest,
+        });
+    }
+
+    let selection = select(
+        &root_contract.mvs,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .map_err(RootOnlyLockCreationError::Selection)?;
+    let graph = check_selected_graph(&root_contract.mvs, &selection)
+        .map_err(RootOnlyLockCreationError::SelectedGraph)?;
+    let parsed = build_resolved_lock(root_contract, &graph, &BTreeMap::new(), &BTreeMap::new())
+        .map_err(RootOnlyLockCreationError::Build)?;
+    create_workspace_lock_atomically(guard, &parsed).map_err(RootOnlyLockCreationError::Write)
+}
+
+fn read_guarded_root_manifest(
+    guard: &WorkspaceLockGuard,
+) -> Result<Vec<u8>, RootOnlyLockCreationError> {
+    let path = guard.package_directory().join("sai.package");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let mut file =
+        options
+            .open(&path)
+            .map_err(|source| RootOnlyLockCreationError::RootManifestRead {
+                path: path.clone(),
+                source,
+            })?;
+    let metadata =
+        file.metadata()
+            .map_err(|source| RootOnlyLockCreationError::RootManifestRead {
+                path: path.clone(),
+                source,
+            })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(RootOnlyLockCreationError::RootManifestNotRegularFile(path));
+        }
+    }
+    if !metadata.is_file() {
+        return Err(RootOnlyLockCreationError::RootManifestNotRegularFile(path));
+    }
+    if metadata.len() > MAX_PACKAGE_MANIFEST_BYTES as u64 {
+        return Err(RootOnlyLockCreationError::RootManifestTooLarge(path));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_PACKAGE_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| RootOnlyLockCreationError::RootManifestRead {
+            path: path.clone(),
+            source,
+        })?;
+    if bytes.len() > MAX_PACKAGE_MANIFEST_BYTES {
+        return Err(RootOnlyLockCreationError::RootManifestTooLarge(path));
+    }
+    Ok(bytes)
+}
 
 /// Builds a lock AST for the final resolved graph.
 ///
@@ -375,11 +566,19 @@ impl LockRequirementField for LockPackageField {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{LockBuildError, LockPackageMetadata, build_resolved_lock};
+    use super::{
+        LockBuildError, LockPackageMetadata, RootOnlyLockCreationError, build_resolved_lock,
+        create_root_only_lock_if_missing,
+    };
     use crate::lock::{LockPackageField, LockSource};
     use crate::lock_graph_validation::validate as validate_lock_graph;
     use crate::lock_serialization::serialize_canonical;
+    use crate::lock_writer::{LockWriteOutcome, WorkspaceLockWriteError};
+    use crate::manifest::MAX_PACKAGE_MANIFEST_BYTES;
     use crate::manifest::{PackageRole, parse, parse_for_role};
     use crate::mvs::{MvsPackageVersion, select};
     use crate::mvs_graph_validation::{
@@ -390,6 +589,30 @@ mod tests {
     };
     use crate::validation::PackageValidationContext;
     use crate::version::Version;
+    use crate::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    const ROOT_MANIFEST_BYTES: &[u8] = b"package acme:root @ 1.0.0\n\
+                                         source \"src\"\n\
+                                         targets { wasm32-core }\n";
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("sai-lock-build-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct Fixture {
         root: ResolverContract,
@@ -405,6 +628,21 @@ mod tests {
             Version::parse(version).expect("test version is valid"),
         )
         .expect("test package identity is valid")
+    }
+
+    fn root_only_contract() -> ResolverContract {
+        let manifest = parse(ROOT_MANIFEST_BYTES);
+        let path_packages = BTreeMap::new();
+        let root_path_overrides = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &manifest,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root manifest is valid");
+        build_resolver_contract(&manifest, &context, PackageValidationContext::default())
+            .expect("root contract is valid")
     }
 
     fn fixture() -> Fixture {
@@ -553,6 +791,130 @@ requires {
             !canonical.contains("acme:excluded"),
             "requirements excluded by root targets are not recorded"
         );
+    }
+
+    #[test]
+    fn creates_a_canonical_lock_for_a_root_without_active_requirements() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("sai.package"), ROOT_MANIFEST_BYTES).unwrap();
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        let outcome = create_root_only_lock_if_missing(&guard, &root_only_contract())
+            .expect("root-only lock is created");
+        let expected = b"lock 1\n\nroot acme:root @ 1.0.0\n    targets { wasm32-core }\n";
+        assert_eq!(
+            outcome,
+            LockWriteOutcome::Written {
+                bytes: expected.len()
+            }
+        );
+        assert_eq!(fs::read(directory.0.join("sai.lock")).unwrap(), expected);
+    }
+
+    #[test]
+    fn root_only_lock_creation_rejects_active_requirements_without_writing() {
+        let directory = TestDirectory::new();
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let root = fixture().root;
+
+        assert!(matches!(
+            create_root_only_lock_if_missing(&guard, &root),
+            Err(RootOnlyLockCreationError::RootHasRequirements(_))
+        ));
+        assert!(!directory.0.join("sai.lock").exists());
+    }
+
+    #[test]
+    fn root_only_lock_creation_rejects_a_shared_guard() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("sai.package"), ROOT_MANIFEST_BYTES).unwrap();
+        let guard = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Shared).unwrap();
+
+        assert!(matches!(
+            create_root_only_lock_if_missing(&guard, &root_only_contract()),
+            Err(RootOnlyLockCreationError::Write(
+                WorkspaceLockWriteError::WorkspaceLockNotExclusive(WorkspaceLockMode::Shared)
+            ))
+        ));
+        assert!(!directory.0.join("sai.lock").exists());
+    }
+
+    #[test]
+    fn root_only_lock_creation_does_not_replace_an_existing_lock() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("sai.lock");
+        fs::write(directory.0.join("sai.package"), ROOT_MANIFEST_BYTES).unwrap();
+        fs::write(&path, b"preserve existing lock").unwrap();
+        let canonical_path = fs::canonicalize(&directory.0).unwrap().join("sai.lock");
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert!(matches!(
+            create_root_only_lock_if_missing(&guard, &root_only_contract()),
+            Err(RootOnlyLockCreationError::Write(
+                WorkspaceLockWriteError::DestinationAlreadyExists(existing)
+            )) if existing == canonical_path
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"preserve existing lock");
+    }
+
+    #[test]
+    fn root_only_lock_creation_rejects_a_contract_for_another_workspace() {
+        let directory = TestDirectory::new();
+        fs::write(
+            directory.0.join("sai.package"),
+            b"package acme:other @ 9.0.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+        )
+        .unwrap();
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert!(matches!(
+            create_root_only_lock_if_missing(&guard, &root_only_contract()),
+            Err(RootOnlyLockCreationError::RootManifestMismatch { .. })
+        ));
+        assert!(!directory.0.join("sai.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_only_lock_creation_does_not_follow_a_manifest_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let target = directory.0.join("manifest-target");
+        fs::write(&target, ROOT_MANIFEST_BYTES).unwrap();
+        symlink(&target, directory.0.join("sai.package")).unwrap();
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert!(matches!(
+            create_root_only_lock_if_missing(&guard, &root_only_contract()),
+            Err(RootOnlyLockCreationError::RootManifestRead { .. })
+        ));
+        assert!(!directory.0.join("sai.lock").exists());
+    }
+
+    #[test]
+    fn root_only_lock_creation_enforces_the_manifest_size_limit() {
+        let directory = TestDirectory::new();
+        fs::write(
+            directory.0.join("sai.package"),
+            vec![b' '; MAX_PACKAGE_MANIFEST_BYTES + 1],
+        )
+        .unwrap();
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert!(matches!(
+            create_root_only_lock_if_missing(&guard, &root_only_contract()),
+            Err(RootOnlyLockCreationError::RootManifestTooLarge(_))
+        ));
+        assert!(!directory.0.join("sai.lock").exists());
     }
 
     #[test]
