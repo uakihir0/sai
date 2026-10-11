@@ -3,7 +3,7 @@ use sai_syntax::{
     ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Pattern, Stmt},
 };
 
-use crate::{Doc, ParsedSource};
+use crate::{Doc, GroupId, ParsedSource};
 
 /// Syntax shapes that the source document builder does not support yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14,9 +14,9 @@ pub(super) enum SourceDocumentError {
 /// Build a document for the deliberately small source-formatting foundation.
 ///
 /// The builder is private and fail-closed while source-formatting coverage is
-/// being implemented. It accepts files made only of unannotated, zero-argument
-/// functions with empty bodies or one single-line literal `let` and a final
-/// name expression.
+/// being implemented. It accepts files made only of unannotated functions
+/// with simple parameters and empty bodies or one single-line literal `let`
+/// followed by a final name expression.
 pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocumentError> {
     if has_comment_trivia(source.root().green()) {
         return Err(SourceDocumentError::UnsupportedShape);
@@ -121,9 +121,7 @@ fn function_document(
     let params = function
         .params()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    if params.params().next().is_some() || params.self_param().is_some() {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
+    let parameters = parameter_list_document(source, &params)?;
     let block = function
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -207,7 +205,12 @@ fn function_document(
         }
         _ => return Err(SourceDocumentError::UnsupportedShape),
     };
-    let document = Doc::concat([Doc::text(format!("fn {name}() ")), body]);
+    let document = Doc::concat([
+        Doc::text(format!("fn {name}")),
+        parameters,
+        Doc::text(" "),
+        body,
+    ]);
     let range = function.syntax().text_range();
     Ok(FunctionDocument {
         document,
@@ -215,6 +218,73 @@ fn function_document(
         end: range.end().to_usize(),
         multiline: !statements.is_empty(),
     })
+}
+
+fn parameter_list_document(
+    source: &ParsedSource,
+    params: &ast::ParamList,
+) -> Result<Doc, SourceDocumentError> {
+    if params.self_param().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let parameters = params
+        .params()
+        .map(|param| parameter_document(source, param))
+        .collect::<Result<Vec<_>, _>>()?;
+    if parameters.is_empty() {
+        return Ok(Doc::text("()"));
+    }
+
+    let group = GroupId(params.syntax().text_range().start().raw());
+    let mut contents = Vec::with_capacity(parameters.len() * 2 + 2);
+    contents.push(Doc::SoftLine);
+    for (index, parameter) in parameters.into_iter().enumerate() {
+        if index > 0 {
+            contents.push(Doc::text(","));
+            contents.push(Doc::Line);
+        }
+        contents.push(parameter);
+    }
+    contents.push(Doc::if_broken(group, Doc::text(","), Doc::text("")));
+
+    Ok(Doc::group(
+        group,
+        Doc::concat([
+            Doc::text("("),
+            Doc::indent(Doc::concat(contents)),
+            Doc::SoftLine,
+            Doc::text(")"),
+        ]),
+    ))
+}
+
+fn parameter_document(
+    source: &ParsedSource,
+    param: ast::Param,
+) -> Result<Doc, SourceDocumentError> {
+    if param.is_mutable() || param.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let name = param.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let ty = param.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let ast::Type::PathType(path) = ty else {
+        return Err(SourceDocumentError::UnsupportedShape);
+    };
+    let segments = path.segments().collect::<Vec<_>>();
+    let [segment] = segments.as_slice() else {
+        return Err(SourceDocumentError::UnsupportedShape);
+    };
+    if segment.generic_args().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let type_name = segment
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    Ok(Doc::text(format!(
+        "{}: {}",
+        node_text(source, name.syntax()),
+        node_text(source, type_name.syntax())
+    )))
 }
 
 fn node_text<'a>(source: &'a ParsedSource, node: &sai_syntax::SyntaxNode) -> &'a str {
@@ -279,6 +349,45 @@ mod tests {
             format_shape(b"fn  f ( ) {\n    let   x = 1\n\n    x\n}\n"),
             Ok(expected.replace("1\n    x", "1\n\n    x"))
         );
+    }
+
+    #[test]
+    fn formats_simple_parameter_lists_and_breaks_them_at_the_width_limit() {
+        assert_eq!(
+            format_shape(b"fn f(x:I32){}"),
+            Ok("fn f(x: I32) {}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f( x : I32 , y:U32 ) {}"),
+            Ok("fn f(x: I32, y: U32) {}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f(_:I32){}"),
+            Ok("fn f(_: I32) {}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f(x:I32,){}"),
+            Ok("fn f(x: I32) {}\n".to_owned())
+        );
+        assert_eq!(
+            format_shape(b"fn f(\n x:I32,\n y:U32\n){}"),
+            Ok("fn f(x: I32, y: U32) {}\n".to_owned())
+        );
+
+        let first = "a".repeat(46);
+        let second = "b".repeat(46);
+        let input = format!("fn f({first}:I32,{second}:U32){{}}");
+        let parsed_input = parse_source(input.as_bytes()).expect("long input parses");
+        let expected = format!("fn f(\n    {first}: I32,\n    {second}: U32,\n) {{}}\n");
+        let output = format_shape(input.as_bytes()).expect("simple parameters are supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped parameter list reparses");
+        assert_eq!(
+            syntax_shape(parsed_input.root()),
+            syntax_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
@@ -370,7 +479,11 @@ mod tests {
     #[test]
     fn unsupported_shapes_and_comments_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f(a: I32) { let x = 1\nx }"),
+            format_shape(b"fn f(var a: I32) {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f(a: Vec<I32>) {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
@@ -416,16 +529,20 @@ mod tests {
                 Work::Node(node) => {
                     shape.push(ShapeElement::NodeStart(node.kind()));
                     pending.push(Work::NodeEnd);
-                    pending.extend(
-                        node.children_with_tokens()
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .map(|element| match element {
-                                SyntaxElement::Node(node) => Work::Node(node),
-                                SyntaxElement::Token(token) => Work::Token(token),
-                            }),
-                    );
+                    let mut elements = node.children_with_tokens().collect::<Vec<_>>();
+                    if node.kind() == SyntaxKind::PARAM_LIST {
+                        let trailing_comma = elements.windows(2).position(|pair| {
+                            matches!(&pair[0], SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA)
+                                && matches!(&pair[1], SyntaxElement::Token(token) if token.kind() == SyntaxKind::R_PAREN)
+                        });
+                        if let Some(index) = trailing_comma {
+                            elements.remove(index);
+                        }
+                    }
+                    pending.extend(elements.into_iter().rev().map(|element| match element {
+                        SyntaxElement::Node(node) => Work::Node(node),
+                        SyntaxElement::Token(token) => Work::Token(token),
+                    }));
                 }
                 Work::Token(token) => {
                     if !matches!(token.kind(), SyntaxKind::NEWLINE | SyntaxKind::EOF) {
