@@ -2587,3 +2587,11 @@
 - **Review:** Tests cover `if` with and without `else`, `else if`, empty and nonempty blocks, a source newline before `else`, ordinary block expressions, let initializers, call arguments, long-condition wrapping, reparsing, fixed-point output, and fail-closed `if let`. Hostile review found no actionable issues. All 219 `sai_fmt` tests and full workspace tests pass; warning-denied workspace Clippy, formatting, and `git diff --check` pass.
 - **Human review:** **Review required:** Confirm that supporting expression conditions before `if let` is an appropriate staged formatter boundary.
 - **Remaining scope:** Add if-let, loop, match, closure, and unsafe/async/region expressions; destructuring and let-else statements; enclosing impl/trait/interface-resource declarations; comments; preservation verification; production source formatting; CLI integration; and implicit workspace discovery.
+
+### IR-364: Format `loop` expressions
+
+- **Decision:** Format labeled and unlabeled `loop` expressions, with the loop body rendered using the shared block formatter. Preserve the label spelling and put the loop keyword on the same line as the label, even when the source breaks after the label's colon.
+- **Reason:** Formatter §14.9.8 rule 4 specifies the canonical label and loop layout, and §14.8.1 requires loop blocks to use the broken block form. The AST provides a separate `LoopLabel` node, allowing the formatter to validate the label and colon without parsing label text or resolving its target.
+- **Review:** Tests cover labeled and unlabeled loops, empty and nonempty bodies, a source newline after the label colon, reparsing, syntax-shape preservation, and fixed-point output. Hostile review found no actionable issues. All 220 `sai_fmt` tests and full workspace tests pass; warning-denied workspace Clippy, formatting, and `git diff --check` pass.
+- **Human review:** **Review required:** Confirm that preserving label source spelling while canonicalizing the label/loop line break is appropriate.
+- **Remaining scope:** Add `while` and `for` expressions, match and closure expressions, unsafe/async/region block wrappers, if-let, destructuring and let-else statements, enclosing impl/trait/interface-resource declarations, comments, preservation verification, production source formatting, CLI integration, and implicit workspace discovery.

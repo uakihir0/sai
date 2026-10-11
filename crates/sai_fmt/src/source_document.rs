@@ -369,6 +369,49 @@ fn if_expression_document(
     Ok(Doc::concat(documents))
 }
 
+fn loop_expression_document(
+    source: &ParsedSource,
+    loop_expr: &ast::LoopExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let label = loop_expr.label();
+    let body = loop_expr
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let loop_tokens = direct_token_kinds(loop_expr.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if loop_expr.syntax().children().count() != 1 + usize::from(label.is_some())
+        || loop_tokens != [SyntaxKind::LOOP_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = Vec::with_capacity(3);
+    if let Some(label) = label {
+        let token = label.label().ok_or(SourceDocumentError::UnsupportedShape)?;
+        let label_tokens = direct_token_kinds(label.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>();
+        if label.syntax().children().count() != 0
+            || label_tokens != [SyntaxKind::LABEL, SyntaxKind::COLON]
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.extend([
+            Doc::text(token.syntax().text().to_string()),
+            Doc::text(": "),
+        ]);
+    }
+    documents.extend([
+        Doc::text("loop "),
+        block_document(source, &body, expression_group_ids)?,
+    ]);
+    Ok(Doc::concat(documents))
+}
+
 fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
@@ -866,6 +909,7 @@ fn expression_document(
         Expr::Array(array) => array_expression_document(source, array, expression_group_ids),
         Expr::Block(block) => block_expression_document(source, block, expression_group_ids),
         Expr::If(if_expr) => if_expression_document(source, if_expr, expression_group_ids),
+        Expr::Loop(loop_expr) => loop_expression_document(source, loop_expr, expression_group_ids),
         Expr::SelfValue(value) => {
             if value.syntax().children().count() != 0
                 || direct_token_kinds(value.syntax()) != [SyntaxKind::SELF_KW]
@@ -3973,6 +4017,28 @@ mod tests {
         assert!(output.lines().all(|line| line.chars().count() <= 100));
         parse_source(output.as_bytes()).expect("wrapped condition reparses");
         assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_loop_expressions_and_labels() {
+        for (input, expected) in [
+            (
+                b"fn f(){loop {tick()}}".as_slice(),
+                "fn f() {\n    loop {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){'outer:\nloop {break 'outer}}".as_slice(),
+                "fn f() {\n    'outer: loop {\n        break 'outer\n    }\n}\n",
+            ),
+            (b"fn f(){'scan:loop{}}", "fn f() {\n    'scan: loop {}\n}\n"),
+        ] {
+            let parsed = parse_source(input).expect("loop expression parses");
+            let output = format_shape(input).expect("loop expression is supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted loop parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
     }
 
     #[test]
