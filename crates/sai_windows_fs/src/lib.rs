@@ -39,6 +39,75 @@ pub fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 
+/// Atomically move a completed file only when the destination does not exist.
+///
+/// The source and destination must be on the same volume. Callers should place
+/// the temporary file beside the destination before calling this function.
+pub fn move_file_without_replacing(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+        let source = encode_windows_path(source)?;
+        let destination = encode_windows_path(destination)?;
+        // SAFETY: both paths are NUL-terminated UTF-16 buffers that stay alive
+        // for this call; MoveFileExW does not retain either pointer. Omitting
+        // MOVEFILE_REPLACE_EXISTING makes an existing destination an error.
+        let succeeded = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::hard_link(source, destination)?;
+        fs::remove_file(source)
+    }
+}
+
+/// Atomically move a directory only when the destination does not exist.
+///
+/// The source and destination must be on the same volume.
+pub fn move_directory_without_replacing(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+        let source = encode_windows_path(source)?;
+        let destination = encode_windows_path(destination)?;
+        // SAFETY: both paths are NUL-terminated UTF-16 buffers that stay alive
+        // for this call. MoveFileExW supports directory moves on one volume.
+        // Omitting MOVEFILE_REPLACE_EXISTING leaves an existing destination
+        // untouched.
+        let succeeded = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace directory moves are available only on Windows",
+        ))
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::fs::{self, OpenOptions};
@@ -56,7 +125,9 @@ mod tests {
 
     use super::{
         is_reparse_point, lock_file_range, lock_file_range_windows,
-        open_directory_without_following, replace_file, unlock_file_range,
+        move_directory_without_replacing, move_file_without_replacing,
+        open_directory_for_rename_without_following, open_directory_without_following,
+        replace_file, unlock_file_range,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -89,6 +160,68 @@ mod tests {
         let error =
             replace_file(Path::new("source\0ignored"), Path::new("destination")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn move_without_replacing_preserves_an_existing_destination() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("temporary");
+        let destination = directory.0.join("destination");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&destination, b"existing").unwrap();
+
+        let error = move_file_without_replacing(&source, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).unwrap(), b"new");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn move_without_replacing_publishes_a_missing_destination() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("temporary");
+        let destination = directory.0.join("destination");
+        fs::write(&source, b"complete").unwrap();
+
+        move_file_without_replacing(&source, &destination).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn directory_move_without_replacing_preserves_an_existing_destination() {
+        let temporary = TestDirectory::new();
+        let source = temporary.0.join("source");
+        let destination = temporary.0.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        let error = move_directory_without_replacing(&source, &destination).unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+        ));
+        assert!(source.is_dir());
+        assert!(destination.is_dir());
+    }
+
+    #[test]
+    fn renameable_directory_handle_allows_atomic_publication() {
+        let temporary = TestDirectory::new();
+        let source = temporary.0.join("source");
+        let destination = temporary.0.join("destination");
+        fs::create_dir(&source).unwrap();
+        let handle = open_directory_for_rename_without_following(&source).unwrap();
+
+        move_directory_without_replacing(&source, &destination).unwrap();
+
+        assert!(!source.exists());
+        assert!(destination.is_dir());
+        assert!(!is_reparse_point(&handle).unwrap());
+        assert!(handle.metadata().unwrap().is_dir());
     }
 
     #[test]
@@ -368,6 +501,50 @@ pub fn open_directory_without_following(path: &Path) -> io::Result<File> {
         let file = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if is_reparse_point(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path is a Windows reparse point",
+            ));
+        }
+        if !file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a directory",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows directory handles are unavailable on this platform",
+        ))
+    }
+}
+
+/// Open a directory without following a reparse point while allowing rename.
+///
+/// This is intended for a directory that is renamed into its final name after
+/// it has been opened and verified. Unlike
+/// [`open_directory_without_following`], the handle permits delete sharing.
+pub fn open_directory_for_rename_without_following(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         if is_reparse_point(&file)? {
