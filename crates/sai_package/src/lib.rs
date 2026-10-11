@@ -34,3 +34,4 @@ mod unicode_data_16;
 pub mod validation;
 pub mod version;
 pub mod version_req;
+pub mod workspace_lock;
