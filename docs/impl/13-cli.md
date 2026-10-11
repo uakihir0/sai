@@ -737,14 +737,14 @@ Formats SAI source files and `sai.package` files into the canonical form of [14-
 
 | Option | Meaning |
 |---|---|
-| `--check` | write nothing; report every file that is not in canonical form |
+| `--check` | do not rewrite source files; report every file that is not in canonical form |
 | `-` | read one file from standard input and write the formatted text to standard output |
 | `--stdin-kind <k>` | with `-`: `source` (default) formats a SAI source file, `package` a `sai.package` file. Without `-` it is `CONFLICTING_OPTIONS`. |
 
 File selection:
 
 1. **No path.** The command needs a package (§13.2.1). It formats, for the root package and every workspace member: `sai.package` and every file below the source directory whose name ends in `.sai`. Workspace members are found from the `from path` requirements of the `sai.package` files, transitively, without resolving or fetching anything (§13.2.2).
-2. **Paths.** No package is needed. A path that names a file is formatted: as a package contract if its name is `sai.package`, and as a SAI source file otherwise. A path that names a directory is searched recursively for files whose name ends in `.sai` or is `sai.package`. The search does not follow symbolic links, skips directories whose name starts with `.`, and skips a directory named `out` that is next to a `sai.package` file. A path that does not exist is `PATH_NOT_FOUND`.
+2. **Paths.** No package is needed. A path that names a file is formatted: as a package contract if its name is `sai.package`, and as a SAI source file otherwise. An explicit symbolic link to a regular file is resolved to its target. A symbolic link to a directory is not traversed. A path that names a directory is searched recursively for files whose name ends in `.sai` or is `sai.package`. The search does not follow symbolic links, skips directories whose name starts with `.`, and skips a directory named `out` that is next to a `sai.package` file. A path that does not exist is `PATH_NOT_FOUND`.
 3. **`-`.** Standard input is formatted. `-` cannot be combined with paths (`CONFLICTING_OPTIONS`). Diagnostics name the file `<stdin>` ([11-diagnostics.md](11-diagnostics.md) §11.5.4).
 4. The selected files are processed in byte order of their paths. A file named twice is processed once.
 
@@ -752,7 +752,7 @@ Behavior:
 
 1. A file with a lexical or syntax error is **refused**: its diagnostics are reported, and the file is left unchanged ([14-formatter.md](14-formatter.md) §14.2). The other files are still formatted.
 2. Without `--check`, every file whose canonical form differs from its content is rewritten atomically (§13.5.4), and its path is reported with the progress line `formatted <path>`. Files already in canonical form are not written, so their modification time does not change.
-3. With `--check`, nothing is written. Every file whose canonical form differs from its content is reported with the error `UNFORMATTED_FILE` ([14-formatter.md](14-formatter.md) §14.11), whose primary location is the first line that differs.
+3. With `--check`, no source file is rewritten. The command may create the internal `.sai/lock` bookkeeping file needed to coordinate shared reads. Every file whose canonical form differs from its content is reported with the error `UNFORMATTED_FILE` ([14-formatter.md](14-formatter.md) §14.11), whose primary location is the first line that differs.
 4. With `-` and without `--check`, the canonical form is written to standard output, even if it equals the input (in JSON format, into the result record). A refused input writes nothing to standard output.
 
 JSON result: one record of kind `fmt`.
@@ -1684,6 +1684,7 @@ Codes owned by this chapter, and codes of other documents that this chapter repo
 | `TARGET_NOT_RUNNABLE` | error | `sai run` was used with a target that is not a WASI target: a core target or a native target (§13.6.5). |
 | `MISSING_ENTRY_POINT` | error | `sai run` was used on a reactor component; the package has no `main` (§13.6.5). |
 | `PATH_NOT_FOUND` | error | A path given to `sai fmt` does not exist (§13.6.7). |
+| `WORKSPACE_LOCK_FAILED` | error | `sai fmt` could not identify or acquire a selected file's package lock (§13.5.4, §13.6.7). |
 | `NOT_PRESENT_IN_BUILD` | info | The item named by `sai size --why` or `sai inspect effects --why` is not in the build or the effect set (§13.6.14, §13.6.15). |
 | `NOT_A_GIT_REPOSITORY` | error | `sai diff` needs a revision, but the workspace root is not in a Git repository (§13.6.17). |
 | `UNKNOWN_REVISION` | error | A revision given to `sai diff` does not resolve to a commit (§13.6.17). |
