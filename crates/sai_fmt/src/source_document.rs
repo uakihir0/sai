@@ -110,12 +110,17 @@ fn function_document(
         || function.async_token().is_some()
         || function.generic_params().is_some()
         || function.where_clause().is_some()
-        || function.borrows_clause().is_some()
-        || function.effects_clause().is_some()
         || function.requires_clauses().next().is_some()
         || function.ensures_clauses().next().is_some()
     {
         return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut clauses = Vec::with_capacity(2);
+    if let Some(clause) = function.borrows_clause() {
+        clauses.push(borrows_clause_document(source, &clause)?);
+    }
+    if let Some(clause) = function.effects_clause() {
+        clauses.push(effects_clause_document(source, &clause)?);
     }
     let params = function
         .params()
@@ -215,19 +220,31 @@ fn function_document(
         }
         _ => return Err(SourceDocumentError::UnsupportedShape),
     };
-    let document = Doc::concat([
-        Doc::text(format!("fn {name}")),
-        parameters,
-        return_type,
-        Doc::text(" "),
-        body,
-    ]);
+    let head = Doc::concat([Doc::text(format!("fn {name}")), parameters, return_type]);
+    let has_clauses = !clauses.is_empty();
+    let document = if clauses.is_empty() {
+        Doc::concat([head, Doc::text(" "), body])
+    } else {
+        let mut clause_lines = vec![Doc::HardLine];
+        for (index, clause) in clauses.into_iter().enumerate() {
+            if index > 0 {
+                clause_lines.push(Doc::HardLine);
+            }
+            clause_lines.push(clause);
+        }
+        Doc::concat([
+            head,
+            Doc::indent(Doc::concat(clause_lines)),
+            Doc::HardLine,
+            body,
+        ])
+    };
     let range = function.syntax().text_range();
     Ok(FunctionDocument {
         document,
         start: range.start().to_usize(),
         end: range.end().to_usize(),
-        multiline: !statements.is_empty(),
+        multiline: has_clauses || !statements.is_empty(),
     })
 }
 
@@ -648,6 +665,63 @@ fn effects_clause_document(
     effect_set_document(source, &set).map(|set| Doc::concat([Doc::text("effects "), set]))
 }
 
+fn borrows_clause_document(
+    source: &ParsedSource,
+    clause: &ast::BorrowsClause,
+) -> Result<Doc, SourceDocumentError> {
+    let has_borrows_keyword = clause
+        .syntax()
+        .children_with_tokens()
+        .any(|element| matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::LIDENT && token.text() == "borrows"));
+    let provenances = clause.provenances().collect::<Vec<_>>();
+    let token_kinds = direct_token_kinds(clause.syntax());
+    if clause.syntax().children().count() != provenances.len()
+        || token_kinds.first() != Some(&SyntaxKind::LIDENT)
+        || token_kinds.get(1) != Some(&SyntaxKind::L_BRACE)
+        || token_kinds.last() != Some(&SyntaxKind::R_BRACE)
+        || token_kinds[2..token_kinds.len() - 1]
+            .iter()
+            .any(|kind| !matches!(kind, SyntaxKind::COMMA | SyntaxKind::NEWLINE))
+        || !has_borrows_keyword
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let documents = provenances
+        .iter()
+        .map(|provenance| provenance_document(source, provenance))
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = clause.syntax().text_range();
+    Ok(Doc::concat([
+        Doc::text("borrows "),
+        brace_list_document(GroupId(range.start().raw()), documents),
+    ]))
+}
+
+fn provenance_document(
+    source: &ParsedSource,
+    provenance: &ast::Provenance,
+) -> Result<Doc, SourceDocumentError> {
+    let segments = provenance.segments().collect::<Vec<_>>();
+    let token_kinds = direct_token_kinds(provenance.syntax());
+    if segments.is_empty() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let expected_tokens =
+        std::iter::repeat_n(SyntaxKind::DOT, segments.len() - 1).collect::<Vec<_>>();
+    if token_kinds != expected_tokens {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = Vec::with_capacity(segments.len() * 2 - 1);
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            documents.push(Doc::text("."));
+        }
+        documents.push(Doc::text(node_text(source, segment.syntax())));
+    }
+    Ok(Doc::concat(documents))
+}
+
 fn effect_set_document(
     source: &ParsedSource,
     set: &ast::EffectSet,
@@ -664,17 +738,23 @@ fn effect_set_document(
         .map(|effect| effect_ref_document(source, effect))
         .collect::<Result<Vec<_>, _>>()?;
     let range = set.syntax().text_range();
-    let group = GroupId(range.start().raw());
-    let mut contents = Vec::with_capacity(documents.len() * 2 + 2);
+    Ok(brace_list_document(GroupId(range.start().raw()), documents))
+}
+
+fn brace_list_document(group: GroupId, items: Vec<Doc>) -> Doc {
+    if items.is_empty() {
+        return Doc::text("{}");
+    }
+    let mut contents = Vec::with_capacity(items.len() * 2 + 1);
     contents.push(Doc::Line);
-    for (index, effect) in documents.into_iter().enumerate() {
+    for (index, item) in items.into_iter().enumerate() {
         if index > 0 {
             contents.push(Doc::if_broken(group, Doc::text(""), Doc::text(",")));
             contents.push(Doc::Line);
         }
-        contents.push(effect);
+        contents.push(item);
     }
-    Ok(Doc::group(
+    Doc::group(
         group,
         Doc::concat([
             Doc::text("{"),
@@ -682,7 +762,7 @@ fn effect_set_document(
             Doc::Line,
             Doc::text("}"),
         ]),
-    ))
+    )
 }
 
 fn effect_ref_document(
@@ -981,6 +1061,59 @@ mod tests {
     }
 
     #[test]
+    fn formats_borrows_and_function_effect_clauses() {
+        for (input, expected) in [
+            (
+                b"fn f()effects{io,net.http}{}".as_slice(),
+                "fn f()\n    effects { io, net.http }\n{}\n",
+            ),
+            (
+                b"fn f()borrows{self,user.name}effects{alloc}{}",
+                "fn f()\n    borrows { self, user.name }\n    effects { alloc }\n{}\n",
+            ),
+            (b"fn f()borrows{}{}", "fn f()\n    borrows {}\n{}\n"),
+            (
+                b"fn f()effects{io}{let x=1\nx}",
+                "fn f()\n    effects { io }\n{\n    let x = 1\n    x\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("input parses");
+            let output = format_shape(input)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", String::from_utf8_lossy(input)));
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("output parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn reorders_function_borrows_and_effect_clauses() {
+        let input = b"fn f() effects { io } borrows { self } {}";
+        let expected = "fn f()\n    borrows { self }\n    effects { io }\n{}\n";
+        parse_source(input).expect("input parses with a clause-order diagnostic");
+        assert_eq!(format_shape(input), Ok(expected.to_owned()));
+        parse_source(expected.as_bytes()).expect("canonical output parses");
+        assert_eq!(format_shape(expected.as_bytes()), Ok(expected.to_owned()));
+    }
+
+    #[test]
+    fn breaks_long_borrows_provenances_without_commas() {
+        let first = format!("resource.{}", "a".repeat(45));
+        let second = format!("storage.{}", "b".repeat(45));
+        let input = format!("fn f() borrows {{{first},{second}}} {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let output = format_shape(input.as_bytes()).expect("long borrows clause is supported");
+        assert!(output.contains("    borrows {\n"));
+        assert!(output.contains(&format!("        {first}\n")));
+        assert!(output.contains(&format!("        {second}\n")));
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped output parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn formats_supported_self_parameter_types() {
         for (input, expected) in [
             (b"fn f(self:Self){}".as_slice(), "fn f(self: Self) {}\n"),
@@ -1126,11 +1259,19 @@ mod tests {
     #[test]
     fn unsupported_shapes_and_comments_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f() effects {io} {}"),
+            format_shape(b"fn f() requires true {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
-            format_shape(b"fn f() requires true {}"),
+            format_shape(b"fn f() ensures true {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f() where T: Clone {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"fn f<T>() {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
@@ -1201,7 +1342,10 @@ mod tests {
                     shape.push(ShapeElement::NodeStart(node.kind()));
                     pending.push(Work::NodeEnd);
                     let mut elements = node.children_with_tokens().collect::<Vec<_>>();
-                    if node.kind() == SyntaxKind::EFFECT_SET {
+                    if matches!(
+                        node.kind(),
+                        SyntaxKind::EFFECT_SET | SyntaxKind::BORROWS_CLAUSE
+                    ) {
                         elements.retain(
                             |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA),
                         );
