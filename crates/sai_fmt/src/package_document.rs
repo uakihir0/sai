@@ -120,6 +120,107 @@ pub(crate) fn package_identity_declaration(
     Ok(Doc::concat(document))
 }
 
+pub(crate) fn compiler_declaration(
+    input: &PackageInput<'_>,
+    declaration: Range<u32>,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+    if declaration
+        .end
+        .checked_sub(declaration.start)
+        .is_none_or(|count| count < 2)
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let first =
+        usize::try_from(declaration.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let end = usize::try_from(declaration.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let declaration_tokens = tokens
+        .get(first..end)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let (keyword, value_tokens) = declaration_tokens
+        .split_first()
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if keyword.kind != PackageTokenKind::Word || token_text(input.source(), keyword) != "compiler" {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    if !valid_version_requirement_tokens(value_tokens) {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let last = end - 1;
+    let mut comments = TokenComments::new(input, tokens, first, last);
+    let mut keyword_leading = comments.take_leading(first);
+    let keyword_trailing = comments.take_trailing(first);
+    sort_comments(input, &mut keyword_leading);
+    let mut document = leading_comments_before(input, &keyword_leading, Some(keyword.span.start));
+    document.push(Doc::text("compiler"));
+    document.push(trailing_comments(input, &keyword_trailing));
+
+    let mut value_document = vec![Doc::text(" ")];
+    let mut previous_forced_break = false;
+    let mut previous_forced_comment_end = None;
+    let mut previous_had_trailing_block_comment = false;
+    for (offset, token) in value_tokens.iter().enumerate() {
+        let token_index = first + offset + 1;
+        let mut leading = comments.take_leading(token_index);
+        let trailing = comments.take_trailing(token_index);
+        sort_comments(input, &mut leading);
+
+        if !leading.is_empty() {
+            let preserve_blank_line = previous_forced_break
+                && previous_forced_comment_end
+                    .zip(leading.first())
+                    .is_some_and(|(previous_end, comment)| {
+                        has_blank_line(input, previous_end, input.comment_span(comment).start)
+                    });
+            if !previous_forced_break || preserve_blank_line {
+                value_document.push(Doc::HardLine);
+            }
+            value_document.extend(leading_comments_before(
+                input,
+                &leading,
+                Some(token.span.start),
+            ));
+        } else if offset > 0 && !previous_forced_break {
+            let previous = &value_tokens[offset - 1];
+            let is_comma = token.kind == PackageTokenKind::Punctuator(PackagePunctuator::Comma);
+            if (previous_had_trailing_block_comment && !is_comma)
+                || (!previous_had_trailing_block_comment
+                    && previous.kind == PackageTokenKind::Punctuator(PackagePunctuator::Comma))
+            {
+                value_document.push(Doc::text(" "));
+            }
+        }
+
+        value_document.push(Doc::text(token_text(input.source(), token)));
+        value_document.push(trailing_comments(input, &trailing));
+        previous_forced_break =
+            offset + 1 < value_tokens.len() && trailing_comments_force_line_break(input, &trailing);
+        if previous_forced_break {
+            value_document.push(Doc::HardLine);
+            previous_forced_comment_end = trailing
+                .last()
+                .map(|comment| input.comment_span(comment).end);
+        } else {
+            previous_forced_comment_end = None;
+        }
+        previous_had_trailing_block_comment = trailing
+            .iter()
+            .any(|comment| input.comment_kind(comment) == PackageTriviaKind::BlockComment);
+    }
+
+    if comments.has_pending(first, last) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+    document.push(Doc::indent(Doc::concat(value_document)));
+    Ok(Doc::concat(document))
+}
+
 pub(crate) fn string_declaration(
     input: &PackageInput<'_>,
     declaration: Range<u32>,
@@ -311,6 +412,76 @@ fn value_declaration(
         trailing_comments(input, &value_trailing),
     ]);
     Ok(Doc::concat(document))
+}
+
+fn valid_version_requirement_tokens(tokens: &[PackageToken]) -> bool {
+    if tokens.len() == 1 {
+        return matches!(
+            tokens[0].kind,
+            PackageTokenKind::Integer | PackageTokenKind::Version
+        );
+    }
+
+    let mut cursor = 0;
+    loop {
+        let Some(operator) = tokens.get(cursor) else {
+            return false;
+        };
+        if !is_version_operator(operator.kind) {
+            return false;
+        }
+        cursor += 1;
+
+        let Some(version) = tokens.get(cursor) else {
+            return false;
+        };
+        if !matches!(
+            version.kind,
+            PackageTokenKind::Integer | PackageTokenKind::Version
+        ) {
+            return false;
+        }
+        cursor += 1;
+        if cursor == tokens.len() {
+            return true;
+        }
+
+        if tokens[cursor].kind != PackageTokenKind::Punctuator(PackagePunctuator::Comma) {
+            return false;
+        }
+        cursor += 1;
+        if cursor == tokens.len() {
+            return false;
+        }
+    }
+}
+
+const fn is_version_operator(kind: PackageTokenKind) -> bool {
+    matches!(
+        kind,
+        PackageTokenKind::Punctuator(
+            PackagePunctuator::Caret
+                | PackagePunctuator::Tilde
+                | PackagePunctuator::Equal
+                | PackagePunctuator::Greater
+                | PackagePunctuator::GreaterEqual
+                | PackagePunctuator::Less
+                | PackagePunctuator::LessEqual
+        )
+    )
+}
+
+fn trailing_comments_force_line_break(
+    input: &PackageInput<'_>,
+    comments: &[&AttachedComment],
+) -> bool {
+    comments
+        .iter()
+        .any(|comment| match input.comment_kind(comment) {
+            PackageTriviaKind::LineComment => true,
+            PackageTriviaKind::BlockComment => input.comment_text(comment).contains('\n'),
+            _ => false,
+        })
 }
 
 fn comma_list_declaration(
@@ -744,8 +915,8 @@ mod tests {
 
     use super::{
         PackageDocumentError, allocator_declaration, authors_declaration, capability_declaration,
-        export_world_declaration, package_identity_declaration, string_declaration,
-        targets_declaration, token_text,
+        compiler_declaration, export_world_declaration, package_identity_declaration,
+        string_declaration, targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -811,6 +982,15 @@ mod tests {
         let declaration = find_declaration(&input, &index, "package");
         let doc =
             package_identity_declaration(&input, declaration).expect("package identity document");
+        print(&doc).expect("print document")
+    }
+
+    fn render_compiler(source: &[u8]) -> String {
+        let input = PackageInput::new(source);
+        assert!(input.refusals().is_empty(), "{:?}", input.refusals());
+        let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
+        let declaration = find_declaration(&input, &index, "compiler");
+        let doc = compiler_declaration(&input, declaration).expect("compiler document");
         print(&doc).expect("print document")
     }
 
@@ -1052,6 +1232,58 @@ mod tests {
                 b"package/* identity */acme:app/* version */@/* release */1.0.0\n"
             ),
             "package /* identity */ acme:app /* version */ @ /* release */ 1.0.0\n"
+        );
+    }
+
+    #[test]
+    fn formats_compiler_version_requirements_with_canonical_spacing() {
+        assert_eq!(
+            render_compiler(b"package acme:app @ 1.0.0\ncompiler^0.1\n"),
+            "compiler ^0.1\n"
+        );
+        assert_eq!(
+            render_compiler(b"package acme:app @ 1.0.0\ncompiler ^ 1.4 , < 2.0\n"),
+            "compiler ^1.4, <2.0\n"
+        );
+    }
+
+    #[test]
+    fn preserves_semantically_invalid_compiler_requirement_tokens() {
+        assert_eq!(
+            render_compiler(b"package acme:app @ 1.0.0\ncompiler > 1.2\n"),
+            "compiler >1.2\n"
+        );
+        assert_eq!(
+            render_compiler(b"package acme:app @ 1.0.0\ncompiler 0.1\n"),
+            "compiler 0.1\n"
+        );
+    }
+
+    #[test]
+    fn retains_compiler_requirement_comments_and_breaks_after_line_comments() {
+        assert_eq!(
+            render_compiler(b"package acme:app @ 1.0.0\ncompiler ^/* operator */ 0.1\n"),
+            "compiler ^ /* operator */ 0.1\n"
+        );
+        assert_eq!(
+            render_compiler(b"package acme:app @ 1.0.0\ncompiler ^1.4, // next comparator\n <2\n"),
+            "compiler ^1.4, // next comparator\n    <2\n"
+        );
+    }
+
+    #[test]
+    fn preserves_blank_line_gaps_between_compiler_requirement_comments() {
+        assert_eq!(
+            render_compiler(
+                b"package acme:app @ 1.0.0\ncompiler ^1.4, // trailing\n// own-line\n <2\n"
+            ),
+            "compiler ^1.4, // trailing\n    // own-line\n    <2\n"
+        );
+        assert_eq!(
+            render_compiler(
+                b"package acme:app @ 1.0.0\ncompiler ^1.4, // trailing\n\n// own-line\n <2\n"
+            ),
+            "compiler ^1.4, // trailing\n\n    // own-line\n    <2\n"
         );
     }
 
