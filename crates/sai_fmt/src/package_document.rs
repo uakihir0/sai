@@ -82,6 +82,107 @@ pub(crate) fn allocator_declaration(
     )
 }
 
+pub(crate) fn export_world_declaration(
+    input: &PackageInput<'_>,
+    declaration: Range<u32>,
+) -> Result<Doc, PackageDocumentError> {
+    if !input.refusals().is_empty() {
+        return Err(PackageDocumentError::InputRefused);
+    }
+
+    let token_count = declaration
+        .end
+        .checked_sub(declaration.start)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if token_count < 3 {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let tokens = &input.lexed().tokens;
+    let first =
+        usize::try_from(declaration.start).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    let end = usize::try_from(declaration.end).map_err(|_| PackageDocumentError::InvalidEntry)?;
+    if end > tokens.len() {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+    let export_token = tokens
+        .get(first)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    let world_token = tokens
+        .get(first + 1)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    if export_token.kind != PackageTokenKind::Word
+        || token_text(input.source(), export_token) != "export"
+        || world_token.kind != PackageTokenKind::Word
+        || token_text(input.source(), world_token) != "world"
+    {
+        return Err(PackageDocumentError::InvalidEntry);
+    }
+
+    let name_tokens = tokens
+        .get(first + 2..end)
+        .ok_or(PackageDocumentError::InvalidEntry)?;
+    match name_tokens {
+        [name]
+            if matches!(
+                name.kind,
+                PackageTokenKind::Word | PackageTokenKind::PackagePath
+            ) => {}
+        [first_name, tail @ ..]
+            if first_name.kind == PackageTokenKind::Word
+                && tail.len() % 2 == 0
+                && tail.chunks_exact(2).all(|pair| {
+                    pair[0].kind == PackageTokenKind::Punctuator(PackagePunctuator::Slash)
+                        && pair[1].kind == PackageTokenKind::Word
+                }) => {}
+        _ => return Err(PackageDocumentError::InvalidEntry),
+    }
+
+    let last = end - 1;
+    let mut comments = TokenComments::new(input, tokens, first, last);
+    let mut document = Vec::new();
+    let mut leading = comments.take_leading(first);
+    sort_comments(input, &mut leading);
+    document.extend(leading_comments_before(
+        input,
+        &leading,
+        Some(export_token.span.start),
+    ));
+
+    let mut previous_has_trailing_block_comment = false;
+    for token_index in first..end {
+        let mut leading = comments.take_leading(token_index);
+        let trailing = comments.take_trailing(token_index);
+        sort_comments(input, &mut leading);
+        if token_index > first {
+            let previous = &tokens[token_index - 1];
+            let current = &tokens[token_index];
+            if !leading.is_empty() {
+                document.extend(leading_comments_before(
+                    input,
+                    &leading,
+                    Some(current.span.start),
+                ));
+            } else if previous_has_trailing_block_comment
+                || (previous.kind != PackageTokenKind::Punctuator(PackagePunctuator::Slash)
+                    && current.kind != PackageTokenKind::Punctuator(PackagePunctuator::Slash))
+            {
+                document.push(Doc::text(" "));
+            }
+        }
+        document.push(Doc::text(token_text(input.source(), &tokens[token_index])));
+        previous_has_trailing_block_comment = trailing
+            .iter()
+            .any(|comment| input.comment_kind(comment) == PackageTriviaKind::BlockComment);
+        document.push(trailing_comments(input, &trailing));
+    }
+
+    if comments.has_pending(first, last) {
+        return Err(PackageDocumentError::UnknownCommentAnchor);
+    }
+    Ok(Doc::concat(document))
+}
+
 fn value_declaration(
     input: &PackageInput<'_>,
     declaration: Range<u32>,
@@ -577,7 +678,7 @@ mod tests {
 
     use super::{
         PackageDocumentError, allocator_declaration, authors_declaration, capability_declaration,
-        string_declaration, targets_declaration, token_text,
+        export_world_declaration, string_declaration, targets_declaration, token_text,
     };
 
     fn render(source: &[u8], force_break: bool) -> String {
@@ -624,6 +725,15 @@ mod tests {
         let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
         let declaration = find_declaration(&input, &index, "allocator");
         let doc = allocator_declaration(&input, declaration).expect("allocator document");
+        print(&doc).expect("print document")
+    }
+
+    fn render_export_world(source: &[u8]) -> String {
+        let input = PackageInput::new(source);
+        assert!(input.refusals().is_empty(), "{:?}", input.refusals());
+        let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
+        let declaration = find_declaration(&input, &index, "export");
+        let doc = export_world_declaration(&input, declaration).expect("export world document");
         print(&doc).expect("print document")
     }
 
@@ -817,6 +927,63 @@ mod tests {
                 b"package acme:app @ 1.0.0\nallocator/* selected allocator */acme:bump-alloc // build choice\n"
             ),
             "allocator /* selected allocator */ acme:bump-alloc // build choice\n"
+        );
+    }
+
+    #[test]
+    fn formats_export_world_names_and_package_paths() {
+        assert_eq!(
+            render_export_world(b"package acme:app @ 1.0.0\nexport world api\n"),
+            "export world api\n"
+        );
+        assert_eq!(
+            render_export_world(b"package acme:app @ 1.0.0\nexport  world   api / server\n"),
+            "export world api/server\n"
+        );
+        assert_eq!(
+            render_export_world(b"package acme:app @ 1.0.0\nexport world acme:server\n"),
+            "export world acme:server\n"
+        );
+    }
+
+    #[test]
+    fn retains_comments_around_export_world_declarations() {
+        assert_eq!(
+            render_export_world(
+                b"package acme:app @ 1.0.0\nexport/* selected */world api/server // world\n"
+            ),
+            "export /* selected */ world api/server // world\n"
+        );
+    }
+
+    #[test]
+    fn separates_export_world_slashes_from_adjacent_block_comments() {
+        assert_eq!(
+            render_export_world(
+                b"package acme:app @ 1.0.0\nexport world api /* path segment */ / server\n"
+            ),
+            "export world api /* path segment */ /server\n"
+        );
+        assert_eq!(
+            render_export_world(
+                b"package acme:app @ 1.0.0\nexport world api / /* path segment */ server\n"
+            ),
+            "export world api/ /* path segment */ server\n"
+        );
+    }
+
+    #[test]
+    fn rejects_export_world_declaration_ranges_past_the_token_stream() {
+        let input = PackageInput::new(b"package acme:app @ 1.0.0\nexport world api\n");
+        let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
+        let declaration = find_declaration(&input, &index, "export");
+        let past_end = u32::try_from(input.lexed().tokens.len())
+            .expect("small token stream")
+            .checked_add(1)
+            .expect("token stream index fits in u32");
+        assert_eq!(
+            export_world_declaration(&input, declaration.start..past_end),
+            Err(PackageDocumentError::InvalidEntry)
         );
     }
 
