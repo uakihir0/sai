@@ -133,11 +133,40 @@ fn function_document(
     function: &ast::FnDecl,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<FunctionDocument, SourceDocumentError> {
-    if function.docs().is_some()
-        || function.attrs().next().is_some()
-        || function.visibility().is_some()
-        || function.unsafe_token().is_some()
-        || function.async_token().is_some()
+    if function.docs().is_some() || function.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let visibility_prefix = function
+        .visibility()
+        .map(|visibility| {
+            match direct_token_kinds(visibility.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [SyntaxKind::PUB_KW] => Ok("pub "),
+                [SyntaxKind::EXPORT_KW] => Ok("export "),
+                _ => Err(SourceDocumentError::UnsupportedShape),
+            }
+        })
+        .transpose()?
+        .unwrap_or("");
+    let is_unsafe = function.unsafe_token().is_some();
+    let is_async = function.async_token().is_some();
+    let mut expected_tokens = Vec::new();
+    if is_unsafe {
+        expected_tokens.push(SyntaxKind::UNSAFE_KW);
+    }
+    if is_async {
+        expected_tokens.push(SyntaxKind::ASYNC_KW);
+    }
+    expected_tokens.push(SyntaxKind::FN_KW);
+    if direct_token_kinds(function.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>()
+        != expected_tokens
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
@@ -178,23 +207,26 @@ fn function_document(
         .transpose()?
         .map(|type_doc| Doc::concat([Doc::text(" -> "), type_doc]))
         .unwrap_or_else(|| Doc::text(""));
-    let block = function
-        .body()
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let body = function.body();
     let name = function
         .name()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let name = node_text(source, name.syntax());
+    let head_prefix = format!(
+        "{visibility_prefix}{}{}",
+        if is_unsafe { "unsafe " } else { "" },
+        if is_async { "async " } else { "" },
+    );
+    let head_prefix = format!("{head_prefix}fn {name}");
     let generic_params = function
         .generic_params()
         .map(|params| {
             let document = generic_params_document(source, &params)?;
             let prefix_width = flat_document_width(&document)
                 .and_then(|generic_width| {
-                    "fn "
+                    head_prefix
                         .chars()
                         .count()
-                        .checked_add(name.chars().count())?
                         .checked_add(generic_width)?
                         .checked_add(1)
                 })
@@ -207,17 +239,22 @@ fn function_document(
         })
         .transpose()?
         .unwrap_or_else(|| Doc::text(""));
-    let statements = block.statements().collect::<Vec<_>>();
-    let body = block_document(source, &block, expression_group_ids)?;
+    let body_document = body
+        .as_ref()
+        .map(|body| block_document(source, body, expression_group_ids))
+        .transpose()?;
     let head = Doc::concat([
-        Doc::text(format!("fn {name}")),
+        Doc::text(head_prefix),
         generic_params,
         parameters,
         return_type,
     ]);
-    let has_clauses = !clauses.is_empty();
     let document = if clauses.is_empty() {
-        Doc::concat([head, Doc::text(" "), body])
+        if let Some(body) = body_document {
+            Doc::concat([head, Doc::text(" "), body])
+        } else {
+            head
+        }
     } else {
         let mut clause_lines = vec![Doc::HardLine];
         for (index, clause) in clauses.into_iter().enumerate() {
@@ -226,19 +263,22 @@ fn function_document(
             }
             clause_lines.push(clause);
         }
-        Doc::concat([
-            head,
-            Doc::indent(Doc::concat(clause_lines)),
-            Doc::HardLine,
-            body,
-        ])
+        let mut document = vec![head, Doc::indent(Doc::concat(clause_lines))];
+        if let Some(body) = body_document {
+            document.extend([Doc::HardLine, body]);
+        }
+        Doc::concat(document)
     };
     let range = function.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
     Ok(FunctionDocument {
         document,
         start: range.start().to_usize(),
         end: range.end().to_usize(),
-        multiline: has_clauses || !statements.is_empty(),
+        multiline,
     })
 }
 
@@ -4189,17 +4229,97 @@ fn document_contains_unavoidable_forced_break(document: &Doc) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceDocumentError, source_document};
+    use super::{ExpressionGroupIds, SourceDocumentError, function_document, source_document};
     use crate::{parse_source, print};
     use sai_syntax::{
         SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
-        ast::{AstNode, Expr, Pattern, RangeExpr, Stmt, Type},
+        ast::{AstNode, Expr, FnDecl, Pattern, RangeExpr, Stmt, Type},
     };
 
     fn format_shape(source: &[u8]) -> Result<String, SourceDocumentError> {
         let parsed = parse_source(source).expect("source parses");
         let document = source_document(&parsed)?;
         Ok(print(&document).expect("document prints"))
+    }
+
+    #[test]
+    fn formats_function_modifiers_and_bodyless_signatures() {
+        for (input, expected) in [
+            (
+                b"pub async fn fetch(){}".as_slice(),
+                "pub async fn fetch() {}\n",
+            ),
+            (
+                b"export unsafe async fn load()->U32{}",
+                "export unsafe async fn load() -> U32 {}\n",
+            ),
+            (b"fn read() -> I32", "fn read() -> I32\n"),
+        ] {
+            let output = format_shape(input).expect("function modifiers are supported");
+            assert_eq!(output, expected);
+            let parsed = parse_source(input).expect("function declaration parses");
+            let reparsed = parse_source(output.as_bytes()).expect("formatted function parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+
+        let params = (0..10)
+            .map(|index| format!("p{index}:I32"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!("pub unsafe async fn f({params}){{}}\nfn g(){{}}");
+        let expected = concat!(
+            "pub unsafe async fn f(\n",
+            "    p0: I32,\n",
+            "    p1: I32,\n",
+            "    p2: I32,\n",
+            "    p3: I32,\n",
+            "    p4: I32,\n",
+            "    p5: I32,\n",
+            "    p6: I32,\n",
+            "    p7: I32,\n",
+            "    p8: I32,\n",
+            "    p9: I32,\n",
+            ") {}\n",
+            "\n",
+            "fn g() {}\n",
+        );
+        let output = format_shape(input.as_bytes()).expect("wrapped function head is supported");
+        assert_eq!(output, expected);
+        let parsed = parse_source(input.as_bytes()).expect("wrapped function heads parse");
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped function heads reparse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let parsed = parse_source(b"trait Reader { fn read() -> I32 }")
+            .expect("bodyless function declaration parses");
+        let function = parsed
+            .root()
+            .descendants()
+            .filter_map(FnDecl::cast)
+            .next()
+            .expect("trait function exists");
+        let document = function_document(&parsed, &function, &mut ExpressionGroupIds::default())
+            .expect("bodyless function declaration formats");
+        assert_eq!(
+            print(&document.document).expect("bodyless function document prints"),
+            "fn read() -> I32\n"
+        );
+
+        let parsed = parse_source(b"trait Reader { fn read() -> I32 ensures result >= 0 }")
+            .expect("bodyless function with a clause parses");
+        let function = parsed
+            .root()
+            .descendants()
+            .filter_map(FnDecl::cast)
+            .next()
+            .expect("trait function exists");
+        let document = function_document(&parsed, &function, &mut ExpressionGroupIds::default())
+            .expect("bodyless function clause formats");
+        assert_eq!(
+            print(&document.document).expect("bodyless function document prints"),
+            "fn read() -> I32\n    ensures result >= 0\n"
+        );
     }
 
     #[test]
