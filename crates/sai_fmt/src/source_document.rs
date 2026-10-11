@@ -557,6 +557,68 @@ fn for_expression_document(
     Ok(Doc::concat(documents))
 }
 
+fn async_block_expression_document(
+    source: &ParsedSource,
+    async_block: &ast::AsyncBlockExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let body = async_block
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let tokens = direct_token_kinds(async_block.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let move_prefix = match tokens.as_slice() {
+        [SyntaxKind::ASYNC_KW] => "",
+        [SyntaxKind::ASYNC_KW, SyntaxKind::MOVE_KW] => "move ",
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    if async_block.syntax().children().count() != 1 {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat([
+        Doc::text("async "),
+        Doc::text(move_prefix),
+        block_document(source, &body, expression_group_ids)?,
+    ]))
+}
+
+fn region_expression_document(
+    source: &ParsedSource,
+    region_expr: &ast::RegionExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let name = region_expr
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let body = region_expr
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let prefix_token = region_expr
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::LIDENT => Some(token),
+            SyntaxElement::Node(_) | SyntaxElement::Token(_) => None,
+        })
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if region_expr.syntax().children().count() != 2
+        || direct_token_kinds(region_expr.syntax()) != [SyntaxKind::LIDENT]
+        || prefix_token.text() != "region"
+        || name.syntax().children().count() != 0
+        || direct_token_kinds(name.syntax()) != [SyntaxKind::LIDENT]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat([
+        Doc::text("region "),
+        Doc::text(node_text(source, name.syntax())),
+        Doc::text(" "),
+        block_document(source, &body, expression_group_ids)?,
+    ]))
+}
+
 fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
@@ -1053,12 +1115,18 @@ fn expression_document(
         Expr::Tuple(tuple) => tuple_expression_document(source, tuple, expression_group_ids),
         Expr::Array(array) => array_expression_document(source, array, expression_group_ids),
         Expr::Block(block) => block_expression_document(source, block, expression_group_ids),
+        Expr::AsyncBlock(async_block) => {
+            async_block_expression_document(source, async_block, expression_group_ids)
+        }
         Expr::If(if_expr) => if_expression_document(source, if_expr, expression_group_ids),
         Expr::Loop(loop_expr) => loop_expression_document(source, loop_expr, expression_group_ids),
         Expr::While(while_expr) => {
             while_expression_document(source, while_expr, expression_group_ids)
         }
         Expr::For(for_expr) => for_expression_document(source, for_expr, expression_group_ids),
+        Expr::Region(region_expr) => {
+            region_expression_document(source, region_expr, expression_group_ids)
+        }
         Expr::SelfValue(value) => {
             if value.syntax().children().count() != 0
                 || direct_token_kinds(value.syntax()) != [SyntaxKind::SELF_KW]
@@ -4262,6 +4330,34 @@ mod tests {
             format_shape(b"fn f(){for (left,right) in pairs {consume(left)}}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
+    }
+
+    #[test]
+    fn formats_async_and_region_block_expressions() {
+        for (input, expected) in [
+            (
+                b"fn f(){async {work()}}".as_slice(),
+                "fn f() {\n    async {\n        work()\n    }\n}\n",
+            ),
+            (b"fn f(){async move{}}", "fn f() {\n    async move {}\n}\n"),
+            (
+                b"fn f(){region arena{work()}}".as_slice(),
+                "fn f() {\n    region arena {\n        work()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){region arena{}}",
+                "fn f() {\n    region arena {}\n}\n",
+            ),
+            (b"fn f(){region}", "fn f() {\n    region\n}\n"),
+        ] {
+            let parsed = parse_source(input).expect("block wrapper parses");
+            let output = format_shape(input).expect("async or region block is supported");
+            assert_eq!(output, expected);
+            let reparsed =
+                parse_source(output.as_bytes()).expect("formatted block wrapper reparses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
     }
 
     #[test]
