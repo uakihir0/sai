@@ -285,6 +285,90 @@ fn block_document(
     ]))
 }
 
+fn block_expression_document(
+    source: &ParsedSource,
+    block_expr: &ast::BlockExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let block = block_expr
+        .block()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if block_expr.syntax().children().count() != 1
+        || !direct_token_kinds(block_expr.syntax()).is_empty()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    block_document(source, &block, expression_group_ids)
+}
+
+fn if_expression_document(
+    source: &ParsedSource,
+    if_expr: &ast::IfExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let condition = if_expr
+        .condition()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let condition_expr = condition
+        .expression()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let then_branch = if_expr
+        .then_branch()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let else_branch = if_expr.else_branch();
+    let if_tokens = direct_token_kinds(if_expr.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if condition.let_condition().is_some()
+        || condition.syntax().children().count() != 1
+        || !direct_token_kinds(condition.syntax()).is_empty()
+        || if_expr.syntax().children().count() != 2 + usize::from(else_branch.is_some())
+        || if_tokens != [SyntaxKind::IF_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = vec![
+        Doc::text("if "),
+        expression_document(
+            source,
+            &condition_expr,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?,
+        Doc::text(" "),
+        block_document(source, &then_branch, expression_group_ids)?,
+    ];
+    if let Some(else_branch) = else_branch {
+        if else_branch.syntax().children().count() != 1
+            || direct_token_kinds(else_branch.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>()
+                != [SyntaxKind::ELSE_KW]
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let block = else_branch.block();
+        let else_if = else_branch.else_if();
+        if block.is_some() == else_if.is_some() {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.push(Doc::text(" else "));
+        if let Some(block) = block {
+            documents.push(block_document(source, &block, expression_group_ids)?);
+        } else if let Some(else_if) = else_if {
+            documents.push(if_expression_document(
+                source,
+                &else_if,
+                expression_group_ids,
+            )?);
+        }
+    }
+    Ok(Doc::concat(documents))
+}
+
 fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
@@ -780,6 +864,8 @@ fn expression_document(
         }
         Expr::Tuple(tuple) => tuple_expression_document(source, tuple, expression_group_ids),
         Expr::Array(array) => array_expression_document(source, array, expression_group_ids),
+        Expr::Block(block) => block_expression_document(source, block, expression_group_ids),
+        Expr::If(if_expr) => if_expression_document(source, if_expr, expression_group_ids),
         Expr::SelfValue(value) => {
             if value.syntax().children().count() != 0
                 || direct_token_kinds(value.syntax()) != [SyntaxKind::SELF_KW]
@@ -3781,6 +3867,111 @@ mod tests {
         let output = format_shape(input.as_bytes()).expect("long return value is supported");
         assert_eq!(output, expected);
         assert!(output.lines().any(|line| line.chars().count() > 100));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_block_and_conditional_expressions() {
+        for (input, expected) in [
+            (
+                b"fn f(){if ready {work()}}".as_slice(),
+                "fn f() {\n    if ready {\n        work()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if ready {} else {work()}}".as_slice(),
+                "fn f() {\n    if ready {} else {\n        work()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if first {one()} else if second {two()} else {three()}}".as_slice(),
+                concat!(
+                    "fn f() {\n",
+                    "    if first {\n",
+                    "        one()\n",
+                    "    } else if second {\n",
+                    "        two()\n",
+                    "    } else {\n",
+                    "        three()\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                b"fn f(){\nif ready {\nwork()\n}\nelse {\nwait()\n}\n}".as_slice(),
+                concat!(
+                    "fn f() {\n",
+                    "    if ready {\n",
+                    "        work()\n",
+                    "    } else {\n",
+                    "        wait()\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                b"fn f(){{value}}".as_slice(),
+                "fn f() {\n    {\n        value\n    }\n}\n",
+            ),
+            (
+                b"fn f(){let result=if ready {yes()} else {no()}\nresult}".as_slice(),
+                concat!(
+                    "fn f() {\n",
+                    "    let result = if ready {\n",
+                    "        yes()\n",
+                    "    } else {\n",
+                    "        no()\n",
+                    "    }\n",
+                    "    result\n",
+                    "}\n",
+                ),
+            ),
+            (
+                b"fn f(){consume(if ready {yes()} else {no()})}".as_slice(),
+                concat!(
+                    "fn f() {\n",
+                    "    consume(\n",
+                    "        if ready {\n",
+                    "            yes()\n",
+                    "        } else {\n",
+                    "            no()\n",
+                    "        },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+        ] {
+            let parsed = parse_source(input).expect("control and block expressions parse");
+            let output =
+                format_shape(input).expect("supported control and block expressions format");
+            assert_eq!(output, expected);
+            let reparsed =
+                parse_source(output.as_bytes()).expect("formatted expressions parse again");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn unsupported_if_let_conditions_remain_fail_closed() {
+        assert_eq!(
+            format_shape(b"fn f(){if let Some(value)=input {value}}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn breaks_long_if_conditions_with_parentheses() {
+        let left = format!("first_{}", "a".repeat(43));
+        let right = format!("second_{}", "b".repeat(42));
+        let input = format!("fn f(){{if {left} or {right}{{act()}}}}");
+        let expected = format!(
+            "fn f() {{\n    if (\n        {left}\n        or {right}\n    ) {{\n        act()\n    }}\n}}\n"
+        );
+
+        parse_source(input.as_bytes()).expect("long condition parses");
+        let output = format_shape(input.as_bytes()).expect("long condition is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        parse_source(output.as_bytes()).expect("wrapped condition reparses");
         assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
