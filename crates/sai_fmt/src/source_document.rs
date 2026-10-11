@@ -1,6 +1,6 @@
 use sai_syntax::{
     GreenElement, GreenNode, GreenTrivia, SyntaxElement, SyntaxKind, SyntaxToken, TriviaKind,
-    ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Pattern, Stmt},
+    ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Stmt},
 };
 
 use crate::{Doc, GroupId, ParsedSource, printer::MAX_LINE_WIDTH};
@@ -402,7 +402,7 @@ fn condition_document(
     }
     Ok(Doc::concat([
         Doc::text("let "),
-        simple_binding_pattern_document(source, &pattern)?,
+        pattern_document(source, &pattern, expression_group_ids)?,
         Doc::text(" = "),
         expression_document(
             source,
@@ -495,40 +495,78 @@ fn while_expression_document(
     Ok(Doc::concat(documents))
 }
 
+fn pattern_document(
+    source: &ParsedSource,
+    pattern: &ast::Pattern,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    match pattern {
+        ast::Pattern::Binding(_) | ast::Pattern::Wildcard(_) => {
+            simple_binding_pattern_document(source, pattern)
+        }
+        ast::Pattern::Or(or_pattern) => {
+            or_pattern_document(source, or_pattern, expression_group_ids)
+        }
+        ast::Pattern::At(at_pattern) => {
+            let binding = at_pattern
+                .binding()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let pattern = at_pattern
+                .pattern()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            if at_pattern.syntax().children().count() != 2
+                || direct_token_kinds(at_pattern.syntax())
+                    .into_iter()
+                    .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                    .collect::<Vec<_>>()
+                    != [SyntaxKind::AT]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            Ok(Doc::concat([
+                binding_pattern_document(source, &binding)?,
+                Doc::text(" @ "),
+                pattern_document(source, &pattern, expression_group_ids)?,
+            ]))
+        }
+        ast::Pattern::Literal(literal) => literal_pattern_document(source, literal),
+        ast::Pattern::Range(range) => range_pattern_document(source, range),
+        ast::Pattern::Tuple(tuple) => tuple_pattern_document(source, tuple, expression_group_ids),
+        ast::Pattern::Parenthesized(paren) => {
+            let pattern = paren
+                .pattern()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            if paren.syntax().children().count() != 1
+                || direct_token_kinds(paren.syntax())
+                    .into_iter()
+                    .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                    .collect::<Vec<_>>()
+                    != [SyntaxKind::L_PAREN, SyntaxKind::R_PAREN]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            Ok(Doc::concat([
+                Doc::text("("),
+                pattern_document(source, &pattern, expression_group_ids)?,
+                Doc::text(")"),
+            ]))
+        }
+        ast::Pattern::Slice(slice) => slice_pattern_document(source, slice, expression_group_ids),
+        ast::Pattern::Constructor(constructor) => {
+            constructor_pattern_document(source, constructor, expression_group_ids)
+        }
+        ast::Pattern::ImplicitMember(member) => {
+            implicit_member_pattern_document(source, member, expression_group_ids)
+        }
+    }
+}
+
 fn simple_binding_pattern_document(
     source: &ParsedSource,
     pattern: &ast::Pattern,
 ) -> Result<Doc, SourceDocumentError> {
     match pattern {
-        ast::Pattern::Binding(binding) => {
-            let mode = binding.mode();
-            let name = binding
-                .name()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            let mut documents = Vec::with_capacity(2);
-            if binding.syntax().children().count() != 1 + usize::from(mode.is_some())
-                || !direct_token_kinds(binding.syntax()).is_empty()
-                || name.syntax().children().count() != 0
-                || direct_token_kinds(name.syntax()) != [SyntaxKind::LIDENT]
-            {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            if let Some(mode) = mode {
-                let mode_tokens = direct_token_kinds(mode.syntax());
-                let mode_text = match mode_tokens.as_slice() {
-                    [SyntaxKind::VAR_KW] => "var ",
-                    [SyntaxKind::BORROW_KW] => "borrow ",
-                    [SyntaxKind::BORROW_KW, SyntaxKind::MUT_KW] => "borrow mut ",
-                    _ => return Err(SourceDocumentError::UnsupportedShape),
-                };
-                if mode.syntax().children().count() != 0 {
-                    return Err(SourceDocumentError::UnsupportedShape);
-                }
-                documents.push(Doc::text(mode_text));
-            }
-            documents.push(Doc::text(node_text(source, name.syntax())));
-            Ok(Doc::concat(documents))
-        }
+        ast::Pattern::Binding(binding) => binding_pattern_document(source, binding),
         ast::Pattern::Wildcard(wildcard) => {
             if wildcard.syntax().children().count() != 0
                 || direct_token_kinds(wildcard.syntax()) != [SyntaxKind::UNDERSCORE]
@@ -539,6 +577,437 @@ fn simple_binding_pattern_document(
         }
         _ => Err(SourceDocumentError::UnsupportedShape),
     }
+}
+
+fn binding_pattern_document(
+    source: &ParsedSource,
+    binding: &ast::BindingPat,
+) -> Result<Doc, SourceDocumentError> {
+    let mode = binding.mode();
+    let name = binding
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let mut documents = Vec::with_capacity(2);
+    if binding.syntax().children().count() != 1 + usize::from(mode.is_some())
+        || !direct_token_kinds(binding.syntax()).is_empty()
+        || name.syntax().children().count() != 0
+        || direct_token_kinds(name.syntax()) != [SyntaxKind::LIDENT]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    if let Some(mode) = mode {
+        let mode_tokens = direct_token_kinds(mode.syntax());
+        let mode_text = match mode_tokens.as_slice() {
+            [SyntaxKind::VAR_KW] => "var ",
+            [SyntaxKind::BORROW_KW] => "borrow ",
+            [SyntaxKind::BORROW_KW, SyntaxKind::MUT_KW] => "borrow mut ",
+            _ => return Err(SourceDocumentError::UnsupportedShape),
+        };
+        if mode.syntax().children().count() != 0 {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.push(Doc::text(mode_text));
+    }
+    documents.push(Doc::text(node_text(source, name.syntax())));
+    Ok(Doc::concat(documents))
+}
+
+fn or_pattern_document(
+    source: &ParsedSource,
+    or_pattern: &ast::OrPat,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let alternatives = or_pattern.alternatives().collect::<Vec<_>>();
+    let direct_tokens = direct_token_kinds(or_pattern.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let first_element = or_pattern.syntax().children_with_tokens().find(|element| {
+        !matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::NEWLINE)
+    });
+    let leading_pipe = matches!(
+        first_element,
+        Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::PIPE
+    );
+    let expected_pipe_count = alternatives.len().saturating_sub(1) + usize::from(leading_pipe);
+    if or_pattern.syntax().children().count() != alternatives.len()
+        || direct_tokens.len() != expected_pipe_count
+        || direct_tokens.iter().any(|kind| *kind != SyntaxKind::PIPE)
+        || alternatives.is_empty()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = alternatives
+        .into_iter()
+        .map(|alternative| pattern_document(source, &alternative, expression_group_ids));
+    let first = documents
+        .next()
+        .ok_or(SourceDocumentError::UnsupportedShape)??;
+    let mut alternatives = vec![first];
+    for alternative in documents {
+        alternatives.extend([
+            Doc::text(" |"),
+            Doc::indent(Doc::concat([Doc::Line, alternative?])),
+        ]);
+    }
+    if alternatives.len() == 1 {
+        Ok(alternatives
+            .pop()
+            .ok_or(SourceDocumentError::UnsupportedShape)?)
+    } else {
+        Ok(Doc::group(
+            expression_group_ids.next(),
+            Doc::concat(alternatives),
+        ))
+    }
+}
+
+fn literal_pattern_document(
+    source: &ParsedSource,
+    literal: &ast::LiteralPat,
+) -> Result<Doc, SourceDocumentError> {
+    if literal.syntax().children().count() != 0 {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let tokens = literal
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() != SyntaxKind::NEWLINE => Some(token),
+            SyntaxElement::Node(_) | SyntaxElement::Token(_) => None,
+        })
+        .collect::<Vec<_>>();
+    match tokens.as_slice() {
+        [token] => {
+            let literal = LiteralToken::cast((*token).clone())
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            Ok(Doc::text(normalize_literal(source, literal)?))
+        }
+        [minus, integer]
+            if minus.kind() == SyntaxKind::MINUS && integer.kind() == SyntaxKind::INT =>
+        {
+            let integer = LiteralToken::cast((*integer).clone())
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            Ok(Doc::concat([
+                Doc::text("-"),
+                Doc::text(normalize_literal(source, integer)?),
+            ]))
+        }
+        _ => Err(SourceDocumentError::UnsupportedShape),
+    }
+}
+
+fn range_pattern_endpoint_document(
+    source: &ParsedSource,
+    endpoint: &ast::RangePatEndpoint,
+) -> Result<Doc, SourceDocumentError> {
+    match endpoint {
+        ast::RangePatEndpoint::Literal(literal) => literal_pattern_document(source, literal),
+        ast::RangePatEndpoint::ConstantPath(path) => const_path_pattern_document(source, path),
+    }
+}
+
+fn range_pattern_document(
+    source: &ParsedSource,
+    range: &ast::RangePat,
+) -> Result<Doc, SourceDocumentError> {
+    let start = range.start();
+    let end = range.end();
+    let tokens = direct_token_kinds(range.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if range.syntax().children().count()
+        != usize::from(start.is_some()) + usize::from(end.is_some())
+        || tokens.len() != 1
+        || !matches!(tokens[0], SyntaxKind::DOT2 | SyntaxKind::DOT2EQ)
+        || (tokens[0] == SyntaxKind::DOT2EQ && end.is_none())
+        || (start.is_none() && tokens[0] == SyntaxKind::DOT2)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = Vec::with_capacity(3);
+    if let Some(start) = start {
+        documents.push(range_pattern_endpoint_document(source, &start)?);
+    }
+    documents.push(Doc::text(if tokens[0] == SyntaxKind::DOT2EQ {
+        "..="
+    } else {
+        ".."
+    }));
+    if let Some(end) = end {
+        documents.push(range_pattern_endpoint_document(source, &end)?);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn const_path_pattern_document(
+    source: &ParsedSource,
+    path: &ast::ConstPath,
+) -> Result<Doc, SourceDocumentError> {
+    let segments = path.segments().collect::<Vec<_>>();
+    let tokens = direct_token_kinds(path.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if segments.is_empty()
+        || path.syntax().children().count() != segments.len()
+        || tokens.len() != segments.len().saturating_sub(1)
+        || tokens.iter().any(|kind| *kind != SyntaxKind::DOT)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = Vec::with_capacity(segments.len() * 2 - 1);
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.syntax().children().count() != 0 {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let token = segment
+            .syntax()
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) => Some(token),
+                SyntaxElement::Node(_) => None,
+            })
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        if (index + 1 == segments.len() && token.kind() != SyntaxKind::UIDENT)
+            || (index + 1 < segments.len()
+                && !matches!(token.kind(), SyntaxKind::LIDENT | SyntaxKind::UIDENT))
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        if index > 0 {
+            documents.push(Doc::text("."));
+        }
+        documents.push(Doc::text(node_text(source, segment.syntax())));
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn tuple_pattern_document(
+    source: &ParsedSource,
+    tuple: &ast::TuplePat,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let elements = tuple.elements().collect::<Vec<_>>();
+    if tuple.syntax().children().count() != elements.len()
+        || !comma_delimited_tokens_match(
+            tuple.syntax(),
+            SyntaxKind::L_PAREN,
+            SyntaxKind::R_PAREN,
+            elements.len(),
+        )
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let documents = elements
+        .into_iter()
+        .map(|element| pattern_document(source, &element, expression_group_ids))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(delimited_list_document(
+        expression_group_ids.next(),
+        "(",
+        ")",
+        documents,
+        true,
+    ))
+}
+
+fn slice_pattern_document(
+    source: &ParsedSource,
+    slice: &ast::SlicePat,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let children = slice.syntax().children().collect::<Vec<_>>();
+    if !comma_delimited_tokens_match(
+        slice.syntax(),
+        SyntaxKind::L_BRACKET,
+        SyntaxKind::R_BRACKET,
+        children.len(),
+    ) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let documents = children
+        .into_iter()
+        .map(|child| {
+            if let Some(pattern) = ast::Pattern::cast(child.clone()) {
+                pattern_document(source, &pattern, expression_group_ids)
+            } else if let Some(rest) = ast::RestPat::cast(child) {
+                rest_pattern_document(source, &rest, true)
+            } else {
+                Err(SourceDocumentError::UnsupportedShape)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if documents.len() != slice.elements().count() + slice.rest_patterns().count()
+        || slice.syntax().children().count() != documents.len()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(delimited_list_document(
+        expression_group_ids.next(),
+        "[",
+        "]",
+        documents,
+        false,
+    ))
+}
+
+fn rest_pattern_document(
+    source: &ParsedSource,
+    rest: &ast::RestPat,
+    allow_binding: bool,
+) -> Result<Doc, SourceDocumentError> {
+    let binding = rest.binding();
+    if rest.syntax().children().count() != usize::from(binding.is_some())
+        || direct_token_kinds(rest.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::DOT2]
+        || (binding.is_some() && !allow_binding)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text("..")];
+    if let Some(binding) = binding {
+        documents.push(binding_pattern_document(source, &binding)?);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn named_pattern_argument_document(
+    source: &ParsedSource,
+    argument: &ast::NamedPatArg,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let name = argument
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let pattern = argument
+        .pattern()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if argument.syntax().children().count() != 2
+        || direct_token_kinds(argument.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::COLON]
+        || name.syntax().children().count() != 0
+        || direct_token_kinds(name.syntax()) != [SyntaxKind::LIDENT]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat([
+        Doc::text(node_text(source, name.syntax())),
+        Doc::text(": "),
+        pattern_document(source, &pattern, expression_group_ids)?,
+    ]))
+}
+
+fn constructor_pattern_arguments_document(
+    source: &ParsedSource,
+    arguments: &ast::CtorPatArgs,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let children = arguments.syntax().children().collect::<Vec<_>>();
+    if !comma_delimited_tokens_match(
+        arguments.syntax(),
+        SyntaxKind::L_PAREN,
+        SyntaxKind::R_PAREN,
+        children.len(),
+    ) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = Vec::with_capacity(children.len());
+    for child in &children {
+        if let Some(pattern) = ast::Pattern::cast(child.clone()) {
+            documents.push(pattern_document(source, &pattern, expression_group_ids)?);
+        } else if let Some(named) = ast::NamedPatArg::cast(child.clone()) {
+            documents.push(named_pattern_argument_document(
+                source,
+                &named,
+                expression_group_ids,
+            )?);
+        } else if let Some(rest) = ast::RestPat::cast(child.clone()) {
+            documents.push(rest_pattern_document(source, &rest, false)?);
+        } else {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+    }
+    if documents.len()
+        != arguments.positional_patterns().count()
+            + arguments.named_args().count()
+            + arguments.rest_patterns().count()
+        || arguments.syntax().children().count() != documents.len()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let final_is_rest = children
+        .last()
+        .is_some_and(|child| ast::RestPat::can_cast(child.kind()));
+    Ok(delimited_list_document_with_options(
+        expression_group_ids.next(),
+        "(",
+        ")",
+        documents,
+        !final_is_rest,
+        false,
+    ))
+}
+
+fn constructor_pattern_document(
+    source: &ParsedSource,
+    constructor: &ast::CtorPat,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let path = constructor
+        .path()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let arguments = constructor.args();
+    if constructor.syntax().children().count() != 1 + usize::from(arguments.is_some())
+        || !direct_token_kinds(constructor.syntax()).is_empty()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![const_path_pattern_document(source, &path)?];
+    if let Some(arguments) = arguments {
+        documents.push(constructor_pattern_arguments_document(
+            source,
+            &arguments,
+            expression_group_ids,
+        )?);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn implicit_member_pattern_document(
+    source: &ParsedSource,
+    member: &ast::ImplicitMemberPat,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let name = member.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let arguments = member.args();
+    if member.syntax().children().count() != 1 + usize::from(arguments.is_some())
+        || direct_token_kinds(member.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::DOT]
+        || name.syntax().children().count() != 0
+        || direct_token_kinds(name.syntax()) != [SyntaxKind::UIDENT]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text("."), Doc::text(node_text(source, name.syntax()))];
+    if let Some(arguments) = arguments {
+        documents.push(constructor_pattern_arguments_document(
+            source,
+            &arguments,
+            expression_group_ids,
+        )?);
+    }
+    Ok(Doc::concat(documents))
 }
 
 fn for_expression_document(
@@ -577,7 +1046,7 @@ fn for_expression_document(
         documents.push(loop_label_document(&label)?);
     }
     documents.push(Doc::text(if is_await { "for await " } else { "for " }));
-    documents.push(simple_binding_pattern_document(source, &pattern)?);
+    documents.push(pattern_document(source, &pattern, expression_group_ids)?);
     documents.push(Doc::text(" in "));
     documents.push(expression_document(
         source,
@@ -896,12 +1365,6 @@ fn statement_document(
             let pattern = statement
                 .pattern()
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
-            let Pattern::Binding(pattern) = pattern else {
-                return Err(SourceDocumentError::UnsupportedShape);
-            };
-            let name = pattern
-                .name()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
             let ty = statement.ty();
             let initializer = statement
                 .initializer()
@@ -915,15 +1378,7 @@ fn statement_document(
                 expected_tokens.push(SyntaxKind::COLON);
             }
             expected_tokens.push(SyntaxKind::EQ);
-            if pattern.mode().is_some()
-                || pattern.syntax().children().count() != 1
-                || !direct_token_kinds(pattern.syntax()).is_empty()
-                || name.syntax().children().count() != 0
-                || !matches!(
-                    direct_token_kinds(name.syntax()).as_slice(),
-                    [SyntaxKind::LIDENT]
-                )
-                || statement.else_clause().is_some()
+            if statement.else_clause().is_some()
                 || statement.syntax().children().count() != 2 + usize::from(ty.is_some())
                 || type_tokens != expected_tokens
             {
@@ -931,7 +1386,7 @@ fn statement_document(
             }
             let mut binding = vec![
                 Doc::text("let "),
-                Doc::text(node_text(source, name.syntax())),
+                pattern_document(source, &pattern, expression_group_ids)?,
             ];
             if let Some(ty) = ty {
                 binding.extend([Doc::text(": "), type_document(source, &ty)?]);
@@ -2974,6 +3429,17 @@ fn delimited_list_document(
     items: Vec<Doc>,
     keep_singleton_comma: bool,
 ) -> Doc {
+    delimited_list_document_with_options(group, open, close, items, true, keep_singleton_comma)
+}
+
+fn delimited_list_document_with_options(
+    group: GroupId,
+    open: &str,
+    close: &str,
+    items: Vec<Doc>,
+    trailing_comma_when_broken: bool,
+    keep_singleton_comma: bool,
+) -> Doc {
     if items.is_empty() {
         return Doc::concat([Doc::text(open), Doc::text(close)]);
     }
@@ -2988,7 +3454,7 @@ fn delimited_list_document(
     }
     contents.push(Doc::if_broken(
         group,
-        Doc::text(","),
+        Doc::text(if trailing_comma_when_broken { "," } else { "" }),
         Doc::text(if keep_singleton_comma && items.len() == 1 {
             ","
         } else {
@@ -3267,7 +3733,7 @@ mod tests {
     use crate::{parse_source, print};
     use sai_syntax::{
         SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
-        ast::{AstNode, Expr, RangeExpr, Type},
+        ast::{AstNode, Expr, Pattern, RangeExpr, Type},
     };
 
     fn format_shape(source: &[u8]) -> Result<String, SourceDocumentError> {
@@ -4593,7 +5059,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_if_let_conditions_with_simple_patterns() {
+    fn formats_if_let_conditions_with_patterns() {
         for (input, expected) in [
             (
                 b"fn f(){if let value=input {consume(value)}}".as_slice(),
@@ -4611,9 +5077,69 @@ mod tests {
                 b"fn f(){if let value=input {one()}else if ready{two()}else{three()}}".as_slice(),
                 "fn f() {\n    if let value = input {\n        one()\n    } else if ready {\n        two()\n    } else {\n        three()\n    }\n}\n",
             ),
+            (
+                b"fn f(){if let Some(value)=input {consume(value)}}".as_slice(),
+                "fn f() {\n    if let Some(value) = input {\n        consume(value)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let Some()=input {tick()}}".as_slice(),
+                "fn f() {\n    if let Some() = input {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let |.Pending|.Active=input {tick()}}".as_slice(),
+                "fn f() {\n    if let .Pending | .Active = input {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let .Disabled(..)=input {tick()}}".as_slice(),
+                "fn f() {\n    if let .Disabled(..) = input {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let User(id,name:label,..)=input {consume(label)}}".as_slice(),
+                "fn f() {\n    if let User(id, name: label, ..) = input {\n        consume(label)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let [first,..rest,last]=input {consume(rest)}}".as_slice(),
+                "fn f() {\n    if let [first, ..rest, last] = input {\n        consume(rest)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let name@module.State.Ready=input {consume(name)}}".as_slice(),
+                "fn f() {\n    if let name @ module.State.Ready = input {\n        consume(name)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let (left,right)=input {consume(left)}}".as_slice(),
+                "fn f() {\n    if let (left, right) = input {\n        consume(left)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let (value,)=input {consume(value)}}".as_slice(),
+                "fn f() {\n    if let (value,) = input {\n        consume(value)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let ()=input {tick()}}".as_slice(),
+                "fn f() {\n    if let () = input {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let (value)=input {consume(value)}}".as_slice(),
+                "fn f() {\n    if let (value) = input {\n        consume(value)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let 0x2a..=0xff=input {tick()}}".as_slice(),
+                "fn f() {\n    if let 0x2A..=0xFF = input {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let -1=input {tick()}}".as_slice(),
+                "fn f() {\n    if let -1 = input {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let ..=MAX=input {tick()}}".as_slice(),
+                "fn f() {\n    if let ..=MAX = input {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let 10.. = input {tick()}}".as_slice(),
+                "fn f() {\n    if let 10.. = input {\n        tick()\n    }\n}\n",
+            ),
         ] {
             let parsed = parse_source(input).expect("if-let condition parses");
-            let output = format_shape(input).expect("simple if-let condition formats");
+            let output = format_shape(input).expect("if-let condition pattern formats");
             assert_eq!(output, expected);
             let reparsed = parse_source(output.as_bytes()).expect("formatted if-let parses");
             assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
@@ -4622,11 +5148,54 @@ mod tests {
     }
 
     #[test]
-    fn keeps_if_let_conditions_with_unsupported_patterns_fail_closed() {
-        assert_eq!(
-            format_shape(b"fn f(){if let Some(value)=input {value}}"),
-            Err(SourceDocumentError::UnsupportedShape)
+    fn breaks_long_or_patterns_after_each_alternative_separator() {
+        let first = format!("Variant{}", "A".repeat(37));
+        let second = format!("Variant{}", "B".repeat(37));
+        let input = format!("fn f(){{if let {first}|{second}=value{{tick()}}}}");
+        let expected = format!(
+            "fn f() {{\n    if let {first} |\n        {second} = value {{\n        tick()\n    }}\n}}\n"
         );
+        let parsed = parse_source(input.as_bytes()).expect("long or-pattern parses");
+        let output = format_shape(input.as_bytes()).expect("long or-pattern formats");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("broken or-pattern reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_constructor_pattern_arguments_without_comma_after_final_rest() {
+        let first = format!("first_{}", "a".repeat(36));
+        let second = format!("second_{}", "b".repeat(36));
+        let input = format!("fn f(){{if let Some({first},{second},..)=value{{tick()}}}}");
+        let expected = format!(
+            "fn f() {{\n    if let Some(\n        {first},\n        {second},\n        ..\n    ) = value {{\n        tick()\n    }}\n}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("long constructor pattern parses");
+        let output = format_shape(input.as_bytes()).expect("long constructor pattern formats");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed =
+            parse_source(output.as_bytes()).expect("broken constructor pattern reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_single_element_slice_patterns_with_a_trailing_comma() {
+        let binding = format!("value_{}", "x".repeat(85));
+        let input = format!("fn f(){{if let [{binding}]=values{{tick()}}}}");
+        let expected = format!(
+            "fn f() {{\n    if let [\n        {binding},\n    ] = values {{\n        tick()\n    }}\n}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("long slice pattern parses");
+        let output = format_shape(input.as_bytes()).expect("long slice pattern formats");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("broken slice pattern reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
@@ -4717,22 +5286,18 @@ mod tests {
                 b"fn f(){'scan:\nwhile let _=next() {tick()}}".as_slice(),
                 "fn f() {\n    'scan: while let _ = next() {\n        tick()\n    }\n}\n",
             ),
+            (
+                b"fn f(){while let Some((left,right))=next() {consume(left)}}".as_slice(),
+                "fn f() {\n    while let Some((left, right)) = next() {\n        consume(left)\n    }\n}\n",
+            ),
         ] {
             let parsed = parse_source(input).expect("while-let condition parses");
-            let output = format_shape(input).expect("simple while-let condition formats");
+            let output = format_shape(input).expect("while-let pattern formats");
             assert_eq!(output, expected);
             let reparsed = parse_source(output.as_bytes()).expect("formatted while-let parses");
             assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
             assert_eq!(format_shape(output.as_bytes()), Ok(output));
         }
-    }
-
-    #[test]
-    fn keeps_while_let_conditions_with_unsupported_patterns_fail_closed() {
-        assert_eq!(
-            format_shape(b"fn f(){while let (left,right)=pair {consume(left)}}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
     }
 
     #[test]
@@ -4932,9 +5497,17 @@ mod tests {
                 b"fn f(){for await row in rows {consume(row)}}".as_slice(),
                 "fn f() {\n    for await row in rows {\n        consume(row)\n    }\n}\n",
             ),
+            (
+                b"fn f(){for (left,right) in pairs {consume(left)}}".as_slice(),
+                "fn f() {\n    for (left, right) in pairs {\n        consume(left)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){for [head,..tail] in rows {consume(head)}}".as_slice(),
+                "fn f() {\n    for [head, ..tail] in rows {\n        consume(head)\n    }\n}\n",
+            ),
         ] {
             let parsed = parse_source(input).expect("for expression parses");
-            let output = format_shape(input).expect("simple for expression is supported");
+            let output = format_shape(input).expect("for expression pattern is supported");
             assert_eq!(output, expected);
             let reparsed = parse_source(output.as_bytes()).expect("formatted for parses");
             assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
@@ -4943,9 +5516,21 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_destructuring_for_patterns_remain_fail_closed() {
+    fn formats_destructuring_let_statements() {
+        let input = b"fn f(){let (left,right)=pair\nconsume(left)}";
+        let expected = "fn f() {\n    let (left, right) = pair\n    consume(left)\n}\n";
+        let parsed = parse_source(input).expect("destructuring let parses");
+        let output = format_shape(input).expect("destructuring let formats");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted let reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn keeps_let_else_statements_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f(){for (left,right) in pairs {consume(left)}}"),
+            format_shape(b"fn f(){let Some(value)=next() else{return}\nvalue}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
@@ -5125,10 +5710,6 @@ mod tests {
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
-            format_shape(b"fn f(){let (x,y)=pair\nx}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
             format_shape(b"fn f(){}\n/// trailing"),
             Err(SourceDocumentError::UnsupportedShape)
         );
@@ -5158,7 +5739,9 @@ mod tests {
                     let mut elements = node.children_with_tokens().collect::<Vec<_>>();
                     if matches!(
                         node.kind(),
-                        SyntaxKind::EFFECT_SET | SyntaxKind::BORROWS_CLAUSE
+                        SyntaxKind::EFFECT_SET
+                            | SyntaxKind::BORROWS_CLAUSE
+                            | SyntaxKind::MATCH_ARM_LIST
                     ) {
                         elements.retain(
                             |element| !matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA),
@@ -5168,7 +5751,14 @@ mod tests {
                             SyntaxKind::PARAM_LIST
                             | SyntaxKind::ARG_LIST
                             | SyntaxKind::FN_PTR_TYPE
-                            | SyntaxKind::FN_SUGAR_BOUND => Some(SyntaxKind::R_PAREN),
+                            | SyntaxKind::FN_SUGAR_BOUND
+                            | SyntaxKind::CTOR_PAT_ARGS => Some(SyntaxKind::R_PAREN),
+                            SyntaxKind::TUPLE_PAT
+                                if node.children().filter_map(Pattern::cast).count() != 1 =>
+                            {
+                                Some(SyntaxKind::R_PAREN)
+                            }
+                            SyntaxKind::SLICE_PAT => Some(SyntaxKind::R_BRACKET),
                             SyntaxKind::GENERIC_ARG_LIST | SyntaxKind::GENERIC_PARAM_LIST => {
                                 Some(SyntaxKind::GT)
                             }
@@ -5193,6 +5783,20 @@ mod tests {
                             if let Some(index) = trailing_comma {
                                 elements.remove(index);
                             }
+                        }
+                    }
+                    if node.kind() == SyntaxKind::OR_PAT {
+                        let first_significant = elements.iter().position(|element| {
+                            !matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::NEWLINE)
+                        });
+                        if first_significant.is_some_and(|index| {
+                            matches!(
+                                elements.get(index),
+                                Some(SyntaxElement::Token(token))
+                                    if token.kind() == SyntaxKind::PIPE
+                            )
+                        }) {
+                            elements.remove(first_significant.expect("significant element exists"));
                         }
                     }
                     pending.extend(elements.into_iter().rev().map(|element| match element {
