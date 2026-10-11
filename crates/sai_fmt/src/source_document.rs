@@ -1574,6 +1574,17 @@ fn statement_document(
             let initializer = statement
                 .initializer()
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let else_clause = statement.else_clause();
+            let statement_children = statement.syntax().children().collect::<Vec<_>>();
+            let expected_child_ranges = std::iter::once(pattern.syntax().text_range())
+                .chain(ty.as_ref().map(|ty| ty.syntax().text_range()))
+                .chain(std::iter::once(initializer.syntax().text_range()))
+                .chain(
+                    else_clause
+                        .as_ref()
+                        .map(|else_clause| else_clause.syntax().text_range()),
+                )
+                .collect::<Vec<_>>();
             let type_tokens = direct_token_kinds(statement.syntax())
                 .into_iter()
                 .filter(|kind| *kind != SyntaxKind::NEWLINE)
@@ -1583,12 +1594,37 @@ fn statement_document(
                 expected_tokens.push(SyntaxKind::COLON);
             }
             expected_tokens.push(SyntaxKind::EQ);
-            if statement.else_clause().is_some()
-                || statement.syntax().children().count() != 2 + usize::from(ty.is_some())
+            if statement_children.len() != expected_child_ranges.len()
+                || statement_children
+                    .iter()
+                    .map(|child| child.text_range())
+                    .ne(expected_child_ranges)
                 || type_tokens != expected_tokens
             {
                 return Err(SourceDocumentError::UnsupportedShape);
             }
+            let else_suffix = if let Some(else_clause) = else_clause.as_ref() {
+                let block = else_clause
+                    .block()
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                let else_children = else_clause.syntax().children().collect::<Vec<_>>();
+                if else_children.len() != 1
+                    || else_children[0].text_range() != block.syntax().text_range()
+                    || direct_token_kinds(else_clause.syntax())
+                        .into_iter()
+                        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                        .collect::<Vec<_>>()
+                        != [SyntaxKind::ELSE_KW]
+                {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                Some(Doc::concat([
+                    Doc::text(" else "),
+                    block_document(source, &block, expression_group_ids)?,
+                ]))
+            } else {
+                None
+            };
             let mut binding = vec![
                 Doc::text("let "),
                 pattern_document(source, &pattern, expression_group_ids)?,
@@ -1596,16 +1632,23 @@ fn statement_document(
             if let Some(ty) = ty {
                 binding.extend([Doc::text(": "), type_document(source, &ty)?]);
             }
-            binding.extend([
-                Doc::text(" ="),
-                right_hand_side_document(
-                    source,
+            let initializer_document = expression_document(
+                source,
+                &initializer,
+                ExpressionContext::Unprotected,
+                expression_group_ids,
+            )?;
+            let initializer_document = if let Some(else_suffix) = else_suffix {
+                right_hand_side_document_from_document_with_suffix(
                     &initializer,
-                    ExpressionContext::Unprotected,
-                    expression_group_ids,
+                    initializer_document,
                     true,
-                )?,
-            ]);
+                    else_suffix,
+                )
+            } else {
+                right_hand_side_document_from_document(&initializer, initializer_document, true)
+            };
+            binding.extend([Doc::text(" ="), initializer_document]);
             Ok(Doc::concat(binding))
         }
         Stmt::Var(statement) => {
@@ -1762,6 +1805,31 @@ fn right_hand_side_document_from_document(
     document: Doc,
     allow_move: bool,
 ) -> Doc {
+    right_hand_side_document_from_document_with_optional_suffix(
+        expression, document, allow_move, None,
+    )
+}
+
+fn right_hand_side_document_from_document_with_suffix(
+    expression: &Expr,
+    document: Doc,
+    allow_move: bool,
+    suffix: Doc,
+) -> Doc {
+    right_hand_side_document_from_document_with_optional_suffix(
+        expression,
+        document,
+        allow_move,
+        Some(suffix),
+    )
+}
+
+fn right_hand_side_document_from_document_with_optional_suffix(
+    expression: &Expr,
+    document: Doc,
+    allow_move: bool,
+    suffix: Option<Doc>,
+) -> Doc {
     let block_like = matches!(
         expression.syntax().kind(),
         SyntaxKind::BLOCK_EXPR
@@ -1775,23 +1843,32 @@ fn right_hand_side_document_from_document(
             | SyntaxKind::CLOSURE_EXPR
             | SyntaxKind::REGION_EXPR
     );
+    let with_suffix = |mut documents: Vec<Doc>| {
+        if let Some(suffix) = suffix.as_ref() {
+            documents.push(suffix.clone());
+        }
+        Doc::concat(documents)
+    };
     if block_like {
-        return Doc::concat([Doc::text(" "), document]);
+        return with_suffix(vec![Doc::text(" "), document]);
     }
 
-    let inline = Doc::concat([Doc::text(" "), Doc::flat(document.clone())]);
+    let inline = with_suffix(vec![Doc::text(" "), Doc::flat(document.clone())]);
     let mut alternatives = vec![inline];
     if allow_move {
-        alternatives.push(Doc::indent(Doc::concat([
+        alternatives.push(Doc::indent(with_suffix(vec![
             Doc::HardLine,
             Doc::flat(document.clone()),
         ])));
     }
-    alternatives.push(Doc::concat([Doc::text(" "), document.clone()]));
+    alternatives.push(with_suffix(vec![Doc::text(" "), document.clone()]));
     if allow_move {
-        alternatives.push(Doc::indent(Doc::concat([Doc::HardLine, document.clone()])));
+        alternatives.push(Doc::indent(with_suffix(vec![
+            Doc::HardLine,
+            document.clone(),
+        ])));
     }
-    alternatives.push(Doc::concat([Doc::text(" "), document]));
+    alternatives.push(with_suffix(vec![Doc::text(" "), document]));
     Doc::choice(alternatives)
 }
 
@@ -4116,7 +4193,7 @@ mod tests {
     use crate::{parse_source, print};
     use sai_syntax::{
         SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
-        ast::{AstNode, Expr, Pattern, RangeExpr, Type},
+        ast::{AstNode, Expr, Pattern, RangeExpr, Stmt, Type},
     };
 
     fn format_shape(source: &[u8]) -> Result<String, SourceDocumentError> {
@@ -6204,11 +6281,88 @@ mod tests {
     }
 
     #[test]
-    fn keeps_let_else_statements_fail_closed() {
-        assert_eq!(
-            format_shape(b"fn f(){let Some(value)=next() else{return}\nvalue}"),
-            Err(SourceDocumentError::UnsupportedShape)
+    fn formats_let_else_statements() {
+        for (input, expected) in [
+            (
+                b"fn f(){let Some(value)=next()else{return}\nvalue}".as_slice(),
+                concat!(
+                    "fn f() {\n",
+                    "    let Some(value) = next() else {\n",
+                    "        return\n",
+                    "    }\n",
+                    "    value\n",
+                    "}\n",
+                ),
+            ),
+            (
+                b"fn f(){let (Some(value),flag):(Option<I32>,Bool)=pair\nelse{fallback()}\nconsume(value)}",
+                concat!(
+                    "fn f() {\n",
+                    "    let (Some(value), flag): (Option<I32>, Bool) = pair else {\n",
+                    "        fallback()\n",
+                    "    }\n",
+                    "    consume(value)\n",
+                    "}\n",
+                ),
+            ),
+            (
+                b"fn f(){let Some(value)=if ready{next()}else{fallback()}else{return}\nconsume(value)}",
+                concat!(
+                    "fn f() {\n",
+                    "    let Some(value) = if ready {\n",
+                    "        next()\n",
+                    "    } else {\n",
+                    "        fallback()\n",
+                    "    } else {\n",
+                    "        return\n",
+                    "    }\n",
+                    "    consume(value)\n",
+                    "}\n",
+                ),
+            ),
+        ] {
+            let parsed = parse_source(input).expect("let-else statement parses");
+            let output = format_shape(input).expect("let-else statement formats");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted let-else reparses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+
+        for (binding_length, repeated_chars) in [(78, 70), (85, 77)] {
+            let binding = format!("binding_{}", "a".repeat(repeated_chars));
+            assert_eq!(binding.len(), binding_length);
+            let input = format!("fn f(){{let {binding}=value else{{return}}}}");
+            let expected = format!(
+                "fn f() {{\n    let {binding} =\n        value else {{\n            return\n        }}\n}}\n"
+            );
+            let parsed = parse_source(input.as_bytes()).expect("long let-else statement parses");
+            let output = format_shape(input.as_bytes()).expect("long let-else statement formats");
+            assert_eq!(output, expected);
+            assert!(output.lines().all(|line| line.chars().count() <= 100));
+            let reparsed =
+                parse_source(output.as_bytes()).expect("formatted long let-else reparses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+
+        let binding = format!("binding_{}", "a".repeat(81));
+        let first = format!("first_{}", "b".repeat(44));
+        let second = format!("second_{}", "c".repeat(44));
+        let input = format!("fn f(){{let {binding}={first}+{second} else{{return}}}}");
+        let expected = format!(
+            "fn f() {{\n    let {binding} =\n        (\n            {first}\n            + {second}\n        ) else {{\n            return\n        }}\n}}\n"
         );
+        let parsed = parse_source(input.as_bytes()).expect("broken let-else statement parses");
+        let output = format_shape(input.as_bytes()).expect("broken let-else statement formats");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("broken let-else reparses");
+        assert_eq!(
+            let_initializer_shape(parsed.root()),
+            let_initializer_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
@@ -6406,6 +6560,26 @@ mod tests {
 
     fn syntax_shape(root: &SyntaxNode) -> Vec<ShapeElement> {
         syntax_shape_impl(root, false)
+    }
+
+    fn let_initializer_shape(root: &SyntaxNode) -> Vec<ShapeElement> {
+        let initializer = root
+            .descendants()
+            .filter_map(Stmt::cast)
+            .find_map(|statement| match statement {
+                Stmt::Let(statement) => statement.initializer(),
+                _ => None,
+            })
+            .expect("let initializer exists");
+        match initializer {
+            Expr::Paren(paren) => {
+                let expression = paren
+                    .expression()
+                    .expect("parenthesized initializer exists");
+                syntax_shape(expression.syntax())
+            }
+            expression => syntax_shape(expression.syntax()),
+        }
     }
 
     fn match_scrutinee_shape(root: &SyntaxNode) -> Vec<ShapeElement> {
