@@ -2595,3 +2595,11 @@
 - **Review:** Tests cover labeled and unlabeled loops, empty and nonempty bodies, a source newline after the label colon, reparsing, syntax-shape preservation, and fixed-point output. Hostile review found no actionable issues. All 220 `sai_fmt` tests and full workspace tests pass; warning-denied workspace Clippy, formatting, and `git diff --check` pass.
 - **Human review:** **Review required:** Confirm that preserving label source spelling while canonicalizing the label/loop line break is appropriate.
 - **Remaining scope:** Add `while` and `for` expressions, match and closure expressions, unsafe/async/region block wrappers, if-let, destructuring and let-else statements, enclosing impl/trait/interface-resource declarations, comments, preservation verification, production source formatting, CLI integration, and implicit workspace discovery.
+
+### IR-365: Format `while` expressions
+
+- **Decision:** Format labeled and unlabeled `while` expressions with ordinary expression conditions, preserving the shared loop-label rules and broken block layout. Keep `while let` fail-closed.
+- **Reason:** Formatter §14.9.8 rules 2 and 4 require conditions and labels on the keyword line, with line breaks inside a binary condition protected by parentheses. The existing `Condition` wrapper distinguishes expression conditions from let conditions, and sharing its renderer with `if` keeps those layout guarantees consistent.
+- **Review:** Tests cover labeled and unlabeled loops, body formatting, reparsing, syntax-shape preservation, fixed-point output, and fail-closed `while let`. Hostile review found no actionable issues. All 222 `sai_fmt` tests and full workspace tests pass; warning-denied workspace Clippy, formatting, and `git diff --check` pass.
+- **Human review:** **Review required:** Confirm that expression-condition `while` support and fail-closed `while let` are an appropriate staged boundary.
+- **Remaining scope:** Add `for` expressions, match and closure expressions, unsafe/async/region block wrappers, if-let and while-let, destructuring and let-else statements, enclosing impl/trait/interface-resource declarations, comments, preservation verification, production source formatting, CLI integration, and implicit workspace discovery.
