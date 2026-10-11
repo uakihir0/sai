@@ -29,18 +29,46 @@ pub(crate) fn targets_declaration(
     index: &PackageSyntaxIndex,
     list: &PackageBraceList,
 ) -> Result<Doc, PackageDocumentError> {
+    comma_list_declaration(input, index, list, PackageBraceOwner::Targets)
+}
+
+pub(crate) fn capability_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex,
+    list: &PackageBraceList,
+) -> Result<Doc, PackageDocumentError> {
+    match list.owner {
+        PackageBraceOwner::Allow | PackageBraceOwner::Deny => {
+            comma_list_declaration(input, index, list, list.owner)
+        }
+        _ => Err(PackageDocumentError::WrongListOwner),
+    }
+}
+
+fn comma_list_declaration(
+    input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex,
+    list: &PackageBraceList,
+    owner: PackageBraceOwner,
+) -> Result<Doc, PackageDocumentError> {
     if !input.refusals().is_empty() {
         return Err(PackageDocumentError::InputRefused);
     }
-    if list.owner != PackageBraceOwner::Targets {
+    if list.owner != owner {
         return Err(PackageDocumentError::WrongListOwner);
     }
 
     let tokens = &input.lexed().tokens;
+    let keyword = match owner {
+        PackageBraceOwner::Targets => "targets",
+        PackageBraceOwner::Allow => "allow",
+        PackageBraceOwner::Deny => "deny",
+        _ => return Err(PackageDocumentError::WrongListOwner),
+    };
     let keyword_index = (list.open_token as usize)
         .checked_sub(1)
         .ok_or(PackageDocumentError::InvalidEntry)?;
-    if token_text(input.source(), &tokens[keyword_index]) != "targets" {
+    if token_text(input.source(), &tokens[keyword_index]) != keyword {
         return Err(PackageDocumentError::InvalidEntry);
     }
 
@@ -55,51 +83,56 @@ pub(crate) fn targets_declaration(
     let closing_trailing = comments.take_trailing(close_token);
 
     let entries = index.entries(list);
-    let mut target_entries = Vec::with_capacity(entries.len());
+    let mut list_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         if entry.end != entry.start + 1 {
             return Err(PackageDocumentError::InvalidEntry);
         }
         let token_index = entry.start as usize;
         let token = &tokens[token_index];
-        if token.kind != PackageTokenKind::Word {
+        let valid_entry = match owner {
+            PackageBraceOwner::Targets => token.kind == PackageTokenKind::Word,
+            PackageBraceOwner::Allow | PackageBraceOwner::Deny => matches!(
+                token.kind,
+                PackageTokenKind::Word | PackageTokenKind::PackagePath
+            ),
+            _ => false,
+        };
+        if !valid_entry {
             return Err(PackageDocumentError::InvalidEntry);
         }
-        target_entries.push(TargetEntry {
+        list_entries.push(ListEntry {
             token_index,
             leading: comments.take_leading(token_index),
             trailing: comments.take_trailing(token_index),
         });
     }
 
-    let mut comma_trailing = vec![Vec::new(); target_entries.len().saturating_sub(1)];
+    let mut comma_trailing = vec![Vec::new(); list_entries.len().saturating_sub(1)];
     for &separator in index.separators(list) {
         let separator_index = separator as usize;
         if tokens[separator_index].kind != PackageTokenKind::Punctuator(PackagePunctuator::Comma) {
             continue;
         }
 
-        let next_entry =
-            target_entries.partition_point(|entry| entry.token_index <= separator_index);
+        let next_entry = list_entries.partition_point(|entry| entry.token_index <= separator_index);
         let previous_entry = next_entry
             .checked_sub(1)
             .ok_or(PackageDocumentError::InvalidEntry)?;
         let mut leading = comments.take_leading(separator_index);
         let mut trailing = comments.take_trailing(separator_index);
-        if next_entry < target_entries.len() {
-            leading.append(&mut target_entries[next_entry].leading);
+        if next_entry < list_entries.len() {
+            leading.append(&mut list_entries[next_entry].leading);
             sort_comments(input, &mut leading);
-            target_entries[next_entry].leading = leading;
+            list_entries[next_entry].leading = leading;
             comma_trailing[previous_entry].append(&mut trailing);
             sort_comments(input, &mut comma_trailing[previous_entry]);
         } else {
             leading.append(&mut closing_leading);
             sort_comments(input, &mut leading);
             closing_leading = leading;
-            target_entries[previous_entry]
-                .trailing
-                .append(&mut trailing);
-            sort_comments(input, &mut target_entries[previous_entry].trailing);
+            list_entries[previous_entry].trailing.append(&mut trailing);
+            sort_comments(input, &mut list_entries[previous_entry].trailing);
         }
     }
 
@@ -113,14 +146,14 @@ pub(crate) fn targets_declaration(
         &keyword_leading,
         Some(tokens[keyword_index].span.start),
     );
-    let needs_group = !target_entries.is_empty()
+    let needs_group = !list_entries.is_empty()
         || !opening_leading.is_empty()
         || !opening_trailing.is_empty()
         || !closing_leading.is_empty();
 
     if !needs_group {
         prefix.extend([
-            Doc::text("targets"),
+            Doc::text(keyword),
             trailing_comments(input, &keyword_trailing),
             Doc::text(" {}"),
             trailing_comments(input, &closing_trailing),
@@ -130,7 +163,7 @@ pub(crate) fn targets_declaration(
 
     let group = GroupId(list.open_token);
     let mut declaration = vec![
-        Doc::text("targets"),
+        Doc::text(keyword),
         trailing_comments(input, &keyword_trailing),
     ];
     if opening_leading.is_empty() {
@@ -148,14 +181,14 @@ pub(crate) fn targets_declaration(
     }
     declaration.push(Doc::text("{"));
 
-    let empty_inline_comment = target_entries.is_empty() && !opening_trailing.is_empty();
+    let empty_inline_comment = list_entries.is_empty() && !opening_trailing.is_empty();
     let mut body = vec![trailing_comments(input, &opening_trailing)];
-    if !target_entries.is_empty() {
+    if !list_entries.is_empty() {
         body.push(Doc::Line);
-        for (position, entry) in target_entries.iter().enumerate() {
+        for (position, entry) in list_entries.iter().enumerate() {
             if position > 0 {
-                let previous = &target_entries[position - 1];
-                let current = &target_entries[position];
+                let previous = &list_entries[position - 1];
+                let current = &list_entries[position];
                 let previous_end = tokens[previous.token_index].span.end;
                 let current_start = tokens[current.token_index].span.start;
                 let blank_line_before_entry = current
@@ -200,12 +233,12 @@ pub(crate) fn targets_declaration(
 
     if !closing_leading.is_empty() {
         sort_comments(input, &mut closing_leading);
-        let gap_start = target_entries
+        let gap_start = list_entries
             .last()
             .map(|entry| tokens[entry.token_index].span.end)
             .unwrap_or(tokens[opening_brace].span.end);
         body.push(Doc::HardLine);
-        let preserve_blank_line = !target_entries.is_empty()
+        let preserve_blank_line = !list_entries.is_empty()
             && has_blank_line(
                 input,
                 gap_start,
@@ -224,7 +257,7 @@ pub(crate) fn targets_declaration(
             Doc::indent(Doc::concat(body)),
             if empty_inline_comment {
                 Doc::HardLine
-            } else if target_entries.last().is_some_and(|entry| {
+            } else if list_entries.last().is_some_and(|entry| {
                 entry.trailing.last().is_some_and(|comment| {
                     input.comment_kind(comment) == PackageTriviaKind::BlockComment
                         && !normalized_comment_text(input, comment).contains('\n')
@@ -242,7 +275,7 @@ pub(crate) fn targets_declaration(
     Ok(Doc::concat(prefix))
 }
 
-struct TargetEntry<'a> {
+struct ListEntry<'a> {
     token_index: usize,
     leading: Vec<&'a AttachedComment>,
     trailing: Vec<&'a AttachedComment>,
@@ -439,18 +472,29 @@ mod tests {
     use crate::package_surface::{PackageBraceOwner, PackageSyntaxIndex};
     use crate::{GroupId, print, print_with_forced_groups};
 
-    use super::{PackageDocumentError, targets_declaration};
+    use super::{PackageDocumentError, capability_declaration, targets_declaration};
 
     fn render(source: &[u8], force_break: bool) -> String {
+        render_owner(source, PackageBraceOwner::Targets, force_break)
+    }
+
+    fn render_owner(source: &[u8], owner: PackageBraceOwner, force_break: bool) -> String {
         let input = PackageInput::new(source);
         assert!(input.refusals().is_empty(), "{:?}", input.refusals());
-        let index = PackageSyntaxIndex::new(&input).expect("valid target declaration structure");
+        let index = PackageSyntaxIndex::new(&input).expect("valid package declaration structure");
         let list = index
             .brace_lists()
             .iter()
-            .find(|list| list.owner == PackageBraceOwner::Targets)
-            .expect("targets list");
-        let doc = targets_declaration(&input, &index, list).expect("targets document");
+            .find(|list| list.owner == owner)
+            .expect("expected brace list");
+        let doc = match owner {
+            PackageBraceOwner::Targets => targets_declaration(&input, &index, list),
+            PackageBraceOwner::Allow | PackageBraceOwner::Deny => {
+                capability_declaration(&input, &index, list)
+            }
+            _ => panic!("unsupported simple-list owner in test helper"),
+        }
+        .expect("package list document");
         if force_break {
             print_with_forced_groups(&doc, &[GroupId(list.open_token)]).expect("print document")
         } else {
@@ -466,6 +510,74 @@ mod tests {
                 false
             ),
             "targets { wasm32-core, wasm32-wasi }\n"
+        );
+    }
+
+    #[test]
+    fn formats_allow_and_deny_capability_paths_in_flat_lists() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nallow{alloc,wasi:http/outgoing-handler,alloc}\n",
+                PackageBraceOwner::Allow,
+                false
+            ),
+            "allow { alloc, wasi:http/outgoing-handler, alloc }\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\ndeny { wasi:filesystem }\n",
+                PackageBraceOwner::Deny,
+                false
+            ),
+            "deny { wasi:filesystem }\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nallow { unknown_capability }\n",
+                PackageBraceOwner::Allow,
+                false
+            ),
+            "allow { unknown_capability }\n"
+        );
+    }
+
+    #[test]
+    fn formats_empty_capability_lists_without_inner_spaces() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nallow { }\n",
+                PackageBraceOwner::Allow,
+                false
+            ),
+            "allow {}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\ndeny {}\n",
+                PackageBraceOwner::Deny,
+                false
+            ),
+            "deny {}\n"
+        );
+    }
+
+    #[test]
+    fn breaks_capability_lists_and_rehomes_removed_comma_comments() {
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\nallow { alloc, // retain this\n wasi:http/outgoing-handler }\n",
+                PackageBraceOwner::Allow,
+                false
+            ),
+            "allow {\n    alloc // retain this\n    wasi:http/outgoing-handler\n}\n"
+        );
+        assert_eq!(
+            render_owner(
+                b"package acme:app @ 1.0.0\ndeny { wasi:filesystem, alloc }\n",
+                PackageBraceOwner::Deny,
+                true
+            ),
+            "deny {\n    wasi:filesystem\n    alloc\n}\n"
         );
     }
 
