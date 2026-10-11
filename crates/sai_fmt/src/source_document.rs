@@ -47,6 +47,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             Item::Interface(declaration) => {
                 interface_document(source, &declaration, &mut expression_group_ids)?
             }
+            Item::Type(declaration) => type_alias_document(source, &declaration)?,
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
         units.push(unit);
@@ -638,6 +639,10 @@ fn interface_document(
                 &ast::IfaceResource::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
                 expression_group_ids,
             ),
+            SyntaxKind::TYPE_DECL => type_alias_document(
+                source,
+                &ast::TypeDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+            ),
             _ => Err(SourceDocumentError::UnsupportedShape),
         },
     )?;
@@ -708,6 +713,85 @@ fn iface_resource_document(
     }
     let document = Doc::concat(document);
     let range = resource.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn type_alias_document(
+    source: &ParsedSource,
+    declaration: &ast::TypeDecl,
+) -> Result<ItemDocument, SourceDocumentError> {
+    if declaration.docs().is_some() || declaration.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let visibility_prefix = visibility_prefix(declaration.visibility())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let generic_params = declaration.generic_params();
+    let alias = declaration
+        .alias_def()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let ty = alias.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+    if declaration.struct_def().is_some()
+        || alias.refinement().is_some()
+        || direct_token_kinds(declaration.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::TYPE_KW]
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(declaration
+                .visibility()
+                .map(|visibility| visibility.syntax().text_range())
+                .into_iter()
+                .chain([name.syntax().text_range()])
+                .chain(
+                    generic_params
+                        .as_ref()
+                        .map(|params| params.syntax().text_range()),
+                )
+                .chain([alias.syntax().text_range()]))
+        || alias.syntax().children().count() != 1
+        || alias
+            .syntax()
+            .children()
+            .next()
+            .map(|child| child.text_range())
+            != Some(ty.syntax().text_range())
+        || direct_token_kinds(alias.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::EQ]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = vec![Doc::text(format!(
+        "{visibility_prefix}type {}",
+        node_text(source, name.syntax())
+    ))];
+    if let Some(generic_params) = generic_params {
+        documents.push(generic_params_document(source, &generic_params)?);
+    }
+    documents.extend([
+        Doc::text(" ="),
+        movable_right_hand_side_document(type_document(source, &ty)?, true, None),
+    ]);
+    let document = Doc::concat(documents);
+    let range = declaration.syntax().text_range();
     let multiline = crate::print(&document)
         .map_err(|_| SourceDocumentError::UnsupportedShape)?
         .trim_end_matches('\n')
@@ -2521,6 +2605,16 @@ fn right_hand_side_document_from_document_with_optional_suffix(
         return with_suffix(vec![Doc::text(" "), document]);
     }
 
+    movable_right_hand_side_document(document, allow_move, suffix)
+}
+
+fn movable_right_hand_side_document(document: Doc, allow_move: bool, suffix: Option<Doc>) -> Doc {
+    let with_suffix = |mut documents: Vec<Doc>| {
+        if let Some(suffix) = suffix.as_ref() {
+            documents.push(suffix.clone());
+        }
+        Doc::concat(documents)
+    };
     let inline = with_suffix(vec![Doc::text(" "), Doc::flat(document.clone())]);
     let mut alternatives = vec![inline];
     if allow_move {
@@ -5203,9 +5297,72 @@ mod tests {
     }
 
     #[test]
+    fn formats_top_level_and_interface_type_aliases() {
+        let input = concat!(
+            "type Scalar=U32\n",
+            "pub type Lookup<K>=Map<Str,K>\n",
+            "interface storage{type Entry=(U32,Str)\n",
+            "resource Handle\n",
+            "fn open()->Handle\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "type Scalar = U32\n",
+            "pub type Lookup<K> = Map<Str, K>\n\n",
+            "interface storage {\n",
+            "    type Entry = (U32, Str)\n",
+            "    resource Handle\n",
+            "    fn open() -> Handle\n",
+            "}\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("type aliases parse");
+        let output = format_shape(input.as_bytes()).expect("type aliases format");
+
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted aliases reparse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn moves_long_alias_right_hand_sides_and_separates_following_items() {
+        let right_hand_side = "A".repeat(96);
+        let input = format!("type T = {right_hand_side}\ntype Next=U32\n");
+        let expected = format!("type T =\n    {right_hand_side}\n\ntype Next = U32\n");
+        let parsed = parse_source(input.as_bytes()).expect("long alias parses");
+        let output = format_shape(input.as_bytes()).expect("long alias formats");
+
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted alias reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn keeps_unhandled_type_declarations_fail_closed() {
+        assert_eq!(
+            format_shape(b"type Point { x: I32 }"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"type Positive = I32 where self > 0"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"@allow(UNUSED_IMPORTS) type Scalar = U32"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"interface storage { @allow(UNUSED_IMPORTS) type Entry = Str }"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+    }
+
+    #[test]
     fn keeps_unhandled_interface_members_fail_closed() {
         assert_eq!(
-            format_shape(b"interface storage { type Entry = Str }"),
+            format_shape(b"interface storage { enum Entry {} }"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
