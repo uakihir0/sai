@@ -44,6 +44,9 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             Item::Trait(declaration) => {
                 trait_document(source, &declaration, &mut expression_group_ids)?
             }
+            Item::Interface(declaration) => {
+                interface_document(source, &declaration, &mut expression_group_ids)?
+            }
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
         units.push(unit);
@@ -141,22 +144,7 @@ fn function_document(
     if function.docs().is_some() || function.attrs().next().is_some() {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let visibility_prefix = function
-        .visibility()
-        .map(|visibility| {
-            match direct_token_kinds(visibility.syntax())
-                .into_iter()
-                .filter(|kind| *kind != SyntaxKind::NEWLINE)
-                .collect::<Vec<_>>()
-                .as_slice()
-            {
-                [SyntaxKind::PUB_KW] => Ok("pub "),
-                [SyntaxKind::EXPORT_KW] => Ok("export "),
-                _ => Err(SourceDocumentError::UnsupportedShape),
-            }
-        })
-        .transpose()?
-        .unwrap_or("");
+    let visibility_prefix = visibility_prefix(function.visibility())?;
     let is_unsafe = function.unsafe_token().is_some();
     let is_async = function.async_token().is_some();
     let mut expected_tokens = Vec::new();
@@ -285,6 +273,26 @@ fn function_document(
         end: range.end().to_usize(),
         multiline,
     })
+}
+
+fn visibility_prefix(
+    visibility: Option<ast::Visibility>,
+) -> Result<&'static str, SourceDocumentError> {
+    visibility
+        .map(|visibility| {
+            match direct_token_kinds(visibility.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [SyntaxKind::PUB_KW] => Ok("pub "),
+                [SyntaxKind::EXPORT_KW] => Ok("export "),
+                _ => Err(SourceDocumentError::UnsupportedShape),
+            }
+        })
+        .transpose()
+        .map(|prefix| prefix.unwrap_or(""))
 }
 
 fn impl_document(
@@ -477,22 +485,7 @@ fn trait_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
 
-    let visibility_prefix = declaration
-        .visibility()
-        .map(|visibility| {
-            match direct_token_kinds(visibility.syntax())
-                .into_iter()
-                .filter(|kind| *kind != SyntaxKind::NEWLINE)
-                .collect::<Vec<_>>()
-                .as_slice()
-            {
-                [SyntaxKind::PUB_KW] => Ok("pub "),
-                [SyntaxKind::EXPORT_KW] => Ok("export "),
-                _ => Err(SourceDocumentError::UnsupportedShape),
-            }
-        })
-        .transpose()?
-        .unwrap_or("");
+    let visibility_prefix = visibility_prefix(declaration.visibility())?;
     let is_unsafe = declaration.unsafe_token().is_some();
     let name = declaration
         .name()
@@ -589,6 +582,132 @@ fn trait_document(
         Doc::concat([head, Doc::text(" "), item_body])
     };
     let range = declaration.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn interface_document(
+    source: &ParsedSource,
+    declaration: &ast::InterfaceDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    if declaration.docs().is_some() || declaration.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let visibility_prefix = visibility_prefix(declaration.visibility())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let items = declaration
+        .items()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if !has_contextual_token(source, declaration.syntax(), "interface")?
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(declaration
+                .visibility()
+                .map(|visibility| visibility.syntax().text_range())
+                .into_iter()
+                .chain([name.syntax().text_range(), items.syntax().text_range()]))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let item_body = item_list_body_document(
+        source,
+        &items,
+        expression_group_ids,
+        |child, expression_group_ids| match child.kind() {
+            SyntaxKind::FN_DECL => function_document(
+                source,
+                &ast::FnDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+                expression_group_ids,
+            ),
+            SyntaxKind::IFACE_RESOURCE => iface_resource_document(
+                source,
+                &ast::IfaceResource::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+                expression_group_ids,
+            ),
+            _ => Err(SourceDocumentError::UnsupportedShape),
+        },
+    )?;
+    let document = Doc::concat([
+        Doc::text(format!(
+            "{visibility_prefix}interface {} ",
+            node_text(source, name.syntax())
+        )),
+        item_body,
+    ]);
+    let range = declaration.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn iface_resource_document(
+    source: &ParsedSource,
+    resource: &ast::IfaceResource,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    if resource.docs().is_some() || resource.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let name = resource
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let items = resource.items();
+    if !has_contextual_token(source, resource.syntax(), "resource")?
+        || resource
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(std::iter::once(name.syntax().text_range())
+                .chain(items.as_ref().map(|items| items.syntax().text_range())))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut document = vec![
+        Doc::text("resource "),
+        Doc::text(node_text(source, name.syntax())),
+    ];
+    if let Some(items) = items {
+        document.extend([
+            Doc::text(" "),
+            item_list_body_document(
+                source,
+                &items,
+                expression_group_ids,
+                |child, expression_group_ids| match child.kind() {
+                    SyntaxKind::FN_DECL => function_document(
+                        source,
+                        &ast::FnDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+                        expression_group_ids,
+                    ),
+                    _ => Err(SourceDocumentError::UnsupportedShape),
+                },
+            )?,
+        ]);
+    }
+    let document = Doc::concat(document);
+    let range = resource.syntax().text_range();
     let multiline = crate::print(&document)
         .map_err(|_| SourceDocumentError::UnsupportedShape)?
         .trim_end_matches('\n')
@@ -4250,6 +4369,24 @@ fn direct_token_kinds(node: &sai_syntax::SyntaxNode) -> Vec<SyntaxKind> {
         .collect()
 }
 
+fn has_contextual_token(
+    source: &ParsedSource,
+    node: &sai_syntax::SyntaxNode,
+    spelling: &str,
+) -> Result<bool, SourceDocumentError> {
+    let tokens = node
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() != SyntaxKind::NEWLINE => Some(token),
+            SyntaxElement::Token(_) | SyntaxElement::Node(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let [token] = tokens.as_slice() else {
+        return Ok(false);
+    };
+    Ok(token.kind() == SyntaxKind::LIDENT && token_text(source, token)? == spelling)
+}
+
 fn comma_delimited_tokens_match(
     node: &sai_syntax::SyntaxNode,
     open: SyntaxKind,
@@ -5022,6 +5159,63 @@ mod tests {
         let reparsed = parse_source(output.as_bytes()).expect("formatted trait header reparses");
         assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
         assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn formats_interfaces_resources_and_bodyless_functions() {
+        let input = concat!(
+            "pub interface storage{\n",
+            "fn open(path:Str)->Handle\n",
+            "resource Handle\n",
+            "resource Empty{}\n",
+            "resource File{fn close(self:borrow Self)}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "pub interface storage {\n",
+            "    fn open(path: Str) -> Handle\n",
+            "    resource Handle\n",
+            "    resource Empty {}\n",
+            "    resource File {\n",
+            "        fn close(self: borrow Self)\n",
+            "    }\n",
+            "}\n",
+        );
+        let parsed = parse_source(input.as_bytes()).expect("interface declarations parse");
+        let output = format_shape(input.as_bytes()).expect("interface declarations format");
+
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted interface reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        for (input, expected) in [
+            (b"interface empty {}".as_slice(), "interface empty {}\n"),
+            (
+                b"interface empty { resource Empty }",
+                "interface empty {\n    resource Empty\n}\n",
+            ),
+        ] {
+            let output = format_shape(input).expect("empty interface shape is supported");
+            assert_eq!(output, expected);
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn keeps_unhandled_interface_members_fail_closed() {
+        assert_eq!(
+            format_shape(b"interface storage { type Entry = Str }"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"@allow(UNUSED_IMPORTS) interface storage {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"interface storage { @allow(UNUSED_IMPORTS) resource Handle }"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
     }
 
     #[test]
