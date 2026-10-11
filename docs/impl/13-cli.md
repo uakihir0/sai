@@ -1305,6 +1305,8 @@ sai explain --list
 
 Prints the explanation of a diagnostic code or a lint, as defined by [11-diagnostics.md](11-diagnostics.md) §11.13. Stage 0. The command needs no package, accepts none of the options of §13.4, and reads no file. The human output is the Markdown text of 11 §11.13.2. JSON: kind `explain` (11 §11.13.2), or, with `--list`, one record of kind `explain.list` with `{"codes":[{"code":…,"class":"hard","summary":…}]}` in byte order. Exit codes: 0 if the code is registered; 1 for `UNKNOWN_DIAGNOSTIC_CODE`. `sai explain` without an argument and without `--list` is `MISSING_ARGUMENT`.
 
+**Current implementation slice.** `sai explain --list` is implemented for all 493 registered codes in human and JSON output. An unknown code reports `UNKNOWN_DIAGNOSTIC_CODE` with ranked candidates. A known code still reports `FEATURE_NOT_IMPLEMENTED` until its complete metadata and Markdown explanation record are available.
+
 ### 13.6.21 `sai lsp`
 
 ```text

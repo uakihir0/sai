@@ -538,4 +538,4 @@ Codes owned by implementation documents (`impl/`). 44 codes.
 
 ## A.6 Counts
 
-v0.1 defines 492 codes: 344 in spec, 100 in package, 4 in targets, 44 in impl. 28 of them are lints.
+v0.1 defines 493 codes: 344 in spec, 101 in package, 4 in targets, 44 in impl. 28 of them are lints.

@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::args::{ColorChoice, OutputFormat, ParsedArgs, UsageError, UsageErrorKind, parse_args};
 use crate::help::{render_command_help, render_top_level_help, render_version};
 use crate::new_package::parse_new_command;
+use sai_diagnostics::EXPLAIN_CODE_SUMMARIES;
 use sai_driver::CancellationToken;
 use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
@@ -67,6 +68,7 @@ pub fn run_with_cancellation(
     let command_name = command.name.to_string_lossy().into_owned();
     match command_name.as_str() {
         "new" => run_new(&parsed, command, cancellation, stdout, stderr),
+        "explain" => run_explain(&parsed, command, stdout, stderr),
         "help" => {
             let help = command_help(&parsed);
             write_stdout_text(stdout, &help, stderr)
@@ -108,6 +110,267 @@ pub fn run_with_cancellation(
             }
         }
     }
+}
+
+fn run_explain(
+    parsed: &ParsedArgs,
+    command: &crate::args::ParsedCommand,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let mut errors = parsed.usage_errors.clone();
+    errors.extend(validate_known_command_options(command));
+    if !errors.is_empty() {
+        return report_usage_errors(parsed, "explain", errors, stdout, stderr);
+    }
+
+    let global_indices = command
+        .global_argument_indices
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let list = command
+        .arguments
+        .iter()
+        .enumerate()
+        .any(|(index, argument)| {
+            !global_indices.contains(&index)
+                && crate::args::split_os_option(argument).is_some_and(|(name, _)| name == "--list")
+        });
+    if list {
+        return report_explain_list(parsed.globals.format, stdout, stderr);
+    }
+
+    let positionals = collect_command_positionals(command, &None);
+    let name = positionals
+        .first()
+        .map(|(argument, _)| argument.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if sai_diagnostics::Code::from_name(&name).is_none() {
+        return report_unknown_diagnostic_code(parsed, &name, stdout, stderr);
+    }
+
+    report_feature_not_implemented(
+        CliOutputOptions {
+            format: parsed.globals.format,
+            quiet: parsed.globals.quiet,
+            color: parsed.globals.color,
+            max_errors: parsed.globals.max_errors,
+        },
+        "explain",
+        0,
+        "sai explain",
+        stdout,
+        stderr,
+    )
+}
+
+fn report_explain_list(
+    format: OutputFormat,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    match format {
+        OutputFormat::Human => {
+            let mut output = String::new();
+            for entry in EXPLAIN_CODE_SUMMARIES {
+                use std::fmt::Write as _;
+                writeln!(
+                    output,
+                    "{} {} {}",
+                    entry.code.as_str(),
+                    entry.class.as_str(),
+                    entry.summary
+                )
+                .expect("writing to a String cannot fail");
+            }
+            write_stdout_text(stdout, &output, stderr)
+        }
+        OutputFormat::Json => {
+            if let Err(error) = write_json_explain_list(stdout) {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn write_json_explain_list(writer: &mut impl Write) -> io::Result<()> {
+    write_json_success_header(writer, "explain")?;
+    writer.write_all(b"{\"type\":\"result\",\"kind\":\"explain.list\",\"data\":{\"codes\":[")?;
+    for (index, entry) in EXPLAIN_CODE_SUMMARIES.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        write!(
+            writer,
+            "{{\"code\":\"{}\",\"class\":\"{}\",\"summary\":\"{}\"}}",
+            entry.code.as_str(),
+            entry.class.as_str(),
+            escape_json(entry.summary)
+        )?;
+    }
+    writeln!(writer, "]}}}}")?;
+    writeln!(
+        writer,
+        "{{\"type\":\"summary\",\"errors\":0,\"warnings\":0,\"infos\":0,\"shown_errors\":0,\"suppressed\":{{\"cascade\":0,\"duplicate\":0,\"dependency\":0}},\"exit_code\":0}}"
+    )
+}
+
+fn report_unknown_diagnostic_code(
+    parsed: &ParsedArgs,
+    name: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let candidates = diagnostic_code_candidates(name);
+    let safe_name = diagnostic_display_name(name);
+    let diagnostic = CliDiagnostic {
+        code: "UNKNOWN_DIAGNOSTIC_CODE",
+        message: format!("unknown diagnostic code `{safe_name}`"),
+        argument_index: None,
+        argument: String::new(),
+        help: candidates
+            .first()
+            .map(|candidate| format!("did you mean `{candidate}`?")),
+        data: Some(format!(
+            "{{\"name\":\"{}\",\"candidates\":[{}]}}",
+            escape_json(name),
+            candidates
+                .iter()
+                .map(|candidate| format!("\"{candidate}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+    };
+
+    match parsed.globals.format {
+        OutputFormat::Human => {
+            if let Err(error) = write_human_diagnostics(
+                stderr,
+                "explain",
+                std::slice::from_ref(&diagnostic),
+                !parsed.globals.quiet,
+                color_enabled(parsed.globals.color, io::stderr().is_terminal()),
+                1,
+                parsed.globals.max_errors,
+            ) {
+                report_stderr_failure(error)
+            } else {
+                1
+            }
+        }
+        OutputFormat::Json => {
+            if let Err(error) = write_json_diagnostics(stdout, "explain", &[diagnostic], 1, 1) {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                1
+            }
+        }
+    }
+}
+
+fn diagnostic_display_name(name: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut display = String::new();
+    let mut truncated = false;
+    for character in name.chars() {
+        let value = if character.is_control() {
+            format!("\\u{{{:X}}}", character as u32)
+        } else {
+            character.to_string()
+        };
+        if display.chars().count() + value.chars().count() > MAX_CHARS {
+            truncated = true;
+            break;
+        }
+        display.push_str(&value);
+    }
+    if truncated {
+        while display.chars().count() >= MAX_CHARS {
+            display.pop();
+        }
+        display.push('…');
+    }
+    display
+}
+
+fn diagnostic_code_candidates(name: &str) -> Vec<&'static str> {
+    let input = name.chars().collect::<Vec<_>>();
+    let maximum_code_length = EXPLAIN_CODE_SUMMARIES
+        .iter()
+        .map(|entry| entry.code.as_str().chars().count())
+        .max()
+        .unwrap_or_default();
+    if input.len() > 2 && input.len() > maximum_code_length.saturating_mul(3) / 2 {
+        return Vec::new();
+    }
+
+    let maximum_distance = (input.len() / 3).max(1);
+    let mut candidates = Vec::new();
+    for entry in EXPLAIN_CODE_SUMMARIES {
+        let candidate = entry.code.as_str();
+        let candidate_characters = candidate.chars().collect::<Vec<_>>();
+        if input.len().abs_diff(candidate_characters.len()) > maximum_distance {
+            continue;
+        }
+        let distance = damerau_levenshtein(&input, &candidate_characters);
+        if distance <= maximum_distance {
+            candidates.push((distance, entry.declaration_order, candidate));
+        }
+    }
+    candidates.sort_by_key(|(distance, declaration_order, _)| (*distance, *declaration_order));
+    candidates
+        .into_iter()
+        .take(10)
+        .map(|(_, _, candidate)| candidate)
+        .collect()
+}
+
+fn damerau_levenshtein(left: &[char], right: &[char]) -> usize {
+    let max_distance = left.len().saturating_add(right.len());
+    let mut distances = vec![vec![0; right.len() + 2]; left.len() + 2];
+    distances[0][0] = max_distance;
+    for row in 0..=left.len() {
+        distances[row + 1][0] = max_distance;
+        distances[row + 1][1] = row;
+    }
+    for column in 0..=right.len() {
+        distances[0][column + 1] = max_distance;
+        distances[1][column + 1] = column;
+    }
+
+    let mut last_row = std::collections::BTreeMap::new();
+    for (left_index, left_character) in left.iter().enumerate() {
+        let mut last_matching_column = 0;
+        for (right_index, right_character) in right.iter().enumerate() {
+            let row = left_index + 1;
+            let column = right_index + 1;
+            let prior_row = last_row.get(right_character).copied().unwrap_or(0);
+            let prior_column = last_matching_column;
+            let substitution_cost = usize::from(left_character != right_character);
+            if substitution_cost == 0 {
+                last_matching_column = column;
+            }
+            distances[row + 1][column + 1] = [
+                distances[row][column] + substitution_cost,
+                distances[row + 1][column] + 1,
+                distances[row][column + 1] + 1,
+                distances[prior_row][prior_column]
+                    + (row - prior_row - 1)
+                    + 1
+                    + (column - prior_column - 1),
+            ]
+            .into_iter()
+            .min()
+            .expect("at least one edit distance");
+        }
+        last_row.insert(*left_character, left_index + 1);
+    }
+    distances[left.len() + 1][right.len() + 1]
 }
 
 fn run_new(
@@ -1031,7 +1294,6 @@ fn unimplemented_command(command: &crate::args::ParsedCommand) -> Option<(u8, St
             Some((stage, format!("sai inspect {subcommand}")))
         }
         "graph" | "diff" | "edit" => Some((6, "semantic-protocol".to_owned())),
-        "explain" => Some((0, "sai explain".to_owned())),
         "lsp" => Some((0, "sai lsp".to_owned())),
         _ => None,
     }
@@ -1655,7 +1917,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{human_file_path, relative_path, run, run_new_with_creator, run_with_cancellation};
+    use super::{
+        EXPLAIN_CODE_SUMMARIES, human_file_path, relative_path, run, run_new_with_creator,
+        run_with_cancellation,
+    };
     use sai_driver::CancellationToken;
 
     struct BrokenPipeWriter;
@@ -1992,6 +2257,156 @@ mod tests {
             );
             assert!(!stdout.contains("FEATURE_NOT_IMPLEMENTED"), "{arguments:?}");
         }
+    }
+
+    #[test]
+    fn explain_list_writes_the_complete_sorted_json_registry() {
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "explain", "--list"]);
+        let records = stdout.lines().collect::<Vec<_>>();
+
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(records.len(), 3);
+        assert!(records[0].contains("\"command\":\"explain\""));
+        assert!(records[1].contains("\"kind\":\"explain.list\""));
+        assert_eq!(
+            records[1].matches("\"code\":").count(),
+            EXPLAIN_CODE_SUMMARIES.len()
+        );
+        assert!(records[1].contains("\"code\":\"UNKNOWN_FIELD\",\"class\":\"hard\""));
+        assert!(
+            records[1].find("\"code\":\"ALIAS_CASE_MISMATCH\"")
+                < records[1].find("\"code\":\"WORLD_IMPORT_UNDECLARED\"")
+        );
+        assert!(records[2].contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn explain_list_writes_one_plain_summary_per_code() {
+        let (exit_code, stdout, stderr) = invoke(&["explain", "--list"]);
+
+        assert_eq!(exit_code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout.lines().count(), EXPLAIN_CODE_SUMMARIES.len());
+        assert!(stdout.starts_with("ALIAS_CASE_MISMATCH hard "));
+        assert!(stdout.contains("\nUNKNOWN_FIELD hard "));
+        assert!(stdout.chars().all(|character| character != '\r'));
+    }
+
+    #[test]
+    fn explain_reports_unknown_codes_with_ranked_candidates() {
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "explain", "UNKNOWN_DIAGNOSTIC_CDOE"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"UNKNOWN_DIAGNOSTIC_CODE\""));
+        assert!(stdout.contains("\"name\":\"UNKNOWN_DIAGNOSTIC_CDOE\""));
+        assert!(stdout.contains("\"candidates\":[\"UNKNOWN_DIAGNOSTIC_CODE\""));
+        assert!(stdout.contains("\"exit_code\":1"));
+        assert!(!stdout.contains("FEATURE_NOT_IMPLEMENTED"));
+    }
+
+    #[test]
+    fn explain_keeps_unknown_code_diagnostics_single_line_and_json_safe() {
+        let arguments = [
+            "--format=json".into(),
+            "explain".into(),
+            "UNKNOWN\nFIELD\"".into(),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run(&arguments, &mut stdout, &mut stderr);
+        let stdout = String::from_utf8(stdout).expect("JSON output is UTF-8");
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout.lines().count(), 3);
+        assert!(stdout.contains(r#""name":"UNKNOWN\nFIELD\"""#));
+        assert!(stdout.contains(r#"unknown diagnostic code `UNKNOWN\\u{A}FIELD\"`"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_handles_non_unicode_code_arguments() {
+        let arguments = vec![
+            "--format=json".into(),
+            "explain".into(),
+            std::ffi::OsString::from_vec(vec![b'X', 0xff]),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit_code = run(&arguments, &mut stdout, &mut stderr);
+        let stdout = String::from_utf8(stdout).expect("JSON output is UTF-8");
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"name\":\"X�\""));
+        assert!(stdout.contains("\"code\":\"UNKNOWN_DIAGNOSTIC_CODE\""));
+    }
+
+    #[test]
+    fn explain_list_reports_standard_output_failures() {
+        let arguments = ["explain", "--list"].map(std::ffi::OsString::from);
+        let mut stderr = Vec::new();
+
+        let exit_code = run(&arguments, &mut BrokenPipeWriter, &mut stderr);
+
+        assert_eq!(exit_code, 4);
+        assert!(
+            String::from_utf8(stderr)
+                .expect("stderr is UTF-8")
+                .contains("cannot write to standard output")
+        );
+    }
+
+    #[test]
+    fn explain_rejects_invalid_list_shapes_before_running() {
+        for arguments in [
+            vec!["--format=json", "explain", "--list=invalid"],
+            vec!["--format=json", "explain", "--list", "UNKNOWN_FIELD"],
+            vec![
+                "--format=json",
+                "explain",
+                "UNKNOWN_FIELD",
+                "--target",
+                "wasm32-core",
+            ],
+        ] {
+            let (exit_code, stdout, stderr) = invoke(&arguments);
+
+            assert_eq!(exit_code, 2, "{arguments:?}");
+            assert!(stderr.is_empty(), "{arguments:?}");
+            assert!(!stdout.contains("FEATURE_NOT_IMPLEMENTED"), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn explain_does_not_treat_a_global_option_value_as_list_flag() {
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "explain",
+            "--directory",
+            "--list",
+            "UNKNOWN_FIELD",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(!stdout.contains("\"kind\":\"explain.list\""));
+    }
+
+    #[test]
+    fn explain_defers_single_code_markdown_until_full_records_exist() {
+        let (exit_code, stdout, stderr) = invoke(&["--format=json", "explain", "UNKNOWN_FIELD"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(stdout.contains("\"feature\":\"sai explain\""));
     }
 
     #[test]

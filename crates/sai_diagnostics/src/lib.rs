@@ -15,6 +15,29 @@ pub use sai_vfs::{FileId, Span, TextRange, TextSize, WorkspaceSnapshot, Workspac
 
 include!(concat!(env!("OUT_DIR"), "/diagnostic_codes.rs"));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticCodeClass {
+    Hard,
+    Lint,
+}
+
+impl DiagnosticCodeClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Lint => "lint",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExplainCodeSummary {
+    pub code: Code,
+    pub class: DiagnosticCodeClass,
+    pub declaration_order: usize,
+    pub summary: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Severity {
     Error,
@@ -2487,6 +2510,54 @@ mod tests {
     }
 
     #[test]
+    fn explain_code_summaries_cover_the_registry_in_byte_order() {
+        let names = DIAGNOSTIC_CODE_NAMES
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(EXPLAIN_CODE_SUMMARIES.len(), names.len());
+        assert_eq!(
+            EXPLAIN_CODE_SUMMARIES
+                .iter()
+                .map(|entry| entry.code.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+        let mut declaration_orders = EXPLAIN_CODE_SUMMARIES
+            .iter()
+            .map(|entry| entry.declaration_order)
+            .collect::<Vec<_>>();
+        declaration_orders.sort_unstable();
+        assert_eq!(
+            declaration_orders,
+            (0..EXPLAIN_CODE_SUMMARIES.len()).collect::<Vec<_>>()
+        );
+
+        for entry in EXPLAIN_CODE_SUMMARIES {
+            assert!(!entry.summary.is_empty(), "{}", entry.code.as_str());
+            assert!(
+                entry.summary.chars().count() <= 80,
+                "{}: {}",
+                entry.code.as_str(),
+                entry.summary
+            );
+            assert!(
+                !entry.summary.ends_with('.'),
+                "{}: {}",
+                entry.code.as_str(),
+                entry.summary
+            );
+            match (entry.class, lookup_lint_name(entry.code.as_str())) {
+                (DiagnosticCodeClass::Lint, LintNameLookup::Lint(_))
+                | (DiagnosticCodeClass::Hard, LintNameLookup::HardDiagnostic(_)) => {}
+                (class, lookup) => panic!(
+                    "explain class {class:?} disagrees with registry lookup {lookup:?} for {}",
+                    entry.code.as_str()
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn lint_name_lookup_uses_the_complete_v01_registry() {
         let registered = DIAGNOSTIC_CODE_NAMES
             .split_ascii_whitespace()
@@ -2574,6 +2645,45 @@ mod tests {
             // Packaged crates do not contain the workspace's specification sources.
             return;
         };
+
+        let mut declaration_order = 0;
+        let mut documented_summaries = appendix
+            .lines()
+            .filter_map(|line| {
+                let row = line.strip_prefix("| `")?;
+                let (code, row) = row.split_once("` | ")?;
+                let mut columns = row.splitn(3, " | ");
+                let severity = columns.next()?;
+                let _owner = columns.next()?;
+                let summary = columns.next()?.strip_suffix(" |")?;
+                let class = match severity {
+                    "warning (lint)" | "info (lint)" => "lint",
+                    "error" | "warning" | "info" => "hard",
+                    _ => return None,
+                };
+                let order = declaration_order;
+                declaration_order += 1;
+                Some((code.to_owned(), class, order, summary.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        documented_summaries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        let snapshot_summaries = include_str!("diagnostic_code_summaries.txt")
+            .lines()
+            .map(|line| {
+                let mut columns = line.splitn(4, '|');
+                (
+                    columns.next().expect("snapshot code").to_owned(),
+                    columns.next().expect("snapshot class"),
+                    columns
+                        .next()
+                        .expect("snapshot declaration order")
+                        .parse::<usize>()
+                        .expect("numeric snapshot declaration order"),
+                    columns.next().expect("snapshot summary").to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot_summaries, documented_summaries);
 
         let mut documented_codes = appendix
             .lines()

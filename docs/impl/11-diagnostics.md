@@ -93,7 +93,7 @@ The diagnostic registry is the list of all codes. It is published as [appendix-a
 | `data_schema` | the JSON Schema of the code's `data` object (§11.4.5), or `null` |
 | `explanation` | the text of `sai explain` (§11.13) |
 
-**Current implementation slice.** `sai_diagnostics` compiles a sorted snapshot of all 492 v0.1 code names from Appendix A into the non-exhaustive `Code` enum and exposes `Code::ALL`, `Code::from_name`, and `Code::as_str` for the complete registry. The enum preserves the pre-existing variant order first, keeping derived `Ord` results stable; newly added codes follow the snapshot's name order. It also exposes `lookup_lint_name`, which returns a lint entry with its default level and stage, a hard diagnostic with its fixed severity, or unknown. The 28-entry `LINT_REGISTRY` follows spec/15 §15.17.2; tests compare the checked-in code-name snapshot, hard warning/info classifications, and lint metadata against the workspace specifications. The enum is generated from the checked-in name snapshot, and the build rejects malformed, unsorted, duplicate, or colliding names and Rust variants. The full `sai explain` metadata record, registry lifecycle, and callers for package `lints { }` and CLI flags remain unimplemented.
+**Current implementation slice.** `sai_diagnostics` compiles a sorted snapshot of all 493 v0.1 code names from Appendix A into the non-exhaustive `Code` enum and exposes `Code::ALL`, `Code::from_name`, and `Code::as_str` for the complete registry. The enum preserves the pre-existing variant order first, keeping derived `Ord` results stable; newly added codes follow the snapshot's name order. It also exposes `lookup_lint_name`, which returns a lint entry with its default level and stage, a hard diagnostic with its fixed severity, or unknown. The 28-entry `LINT_REGISTRY` follows spec/15 §15.17.2; tests compare the checked-in code-name and summary snapshots, hard warning/info classifications, and lint metadata against the workspace specifications. The enum and `EXPLAIN_CODE_SUMMARIES` table are generated at build time from checked-in snapshots; the build rejects malformed, unsorted, duplicate, or colliding names and Rust variants and does not require the workspace documentation to be present. `tools/update_summary_snapshot.py` regenerates the summaries snapshot from Appendix A, and a workspace test checks that the checked-in rows match the specification, including their declaration ordinals. `sai explain --list` prints every code in byte order with its hard/lint class and a plain-text summary of at most 80 Unicode scalar values. Candidate ties use Appendix A declaration order. For this list view, inline-code delimiters are removed, Markdown links become their labels, surrounding whitespace and one final period are removed, and an overlong summary is shortened at the last whitespace before character 80 (or at character 79 if there is none) followed by an ellipsis. Tests check complete coverage, byte order, classes, and snapshot agreement. Individual `sai explain <CODE>` records, the registry lifecycle, and callers for package `lints { }` and CLI flags remain unimplemented.
 
 ---
 
@@ -1084,6 +1084,8 @@ Whether these are reported for attributes is owned by [15-attributes-and-lints.m
 - Deprecated and removed codes are explained normally, and a notice line follows the metadata table.
 - `sai explain --list` prints every registered code, one per line, in byte order, followed by a space, the class (`hard` or `lint`), a space, and the summary.
 
+The list summary is derived from the Appendix A summary column. Remove inline-code delimiter runs (one or two backticks), replace each Markdown link of the form `[label](destination)` with `label`, then trim surrounding whitespace and one trailing period. If the resulting text exceeds 80 Unicode scalar values, take the first 79 values and shorten at the last whitespace within them; if there is no such whitespace, keep all 79. Trim whitespace at the cut and append `…`, so the result is at most 80 values. This transform is specific to the compact list view; the full explanation record keeps the Appendix summary unchanged.
+
 ### 11.13.2 Explanation record
 
 The explanation is CommonMark. Its structure is normative for all conforming tools, so that editors and documentation generators can process it:
@@ -1134,6 +1136,8 @@ The human output is this Markdown text. A terminal renderer MAY add styling, but
 ```json
 {"type":"result","kind":"explain","data":{"code":"UNKNOWN_FIELD","class":"hard","severity":"error","default_level":null,"stage":1,"owner":"spec/06-expressions-and-statements.md","since":"0.1.0","status":"active","superseded_by":null,"summary":"A field access names a field that the record type does not have.","markdown":"# UNKNOWN_FIELD\n..."}}
 ```
+
+With `--list`, the JSON stream uses the same standard header and summary records, and contains exactly one result record of kind `explain.list`; that result's `data.codes` array follows the byte order above.
 
 ---
 

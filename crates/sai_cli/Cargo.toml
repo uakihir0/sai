@@ -9,4 +9,5 @@ name = "sai"
 path = "src/main.rs"
 
 [dependencies]
+sai_diagnostics = { path = "../sai_diagnostics" }
 sai_driver = { path = "../sai_driver" }
