@@ -83,6 +83,7 @@ pub struct WorkspaceLockGuard {
     file: File,
     _package_directory: Option<File>,
     _state_directory: File,
+    package_directory_path: PathBuf,
     path: PathBuf,
     mode: WorkspaceLockMode,
 }
@@ -91,6 +92,7 @@ impl fmt::Debug for WorkspaceLockGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WorkspaceLockGuard")
+            .field("package_directory", &self.package_directory_path)
             .field("path", &self.path)
             .field("mode", &self.mode)
             .finish_non_exhaustive()
@@ -127,6 +129,7 @@ impl WorkspaceLockGuard {
             file,
             _package_directory: package_directory,
             _state_directory: state_directory,
+            package_directory_path,
             path,
             mode,
         };
@@ -186,6 +189,7 @@ impl WorkspaceLockGuard {
             file,
             _package_directory: package_directory,
             _state_directory: state_directory,
+            package_directory_path,
             path,
             mode,
         };
@@ -201,6 +205,11 @@ impl WorkspaceLockGuard {
     /// The persistent `.sai/lock` path held by this guard.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The canonical package directory whose `.sai/lock` is held.
+    pub fn package_directory(&self) -> &Path {
+        &self.package_directory_path
     }
 
     fn validate_empty(&self) -> Result<(), WorkspaceLockError> {

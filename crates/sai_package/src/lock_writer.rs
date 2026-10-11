@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::lock::LockParseOutput;
 use crate::lock_serialization::{LockSerializationError, serialize_canonical};
+use crate::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 
 const LOCK_FILE_NAME: &str = "sai.lock";
 const TEMPORARY_PREFIX: &str = ".sai.lock.";
@@ -40,6 +41,33 @@ pub enum LockWriteError {
     },
     /// The new lock is installed, but syncing its parent directory failed.
     InstalledButDirectorySyncFailed { path: PathBuf, source: io::Error },
+}
+
+/// Failure while writing a canonical lock under a workspace guard.
+#[derive(Debug)]
+pub enum WorkspaceLockWriteError {
+    WorkspaceLockNotExclusive(WorkspaceLockMode),
+    LockWrite(LockWriteError),
+}
+
+impl fmt::Display for WorkspaceLockWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkspaceLockNotExclusive(_) => {
+                formatter.write_str("an exclusive workspace lock is required to write sai.lock")
+            }
+            Self::LockWrite(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for WorkspaceLockWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::WorkspaceLockNotExclusive(_) => None,
+            Self::LockWrite(error) => Some(error),
+        }
+    }
 }
 
 impl fmt::Display for LockWriteError {
@@ -101,7 +129,7 @@ impl Error for LockWriteError {
 /// original parsed lock before calling this function. Canonical serialization
 /// can remove covered capabilities, including unknown names, so this writer
 /// can only perform lock-local validation.
-pub fn write_canonical_lock_atomically(
+pub(crate) fn write_canonical_lock_atomically(
     path: &Path,
     parsed: &LockParseOutput,
 ) -> Result<LockWriteOutcome, LockWriteError> {
@@ -146,6 +174,26 @@ pub fn write_canonical_lock_atomically(
     Ok(LockWriteOutcome::Written {
         bytes: serialized.len(),
     })
+}
+
+/// Atomically write `sai.lock` while the caller holds the package's exclusive
+/// workspace lock.
+///
+/// The guard captures the canonical package directory, so the lock and target
+/// resolve to the same workspace. Commands should acquire the guard before
+/// reading workspace files and retain it for their whole duration.
+/// Graph-dependent capability validation must be complete before this call.
+pub fn write_workspace_lock_atomically(
+    guard: &WorkspaceLockGuard,
+    parsed: &LockParseOutput,
+) -> Result<LockWriteOutcome, WorkspaceLockWriteError> {
+    if guard.mode() != WorkspaceLockMode::Exclusive {
+        return Err(WorkspaceLockWriteError::WorkspaceLockNotExclusive(
+            guard.mode(),
+        ));
+    }
+    let path = guard.package_directory().join(LOCK_FILE_NAME);
+    write_canonical_lock_atomically(&path, parsed).map_err(WorkspaceLockWriteError::LockWrite)
 }
 
 fn existing_regular_file_matches(path: &Path, expected: &[u8]) -> Result<bool, LockWriteError> {
@@ -381,8 +429,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{LockWriteError, LockWriteOutcome, write_canonical_lock_atomically};
+    use super::{
+        LockWriteError, LockWriteOutcome, WorkspaceLockWriteError, write_canonical_lock_atomically,
+        write_workspace_lock_atomically,
+    };
     use crate::lock::parse;
+    use crate::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -467,6 +519,91 @@ mod tests {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn workspace_writer_uses_the_held_exclusive_lock() {
+        let directory = TestDirectory::new();
+        let parsed = parse(CANONICAL);
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert_eq!(
+            write_workspace_lock_atomically(&guard, &parsed).unwrap(),
+            LockWriteOutcome::Written {
+                bytes: CANONICAL.len()
+            }
+        );
+        assert_eq!(fs::read(directory.lock_path()).unwrap(), CANONICAL);
+        assert_eq!(
+            fs::metadata(directory.0.join(".sai/lock")).unwrap().len(),
+            0
+        );
+        assert!(
+            WorkspaceLockGuard::try_acquire(&directory.0, WorkspaceLockMode::Exclusive)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_writer_uses_the_guarded_canonical_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let package = directory.0.join("package");
+        fs::create_dir(&package).unwrap();
+        let alias = directory.0.join("package-alias");
+        symlink(&package, &alias).unwrap();
+        let guard = WorkspaceLockGuard::acquire(&alias, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert_eq!(
+            guard.package_directory(),
+            fs::canonicalize(&package).unwrap()
+        );
+        write_workspace_lock_atomically(&guard, &parse(CANONICAL)).unwrap();
+        assert_eq!(fs::read(package.join("sai.lock")).unwrap(), CANONICAL);
+    }
+
+    #[test]
+    fn workspace_writer_requires_an_exclusive_lock() {
+        let directory = TestDirectory::new();
+        let guard = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Shared).unwrap();
+        let parsed = parse(b"not a lock");
+
+        assert!(matches!(
+            write_workspace_lock_atomically(&guard, &parsed),
+            Err(WorkspaceLockWriteError::WorkspaceLockNotExclusive(
+                WorkspaceLockMode::Shared
+            ))
+        ));
+    }
+
+    #[test]
+    fn workspace_writer_keeps_the_callers_lock_after_serialization_failure() {
+        let directory = TestDirectory::new();
+        let guard =
+            WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let parsed = parse(b"not a lock");
+
+        assert!(matches!(
+            write_workspace_lock_atomically(&guard, &parsed),
+            Err(WorkspaceLockWriteError::LockWrite(
+                LockWriteError::Serialization(_)
+            ))
+        ));
+        assert!(
+            WorkspaceLockGuard::try_acquire(&directory.0, WorkspaceLockMode::Exclusive)
+                .unwrap()
+                .is_none()
+        );
+        drop(guard);
+        assert!(
+            WorkspaceLockGuard::try_acquire(&directory.0, WorkspaceLockMode::Exclusive)
+                .unwrap()
+                .is_some()
         );
     }
 
