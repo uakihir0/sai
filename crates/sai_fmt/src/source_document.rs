@@ -1,5 +1,5 @@
 use sai_syntax::{
-    GreenElement, GreenNode, GreenTrivia, TriviaKind,
+    GreenElement, GreenNode, GreenTrivia, SyntaxElement, SyntaxKind, TriviaKind,
     ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Pattern, Stmt},
 };
 
@@ -127,10 +127,10 @@ fn function_document(
             let ty = return_type
                 .ty()
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
-            simple_path_type_text(source, &ty)
+            type_document(source, &ty)
         })
         .transpose()?
-        .map(|type_name| Doc::text(format!(" -> {type_name}")))
+        .map(|type_doc| Doc::concat([Doc::text(" -> "), type_doc]))
         .unwrap_or_else(|| Doc::text(""));
     let block = function
         .body()
@@ -261,26 +261,7 @@ fn parameter_list_document(
     }
 
     let group = GroupId(params.syntax().text_range().start().raw());
-    let mut contents = Vec::with_capacity(parameters.len() * 2 + 2);
-    contents.push(Doc::SoftLine);
-    for (index, parameter) in parameters.into_iter().enumerate() {
-        if index > 0 {
-            contents.push(Doc::text(","));
-            contents.push(Doc::Line);
-        }
-        contents.push(parameter);
-    }
-    contents.push(Doc::if_broken(group, Doc::text(","), Doc::text("")));
-
-    Ok(Doc::group(
-        group,
-        Doc::concat([
-            Doc::text("("),
-            Doc::indent(Doc::concat(contents)),
-            Doc::SoftLine,
-            Doc::text(")"),
-        ]),
-    ))
+    Ok(delimited_list_document(group, "(", ")", parameters, false))
 }
 
 fn parameter_document(
@@ -292,12 +273,12 @@ fn parameter_document(
     }
     let name = param.name().ok_or(SourceDocumentError::UnsupportedShape)?;
     let ty = param.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
-    let type_name = simple_path_type_text(source, &ty)?;
+    let type_doc = type_document(source, &ty)?;
     let mutable = if param.is_mutable() { "var " } else { "" };
-    Ok(Doc::text(format!(
-        "{mutable}{}: {type_name}",
-        node_text(source, name.syntax())
-    )))
+    Ok(Doc::concat([
+        Doc::text(format!("{mutable}{}: ", node_text(source, name.syntax()))),
+        type_doc,
+    ]))
 }
 
 fn self_parameter_document(param: ast::SelfParam) -> Result<Doc, SourceDocumentError> {
@@ -328,24 +309,259 @@ fn self_parameter_document(param: ast::SelfParam) -> Result<Doc, SourceDocumentE
     Ok(Doc::text(format!("{mutable}self: {type_name}")))
 }
 
-fn simple_path_type_text<'a>(
-    source: &'a ParsedSource,
-    ty: &ast::Type,
-) -> Result<&'a str, SourceDocumentError> {
-    let ast::Type::PathType(path) = ty else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
+fn type_document(source: &ParsedSource, ty: &ast::Type) -> Result<Doc, SourceDocumentError> {
+    match ty {
+        ast::Type::PathType(path) => path_type_document(source, path),
+        ast::Type::SelfType(self_type) => self_type_document(source, self_type),
+        ast::Type::BorrowType(borrow_type) => {
+            if borrow_type.syntax().children().count() != 1 {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let prefix = match direct_token_kinds(borrow_type.syntax()).as_slice() {
+                [SyntaxKind::BORROW_KW] => "borrow",
+                [SyntaxKind::BORROW_KW, SyntaxKind::MUT_KW] => "borrow mut",
+                _ => return Err(SourceDocumentError::UnsupportedShape),
+            };
+            let inner = borrow_type
+                .ty()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let range = borrow_type.syntax().text_range();
+            Ok(Doc::group(
+                GroupId(range.start().raw()),
+                Doc::concat([
+                    Doc::text(prefix),
+                    Doc::indent(Doc::concat([Doc::Line, type_document(source, &inner)?])),
+                ]),
+            ))
+        }
+        ast::Type::OwnedType(owned_type) => {
+            if owned_type.syntax().children().count() != 1
+                || direct_token_kinds(owned_type.syntax()) != [SyntaxKind::OWNED_KW]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let inner = owned_type
+                .ty()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let range = owned_type.syntax().text_range();
+            Ok(Doc::group(
+                GroupId(range.start().raw()),
+                Doc::concat([
+                    Doc::text("owned"),
+                    Doc::indent(Doc::concat([Doc::Line, type_document(source, &inner)?])),
+                ]),
+            ))
+        }
+        ast::Type::TupleType(tuple_type) => {
+            let elements = tuple_type.elements().collect::<Vec<_>>();
+            if tuple_type.syntax().children().count() != elements.len() {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            if elements.is_empty() {
+                return Ok(Doc::text("()"));
+            }
+            let documents = elements
+                .iter()
+                .map(|element| type_document(source, element))
+                .collect::<Result<Vec<_>, _>>()?;
+            let range = tuple_type.syntax().text_range();
+            Ok(delimited_list_document(
+                GroupId(range.start().raw()),
+                "(",
+                ")",
+                documents,
+                elements.len() == 1,
+            ))
+        }
+        ast::Type::ParenType(paren_type) => {
+            if paren_type.syntax().children().count() != 1 {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let inner = paren_type
+                .ty()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let range = paren_type.syntax().text_range();
+            Ok(Doc::group(
+                GroupId(range.start().raw()),
+                Doc::concat([
+                    Doc::text("("),
+                    Doc::indent(Doc::concat([Doc::SoftLine, type_document(source, &inner)?])),
+                    Doc::SoftLine,
+                    Doc::text(")"),
+                ]),
+            ))
+        }
+        ast::Type::InferType(infer_type) if infer_type.syntax().children().next().is_none() => {
+            Ok(Doc::text("_"))
+        }
+        ast::Type::InferType(_) | ast::Type::FnPtrType(_) => {
+            Err(SourceDocumentError::UnsupportedShape)
+        }
+    }
+}
+
+fn path_type_document(
+    source: &ParsedSource,
+    path: &ast::PathType,
+) -> Result<Doc, SourceDocumentError> {
     let segments = path.segments().collect::<Vec<_>>();
-    let [segment] = segments.as_slice() else {
-        return Err(SourceDocumentError::UnsupportedShape);
-    };
-    if segment.generic_args().is_some() {
+    if segments.is_empty() || path.syntax().children().count() != segments.len() {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let type_name = segment
-        .name()
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
-    Ok(node_text(source, type_name.syntax()))
+    let mut documents = Vec::with_capacity(segments.len() * 2);
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            documents.push(Doc::text("."));
+        }
+        let name = segment
+            .name()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        documents.push(Doc::text(node_text(source, name.syntax())));
+        if let Some(args) = segment.generic_args() {
+            documents.push(generic_args_document(source, &args)?);
+        }
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn self_type_document(
+    source: &ParsedSource,
+    self_type: &ast::SelfType,
+) -> Result<Doc, SourceDocumentError> {
+    let segments = self_type.segments().collect::<Vec<_>>();
+    if self_type.syntax().children().count() != segments.len()
+        || segments
+            .iter()
+            .any(|segment| segment.generic_args().is_some())
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text("Self")];
+    for segment in segments {
+        let name = segment
+            .name()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        documents.push(Doc::text("."));
+        documents.push(Doc::text(node_text(source, name.syntax())));
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn generic_args_document(
+    source: &ParsedSource,
+    args: &ast::GenericArgList,
+) -> Result<Doc, SourceDocumentError> {
+    let children = args.syntax().children().collect::<Vec<_>>();
+    if children.is_empty() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let documents = children
+        .into_iter()
+        .map(|child| {
+            if let Some(type_arg) = ast::TypeArg::cast(child.clone()) {
+                if type_arg.syntax().children().count() != 1 {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                let ty = type_arg.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+                type_document(source, &ty)
+            } else if let Some(const_arg) = ast::ConstArg::cast(child.clone()) {
+                const_argument_document(&const_arg)
+            } else if let Some(binding) = ast::AssocTypeBinding::cast(child) {
+                if binding.syntax().children().count() != 2 {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                let name = binding
+                    .name()
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                let ty = binding.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+                Ok(Doc::concat([
+                    Doc::text(node_text(source, name.syntax())),
+                    Doc::text(" = "),
+                    type_document(source, &ty)?,
+                ]))
+            } else {
+                Err(SourceDocumentError::UnsupportedShape)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = args.syntax().text_range();
+    Ok(delimited_list_document(
+        GroupId(range.start().raw()),
+        "<",
+        ">",
+        documents,
+        false,
+    ))
+}
+
+fn const_argument_document(arg: &ast::ConstArg) -> Result<Doc, SourceDocumentError> {
+    let tokens = arg
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) => Some(token),
+            SyntaxElement::Node(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let text = match tokens.as_slice() {
+        [integer] if integer.kind() == SyntaxKind::INT => normalize_integer_literal(integer.text()),
+        [minus, integer]
+            if minus.kind() == SyntaxKind::MINUS && integer.kind() == SyntaxKind::INT =>
+        {
+            format!("-{}", normalize_integer_literal(integer.text()))
+        }
+        [character] if character.kind() == SyntaxKind::CHAR => character.text().to_owned(),
+        [boolean] if matches!(boolean.kind(), SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW) => {
+            boolean.text().to_owned()
+        }
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    Ok(Doc::text(text))
+}
+
+fn direct_token_kinds(node: &sai_syntax::SyntaxNode) -> Vec<SyntaxKind> {
+    node.children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) => Some(token.kind()),
+            SyntaxElement::Node(_) => None,
+        })
+        .collect()
+}
+
+fn delimited_list_document(
+    group: GroupId,
+    open: &str,
+    close: &str,
+    items: Vec<Doc>,
+    keep_singleton_comma: bool,
+) -> Doc {
+    let mut contents = Vec::with_capacity(items.len() * 2 + 2);
+    contents.push(Doc::SoftLine);
+    for (index, item) in items.iter().cloned().enumerate() {
+        if index > 0 {
+            contents.push(Doc::text(","));
+            contents.push(Doc::Line);
+        }
+        contents.push(item);
+    }
+    contents.push(Doc::if_broken(
+        group,
+        Doc::text(","),
+        Doc::text(if keep_singleton_comma && items.len() == 1 {
+            ","
+        } else {
+            ""
+        }),
+    ));
+    Doc::group(
+        group,
+        Doc::concat([
+            Doc::text(open),
+            Doc::indent(Doc::concat(contents)),
+            Doc::SoftLine,
+            Doc::text(close),
+        ]),
+    )
 }
 
 fn node_text<'a>(source: &'a ParsedSource, node: &sai_syntax::SyntaxNode) -> &'a str {
@@ -393,7 +609,10 @@ fn normalize_literal(
 mod tests {
     use super::{SourceDocumentError, source_document};
     use crate::{parse_source, print};
-    use sai_syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
+    use sai_syntax::{
+        SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
+        ast::{AstNode, Type},
+    };
 
     fn format_shape(source: &[u8]) -> Result<String, SourceDocumentError> {
         let parsed = parse_source(source).expect("source parses");
@@ -468,6 +687,107 @@ mod tests {
             format_shape(b"fn f(var _:I32){}"),
             Ok("fn f(var _: I32) {}\n".to_owned())
         );
+    }
+
+    #[test]
+    fn formats_compound_parameter_and_return_types() {
+        for (input, expected) in [
+            (
+                b"fn f(value:http.client.Response<Vec<I32>>) -> Map<Str, User> {}".as_slice(),
+                "fn f(value: http.client.Response<Vec<I32>>) -> Map<Str, User> {}\n",
+            ),
+            (
+                b"fn f(value:borrow mut Map<Str,(I32,)>) -> (I32, Str) {}",
+                "fn f(value: borrow mut Map<Str, (I32,)>) -> (I32, Str) {}\n",
+            ),
+            (
+                b"fn f(value:owned Self.Item) -> owned Vec<User> {}",
+                "fn f(value: owned Self.Item) -> owned Vec<User> {}\n",
+            ),
+            (
+                b"fn f(value: (Vec<I32>)) -> () {}",
+                "fn f(value: (Vec<I32>)) -> () {}\n",
+            ),
+            (b"fn f(value: _) {}", "fn f(value: _) {}\n"),
+            (b"fn f(value: Vec<I32,>) {}", "fn f(value: Vec<I32>) {}\n"),
+            (
+                b"fn f(value:Array<I32,0xff>, other:Pair<' ',true,-0xff>) {}",
+                "fn f(value: Array<I32, 0xFF>, other: Pair<' ', true, -0xFF>) {}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("input parses");
+            let output = format_shape(input).expect("compound types are supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("output parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn breaks_long_generic_type_arguments_as_a_delimited_list() {
+        let first = "FirstType".repeat(6);
+        let second = "SecondType".repeat(6);
+        let input = format!("fn f(value:Container<{first},{second}>){{}}");
+        let parsed = parse_source(input.as_bytes()).expect("input parses");
+        let expected = format!(
+            "fn f(\n    value: Container<\n        {first},\n        {second},\n    >,\n) {{}}\n"
+        );
+        let output = format_shape(input.as_bytes()).expect("long type is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("output parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let return_input = format!("fn f(value:I32)->Container<{first},{second}>{{}}");
+        let return_output =
+            format_shape(return_input.as_bytes()).expect("compound return type is supported");
+        assert!(return_output.contains(") -> Container<\n"));
+        assert!(return_output.contains(&format!("    {first},\n")));
+        assert!(
+            return_output
+                .lines()
+                .all(|line| line.chars().count() <= 100)
+        );
+        let reparsed = parse_source(return_output.as_bytes()).expect("wrapped return type parses");
+        let parsed_return = parse_source(return_input.as_bytes()).expect("input parses");
+        assert_eq!(
+            syntax_shape(parsed_return.root()),
+            syntax_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(return_output.as_bytes()), Ok(return_output));
+    }
+
+    #[test]
+    fn breaks_long_borrow_owned_and_grouped_types_safely() {
+        let long_type = "A".repeat(86);
+        for (input, expected) in [
+            (
+                format!("fn f()->borrow {long_type}{{}}"),
+                format!("fn f() -> borrow\n    {long_type} {{}}\n"),
+            ),
+            (
+                format!("fn f()->borrow mut {long_type}{{}}"),
+                format!("fn f() -> borrow mut\n    {long_type} {{}}\n"),
+            ),
+            (
+                format!("fn f()->owned {long_type}{{}}"),
+                format!("fn f() -> owned\n    {long_type} {{}}\n"),
+            ),
+            (
+                format!("fn f()->({long_type}){{}}"),
+                format!("fn f() -> (\n    {long_type}\n) {{}}\n"),
+            ),
+        ] {
+            let parsed = parse_source(input.as_bytes()).expect("input parses");
+            let output = format_shape(input.as_bytes()).expect("wrapped type is supported");
+            assert_eq!(output, expected);
+            assert!(output.lines().all(|line| line.chars().count() <= 100));
+            let reparsed = parse_source(output.as_bytes()).expect("wrapped output parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
     }
 
     #[test]
@@ -616,15 +936,7 @@ mod tests {
     #[test]
     fn unsupported_shapes_and_comments_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f(x: Foo.Bar) {}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
-            format_shape(b"fn f(a: Vec<I32>) {}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
-            format_shape(b"fn f() -> Vec<I32> {}"),
+            format_shape(b"fn f(callback: fn(I32) -> I32) {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
@@ -695,10 +1007,20 @@ mod tests {
                     shape.push(ShapeElement::NodeStart(node.kind()));
                     pending.push(Work::NodeEnd);
                     let mut elements = node.children_with_tokens().collect::<Vec<_>>();
-                    if node.kind() == SyntaxKind::PARAM_LIST {
+                    let trailing_comma_close = match node.kind() {
+                        SyntaxKind::PARAM_LIST => Some(SyntaxKind::R_PAREN),
+                        SyntaxKind::GENERIC_ARG_LIST => Some(SyntaxKind::GT),
+                        SyntaxKind::TUPLE_TYPE
+                            if node.children().filter_map(Type::cast).count() != 1 =>
+                        {
+                            Some(SyntaxKind::R_PAREN)
+                        }
+                        _ => None,
+                    };
+                    if let Some(close) = trailing_comma_close {
                         let trailing_comma = elements.windows(2).position(|pair| {
                             matches!(&pair[0], SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA)
-                                && matches!(&pair[1], SyntaxElement::Token(token) if token.kind() == SyntaxKind::R_PAREN)
+                                && matches!(&pair[1], SyntaxElement::Token(token) if token.kind() == close)
                         });
                         if let Some(index) = trailing_comma {
                             elements.remove(index);
