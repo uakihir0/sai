@@ -41,6 +41,9 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             Item::Impl(implementation) => {
                 impl_document(source, &implementation, &mut expression_group_ids)?
             }
+            Item::Trait(declaration) => {
+                trait_document(source, &declaration, &mut expression_group_ids)?
+            }
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
         units.push(unit);
@@ -410,60 +413,23 @@ fn impl_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
 
-    let mut members =
-        Vec::with_capacity(items.functions().count() + items.assoc_type_defs().count());
-    for child in items.syntax().children() {
-        let member = match child.kind() {
+    let item_body = item_list_body_document(
+        source,
+        &items,
+        expression_group_ids,
+        |child, expression_group_ids| match child.kind() {
             SyntaxKind::FN_DECL => function_document(
                 source,
                 &ast::FnDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
                 expression_group_ids,
-            )?,
+            ),
             SyntaxKind::ASSOC_TYPE_DEF => assoc_type_def_document(
                 source,
                 &ast::AssocTypeDef::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
-            )?,
-            _ => return Err(SourceDocumentError::UnsupportedShape),
-        };
-        members.push(member);
-    }
-    let item_list_tokens = direct_token_kinds(items.syntax());
-    if items.syntax().children().count() != members.len()
-        || item_list_tokens.len() < 2
-        || item_list_tokens.first() != Some(&SyntaxKind::L_BRACE)
-        || item_list_tokens.last() != Some(&SyntaxKind::R_BRACE)
-        || item_list_tokens[1..item_list_tokens.len() - 1]
-            .iter()
-            .any(|kind| *kind != SyntaxKind::NEWLINE)
-    {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
-
-    let item_body = if members.is_empty() {
-        Doc::text("{}")
-    } else {
-        let mut body = vec![Doc::HardLine];
-        for (index, member) in members.iter().enumerate() {
-            if index > 0 {
-                let previous = &members[index - 1];
-                let gap = source
-                    .text()
-                    .get(previous.end..member.start)
-                    .ok_or(SourceDocumentError::UnsupportedShape)?;
-                body.push(Doc::HardLine);
-                if gap.matches('\n').count() > 1 {
-                    body.push(Doc::HardLine);
-                }
-            }
-            body.push(member.document.clone());
-        }
-        Doc::concat([
-            Doc::text("{"),
-            Doc::indent(Doc::concat(body)),
-            Doc::HardLine,
-            Doc::text("}"),
-        ])
-    };
+            ),
+            _ => Err(SourceDocumentError::UnsupportedShape),
+        },
+    )?;
 
     let mut head = vec![Doc::text(if is_unsafe { "unsafe impl" } else { "impl" })];
     if let Some(generic_params) = generic_params.as_ref() {
@@ -490,6 +456,242 @@ fn impl_document(
         Doc::concat([head, Doc::text(" "), item_body])
     };
     let range = implementation.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn trait_document(
+    source: &ParsedSource,
+    declaration: &ast::TraitDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    if declaration.docs().is_some() || declaration.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let visibility_prefix = declaration
+        .visibility()
+        .map(|visibility| {
+            match direct_token_kinds(visibility.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [SyntaxKind::PUB_KW] => Ok("pub "),
+                [SyntaxKind::EXPORT_KW] => Ok("export "),
+                _ => Err(SourceDocumentError::UnsupportedShape),
+            }
+        })
+        .transpose()?
+        .unwrap_or("");
+    let is_unsafe = declaration.unsafe_token().is_some();
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let generic_params = declaration.generic_params();
+    let bounds = declaration.bounds();
+    let where_clause = declaration.where_clause();
+    let items = declaration
+        .items()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+
+    let expected_direct_tokens = [
+        is_unsafe.then_some(SyntaxKind::UNSAFE_KW),
+        Some(SyntaxKind::TRAIT_KW),
+        bounds.as_ref().map(|_| SyntaxKind::COLON),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if direct_token_kinds(declaration.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>()
+        != expected_direct_tokens
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut expected_children = Vec::with_capacity(6);
+    if let Some(visibility) = declaration.visibility() {
+        expected_children.push(visibility.syntax().text_range());
+    }
+    expected_children.push(name.syntax().text_range());
+    if let Some(generic_params) = generic_params.as_ref() {
+        expected_children.push(generic_params.syntax().text_range());
+    }
+    if let Some(bounds) = bounds.as_ref() {
+        expected_children.push(bounds.syntax().text_range());
+    }
+    if let Some(where_clause) = where_clause.as_ref() {
+        expected_children.push(where_clause.syntax().text_range());
+    }
+    expected_children.push(items.syntax().text_range());
+    if declaration
+        .syntax()
+        .children()
+        .map(|child| child.text_range())
+        .ne(expected_children)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let item_body = item_list_body_document(
+        source,
+        &items,
+        expression_group_ids,
+        |child, expression_group_ids| match child.kind() {
+            SyntaxKind::FN_DECL => function_document(
+                source,
+                &ast::FnDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+                expression_group_ids,
+            ),
+            SyntaxKind::ASSOC_TYPE_DECL => assoc_type_decl_document(
+                source,
+                &ast::AssocTypeDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+            ),
+            _ => Err(SourceDocumentError::UnsupportedShape),
+        },
+    )?;
+
+    let name = node_text(source, name.syntax());
+    let mut head = vec![Doc::text(format!(
+        "{visibility_prefix}{}trait {name}",
+        if is_unsafe { "unsafe " } else { "" }
+    ))];
+    if let Some(generic_params) = generic_params.as_ref() {
+        head.push(generic_params_document(source, generic_params)?);
+    }
+    if let Some(bounds) = bounds.as_ref() {
+        head.extend([Doc::text(": "), bound_list_document(source, bounds)?]);
+    }
+    let head = Doc::concat(head);
+    let document = if let Some(where_clause) = where_clause {
+        Doc::concat([
+            head,
+            Doc::indent(Doc::concat([
+                Doc::HardLine,
+                where_clause_document(source, &where_clause)?,
+            ])),
+            Doc::HardLine,
+            item_body,
+        ])
+    } else {
+        Doc::concat([head, Doc::text(" "), item_body])
+    };
+    let range = declaration.syntax().text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn item_list_body_document(
+    source: &ParsedSource,
+    items: &ast::ItemList,
+    expression_group_ids: &mut ExpressionGroupIds,
+    mut render_member: impl FnMut(
+        sai_syntax::SyntaxNode,
+        &mut ExpressionGroupIds,
+    ) -> Result<ItemDocument, SourceDocumentError>,
+) -> Result<Doc, SourceDocumentError> {
+    let mut members = Vec::with_capacity(items.syntax().children().count());
+    for child in items.syntax().children() {
+        members.push(render_member(child, expression_group_ids)?);
+    }
+    let item_list_tokens = direct_token_kinds(items.syntax());
+    if item_list_tokens.len() < 2
+        || item_list_tokens.first() != Some(&SyntaxKind::L_BRACE)
+        || item_list_tokens.last() != Some(&SyntaxKind::R_BRACE)
+        || item_list_tokens[1..item_list_tokens.len() - 1]
+            .iter()
+            .any(|kind| *kind != SyntaxKind::NEWLINE)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    if members.is_empty() {
+        return Ok(Doc::text("{}"));
+    }
+
+    let mut body = vec![Doc::HardLine];
+    for (index, member) in members.iter().enumerate() {
+        if index > 0 {
+            let previous = &members[index - 1];
+            let gap = source
+                .text()
+                .get(previous.end..member.start)
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            body.push(Doc::HardLine);
+            if gap.matches('\n').count() > 1 {
+                body.push(Doc::HardLine);
+            }
+        }
+        body.push(member.document.clone());
+    }
+    Ok(Doc::concat([
+        Doc::text("{"),
+        Doc::indent(Doc::concat(body)),
+        Doc::HardLine,
+        Doc::text("}"),
+    ]))
+}
+
+fn assoc_type_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::AssocTypeDecl,
+) -> Result<ItemDocument, SourceDocumentError> {
+    if declaration.docs().is_some() || declaration.attrs().next().is_some() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let bounds = declaration.bounds();
+    if declaration
+        .syntax()
+        .children()
+        .map(|child| child.text_range())
+        .ne(std::iter::once(name.syntax().text_range())
+            .chain(bounds.as_ref().map(|bounds| bounds.syntax().text_range())))
+        || direct_token_kinds(declaration.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [
+                Some(SyntaxKind::TYPE_KW),
+                bounds.as_ref().map(|_| SyntaxKind::COLON),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut document = vec![
+        Doc::text("type "),
+        Doc::text(node_text(source, name.syntax())),
+    ];
+    if let Some(bounds) = bounds {
+        document.extend([Doc::text(": "), bound_list_document(source, &bounds)?]);
+    }
+    let document = Doc::concat(document);
+    let range = declaration.syntax().text_range();
     let multiline = crate::print(&document)
         .map_err(|_| SourceDocumentError::UnsupportedShape)?
         .trim_end_matches('\n')
@@ -4726,6 +4928,100 @@ mod tests {
             format_shape(b"impl Buffer { @inline type Item = I32 }"),
             Err(SourceDocumentError::UnsupportedShape)
         );
+    }
+
+    #[test]
+    fn formats_traits_superbounds_associated_types_and_methods() {
+        for (input, expected) in [
+            (
+                concat!(
+                    "pub trait Container<T>:Clone where T:Copy {\n",
+                    "type Item:Clone\n",
+                    "fn next<U>(self:borrow Self)->Item where U:Clone\n",
+                    "fn default_value(value:T)->T{value}\n",
+                    "}\n",
+                )
+                .as_bytes(),
+                concat!(
+                    "pub trait Container<T>: Clone\n",
+                    "    where T: Copy\n",
+                    "{\n",
+                    "    type Item: Clone\n",
+                    "    fn next<U>(self: borrow Self) -> Item\n",
+                    "        where U: Clone\n",
+                    "    fn default_value(value: T) -> T {\n",
+                    "        value\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                b"unsafe trait Marker{}".as_slice(),
+                "unsafe trait Marker {}\n",
+            ),
+            (b"trait Empty {}".as_slice(), "trait Empty {}\n"),
+        ] {
+            let parsed = parse_source(input).expect("trait declaration parses");
+            let output = format_shape(input).unwrap_or_else(|error| {
+                panic!(
+                    "trait declaration should be supported: {error:?}\n{}",
+                    String::from_utf8_lossy(input)
+                )
+            });
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted trait reparses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn preserves_trait_member_blank_lines_and_rejects_unhandled_annotations() {
+        let input = concat!(
+            "trait Render {\n",
+            "type Output:Clone\n",
+            "\n",
+            "fn render()\n",
+            "fn flush(){}\n",
+            "}\n",
+        );
+        assert_eq!(
+            format_shape(input.as_bytes()),
+            Ok(concat!(
+                "trait Render {\n",
+                "    type Output: Clone\n",
+                "\n",
+                "    fn render()\n",
+                "    fn flush() {}\n",
+                "}\n",
+            )
+            .to_owned())
+        );
+        assert_eq!(
+            format_shape(b"@inline trait Render {}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"trait Render { @inline type Output }"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn separates_following_items_after_a_wrapped_trait_header() {
+        let bounds = (0..12)
+            .map(|index| format!("BoundName{index}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let input = format!("trait Marker: {bounds} {{}}\nfn following() {{}}");
+        let parsed = parse_source(input.as_bytes()).expect("long trait header parses");
+        let output = format_shape(input.as_bytes()).expect("long trait header formats");
+
+        assert!(output.contains("\n\nfn following() {}\n"), "{output}");
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted trait header reparses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
