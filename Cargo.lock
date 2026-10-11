@@ -3053,8 +3053,10 @@ dependencies = [
 name = "sai_fmt"
 version = "0.1.0"
 dependencies = [
+ "sai_diagnostics",
  "sai_package",
  "sai_syntax",
+ "sai_vfs",
 ]
 
 [[package]]

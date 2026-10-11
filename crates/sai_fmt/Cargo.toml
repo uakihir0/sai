@@ -5,5 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sai_diagnostics = { path = "../sai_diagnostics" }
 sai_package = { path = "../sai_package" }
 sai_syntax = { path = "../sai_syntax" }
+sai_vfs = { path = "../sai_vfs" }

@@ -15,12 +15,35 @@ This chapter defines the canonical form of SAI source files and of `sai.package`
 The formatter is the library crate `sai_fmt`. It has two entry points.
 
 ```rust
-pub fn format_source(text: &[u8]) -> Result<String, Refusal>;
+pub fn format_source(text: &[u8]) -> Result<String, SourceFormatError>;
 pub fn format_package(text: &[u8]) -> Result<String, PackageFormatError>;
 
+// Package-format refusal. Its fields are package-grammar diagnostics.
 pub struct Refusal {
     pub lexical_errors: Vec<sai_package::lexer::PackageLexError>,
     pub syntax_errors: Vec<sai_package::manifest::PackageParseError>,
+}
+
+// Source-format refusal. `SourceRefusal` and `SourceFormatError` are distinct
+// from the package API because they carry source-file diagnostics.
+pub struct SourceRefusal {
+    pub input_errors: Vec<Diagnostic>,
+    pub lexical_errors: Vec<Diagnostic>,
+    pub syntax_errors: Vec<Diagnostic>,
+}
+
+pub enum SourceFormatError {
+    Refused(SourceRefusal),
+    InternalError,
+    Print(PrintError),
+    VerificationFailed(SourceVerificationFailure),
+}
+
+pub enum SourceVerificationCheck {
+    OutputSyntax,
+    SyntaxTreePreservation,
+    CommentPreservation,
+    Idempotency,
 }
 
 pub enum PackageFormatError {
@@ -34,13 +57,21 @@ pub struct PackageVerificationFailure {
     pub check: PackageVerificationCheck,
     pub input_byte_offset: Option<usize>,
 }
+
+pub struct SourceVerificationFailure {
+    pub check: SourceVerificationCheck,
+    pub input_byte_offset: Option<usize>,
+}
 ```
 
 - `format_source` formats a SAI source file. `format_package` formats a `sai.package` file (§14.12).
 - `PackageFormatError::Refused` carries only lexer errors and parser errors that cause refusal; structural and value diagnostics remain formatable (§14.12.1).
+- `SourceFormatError::Refused` carries input-limit, lexer, and parser diagnostics as defined in §14.2.2. Its `SourceRefusal` is separate from the package-specific `Refusal`.
 - `PackageFormatError::VerificationFailed` carries the failed check and, when available, the first differing byte offset in the original input (§14.11.2).
 - The package entry point receives bytes without a file identity, so its refusal returns the parser's byte-spanned error records. The CLI maps those records to file diagnostics after it supplies the source location.
-- The package entry point is implemented before `format_source`; source formatting is still pending.
+- `format_package` is implemented. The source input-preparation helper `parse_source` now decodes, lexes, parses, and applies the source refusal rules; the `format_source` entry point and source document builder are still pending.
+- `parse_source` returns a lossless `ParsedSource` on success. Its `SourceInputError::Refused(SourceRefusal)` contains input-limit, lexer, and parser diagnostics. A source larger than 16 MiB produces `IMPLEMENTATION_LIMIT_EXCEEDED`. Parser diagnostics are selected by origin from impl/02 §2.5.12, except `CLAUSE_ORDER`; validation diagnostics and warnings remain available from `ParsedSource::diagnostics()` without refusing formatting. Decode and snapshot failures return `InternalError`. A hard parse failure without a lexer error also returns `InternalError`; if lexical errors were already observed, an unrecoverable parse returns `Refused` with those lexer diagnostics and no parser diagnostics.
+- Because `parse_source` accepts bytes without a caller-supplied file identity, it binds diagnostics to the VFS `<stdin>` source sentinel. A caller that formats a named file must replace that sentinel with the selected file's source reference before presenting diagnostics.
 - The input is the raw file content. The output is UTF-8 text without a BOM.
 - Neither function reads anything other than its argument: no configuration file, no environment variable, no locale, and no clock. The output is a function of the input bytes and of the toolchain version.
 - `sai fmt` ([13-cli.md](13-cli.md) §13.6.7), the language server ([12-semantic-tooling.md](12-semantic-tooling.md) §12.10), structured fixes ([11-diagnostics.md](11-diagnostics.md) §11.7.3), and every tool that writes SAI text use this crate. A tool never produces source text by any other means, so generated text is canonical by construction.
@@ -97,12 +128,13 @@ The input is decoded and lexed exactly as by the compiler ([02-frontend-ast-hir.
 
 The formatter **refuses** a file, and produces no output for it, if and only if one of the following holds (N-H-43):
 
-1. The lexer reported a diagnostic of severity `error` (spec/02 §2.12, impl/02 §2.4).
-2. The parser reported a diagnostic of severity `error` other than `CLAUSE_ORDER`. "The parser" means the rows marked `parser` in the table of impl/02 §2.5.12, which include every recovery of §2.5.11 (`EXPECTED_TOKEN`, `EXPECTED_EXPRESSION`, `UNEXPECTED_NEWLINE`) and every check made while parsing (for example `CHAINED_COMPARISON`, `DUPLICATE_CLAUSE`, `BLOCK_IN_CONDITION`, `NO_DOUBLE_COLON`, `ITEM_IN_BLOCK`).
+1. The source file is larger than the 16 MiB implementation limit and produces `IMPLEMENTATION_LIMIT_EXCEEDED` before lexing (impl/02 §2.2.2).
+2. The lexer reported a diagnostic of severity `error` (spec/02 §2.12, impl/02 §2.4).
+3. The parser reported a diagnostic of severity `error` other than `CLAUSE_ORDER`. "The parser" means the rows marked `parser` in the table of impl/02 §2.5.12, which include every recovery of §2.5.11 (`EXPECTED_TOKEN`, `EXPECTED_EXPRESSION`, `UNEXPECTED_NEWLINE`) and every check made while parsing (for example `CHAINED_COMPARISON`, `DUPLICATE_CLAUSE`, `BLOCK_IN_CONDITION`, `NO_DOUBLE_COLON`, `ITEM_IN_BLOCK`).
 
 Consequences:
 
-- A refused file is never changed. `sai fmt` reports the diagnostics of the refusal and continues with the other files ([13-cli.md](13-cli.md) §13.6.7). No refusal diagnostic of its own exists: the lexer and parser diagnostics are the explanation.
+- A refused file is never changed. `sai fmt` reports the input-limit, lexer, and parser diagnostics of the refusal and continues with the other files ([13-cli.md](13-cli.md) §13.6.7). No additional generic refusal diagnostic is created.
 - Errors of the syntactic validation pass (the rows marked `validation` in impl/02 §2.5.12, such as `MISSING_FN_BODY`, `UNKNOWN_ATTRIBUTE`, or `INFER_IN_SIGNATURE`) and every error found later (name resolution, types, effects) do not refuse. Their trees are complete, so they can be formatted, and a user can format a file while it still has semantic errors.
 - Warnings never refuse. A doc comment demoted by `MISPLACED_DOC_COMMENT` is formatted as an ordinary line comment (impl/02 §2.6.4).
 - `CLAUSE_ORDER` does not refuse. The tree is complete, and the formatter puts the clauses in the order of D-SYN-06 (§14.7.5), which is the fix of that diagnostic.

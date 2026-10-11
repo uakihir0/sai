@@ -907,6 +907,7 @@ Some rules of spec/03 depend on context that is awkward to track while parsing. 
 | `BLOCK_IN_CONDITION` | parser | §2.5.6 |
 | `NO_ASYNC_CLOSURE` | parser | §2.5.6 |
 | `NO_AS_CAST` | impl/03 | the parser builds `CAST_EXPR` without a diagnostic (§2.5.6); the type checker reports the code (impl/03 §3.10.3) |
+| `INVALID_ATTRIBUTE_TARGET` | parser | an attribute before a statement or expression-list element where attributes are not permitted; the attributes are retained in an `ERROR` node (§2.10.2) |
 | `REDUNDANT_PUB_EXPORT`, `INVALID_EXPORT_TARGET` | parser | §2.5.4 |
 | `NO_DOUBLE_COLON`, `USE_AND_OR` | parser | §2.5.2 |
 | `MISSING_INITIALIZER`, `ITEM_IN_BLOCK`, `BASE_ARG_NOT_LAST`, `INVALID_TUPLE_INDEX`, `FLOAT_PATTERN`, `MULTIPLE_REST_PATTERNS`, `UNEXPECTED_FN_BODY`, `INTERFACE_FN_BODY`, `IMPLEMENTATION_LIMIT_EXCEEDED` | parser | §2.5.3–§2.5.8 |

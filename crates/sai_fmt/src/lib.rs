@@ -11,10 +11,12 @@ mod package_document;
 mod package_input;
 mod package_surface;
 mod printer;
+mod source_input;
 
 use package_input::PackageInput;
 use package_surface::PackageSyntaxIndex;
 pub use printer::{Doc, GroupId, PrintError, print, print_with_forced_groups};
+pub use source_input::{ParsedSource, SourceInputError, SourceRefusal, parse_source};
 
 /// Source errors that caused package formatting to be refused.
 ///

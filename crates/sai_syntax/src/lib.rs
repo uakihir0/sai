@@ -447,6 +447,15 @@ pub enum LexError {
 pub struct Parse {
     pub root: SyntaxNode,
     pub errors: Vec<Diagnostic>,
+    parser_diagnostics: Vec<Diagnostic>,
+}
+
+impl Parse {
+    /// Diagnostics emitted by the grammar parser, excluding lexer and
+    /// post-parse validation diagnostics.
+    pub fn parser_diagnostics(&self) -> &[Diagnostic] {
+        &self.parser_diagnostics
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -461,6 +470,7 @@ struct ParseFix {
 pub struct GreenParse {
     root: GreenNode,
     diagnostics: Vec<DiagnosticTemplate>,
+    parser_diagnostics: Vec<DiagnosticTemplate>,
     fixes: Vec<ParseFix>,
 }
 
@@ -488,6 +498,7 @@ impl StableHash for GreenParse {
         hasher.write_tag(0xC5);
         self.root.stable_hash(hasher);
         self.diagnostics.stable_hash(hasher);
+        self.parser_diagnostics.stable_hash(hasher);
         self.fixes.stable_hash(hasher);
     }
 }
@@ -898,8 +909,10 @@ fn parse_green_source(
     .map_err(ParseError::Tree)?;
     let root = SyntaxNode::new_root_for_query(tree.root.clone());
 
+    let parser_diagnostic_start = lexed.errors.len();
     let mut errors = lexed.errors;
     errors.extend(tree.errors);
+    let parser_diagnostic_end = errors.len();
     let mut fixes = Vec::new();
     report_unknown_attributes(
         &root,
@@ -911,7 +924,8 @@ fn parse_green_source(
         &mut fixes,
     )
     .map_err(ParseError::Lex)?;
-    errors.sort_by(|left, right| {
+    let mut indexed_errors = errors.into_iter().enumerate().collect::<Vec<_>>();
+    indexed_errors.sort_by(|(_, left), (_, right)| {
         let location_key = |diagnostic: &Diagnostic| {
             diagnostic
                 .primary()
@@ -923,9 +937,20 @@ fn parse_green_source(
             .then_with(|| left.code.as_str().cmp(right.code.as_str()))
             .then_with(|| left.message.cmp(&right.message))
     });
-    let diagnostics = errors
+    let parser_diagnostics = indexed_errors
+        .iter()
+        .filter(|(input_index, _)| {
+            *input_index >= parser_diagnostic_start && *input_index < parser_diagnostic_end
+        })
+        .map(|(_, diagnostic)| {
+            diagnostic
+                .to_template()
+                .map_err(ParseError::DiagnosticTemplate)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let diagnostics = indexed_errors
         .into_iter()
-        .map(|diagnostic| {
+        .map(|(_, diagnostic)| {
             diagnostic
                 .to_template()
                 .map_err(ParseError::DiagnosticTemplate)
@@ -934,6 +959,7 @@ fn parse_green_source(
     Ok(GreenParse {
         root: tree.root,
         diagnostics,
+        parser_diagnostics,
         fixes,
     })
 }
@@ -961,6 +987,11 @@ fn bind_green_parse(
         .iter()
         .map(|diagnostic| diagnostic.bind(file_id, source_ref.clone()))
         .collect::<Vec<_>>();
+    let parser_diagnostics = parsed
+        .parser_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.bind(file_id, source_ref.clone()))
+        .collect();
 
     for template in &parsed.fixes {
         let original_range = source
@@ -1016,7 +1047,11 @@ fn bind_green_parse(
             .map_err(|_| ParseError::Lex(LexError::FixPlanningFailed))?;
     }
 
-    Ok(Parse { root, errors })
+    Ok(Parse {
+        root,
+        errors,
+        parser_diagnostics,
+    })
 }
 
 /// Memoized syntax parsing over stable VFS file keys.
@@ -4551,7 +4586,9 @@ mod tests {
     #[test]
     fn syntax_parse_query_memoizes_rebinds_and_invalidates_by_source() {
         let key = FileKey::new("sai:core", "src/main.sai").expect("stable key");
-        let bytes: Arc<[u8]> = Arc::from(&b"\xEF\xBB\xBF@dervie\r\nfn run() {}\r\n"[..]);
+        let bytes: Arc<[u8]> = Arc::from(
+            &b"\xEF\xBB\xBF@dervie\r\nfn run() {\n@allow(unused_imports)\nlet value = 1\n}\r\n"[..],
+        );
         let vfs = VfsInputs::new().expect("VFS query IDs are available");
         let mut database = QueryDatabase::new();
         vfs.set_file_contents(
@@ -4576,6 +4613,19 @@ mod tests {
             .expect("query parse");
         assert_eq!(direct.root.green(), queried.root.green());
         assert_eq!(direct.errors, queried.errors);
+        assert_eq!(direct.parser_diagnostics(), queried.parser_diagnostics());
+        assert!(
+            queried
+                .parser_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+        );
+        assert!(
+            !queried
+                .parser_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::UnknownAttribute)
+        );
         let direct_ast_ids = ast::AstIdMap::new(first_id, &direct.root).expect("direct AST ID map");
         let queried_ast_ids = queries
             .ast_id_map(&mut database, &first_files, &first_snapshot, first_id)
@@ -4703,6 +4753,23 @@ mod tests {
         let rebound = queries
             .parse(&mut database, &second_files, &second_snapshot, second_id)
             .expect("memo is rebound to the requesting snapshot");
+        assert_eq!(
+            queried
+                .parser_diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            rebound
+                .parser_diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>()
+        );
+        assert!(rebound.parser_diagnostics().iter().all(|diagnostic| {
+            diagnostic
+                .primary()
+                .is_some_and(|location| location.span.file == second_id)
+        }));
         let rebound_ast_ids = queries
             .ast_id_map(&mut database, &second_files, &second_snapshot, second_id)
             .expect("AST ID shape is rebound to the requesting snapshot");
