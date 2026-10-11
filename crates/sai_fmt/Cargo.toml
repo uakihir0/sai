@@ -1,0 +1,8 @@
+[package]
+name = "sai_fmt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sai_syntax = { path = "../sai_syntax" }

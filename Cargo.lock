@@ -3045,6 +3045,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sai_fmt"
+version = "0.1.0"
+dependencies = [
+ "sai_syntax",
+]
+
+[[package]]
 name = "sai_hir"
 version = "0.1.0"
 dependencies = [
