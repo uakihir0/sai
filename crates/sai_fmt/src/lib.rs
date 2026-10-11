@@ -11,6 +11,8 @@ mod package_document;
 mod package_input;
 mod package_surface;
 mod printer;
+#[cfg(test)]
+mod source_document;
 mod source_input;
 
 use package_input::PackageInput;

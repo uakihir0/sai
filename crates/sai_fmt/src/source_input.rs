@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value, ValueObject};
+#[cfg(test)]
+use sai_syntax::LexOutput;
 use sai_syntax::{Parse, SyntaxNode};
 use sai_vfs::{
     FileId, MAX_SOURCE_BYTES, SnapshotFile, SourceDecodeError, SourceFile, Span, TextRange,
@@ -34,6 +36,8 @@ pub enum SourceInputError {
 pub struct ParsedSource {
     source: Arc<SourceFile>,
     _snapshot: WorkspaceSnapshot,
+    #[cfg(test)]
+    lexed: LexOutput,
     parse: Parse,
 }
 
@@ -52,6 +56,11 @@ impl ParsedSource {
     /// non-refusing validation diagnostics.
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.parse.errors
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lexed(&self) -> &LexOutput {
+        &self.lexed
     }
 }
 
@@ -114,6 +123,8 @@ pub fn parse_source(bytes: &[u8]) -> Result<ParsedSource, SourceInputError> {
     Ok(ParsedSource {
         source,
         _snapshot: snapshot,
+        #[cfg(test)]
+        lexed,
         parse,
     })
 }
