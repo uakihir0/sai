@@ -515,7 +515,7 @@ pub(crate) fn requirements_declaration(
         .entries(list)
         .ok_or(PackageDocumentError::InvalidEntry)?;
     let mut entries = Vec::with_capacity(indexed_entries.len());
-    for range in indexed_entries {
+    for (entry_number, range) in indexed_entries.iter().enumerate() {
         if range.start <= list.open_token
             || range.end > list.close_token
             || range.start >= range.end
@@ -527,8 +527,15 @@ pub(crate) fn requirements_declaration(
         let entry_tokens = tokens
             .get(start..end)
             .ok_or(PackageDocumentError::InvalidEntry)?;
-        let parts = requirement_entry_parts(input.source(), start, entry_tokens)
-            .ok_or(PackageDocumentError::InvalidEntry)?;
+        let parts = requirement_entry_parts(
+            input.source(),
+            start,
+            entry_tokens,
+            index,
+            list,
+            u32::try_from(entry_number).map_err(|_| PackageDocumentError::InvalidEntry)?,
+        )
+        .ok_or(PackageDocumentError::InvalidEntry)?;
         let mut leading = Vec::with_capacity(entry_tokens.len());
         let mut trailing = Vec::with_capacity(entry_tokens.len());
         for token_index in start..end {
@@ -539,6 +546,8 @@ pub(crate) fn requirements_declaration(
             token_indices: start..end,
             version: parts.version,
             from: parts.from,
+            only: parts.only,
+            grant: parts.grant,
             leading,
             trailing,
         });
@@ -616,6 +625,7 @@ pub(crate) fn requirements_declaration(
                 }
                 body.extend(requirement_entry_document(
                     input,
+                    index,
                     tokens,
                     &mut entries[position],
                 )?);
@@ -1061,6 +1071,8 @@ struct RequirementEntry<'a> {
     token_indices: Range<usize>,
     version: Range<usize>,
     from: Option<Range<usize>>,
+    only: Option<PackageBraceList>,
+    grant: Option<PackageBraceList>,
     leading: Vec<Vec<&'a AttachedComment>>,
     trailing: Vec<Vec<&'a AttachedComment>>,
 }
@@ -1068,12 +1080,17 @@ struct RequirementEntry<'a> {
 struct RequirementParts {
     version: Range<usize>,
     from: Option<Range<usize>>,
+    only: Option<PackageBraceList>,
+    grant: Option<PackageBraceList>,
 }
 
 fn requirement_entry_parts(
     source: &[u8],
     start: usize,
     tokens: &[PackageToken],
+    index: &PackageSyntaxIndex<'_>,
+    parent_list: &PackageBraceList,
+    parent_entry: u32,
 ) -> Option<RequirementParts> {
     let [package, at, remainder @ ..] = tokens else {
         return None;
@@ -1085,14 +1102,19 @@ fn requirement_entry_parts(
         return None;
     }
 
-    let clause_start = remainder
-        .iter()
-        .position(|token| {
-            token.kind == PackageTokenKind::Word
-                && matches!(token_text(source, token), "from" | "only" | "grant")
-        })
-        .map_or(tokens.len(), |offset| offset + 2);
-    let version_tokens = tokens.get(2..clause_start)?;
+    let mut cursor = 2;
+    while let Some(token) = tokens.get(cursor) {
+        if token.kind == PackageTokenKind::Word
+            && matches!(token_text(source, token), "from" | "only" | "grant")
+        {
+            break;
+        }
+        if !is_version_requirement_piece(token.kind) {
+            return None;
+        }
+        cursor += 1;
+    }
+    let version_tokens = tokens.get(2..cursor)?;
     if version_tokens.is_empty()
         || version_tokens
             .iter()
@@ -1100,48 +1122,120 @@ fn requirement_entry_parts(
     {
         return None;
     }
-    let version = start.checked_add(2)?..start.checked_add(clause_start)?;
+    let version = start.checked_add(2)?..start.checked_add(cursor)?;
 
-    let from = if clause_start == tokens.len() {
-        None
+    let mut from = None;
+    if tokens.get(cursor).is_some_and(|token| {
+        token.kind == PackageTokenKind::Word && token_text(source, token) == "from"
+    }) {
+        let from_start = cursor;
+        let kind = tokens.get(cursor.checked_add(1)?)?;
+        let source_path = tokens.get(cursor.checked_add(2)?)?;
+        if kind.kind != PackageTokenKind::Word
+            || !matches!(token_text(source, kind), "path" | "git")
+            || source_path.kind != PackageTokenKind::String
+        {
+            return None;
+        }
+        cursor += 3;
+        if token_text(source, kind) == "git"
+            && tokens.get(cursor).is_some_and(|token| {
+                token.kind == PackageTokenKind::Word && token_text(source, token) == "dir"
+            })
+        {
+            let directory = tokens.get(cursor.checked_add(1)?)?;
+            if directory.kind != PackageTokenKind::String {
+                return None;
+            }
+            cursor += 2;
+        }
+        from = Some(start.checked_add(from_start)?..start.checked_add(cursor)?);
+    }
+
+    let only = if tokens.get(cursor).is_some_and(|token| {
+        token.kind == PackageTokenKind::Word && token_text(source, token) == "only"
+    }) {
+        let (list, after_list) = nested_requirement_list(
+            tokens,
+            start,
+            cursor,
+            index,
+            parent_list,
+            parent_entry,
+            PackageBraceOwner::Only,
+        )?;
+        cursor = after_list;
+        Some(list)
     } else {
-        let clause = tokens.get(clause_start..)?;
-        if clause.first().is_none_or(|token| {
-            token.kind != PackageTokenKind::Word || token_text(source, token) != "from"
-        }) {
-            // `only` and `grant` are added by the nested-clause formatter step.
-            return None;
-        }
-        let valid_source = match clause {
-            [from, kind, path]
-                if from.kind == PackageTokenKind::Word
-                    && kind.kind == PackageTokenKind::Word
-                    && matches!(token_text(source, kind), "path" | "git")
-                    && path.kind == PackageTokenKind::String =>
-            {
-                token_text(source, from) == "from"
-            }
-            [from, kind, url, dir, path]
-                if from.kind == PackageTokenKind::Word
-                    && token_text(source, from) == "from"
-                    && kind.kind == PackageTokenKind::Word
-                    && token_text(source, kind) == "git"
-                    && url.kind == PackageTokenKind::String
-                    && dir.kind == PackageTokenKind::Word
-                    && token_text(source, dir) == "dir"
-                    && path.kind == PackageTokenKind::String =>
-            {
-                true
-            }
-            _ => false,
-        };
-        if !valid_source {
-            return None;
-        }
-        Some(start.checked_add(clause_start)?..start.checked_add(tokens.len())?)
+        None
     };
+    let grant = if tokens.get(cursor).is_some_and(|token| {
+        token.kind == PackageTokenKind::Word && token_text(source, token) == "grant"
+    }) {
+        let (list, after_list) = nested_requirement_list(
+            tokens,
+            start,
+            cursor,
+            index,
+            parent_list,
+            parent_entry,
+            PackageBraceOwner::Grant,
+        )?;
+        cursor = after_list;
+        Some(list)
+    } else {
+        None
+    };
+    if cursor != tokens.len() {
+        return None;
+    }
 
-    Some(RequirementParts { version, from })
+    Some(RequirementParts {
+        version,
+        from,
+        only,
+        grant,
+    })
+}
+
+fn nested_requirement_list(
+    tokens: &[PackageToken],
+    token_base: usize,
+    keyword_offset: usize,
+    index: &PackageSyntaxIndex<'_>,
+    parent_list: &PackageBraceList,
+    parent_entry: u32,
+    owner: PackageBraceOwner,
+) -> Option<(PackageBraceList, usize)> {
+    let open_offset = keyword_offset.checked_add(1)?;
+    let open_token = tokens.get(open_offset)?;
+    if open_token.kind != PackageTokenKind::Punctuator(PackagePunctuator::LeftBrace) {
+        return None;
+    }
+    let global_open_offset = token_base.checked_add(open_offset)?;
+    let open_token_index = u32::try_from(global_open_offset).ok()?;
+    let list = index
+        .brace_lists()
+        .iter()
+        .find(|list| list.open_token == open_token_index)?;
+    if list.owner != owner
+        || list.parent_open_token(index) != Some(parent_list.open_token)
+        || list.parent_entry() != Some(parent_entry)
+    {
+        return None;
+    }
+    let global_close_offset = usize::try_from(list.close_token).ok()?;
+    let close_offset = global_close_offset.checked_sub(token_base)?;
+    if close_offset <= open_offset
+        || tokens.get(close_offset).is_none_or(|token| {
+            token.kind != PackageTokenKind::Punctuator(PackagePunctuator::RightBrace)
+        })
+    {
+        return None;
+    }
+    index.entries(list)?;
+    index.separators(list)?;
+    Some((list.clone(), close_offset.checked_add(1)?))
 }
 
 const fn is_version_requirement_piece(kind: PackageTokenKind) -> bool {
@@ -1180,6 +1274,7 @@ const fn is_version_requirement_continuation(kind: PackageTokenKind) -> bool {
 
 fn requirement_entry_document(
     input: &PackageInput<'_>,
+    index: &PackageSyntaxIndex<'_>,
     tokens: &[PackageToken],
     entry: &mut RequirementEntry<'_>,
 ) -> Result<Vec<Doc>, PackageDocumentError> {
@@ -1333,6 +1428,13 @@ fn requirement_entry_document(
 
     if let Some(from_range) = entry.from.clone() {
         document.extend(requirement_from_document(input, tokens, entry, from_range)?);
+    }
+    for list in [entry.only.as_ref(), entry.grant.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let clause = comma_list_declaration(input, index, list, list.owner)?;
+        document.push(Doc::indent(Doc::concat([Doc::HardLine, clause])));
     }
     Ok(document)
 }
@@ -1572,6 +1674,8 @@ fn comma_list_declaration(
         PackageBraceOwner::Allow => "allow",
         PackageBraceOwner::Deny => "deny",
         PackageBraceOwner::Authors => "authors",
+        PackageBraceOwner::Only => "only",
+        PackageBraceOwner::Grant => "grant",
         _ => return Err(PackageDocumentError::WrongListOwner),
     };
     let keyword_index = (list.open_token as usize)
@@ -1608,6 +1712,11 @@ fn comma_list_declaration(
                 PackageTokenKind::Word | PackageTokenKind::PackagePath
             ),
             PackageBraceOwner::Authors => token.kind == PackageTokenKind::String,
+            PackageBraceOwner::Only => token.kind == PackageTokenKind::Word,
+            PackageBraceOwner::Grant => matches!(
+                token.kind,
+                PackageTokenKind::Word | PackageTokenKind::PackagePath
+            ),
             _ => false,
         };
         if !valid_entry {
@@ -2438,6 +2547,91 @@ mod tests {
                 false
             ),
             "requires test {\n    acme:test @ >=1.2\n}\n"
+        );
+    }
+
+    #[test]
+    fn formats_nested_only_and_grant_requirement_lists() {
+        let formatted = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              requires {\n\
+                  acme:target @ ^1 from path \"../target\" only { wasm32-core, wasm32-wasi } grant { alloc, wasi:filesystem }\n\
+                  acme:isolated @ ^1 grant { }\n\
+              }\n",
+            PackageBraceOwner::Requires,
+            false,
+        );
+        assert_eq!(
+            formatted,
+            "requires {\n    acme:target @ ^1\n        from path \"../target\"\n        only { wasm32-core, wasm32-wasi }\n        grant { alloc, wasi:filesystem }\n    acme:isolated @ ^1\n        grant {}\n}\n"
+        );
+        let formatted_test = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              requires test {\n\
+                  acme:test-helper @ ^1 only { wasm32-core, wasm32-wasi, wasm64-core, wasm64-wasi, wasm32-wasi-preview, wasm64-wasi-preview, wasm32-core-preview, wasm64-core-preview } grant { alloc, // retain grant comment\n\
+                      wasi:filesystem }\n\
+              }\n",
+            PackageBraceOwner::RequiresTest,
+            false,
+        );
+        assert_eq!(
+            formatted_test,
+            "requires test {\n    acme:test-helper @ ^1\n        only {\n            wasm32-core\n            wasm32-wasi\n            wasm64-core\n            wasm64-wasi\n            wasm32-wasi-preview\n            wasm64-wasi-preview\n            wasm32-core-preview\n            wasm64-core-preview\n        }\n        grant {\n            alloc // retain grant comment\n            wasi:filesystem\n        }\n}\n"
+        );
+        let mut reparsed_source = b"package acme:app @ 1.0.0\n".to_vec();
+        reparsed_source.extend_from_slice(formatted.as_bytes());
+        let reparsed = PackageInput::new(&reparsed_source);
+        assert!(reparsed.refusals().is_empty(), "{:?}", reparsed.refusals());
+        let reparsed_test = PackageInput::new(formatted_test.as_bytes());
+        assert!(
+            reparsed_test.refusals().is_empty(),
+            "{:?}",
+            reparsed_test.refusals()
+        );
+        assert_eq!(
+            render_owner(formatted.as_bytes(), PackageBraceOwner::Requires, false,),
+            formatted
+        );
+        assert_eq!(
+            render_owner(
+                formatted_test.as_bytes(),
+                PackageBraceOwner::RequiresTest,
+                false,
+            ),
+            formatted_test
+        );
+    }
+
+    #[test]
+    fn preserves_comments_attached_to_nested_requirement_clauses() {
+        let formatted = render_owner(
+            b"package acme:app @ 1.0.0\n\
+              requires {\n\
+                  acme:target @ ^1 only /* keep only keyword comment */ { // keep only opening brace comment\n\
+                      // keep target comment\n\
+                      wasm32-core\n\
+                  } // keep only closing brace comment\n\
+                      grant /* keep grant keyword comment */ { alloc }\n\
+              }\n",
+            PackageBraceOwner::Requires,
+            false,
+        );
+        assert_eq!(
+            formatted,
+            "requires {\n    acme:target @ ^1\n        only /* keep only keyword comment */ { // keep only opening brace comment\n            // keep target comment\n            wasm32-core\n        } // keep only closing brace comment\n        grant /* keep grant keyword comment */ { alloc }\n}\n"
+        );
+        let mut reparsed_source = b"package acme:app @ 1.0.0\n".to_vec();
+        reparsed_source.extend_from_slice(formatted.as_bytes());
+        let reparsed = PackageInput::new(&reparsed_source);
+        assert!(reparsed.refusals().is_empty(), "{:?}", reparsed.refusals());
+        assert!(
+            reparsed.parsed().errors().is_empty(),
+            "{:?}",
+            reparsed.parsed().errors()
+        );
+        assert_eq!(
+            render_owner(formatted.as_bytes(), PackageBraceOwner::Requires, false,),
+            formatted
         );
     }
 
