@@ -462,6 +462,101 @@ fn while_expression_document(
     Ok(Doc::concat(documents))
 }
 
+fn for_pattern_document(
+    source: &ParsedSource,
+    pattern: &ast::Pattern,
+) -> Result<Doc, SourceDocumentError> {
+    match pattern {
+        ast::Pattern::Binding(binding) => {
+            let mode = binding.mode();
+            let name = binding
+                .name()
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let mut documents = Vec::with_capacity(2);
+            if binding.syntax().children().count() != 1 + usize::from(mode.is_some())
+                || !direct_token_kinds(binding.syntax()).is_empty()
+                || name.syntax().children().count() != 0
+                || direct_token_kinds(name.syntax()) != [SyntaxKind::LIDENT]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            if let Some(mode) = mode {
+                let mode_tokens = direct_token_kinds(mode.syntax());
+                let mode_text = match mode_tokens.as_slice() {
+                    [SyntaxKind::VAR_KW] => "var ",
+                    [SyntaxKind::BORROW_KW] => "borrow ",
+                    [SyntaxKind::BORROW_KW, SyntaxKind::MUT_KW] => "borrow mut ",
+                    _ => return Err(SourceDocumentError::UnsupportedShape),
+                };
+                if mode.syntax().children().count() != 0 {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                documents.push(Doc::text(mode_text));
+            }
+            documents.push(Doc::text(node_text(source, name.syntax())));
+            Ok(Doc::concat(documents))
+        }
+        ast::Pattern::Wildcard(wildcard) => {
+            if wildcard.syntax().children().count() != 0
+                || direct_token_kinds(wildcard.syntax()) != [SyntaxKind::UNDERSCORE]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            Ok(Doc::text("_"))
+        }
+        _ => Err(SourceDocumentError::UnsupportedShape),
+    }
+}
+
+fn for_expression_document(
+    source: &ParsedSource,
+    for_expr: &ast::ForExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let label = for_expr.label();
+    let pattern = for_expr
+        .pattern()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let iterable = for_expr
+        .iterable()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let body = for_expr
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let for_tokens = direct_token_kinds(for_expr.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let is_await = for_tokens.contains(&SyntaxKind::AWAIT_KW);
+    let mut expected_tokens = vec![SyntaxKind::FOR_KW];
+    if is_await {
+        expected_tokens.push(SyntaxKind::AWAIT_KW);
+    }
+    expected_tokens.push(SyntaxKind::IN_KW);
+    if for_expr.syntax().children().count() != 3 + usize::from(label.is_some())
+        || for_tokens != expected_tokens
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = Vec::with_capacity(6);
+    if let Some(label) = label {
+        documents.push(loop_label_document(&label)?);
+    }
+    documents.push(Doc::text(if is_await { "for await " } else { "for " }));
+    documents.push(for_pattern_document(source, &pattern)?);
+    documents.push(Doc::text(" in "));
+    documents.push(expression_document(
+        source,
+        &iterable,
+        ExpressionContext::Unprotected,
+        expression_group_ids,
+    )?);
+    documents.push(Doc::text(" "));
+    documents.push(block_document(source, &body, expression_group_ids)?);
+    Ok(Doc::concat(documents))
+}
+
 fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
@@ -963,6 +1058,7 @@ fn expression_document(
         Expr::While(while_expr) => {
             while_expression_document(source, while_expr, expression_group_ids)
         }
+        Expr::For(for_expr) => for_expression_document(source, for_expr, expression_group_ids),
         Expr::SelfValue(value) => {
             if value.syntax().children().count() != 0
                 || direct_token_kinds(value.syntax()) != [SyntaxKind::SELF_KW]
@@ -4119,6 +4215,51 @@ mod tests {
     fn unsupported_while_let_conditions_remain_fail_closed() {
         assert_eq!(
             format_shape(b"fn f(){while let Some(value)=next() {value}}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn formats_for_expressions_with_simple_patterns() {
+        for (input, expected) in [
+            (
+                b"fn f(){for row in rows {consume(row)}}".as_slice(),
+                "fn f() {\n    for row in rows {\n        consume(row)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){for _ in rows {tick()}}".as_slice(),
+                "fn f() {\n    for _ in rows {\n        tick()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){for var row in rows {row+=1}}".as_slice(),
+                "fn f() {\n    for var row in rows {\n        row += 1\n    }\n}\n",
+            ),
+            (
+                b"fn f(){for borrow mut row in rows {mutate(row)}}".as_slice(),
+                "fn f() {\n    for borrow mut row in rows {\n        mutate(row)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){'rows:\nfor row in rows {break 'rows}}".as_slice(),
+                "fn f() {\n    'rows: for row in rows {\n        break 'rows\n    }\n}\n",
+            ),
+            (
+                b"fn f(){for await row in rows {consume(row)}}".as_slice(),
+                "fn f() {\n    for await row in rows {\n        consume(row)\n    }\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("for expression parses");
+            let output = format_shape(input).expect("simple for expression is supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted for parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn unsupported_destructuring_for_patterns_remain_fail_closed() {
+        assert_eq!(
+            format_shape(b"fn f(){for (left,right) in pairs {consume(left)}}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
