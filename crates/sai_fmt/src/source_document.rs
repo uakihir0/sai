@@ -5769,7 +5769,7 @@ fn token_text<'a>(
         .ok_or(SourceDocumentError::UnsupportedShape)
 }
 
-fn normalize_integer_literal(literal: &str) -> String {
+pub(super) fn normalize_integer_literal(literal: &str) -> String {
     if let Some(digits) = literal.strip_prefix("0x") {
         format!("0x{}", digits.to_ascii_uppercase())
     } else {
@@ -5871,7 +5871,7 @@ fn continued_string_document(text: &str) -> Result<Doc, SourceDocumentError> {
     Ok(Doc::concat(documents))
 }
 
-fn split_string_lines(text: &str) -> Vec<(&str, &str)> {
+pub(super) fn split_string_lines(text: &str) -> Vec<(&str, &str)> {
     let mut lines = Vec::new();
     let mut line_start = 0;
     for (line_feed, character) in text.char_indices() {
@@ -5893,6 +5893,48 @@ fn split_string_lines(text: &str) -> Vec<(&str, &str)> {
         lines.push((&text[line_start..], ""));
     }
     lines
+}
+
+pub(super) fn normalized_string_value(text: &str) -> Option<String> {
+    let lines = split_string_lines(text);
+    if !text.starts_with("\"\"\"") {
+        if lines.len() < 2 || text.starts_with('r') {
+            return None;
+        }
+        let mut value = lines.first()?.0.to_string();
+        for line in lines.iter().skip(1) {
+            if !value.ends_with('\\') {
+                return None;
+            }
+            value.pop();
+            value.push_str(line.0.trim_start_matches([' ', '\t']));
+        }
+        return Some(value);
+    }
+
+    if lines.len() < 2 || lines.first()?.0 != "\"\"\"" {
+        return None;
+    }
+    let closing_line = lines.last()?.0;
+    let base_indent_length =
+        closing_line.len() - closing_line.trim_start_matches([' ', '\t']).len();
+    let base_indent = &closing_line[..base_indent_length];
+    if &closing_line[base_indent_length..] != "\"\"\"" {
+        return None;
+    }
+    let mut value_lines = Vec::with_capacity(lines.len().saturating_sub(2));
+    for index in 1..lines.len() - 1 {
+        let line = lines[index].0;
+        if line.is_empty() || line == base_indent {
+            value_lines.push("");
+        } else {
+            value_lines.push(line.strip_prefix(base_indent)?);
+        }
+        if index + 1 < lines.len() - 1 {
+            value_lines.push(lines[index].1);
+        }
+    }
+    Some(value_lines.concat())
 }
 
 fn string_line_break(ending: &str, content: Option<&str>) -> Result<Doc, SourceDocumentError> {
@@ -5936,7 +5978,10 @@ fn document_contains_unavoidable_forced_break(document: &Doc) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExpressionGroupIds, SourceDocumentError, function_document, source_document};
+    use super::{
+        ExpressionGroupIds, SourceDocumentError, function_document, normalized_string_value,
+        source_document,
+    };
     use crate::{parse_source, print};
     use sai_syntax::{
         SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
@@ -9380,48 +9425,6 @@ mod tests {
             }
         }
         shape
-    }
-
-    fn normalized_string_value(text: &str) -> Option<String> {
-        let lines = super::split_string_lines(text);
-        if !text.starts_with("\"\"\"") {
-            if lines.len() < 2 || text.starts_with('r') {
-                return None;
-            }
-            let mut value = lines.first()?.0.to_string();
-            for line in lines.iter().skip(1) {
-                if !value.ends_with('\\') {
-                    return None;
-                }
-                value.pop();
-                value.push_str(line.0.trim_start_matches([' ', '\t']));
-            }
-            return Some(value);
-        }
-
-        if lines.len() < 2 || lines.first()?.0 != "\"\"\"" {
-            return None;
-        }
-        let closing_line = lines.last()?.0;
-        let base_indent_length =
-            closing_line.len() - closing_line.trim_start_matches([' ', '\t']).len();
-        let base_indent = &closing_line[..base_indent_length];
-        if &closing_line[base_indent_length..] != "\"\"\"" {
-            return None;
-        }
-        let mut value_lines = Vec::with_capacity(lines.len().saturating_sub(2));
-        for index in 1..lines.len() - 1 {
-            let line = lines[index].0;
-            if line.is_empty() || line == base_indent {
-                value_lines.push("");
-            } else {
-                value_lines.push(line.strip_prefix(base_indent)?);
-            }
-            if index + 1 < lines.len() - 1 {
-                value_lines.push(lines[index].1);
-            }
-        }
-        Some(value_lines.concat())
     }
 
     fn contract_expression_shape(root: &SyntaxNode) -> Vec<ShapeElement> {

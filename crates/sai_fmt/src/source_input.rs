@@ -53,6 +53,12 @@ impl ParsedSource {
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.parse.errors
     }
+
+    pub(crate) fn original_byte_offset(&self, decoded_offset: usize) -> Option<usize> {
+        self.source
+            .to_original_offset(TextSize::from_usize(decoded_offset)?)
+            .map(TextSize::to_usize)
+    }
 }
 
 /// Decode, lex, and parse one source file, applying the formatter refusal
