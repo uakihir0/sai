@@ -108,13 +108,15 @@ fn function_document(
         || function.visibility().is_some()
         || function.unsafe_token().is_some()
         || function.async_token().is_some()
-        || function.where_clause().is_some()
         || function.requires_clauses().next().is_some()
         || function.ensures_clauses().next().is_some()
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let mut clauses = Vec::with_capacity(2);
+    let mut clauses = Vec::with_capacity(3);
+    if let Some(clause) = function.where_clause() {
+        clauses.push(where_clause_document(source, &clause)?);
+    }
     if let Some(clause) = function.borrows_clause() {
         clauses.push(borrows_clause_document(source, &clause)?);
     }
@@ -272,6 +274,151 @@ fn function_document(
         end: range.end().to_usize(),
         multiline: has_clauses || !statements.is_empty(),
     })
+}
+
+fn where_clause_document(
+    source: &ParsedSource,
+    clause: &ast::WhereClause,
+) -> Result<Doc, SourceDocumentError> {
+    let predicates = clause.predicates().collect::<Vec<_>>();
+    let token_kinds = direct_token_kinds(clause.syntax());
+    let significant_tokens = token_kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let expected_tokens = std::iter::once(SyntaxKind::WHERE_KW)
+        .chain(std::iter::repeat_n(
+            SyntaxKind::COMMA,
+            predicates.len().saturating_sub(1),
+        ))
+        .collect::<Vec<_>>();
+    if predicates.is_empty()
+        || clause.syntax().children().count() != predicates.len()
+        || significant_tokens != expected_tokens
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let documents = predicates
+        .iter()
+        .map(|predicate| where_predicate_document(source, predicate))
+        .collect::<Result<Vec<_>, _>>()?;
+    let range = clause.syntax().text_range();
+    let mut contents = Vec::with_capacity(documents.len() * 2);
+    for (index, predicate) in documents.into_iter().enumerate() {
+        if index > 0 {
+            contents.extend([Doc::text(","), Doc::Line]);
+        }
+        contents.push(predicate);
+    }
+    Ok(Doc::group(
+        GroupId(range.start().raw()),
+        Doc::concat([
+            Doc::text("where"),
+            Doc::indent(Doc::concat([Doc::Line, Doc::concat(contents)])),
+        ]),
+    ))
+}
+
+fn where_predicate_document(
+    source: &ParsedSource,
+    predicate: &ast::WherePred,
+) -> Result<Doc, SourceDocumentError> {
+    let ty = predicate
+        .ty()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let bounds = predicate.bounds().collect::<Vec<_>>();
+    let elements = predicate
+        .syntax()
+        .children_with_tokens()
+        .collect::<Vec<_>>();
+    let children = predicate.syntax().children().collect::<Vec<_>>();
+    let ty_syntax = ty.syntax();
+    if bounds.is_empty()
+        || children.len() != bounds.len() + 1
+        || children.first().is_none_or(|child| {
+            child.kind() != ty_syntax.kind() || child.text_range() != ty_syntax.text_range()
+        })
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut cursor = 0;
+    if !matches!(
+        elements.get(cursor),
+        Some(SyntaxElement::Node(node))
+            if node.kind() == ty_syntax.kind() && node.text_range() == ty_syntax.text_range()
+    ) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    cursor += 1;
+    if !matches!(elements.get(cursor), Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::COLON)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    cursor += 1;
+
+    let mut bound_documents = Vec::with_capacity(bounds.len());
+    for (index, bound) in bounds.iter().enumerate() {
+        let parenthesized = matches!(
+            elements.get(cursor),
+            Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::L_PAREN
+        );
+        if parenthesized {
+            cursor += 1;
+        }
+        let bound_syntax = bound.syntax();
+        if !matches!(
+            elements.get(cursor),
+            Some(SyntaxElement::Node(node))
+                if node.kind() == bound_syntax.kind() && node.text_range() == bound_syntax.text_range()
+        ) {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        cursor += 1;
+        if parenthesized {
+            if !matches!(elements.get(cursor), Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::R_PAREN)
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            cursor += 1;
+        }
+        let document = bound_document(source, bound.clone())?;
+        bound_documents.push(if parenthesized {
+            Doc::concat([Doc::text("("), document, Doc::text(")")])
+        } else {
+            document
+        });
+        if index + 1 < bounds.len() {
+            if !matches!(elements.get(cursor), Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::PLUS)
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            cursor += 1;
+        }
+    }
+    if cursor != elements.len() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let range = predicate.syntax().text_range();
+    let mut contents = vec![type_document(source, &ty)?, Doc::text(": ")];
+    for (index, bound) in bound_documents.into_iter().enumerate() {
+        if index > 0 {
+            contents.extend([
+                Doc::text(" "),
+                Doc::text("+"),
+                Doc::indent(Doc::concat([Doc::Line, bound])),
+            ]);
+        } else {
+            contents.push(bound);
+        }
+    }
+    Ok(Doc::group(
+        GroupId(range.start().raw()),
+        Doc::concat(contents),
+    ))
 }
 
 fn generic_params_document(
@@ -1256,6 +1403,71 @@ mod tests {
     }
 
     #[test]
+    fn formats_function_where_clauses_and_breaks_by_predicate() {
+        for (input, expected) in [
+            (
+                b"fn f<T>(x:T)\nwhere T:Clone+Hash\n{}".as_slice(),
+                "fn f<T>(x: T)\n    where T: Clone + Hash\n{}\n",
+            ),
+            (
+                b"fn f<T>()\nwhere T:(Fn() effects{io})\n{}".as_slice(),
+                "fn f<T>()\n    where T: (Fn() effects { io })\n{}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("input parses");
+            let output = format_shape(input)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", String::from_utf8_lossy(input)));
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted where clause parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+
+        let first = format!("Trait{}", "A".repeat(42));
+        let second = format!("Trait{}", "B".repeat(42));
+        let input = format!("fn f<T,U>()\nwhere T:{first},U:{second}\n{{}}");
+        let parsed = parse_source(input.as_bytes()).expect("long input parses");
+        let output = format_shape(input.as_bytes()).expect("where predicates are supported");
+        let expected =
+            format!("fn f<T, U>()\n    where\n        T: {first},\n        U: {second}\n{{}}\n");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped where clause parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let first_bound = format!("Trait{}", "C".repeat(42));
+        let second_bound = format!("Trait{}", "D".repeat(42));
+        let input = format!("fn f<T>()\nwhere T:{first_bound}+{second_bound}\n{{}}");
+        let parsed = parse_source(input.as_bytes()).expect("long bounds parse");
+        let output = format_shape(input.as_bytes()).expect("long where bounds are supported");
+        let expected = format!(
+            "fn f<T>()\n    where\n        T: {first_bound} +\n            {second_bound}\n{{}}\n"
+        );
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("wrapped where bounds parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn orders_where_before_borrows_and_effects() {
+        let input = b"fn f<T>() effects{io} borrows{self} where T:Clone {}";
+        let expected = concat!(
+            "fn f<T>()\n",
+            "    where T: Clone\n",
+            "    borrows { self }\n",
+            "    effects { io }\n",
+            "{}\n",
+        );
+        parse_source(input).expect("input parses with a clause-order diagnostic");
+        assert_eq!(format_shape(input), Ok(expected.to_owned()));
+        parse_source(expected.as_bytes()).expect("canonical output parses");
+        assert_eq!(format_shape(expected.as_bytes()), Ok(expected.to_owned()));
+    }
+
+    #[test]
     fn keeps_short_generics_flat_when_function_parameters_wrap() {
         let first = "first".repeat(9);
         let second = "second".repeat(8);
@@ -1639,10 +1851,6 @@ mod tests {
         );
         assert_eq!(
             format_shape(b"fn f() ensures true {}"),
-            Err(SourceDocumentError::UnsupportedShape)
-        );
-        assert_eq!(
-            format_shape(b"fn f() where T: Clone {}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
         assert_eq!(
