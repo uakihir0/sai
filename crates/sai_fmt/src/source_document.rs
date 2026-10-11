@@ -1295,44 +1295,116 @@ fn call_arguments_document(
     arguments: &ast::ArgList,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
-    if arguments.named_args().next().is_some() || arguments.base_args().next().is_some() {
+    let argument_count = arguments.syntax().children().count();
+    let mut documents = Vec::with_capacity(argument_count);
+    let mut has_trailing_record_update = false;
+    for node in arguments.syntax().children() {
+        if has_trailing_record_update {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let document = match node.kind() {
+            SyntaxKind::ARG => {
+                let argument = ast::Arg::cast(node).ok_or(SourceDocumentError::UnsupportedShape)?;
+                let expression = argument
+                    .expression()
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                if argument.syntax().children().count() != 1
+                    || !direct_token_kinds(argument.syntax()).is_empty()
+                {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                expression_document(
+                    source,
+                    &expression,
+                    ExpressionContext::Protected,
+                    expression_group_ids,
+                )?
+            }
+            SyntaxKind::NAMED_ARG => {
+                let argument =
+                    ast::NamedArg::cast(node).ok_or(SourceDocumentError::UnsupportedShape)?;
+                let name = argument
+                    .name()
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                let expression = argument
+                    .expression()
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                if argument.syntax().children().count() != 2
+                    || direct_token_kinds(argument.syntax()) != [SyntaxKind::COLON]
+                {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                Doc::concat([
+                    Doc::text(node_text(source, name.syntax())),
+                    Doc::text(": "),
+                    expression_document(
+                        source,
+                        &expression,
+                        ExpressionContext::Protected,
+                        expression_group_ids,
+                    )?,
+                ])
+            }
+            SyntaxKind::BASE_ARG => {
+                let argument =
+                    ast::BaseArg::cast(node).ok_or(SourceDocumentError::UnsupportedShape)?;
+                let expression = argument
+                    .expression()
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                if argument.syntax().children().count() != 1
+                    || direct_token_kinds(argument.syntax()) != [SyntaxKind::DOT2]
+                {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                has_trailing_record_update = true;
+                Doc::concat([
+                    Doc::text(".."),
+                    expression_document(
+                        source,
+                        &expression,
+                        ExpressionContext::Protected,
+                        expression_group_ids,
+                    )?,
+                ])
+            }
+            _ => return Err(SourceDocumentError::UnsupportedShape),
+        };
+        documents.push((document, has_trailing_record_update));
+    }
+    if !comma_delimited_tokens_match(
+        arguments.syntax(),
+        SyntaxKind::L_PAREN,
+        SyntaxKind::R_PAREN,
+        documents.len(),
+    ) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let positional_arguments = arguments.positional_args().collect::<Vec<_>>();
-    if positional_arguments
-        .iter()
-        .any(|argument| argument.syntax().children().count() != 1)
-        || arguments.syntax().children().count() != positional_arguments.len()
-        || !comma_delimited_tokens_match(
-            arguments.syntax(),
-            SyntaxKind::L_PAREN,
-            SyntaxKind::R_PAREN,
-            positional_arguments.len(),
-        )
-    {
-        return Err(SourceDocumentError::UnsupportedShape);
+    if documents.is_empty() {
+        return Ok(Doc::text("()"));
     }
-    let argument_documents = positional_arguments
-        .iter()
-        .map(|argument| {
-            let expression = argument
-                .expression()
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            expression_document(
-                source,
-                &expression,
-                ExpressionContext::Protected,
-                expression_group_ids,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+
     let range = arguments.syntax().text_range();
-    Ok(delimited_list_document(
-        GroupId(range.start().raw()),
-        "(",
-        ")",
-        argument_documents,
-        false,
+    let group = GroupId(range.start().raw());
+    let mut contents = Vec::with_capacity(documents.len() * 2 + 2);
+    contents.push(Doc::SoftLine);
+    for (index, (document, is_record_update)) in documents.iter().enumerate() {
+        if index > 0 {
+            contents.push(Doc::text(","));
+            contents.push(Doc::Line);
+        }
+        contents.push(document.clone());
+        if index + 1 == documents.len() && !is_record_update {
+            contents.push(Doc::if_broken(group, Doc::text(","), Doc::text("")));
+        }
+    }
+    Ok(Doc::group(
+        group,
+        Doc::concat([
+            Doc::text("("),
+            Doc::indent(Doc::concat(contents)),
+            Doc::SoftLine,
+            Doc::text(")"),
+        ]),
     ))
 }
 
@@ -2628,6 +2700,36 @@ mod tests {
             assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
             assert_eq!(format_shape(output.as_bytes()), Ok(output));
         }
+    }
+
+    #[test]
+    fn formats_named_and_record_update_call_arguments_in_source_order() {
+        let input = "fn f() requires call(first,named: value,last,..base,) {}\n";
+        let expected = "fn f()\n    requires call(first, named: value, last, ..base)\n{}\n";
+        let parsed = parse_source(input.as_bytes()).expect("mixed call arguments parse");
+        let output = format_shape(input.as_bytes()).expect("mixed call arguments are supported");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted call arguments parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+
+        let first = "first".repeat(8);
+        let name = format!("named_{}", "n".repeat(15));
+        let value = "value".repeat(7);
+        let base = "base".repeat(8);
+        let input = format!("fn f() requires call({first},{name}:{value},..{base},) {{}}\n");
+        let expected = format!(
+            "fn f()\n    requires call(\n        {first},\n        {name}: {value},\n        ..{base}\n    )\n{{}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("long mixed call arguments parse");
+        let output =
+            format_shape(input.as_bytes()).expect("long mixed call arguments are supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        assert!(!output.contains(&format!("..{base},\n")));
+        let reparsed = parse_source(output.as_bytes()).expect("broken mixed call arguments parse");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
     #[test]
