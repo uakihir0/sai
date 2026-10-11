@@ -358,6 +358,209 @@ fn if_expression_document(
     Ok(Doc::concat(documents))
 }
 
+fn match_expression_document(
+    source: &ParsedSource,
+    match_expr: &ast::MatchExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let scrutinee = match_expr
+        .scrutinee()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let arms = match_expr
+        .arms()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let match_children = match_expr.syntax().children().collect::<Vec<_>>();
+    if match_expr.syntax().children().count() != 2
+        || match_children[0].text_range() != scrutinee.syntax().text_range()
+        || match_children[1].text_range() != arms.syntax().text_range()
+        || direct_token_kinds(match_expr.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::MATCH_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let match_arms = arms.arms().collect::<Vec<_>>();
+    if arms.syntax().children().count() != match_arms.len()
+        || !match_arm_list_elements_match(&arms, &match_arms)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let list_group = GroupId(arms.syntax().text_range().start().raw());
+    let mut arm_documents = Vec::with_capacity(match_arms.len());
+    for (index, arm) in match_arms.iter().enumerate() {
+        arm_documents.push(match_arm_document(
+            source,
+            arm,
+            list_group,
+            index + 1 < match_arms.len(),
+            expression_group_ids,
+        )?);
+    }
+    let force_break = arm_documents
+        .iter()
+        .any(document_contains_unavoidable_forced_break);
+
+    Ok(Doc::concat([
+        Doc::text("match "),
+        expression_document(
+            source,
+            &scrutinee,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?,
+        Doc::text(" "),
+        brace_list_document_with_forced_break(list_group, arm_documents, force_break),
+    ]))
+}
+
+fn match_arm_list_elements_match(list: &ast::MatchArmList, arms: &[ast::MatchArm]) -> bool {
+    let elements = list.syntax().children_with_tokens().collect::<Vec<_>>();
+    let mut cursor = 0;
+    if !matches!(
+        elements.get(cursor),
+        Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::L_BRACE
+    ) {
+        return false;
+    }
+    cursor += 1;
+    while matches!(
+        elements.get(cursor),
+        Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::NEWLINE
+    ) {
+        cursor += 1;
+    }
+
+    for (index, arm) in arms.iter().enumerate() {
+        let arm_syntax = arm.syntax();
+        if !matches!(
+            elements.get(cursor),
+            Some(SyntaxElement::Node(node))
+                if node.kind() == SyntaxKind::MATCH_ARM
+                    && node.text_range() == arm_syntax.text_range()
+        ) {
+            return false;
+        }
+        cursor += 1;
+
+        let mut has_separator = false;
+        while matches!(
+            elements.get(cursor),
+            Some(SyntaxElement::Token(token))
+                if matches!(token.kind(), SyntaxKind::COMMA | SyntaxKind::NEWLINE)
+        ) {
+            has_separator = true;
+            cursor += 1;
+        }
+        if index + 1 < arms.len() && !has_separator {
+            return false;
+        }
+        if index + 1 == arms.len() {
+            break;
+        }
+    }
+
+    while matches!(
+        elements.get(cursor),
+        Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::NEWLINE
+    ) {
+        cursor += 1;
+    }
+    if !matches!(
+        elements.get(cursor),
+        Some(SyntaxElement::Token(token)) if token.kind() == SyntaxKind::R_BRACE
+    ) {
+        return false;
+    }
+    cursor += 1;
+    cursor == elements.len()
+}
+
+fn match_arm_document(
+    source: &ParsedSource,
+    arm: &ast::MatchArm,
+    list_group: GroupId,
+    has_following_arm: bool,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let pattern = arm.pattern().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let guard = arm.guard();
+    let expression = arm
+        .expression()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let arm_children = arm.syntax().children().collect::<Vec<_>>();
+    let expected_child_ranges = std::iter::once(pattern.syntax().text_range())
+        .chain(guard.as_ref().map(|guard| guard.syntax().text_range()))
+        .chain(std::iter::once(expression.syntax().text_range()))
+        .collect::<Vec<_>>();
+    if arm.syntax().children().count() != 2 + usize::from(guard.is_some())
+        || arm_children
+            .iter()
+            .map(|child| child.text_range())
+            .ne(expected_child_ranges)
+        || direct_token_kinds(arm.syntax())
+            .into_iter()
+            .filter(|kind| *kind != SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::FAT_ARROW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = vec![pattern_document(source, &pattern, expression_group_ids)?];
+    if let Some(guard) = guard {
+        let guard_expression = guard
+            .expression()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        if guard.syntax().children().count() != 1
+            || direct_token_kinds(guard.syntax())
+                .into_iter()
+                .filter(|kind| *kind != SyntaxKind::NEWLINE)
+                .collect::<Vec<_>>()
+                != [SyntaxKind::IF_KW]
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.extend([
+            Doc::text(" if "),
+            expression_document(
+                source,
+                &guard_expression,
+                ExpressionContext::Unprotected,
+                expression_group_ids,
+            )?,
+        ]);
+    }
+    documents.push(Doc::text(" =>"));
+
+    let body = expression_document(
+        source,
+        &expression,
+        ExpressionContext::Unprotected,
+        expression_group_ids,
+    )?;
+    let body = if has_following_arm && is_open_ended_range_expression(&expression) {
+        let parenthesized = right_hand_side_document_from_document(
+            &expression,
+            Doc::concat([Doc::text("("), body.clone(), Doc::text(")")]),
+            true,
+        );
+        let plain = right_hand_side_document_from_document(&expression, body, true);
+        Doc::if_broken(list_group, parenthesized, plain)
+    } else {
+        right_hand_side_document_from_document(&expression, body, true)
+    };
+    documents.push(body);
+    Ok(Doc::concat(documents))
+}
+
+fn is_open_ended_range_expression(expression: &Expr) -> bool {
+    matches!(expression, Expr::Range(range) if range.end().is_none())
+}
+
 fn condition_document(
     source: &ParsedSource,
     condition: &ast::Condition,
@@ -681,7 +884,7 @@ fn literal_pattern_document(
         [token] => {
             let literal = LiteralToken::cast((*token).clone())
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
-            Ok(Doc::text(normalize_literal(source, literal)?))
+            literal_document(source, literal)
         }
         [minus, integer]
             if minus.kind() == SyntaxKind::MINUS && integer.kind() == SyntaxKind::INT =>
@@ -690,7 +893,7 @@ fn literal_pattern_document(
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
             Ok(Doc::concat([
                 Doc::text("-"),
-                Doc::text(normalize_literal(source, integer)?),
+                literal_document(source, integer)?,
             ]))
         }
         _ => Err(SourceDocumentError::UnsupportedShape),
@@ -1308,6 +1511,7 @@ fn first_choice_layout(document: &Doc) -> Doc {
         Doc::Line => Doc::Line,
         Doc::SoftLine => Doc::SoftLine,
         Doc::HardLine => Doc::HardLine,
+        Doc::HardLineCrlf => Doc::HardLineCrlf,
         Doc::Indent(child) => Doc::indent(first_choice_layout(child)),
         Doc::Group(id, child) => Doc::group(*id, first_choice_layout(child)),
         Doc::IfBroken(id, broken, flat) => {
@@ -1320,6 +1524,7 @@ fn first_choice_layout(document: &Doc) -> Doc {
             .unwrap_or_else(|| Doc::choice([])),
         Doc::Flat(child) => Doc::flat(first_choice_layout(child)),
         Doc::Verbatim(text) => Doc::verbatim(text.clone()),
+        Doc::VerbatimExact(text) => Doc::VerbatimExact(text.clone()),
         Doc::Concat(documents) => Doc::concat(documents.iter().map(first_choice_layout)),
     }
 }
@@ -1547,7 +1752,16 @@ fn right_hand_side_document(
     allow_move: bool,
 ) -> Result<Doc, SourceDocumentError> {
     let document = expression_document(source, expression, context, expression_group_ids)?;
-    let inline = Doc::concat([Doc::text(" "), Doc::flat(document.clone())]);
+    Ok(right_hand_side_document_from_document(
+        expression, document, allow_move,
+    ))
+}
+
+fn right_hand_side_document_from_document(
+    expression: &Expr,
+    document: Doc,
+    allow_move: bool,
+) -> Doc {
     let block_like = matches!(
         expression.syntax().kind(),
         SyntaxKind::BLOCK_EXPR
@@ -1561,19 +1775,24 @@ fn right_hand_side_document(
             | SyntaxKind::CLOSURE_EXPR
             | SyntaxKind::REGION_EXPR
     );
-    let mut alternatives = vec![inline.clone()];
-    if !block_like && allow_move {
+    if block_like {
+        return Doc::concat([Doc::text(" "), document]);
+    }
+
+    let inline = Doc::concat([Doc::text(" "), Doc::flat(document.clone())]);
+    let mut alternatives = vec![inline];
+    if allow_move {
         alternatives.push(Doc::indent(Doc::concat([
             Doc::HardLine,
             Doc::flat(document.clone()),
         ])));
     }
     alternatives.push(Doc::concat([Doc::text(" "), document.clone()]));
-    if !block_like && allow_move {
+    if allow_move {
         alternatives.push(Doc::indent(Doc::concat([Doc::HardLine, document.clone()])));
     }
     alternatives.push(Doc::concat([Doc::text(" "), document]));
-    Ok(Doc::choice(alternatives))
+    Doc::choice(alternatives)
 }
 
 fn where_clause_document(
@@ -1786,7 +2005,7 @@ fn expression_document(
             let token = literal
                 .token()
                 .ok_or(SourceDocumentError::UnsupportedShape)?;
-            Ok(Doc::text(normalize_literal(source, token)?))
+            literal_document(source, token)
         }
         Expr::FormatString(format_string) => Ok(Doc::Verbatim(
             node_text(source, format_string.syntax()).to_owned(),
@@ -1844,6 +2063,9 @@ fn expression_document(
             async_block_expression_document(source, async_block, expression_group_ids)
         }
         Expr::If(if_expr) => if_expression_document(source, if_expr, expression_group_ids),
+        Expr::Match(match_expr) => {
+            match_expression_document(source, match_expr, expression_group_ids)
+        }
         Expr::Loop(loop_expr) => loop_expression_document(source, loop_expr, expression_group_ids),
         Expr::While(while_expr) => {
             while_expression_document(source, while_expr, expression_group_ids)
@@ -3079,7 +3301,7 @@ fn flat_document_width(document: &Doc) -> Option<usize> {
             Doc::Text(text) => text.chars().count(),
             Doc::Line => 1,
             Doc::SoftLine | Doc::LineSuffix(_) => 0,
-            Doc::HardLine => return None,
+            Doc::HardLine | Doc::HardLineCrlf => return None,
             Doc::Indent(child) | Doc::Group(_, child) | Doc::Flat(child) => {
                 pending.push(child);
                 continue;
@@ -3094,6 +3316,8 @@ fn flat_document_width(document: &Doc) -> Option<usize> {
             }
             Doc::Verbatim(text) if !text.contains(['\r', '\n']) => text.chars().count(),
             Doc::Verbatim(_) => return None,
+            Doc::VerbatimExact(text) if !text.contains(['\r', '\n']) => text.chars().count(),
+            Doc::VerbatimExact(_) => return None,
             Doc::Concat(documents) => {
                 pending.extend(documents.iter().rev());
                 continue;
@@ -3634,9 +3858,36 @@ fn effect_set_document(
 }
 
 fn brace_list_document(group: GroupId, items: Vec<Doc>) -> Doc {
+    brace_list_document_with_forced_break(group, items, false)
+}
+
+fn brace_list_document_with_forced_break(
+    group: GroupId,
+    items: Vec<Doc>,
+    force_break: bool,
+) -> Doc {
     if items.is_empty() {
         return Doc::text("{}");
     }
+    if force_break {
+        let mut contents = vec![Doc::HardLine];
+        for (index, item) in items.into_iter().enumerate() {
+            if index > 0 {
+                contents.push(Doc::HardLine);
+            }
+            contents.push(item);
+        }
+        return Doc::group(
+            group,
+            Doc::concat([
+                Doc::text("{"),
+                Doc::indent(Doc::concat(contents)),
+                Doc::HardLine,
+                Doc::text("}"),
+            ]),
+        );
+    }
+
     let mut contents = Vec::with_capacity(items.len() * 2 + 1);
     contents.push(Doc::Line);
     for (index, item) in items.into_iter().enumerate() {
@@ -3725,6 +3976,138 @@ fn normalize_literal(
         | LiteralToken::True(_)
         | LiteralToken::False(_) => text.to_owned(),
     })
+}
+
+fn literal_document(
+    source: &ParsedSource,
+    literal: LiteralToken,
+) -> Result<Doc, SourceDocumentError> {
+    let text = token_text(source, literal.syntax())?;
+    if !text.contains(['\n', '\r']) {
+        return normalize_literal(source, literal).map(Doc::text);
+    }
+    match literal {
+        LiteralToken::String(_) if text.starts_with("\"\"\"") => multiline_string_document(text),
+        LiteralToken::String(_) if text.starts_with('r') => Ok(Doc::VerbatimExact(text.to_owned())),
+        LiteralToken::String(_) if !text.starts_with('r') => continued_string_document(text),
+        LiteralToken::ByteString(_) => Ok(Doc::VerbatimExact(text.to_owned())),
+        _ => Err(SourceDocumentError::UnsupportedShape),
+    }
+}
+
+fn multiline_string_document(text: &str) -> Result<Doc, SourceDocumentError> {
+    let lines = split_string_lines(text);
+    if lines.len() < 2 || lines[0].0 != "\"\"\"" || lines[0].1.is_empty() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let (closing_line, closing_ending) = lines
+        .last()
+        .copied()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let base_indent_length =
+        closing_line.len() - closing_line.trim_start_matches([' ', '\t']).len();
+    let base_indent = &closing_line[..base_indent_length];
+    if &closing_line[base_indent_length..] != "\"\"\"" || !closing_ending.is_empty() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = vec![Doc::Verbatim(lines[0].0.to_owned())];
+    for index in 1..lines.len() - 1 {
+        let (line, _) = lines[index];
+        let previous_ending = lines[index - 1].1;
+        if line.is_empty() || line == base_indent {
+            documents.push(string_line_break(previous_ending, None)?);
+        } else {
+            let content = line
+                .strip_prefix(base_indent)
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            documents.push(string_line_break(previous_ending, Some(content))?);
+        }
+    }
+    documents.push(string_line_break(lines[lines.len() - 2].1, Some("\"\"\""))?);
+    Ok(Doc::concat(documents))
+}
+
+fn continued_string_document(text: &str) -> Result<Doc, SourceDocumentError> {
+    let lines = split_string_lines(text);
+    if lines.len() < 2 {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::Verbatim(lines[0].0.to_owned())];
+    for index in 1..lines.len() {
+        if !lines[index - 1].0.ends_with('\\') || lines[index - 1].1.is_empty() {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let content = lines[index].0.trim_start_matches([' ', '\t']);
+        documents.push(Doc::indent(Doc::concat([
+            Doc::HardLine,
+            Doc::Verbatim(content.to_owned()),
+        ])));
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn split_string_lines(text: &str) -> Vec<(&str, &str)> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for (line_feed, character) in text.char_indices() {
+        if character != '\n' {
+            continue;
+        }
+        let content_end = if line_feed > line_start && text.as_bytes()[line_feed - 1] == b'\r' {
+            line_feed - 1
+        } else {
+            line_feed
+        };
+        lines.push((
+            &text[line_start..content_end],
+            &text[content_end..line_feed + 1],
+        ));
+        line_start = line_feed + 1;
+    }
+    if line_start < text.len() || lines.is_empty() {
+        lines.push((&text[line_start..], ""));
+    }
+    lines
+}
+
+fn string_line_break(ending: &str, content: Option<&str>) -> Result<Doc, SourceDocumentError> {
+    let line_break = match ending {
+        "\n" => Doc::HardLine,
+        "\r\n" => Doc::HardLineCrlf,
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    match content {
+        Some(content) => Ok(Doc::indent(Doc::concat([
+            line_break,
+            Doc::Verbatim(content.to_owned()),
+        ]))),
+        None => Ok(line_break),
+    }
+}
+
+fn document_contains_unavoidable_forced_break(document: &Doc) -> bool {
+    match document {
+        Doc::HardLine | Doc::HardLineCrlf => true,
+        Doc::Verbatim(text) | Doc::VerbatimExact(text) => text.contains(['\n', '\r']),
+        Doc::Concat(documents) => documents
+            .iter()
+            .any(document_contains_unavoidable_forced_break),
+        Doc::Indent(child) | Doc::Group(_, child) | Doc::Flat(child) | Doc::LineSuffix(child) => {
+            document_contains_unavoidable_forced_break(child)
+        }
+        Doc::IfBroken(_, broken, flat) => {
+            document_contains_unavoidable_forced_break(broken)
+                && document_contains_unavoidable_forced_break(flat)
+        }
+        Doc::Choice(alternatives) => {
+            !alternatives.is_empty()
+                && alternatives
+                    .iter()
+                    .all(document_contains_unavoidable_forced_break)
+        }
+        Doc::Text(_) | Doc::Line | Doc::SoftLine => false,
+    }
 }
 
 #[cfg(test)]
@@ -5059,6 +5442,299 @@ mod tests {
     }
 
     #[test]
+    fn formats_match_expressions_and_guarded_arms() {
+        for (input, expected) in [
+            (
+                b"fn f(){match value{.Ready=>1,_=>0}}".as_slice(),
+                "fn f() {\n    match value { .Ready => 1, _ => 0 }\n}\n",
+            ),
+            (
+                b"fn f(){match value{.Ready=>1,}}",
+                "fn f() {\n    match value { .Ready => 1 }\n}\n",
+            ),
+            (
+                b"fn f(){match value{.Ready if ready=>work(),_=>fallback()}}",
+                "fn f() {\n    match value { .Ready if ready => work(), _ => fallback() }\n}\n",
+            ),
+            (
+                b"fn f(){match value{Some((left,right))=>consume(left)}}",
+                "fn f() {\n    match value { Some((left, right)) => consume(left) }\n}\n",
+            ),
+            (
+                b"fn f(){match value{|.Ready|.Other=>work()}}",
+                "fn f() {\n    match value { .Ready | .Other => work() }\n}\n",
+            ),
+            (
+                b"fn f(){match value{}}",
+                "fn f() {\n    match value {}\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("match expression parses");
+            let output = format_shape(input).expect("match expression is supported");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted match parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+
+        let left = format!("left_{}", "a".repeat(43));
+        let right = format!("right_{}", "b".repeat(42));
+        let input = format!("fn f(){{match {left} or {right}{{_=>1}}}}");
+        let expected = format!(
+            "fn f() {{\n    match (\n        {left}\n        or {right}\n    ) {{ _ => 1 }}\n}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("long match scrutinee parses");
+        let output = format_shape(input.as_bytes()).expect("long match scrutinee formats");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("formatted scrutinee parses");
+        assert_eq!(
+            match_scrutinee_shape(parsed.root()),
+            match_scrutinee_shape(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn moves_a_long_match_arm_rhs_to_the_following_line() {
+        let text = format!("\"{}\"", "x".repeat(86));
+        let input = format!("fn f(){{match value{{_=>{text}}}}}");
+        let expected = format!(
+            "fn f() {{\n    match value {{\n        _ =>\n            {text}\n    }}\n}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("long match arm parses");
+        let output = format_shape(input.as_bytes()).expect("long match arm is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("moved match arm parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_match_arm_lists_for_nested_forced_blocks() {
+        let input = b"fn f(){match x{_=>consume(if ready {a()}else{b()}),.Other=>0}}";
+        let parsed = parse_source(input).expect("nested forced-block match parses");
+        let output = format_shape(input).expect("nested forced-block match formats");
+        assert_eq!(
+            output,
+            concat!(
+                "fn f() {\n",
+                "    match x {\n",
+                "        _ => consume(\n",
+                "            if ready {\n",
+                "                a()\n",
+                "            } else {\n",
+                "                b()\n",
+                "            },\n",
+                "        )\n",
+                "        .Other => 0\n",
+                "    }\n",
+                "}\n",
+            )
+        );
+        let reparsed = parse_source(output.as_bytes()).expect("formatted match parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_match_arm_lists_and_protects_nonfinal_open_ranges() {
+        let first = format!(".Variant{}", "A".repeat(34));
+        let second = format!(".Variant{}", "B".repeat(34));
+        let input = format!(
+            "fn f(){{match value{{{first}=>1,{second}=>2}}\nmatch value{{_=>10..,.Other=>{{work()}}}}\nmatch value{{_=>{{work()}},.Other=>20..}}\nmatch value{{_=>..,.Other=>{{work()}}}}}}"
+        );
+        let expected = format!(
+            concat!(
+                "fn f() {{\n",
+                "    match value {{\n",
+                "        {first} => 1\n",
+                "        {second} => 2\n",
+                "    }}\n",
+                "    match value {{\n",
+                "        _ => (10..)\n",
+                "        .Other => {{\n",
+                "            work()\n",
+                "        }}\n",
+                "    }}\n",
+                "    match value {{\n",
+                "        _ => {{\n",
+                "            work()\n",
+                "        }}\n",
+                "        .Other => 20..\n",
+                "    }}\n",
+                "    match value {{\n",
+                "        _ => (..)\n",
+                "        .Other => {{\n",
+                "            work()\n",
+                "        }}\n",
+                "    }}\n",
+                "}}\n",
+            ),
+            first = first,
+            second = second,
+        );
+        let parsed = parse_source(input.as_bytes()).expect("broken match input parses");
+        let output = format_shape(input.as_bytes()).expect("broken match lists are supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        let reparsed = parse_source(output.as_bytes()).expect("broken match output parses");
+        assert_eq!(
+            syntax_shape(parsed.root()),
+            syntax_shape_with_match_range_parentheses_removed(reparsed.root())
+        );
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn reindents_multiline_strings_in_match_arms_and_breaks_the_list() {
+        for (input, expected) in [
+            (
+                concat!(
+                    "fn f(){match value{.Pending=>\"\"\"\n",
+                    "        pending\n",
+                    "        \"\"\"\n",
+                    ".Other=>0}}",
+                ),
+                concat!(
+                    "fn f() {\n",
+                    "    match value {\n",
+                    "        .Pending => \"\"\"\n",
+                    "            pending\n",
+                    "            \"\"\"\n",
+                    "        .Other => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                concat!(
+                    "fn f(){match value{_=>\"first\\\n",
+                    "        second\",.Other=>0}}",
+                ),
+                concat!(
+                    "fn f() {\n",
+                    "    match value {\n",
+                    "        _ => \"first\\\n",
+                    "            second\"\n",
+                    "        .Other => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                concat!(
+                    "fn f(){match value{_=>b\"first\\\n",
+                    "        second\",.Other=>0}}",
+                ),
+                concat!(
+                    "fn f() {\n",
+                    "    match value {\n",
+                    "        _ => b\"first\\\n",
+                    "        second\"\n",
+                    "        .Other => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                concat!(
+                    "fn f(){match value{.Pending=>\"\"\"\r\n",
+                    "        first\r\n",
+                    "        second\r\n",
+                    "        \"\"\"\n",
+                    ".Other=>0}}",
+                ),
+                concat!(
+                    "fn f() {\n",
+                    "    match value {\n",
+                    "        .Pending => \"\"\"\r\n",
+                    "            first\r\n",
+                    "            second\r\n",
+                    "            \"\"\"\n",
+                    "        .Other => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                concat!(
+                    "fn f(){match value{_=>r#\"first\n",
+                    "      second\"#,.Other=>0}}",
+                ),
+                concat!(
+                    "fn f() {\n",
+                    "    match value {\n",
+                    "        _ => r#\"first\n",
+                    "      second\"#\n",
+                    "        .Other => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                concat!(
+                    "fn f(){match value{_=>br#\"first\n",
+                    "  second\"#,.Other=>0}}",
+                ),
+                concat!(
+                    "fn f() {\n",
+                    "    match value {\n",
+                    "        _ => br#\"first\n",
+                    "  second\"#\n",
+                    "        .Other => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ] {
+            let parsed = parse_source(input.as_bytes()).expect("multiline match parses");
+            let output = format_shape(input.as_bytes()).expect("multiline string formats");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted string reparses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn raw_crlf_string_width_excludes_the_carriage_return() {
+        let content = "A".repeat(84);
+        let input = format!("fn f(){{match x{{_=>r#\"{content}\r\nnext\"#,.Other=>0}}}}");
+        let first_line = format!("        _ => r#\"{content}");
+        assert_eq!(first_line.chars().count(), 100);
+        let expected = format!(
+            "fn f() {{\n    match x {{\n{first_line}\r\nnext\"#\n        .Other => 0\n    }}\n}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("raw CRLF match parses");
+        let output = format_shape(input.as_bytes()).expect("raw CRLF match formats");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted raw CRLF parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn triple_quoted_crlf_string_width_excludes_the_carriage_return() {
+        let name = "a".repeat(85);
+        let input = format!(
+            "fn f(){{match x{{{name}=>\"\"\"\r\n        x\r\n        \"\"\"\r\n.Other=>0}}}}"
+        );
+        let first_line = format!("        {name} => \"\"\"");
+        assert_eq!(first_line.chars().count(), 100);
+        let expected = format!(
+            "fn f() {{\n    match x {{\n{first_line}\r\n            x\r\n            \"\"\"\n        .Other => 0\n    }}\n}}\n"
+        );
+        let parsed = parse_source(input.as_bytes()).expect("triple CRLF match parses");
+        let output = format_shape(input.as_bytes()).expect("triple CRLF match formats");
+        assert_eq!(output, expected);
+        let reparsed = parse_source(output.as_bytes()).expect("formatted triple CRLF parses");
+        assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
     fn formats_if_let_conditions_with_patterns() {
         for (input, expected) in [
             (
@@ -5729,11 +6405,64 @@ mod tests {
     }
 
     fn syntax_shape(root: &SyntaxNode) -> Vec<ShapeElement> {
+        syntax_shape_impl(root, false)
+    }
+
+    fn match_scrutinee_shape(root: &SyntaxNode) -> Vec<ShapeElement> {
+        let match_expr = root
+            .descendants()
+            .filter_map(Expr::cast)
+            .find_map(|expression| match expression {
+                Expr::Match(match_expr) => Some(match_expr),
+                _ => None,
+            })
+            .expect("match expression exists");
+        let scrutinee = match_expr.scrutinee().expect("match scrutinee exists");
+        match scrutinee {
+            Expr::Paren(paren) => {
+                let inner = paren.expression().expect("scrutinee expression exists");
+                syntax_shape(inner.syntax())
+            }
+            expression => syntax_shape(expression.syntax()),
+        }
+    }
+
+    fn syntax_shape_with_match_range_parentheses_removed(root: &SyntaxNode) -> Vec<ShapeElement> {
+        syntax_shape_impl(root, true)
+    }
+
+    fn syntax_shape_impl(
+        root: &SyntaxNode,
+        remove_open_range_parentheses: bool,
+    ) -> Vec<ShapeElement> {
         let mut shape = Vec::new();
         let mut pending = vec![Work::Node(root.clone())];
         while let Some(work) = pending.pop() {
             match work {
                 Work::Node(node) => {
+                    if remove_open_range_parentheses
+                        && node.kind() == SyntaxKind::PAREN_EXPR
+                        && node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == SyntaxKind::MATCH_ARM)
+                        && matches!(
+                            Expr::cast(node.clone()),
+                            Some(Expr::Paren(paren))
+                                if matches!(
+                                    paren.expression(),
+                                    Some(Expr::Range(range)) if range.end().is_none()
+                                )
+                        )
+                    {
+                        let inner = match Expr::cast(node) {
+                            Some(Expr::Paren(paren)) => {
+                                paren.expression().expect("parenthesized range exists")
+                            }
+                            _ => unreachable!("the node is a parenthesized expression"),
+                        };
+                        pending.push(Work::Node(inner.syntax().clone()));
+                        continue;
+                    }
                     shape.push(ShapeElement::NodeStart(node.kind()));
                     pending.push(Work::NodeEnd);
                     let mut elements = node.children_with_tokens().collect::<Vec<_>>();
@@ -5809,6 +6538,10 @@ mod tests {
                         let text = match token.kind() {
                             SyntaxKind::INT => super::normalize_integer_literal(token.text()),
                             SyntaxKind::FLOAT => token.text().replace('E', "e"),
+                            SyntaxKind::STRING if token.text().contains(['\n', '\r']) => {
+                                normalized_string_value(token.text())
+                                    .unwrap_or_else(|| token.text().to_owned())
+                            }
                             _ => token.text().to_owned(),
                         };
                         shape.push(ShapeElement::Token(token.kind(), text));
@@ -5818,6 +6551,48 @@ mod tests {
             }
         }
         shape
+    }
+
+    fn normalized_string_value(text: &str) -> Option<String> {
+        let lines = super::split_string_lines(text);
+        if !text.starts_with("\"\"\"") {
+            if lines.len() < 2 || text.starts_with('r') {
+                return None;
+            }
+            let mut value = lines.first()?.0.to_string();
+            for line in lines.iter().skip(1) {
+                if !value.ends_with('\\') {
+                    return None;
+                }
+                value.pop();
+                value.push_str(line.0.trim_start_matches([' ', '\t']));
+            }
+            return Some(value);
+        }
+
+        if lines.len() < 2 || lines.first()?.0 != "\"\"\"" {
+            return None;
+        }
+        let closing_line = lines.last()?.0;
+        let base_indent_length =
+            closing_line.len() - closing_line.trim_start_matches([' ', '\t']).len();
+        let base_indent = &closing_line[..base_indent_length];
+        if &closing_line[base_indent_length..] != "\"\"\"" {
+            return None;
+        }
+        let mut value_lines = Vec::with_capacity(lines.len().saturating_sub(2));
+        for index in 1..lines.len() - 1 {
+            let line = lines[index].0;
+            if line.is_empty() || line == base_indent {
+                value_lines.push("");
+            } else {
+                value_lines.push(line.strip_prefix(base_indent)?);
+            }
+            if index + 1 < lines.len() - 1 {
+                value_lines.push(lines[index].1);
+            }
+        }
+        Some(value_lines.concat())
     }
 
     fn contract_expression_shape(root: &SyntaxNode) -> Vec<ShapeElement> {

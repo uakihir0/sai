@@ -25,6 +25,8 @@ pub enum Doc {
     Line,
     SoftLine,
     HardLine,
+    /// A forced line break that preserves a CRLF source line ending.
+    HardLineCrlf,
     Indent(Box<Doc>),
     Group(GroupId, Box<Doc>),
     IfBroken(GroupId, Box<Doc>, Box<Doc>),
@@ -32,6 +34,8 @@ pub enum Doc {
     Choice(Vec<Doc>),
     Flat(Box<Doc>),
     Verbatim(String),
+    /// Verbatim token text whose internal indentation is part of its value.
+    VerbatimExact(String),
     Concat(Vec<Doc>),
 }
 
@@ -122,6 +126,9 @@ struct Command<'a> {
 enum Action<'a> {
     Doc(&'a Doc),
     VerbatimSegment(&'a str),
+    CarriageReturnLineBreak {
+        next_indent: Option<usize>,
+    },
     InternalLineBreak {
         indent: usize,
         next_indent: Option<usize>,
@@ -647,6 +654,22 @@ impl<'a> Renderer<'a> {
                     }
                     continue;
                 }
+                Action::CarriageReturnLineBreak { next_indent } => {
+                    if self.pending_suffixes.is_empty() {
+                        if let Some(result) = self.choice_fit_at_line_break(command.choice_trial) {
+                            return Ok(RenderEvent::TrialFinished(result));
+                        }
+                        self.trim_trailing_spaces();
+                        self.output.push('\r');
+                        self.emit_line_break(next_indent);
+                    } else {
+                        self.stack.push(command);
+                        for suffix in self.pending_suffixes.drain(..).rev() {
+                            self.stack.push(suffix);
+                        }
+                    }
+                    continue;
+                }
                 Action::InternalLineBreak {
                     indent,
                     next_indent,
@@ -677,6 +700,9 @@ impl<'a> Renderer<'a> {
                 Doc::Verbatim(text) => {
                     self.push_verbatim_segments(text, command.indent, command.choice_trial)
                 }
+                Doc::VerbatimExact(text) => {
+                    self.push_verbatim_exact_segments(text, command.indent, command.choice_trial)
+                }
                 Doc::Concat(docs) => {
                     self.push_docs(docs, command.indent, command.mode, command.choice_trial);
                 }
@@ -697,6 +723,14 @@ impl<'a> Renderer<'a> {
                         Some(command.indent),
                         command.choice_trial,
                     );
+                }
+                Doc::HardLineCrlf => {
+                    self.stack.push(Command {
+                        action: Action::CarriageReturnLineBreak {
+                            next_indent: Some(command.indent),
+                        },
+                        ..command
+                    });
                 }
                 Doc::Group(id, doc) => {
                     let mode = self.group_mode(*id, doc, command)?;
@@ -1082,6 +1116,48 @@ impl<'a> Renderer<'a> {
             }));
     }
 
+    fn push_verbatim_exact_segments(
+        &mut self,
+        text: &'a str,
+        indent: usize,
+        choice_trial: Option<u64>,
+    ) {
+        let lines = text.split('\n').collect::<Vec<_>>();
+        let mut actions = Vec::with_capacity(lines.len().saturating_mul(2));
+        for (index, line) in lines.iter().enumerate() {
+            let (line, is_crlf) = if index + 1 < lines.len() {
+                line.strip_suffix('\r')
+                    .map_or((*line, false), |line| (line, true))
+            } else {
+                (*line, false)
+            };
+            if !line.is_empty() {
+                actions.push((
+                    Action::VerbatimSegment(line),
+                    if index == 0 { indent } else { 0 },
+                ));
+            }
+            if index + 1 < lines.len() {
+                let action = if is_crlf {
+                    Action::CarriageReturnLineBreak { next_indent: None }
+                } else {
+                    Action::InternalLineBreak {
+                        indent: 0,
+                        next_indent: None,
+                    }
+                };
+                actions.push((action, 0));
+            }
+        }
+        self.stack
+            .extend(actions.into_iter().rev().map(|(action, indent)| Command {
+                indent,
+                mode: Mode::Break,
+                choice_trial,
+                action,
+            }));
+    }
+
     fn emit_pending_indent(&mut self) {
         if let Some(indent) = self.pending_indent.take() {
             self.output.extend(std::iter::repeat_n(' ', indent));
@@ -1136,8 +1212,13 @@ fn collect_forced_groups(root: &Doc, explicitly_forced: &[GroupId]) -> BTreeSet<
 
     while let Some((doc, ancestors)) = stack.pop() {
         match doc {
-            Doc::HardLine => mark_ancestors(ancestors.as_deref(), &mut forced),
+            Doc::HardLine | Doc::HardLineCrlf => {
+                mark_ancestors(ancestors.as_deref(), &mut forced);
+            }
             Doc::Verbatim(text) if text.contains(['\n', '\r']) => {
+                mark_ancestors(ancestors.as_deref(), &mut forced);
+            }
+            Doc::VerbatimExact(text) if text.contains(['\n', '\r']) => {
                 mark_ancestors(ancestors.as_deref(), &mut forced);
             }
             Doc::LineSuffix(child) => {
@@ -1165,7 +1246,8 @@ fn collect_forced_groups(root: &Doc, explicitly_forced: &[GroupId]) -> BTreeSet<
                 stack.push((broken, ancestors.clone()));
                 stack.push((flat, ancestors));
             }
-            Doc::Text(_) | Doc::Line | Doc::SoftLine | Doc::Verbatim(_) => {}
+            Doc::Text(_) | Doc::Line | Doc::SoftLine | Doc::Verbatim(_) | Doc::VerbatimExact(_) => {
+            }
         }
     }
 
@@ -1198,7 +1280,13 @@ fn contains_forced_flat(root: &Doc, forced: &BTreeSet<GroupId>) -> bool {
                 stack.push(flat);
             }
             Doc::Choice(_) => {}
-            Doc::Text(_) | Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::Verbatim(_) => {}
+            Doc::Text(_)
+            | Doc::Line
+            | Doc::SoftLine
+            | Doc::HardLine
+            | Doc::HardLineCrlf
+            | Doc::Verbatim(_)
+            | Doc::VerbatimExact(_) => {}
         }
     }
     false
@@ -1208,8 +1296,9 @@ fn contains_forced_content_before_choice(root: &Doc, forced: &BTreeSet<GroupId>)
     let mut stack = vec![root];
     while let Some(doc) = stack.pop() {
         match doc {
-            Doc::HardLine => return true,
+            Doc::HardLine | Doc::HardLineCrlf => return true,
             Doc::Verbatim(text) if text.contains(['\n', '\r']) => return true,
+            Doc::VerbatimExact(text) if text.contains(['\n', '\r']) => return true,
             Doc::Group(id, child) => {
                 if forced.contains(id) {
                     return true;
@@ -1223,7 +1312,8 @@ fn contains_forced_content_before_choice(root: &Doc, forced: &BTreeSet<GroupId>)
                 stack.push(flat);
             }
             Doc::Choice(_) => {}
-            Doc::Text(_) | Doc::Line | Doc::SoftLine | Doc::Verbatim(_) => {}
+            Doc::Text(_) | Doc::Line | Doc::SoftLine | Doc::Verbatim(_) | Doc::VerbatimExact(_) => {
+            }
         }
     }
     false
@@ -1248,7 +1338,13 @@ fn collect_if_broken_group_ids(root: &Doc) -> BTreeSet<GroupId> {
             | Doc::Group(_, child)
             | Doc::LineSuffix(child)
             | Doc::Flat(child) => pending.push(child),
-            Doc::Text(_) | Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::Verbatim(_) => {}
+            Doc::Text(_)
+            | Doc::Line
+            | Doc::SoftLine
+            | Doc::HardLine
+            | Doc::HardLineCrlf
+            | Doc::Verbatim(_)
+            | Doc::VerbatimExact(_) => {}
         }
     }
     group_ids
@@ -1402,6 +1498,33 @@ fn make_fit_frame<'a>(
     }
 }
 
+fn verbatim_fit_step<'a>(
+    frame: &mut FitFrame<'a>,
+    command: Command<'a>,
+    region: FitRegion,
+    width: usize,
+    has_line_break: bool,
+) -> Result<FitStep<'a>, PrintError> {
+    if !has_line_break {
+        return consume_width(frame, width);
+    }
+    if width > frame.remaining {
+        Ok(FitStep::Done(false))
+    } else if region != FitRegion::Candidate && !frame.deferred_suffixes.is_empty() {
+        frame.remaining -= width;
+        let line_break = FitCommand {
+            command: Command {
+                action: Action::LineBreak { next_indent: None },
+                ..command
+            },
+            region,
+        };
+        Ok(end_fit_at_line_break(frame, line_break))
+    } else {
+        Ok(FitStep::Done(true))
+    }
+}
+
 fn fit_step<'a>(
     frame: &mut FitFrame<'a>,
     forced: &BTreeSet<GroupId>,
@@ -1451,7 +1574,9 @@ fn fit_step<'a>(
     };
     match command.action {
         Action::ChoiceEnd(_) => Ok(FitStep::Continue),
-        Action::InternalLineBreak { .. } | Action::LineBreak { .. } => {
+        Action::CarriageReturnLineBreak { .. }
+        | Action::InternalLineBreak { .. }
+        | Action::LineBreak { .. } => {
             Ok(end_fit_at_line_break(frame, FitCommand { command, region }))
         }
         Action::VerbatimSegment(text) => consume_width(frame, text.chars().count()),
@@ -1464,27 +1589,28 @@ fn fit_step<'a>(
             }
             Doc::Verbatim(text) => {
                 let first_line = text.split(['\n', '\r']).next().unwrap_or_default();
-                let width = first_line.chars().count();
-                if first_line.len() != text.len() {
-                    if width > frame.remaining {
-                        Ok(FitStep::Done(false))
-                    } else if region != FitRegion::Candidate && !frame.deferred_suffixes.is_empty()
-                    {
-                        frame.remaining -= width;
-                        let line_break = FitCommand {
-                            command: Command {
-                                action: Action::LineBreak { next_indent: None },
-                                ..command
-                            },
-                            region,
-                        };
-                        Ok(end_fit_at_line_break(frame, line_break))
-                    } else {
-                        Ok(FitStep::Done(true))
-                    }
+                verbatim_fit_step(
+                    frame,
+                    command,
+                    region,
+                    first_line.chars().count(),
+                    first_line.len() != text.len(),
+                )
+            }
+            Doc::VerbatimExact(text) => {
+                let first_line = text.split('\n').next().unwrap_or_default();
+                let first_line = if text.contains('\n') {
+                    first_line.strip_suffix('\r').unwrap_or(first_line)
                 } else {
-                    consume_width(frame, width)
-                }
+                    first_line
+                };
+                verbatim_fit_step(
+                    frame,
+                    command,
+                    region,
+                    first_line.chars().count(),
+                    text.contains('\n'),
+                )
             }
             Doc::Concat(docs) => {
                 let key = ConcatExpansionKey {
@@ -1529,7 +1655,7 @@ fn fit_step<'a>(
             }
             Doc::Line if command.mode == Mode::Flat => consume_width(frame, 1),
             Doc::SoftLine if command.mode == Mode::Flat => Ok(FitStep::Continue),
-            Doc::Line | Doc::SoftLine | Doc::HardLine => {
+            Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::HardLineCrlf => {
                 Ok(end_fit_at_line_break(frame, FitCommand { command, region }))
             }
             Doc::Group(id, child)
@@ -1764,7 +1890,9 @@ fn queue_deferred_suffixes<'a>(path: &mut LeadingPath<'a>, continuation: Leading
             Action::VerbatimSegment(text) => {
                 path.stack.push(LeadingCommand::Verbatim(text));
             }
-            Action::InternalLineBreak { .. } | Action::LineBreak { .. } => {
+            Action::CarriageReturnLineBreak { .. }
+            | Action::InternalLineBreak { .. }
+            | Action::LineBreak { .. } => {
                 path.stack.push(LeadingCommand::LineBreak);
             }
             Action::ChoiceEnd(_) => {}
@@ -1804,7 +1932,8 @@ fn is_trivially_empty(doc: &Doc) -> bool {
     let mut pending = vec![doc];
     while let Some(doc) = pending.pop() {
         match doc {
-            Doc::Text(text) | Doc::Verbatim(text) if text.is_empty() => {}
+            Doc::Text(text) | Doc::Verbatim(text) | Doc::VerbatimExact(text) if text.is_empty() => {
+            }
             Doc::Concat(children) => pending.extend(children),
             Doc::Indent(child) | Doc::Flat(child) | Doc::LineSuffix(child) => pending.push(child),
             _ => return false,
@@ -1867,8 +1996,8 @@ fn leading_step<'a>(
                 Doc::Text(_) => {
                     frame.paths.pop();
                 }
-                Doc::Verbatim(text) if text.is_empty() => {}
-                Doc::Verbatim(text) => {
+                Doc::Verbatim(text) | Doc::VerbatimExact(text) if text.is_empty() => {}
+                Doc::Verbatim(text) | Doc::VerbatimExact(text) => {
                     if text.starts_with('\n') || text.starts_with('\r') {
                         if path.deferred_suffixes.is_empty() {
                             return Ok(LeadingStep::Done(true));
@@ -1878,7 +2007,7 @@ fn leading_step<'a>(
                         frame.paths.pop();
                     }
                 }
-                Doc::HardLine => {
+                Doc::HardLine | Doc::HardLineCrlf => {
                     if path.deferred_suffixes.is_empty() {
                         return Ok(LeadingStep::Done(true));
                     }
@@ -2089,6 +2218,15 @@ mod tests {
             print(&Doc::concat([Doc::text("a"), Doc::HardLine, Doc::HardLine])).unwrap(),
             "a\n"
         );
+    }
+
+    #[test]
+    fn crlf_line_break_trims_generated_spaces_and_preserves_verbatim_spaces() {
+        let generated = Doc::concat([Doc::text("a "), Doc::HardLineCrlf, Doc::text("b")]);
+        assert_eq!(print(&generated).unwrap(), "a\r\nb\n");
+
+        let verbatim = Doc::VerbatimExact("a \r\nb".to_owned());
+        assert_eq!(print(&verbatim).unwrap(), "a \r\nb\n");
     }
 
     #[test]
