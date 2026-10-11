@@ -325,7 +325,7 @@ fn if_expression_document(
 
     let mut documents = vec![
         Doc::text("if "),
-        condition_expression_document(source, &condition, expression_group_ids)?,
+        condition_document(source, &condition, expression_group_ids)?,
         Doc::text(" "),
         block_document(source, &then_branch, expression_group_ids)?,
     ];
@@ -358,26 +358,59 @@ fn if_expression_document(
     Ok(Doc::concat(documents))
 }
 
-fn condition_expression_document(
+fn condition_document(
     source: &ParsedSource,
     condition: &ast::Condition,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
-    let expression = condition
-        .expression()
+    let condition_tokens = direct_token_kinds(condition.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if condition.syntax().children().count() != 1 || !condition_tokens.is_empty() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    if let Some(expression) = condition.expression() {
+        if condition.let_condition().is_some() {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        return expression_document(
+            source,
+            &expression,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        );
+    }
+
+    let let_condition = condition
+        .let_condition()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    if condition.let_condition().is_some()
-        || condition.syntax().children().count() != 1
-        || !direct_token_kinds(condition.syntax()).is_empty()
+    let pattern = let_condition
+        .pattern()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let initializer = let_condition
+        .initializer()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let let_tokens = direct_token_kinds(let_condition.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if let_condition.syntax().children().count() != 2
+        || let_tokens != [SyntaxKind::LET_KW, SyntaxKind::EQ]
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    expression_document(
-        source,
-        &expression,
-        ExpressionContext::Unprotected,
-        expression_group_ids,
-    )
+    Ok(Doc::concat([
+        Doc::text("let "),
+        simple_binding_pattern_document(source, &pattern)?,
+        Doc::text(" = "),
+        expression_document(
+            source,
+            &initializer,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?,
+    ]))
 }
 
 fn loop_label_document(label: &ast::LoopLabel) -> Result<Doc, SourceDocumentError> {
@@ -455,14 +488,14 @@ fn while_expression_document(
     }
     documents.extend([
         Doc::text("while "),
-        condition_expression_document(source, &condition, expression_group_ids)?,
+        condition_document(source, &condition, expression_group_ids)?,
         Doc::text(" "),
         block_document(source, &body, expression_group_ids)?,
     ]);
     Ok(Doc::concat(documents))
 }
 
-fn for_pattern_document(
+fn simple_binding_pattern_document(
     source: &ParsedSource,
     pattern: &ast::Pattern,
 ) -> Result<Doc, SourceDocumentError> {
@@ -544,7 +577,7 @@ fn for_expression_document(
         documents.push(loop_label_document(&label)?);
     }
     documents.push(Doc::text(if is_await { "for await " } else { "for " }));
-    documents.push(for_pattern_document(source, &pattern)?);
+    documents.push(simple_binding_pattern_document(source, &pattern)?);
     documents.push(Doc::text(" in "));
     documents.push(expression_document(
         source,
@@ -4268,7 +4301,36 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_if_let_conditions_remain_fail_closed() {
+    fn formats_if_let_conditions_with_simple_patterns() {
+        for (input, expected) in [
+            (
+                b"fn f(){if let value=input {consume(value)}}".as_slice(),
+                "fn f() {\n    if let value = input {\n        consume(value)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let _=input {tick()}else{fallback()}}".as_slice(),
+                "fn f() {\n    if let _ = input {\n        tick()\n    } else {\n        fallback()\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let borrow mut value=next(){consume(value)}}".as_slice(),
+                "fn f() {\n    if let borrow mut value = next() {\n        consume(value)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){if let value=input {one()}else if ready{two()}else{three()}}".as_slice(),
+                "fn f() {\n    if let value = input {\n        one()\n    } else if ready {\n        two()\n    } else {\n        three()\n    }\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("if-let condition parses");
+            let output = format_shape(input).expect("simple if-let condition formats");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted if-let parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn keeps_if_let_conditions_with_unsupported_patterns_fail_closed() {
         assert_eq!(
             format_shape(b"fn f(){if let Some(value)=input {value}}"),
             Err(SourceDocumentError::UnsupportedShape)
@@ -4289,6 +4351,23 @@ mod tests {
         assert_eq!(output, expected);
         assert!(output.lines().all(|line| line.chars().count() <= 100));
         parse_source(output.as_bytes()).expect("wrapped condition reparses");
+        assert_eq!(format_shape(output.as_bytes()), Ok(output));
+    }
+
+    #[test]
+    fn breaks_long_if_let_initializers_with_parentheses() {
+        let left = format!("first_{}", "a".repeat(43));
+        let right = format!("second_{}", "b".repeat(42));
+        let input = format!("fn f(){{if let value={left} or {right}{{consume(value)}}}}");
+        let expected = format!(
+            "fn f() {{\n    if let value = (\n        {left}\n        or {right}\n    ) {{\n        consume(value)\n    }}\n}}\n"
+        );
+
+        parse_source(input.as_bytes()).expect("long if-let initializer parses");
+        let output = format_shape(input.as_bytes()).expect("long if-let initializer is supported");
+        assert_eq!(output, expected);
+        assert!(output.lines().all(|line| line.chars().count() <= 100));
+        parse_source(output.as_bytes()).expect("wrapped if-let initializer reparses");
         assert_eq!(format_shape(output.as_bytes()), Ok(output));
     }
 
@@ -4336,9 +4415,30 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_while_let_conditions_remain_fail_closed() {
+    fn formats_while_let_conditions_with_simple_patterns() {
+        for (input, expected) in [
+            (
+                b"fn f(){while let value=next() {consume(value)}}".as_slice(),
+                "fn f() {\n    while let value = next() {\n        consume(value)\n    }\n}\n",
+            ),
+            (
+                b"fn f(){'scan:\nwhile let _=next() {tick()}}".as_slice(),
+                "fn f() {\n    'scan: while let _ = next() {\n        tick()\n    }\n}\n",
+            ),
+        ] {
+            let parsed = parse_source(input).expect("while-let condition parses");
+            let output = format_shape(input).expect("simple while-let condition formats");
+            assert_eq!(output, expected);
+            let reparsed = parse_source(output.as_bytes()).expect("formatted while-let parses");
+            assert_eq!(syntax_shape(parsed.root()), syntax_shape(reparsed.root()));
+            assert_eq!(format_shape(output.as_bytes()), Ok(output));
+        }
+    }
+
+    #[test]
+    fn keeps_while_let_conditions_with_unsupported_patterns_fail_closed() {
         assert_eq!(
-            format_shape(b"fn f(){while let Some(value)=next() {value}}"),
+            format_shape(b"fn f(){while let (left,right)=pair {consume(left)}}"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
