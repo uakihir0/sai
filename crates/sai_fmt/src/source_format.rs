@@ -1547,6 +1547,48 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_closure_fn_keywords() {
+        let source = concat!(
+            "fn closures(){\n",
+            "fn/* params */(value){value}\n",
+            "let identity=fn/* argument */(value){value}\n",
+            "var moved=move fn/* owned */(value){value}\n",
+            "moved=move fn/* assigned */(value){value}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn closures() {\n",
+            "    fn /* params */(value) { value }\n",
+            "    let identity = fn /* argument */(value) { value }\n",
+            "    var moved = move fn /* owned */(value) { value }\n",
+            "    moved = move fn /* assigned */(value) { value }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("closure fn comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_closure_fn_keywords() {
+        for source in [
+            "fn f() {\n    fn // parameters\n        () {}\n}\n",
+            "fn f() {\n    fn /* parameters\n        continue */ () {}\n}\n",
+            "fn f() {\n    let identity=fn // parameters\n        () {}\n}\n",
+            "fn f() {\n    let identity=fn /* parameters\n        continue */ () {}\n}\n",
+        ] {
+            assert!(format_source(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn refuses_closure_fn_comments_nested_in_composite_expressions() {
+        let source = "fn f() {\n    let identity=consume(fn/* nested */(){1})\n}\n";
+        assert!(format_source(source.as_bytes()).is_err(), "{source}");
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

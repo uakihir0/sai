@@ -902,6 +902,7 @@ fn expression_keyword_token(expression: &Expr) -> Option<SyntaxToken> {
         Expr::Match(match_expr) => (match_expr.syntax(), SyntaxKind::MATCH_KW),
         Expr::UnsafeBlock(unsafe_block) => (unsafe_block.syntax(), SyntaxKind::UNSAFE_KW),
         Expr::AsyncBlock(async_block) => (async_block.syntax(), SyntaxKind::ASYNC_KW),
+        Expr::Closure(closure) => (closure.syntax(), SyntaxKind::FN_KW),
         Expr::Region(region_expr) => {
             return region_expr
                 .syntax()
@@ -4760,6 +4761,7 @@ fn closure_parameter_list_document(
 fn closure_header_document(
     source: &ParsedSource,
     closure: &ast::ClosureExpr,
+    keyword_comments: &[SourceComment],
 ) -> Result<Doc, SourceDocumentError> {
     let parameters = closure
         .params()
@@ -4780,11 +4782,9 @@ fn closure_header_document(
     if closure.syntax().children().count() != 2 + usize::from(return_type.is_some()) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let mut documents = vec![
-        Doc::text(move_prefix),
-        Doc::text("fn"),
-        closure_parameter_list_document(source, &parameters)?,
-    ];
+    let mut documents = vec![Doc::text(move_prefix), Doc::text("fn")];
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
+    documents.push(closure_parameter_list_document(source, &parameters)?);
     if let Some(return_type) = return_type {
         let ty = return_type
             .ty()
@@ -4807,10 +4807,19 @@ fn closure_expression_document(
     closure: &ast::ClosureExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    closure_expression_document_with_keyword_comments(source, closure, expression_group_ids, &[])
+}
+
+fn closure_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    closure: &ast::ClosureExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let body = closure
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let header = closure_header_document(source, closure)?;
+    let header = closure_header_document(source, closure, keyword_comments)?;
     let broken_block = block_document(source, &body, expression_group_ids)?;
     let statements = body.statements().collect::<Vec<_>>();
     if block_has_comments(&body, &statements)? {
@@ -5380,6 +5389,12 @@ fn statement_document(
                         expression_group_ids,
                         keyword_comments,
                     ),
+                    Expr::Closure(closure) => closure_expression_document_with_keyword_comments(
+                        source,
+                        closure,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
                     _ => Err(SourceDocumentError::UnsupportedShape),
                 };
             }
@@ -5450,6 +5465,12 @@ fn right_hand_side_after_operator_document(
             Expr::Region(region_expr) => region_expression_document_with_keyword_comments(
                 source,
                 region_expr,
+                expression_group_ids,
+                comments.expression_keyword,
+            )?,
+            Expr::Closure(closure) => closure_expression_document_with_keyword_comments(
+                source,
+                closure,
                 expression_group_ids,
                 comments.expression_keyword,
             )?,
@@ -6883,7 +6904,7 @@ fn call_arguments_document(
         alternatives.push(Doc::flat(first_choice_layout(&ordinary)));
     }
 
-    let closure_header = closure_header_document(source, &closure)?;
+    let closure_header = closure_header_document(source, &closure, &[])?;
     let closure_body = closure
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
