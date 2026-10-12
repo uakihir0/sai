@@ -1775,6 +1775,69 @@ mod tests {
     }
 
     #[test]
+    fn formats_own_line_comments_before_match_arm_list_opening_braces() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value\n// opening brace\n{.Ready=>1}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value\n",
+                    "    // opening brace\n",
+                    "    { .Ready => 1 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value\n/* opening\ncontinued */\n\n// second\n\n{.Ready=>2}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value\n",
+                    "    /* opening\n",
+                    "continued */\n",
+                    "\n",
+                    "    // second\n",
+                    "\n",
+                    "    { .Ready => 2 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value\n/* nested opening */\n{.Ready=>3})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(\n",
+                    "        match value\n",
+                    "        /* nested opening */\n",
+                    "        { .Ready => 3 },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value\n/* empty opening */\n{}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value\n",
+                    "    /* empty opening */\n",
+                    "    {}\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("comments before a match-arm-list opening brace are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_match_keyword_comments_nested_in_composite_expressions() {
         let source =
             "fn f(value:State) {\n    let selected=consume(match/* nested */value{_=>0})\n}\n";

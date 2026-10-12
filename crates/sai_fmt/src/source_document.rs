@@ -627,6 +627,14 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
         if !match_arm_list_elements_match(&list, &arms) {
             continue;
         }
+        if let Some((opening, _)) = brace_list_delimiters(&node) {
+            owners.insert((
+                true,
+                opening.kind(),
+                opening.text_range().start().to_usize(),
+                opening.text_range().end().to_usize(),
+            ));
+        }
         if let Some((_, closing)) = brace_list_delimiters(&node) {
             owners.insert((
                 true,
@@ -3982,6 +3990,8 @@ fn match_expression_document_with_keyword_comments(
     }
     let separator_comment_documents =
         match_arm_separator_comment_documents(&arms, match_arms.len())?;
+    let opening_leading_comment_documents =
+        match_arm_list_opening_leading_comment_documents(source, &arms)?;
     let opening_comments = match_arm_list_opening_comments(&arms, match_arms.len())?;
     let closing_comment_documents =
         match_arm_list_closing_comment_documents(source, &arms, &match_arms)?;
@@ -4012,15 +4022,19 @@ fn match_expression_document_with_keyword_comments(
             ExpressionContext::Unprotected,
             expression_group_ids,
         )?,
-        Doc::text(" "),
-        brace_list_document_with_separator_suffixes(
-            list_group,
-            arm_documents,
-            force_break,
-            &separator_comment_documents,
-            &closing_comment_documents,
-        ),
     ]);
+    if opening_leading_comment_documents.is_empty() {
+        documents.push(Doc::text(" "));
+    } else {
+        documents.extend(opening_leading_comment_documents);
+    }
+    documents.push(brace_list_document_with_separator_suffixes(
+        list_group,
+        arm_documents,
+        force_break,
+        &separator_comment_documents,
+        &closing_comment_documents,
+    ));
     Ok(Doc::concat(documents))
 }
 
@@ -4137,6 +4151,28 @@ fn match_arm_list_opening_comments(
         })
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     trailing_comments_after_token(&opening)
+}
+
+fn match_arm_list_opening_leading_comment_documents(
+    source: &ParsedSource,
+    list: &ast::MatchArmList,
+) -> Result<Vec<Doc>, SourceDocumentError> {
+    let (opening, _) =
+        brace_list_delimiters(list.syntax()).ok_or(SourceDocumentError::UnsupportedShape)?;
+    let comments = leading_comments_before_token(&opening)?;
+    if comments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut documents = vec![Doc::HardLine];
+    append_comment_documents(&mut documents, &comments, source.text(), None)?;
+    append_comment_gap(
+        &mut documents,
+        source.text(),
+        comments.last().map(|comment| comment.range.end),
+        Some(opening.text_range().start().to_usize()),
+    )?;
+    Ok(documents)
 }
 
 fn match_arm_list_closing_comment_documents(
