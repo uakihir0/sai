@@ -3031,6 +3031,14 @@
 - **Human review:** **Review required:** Confirm that a single-line block comment on the final token of a match arm's result expression stays after the complete result and before its separator, while line-breaking comments and result-expression interior comments remain unsupported.
 - **Remaining scope:** Support comments before match arms, then continue through remaining comment-bearing source syntax.
 
+### IR-419: Preserve comments after match-arm separators
+
+- **Decision:** Preserve single-line block comments attached to a comma between match arms after the comma and before the following arm. Keep line comments, multiline block comments, comments after a trailing comma, and comments on other match-arm list tokens fail-closed.
+- **Reason:** A comment in the comma's trailing trivia belongs to that separator. Carrying it as a suffix for the preceding arm lets flat and broken list layouts preserve both the comma and its comment without changing separators that contain no comment.
+- **Review:** Regressions cover comments between arms in flat and forced-broken lists, canonical spacing, fixed-point output, parser-valid line and multiline comment refusals, and fail-closed behavior after a trailing comma. Hostile review found no actionable issues and confirmed that lists without separator comments retain their previous flat and broken behavior. All 359 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
+- **Human review:** **Review required:** Confirm that a single-line block comment attached to an arm-separating comma stays after that comma in both flat and broken layouts, while comments after a trailing comma remain unsupported.
+- **Remaining scope:** Support comments before match arms and after trailing commas, then continue through remaining comment-bearing source syntax.
+
 ### IR-420: Preserve comments after trailing match-arm commas
 
 - **Decision:** Preserve single-line block comments attached to a trailing comma after the final match arm before the closing brace, including single-arm lists and nested match expressions whose layout is forced to break. Keep line comments and multiline block comments fail-closed.
@@ -3039,10 +3047,10 @@
 - **Human review:** **Review required:** Confirm that a single-line block comment after a trailing match-arm comma stays after the comma and before the closing brace in flat and broken lists, while line-breaking comments remain unsupported.
 - **Remaining scope:** Support comments before match arms, then continue through remaining comment-bearing source syntax.
 
-### IR-419: Preserve comments after match-arm separators
+### IR-421: Preserve comments before match-arm patterns
 
-- **Decision:** Preserve single-line block comments attached to a comma between match arms after the comma and before the following arm. Keep line comments, multiline block comments, comments after a trailing comma, and comments on other match-arm list tokens fail-closed.
-- **Reason:** A comment in the comma's trailing trivia belongs to that separator. Carrying it as a suffix for the preceding arm lets flat and broken list layouts preserve both the comma and its comment without changing separators that contain no comment.
-- **Review:** Regressions cover comments between arms in flat and forced-broken lists, canonical spacing, fixed-point output, parser-valid line and multiline comment refusals, and fail-closed behavior after a trailing comma. Hostile review found no actionable issues and confirmed that lists without separator comments retain their previous flat and broken behavior. All 359 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
-- **Human review:** **Review required:** Confirm that a single-line block comment attached to an arm-separating comma stays after that comma in both flat and broken layouts, while comments after a trailing comma remain unsupported.
-- **Remaining scope:** Support comments before match arms and after trailing commas, then continue through remaining comment-bearing source syntax.
+- **Decision:** Preserve single-line block comments in the trailing trivia of a non-empty match-arm list's opening brace and in the leading trivia of an arm pattern's first token. Place them before the pattern, including for newline-separated arms and recursively formatted match expressions. Keep line comments, multiline block comments, and comments on pattern-interior tokens fail-closed.
+- **Reason:** The parser can assign a comment before the first pattern to either the opening brace or the pattern's first token. Render both ownership positions in the same pre-pattern position so reparsing does not change the formatter's next output.
+- **Review:** Regressions cover opening-brace and pattern-leading comments, newline-separated arms, nested broken match layout, fixed-point output, and parser-valid line and multiline comment refusals. Hostile review confirmed that the fixed-point issue from the first draft is resolved and found no other actionable findings. All 361 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
+- **Human review:** **Review required:** Confirm that a single-line block comment attached to the opening brace or first token of a match-arm pattern stays immediately before the pattern, while line-breaking comments and pattern-interior comments remain unsupported.
+- **Remaining scope:** Support comments before closing match-arm lists and other remaining source tokens, then continue through remaining comment-bearing syntax.
