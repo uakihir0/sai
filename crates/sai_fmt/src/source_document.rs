@@ -114,6 +114,31 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
     });
 
     let mut document = Vec::with_capacity(units.len() * 2 + use_declarations.len() * 2 + 2);
+    if let Some(shebang) = &comments.shebang {
+        document.push(Doc::verbatim(shebang.text.clone()));
+        let first_content_start = comments
+            .file_header
+            .first()
+            .or_else(|| {
+                comments
+                    .leading
+                    .first()
+                    .and_then(|comments| comments.first())
+            })
+            .map(|comment| comment.range.start)
+            .or_else(|| {
+                top_level_ranges
+                    .first()
+                    .map(|range| range.start().to_usize())
+            })
+            .or_else(|| comments.eof.first().map(|comment| comment.range.start));
+        append_comment_gap(
+            &mut document,
+            source.text(),
+            Some(shebang.range.end),
+            first_content_start,
+        )?;
+    }
     if !comments.file_header.is_empty() {
         append_comment_documents(&mut document, &comments.file_header, source.text(), None)?;
         if let Some(first_range) = top_level_ranges.first() {
@@ -184,6 +209,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
 
 #[derive(Default)]
 struct TopLevelComments {
+    shebang: Option<SourceComment>,
     file_header: Vec<SourceComment>,
     leading: Vec<Vec<SourceComment>>,
     trailing: Vec<Vec<SourceComment>>,
@@ -197,6 +223,14 @@ struct SourceComment {
     kind: TriviaKind,
 }
 
+#[derive(Default)]
+struct CommentCandidates {
+    shebang: Option<SourceComment>,
+    eof: Vec<SourceComment>,
+    leading: Vec<SourceComment>,
+    trailing: Vec<SourceComment>,
+}
+
 fn collect_top_level_comments(
     root: &GreenNode,
     top_level_ranges: &[TextRange],
@@ -207,8 +241,7 @@ fn collect_top_level_comments(
         trailing: vec![Vec::new(); top_level_ranges.len()],
         ..TopLevelComments::default()
     };
-    let mut leading_candidates = Vec::new();
-    let mut trailing_candidates = Vec::new();
+    let mut candidates = CommentCandidates::default();
     let mut cursor = 0_usize;
     let mut pending = root.children().iter().rev().collect::<Vec<_>>();
     while let Some(element) = pending.pop() {
@@ -216,35 +249,21 @@ fn collect_top_level_comments(
             GreenElement::Node(node) => pending.extend(node.children().iter().rev()),
             GreenElement::Token(token) => {
                 for trivia in token.leading_trivia() {
-                    scan_source_trivia(
-                        trivia,
-                        true,
-                        token.kind(),
-                        &mut cursor,
-                        &mut comments.eof,
-                        &mut leading_candidates,
-                        &mut trailing_candidates,
-                    )?;
+                    scan_source_trivia(trivia, true, token.kind(), &mut cursor, &mut candidates)?;
                 }
                 cursor = cursor
                     .checked_add(token.text().len())
                     .ok_or(SourceDocumentError::UnsupportedShape)?;
                 for trivia in token.trailing_trivia() {
-                    scan_source_trivia(
-                        trivia,
-                        false,
-                        token.kind(),
-                        &mut cursor,
-                        &mut comments.eof,
-                        &mut leading_candidates,
-                        &mut trailing_candidates,
-                    )?;
+                    scan_source_trivia(trivia, false, token.kind(), &mut cursor, &mut candidates)?;
                 }
             }
         }
     }
 
-    for comment in leading_candidates {
+    comments.eof = candidates.eof;
+    comments.shebang = candidates.shebang;
+    for comment in candidates.leading {
         let node_index = top_level_ranges
             .iter()
             .position(|range| comment.range.end <= range.start().to_usize())
@@ -283,7 +302,7 @@ fn collect_top_level_comments(
             }
         }
     }
-    for comment in trailing_candidates {
+    for comment in candidates.trailing {
         let node_index = top_level_ranges
             .iter()
             .rposition(|range| range.end().to_usize() <= comment.range.start)
@@ -317,9 +336,7 @@ fn scan_source_trivia(
     is_leading: bool,
     token_kind: SyntaxKind,
     cursor: &mut usize,
-    eof_comments: &mut Vec<SourceComment>,
-    leading_candidates: &mut Vec<SourceComment>,
-    trailing_candidates: &mut Vec<SourceComment>,
+    candidates: &mut CommentCandidates,
 ) -> Result<(), SourceDocumentError> {
     let start = *cursor;
     *cursor = cursor
@@ -333,14 +350,23 @@ fn scan_source_trivia(
                 kind: trivia.kind(),
             };
             if is_leading && token_kind == SyntaxKind::EOF {
-                eof_comments.push(comment);
+                candidates.eof.push(comment);
             } else if is_leading {
-                leading_candidates.push(comment);
+                candidates.leading.push(comment);
             } else {
-                trailing_candidates.push(comment);
+                candidates.trailing.push(comment);
             }
         }
-        TriviaKind::Shebang => return Err(SourceDocumentError::UnsupportedShape),
+        TriviaKind::Shebang => {
+            if !is_leading || start != 0 || candidates.shebang.is_some() {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            candidates.shebang = Some(SourceComment {
+                range: start..*cursor,
+                text: normalize_comment_text(trivia.text()),
+                kind: TriviaKind::Shebang,
+            });
+        }
         TriviaKind::Whitespace | TriviaKind::LineBreak | TriviaKind::Skipped => {}
     }
     Ok(())

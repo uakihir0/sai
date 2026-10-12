@@ -6296,8 +6296,8 @@ mod tests {
 
     #[test]
     fn fmt_formats_source_stdin_and_emits_the_json_result_contract() {
-        let source = b"fn greet(name:Str){} // signature";
-        let expected = "fn greet(name: Str) {} // signature\n";
+        let source = b"#!/usr/bin/env sai  \nfn greet(name:Str){} // signature";
+        let expected = "#!/usr/bin/env sai\nfn greet(name: Str) {} // signature\n";
         let (exit_code, stdout, stderr) = invoke_with_stdin(&["fmt", "-"], source);
 
         assert_eq!(exit_code, 0);
@@ -6309,7 +6309,9 @@ mod tests {
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"kind\":\"fmt\""));
         assert!(stdout.contains("\"check\":false,\"files\":1,\"changed\":[\"<stdin>\"]"));
-        assert!(stdout.contains("\"output\":\"fn greet(name: Str) {} // signature\\n\""));
+        assert!(stdout.contains(
+            "\"output\":\"#!/usr/bin/env sai\\nfn greet(name: Str) {} // signature\\n\""
+        ));
         assert!(stdout.contains("\"exit_code\":0"));
     }
 

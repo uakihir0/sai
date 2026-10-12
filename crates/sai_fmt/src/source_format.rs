@@ -673,6 +673,37 @@ mod tests {
     }
 
     #[test]
+    fn formats_shebangs_and_preserves_the_following_blank_line() {
+        for (source, expected) in [
+            (
+                b"#!/usr/bin/env sai  \nfn f(){}".as_slice(),
+                "#!/usr/bin/env sai\nfn f() {}\n",
+            ),
+            (
+                b"#!/usr/bin/env sai  \r\nfn f(){}",
+                "#!/usr/bin/env sai\nfn f() {}\n",
+            ),
+            (
+                b"#!/usr/bin/env sai  \n\n// header\n\nfn f(){}",
+                "#!/usr/bin/env sai\n\n// header\n\nfn f() {}\n",
+            ),
+            (
+                b"#!/usr/bin/env sai\n\n//! module\nfn f(){}",
+                "#!/usr/bin/env sai\n\n//! module\n\nfn f() {}\n",
+            ),
+            (
+                b"#!/usr/bin/env sai  \n// comment-only\n",
+                "#!/usr/bin/env sai\n// comment-only\n",
+            ),
+            (b"#!/usr/bin/env sai  ", "#!/usr/bin/env sai\n"),
+        ] {
+            let formatted = format_source(source).expect("shebang formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
     fn keeps_comments_inside_items_fail_closed() {
         let source = b"fn f() { // inside\n    1\n}".as_slice();
         assert_eq!(
