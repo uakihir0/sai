@@ -669,7 +669,10 @@ fn block_comment_targets(
             ),
             ListCommentTarget::BeforeMember(index),
         );
-        if matches!(first_token.kind(), SyntaxKind::LET_KW | SyntaxKind::VAR_KW) {
+        if matches!(
+            first_token.kind(),
+            SyntaxKind::LET_KW | SyntaxKind::VAR_KW | SyntaxKind::ASSERT_KW
+        ) {
             targets.insert(
                 (
                     false,
@@ -4876,15 +4879,18 @@ fn statement_document(
             {
                 return Err(SourceDocumentError::UnsupportedShape);
             }
-            let mut documents = vec![
-                Doc::text("assert "),
-                expression_document(
-                    source,
-                    &condition,
-                    ExpressionContext::Unprotected,
-                    expression_group_ids,
-                )?,
-            ];
+            let mut documents = vec![Doc::text("assert")];
+            let keyword_comment_break =
+                append_comments_between_tokens(&mut documents, keyword_comments);
+            if !keyword_comment_break {
+                documents.push(Doc::text(" "));
+            }
+            documents.push(expression_document(
+                source,
+                &condition,
+                ExpressionContext::Unprotected,
+                expression_group_ids,
+            )?);
             if let Some(message) = message {
                 documents.extend([
                     Doc::text(", "),

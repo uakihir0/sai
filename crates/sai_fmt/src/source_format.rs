@@ -1091,6 +1091,33 @@ mod tests {
     }
 
     #[test]
+    fn formats_comments_after_assert_keywords() {
+        let source = concat!(
+            "fn assertions() {\n",
+            "    assert /* simple */ true\n",
+            "    assert // condition follows\n",
+            "    false\n",
+            "    assert /* multiline\n",
+            "comment */ true, \"message\"\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn assertions() {\n",
+            "    assert /* simple */ true\n",
+            "    assert // condition follows\n",
+            "    false\n",
+            "    assert /* multiline\n",
+            "comment */\n",
+            "    true, \"message\"\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("assert keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",
