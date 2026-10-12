@@ -671,7 +671,12 @@ fn block_comment_targets(
         );
         if matches!(
             first_token.kind(),
-            SyntaxKind::LET_KW | SyntaxKind::VAR_KW | SyntaxKind::ASSERT_KW
+            SyntaxKind::LET_KW
+                | SyntaxKind::VAR_KW
+                | SyntaxKind::ASSERT_KW
+                | SyntaxKind::RETURN_KW
+                | SyntaxKind::BREAK_KW
+                | SyntaxKind::CONTINUE_KW
         ) {
             targets.insert(
                 (
@@ -4913,6 +4918,28 @@ fn statement_document(
             {
                 return Err(SourceDocumentError::UnsupportedShape);
             }
+            if !keyword_comments.is_empty() {
+                return match &expression {
+                    Expr::Return(return_expr) => return_expression_document(
+                        source,
+                        return_expr,
+                        ExpressionContext::Unprotected,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
+                    Expr::Break(break_expr) => break_expression_document(
+                        source,
+                        break_expr,
+                        ExpressionContext::Unprotected,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
+                    Expr::Continue(continue_expr) => {
+                        continue_expression_document(continue_expr, keyword_comments)
+                    }
+                    _ => Err(SourceDocumentError::UnsupportedShape),
+                };
+            }
             expression_document(
                 source,
                 &expression,
@@ -4934,6 +4961,116 @@ fn right_hand_side_document(
     Ok(right_hand_side_document_from_document(
         expression, document, allow_move,
     ))
+}
+
+fn append_control_keyword_comments(
+    documents: &mut Vec<Doc>,
+    comments: &[SourceComment],
+) -> Result<(), SourceDocumentError> {
+    for comment in comments {
+        if comment.kind != TriviaKind::BlockComment || comment.text.contains('\n') {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.push(Doc::text(" "));
+        documents.push(Doc::verbatim(comment.text.clone()));
+    }
+    Ok(())
+}
+
+fn return_expression_document(
+    source: &ParsedSource,
+    return_expr: &ast::ReturnExpr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
+    let value = return_expr.value();
+    let tokens = direct_token_kinds(return_expr.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    if return_expr.syntax().children().count() != usize::from(value.is_some())
+        || tokens != [SyntaxKind::RETURN_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text("return")];
+    append_control_keyword_comments(&mut documents, keyword_comments)?;
+    if let Some(value) = value {
+        documents.push(right_hand_side_document(
+            source,
+            &value,
+            context,
+            expression_group_ids,
+            false,
+        )?);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn break_expression_document(
+    source: &ParsedSource,
+    break_expr: &ast::BreakExpr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
+    let label = break_expr.label();
+    let value = break_expr.value();
+    let tokens = direct_token_kinds(break_expr.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let mut expected_tokens = vec![SyntaxKind::BREAK_KW];
+    if label.is_some() {
+        expected_tokens.push(SyntaxKind::LABEL);
+    }
+    if break_expr.syntax().children().count() != usize::from(value.is_some())
+        || tokens != expected_tokens
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text("break")];
+    append_control_keyword_comments(&mut documents, keyword_comments)?;
+    if let Some(label) = label {
+        documents.push(Doc::text(" "));
+        documents.push(Doc::text(label.syntax().text().to_string()));
+    }
+    if let Some(value) = value {
+        documents.push(right_hand_side_document(
+            source,
+            &value,
+            context,
+            expression_group_ids,
+            false,
+        )?);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn continue_expression_document(
+    continue_expr: &ast::ContinueExpr,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
+    let label = continue_expr.label();
+    let tokens = direct_token_kinds(continue_expr.syntax())
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let mut expected_tokens = vec![SyntaxKind::CONTINUE_KW];
+    if label.is_some() {
+        expected_tokens.push(SyntaxKind::LABEL);
+    }
+    if continue_expr.syntax().children().count() != 0 || tokens != expected_tokens {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text("continue")];
+    append_control_keyword_comments(&mut documents, keyword_comments)?;
+    if let Some(label) = label {
+        documents.push(Doc::text(" "));
+        documents.push(Doc::text(label.syntax().text().to_string()));
+    }
+    Ok(Doc::concat(documents))
 }
 
 fn right_hand_side_document_from_document(
@@ -5433,80 +5570,12 @@ fn expression_document(
             ]))
         }
         Expr::Return(return_expr) => {
-            let value = return_expr.value();
-            let tokens = direct_token_kinds(return_expr.syntax())
-                .into_iter()
-                .filter(|kind| *kind != SyntaxKind::NEWLINE)
-                .collect::<Vec<_>>();
-            if return_expr.syntax().children().count() != usize::from(value.is_some())
-                || tokens != [SyntaxKind::RETURN_KW]
-            {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            let mut documents = vec![Doc::text("return")];
-            if let Some(value) = value {
-                documents.push(right_hand_side_document(
-                    source,
-                    &value,
-                    context,
-                    expression_group_ids,
-                    false,
-                )?);
-            }
-            Ok(Doc::concat(documents))
+            return_expression_document(source, return_expr, context, expression_group_ids, &[])
         }
         Expr::Break(break_expr) => {
-            let label = break_expr.label();
-            let value = break_expr.value();
-            let tokens = direct_token_kinds(break_expr.syntax())
-                .into_iter()
-                .filter(|kind| *kind != SyntaxKind::NEWLINE)
-                .collect::<Vec<_>>();
-            let mut expected_tokens = vec![SyntaxKind::BREAK_KW];
-            if label.is_some() {
-                expected_tokens.push(SyntaxKind::LABEL);
-            }
-            if break_expr.syntax().children().count() != usize::from(value.is_some())
-                || tokens != expected_tokens
-            {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            let mut documents = vec![Doc::text("break")];
-            if let Some(label) = label {
-                documents.push(Doc::text(" "));
-                documents.push(Doc::text(label.syntax().text().to_string()));
-            }
-            if let Some(value) = value {
-                documents.push(right_hand_side_document(
-                    source,
-                    &value,
-                    context,
-                    expression_group_ids,
-                    false,
-                )?);
-            }
-            Ok(Doc::concat(documents))
+            break_expression_document(source, break_expr, context, expression_group_ids, &[])
         }
-        Expr::Continue(continue_expr) => {
-            let label = continue_expr.label();
-            let tokens = direct_token_kinds(continue_expr.syntax())
-                .into_iter()
-                .filter(|kind| *kind != SyntaxKind::NEWLINE)
-                .collect::<Vec<_>>();
-            let mut expected_tokens = vec![SyntaxKind::CONTINUE_KW];
-            if label.is_some() {
-                expected_tokens.push(SyntaxKind::LABEL);
-            }
-            if continue_expr.syntax().children().count() != 0 || tokens != expected_tokens {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            let mut documents = vec![Doc::text("continue")];
-            if let Some(label) = label {
-                documents.push(Doc::text(" "));
-                documents.push(Doc::text(label.syntax().text().to_string()));
-            }
-            Ok(Doc::concat(documents))
-        }
+        Expr::Continue(continue_expr) => continue_expression_document(continue_expr, &[]),
         Expr::Binary(binary) => {
             operator_chain_document(source, binary, context, expression_group_ids)
         }

@@ -1118,6 +1118,57 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_control_keywords() {
+        let source = concat!(
+            "fn transfer(value:I32)->I32{\n",
+            "return/* result */value\n",
+            "}\n",
+            "fn stop(){\n",
+            "'outer:loop{\n",
+            "break/* exit */'outer 1\n",
+            "    }\n",
+            "'scan:loop{\n",
+            "continue/* retry */'scan\n",
+            "    }\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn transfer(value: I32) -> I32 {\n",
+            "    return /* result */ value\n",
+            "}\n",
+            "\n",
+            "fn stop() {\n",
+            "    'outer: loop {\n",
+            "        break /* exit */ 'outer 1\n",
+            "    }\n",
+            "    'scan: loop {\n",
+            "        continue /* retry */ 'scan\n",
+            "    }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("control keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn preserves_multiline_trailing_comment_after_bare_return() {
+        let source = concat!(
+            "fn transfer(value: I32) -> I32 {\n",
+            "    return /* no value\n",
+            "    on this return */\n",
+            "    value\n",
+            "}\n",
+        );
+        let expected = source;
+        let formatted =
+            format_source(source.as_bytes()).expect("trailing comment remains attached");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",
