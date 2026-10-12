@@ -3101,4 +3101,12 @@
 - **Reason:** The guard keyword introduces its condition. A comment that extends across lines should not absorb or visually join the condition, and an indented continuation makes the relationship to the arm clear.
 - **Review:** Focused regressions cover line and multiline comments, mixed multiline and single-line block-comment runs, nested matches, and fixed-point output. Hostile review found no runtime or formatting issues; it flagged the implementation guide's stale unsupported-status sentence, which was updated to describe the continuation layout and confirmed.
 - **Human review:** **Review required:** Confirm that comments after a guard's `if` stay on that line and the condition moves to an indented continuation, including nested matches and mixed block-comment runs.
-- **Remaining scope:** Match-arm pattern and guard-expression interior comments, plus remaining unsupported comment-bearing syntax.
+- **Remaining scope:** Match-arm pattern interiors and guard-expression comments (see IR-428 for the grammar constraint on comments after the guard expression), plus remaining unsupported comment-bearing syntax.
+
+### IR-428: Preserve trailing comments after match-arm results
+
+- **Decision:** Preserve line comments and multiline block comments attached to the final token of a match-arm result expression. Keep the comments after the formatted result and force the arm list to break for line comments so the suffix is flushed before the next arm or closing brace. Continue rejecting comments inside the result expression.
+- **Reason:** Match-arm lists accept a newline separator after a result expression, so these comments can remain attached without changing the grammar. By contrast, the grammar requires `=>` immediately after a guard expression; line or multiline comments at that boundary introduce a syntax-invalid newline, so no grammar or specification expansion is made for that unsupported case.
+- **Review:** Focused regressions cover line and multiline comments before another arm, a final-arm line comment, nested matches, and fixed-point output. Hostile review found no actionable issues; it spot-checked final-arm comments before closing comments, nested matches, and an open-ended result in a width-broken list, with fixed-point output. A bare non-final open-ended range with a line comment is parser-rejected and remains outside this formatter change's supported inputs.
+- **Human review:** **Review required:** Confirm that result comments stay after the result and break the match-arm list before the following arm or closing brace.
+- **Remaining scope:** Comments attached to interior result-expression tokens, match-arm separators, pattern interiors, and other unsupported comment-bearing syntax.

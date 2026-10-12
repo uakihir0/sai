@@ -106,9 +106,9 @@ Single-line block comments attached to the `if` keyword of a match-arm guard sta
 
 Single-line block comments trailing the final token of a match-arm pattern stay after the formatted pattern and before its optional guard or `=>`, including composite patterns and patterns in nested match expressions. Comments attached to tokens inside the pattern remain unsupported.
 
-Single-line block comments trailing the final token of a match-guard expression stay after the formatted expression and before `=>`, including call expressions and guards in nested match expressions. Comments attached to interior tokens of the guard expression remain unsupported.
+Single-line block comments trailing the final token of a match-guard expression stay after the formatted expression and before `=>`, including call expressions and guards in nested match expressions. Line comments and multiline block comments cannot be formatted at this position because the match-arm grammar requires `=>` immediately after the guard expression; a newline there is a syntax error. Comments attached to interior tokens of the guard expression remain unsupported.
 
-Single-line block comments trailing the final token of a match arm's result expression stay after the formatted expression, including block-like results and results in nested match expressions. Line comments, multiline block comments, and comments attached to interior tokens of the result expression remain unsupported.
+Single-line block comments trailing the final token of a match arm's result expression stay after the formatted expression, including block-like results and results in nested match expressions. Line comments and multiline block comments also stay after the result expression in broken match-arm lists. Comments attached to interior tokens of the result expression remain unsupported.
 
 Single-line block comments trailing an arm-separating comma stay after the comma and before the next arm, including in flat and broken match lists. A comment after a trailing comma stays before the closing brace. Line comments and multiline block comments remain unsupported.
 
