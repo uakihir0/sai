@@ -3118,3 +3118,11 @@
 - **Review:** Focused regressions cover line and multiline comments between arms and after a trailing comma, nested matches, and fixed-point output. Hostile review found no actionable issues; it spot-checked trailing-comma comments before closing comments, mixed result and separator comments, consecutive block comments, and nested matches, all reaching a fixed point. The single-line block-comment path remains unchanged.
 - **Human review:** **Review required:** Confirm that comments after arm-separating commas remain attached to those commas and force broken-list layout, including trailing commas.
 - **Remaining scope:** Pattern interiors, result-expression interiors, and other unsupported comment-bearing syntax.
+
+### IR-430: Preserve own-line comments before match-arm patterns
+
+- **Decision:** Preserve own-line line comments and multiline block comments in a pattern's leading trivia before the pattern. Retain blank-line gaps between these comments and the pattern. Keep the existing inline single-line block-comment behavior.
+- **Reason:** These comments introduce an arm and belong visually before its pattern. A hard line after the leading comment run forces a broken arm list and keeps the pattern separate from the comment.
+- **Review:** Focused regressions cover line and multiline block comments, blank gaps, nested matches, and fixed-point output. Hostile review found no actionable issues; it confirmed the hard line breaks the arm list, blank-line gaps are retained, and opening-brace trailing comments stay on the refusal path. First-arm and nested-match outputs reach a fixed point.
+- **Human review:** **Review required:** Confirm that own-line comments before a match-arm pattern remain before it and retain blank-line gaps.
+- **Remaining scope:** Line and multiline comments trailing the match-arm list's opening brace, pattern-interior comments, and other unsupported comment-bearing syntax.
