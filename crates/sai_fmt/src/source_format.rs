@@ -1525,15 +1525,83 @@ mod tests {
     }
 
     #[test]
-    fn refuses_line_and_multiline_comments_after_match_arm_arrows() {
-        for source in [
-            "fn f(value:State) {\n    match value{.Ready=> // result\n        1,_=>0}\n}\n",
-            "fn f(value:State) {\n    match value{.Ready=> /* result\n        continued */ 1,_=>0}\n}\n",
-        ] {
+    fn formats_line_and_multiline_comments_after_match_arm_arrows() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{.Ready=> // result\n1,_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => // result\n",
+                    "            1\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=> // range\n..,_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => // range\n",
+                    "            (..)\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=>/* multi\ncontinued */ /* tail */1,_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => /* multi\n",
+                    "continued */ /* tail */\n",
+                    "            1\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{.Ready=>/* nested\ncontinued */2,_=>0})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(\n",
+                    "        match value {\n",
+                    "            .Ready => /* nested\n",
+                    "continued */\n",
+                    "                2\n",
+                    "            _ => 0\n",
+                    "        },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=> // block\n{1},_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => // block\n",
+                    "            {\n",
+                    "                1\n",
+                    "            }\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
             assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("line and multiline match-arrow comments are supported");
+            assert_eq!(formatted, expected, "{source}");
             assert_eq!(
-                format_source(source.as_bytes()),
-                Err(SourceFormatError::UnsupportedShape),
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
                 "{source}"
             );
         }

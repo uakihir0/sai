@@ -4354,24 +4354,35 @@ fn match_arm_document(
     }
     documents.push(Doc::text(" =>"));
     let arrow_comments = trailing_comments_after_direct_token(arm.syntax(), SyntaxKind::FAT_ARROW)?;
-    append_single_line_block_comments(&mut documents, &arrow_comments)?;
+    append_match_arm_arrow_comments(&mut documents, &arrow_comments);
+    let arrow_comments_require_line_break = arrow_comments.iter().any(|comment| {
+        comment.kind == TriviaKind::LineComment
+            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
+    });
 
-    let body = expression_document(
+    let body_document = expression_document(
         source,
         &expression,
         ExpressionContext::Unprotected,
         expression_group_ids,
     )?;
-    let body = if has_following_arm && is_open_ended_range_expression(&expression) {
+    let body = if arrow_comments_require_line_break {
+        let body_document = if has_following_arm && is_open_ended_range_expression(&expression) {
+            Doc::concat([Doc::text("("), body_document, Doc::text(")")])
+        } else {
+            body_document
+        };
+        Doc::indent(Doc::concat([Doc::HardLine, body_document]))
+    } else if has_following_arm && is_open_ended_range_expression(&expression) {
         let parenthesized = right_hand_side_document_from_document(
             &expression,
-            Doc::concat([Doc::text("("), body.clone(), Doc::text(")")]),
+            Doc::concat([Doc::text("("), body_document.clone(), Doc::text(")")]),
             true,
         );
-        let plain = right_hand_side_document_from_document(&expression, body, true);
+        let plain = right_hand_side_document_from_document(&expression, body_document, true);
         Doc::if_broken(list_group, parenthesized, plain)
     } else {
-        right_hand_side_document_from_document(&expression, body, true)
+        right_hand_side_document_from_document(&expression, body_document, true)
     };
     documents.push(body);
     let expression_last_token = expression
@@ -4381,6 +4392,26 @@ fn match_arm_document(
     let expression_comments = trailing_comments_after_token(&expression_last_token)?;
     append_single_line_block_comments(&mut documents, &expression_comments)?;
     Ok(Doc::concat(documents))
+}
+
+fn append_match_arm_arrow_comments(document: &mut Vec<Doc>, comments: &[SourceComment]) {
+    let mut previous_comment_requires_line_break = false;
+    for comment in comments {
+        if previous_comment_requires_line_break {
+            document.push(Doc::HardLine);
+        } else {
+            document.push(Doc::text(" "));
+        }
+        if comment.kind == TriviaKind::LineComment {
+            document.push(Doc::line_suffix(Doc::text(comment.text.clone())));
+        } else {
+            document.push(Doc::verbatim(comment.text.clone()));
+        }
+        // Keep a trailing arrow comment run together after block comments.
+        // Breaking there can reattach the next comment to the body as leading
+        // trivia, making the formatted match arm unsupported on a second pass.
+        previous_comment_requires_line_break = comment.kind == TriviaKind::LineComment;
+    }
 }
 
 fn is_open_ended_range_expression(expression: &Expr) -> bool {
