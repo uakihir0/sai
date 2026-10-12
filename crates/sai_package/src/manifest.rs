@@ -232,6 +232,8 @@ pub struct PackageParseOutput {
     lexical_error_count: usize,
     pub(crate) errors: Vec<PackageParseError>,
     error_count: usize,
+    invalid_path_errors: Vec<PackageParseError>,
+    invalid_path_error_count: usize,
     refusing_errors: Vec<PackageParseError>,
     refusing_error_count: usize,
     error_fingerprint: [u8; 32],
@@ -246,6 +248,8 @@ impl PartialEq for PackageParseOutput {
             && self.lexical_error_count == other.lexical_error_count
             && self.errors == other.errors
             && self.error_count == other.error_count
+            && self.invalid_path_errors == other.invalid_path_errors
+            && self.invalid_path_error_count == other.invalid_path_error_count
             && self.refusing_errors == other.refusing_errors
             && self.refusing_error_count == other.refusing_error_count
             && self.error_fingerprint == other.error_fingerprint
@@ -290,6 +294,18 @@ impl PackageParseOutput {
     /// parse call.
     pub const fn error_count(&self) -> usize {
         self.error_count
+    }
+
+    /// Parser errors for invalid content or dependency paths, retained up to
+    /// the parse diagnostic limit.
+    pub fn invalid_path_errors(&self) -> &[PackageParseError] {
+        &self.invalid_path_errors
+    }
+
+    /// Total number of invalid package path errors, including records omitted
+    /// by a bounded parse call.
+    pub const fn invalid_path_error_count(&self) -> usize {
+        self.invalid_path_error_count
     }
 
     /// Parser errors that make a lossless formatter refuse this input.
@@ -373,6 +389,8 @@ pub fn parse_for_role_with_error_limit(
             lexical_error_count: 0,
             errors: retained_errors.clone(),
             error_count: 1,
+            invalid_path_errors: Vec::new(),
+            invalid_path_error_count: 0,
             refusing_errors: retained_errors,
             refusing_error_count: 1,
             error_fingerprint: fingerprint_for_error(&error.kind),
@@ -397,6 +415,8 @@ pub fn parse_for_role_with_error_limit(
             lexical_error_count,
             errors: Vec::new(),
             error_count: 0,
+            invalid_path_errors: Vec::new(),
+            invalid_path_error_count: 0,
             refusing_errors: Vec::new(),
             refusing_error_count: 0,
             error_fingerprint: empty_error_fingerprint(),
@@ -416,6 +436,8 @@ pub fn parse_for_role_with_error_limit(
         lexical_error_count,
         errors: parser.errors,
         error_count: parser.error_count,
+        invalid_path_errors: parser.invalid_path_errors,
+        invalid_path_error_count: parser.invalid_path_error_count,
         refusing_errors: parser.refusing_errors,
         refusing_error_count: parser.refusing_error_count,
         error_fingerprint: parser.error_hasher.finalize().into(),
@@ -429,6 +451,8 @@ struct Parser<'a> {
     position: usize,
     errors: Vec<PackageParseError>,
     error_count: usize,
+    invalid_path_errors: Vec<PackageParseError>,
+    invalid_path_error_count: usize,
     refusing_errors: Vec<PackageParseError>,
     refusing_error_count: usize,
     max_errors: usize,
@@ -448,6 +472,8 @@ impl<'a> Parser<'a> {
             position: 0,
             errors: Vec::new(),
             error_count: 0,
+            invalid_path_errors: Vec::new(),
+            invalid_path_error_count: 0,
             refusing_errors: Vec::new(),
             refusing_error_count: 0,
             max_errors,
@@ -1542,8 +1568,19 @@ impl<'a> Parser<'a> {
 
     fn error(&mut self, kind: PackageParseErrorKind, span: Range<usize>) {
         self.error_count = self.error_count.saturating_add(1);
+        if matches!(
+            &kind,
+            PackageParseErrorKind::InvalidContentPath(_)
+                | PackageParseErrorKind::InvalidDependencyPath(_)
+                | PackageParseErrorKind::InvalidRepositoryDirectory(_)
+        ) {
+            self.invalid_path_error_count = self.invalid_path_error_count.saturating_add(1);
+        }
         add_error_fingerprint(&mut self.error_hasher, &kind);
         let error = PackageParseError { kind, span };
+        if is_invalid_path_error(&error.kind) && self.invalid_path_errors.len() < self.max_errors {
+            self.invalid_path_errors.push(error.clone());
+        }
         if is_formatting_refusal_error(&error.kind) {
             self.refusing_error_count = self.refusing_error_count.saturating_add(1);
             if self.refusing_errors.len() < self.max_errors {
@@ -1554,6 +1591,15 @@ impl<'a> Parser<'a> {
             self.errors.push(error);
         }
     }
+}
+
+fn is_invalid_path_error(kind: &PackageParseErrorKind) -> bool {
+    matches!(
+        kind,
+        PackageParseErrorKind::InvalidContentPath(_)
+            | PackageParseErrorKind::InvalidDependencyPath(_)
+            | PackageParseErrorKind::InvalidRepositoryDirectory(_)
+    )
 }
 
 fn is_formatting_refusal_error(kind: &PackageParseErrorKind) -> bool {
@@ -2010,6 +2056,21 @@ mod tests {
         assert!(invalid_utf8.lexical_errors().is_empty());
         assert!(invalid_utf8.errors().is_empty());
         assert!(!invalid_utf8.is_syntax_valid());
+    }
+
+    #[test]
+    fn bounded_parse_preserves_path_diagnostics_and_their_exact_count() {
+        let source = "package acme:app @ 1.0.0\n\
+                      source \"../outside\"\n\
+                      requires { acme:bad @ ^1 from path \"/absolute\" }\n";
+        let output = parse_for_role_with_error_limit(source.as_bytes(), PackageRole::Root, 1);
+
+        assert_eq!(output.invalid_path_error_count(), 2);
+        assert_eq!(output.invalid_path_errors().len(), 1);
+        assert!(matches!(
+            output.invalid_path_errors()[0].kind,
+            PackageParseErrorKind::InvalidContentPath(_)
+        ));
     }
 
     #[test]

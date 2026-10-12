@@ -19,6 +19,7 @@ use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
 };
 use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
+use sha2::{Digest, Sha256};
 use unicode_width::UnicodeWidthChar;
 
 static NEXT_FMT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
@@ -299,18 +300,17 @@ fn run_fmt(
     let positionals = collect_command_positionals(command, &None);
     if positionals.len() != 1 || positionals[0].0 != "-" {
         if positionals.is_empty() {
-            return report_feature_not_implemented(
-                CliOutputOptions {
-                    format: parsed.globals.format,
-                    quiet: parsed.globals.quiet,
-                    color: parsed.globals.color,
-                    max_errors: parsed.globals.max_errors,
-                },
-                "fmt",
-                3,
-                "sai fmt workspace discovery",
+            let mut retry_state = FmtPathRetryState {
+                remaining_retries: 8,
+                waiting_reported: false,
+            };
+            return run_fmt_workspace(
+                parsed,
+                command,
+                cancellation,
                 stdout,
                 stderr,
+                &mut retry_state,
             );
         }
         let mut retry_state = FmtPathRetryState {
@@ -805,9 +805,10 @@ fn source_value_json(value: &Value) -> String {
 
 struct SelectedFmtFile {
     path: PathBuf,
+    is_package_manifest: bool,
     source_path: String,
     package_root: Option<PathBuf>,
-    package_root_identity: Option<sai_windows_fs::FileIdentity>,
+    package_root_identities: Vec<sai_windows_fs::FileIdentity>,
     parent: Option<Arc<cap_std::fs::Dir>>,
     name: OsString,
     identity: sai_windows_fs::FileIdentity,
@@ -828,6 +829,7 @@ struct FmtPathSelectionSignature {
         sai_windows_fs::FileIdentity,
         sai_windows_fs::FileIdentity,
     )>,
+    resolved_manifest_paths: Vec<(PathBuf, PathBuf)>,
     missing: Vec<(usize, PathBuf)>,
     errors: Vec<(PathBuf, io::ErrorKind, Option<i32>)>,
 }
@@ -835,6 +837,290 @@ struct FmtPathSelectionSignature {
 struct FmtPathRetryState {
     remaining_retries: usize,
     waiting_reported: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FmtWorkspaceSignature {
+    root: Option<PathBuf>,
+    input_paths: Vec<PathBuf>,
+    manifests: Vec<crate::fmt_workspace::FmtManifestSnapshot>,
+    source_directories: Vec<crate::fmt_workspace::FmtWorkspaceSourceDirectory>,
+    errors: Vec<(PathBuf, io::ErrorKind, Option<i32>)>,
+    total_error_count: usize,
+}
+
+struct FmtPathRunInput<'a> {
+    positionals: &'a [(OsString, usize)],
+    input_paths: &'a [PathBuf],
+    initial_errors: Vec<crate::fmt_paths::FmtPathSelectionError>,
+    initial_diagnostics: Vec<CliDiagnostic>,
+    initial_error_count: usize,
+    workspace_discovery_signature: Option<&'a FmtWorkspaceSignature>,
+    workspace_start_directory: Option<&'a Path>,
+}
+
+struct FmtWorkspaceLocation<'a> {
+    start_directory: &'a Path,
+    cwd: &'a Path,
+}
+
+struct FmtRetryRequest<'a> {
+    positionals: &'a [(OsString, usize)],
+    workspace_start_directory: Option<&'a Path>,
+    cwd: &'a Path,
+}
+
+fn fmt_error_limit(max_errors: usize) -> usize {
+    if max_errors == 0 {
+        usize::MAX
+    } else {
+        max_errors
+    }
+}
+
+fn fmt_workspace_signature(
+    discovery: &crate::fmt_workspace::FmtWorkspaceDiscovery,
+) -> FmtWorkspaceSignature {
+    FmtWorkspaceSignature {
+        root: discovery.workspace_root.clone(),
+        input_paths: discovery.input_paths.clone(),
+        manifests: discovery.manifest_snapshots.clone(),
+        source_directories: discovery.source_directories.clone(),
+        errors: discovery
+            .errors
+            .iter()
+            .map(|error| {
+                (
+                    error.path.clone(),
+                    error.source.kind(),
+                    error.source.raw_os_error(),
+                )
+            })
+            .collect(),
+        total_error_count: discovery.total_error_count,
+    }
+}
+
+fn fmt_workspace_diagnostics(
+    discovery: &crate::fmt_workspace::FmtWorkspaceDiscovery,
+    cwd: &Path,
+    diagnostic_base: &Path,
+    include_source_lines: bool,
+) -> Vec<CliDiagnostic> {
+    let mut issues = discovery.diagnostics.iter().collect::<Vec<_>>();
+    issues.sort_by(|left, right| {
+        left.manifest_path
+            .as_deref()
+            .unwrap_or(&left.display_path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(
+                right
+                    .manifest_path
+                    .as_deref()
+                    .unwrap_or(&right.display_path)
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            )
+            .then_with(|| {
+                left.span
+                    .as_ref()
+                    .map_or(usize::MAX, |span| span.start)
+                    .cmp(&right.span.as_ref().map_or(usize::MAX, |span| span.start))
+            })
+    });
+    let mut current_source: Option<(PathBuf, Option<CliSourceIndex>)> = None;
+    let mut diagnostics = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let source_path = fmt_path_reference(&issue.display_path, cwd, Some(diagnostic_base));
+        if let Some(manifest_path) = issue.manifest_path.as_ref()
+            && current_source
+                .as_ref()
+                .is_none_or(|(path, _)| path != manifest_path)
+        {
+            let source_index = discovery
+                .manifest_snapshots
+                .iter()
+                .find(|snapshot| snapshot.path == *manifest_path && !snapshot.oversized)
+                .and_then(|snapshot| {
+                    let expected_digest = snapshot.digest?;
+                    let source = read_fmt_manifest_for_diagnostic(manifest_path).ok()?;
+                    let digest: [u8; 32] = Sha256::digest(&source).into();
+                    (digest == expected_digest).then(|| CliSourceIndex::new(Arc::from(source)))
+                });
+            current_source = Some((manifest_path.clone(), source_index));
+        }
+        let source_index = issue.manifest_path.as_ref().and_then(|manifest_path| {
+            current_source
+                .as_mut()
+                .filter(|(path, _)| path == manifest_path)
+                .and_then(|(_, source)| source.as_mut())
+        });
+        if let (Some(source_index), Some(span)) = (source_index, issue.span.clone()) {
+            diagnostics.push(cli_source_diagnostic(
+                source_index,
+                FmtDiagnosticSource {
+                    path: &source_path,
+                    include_source_line: include_source_lines,
+                },
+                issue.code,
+                issue.message.clone(),
+                span,
+                None,
+                None,
+            ));
+        } else {
+            diagnostics.push(fmt_io_diagnostic(
+                issue.code,
+                &source_path,
+                &issue.message,
+                &io::Error::other("workspace discovery may be incomplete"),
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn read_fmt_manifest_for_diagnostic(path: &Path) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut file = file.take(
+        sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES
+            .saturating_add(1)
+            .try_into()
+            .unwrap_or(u64::MAX),
+    );
+    let mut source =
+        Vec::with_capacity(sai_package::manifest::MAX_PACKAGE_MANIFEST_BYTES.min(8192));
+    file.read_to_end(&mut source)?;
+    Ok(source)
+}
+
+fn fmt_workspace_diagnostic_base<'a>(
+    workspace_root: &'a Path,
+    cwd: &'a Path,
+    format: OutputFormat,
+) -> &'a Path {
+    if format == OutputFormat::Human && cwd.starts_with(workspace_root) {
+        cwd
+    } else {
+        workspace_root
+    }
+}
+
+fn fmt_package_roots_for_input(
+    path: &Path,
+    is_package_manifest: bool,
+    workspace_discovery_signature: Option<&FmtWorkspaceSignature>,
+    cwd: &Path,
+) -> Result<Vec<PathBuf>, crate::package_discovery::PackageDiscoveryError> {
+    let mut workspace_roots = workspace_discovery_signature
+        .into_iter()
+        .flat_map(|signature| signature.manifests.iter())
+        .filter(|manifest| is_package_manifest && manifest.path == path)
+        .filter_map(|manifest| manifest.package_directory.clone())
+        .collect::<Vec<_>>();
+    if is_package_manifest && workspace_discovery_signature.is_some() && workspace_roots.is_empty()
+    {
+        return Err(
+            crate::package_discovery::PackageDiscoveryError::ManifestMetadataIo {
+                path: path.to_path_buf(),
+                source: io::Error::other("workspace manifest changed during discovery"),
+            },
+        );
+    }
+    if is_package_manifest && workspace_discovery_signature.is_some() {
+        match crate::package_discovery::find_root_package(path.parent().unwrap_or(path), cwd) {
+            Ok(root) => workspace_roots.push(root),
+            Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if !is_package_manifest {
+        workspace_roots.extend(
+            workspace_discovery_signature
+                .into_iter()
+                .flat_map(|signature| signature.source_directories.iter())
+                .filter(|source| path.starts_with(&source.directory))
+                .map(|source| source.package_directory.clone()),
+        );
+        if workspace_discovery_signature.is_some() {
+            match crate::package_discovery::find_root_package(path.parent().unwrap_or(path), cwd) {
+                Ok(root) => workspace_roots.push(root),
+                Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    workspace_roots.sort_by(|left, right| {
+        left.as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.as_os_str().as_encoded_bytes())
+    });
+    workspace_roots.dedup();
+    if !workspace_roots.is_empty() {
+        return Ok(workspace_roots);
+    }
+    crate::package_discovery::find_root_package(path.parent().unwrap_or(path), cwd)
+        .map(|root| vec![root])
+}
+
+fn fmt_workspace_display_path(
+    path: &Path,
+    is_package_manifest: bool,
+    workspace_discovery_signature: Option<&FmtWorkspaceSignature>,
+) -> PathBuf {
+    if is_package_manifest {
+        if let Some(package_directory) = workspace_discovery_signature
+            .into_iter()
+            .flat_map(|signature| signature.manifests.iter())
+            .filter(|manifest| manifest.path == path)
+            .filter_map(|manifest| manifest.package_directory.as_ref())
+            .min_by(|left, right| {
+                left.as_os_str()
+                    .as_encoded_bytes()
+                    .cmp(right.as_os_str().as_encoded_bytes())
+            })
+        {
+            return package_directory.join("sai.package");
+        }
+        if let Some(root) =
+            workspace_discovery_signature.and_then(|signature| signature.root.as_ref())
+        {
+            return root.join("sai.package");
+        }
+    }
+    path.to_path_buf()
+}
+
+fn fmt_workspace_selection_error_path(
+    path: &Path,
+    workspace_discovery_signature: &FmtWorkspaceSignature,
+) -> PathBuf {
+    let manifest_owners = workspace_discovery_signature
+        .manifests
+        .iter()
+        .filter(|manifest| manifest.path == path)
+        .filter_map(|manifest| manifest.package_directory.as_ref())
+        .collect::<Vec<_>>();
+    if let Some(owner) = manifest_owners.into_iter().min_by(|left, right| {
+        left.as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.as_os_str().as_encoded_bytes())
+    }) {
+        return owner.join("sai.package");
+    }
+    if workspace_discovery_signature
+        .root
+        .as_deref()
+        .is_some_and(|root| !path.starts_with(root))
+    {
+        return workspace_discovery_signature
+            .root
+            .as_deref()
+            .expect("checked workspace root")
+            .join("sai.package");
+    }
+    path.to_path_buf()
 }
 
 fn open_fmt_package_root(
@@ -901,6 +1187,7 @@ fn fmt_path_selection_signature(
             .iter()
             .map(|file| (file.path.clone(), file.identity, file.parent_identity))
             .collect(),
+        resolved_manifest_paths: selection.resolved_manifest_paths.clone(),
         missing: selection.missing.clone(),
         errors: selection
             .errors
@@ -914,6 +1201,52 @@ fn fmt_path_selection_signature(
             })
             .collect(),
     }
+}
+
+fn fmt_workspace_manifest_resolutions_match(
+    selection: &crate::fmt_paths::FmtPathSelection,
+    workspace_discovery_signature: &FmtWorkspaceSignature,
+) -> bool {
+    let mut expected = workspace_discovery_signature
+        .manifests
+        .iter()
+        .filter(|manifest| manifest.package_directory.is_some())
+        .map(|manifest| (manifest.logical_path.clone(), manifest.path.clone()))
+        .collect::<Vec<_>>();
+    let mut actual = selection.resolved_manifest_paths.clone();
+    let path_order = |left: &PathBuf, right: &PathBuf| {
+        left.as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.as_os_str().as_encoded_bytes())
+    };
+    let resolution_order = |left: &(PathBuf, PathBuf), right: &(PathBuf, PathBuf)| {
+        path_order(&left.0, &right.0).then_with(|| path_order(&left.1, &right.1))
+    };
+    expected.sort_by(&resolution_order);
+    actual.sort_by(resolution_order);
+    expected == actual
+}
+
+fn fmt_workspace_manifest_source_matches_discovery(
+    path: &Path,
+    source: &[u8],
+    workspace_discovery_signature: &FmtWorkspaceSignature,
+) -> bool {
+    let snapshots = workspace_discovery_signature
+        .manifests
+        .iter()
+        .filter(|manifest| manifest.path == path && manifest.package_directory.is_some())
+        .collect::<Vec<_>>();
+    if snapshots.is_empty() {
+        return false;
+    }
+    let source_digest: [u8; 32] = Sha256::digest(source).into();
+    snapshots.iter().all(|snapshot| {
+        !snapshot.oversized
+            && snapshot
+                .digest
+                .is_some_and(|digest| digest == source_digest)
+    })
 }
 
 fn open_selected_fmt_file(file: &mut SelectedFmtFile) -> io::Result<cap_std::fs::File> {
@@ -945,6 +1278,208 @@ fn open_selected_fmt_file(file: &mut SelectedFmtFile) -> io::Result<cap_std::fs:
     Ok(cap_std::fs::File::from_std(opened_file))
 }
 
+fn run_fmt_workspace(
+    parsed: &ParsedArgs,
+    command: &crate::args::ParsedCommand,
+    cancellation: &CancellationToken,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    retry_state: &mut FmtPathRetryState,
+) -> i32 {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            let diagnostic = fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                ".",
+                "could not resolve the current directory",
+                &error,
+            );
+            return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
+        }
+    };
+    let start_directory = parsed.globals.directory.as_deref().map_or_else(
+        || cwd.clone(),
+        |directory| {
+            if directory.is_absolute() {
+                directory.to_path_buf()
+            } else {
+                cwd.join(directory)
+            }
+        },
+    );
+    run_fmt_workspace_at(
+        parsed,
+        command,
+        FmtWorkspaceLocation {
+            start_directory: &start_directory,
+            cwd: &cwd,
+        },
+        cancellation,
+        stdout,
+        stderr,
+        retry_state,
+    )
+}
+
+fn run_fmt_workspace_at(
+    parsed: &ParsedArgs,
+    command: &crate::args::ParsedCommand,
+    location: FmtWorkspaceLocation<'_>,
+    cancellation: &CancellationToken,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    retry_state: &mut FmtPathRetryState,
+) -> i32 {
+    let FmtWorkspaceLocation {
+        start_directory,
+        cwd,
+    } = location;
+    let workspace_root = match crate::package_discovery::find_root_package(start_directory, cwd) {
+        Ok(root) => root,
+        Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound {
+            start_directory,
+        }) => {
+            return report_fmt_no_package_found(parsed, &start_directory, stdout, stderr);
+        }
+        Err(error) => {
+            let source_path = fmt_path_reference(start_directory, cwd, None);
+            let diagnostic = fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                &source_path,
+                "could not discover the formatter workspace",
+                &io::Error::other(error),
+            );
+            return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
+        }
+    };
+    let error_limit = fmt_error_limit(parsed.globals.max_errors);
+    let diagnostic_base =
+        fmt_workspace_diagnostic_base(&workspace_root, cwd, parsed.globals.format);
+    let mut discovery = crate::fmt_workspace::discover_fmt_workspace_with_error_limit_and_base(
+        &workspace_root,
+        cancellation,
+        error_limit,
+        diagnostic_base,
+    );
+    if discovery.interrupted || cancellation.is_cancelled() {
+        return report_interrupted(parsed, stdout, stderr);
+    }
+    let input_paths = discovery.input_paths.clone();
+    let signature = fmt_workspace_signature(&discovery);
+    let initial_error_count = discovery.total_error_count;
+    let initial_errors = std::mem::take(&mut discovery.errors);
+    let initial_diagnostics = fmt_workspace_diagnostics(
+        &discovery,
+        cwd,
+        diagnostic_base,
+        parsed.globals.format == OutputFormat::Human,
+    );
+    run_fmt_paths_for_inputs(
+        parsed,
+        command,
+        FmtPathRunInput {
+            positionals: &[],
+            input_paths: &input_paths,
+            initial_errors,
+            initial_diagnostics,
+            initial_error_count,
+            workspace_discovery_signature: Some(&signature),
+            workspace_start_directory: Some(start_directory),
+        },
+        cancellation,
+        stdout,
+        stderr,
+        retry_state,
+    )
+}
+
+fn report_fmt_no_package_found(
+    parsed: &ParsedArgs,
+    start_directory: &Path,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let diagnostic = CliDiagnostic {
+        code: "NO_PACKAGE_FOUND",
+        message: format!(
+            "no package found from start directory `{}`",
+            start_directory.display()
+        ),
+        primary: None,
+        primary_label: String::new(),
+        argument_index: None,
+        argument: String::new(),
+        help: Some("run `sai new` to create a package".to_owned()),
+        data: None,
+    };
+    match parsed.globals.format {
+        OutputFormat::Human => {
+            if let Err(error) = write_human_diagnostics(
+                stderr,
+                "fmt",
+                std::slice::from_ref(&diagnostic),
+                !parsed.globals.quiet,
+                color_enabled(parsed.globals.color, io::stderr().is_terminal()),
+                1,
+                parsed.globals.max_errors,
+            ) {
+                report_stderr_failure(error)
+            } else {
+                2
+            }
+        }
+        OutputFormat::Json => {
+            if let Err(error) = write_json_fmt_diagnostics(stdout, &[diagnostic], 1, 2, None) {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                2
+            }
+        }
+    }
+}
+
+fn retry_fmt_run(
+    parsed: &ParsedArgs,
+    command: &crate::args::ParsedCommand,
+    request: FmtRetryRequest<'_>,
+    cancellation: &CancellationToken,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    retry_state: &mut FmtPathRetryState,
+) -> i32 {
+    let FmtRetryRequest {
+        positionals,
+        workspace_start_directory,
+        cwd,
+    } = request;
+    if let Some(start_directory) = workspace_start_directory {
+        run_fmt_workspace_at(
+            parsed,
+            command,
+            FmtWorkspaceLocation {
+                start_directory,
+                cwd,
+            },
+            cancellation,
+            stdout,
+            stderr,
+            retry_state,
+        )
+    } else {
+        run_fmt_paths(
+            parsed,
+            command,
+            positionals,
+            cancellation,
+            stdout,
+            stderr,
+            retry_state,
+        )
+    }
+}
+
 fn run_fmt_paths(
     parsed: &ParsedArgs,
     command: &crate::args::ParsedCommand,
@@ -954,6 +1489,47 @@ fn run_fmt_paths(
     stderr: &mut impl Write,
     retry_state: &mut FmtPathRetryState,
 ) -> i32 {
+    let input_paths = positionals
+        .iter()
+        .map(|(path, _)| PathBuf::from(path))
+        .collect::<Vec<_>>();
+    run_fmt_paths_for_inputs(
+        parsed,
+        command,
+        FmtPathRunInput {
+            positionals,
+            input_paths: &input_paths,
+            initial_errors: Vec::new(),
+            initial_diagnostics: Vec::new(),
+            initial_error_count: 0,
+            workspace_discovery_signature: None,
+            workspace_start_directory: None,
+        },
+        cancellation,
+        stdout,
+        stderr,
+        retry_state,
+    )
+}
+
+fn run_fmt_paths_for_inputs(
+    parsed: &ParsedArgs,
+    command: &crate::args::ParsedCommand,
+    run_input: FmtPathRunInput<'_>,
+    cancellation: &CancellationToken,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    retry_state: &mut FmtPathRetryState,
+) -> i32 {
+    let FmtPathRunInput {
+        positionals,
+        input_paths,
+        initial_errors,
+        initial_diagnostics,
+        initial_error_count,
+        workspace_discovery_signature,
+        workspace_start_directory,
+    } = run_input;
     let check = command_tail(command)
         .iter()
         .any(|(argument, _)| argument == "--check");
@@ -969,17 +1545,22 @@ fn run_fmt_paths(
             return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
         }
     };
-    let input_paths = positionals
-        .iter()
-        .map(|(path, _)| PathBuf::from(path))
-        .collect::<Vec<_>>();
-    let selection = crate::fmt_paths::select_fmt_paths(&input_paths, &cwd, cancellation);
+    let workspace_path_base = workspace_discovery_signature
+        .and_then(|signature| signature.root.as_deref())
+        .map(|root| fmt_workspace_diagnostic_base(root, &cwd, parsed.globals.format));
+    let mut selection = if workspace_discovery_signature.is_some() {
+        crate::fmt_paths::select_fmt_workspace_paths(input_paths, &cwd, cancellation)
+    } else {
+        crate::fmt_paths::select_fmt_paths(input_paths, &cwd, cancellation)
+    };
     if selection.interrupted {
         return report_interrupted(parsed, stdout, stderr);
     }
     let selection_signature = fmt_path_selection_signature(&selection);
-    let mut diagnostics = Vec::new();
-    let mut total_error_count = 0usize;
+    let selected_error_count = selection.errors.len();
+    selection.errors.extend(initial_errors);
+    let mut total_error_count = initial_error_count.saturating_add(selected_error_count);
+    let mut diagnostics = initial_diagnostics;
     let mut result = FmtResult {
         check,
         files: selection.files.len(),
@@ -987,33 +1568,44 @@ fn run_fmt_paths(
     };
     let mut human_changed_paths = Vec::new();
 
-    for (input_index, _) in selection.missing {
-        let (argument, command_index) = &positionals[input_index];
-        let argument_index = command
-            .argument_indices
-            .get(*command_index)
-            .map_or(0, |index| index + 1);
-        diagnostics.push(CliDiagnostic {
-            code: "PATH_NOT_FOUND",
-            message: format!("path `{}` does not exist", argument.to_string_lossy()),
-            primary: None,
-            primary_label: String::new(),
-            argument_index: Some(argument_index),
-            argument: argument.to_string_lossy().into_owned(),
-            help: None,
-            data: None,
-        });
+    for (input_index, missing_path) in selection.missing {
+        if let Some((argument, command_index)) = positionals.get(input_index) {
+            let argument_index = command
+                .argument_indices
+                .get(*command_index)
+                .map_or(0, |index| index + 1);
+            diagnostics.push(CliDiagnostic {
+                code: "PATH_NOT_FOUND",
+                message: format!("path `{}` does not exist", argument.to_string_lossy()),
+                primary: None,
+                primary_label: String::new(),
+                argument_index: Some(argument_index),
+                argument: argument.to_string_lossy().into_owned(),
+                help: None,
+                data: None,
+            });
+        } else {
+            let source_path = fmt_run_path_reference(&missing_path, &cwd, workspace_path_base);
+            diagnostics.push(fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                &source_path,
+                "a discovered formatter input no longer exists",
+                &io::Error::new(io::ErrorKind::NotFound, "input path not found"),
+            ));
+        }
         total_error_count = total_error_count.saturating_add(1);
     }
     for error in selection.errors {
-        let source_path = fmt_path_reference(&error.path, &cwd, None);
+        let display_path = workspace_discovery_signature
+            .map(|signature| fmt_workspace_selection_error_path(&error.path, signature))
+            .unwrap_or_else(|| error.path.clone());
+        let source_path = fmt_run_path_reference(&display_path, &cwd, workspace_path_base);
         diagnostics.push(fmt_io_diagnostic(
             "SOURCE_READ_FAILED",
             &source_path,
             "could not inspect a formatter input path",
             &error.source,
         ));
-        total_error_count = total_error_count.saturating_add(1);
     }
 
     let mut files = Vec::with_capacity(selection.files.len());
@@ -1025,6 +1617,7 @@ fn run_fmt_paths(
         }
         let crate::fmt_paths::SelectedFmtPath {
             path,
+            is_package_manifest,
             parent,
             name,
             identity,
@@ -1032,41 +1625,74 @@ fn run_fmt_paths(
             parent_identity,
         } = selected;
         let start_directory = path.parent().unwrap_or(&path);
-        let mut package_root_identity = None;
-        let package_root = match crate::package_discovery::find_root_package(start_directory, &cwd)
-        {
-            Ok(root) => {
-                let inspected_root = if let Some(root) = roots_by_path.get(&root) {
-                    Some(root.clone())
-                } else {
-                    let selected_parent = parent
-                        .as_ref()
-                        .map(|directory| (start_directory, directory, parent_identity));
-                    match open_fmt_package_root(&root, selected_parent) {
-                        Ok(root_capability) => {
-                            roots_by_path.insert(root.clone(), root_capability.clone());
-                            Some(root_capability)
+        let discovered_package_roots = fmt_package_roots_for_input(
+            &path,
+            is_package_manifest,
+            workspace_discovery_signature,
+            &cwd,
+        );
+        let (package_root, package_root_identities) = match discovered_package_roots {
+            Ok(roots) => {
+                let mut package_root = None;
+                let mut package_root_identities = Vec::with_capacity(roots.len());
+                for root in roots {
+                    let inspected_root = if let Some(root) = roots_by_path.get(&root) {
+                        Some(root.clone())
+                    } else {
+                        let selected_parent = (start_directory == root)
+                            .then(|| {
+                                parent
+                                    .as_ref()
+                                    .map(|directory| (start_directory, directory, parent_identity))
+                            })
+                            .flatten();
+                        match open_fmt_package_root(&root, selected_parent) {
+                            Ok(root_capability) => {
+                                roots_by_path.insert(root.clone(), root_capability.clone());
+                                Some(root_capability)
+                            }
+                            Err(error) => {
+                                let display_path = fmt_workspace_display_path(
+                                    &path,
+                                    is_package_manifest,
+                                    workspace_discovery_signature,
+                                );
+                                let source_path = fmt_run_path_reference(
+                                    &display_path,
+                                    &cwd,
+                                    workspace_path_base,
+                                );
+                                diagnostics.push(fmt_io_diagnostic(
+                                    "WORKSPACE_LOCK_FAILED",
+                                    &source_path,
+                                    "could not identify the package lock for a formatter input",
+                                    &error,
+                                ));
+                                total_error_count = total_error_count.saturating_add(1);
+                                blocked_files.insert(path.clone());
+                                None
+                            }
                         }
-                        Err(error) => {
-                            let source_path = fmt_path_reference(&path, &cwd, None);
-                            diagnostics.push(fmt_io_diagnostic(
-                                "WORKSPACE_LOCK_FAILED",
-                                &source_path,
-                                "could not identify the package lock for a formatter input",
-                                &error,
-                            ));
-                            total_error_count = total_error_count.saturating_add(1);
-                            blocked_files.insert(path.clone());
-                            None
-                        }
+                    };
+                    if let Some(inspected_root) = inspected_root {
+                        package_root.get_or_insert_with(|| root.clone());
+                        package_root_identities.push(inspected_root.identity);
+                    } else {
+                        break;
                     }
-                };
-                package_root_identity = inspected_root.map(|root| root.identity);
-                Some(root)
+                }
+                (package_root, package_root_identities)
             }
-            Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound { .. }) => None,
+            Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound { .. }) => {
+                (None, Vec::new())
+            }
             Err(_error) => {
-                let source_path = fmt_path_reference(&path, &cwd, None);
+                let display_path = fmt_workspace_display_path(
+                    &path,
+                    is_package_manifest,
+                    workspace_discovery_signature,
+                );
+                let source_path = fmt_run_path_reference(&display_path, &cwd, workspace_path_base);
                 diagnostics.push(fmt_io_diagnostic(
                     "WORKSPACE_LOCK_FAILED",
                     &source_path,
@@ -1075,14 +1701,15 @@ fn run_fmt_paths(
                 ));
                 total_error_count = total_error_count.saturating_add(1);
                 blocked_files.insert(path.clone());
-                None
+                (None, Vec::new())
             }
         };
         files.push(SelectedFmtFile {
             path,
+            is_package_manifest,
             source_path: String::new(),
             package_root,
-            package_root_identity,
+            package_root_identities,
             parent,
             name,
             identity,
@@ -1091,17 +1718,35 @@ fn run_fmt_paths(
     }
     let roots = normalize_fmt_package_roots(roots_by_path.into_values().collect());
     let locked_roots = fmt_package_root_signature(&roots);
-    let workspace_root = crate::package_discovery::find_root_package(&cwd, &cwd).ok();
+    let workspace_root = workspace_discovery_signature
+        .and_then(|signature| signature.root.clone())
+        .or_else(|| crate::package_discovery::find_root_package(&cwd, &cwd).ok());
     for file in &mut files {
-        let source_root = workspace_root
-            .as_deref()
-            .filter(|root| file.path.starts_with(root))
+        let owning_manifest_directory = (workspace_discovery_signature.is_some()
+            && file.is_package_manifest)
+            .then(|| {
+                fmt_workspace_display_path(&file.path, true, workspace_discovery_signature)
+                    .parent()
+                    .map(Path::to_path_buf)
+            })
+            .flatten();
+        let display_path = owning_manifest_directory
+            .as_ref()
+            .map(|directory| directory.join("sai.package"))
+            .unwrap_or_else(|| file.path.clone());
+        let source_root = workspace_path_base
+            .or(owning_manifest_directory.as_deref())
+            .or_else(|| {
+                workspace_root
+                    .as_deref()
+                    .filter(|root| display_path.starts_with(root))
+            })
             .or_else(|| {
                 (roots.len() == 1)
                     .then_some(file.package_root.as_deref())
                     .flatten()
             });
-        file.source_path = fmt_path_reference(&file.path, &cwd, source_root);
+        file.source_path = fmt_path_reference(&display_path, &cwd, source_root);
     }
     files.sort_by(|left, right| {
         left.path
@@ -1140,8 +1785,33 @@ fn run_fmt_paths(
                     thread::sleep(Duration::from_millis(20));
                 }
                 Err(_error) => {
+                    let logical_workspace_manifest = workspace_discovery_signature
+                        .filter(|signature| {
+                            signature.root.as_deref().is_some_and(|workspace_root| {
+                                !root.path.starts_with(workspace_root)
+                            })
+                        })
+                        .and_then(|signature| {
+                            files
+                                .iter()
+                                .find(|file| {
+                                    file.is_package_manifest
+                                        && file.package_root_identities.contains(&root.identity)
+                                })
+                                .map(|file| {
+                                    fmt_workspace_display_path(&file.path, true, Some(signature))
+                                })
+                                .or_else(|| {
+                                    signature
+                                        .root
+                                        .as_deref()
+                                        .map(|workspace_root| workspace_root.join("sai.package"))
+                                })
+                        });
                     let package_path =
-                        fmt_path_reference(&root.path.join("sai.package"), &cwd, Some(&root.path));
+                        logical_workspace_manifest.unwrap_or_else(|| root.path.join("sai.package"));
+                    let package_path =
+                        fmt_run_path_reference(&package_path, &cwd, workspace_path_base);
                     diagnostics.push(fmt_io_diagnostic(
                         "WORKSPACE_LOCK_FAILED",
                         &package_path,
@@ -1156,27 +1826,41 @@ fn run_fmt_paths(
         }
     }
 
-    let current_selection =
-        crate::fmt_paths::select_fmt_paths_for_comparison(&input_paths, &cwd, cancellation);
+    let current_selection = if workspace_discovery_signature.is_some() {
+        crate::fmt_paths::select_fmt_workspace_paths_for_comparison(input_paths, &cwd, cancellation)
+    } else {
+        crate::fmt_paths::select_fmt_paths_for_comparison(input_paths, &cwd, cancellation)
+    };
     if current_selection.interrupted || cancellation.is_cancelled() {
         return report_interrupted(parsed, stdout, stderr);
     }
     let mut current_roots_by_path = HashMap::new();
-    let mut current_discovery_failed = false;
+    let mut current_discovery_failed = workspace_discovery_signature.is_some_and(|signature| {
+        !fmt_workspace_manifest_resolutions_match(&current_selection, signature)
+    });
     for selected in &current_selection.files {
         let path = &selected.path;
-        match crate::package_discovery::find_root_package(path.parent().unwrap_or(path), &cwd) {
-            Ok(root) => match current_roots_by_path.entry(root) {
-                std::collections::hash_map::Entry::Occupied(_) => {}
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    match inspect_fmt_package_root(entry.key()) {
-                        Ok(root_capability) => {
-                            entry.insert(root_capability);
+        match fmt_package_roots_for_input(
+            path,
+            selected.is_package_manifest,
+            workspace_discovery_signature,
+            &cwd,
+        ) {
+            Ok(roots) => {
+                for root in roots {
+                    match current_roots_by_path.entry(root) {
+                        std::collections::hash_map::Entry::Occupied(_) => {}
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            match inspect_fmt_package_root(entry.key()) {
+                                Ok(root_capability) => {
+                                    entry.insert(root_capability);
+                                }
+                                Err(_) => current_discovery_failed = true,
+                            }
                         }
-                        Err(_) => current_discovery_failed = true,
                     }
                 }
-            },
+            }
             Err(crate::package_discovery::PackageDiscoveryError::NoPackageFound { .. }) => {}
             Err(_) => current_discovery_failed = true,
         }
@@ -1191,10 +1875,14 @@ fn run_fmt_paths(
         drop(held_locks);
         if retry_state.remaining_retries > 0 {
             retry_state.remaining_retries -= 1;
-            return run_fmt_paths(
+            return retry_fmt_run(
                 parsed,
                 command,
-                positionals,
+                FmtRetryRequest {
+                    positionals,
+                    workspace_start_directory,
+                    cwd: &cwd,
+                },
                 cancellation,
                 stdout,
                 stderr,
@@ -1214,6 +1902,58 @@ fn run_fmt_paths(
     }
     drop(current_selection);
 
+    if let (Some(expected), Some(start_directory)) =
+        (workspace_discovery_signature, workspace_start_directory)
+    {
+        let current_discovery =
+            match crate::package_discovery::find_root_package(start_directory, &cwd) {
+                Ok(root) => {
+                    let diagnostic_base =
+                        fmt_workspace_diagnostic_base(&root, &cwd, parsed.globals.format);
+                    crate::fmt_workspace::discover_fmt_workspace_with_error_limit_and_base(
+                        &root,
+                        cancellation,
+                        fmt_error_limit(parsed.globals.max_errors),
+                        diagnostic_base,
+                    )
+                }
+                Err(_) => crate::fmt_workspace::FmtWorkspaceDiscovery::default(),
+            };
+        if cancellation.is_cancelled() || current_discovery.interrupted {
+            return report_interrupted(parsed, stdout, stderr);
+        }
+        if fmt_workspace_signature(&current_discovery) != *expected {
+            drop(files);
+            drop(held_locks);
+            if retry_state.remaining_retries > 0 {
+                retry_state.remaining_retries -= 1;
+                return retry_fmt_run(
+                    parsed,
+                    command,
+                    FmtRetryRequest {
+                        positionals,
+                        workspace_start_directory,
+                        cwd: &cwd,
+                    },
+                    cancellation,
+                    stdout,
+                    stderr,
+                    retry_state,
+                );
+            }
+            let diagnostic = fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                ".",
+                "formatter workspace kept changing during discovery",
+                &io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "formatter workspace did not stabilize",
+                ),
+            );
+            return report_fmt_diagnostics(parsed, vec![diagnostic], 1, None, stdout, stderr);
+        }
+    }
+
     let max_errors = if parsed.globals.max_errors == 0 {
         usize::MAX
     } else {
@@ -1224,19 +1964,15 @@ fn run_fmt_paths(
             return report_interrupted(parsed, stdout, stderr);
         }
         if blocked_files.contains(&file.path)
-            || file.package_root.as_ref().is_some_and(|_| {
-                file.package_root_identity
-                    .is_some_and(|identity| failed_roots.contains(&identity))
-            })
+            || file
+                .package_root_identities
+                .iter()
+                .any(|identity| failed_roots.contains(identity))
         {
             result.refused.push(file.source_path);
             continue;
         }
-        if file
-            .path
-            .file_name()
-            .is_some_and(|name| name == "sai.package")
-        {
+        if file.is_package_manifest {
             let source_file = match open_selected_fmt_file(&mut file) {
                 Ok(file) => file,
                 Err(error) => {
@@ -1284,6 +2020,22 @@ fn run_fmt_paths(
                 }
             };
             let source: Arc<[u8]> = source.into();
+            if let Some(signature) = workspace_discovery_signature
+                && !fmt_workspace_manifest_source_matches_discovery(&file.path, &source, signature)
+            {
+                result.refused.push(file.source_path.clone());
+                diagnostics.push(fmt_io_diagnostic(
+                    "SOURCE_READ_FAILED",
+                    &file.source_path,
+                    "workspace manifest changed after discovery; refusing to format it",
+                    &io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "workspace manifest does not match its discovery snapshot",
+                    ),
+                ));
+                total_error_count = total_error_count.saturating_add(1);
+                continue;
+            }
             let formatting_result = sai_fmt::format_package_with_error_limit(&source, max_errors);
             if cancellation.is_cancelled() {
                 return report_interrupted(parsed, stdout, stderr);
@@ -1328,13 +2080,18 @@ fn run_fmt_paths(
                     ) {
                         Ok(()) => {
                             result.changed.push(file.source_path.clone());
-                            human_changed_paths.push(human_file_path(&file.path.to_string_lossy()));
+                            human_changed_paths.push(fmt_human_changed_path(
+                                &file,
+                                workspace_discovery_signature.is_some(),
+                            ));
                         }
                         Err(error) => {
                             if error.installed {
                                 result.changed.push(file.source_path.clone());
-                                human_changed_paths
-                                    .push(human_file_path(&file.path.to_string_lossy()));
+                                human_changed_paths.push(fmt_human_changed_path(
+                                    &file,
+                                    workspace_discovery_signature.is_some(),
+                                ));
                             }
                             diagnostics.push(fmt_io_diagnostic(
                                 "OUTPUT_WRITE_FAILED",
@@ -1449,13 +2206,18 @@ fn run_fmt_paths(
                     ) {
                         Ok(()) => {
                             result.changed.push(file.source_path.clone());
-                            human_changed_paths.push(human_file_path(&file.path.to_string_lossy()));
+                            human_changed_paths.push(fmt_human_changed_path(
+                                &file,
+                                workspace_discovery_signature.is_some(),
+                            ));
                         }
                         Err(error) => {
                             if error.installed {
                                 result.changed.push(file.source_path.clone());
-                                human_changed_paths
-                                    .push(human_file_path(&file.path.to_string_lossy()));
+                                human_changed_paths.push(fmt_human_changed_path(
+                                    &file,
+                                    workspace_discovery_signature.is_some(),
+                                ));
                             }
                             diagnostics.push(fmt_io_diagnostic(
                                 "OUTPUT_WRITE_FAILED",
@@ -1536,6 +2298,10 @@ fn fmt_path_reference(path: &Path, cwd: &Path, package_root: Option<&Path>) -> S
         },
         |relative| format_relative_path(&relative),
     )
+}
+
+fn fmt_run_path_reference(path: &Path, cwd: &Path, workspace_base: Option<&Path>) -> String {
+    fmt_path_reference(path, cwd, workspace_base)
 }
 
 fn fmt_io_diagnostic(
@@ -4900,6 +5666,14 @@ fn human_file_path(file_path: &str) -> String {
         .unwrap_or_else(|| file_path.to_owned())
 }
 
+fn fmt_human_changed_path(file: &SelectedFmtFile, workspace_discovery: bool) -> String {
+    if workspace_discovery {
+        human_file_path(&file.source_path)
+    } else {
+        human_file_path(&file.path.to_string_lossy())
+    }
+}
+
 fn format_relative_path(path: &Path) -> String {
     let mut components = Vec::<OsString>::new();
     for component in path.components() {
@@ -5674,6 +6448,715 @@ mod tests {
     }
 
     #[test]
+    fn fmt_without_paths_formats_transitive_workspace_members_only() {
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let root_source = workspace.join("src");
+        let member = workspace.join("members/member");
+        let member_source = member.join("code");
+        let outside = directory.child("outside");
+        let outside_source = outside.join("src");
+        fs::create_dir_all(root_source.join(".hidden")).unwrap();
+        fs::create_dir_all(root_source.join("out")).unwrap();
+        fs::create_dir_all(&member_source).unwrap();
+        fs::create_dir_all(&outside_source).unwrap();
+        fs::write(
+            workspace.join("sai.package"),
+            b"package acme:root @ 1.0.0\nsource \"src\"\nrequires { acme:bridge @ ^1 from path \"../outside\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("sai.package"),
+            b"package acme:member @ 1.0.0\nsource \"code\"\n",
+        )
+        .unwrap();
+        fs::write(
+            outside.join("sai.package"),
+            b"package acme:bridge @ 1.0.0\nsource \"src\"\nrequires { acme:member @ ^1 from path \"../workspace/members/member\" }\n",
+        )
+        .unwrap();
+        let root_source_file = root_source.join("lib.sai");
+        let hidden_source_file = root_source.join(".hidden/hidden.sai");
+        let generated_source_file = root_source.join("out/generated.sai");
+        let member_source_file = member_source.join("lib.sai");
+        let outside_source_file = outside_source.join("lib.sai");
+        for (path, contents) in [
+            (&root_source_file, b"fn root(){}".as_slice()),
+            (&hidden_source_file, b"fn hidden(){}".as_slice()),
+            (&generated_source_file, b"fn generated(){}".as_slice()),
+            (&member_source_file, b"fn member(){}".as_slice()),
+            (&outside_source_file, b"fn outside(){}".as_slice()),
+        ] {
+            fs::write(path, contents).unwrap();
+        }
+        let start_directory = workspace.join("src");
+        let start_directory = start_directory.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            start_directory,
+            "fmt",
+            "--check",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"files\":6"));
+        assert!(stdout.contains("\"code\":\"UNFORMATTED_FILE\""));
+        assert_eq!(fs::read(&root_source_file).unwrap(), b"fn root(){}");
+        assert_eq!(fs::read(&hidden_source_file).unwrap(), b"fn hidden(){}");
+        assert_eq!(
+            fs::read(&generated_source_file).unwrap(),
+            b"fn generated(){}"
+        );
+        assert_eq!(fs::read(&member_source_file).unwrap(), b"fn member(){}");
+        assert_eq!(fs::read(&outside_source_file).unwrap(), b"fn outside(){}");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", start_directory, "fmt"]);
+
+        assert_eq!(exit_code, 0, "unexpected workspace fmt output: {stdout}");
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"files\":6"));
+        assert!(stdout.contains("\"refused\":[]"));
+        assert_eq!(fs::read(&root_source_file).unwrap(), b"fn root() {}\n");
+        assert_eq!(fs::read(&hidden_source_file).unwrap(), b"fn hidden() {}\n");
+        assert_eq!(
+            fs::read(&generated_source_file).unwrap(),
+            b"fn generated() {}\n"
+        );
+        assert_eq!(fs::read(&member_source_file).unwrap(), b"fn member() {}\n");
+        assert_eq!(fs::read(&outside_source_file).unwrap(), b"fn outside(){}");
+        assert!(!outside.join(".sai/lock").exists());
+    }
+
+    #[test]
+    fn fmt_without_a_package_reports_the_documented_exit_code() {
+        let directory = TestDirectory::new();
+        let start_directory = directory.0.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", start_directory, "fmt"]);
+
+        assert_eq!(exit_code, 2);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"NO_PACKAGE_FOUND\""));
+        assert!(stdout.contains("\"exit_code\":2"));
+    }
+
+    #[test]
+    fn fmt_workspace_reports_a_missing_path_package_and_formats_known_files() {
+        let directory = TestDirectory::new();
+        let package = directory.child("package");
+        let source = package.join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            package.join("sai.package"),
+            b"package acme:root @ 1.0.0\nsource \"src\"\nrequires { acme:missing @ ^1 from path \"missing\" }\n",
+        )
+        .unwrap();
+        let source_file = source.join("lib.sai");
+        fs::write(&source_file, b"fn root(){}").unwrap();
+        let package_path = package.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "fmt"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("\"code\":\"SOURCE_READ_FAILED\""),
+            "{stdout}"
+        );
+        assert!(stdout.contains("\"path\":\"missing\""), "{stdout}");
+        assert!(!stdout.contains("\"path\":\"../"), "{stdout}");
+        assert!(stdout.contains("\"files\":2"));
+        assert_eq!(fs::read(source_file).unwrap(), b"fn root() {}\n");
+    }
+
+    #[test]
+    fn fmt_workspace_max_errors_keeps_the_first_diagnostic_in_output_order() {
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let later_member = workspace.join("z-member");
+        let earlier_member = workspace.join("a-member");
+        fs::create_dir_all(&later_member).unwrap();
+        fs::create_dir_all(&earlier_member).unwrap();
+        fs::write(
+            workspace.join("sai.package"),
+            b"package acme:root @ 1.0.0\n\
+              requires {\n\
+                  acme:z @ ^1 from path \"z-member\"\n\
+                  acme:a @ ^1 from path \"a-member\"\n\
+              }\n",
+        )
+        .unwrap();
+        fs::write(
+            later_member.join("sai.package"),
+            b"package acme:z @ 1.0.0\nsource \"missing\"\n",
+        )
+        .unwrap();
+        fs::write(
+            earlier_member.join("sai.package"),
+            b"package acme:a @ 1.0.0\nsource \"missing\"\n",
+        )
+        .unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--max-errors=1",
+            "--directory",
+            workspace_path,
+            "fmt",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"errors\":2"));
+        assert!(stdout.contains("\"shown_errors\":1"));
+        assert!(stdout.contains("\"path\":\"a-member/missing\""));
+        assert!(!stdout.contains("\"path\":\"z-member/missing\""));
+    }
+
+    #[test]
+    fn fmt_workspace_reports_external_invalid_paths_without_exposing_the_external_path() {
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let external = directory.child("external");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(
+            workspace.join("sai.package"),
+            b"package acme:root @ 1.0.0\nrequires { acme:external @ ^1 from path \"../external\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            external.join("sai.package"),
+            b"package acme:external @ 1.0.0\nsource \"../outside\"\n",
+        )
+        .unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+        let external_path = external.to_string_lossy();
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", workspace_path, "fmt"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"INVALID_PACKAGE_PATH\""));
+        assert!(stdout.contains("\"path\":\"sai.package\""));
+        assert!(!stdout.contains(external_path.as_ref()));
+        assert!(!stdout.contains("../"));
+    }
+
+    #[test]
+    fn fmt_workspace_diagnostics_do_not_render_spans_against_changed_manifest_bytes() {
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let manifest_path = workspace.join("sai.package");
+        fs::write(
+            &manifest_path,
+            b"package acme:root @ 1.0.0\nsource \"changed\"\n",
+        )
+        .unwrap();
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        let canonical_manifest = fs::canonicalize(&manifest_path).unwrap();
+        let discovery = crate::fmt_workspace::FmtWorkspaceDiscovery {
+            workspace_root: Some(canonical_workspace.clone()),
+            input_paths: vec![manifest_path.clone()],
+            manifest_snapshots: vec![crate::fmt_workspace::FmtManifestSnapshot {
+                logical_path: manifest_path,
+                path: canonical_manifest.clone(),
+                package_directory: Some(canonical_workspace.clone()),
+                digest: Some([0; 32]),
+                oversized: false,
+            }],
+            diagnostics: vec![crate::fmt_workspace::FmtWorkspaceDiagnostic {
+                manifest_path: Some(canonical_manifest),
+                display_path: canonical_workspace.join("sai.package"),
+                code: "INVALID_PACKAGE_PATH",
+                message: "invalid package path".to_owned(),
+                span: Some(30..37),
+            }],
+            total_error_count: 1,
+            ..crate::fmt_workspace::FmtWorkspaceDiscovery::default()
+        };
+
+        let diagnostics = super::fmt_workspace_diagnostics(
+            &discovery,
+            &canonical_workspace,
+            &canonical_workspace,
+            false,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "INVALID_PACKAGE_PATH");
+        assert!(diagnostics[0].primary.is_none());
+    }
+
+    #[test]
+    fn fmt_reports_invalid_source_paths_and_still_discovers_valid_members() {
+        let directory = TestDirectory::new();
+        let package = directory.child("package");
+        let dependency = package.join("dep");
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(
+            package.join("sai.package"),
+            b"package acme:root@1.0.0\nsource \"../outside\"\nrequires { acme:dep @ ^1 from path \"dep\" }\n",
+        )
+        .unwrap();
+        fs::write(dependency.join("sai.package"), b"package acme:dep@1.0.0\n").unwrap();
+        let package_path = package.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "fmt"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"INVALID_PACKAGE_PATH\""));
+        assert!(stdout.contains("\"path\":\"sai.package\""));
+        assert!(stdout.contains("\"files\":2"));
+        assert!(dependency.join(".sai/lock").is_file());
+    }
+
+    #[test]
+    fn fmt_bounds_external_discovery_diagnostics_and_hides_external_paths() {
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let first = directory.child("outside-first");
+        let second = directory.child("outside-second");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(
+            workspace.join("sai.package"),
+            b"package acme:root @ 1.0.0\nrequires {\n  acme:first @ ^1 from path \"../outside-first\"\n  acme:second @ ^1 from path \"../outside-second\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            first.join("sai.package"),
+            b"package acme:first @ 1.0.0\nunknown-first {}\n",
+        )
+        .unwrap();
+        fs::write(
+            second.join("sai.package"),
+            b"package acme:second @ 1.0.0\nunknown-second {}\n",
+        )
+        .unwrap();
+        let expected_errors = [&first, &second]
+            .into_iter()
+            .map(|package| {
+                let source = fs::read(package.join("sai.package")).unwrap();
+                let parsed = sai_package::manifest::parse_for_role(
+                    &source,
+                    sai_package::manifest::PackageRole::Dependency,
+                );
+                parsed
+                    .lexical_error_count()
+                    .saturating_add(parsed.error_count())
+            })
+            .sum::<usize>();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--max-errors=1",
+            "--directory",
+            workspace_path,
+            "fmt",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains(&format!("\"errors\":{expected_errors}")));
+        assert!(stdout.contains("\"shown_errors\":1"));
+        assert!(stdout.contains("\"path\":\"sai.package\""));
+        assert!(!stdout.contains("outside-first"));
+        assert!(!stdout.contains("outside-second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_without_paths_locks_the_package_that_owns_a_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let outside = directory.child("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let manifest_target = outside.join("manifest-data");
+        fs::write(&manifest_target, b"package acme:root@1.0.0\n").unwrap();
+        symlink(&manifest_target, workspace.join("sai.package")).unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", workspace_path, "fmt"]);
+
+        assert_eq!(exit_code, 0, "unexpected workspace fmt output: {stdout}");
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"files\":1"));
+        assert!(stdout.contains("\"changed\":[\"sai.package\"]"));
+        assert_eq!(
+            fs::read(&manifest_target).unwrap(),
+            b"package acme:root @ 1.0.0\n"
+        );
+        assert!(workspace.join(".sai/lock").is_file());
+        assert!(!outside.join(".sai/lock").exists());
+        assert!(
+            fs::symlink_metadata(workspace.join("sai.package"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_workspace_manifest_symlink_locks_a_package_at_its_physical_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let target_package = directory.child("target-package");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&target_package).unwrap();
+        let target_manifest = target_package.join("sai.package");
+        fs::write(&target_manifest, b"package acme:target@1.0.0\n").unwrap();
+        symlink(&target_manifest, workspace.join("sai.package")).unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", workspace_path, "fmt"]);
+
+        assert_eq!(exit_code, 0, "unexpected workspace fmt output: {stdout}");
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"changed\":[\"sai.package\"]"));
+        assert!(!stdout.contains(target_package.to_str().unwrap()));
+        assert_eq!(
+            fs::read(&target_manifest).unwrap(),
+            b"package acme:target @ 1.0.0\n"
+        );
+        assert!(workspace.join(".sai/lock").is_file());
+        assert!(target_package.join(".sai/lock").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_workspace_manifest_target_lock_errors_use_the_logical_path() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let target_package = directory.child("target-package");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(target_package.join(".sai")).unwrap();
+        let target_manifest = target_package.join("sai.package");
+        let original = b"package acme:target@1.0.0\n";
+        fs::write(&target_manifest, original).unwrap();
+        fs::write(target_package.join(".sai/lock"), b"occupied").unwrap();
+        symlink(&target_manifest, workspace.join("sai.package")).unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", workspace_path, "fmt"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"WORKSPACE_LOCK_FAILED\""));
+        assert!(stdout.contains("\"path\":\"sai.package\""));
+        assert!(!stdout.contains(target_package.to_str().unwrap()));
+        assert!(!stdout.contains("../"));
+        assert_eq!(fs::read(&target_manifest).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_human_progress_hides_external_manifest_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let outside = directory.child("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let manifest_target = outside.join("manifest-data");
+        fs::write(&manifest_target, b"package acme:root@1.0.0\n").unwrap();
+        symlink(&manifest_target, workspace.join("sai.package")).unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) = invoke(&["--directory", workspace_path, "fmt"]);
+
+        assert_eq!(
+            exit_code, 0,
+            "unexpected workspace fmt output: {stdout}{stderr}"
+        );
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("formatted sai.package\n"));
+        assert!(!stderr.contains(outside.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_workspace_manifest_error_paths_use_the_logical_path_for_external_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let outside = directory.child("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let manifest_target = outside.join("manifest-data");
+        fs::write(&manifest_target, b"package acme:root @ 1.0.0\n").unwrap();
+        let moved_manifest_package = outside.join("moved-package");
+        fs::create_dir_all(&moved_manifest_package).unwrap();
+        fs::write(
+            moved_manifest_package.join("sai.package"),
+            b"package acme:moved @ 1.0.0\n",
+        )
+        .unwrap();
+        symlink(&manifest_target, workspace.join("sai.package")).unwrap();
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        let canonical_manifest = fs::canonicalize(workspace.join("sai.package")).unwrap();
+        let moved_manifest = fs::canonicalize(moved_manifest_package.join("sai.package")).unwrap();
+        let signature = super::FmtWorkspaceSignature {
+            root: Some(canonical_workspace.clone()),
+            input_paths: vec![canonical_workspace.join("sai.package")],
+            manifests: vec![crate::fmt_workspace::FmtManifestSnapshot {
+                logical_path: canonical_workspace.join("sai.package"),
+                path: canonical_manifest.clone(),
+                package_directory: Some(canonical_workspace.clone()),
+                digest: None,
+                oversized: false,
+            }],
+            source_directories: Vec::new(),
+            errors: Vec::new(),
+            total_error_count: 0,
+        };
+
+        let display_path =
+            super::fmt_workspace_display_path(&canonical_manifest, true, Some(&signature));
+        let selection_error_path =
+            super::fmt_workspace_selection_error_path(&canonical_manifest, &signature);
+        let package_roots = super::fmt_package_roots_for_input(
+            &canonical_manifest,
+            true,
+            Some(&signature),
+            &canonical_workspace,
+        )
+        .unwrap();
+        let retargeted_manifest_roots = super::fmt_package_roots_for_input(
+            &moved_manifest,
+            true,
+            Some(&signature),
+            &canonical_workspace,
+        );
+        let retargeted_display_path =
+            super::fmt_workspace_display_path(&moved_manifest, true, Some(&signature));
+
+        assert_eq!(display_path, canonical_workspace.join("sai.package"));
+        assert_eq!(
+            selection_error_path,
+            canonical_workspace.join("sai.package")
+        );
+        assert_eq!(package_roots, vec![canonical_workspace.clone()]);
+        assert!(retargeted_manifest_roots.is_err());
+        assert_eq!(
+            retargeted_display_path,
+            canonical_workspace.join("sai.package")
+        );
+        assert!(!display_path.starts_with(outside));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_workspace_detects_a_retargeted_manifest_even_when_it_deduplicates_with_a_member() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let member = workspace.join("member");
+        let original_target = directory.child("root-manifest-data");
+        fs::create_dir_all(&member).unwrap();
+        fs::write(&original_target, b"package acme:root @ 1.0.0\n").unwrap();
+        fs::write(member.join("sai.package"), b"package acme:member @ 1.0.0\n").unwrap();
+        let root_manifest = workspace.join("sai.package");
+        symlink(&original_target, &root_manifest).unwrap();
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        let canonical_member = fs::canonicalize(&member).unwrap();
+        let original_target = fs::canonicalize(&root_manifest).unwrap();
+        let member_manifest = canonical_member.join("sai.package");
+        let canonical_member_manifest = fs::canonicalize(&member_manifest).unwrap();
+        let canonical_root_manifest = canonical_workspace.join("sai.package");
+        let signature = super::FmtWorkspaceSignature {
+            root: Some(canonical_workspace.clone()),
+            input_paths: vec![canonical_root_manifest.clone(), member_manifest.clone()],
+            manifests: vec![
+                crate::fmt_workspace::FmtManifestSnapshot {
+                    logical_path: canonical_root_manifest.clone(),
+                    path: original_target,
+                    package_directory: Some(canonical_workspace.clone()),
+                    digest: None,
+                    oversized: false,
+                },
+                crate::fmt_workspace::FmtManifestSnapshot {
+                    logical_path: member_manifest.clone(),
+                    path: canonical_member_manifest.clone(),
+                    package_directory: Some(canonical_member),
+                    digest: None,
+                    oversized: false,
+                },
+            ],
+            source_directories: Vec::new(),
+            errors: Vec::new(),
+            total_error_count: 0,
+        };
+
+        fs::remove_file(&root_manifest).unwrap();
+        symlink(&member_manifest, &root_manifest).unwrap();
+        let selection = crate::fmt_paths::select_fmt_workspace_paths(
+            &signature.input_paths,
+            &canonical_workspace,
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(selection.files.len(), 1);
+        assert_eq!(selection.files[0].path, canonical_member_manifest);
+        assert_eq!(selection.resolved_manifest_paths.len(), 2);
+        assert!(!super::fmt_workspace_manifest_resolutions_match(
+            &selection, &signature
+        ));
+    }
+
+    #[test]
+    fn fmt_workspace_signature_tracks_discovery_errors_beyond_retained_diagnostics() {
+        let mut discovery = crate::fmt_workspace::FmtWorkspaceDiscovery {
+            total_error_count: 3,
+            ..crate::fmt_workspace::FmtWorkspaceDiscovery::default()
+        };
+        let failed_read_signature = super::fmt_workspace_signature(&discovery);
+
+        discovery.total_error_count = 0;
+
+        assert_ne!(
+            failed_read_signature,
+            super::fmt_workspace_signature(&discovery)
+        );
+    }
+
+    #[test]
+    fn fmt_workspace_manifest_source_must_match_its_snapshot_digest() {
+        use sha2::{Digest, Sha256};
+
+        let source = b"package acme:root @ 1.0.0\n";
+        let manifest_path = PathBuf::from("/workspace/sai.package");
+        let package_directory = PathBuf::from("/workspace");
+        let digest: [u8; 32] = Sha256::digest(source).into();
+        let mut signature = super::FmtWorkspaceSignature {
+            root: Some(package_directory.clone()),
+            input_paths: vec![manifest_path.clone()],
+            manifests: vec![crate::fmt_workspace::FmtManifestSnapshot {
+                logical_path: manifest_path.clone(),
+                path: manifest_path.clone(),
+                package_directory: Some(package_directory),
+                digest: Some(digest),
+                oversized: false,
+            }],
+            source_directories: Vec::new(),
+            errors: Vec::new(),
+            total_error_count: 0,
+        };
+
+        assert!(super::fmt_workspace_manifest_source_matches_discovery(
+            &manifest_path,
+            source,
+            &signature
+        ));
+        assert!(!super::fmt_workspace_manifest_source_matches_discovery(
+            &manifest_path,
+            b"package acme:changed @ 1.0.0\n",
+            &signature
+        ));
+        signature.manifests[0].digest = None;
+        assert!(!super::fmt_workspace_manifest_source_matches_discovery(
+            &manifest_path,
+            source,
+            &signature
+        ));
+    }
+
+    #[test]
+    fn fmt_does_not_write_nested_package_sources_when_the_declaring_package_lock_fails() {
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let nested = workspace.join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            workspace.join("sai.package"),
+            b"package acme:root @ 1.0.0\nsource \"src\"\n",
+        )
+        .unwrap();
+        fs::write(nested.join("sai.package"), b"package acme:nested @ 1.0.0\n").unwrap();
+        let source_file = nested.join("lib.sai");
+        fs::write(&source_file, b"fn nested(){}").unwrap();
+        fs::create_dir_all(workspace.join(".sai")).unwrap();
+        fs::write(workspace.join(".sai/lock"), b"not-empty").unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", workspace_path, "fmt"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"WORKSPACE_LOCK_FAILED\""));
+        assert_eq!(fs::read(source_file).unwrap(), b"fn nested(){}");
+        assert!(nested.join(".sai/lock").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fmt_locks_every_package_aliasing_one_manifest_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let workspace = directory.child("workspace");
+        let outside = directory.child("outside");
+        let first_member = workspace.join("members/a");
+        let second_member = workspace.join("members/b");
+        fs::create_dir_all(&first_member).unwrap();
+        fs::create_dir_all(&second_member).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            workspace.join("sai.package"),
+            b"package acme:root @ 1.0.0\nrequires {\n  acme:a @ ^1 from path \"members/a\"\n  acme:b @ ^1 from path \"members/b\"\n}\n",
+        )
+        .unwrap();
+        let shared_manifest = outside.join("manifest-data");
+        fs::write(&shared_manifest, b"package acme:shared@1.0.0\n").unwrap();
+        symlink(&shared_manifest, first_member.join("sai.package")).unwrap();
+        symlink(&shared_manifest, second_member.join("sai.package")).unwrap();
+        let workspace_path = workspace.to_str().expect("temporary path is UTF-8");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", workspace_path, "fmt"]);
+
+        assert_eq!(exit_code, 0, "unexpected workspace fmt output: {stdout}");
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"files\":2"));
+        assert!(workspace.join(".sai/lock").is_file());
+        assert!(first_member.join(".sai/lock").is_file());
+        assert!(second_member.join(".sai/lock").is_file());
+        assert!(!outside.join(".sai/lock").exists());
+        assert_eq!(
+            fs::read(&shared_manifest).unwrap(),
+            b"package acme:shared @ 1.0.0\n"
+        );
+    }
+
+    #[test]
     fn fmt_atomically_formats_an_explicit_package_path() {
         let directory = TestDirectory::new();
         let manifest = directory.child("sai.package");
@@ -5881,9 +7364,10 @@ mod tests {
         .unwrap();
         let mut file = super::SelectedFmtFile {
             path: selected.path,
+            is_package_manifest: selected.is_package_manifest,
             source_path: "sai.package".to_owned(),
             package_root: None,
-            package_root_identity: None,
+            package_root_identities: Vec::new(),
             parent: selected.parent,
             name: selected.name,
             identity: selected.identity,

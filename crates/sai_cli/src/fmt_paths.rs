@@ -13,6 +13,9 @@ use sai_driver::CancellationToken;
 pub(crate) struct FmtPathSelection {
     /// Unique physical files, sorted by their platform path encoding.
     pub files: Vec<SelectedFmtPath>,
+    /// Every explicitly selected manifest and the target resolved for it,
+    /// retained before physical-path deduplication.
+    pub resolved_manifest_paths: Vec<(PathBuf, PathBuf)>,
     /// Input paths that do not exist, paired with their input position.
     pub missing: Vec<(usize, PathBuf)>,
     /// Filesystem paths that could not be inspected during traversal.
@@ -24,6 +27,7 @@ pub(crate) struct FmtPathSelection {
 #[derive(Debug)]
 pub(crate) struct SelectedFmtPath {
     pub path: PathBuf,
+    pub is_package_manifest: bool,
     pub parent: Option<Arc<Dir>>,
     pub name: OsString,
     pub identity: sai_windows_fs::FileIdentity,
@@ -38,6 +42,19 @@ pub(crate) struct FmtPathSelectionError {
     pub source: io::Error,
 }
 
+type SelectedPathIdentity = (
+    sai_windows_fs::FileIdentity,
+    sai_windows_fs::FileIdentity,
+    OsString,
+);
+
+struct FmtSelectedPathState<'a> {
+    selection: &'a mut FmtPathSelection,
+    selected_files: &'a mut HashSet<PathBuf>,
+    selected_identities: &'a mut HashSet<SelectedPathIdentity>,
+    retain_capabilities: bool,
+}
+
 enum PendingDirectory {
     Opened(Arc<Dir>, PathBuf),
     Child {
@@ -50,14 +67,18 @@ enum PendingDirectory {
 struct DirectoryWalker<'a> {
     selection: &'a mut FmtPathSelection,
     selected_files: &'a mut HashSet<PathBuf>,
-    selected_identities: &'a mut HashSet<(
-        sai_windows_fs::FileIdentity,
-        sai_windows_fs::FileIdentity,
-        OsString,
-    )>,
+    selected_identities: &'a mut HashSet<SelectedPathIdentity>,
     visited_directories: &'a mut HashSet<PathBuf>,
     cancellation: &'a CancellationToken,
     retain_capabilities: bool,
+    workspace_source: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FmtTraversalMode {
+    #[default]
+    ExplicitPaths,
+    WorkspaceSource,
 }
 
 /// Expands explicit file and directory arguments using the `sai fmt` rules.
@@ -71,7 +92,13 @@ pub(crate) fn select_fmt_paths(
     current_directory: &Path,
     cancellation: &CancellationToken,
 ) -> FmtPathSelection {
-    select_fmt_paths_inner(paths, current_directory, cancellation, true)
+    select_fmt_paths_inner(
+        paths,
+        current_directory,
+        cancellation,
+        true,
+        FmtTraversalMode::ExplicitPaths,
+    )
 }
 
 pub(crate) fn select_fmt_paths_for_comparison(
@@ -79,7 +106,45 @@ pub(crate) fn select_fmt_paths_for_comparison(
     current_directory: &Path,
     cancellation: &CancellationToken,
 ) -> FmtPathSelection {
-    select_fmt_paths_inner(paths, current_directory, cancellation, false)
+    select_fmt_paths_inner(
+        paths,
+        current_directory,
+        cancellation,
+        false,
+        FmtTraversalMode::ExplicitPaths,
+    )
+}
+
+/// Selects workspace manifests and source files below their declared source
+/// directories. Unlike explicit directory selection, this includes hidden
+/// directories and nested `out` directories because the CLI contract says
+/// every `.sai` file below the declared source directory is selected.
+pub(crate) fn select_fmt_workspace_paths(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_paths_inner(
+        paths,
+        current_directory,
+        cancellation,
+        true,
+        FmtTraversalMode::WorkspaceSource,
+    )
+}
+
+pub(crate) fn select_fmt_workspace_paths_for_comparison(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_paths_inner(
+        paths,
+        current_directory,
+        cancellation,
+        false,
+        FmtTraversalMode::WorkspaceSource,
+    )
 }
 
 fn select_fmt_paths_inner(
@@ -87,6 +152,7 @@ fn select_fmt_paths_inner(
     current_directory: &Path,
     cancellation: &CancellationToken,
     retain_capabilities: bool,
+    mode: FmtTraversalMode,
 ) -> FmtPathSelection {
     let mut selection = FmtPathSelection::default();
     let mut selected_files = HashSet::new();
@@ -180,7 +246,7 @@ fn select_fmt_paths_inner(
                     continue;
                 }
             };
-            if should_skip_root_directory(&root) {
+            if mode == FmtTraversalMode::ExplicitPaths && should_skip_root_directory(&root) {
                 continue;
             }
             DirectoryWalker {
@@ -190,6 +256,7 @@ fn select_fmt_paths_inner(
                 visited_directories: &mut visited_directories,
                 cancellation,
                 retain_capabilities,
+                workspace_source: mode == FmtTraversalMode::WorkspaceSource,
             }
             .walk(root_directory, root);
             if selection.interrupted {
@@ -312,7 +379,7 @@ impl DirectoryWalker<'_> {
                     continue;
                 }
                 if file_type.is_dir() {
-                    if should_skip_directory(&directory, &name) {
+                    if !self.workspace_source && should_skip_directory(&directory, &name) {
                         continue;
                     }
                     child_directories.push(PendingDirectory::Child {
@@ -322,15 +389,25 @@ impl DirectoryWalker<'_> {
                     });
                     continue;
                 }
-                if file_type.is_file() && is_formatter_file(&path) {
+                if file_type.is_file()
+                    && if self.workspace_source {
+                        is_source_file(&path)
+                    } else {
+                        is_formatter_file(&path)
+                    }
+                {
+                    let is_package_manifest = name == "sai.package";
                     push_selected_file(
                         path,
                         Arc::clone(&directory),
                         name,
-                        self.selection,
-                        self.selected_files,
-                        self.selected_identities,
-                        self.retain_capabilities,
+                        FmtSelectedPathState {
+                            selection: self.selection,
+                            selected_files: self.selected_files,
+                            selected_identities: self.selected_identities,
+                            retain_capabilities: self.retain_capabilities,
+                        },
+                        is_package_manifest,
                     );
                 }
             }
@@ -409,18 +486,19 @@ fn is_formatter_file(path: &Path) -> bool {
     })
 }
 
+fn is_source_file(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "sai")
+}
+
 fn push_explicit_file(
     path: &Path,
     selection: &mut FmtPathSelection,
     selected_files: &mut HashSet<PathBuf>,
-    selected_identities: &mut HashSet<(
-        sai_windows_fs::FileIdentity,
-        sai_windows_fs::FileIdentity,
-        OsString,
-    )>,
+    selected_identities: &mut HashSet<SelectedPathIdentity>,
     parent_directories: &mut HashMap<PathBuf, Arc<Dir>>,
     retain_capabilities: bool,
 ) {
+    let is_package_manifest = path.file_name().is_some_and(|name| name == "sai.package");
     let canonical_path = match fs::canonicalize(path) {
         Ok(path) => path,
         Err(source) => {
@@ -431,6 +509,11 @@ fn push_explicit_file(
             return;
         }
     };
+    if is_package_manifest {
+        selection
+            .resolved_manifest_paths
+            .push((path.to_path_buf(), canonical_path.clone()));
+    }
     let Some(name) = canonical_path.file_name().map(OsStr::to_os_string) else {
         selection.errors.push(FmtPathSelectionError {
             path: canonical_path,
@@ -478,10 +561,13 @@ fn push_explicit_file(
                 physical_path,
                 parent,
                 name,
-                selection,
-                selected_files,
-                selected_identities,
-                retain_capabilities,
+                FmtSelectedPathState {
+                    selection,
+                    selected_files,
+                    selected_identities,
+                    retain_capabilities,
+                },
+                is_package_manifest,
             );
         }
         Err(source) => selection.errors.push(FmtPathSelectionError {
@@ -495,15 +581,15 @@ fn push_selected_file(
     path: PathBuf,
     parent: Arc<Dir>,
     name: OsString,
-    selection: &mut FmtPathSelection,
-    selected_files: &mut HashSet<PathBuf>,
-    selected_identities: &mut HashSet<(
-        sai_windows_fs::FileIdentity,
-        sai_windows_fs::FileIdentity,
-        OsString,
-    )>,
-    retain_capabilities: bool,
+    state: FmtSelectedPathState<'_>,
+    is_package_manifest: bool,
 ) {
+    let FmtSelectedPathState {
+        selection,
+        selected_files,
+        selected_identities,
+        retain_capabilities,
+    } = state;
     if path.to_str().is_none() {
         selection.errors.push(FmtPathSelectionError {
             path,
@@ -561,9 +647,10 @@ fn push_selected_file(
         return;
     }
     selected_files.insert(path.clone());
-    let identity_guard = (name == "sai.package" && retain_capabilities).then_some(input);
+    let identity_guard = (is_package_manifest && retain_capabilities).then_some(input);
     selection.files.push(SelectedFmtPath {
         path,
+        is_package_manifest,
         parent: retain_capabilities.then_some(parent),
         name,
         identity,
@@ -669,6 +756,51 @@ mod tests {
             [
                 PathBuf::from("sai.package"),
                 PathBuf::from("visible/ok.sai")
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_source_search_includes_hidden_and_out_files_but_not_nested_manifests() {
+        let directory = TestDirectory::new();
+        let package = directory.0.join("package");
+        let source = package.join("src");
+        fs::create_dir_all(source.join(".hidden")).unwrap();
+        fs::create_dir_all(source.join("out")).unwrap();
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(package.join("sai.package"), b"").unwrap();
+        fs::write(source.join("root.sai"), b"").unwrap();
+        fs::write(source.join(".hidden/hidden.sai"), b"").unwrap();
+        fs::write(source.join("out/generated.sai"), b"").unwrap();
+        fs::write(source.join("nested/sai.package"), b"").unwrap();
+        fs::write(source.join("nested/module.sai"), b"").unwrap();
+
+        let paths = [
+            fs::canonicalize(package.join("sai.package")).unwrap(),
+            fs::canonicalize(&source).unwrap(),
+        ];
+        let canonical_package = fs::canonicalize(&package).unwrap();
+        let selection =
+            super::select_fmt_workspace_paths(&paths, &directory.0, &CancellationToken::default());
+        let comparison = super::select_fmt_workspace_paths_for_comparison(
+            &paths,
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert_eq!(selected_paths(&selection), selected_paths(&comparison));
+        let relative = selection
+            .files
+            .iter()
+            .map(|file| file.path.strip_prefix(&canonical_package).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relative,
+            [
+                PathBuf::from("sai.package"),
+                PathBuf::from("src/.hidden/hidden.sai"),
+                PathBuf::from("src/nested/module.sai"),
+                PathBuf::from("src/out/generated.sai"),
+                PathBuf::from("src/root.sai"),
             ]
         );
     }
@@ -928,10 +1060,13 @@ mod tests {
                 child,
                 std::sync::Arc::clone(&parent),
                 name,
-                &mut selection,
-                &mut selected_files,
-                &mut selected_identities,
-                true,
+                super::FmtSelectedPathState {
+                    selection: &mut selection,
+                    selected_files: &mut selected_files,
+                    selected_identities: &mut selected_identities,
+                    retain_capabilities: true,
+                },
+                false,
             );
         }
 
