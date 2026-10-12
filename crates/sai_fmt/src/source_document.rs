@@ -424,7 +424,8 @@ fn collect_comment_candidates(
 
 #[derive(Clone, Copy)]
 enum ListCommentTarget {
-    Opening,
+    OpeningLeading,
+    OpeningTrailing,
     BeforeMember(usize),
     AfterMember(usize),
     Closing,
@@ -441,7 +442,8 @@ struct BraceCommentTargets {
 
 #[derive(Default)]
 struct ListComments {
-    opening: Vec<SourceComment>,
+    opening_leading: Vec<SourceComment>,
+    opening_trailing: Vec<SourceComment>,
     before: Vec<Vec<SourceComment>>,
     after: Vec<Vec<SourceComment>>,
     closing: Vec<SourceComment>,
@@ -449,7 +451,8 @@ struct ListComments {
 
 impl ListComments {
     fn has_comments(&self) -> bool {
-        !self.opening.is_empty()
+        !self.opening_leading.is_empty()
+            || !self.opening_trailing.is_empty()
             || !self.closing.is_empty()
             || self.before.iter().any(|comments| !comments.is_empty())
             || self.after.iter().any(|comments| !comments.is_empty())
@@ -524,7 +527,7 @@ fn list_comment_targets(
             opening.text_range().start().to_usize(),
             opening.text_range().end().to_usize(),
         ),
-        ListCommentTarget::Opening,
+        ListCommentTarget::OpeningTrailing,
     );
     for (index, member) in members.iter().enumerate() {
         if member.kind() != member_kind {
@@ -627,12 +630,21 @@ fn block_comment_targets(
     let mut owner_tokens = vec![opening.clone(), closing.clone()];
     targets.insert(
         (
+            true,
+            opening.kind(),
+            opening.text_range().start().to_usize(),
+            opening.text_range().end().to_usize(),
+        ),
+        ListCommentTarget::OpeningLeading,
+    );
+    targets.insert(
+        (
             false,
             opening.kind(),
             opening.text_range().start().to_usize(),
             opening.text_range().end().to_usize(),
         ),
-        ListCommentTarget::Opening,
+        ListCommentTarget::OpeningTrailing,
     );
     for (index, statement) in statements.iter().enumerate() {
         if !ast::Stmt::can_cast(statement.kind()) {
@@ -726,6 +738,16 @@ fn block_has_comments(
     Ok(collect_block_comments(block.syntax(), &statement_nodes)?.has_comments())
 }
 
+fn block_has_opening_leading_comments(block: &ast::Block) -> Result<bool, SourceDocumentError> {
+    let statements = block
+        .statements()
+        .map(|statement| statement.syntax().clone())
+        .collect::<Vec<_>>();
+    Ok(!collect_block_comments(block.syntax(), &statements)?
+        .opening_leading
+        .is_empty())
+}
+
 fn collect_brace_unit_comments(
     member_count: usize,
     targets: BraceCommentTargets,
@@ -737,7 +759,8 @@ fn collect_brace_unit_comments(
         owner_tokens,
     } = targets;
     let mut comments = ListComments {
-        opening: Vec::new(),
+        opening_leading: Vec::new(),
+        opening_trailing: Vec::new(),
         before: vec![Vec::new(); member_count],
         after: vec![Vec::new(); member_count],
         closing: Vec::new(),
@@ -745,12 +768,17 @@ fn collect_brace_unit_comments(
     let mut candidates = collect_comments_from_tokens(&owner_tokens)?;
     candidates.sort_by_key(|comment| comment.range.start);
     for comment in candidates {
+        let target = targets.get(&comment_owner_key(&comment)).copied();
+        if matches!(target, Some(ListCommentTarget::OpeningLeading)) {
+            comments.opening_leading.push(comment);
+            continue;
+        }
         if comment.range.start < interior_start || comment.range.end > interior_end {
             continue;
         }
-        let target = targets.get(&comment_owner_key(&comment)).copied();
         match target {
-            Some(ListCommentTarget::Opening) => comments.opening.push(comment),
+            Some(ListCommentTarget::OpeningLeading) => {}
+            Some(ListCommentTarget::OpeningTrailing) => comments.opening_trailing.push(comment),
             Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
             Some(ListCommentTarget::AfterMember(index)) => comments.after[index].push(comment),
             Some(ListCommentTarget::Closing) => comments.closing.push(comment),
@@ -1131,6 +1159,11 @@ fn function_document(
         })
         .transpose()?
         .unwrap_or_else(|| Doc::text(""));
+    let body_has_opening_leading_comments = body
+        .as_ref()
+        .map(block_has_opening_leading_comments)
+        .transpose()?
+        .unwrap_or(false);
     let body_document = body
         .as_ref()
         .map(|body| block_document(source, body, expression_group_ids))
@@ -1157,7 +1190,11 @@ fn function_document(
         }
         let mut document = vec![head, Doc::indent(Doc::concat(clause_lines))];
         if let Some(body) = body_document {
-            document.extend([Doc::HardLine, body]);
+            if body_has_opening_leading_comments {
+                document.push(body);
+            } else {
+                document.extend([Doc::HardLine, body]);
+            }
         }
         Doc::concat(document)
     };
@@ -2582,20 +2619,42 @@ fn record_fields_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    broken_brace_list_document(source, members, &comments.opening, &comments.closing)
+    broken_brace_list_document(
+        source,
+        members,
+        &comments.opening_leading,
+        &comments.opening_trailing,
+        &comments.closing,
+    )
 }
 
 fn broken_brace_list_document(
     source: &ParsedSource,
     members: Vec<(usize, usize, Doc)>,
-    opening_comments: &[SourceComment],
+    opening_leading_comments: &[SourceComment],
+    opening_trailing_comments: &[SourceComment],
     closing_comments: &[SourceComment],
 ) -> Result<Doc, SourceDocumentError> {
-    if members.is_empty() && opening_comments.is_empty() && closing_comments.is_empty() {
-        return Ok(Doc::text("{}"));
+    let mut document = Vec::new();
+    if !opening_leading_comments.is_empty() {
+        document.push(Doc::HardLine);
+        append_comment_documents(&mut document, opening_leading_comments, source.text(), None)?;
+        let opening_start = opening_leading_comments[0].owner_token_range.start;
+        append_comment_gap(
+            &mut document,
+            source.text(),
+            opening_leading_comments
+                .last()
+                .map(|comment| comment.range.end),
+            Some(opening_start),
+        )?;
+    }
+    if members.is_empty() && opening_trailing_comments.is_empty() && closing_comments.is_empty() {
+        document.push(Doc::text("{}"));
+        return Ok(Doc::concat(document));
     }
     let mut body = Vec::new();
-    append_trailing_comment_documents(&mut body, opening_comments);
+    append_trailing_comment_documents(&mut body, opening_trailing_comments);
     if !members.is_empty() || !closing_comments.is_empty() {
         body.push(Doc::HardLine);
     }
@@ -2626,12 +2685,13 @@ fn broken_brace_list_document(
         }
         append_comment_documents(&mut body, closing_comments, source.text(), None)?;
     }
-    Ok(Doc::concat([
+    document.extend([
         Doc::text("{"),
         Doc::indent(Doc::concat(body)),
         Doc::HardLine,
         Doc::text("}"),
-    ]))
+    ]);
+    Ok(Doc::concat(document))
 }
 
 fn decorate_list_member_document(
@@ -2813,8 +2873,13 @@ fn enum_decl_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let variants =
-        broken_brace_list_document(source, members, &comments.opening, &comments.closing)?;
+    let variants = broken_brace_list_document(
+        source,
+        members,
+        &comments.opening_leading,
+        &comments.opening_trailing,
+        &comments.closing,
+    )?;
 
     let mut documents = vec![Doc::text(format!(
         "{visibility_prefix}enum {}",
@@ -3237,7 +3302,7 @@ fn block_document(
         .map(|statement| statement.syntax().clone())
         .collect::<Vec<_>>();
     let comments = collect_block_comments(block.syntax(), &statement_nodes)?;
-    if statements.is_empty() && comments.opening.is_empty() && comments.closing.is_empty() {
+    if statements.is_empty() && !comments.has_comments() {
         return Ok(Doc::text("{}"));
     }
 
@@ -3261,7 +3326,13 @@ fn block_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    broken_brace_list_document(source, members, &comments.opening, &comments.closing)
+    broken_brace_list_document(
+        source,
+        members,
+        &comments.opening_leading,
+        &comments.opening_trailing,
+        &comments.closing,
+    )
 }
 
 fn block_expression_document(

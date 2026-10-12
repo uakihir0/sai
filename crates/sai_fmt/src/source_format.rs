@@ -776,13 +776,57 @@ mod tests {
     }
 
     #[test]
-    fn keeps_comments_before_block_opening_braces_fail_closed() {
-        let source = "fn f()\n// before body\n{\n    1\n}";
-        assert_eq!(
-            format_source(source.as_bytes()),
-            Err(SourceFormatError::UnsupportedShape),
-            "{source}"
+    fn formats_own_line_comments_before_block_opening_braces() {
+        let source = concat!(
+            "fn work()\n",
+            "// before body\n",
+            "{\n",
+            "    1\n",
+            "}\n",
+            "fn empty()\n",
+            "// before empty body\n",
+            "{}\n",
+            "fn clause() where T: Copy\n",
+            "// before clause body\n",
+            "{\n",
+            "    2\n",
+            "}\n",
         );
+        let expected = concat!(
+            "fn work()\n",
+            "// before body\n",
+            "{\n",
+            "    1\n",
+            "}\n",
+            "\n",
+            "fn empty()\n",
+            "// before empty body\n",
+            "{}\n",
+            "\n",
+            "fn clause()\n",
+            "    where T: Copy\n",
+            "// before clause body\n",
+            "{\n",
+            "    2\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("opening brace comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn keeps_own_line_comments_before_record_and_enum_braces_fail_closed() {
+        for source in [
+            "type User\n// before fields\n{\n    id: U32\n}",
+            "enum State\n// before variants\n{\n    Ready\n}",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
     }
 
     #[test]
