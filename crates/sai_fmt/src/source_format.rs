@@ -1910,17 +1910,74 @@ mod tests {
     }
 
     #[test]
-    fn refuses_line_and_multiline_comments_after_match_arm_separators() {
-        for source in [
-            "fn f(value:State) {\n    match value{.Ready=>1, // next\n        _=>0}\n}\n",
-            "fn f(value:State) {\n    match value{.Ready=>1,/* next\n        continued */_=>0}\n}\n",
-            "fn f(value:State) {\n    match value{.Ready=>1, // trailing\n    }\n}\n",
-            "fn f(value:State) {\n    match value{.Ready=>1,/* trailing\n        continued */\n    }\n}\n",
-        ] {
+    fn formats_line_and_multiline_comments_after_match_arm_separators() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1, // next\n_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1, // next\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1,/* next\ncontinued */_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1, /* next\n",
+                    "continued */\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1, // trailing\n}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1, // trailing\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1,/* trailing\ncontinued */\n}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1, /* trailing\n",
+                    "continued */\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{.Ready=>1, // nested\n_=>0})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(\n",
+                    "        match value {\n",
+                    "            .Ready => 1, // nested\n",
+                    "            _ => 0\n",
+                    "        },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
             assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("line and multiline match-arm separator comments are supported");
+            assert_eq!(formatted, expected, "{source}");
             assert_eq!(
-                format_source(source.as_bytes()),
-                Err(SourceFormatError::UnsupportedShape),
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
                 "{source}"
             );
         }

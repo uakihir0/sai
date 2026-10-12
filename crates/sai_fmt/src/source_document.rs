@@ -4012,23 +4012,21 @@ fn match_expression_document_with_keyword_comments(
             expression_group_ids,
         )?);
     }
-    let separator_comment_documents =
+    let (separator_comment_documents, separator_comments_require_line_break) =
         match_arm_separator_comment_documents(&arms, match_arms.len())?;
     let opening_comments = match_arm_list_opening_comments(&arms, match_arms.len())?;
     let closing_comment_documents =
         match_arm_list_closing_comment_documents(source, &arms, &match_arms)?;
-    let mut force_break = arm_documents
-        .iter()
-        .any(document_contains_unavoidable_forced_break);
+    let mut force_break = separator_comments_require_line_break
+        || arm_documents
+            .iter()
+            .any(document_contains_unavoidable_forced_break);
     for arm in &match_arms {
         let result_last_token = arm
             .expression()
             .and_then(|expression| expression.syntax().last_token())
             .ok_or(SourceDocumentError::UnsupportedShape)?;
-        if trailing_comments_after_token(&result_last_token)?
-            .iter()
-            .any(|comment| comment.kind == TriviaKind::LineComment)
-        {
+        if source_comments_require_line_break(&trailing_comments_after_token(&result_last_token)?) {
             force_break = true;
             break;
         }
@@ -4151,8 +4149,9 @@ fn match_arm_list_elements_match(list: &ast::MatchArmList, arms: &[ast::MatchArm
 fn match_arm_separator_comment_documents(
     list: &ast::MatchArmList,
     arm_count: usize,
-) -> Result<Vec<Vec<Doc>>, SourceDocumentError> {
+) -> Result<(Vec<Vec<Doc>>, bool), SourceDocumentError> {
     let mut separator_documents = vec![Vec::new(); arm_count];
+    let mut comments_require_line_break = false;
     let mut next_arm_index = 0;
     let mut previous_arm_index = None;
     for element in list.syntax().children_with_tokens() {
@@ -4172,15 +4171,18 @@ fn match_arm_separator_comment_documents(
                 if !separator_documents[separator_index].is_empty() {
                     return Err(SourceDocumentError::UnsupportedShape);
                 }
-                append_single_line_block_comments(
-                    &mut separator_documents[separator_index],
-                    &comments,
-                )?;
+                let documents = &mut separator_documents[separator_index];
+                if source_comments_require_line_break(&comments) {
+                    append_match_arm_comment_run(documents, &comments);
+                    comments_require_line_break = true;
+                } else {
+                    append_single_line_block_comments(documents, &comments)?;
+                }
             }
             _ => {}
         }
     }
-    Ok(separator_documents)
+    Ok((separator_documents, comments_require_line_break))
 }
 
 fn match_arm_list_opening_comments(
@@ -4355,10 +4357,7 @@ fn match_arm_document(
             ExpressionContext::Unprotected,
             expression_group_ids,
         )?;
-        if guard_keyword_comments.iter().any(|comment| {
-            comment.kind == TriviaKind::LineComment
-                || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
-        }) {
+        if source_comments_require_line_break(&guard_keyword_comments) {
             documents.push(Doc::indent(Doc::concat([
                 Doc::HardLine,
                 guard_expression_document,
@@ -4376,10 +4375,7 @@ fn match_arm_document(
     documents.push(Doc::text(" =>"));
     let arrow_comments = trailing_comments_after_direct_token(arm.syntax(), SyntaxKind::FAT_ARROW)?;
     append_match_arm_comment_run(&mut documents, &arrow_comments);
-    let arrow_comments_require_line_break = arrow_comments.iter().any(|comment| {
-        comment.kind == TriviaKind::LineComment
-            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
-    });
+    let arrow_comments_require_line_break = source_comments_require_line_break(&arrow_comments);
 
     let body_document = expression_document(
         source,
@@ -4411,10 +4407,7 @@ fn match_arm_document(
         .last_token()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let expression_comments = trailing_comments_after_token(&expression_last_token)?;
-    if expression_comments.iter().any(|comment| {
-        comment.kind == TriviaKind::LineComment
-            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
-    }) {
+    if source_comments_require_line_break(&expression_comments) {
         append_match_arm_comment_run(&mut documents, &expression_comments);
     } else {
         append_single_line_block_comments(&mut documents, &expression_comments)?;
@@ -4440,6 +4433,13 @@ fn append_match_arm_comment_run(document: &mut Vec<Doc>, comments: &[SourceComme
         // second formatting pass.
         previous_comment_requires_line_break = comment.kind == TriviaKind::LineComment;
     }
+}
+
+fn source_comments_require_line_break(comments: &[SourceComment]) -> bool {
+    comments.iter().any(|comment| {
+        comment.kind == TriviaKind::LineComment
+            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
+    })
 }
 
 fn is_open_ended_range_expression(expression: &Expr) -> bool {
