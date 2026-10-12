@@ -1499,6 +1499,54 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_region_keywords() {
+        let source = concat!(
+            "fn regions(){\n",
+            "region/* direct */arena{work()}\n",
+            "let local=region/* initialized */arena{read()}\n",
+            "var shared=region/* mutable */arena{}\n",
+            "shared=region/* assigned */arena{write()}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn regions() {\n",
+            "    region /* direct */ arena {\n",
+            "        work()\n",
+            "    }\n",
+            "    let local = region /* initialized */ arena {\n",
+            "        read()\n",
+            "    }\n",
+            "    var shared = region /* mutable */ arena {}\n",
+            "    shared = region /* assigned */ arena {\n",
+            "        write()\n",
+            "    }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("region keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_region_keywords() {
+        for source in [
+            "fn f() {\n    region // area\n        arena{}\n}\n",
+            "fn f() {\n    region /* area\n        name */ arena{}\n}\n",
+            "fn f() {\n    let local=region // area\n        arena{}\n}\n",
+            "fn f() {\n    let local=region /* area\n        name */ arena{}\n}\n",
+        ] {
+            assert!(format_source(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn refuses_region_keyword_comments_nested_in_composite_expressions() {
+        let source = "fn f() {\n    let local=consume(region/* nested */arena{})\n}\n";
+        assert!(format_source(source.as_bytes()).is_err(), "{source}");
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

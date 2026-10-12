@@ -902,6 +902,19 @@ fn expression_keyword_token(expression: &Expr) -> Option<SyntaxToken> {
         Expr::Match(match_expr) => (match_expr.syntax(), SyntaxKind::MATCH_KW),
         Expr::UnsafeBlock(unsafe_block) => (unsafe_block.syntax(), SyntaxKind::UNSAFE_KW),
         Expr::AsyncBlock(async_block) => (async_block.syntax(), SyntaxKind::ASYNC_KW),
+        Expr::Region(region_expr) => {
+            return region_expr
+                .syntax()
+                .children_with_tokens()
+                .find_map(|element| match element {
+                    SyntaxElement::Token(token)
+                        if token.kind() == SyntaxKind::LIDENT && token.text() == "region" =>
+                    {
+                        Some(token)
+                    }
+                    _ => None,
+                });
+        }
         _ => return None,
     };
     expression
@@ -4925,6 +4938,15 @@ fn region_expression_document(
     region_expr: &ast::RegionExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    region_expression_document_with_keyword_comments(source, region_expr, expression_group_ids, &[])
+}
+
+fn region_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    region_expr: &ast::RegionExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let name = region_expr
         .name()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -4947,12 +4969,15 @@ fn region_expression_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    Ok(Doc::concat([
-        Doc::text("region "),
+    let mut documents = vec![Doc::text("region")];
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
+    documents.extend([
+        Doc::text(" "),
         Doc::text(node_text(source, name.syntax())),
         Doc::text(" "),
         block_document(source, &body, expression_group_ids)?,
-    ]))
+    ]);
+    Ok(Doc::concat(documents))
 }
 
 fn first_choice_layout(document: &Doc) -> Doc {
@@ -5349,6 +5374,12 @@ fn statement_document(
                             keyword_comments,
                         )
                     }
+                    Expr::Region(region_expr) => region_expression_document_with_keyword_comments(
+                        source,
+                        region_expr,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
                     _ => Err(SourceDocumentError::UnsupportedShape),
                 };
             }
@@ -5413,6 +5444,12 @@ fn right_hand_side_after_operator_document(
             Expr::AsyncBlock(async_block) => async_block_expression_document_with_keyword_comments(
                 source,
                 async_block,
+                expression_group_ids,
+                comments.expression_keyword,
+            )?,
+            Expr::Region(region_expr) => region_expression_document_with_keyword_comments(
+                source,
+                region_expr,
                 expression_group_ids,
                 comments.expression_keyword,
             )?,
