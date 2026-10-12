@@ -1451,6 +1451,54 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_async_keywords() {
+        let source = concat!(
+            "fn async_blocks(){\n",
+            "async/* statement */{work()}\n",
+            "let moved=async/* moved */move{}\n",
+            "var plain=async/* plain */{}\n",
+            "plain=async/* assigned */move{}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn async_blocks() {\n",
+            "    async /* statement */ {\n",
+            "        work()\n",
+            "    }\n",
+            "    let moved = async /* moved */ move {}\n",
+            "    var plain = async /* plain */ {}\n",
+            "    plain = async /* assigned */ move {}\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("async keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_async_keywords() {
+        for source in [
+            "fn f() {\n    async // block\n        {}\n}\n",
+            "fn f() {\n    async /* block\n        comment */ {}\n}\n",
+            "fn f() {\n    let task=async // block\n        {}\n}\n",
+            "fn f() {\n    let task=async /* block\n        comment */ {}\n}\n",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_async_keyword_comments_nested_in_composite_expressions() {
+        let source = "fn f() {\n    let task=consume(async/* nested */{})\n}\n";
+        assert!(format_source(source.as_bytes()).is_err(), "{source}");
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

@@ -901,6 +901,7 @@ fn expression_keyword_token(expression: &Expr) -> Option<SyntaxToken> {
         Expr::Loop(loop_expr) => (loop_expr.syntax(), SyntaxKind::LOOP_KW),
         Expr::Match(match_expr) => (match_expr.syntax(), SyntaxKind::MATCH_KW),
         Expr::UnsafeBlock(unsafe_block) => (unsafe_block.syntax(), SyntaxKind::UNSAFE_KW),
+        Expr::AsyncBlock(async_block) => (async_block.syntax(), SyntaxKind::ASYNC_KW),
         _ => return None,
     };
     expression
@@ -4880,6 +4881,20 @@ fn async_block_expression_document(
     async_block: &ast::AsyncBlockExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    async_block_expression_document_with_keyword_comments(
+        source,
+        async_block,
+        expression_group_ids,
+        &[],
+    )
+}
+
+fn async_block_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    async_block: &ast::AsyncBlockExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let body = async_block
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -4895,11 +4910,14 @@ fn async_block_expression_document(
     if async_block.syntax().children().count() != 1 {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    Ok(Doc::concat([
-        Doc::text("async "),
+    let mut documents = vec![Doc::text("async")];
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
+    documents.extend([
+        Doc::text(" "),
         Doc::text(move_prefix),
         block_document(source, &body, expression_group_ids)?,
-    ]))
+    ]);
+    Ok(Doc::concat(documents))
 }
 
 fn region_expression_document(
@@ -5323,6 +5341,14 @@ fn statement_document(
                             keyword_comments,
                         )
                     }
+                    Expr::AsyncBlock(async_block) => {
+                        async_block_expression_document_with_keyword_comments(
+                            source,
+                            async_block,
+                            expression_group_ids,
+                            keyword_comments,
+                        )
+                    }
                     _ => Err(SourceDocumentError::UnsupportedShape),
                 };
             }
@@ -5384,6 +5410,12 @@ fn right_hand_side_after_operator_document(
                     comments.expression_keyword,
                 )?
             }
+            Expr::AsyncBlock(async_block) => async_block_expression_document_with_keyword_comments(
+                source,
+                async_block,
+                expression_group_ids,
+                comments.expression_keyword,
+            )?,
             _ => return Err(SourceDocumentError::UnsupportedShape),
         }
     };
