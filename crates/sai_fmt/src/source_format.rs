@@ -1550,6 +1550,60 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_match_arm_expressions() {
+        let source = concat!(
+            "fn f(value:State){\n",
+            "match value{.Ready=>1/* result */,_=>0}\n",
+            "let selected=consume(match value{.Ready=>{perform()}/* nested */,_=>0})\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn f(value: State) {\n",
+            "    match value { .Ready => 1 /* result */, _ => 0 }\n",
+            "    let selected = consume(\n",
+            "        match value {\n",
+            "            .Ready => {\n",
+            "                perform()\n",
+            "            } /* nested */\n",
+            "            _ => 0\n",
+            "        },\n",
+            "    )\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("match arm expression comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_match_arm_expressions() {
+        for source in [
+            "fn f(value:State) {\n    match value{.Ready=>1 // result\n    }\n}\n",
+            "fn f(value:State) {\n    match value{.Ready=>1/* result\n        continued */\n    }\n}\n",
+        ] {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_comments_inside_match_arm_expressions() {
+        let source =
+            "fn f(value:State) {\n    match value{.Ready=>check(/* argument */value),_=>0}\n}\n";
+        assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+        assert_eq!(
+            format_source(source.as_bytes()),
+            Err(SourceFormatError::UnsupportedShape),
+            "{source}"
+        );
+    }
+
+    #[test]
     fn refuses_match_keyword_comments_nested_in_composite_expressions() {
         let source =
             "fn f(value:State) {\n    let selected=consume(match/* nested */value{_=>0})\n}\n";

@@ -592,6 +592,17 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
                 token.text_range().end().to_usize(),
             ));
         }
+        if let Some(token) = ast::MatchArm::cast(node.clone())
+            .and_then(|arm| arm.expression())
+            .and_then(|expression| expression.syntax().last_token())
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
     }
     for node in root
         .descendants()
@@ -4062,6 +4073,12 @@ fn match_arm_document(
         right_hand_side_document_from_document(&expression, body, true)
     };
     documents.push(body);
+    let expression_last_token = expression
+        .syntax()
+        .last_token()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let expression_comments = trailing_comments_after_token(&expression_last_token)?;
+    append_single_line_block_comments(&mut documents, &expression_comments)?;
     Ok(Doc::concat(documents))
 }
 
