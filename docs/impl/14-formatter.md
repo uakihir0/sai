@@ -110,7 +110,7 @@ Single-line block comments trailing the final token of a match-guard expression 
 
 Single-line block comments trailing the final token of a match arm's result expression stay after the formatted expression, including block-like results and results in nested match expressions. Line comments and multiline block comments also stay after the result expression in broken match-arm lists. Comments attached to interior tokens of the result expression remain unsupported.
 
-Single-line block comments trailing an arm-separating comma stay after the comma and before the next arm, including in flat and broken match lists. A comment after a trailing comma stays before the closing brace. Line comments and multiline block comments remain unsupported.
+Single-line block comments trailing an arm-separating comma stay after the comma and before the next arm. Line comments and multiline block comments also stay after the comma and force the match-arm list to break. Comments after a trailing comma stay before the closing brace.
 
 Single-line block comments attached to the opening brace or leading trivia of a match-arm pattern stay before the pattern, including for arms separated by newlines and matches nested in other expressions. Line comments, multiline block comments, and comments attached to pattern-interior tokens remain unsupported.
 

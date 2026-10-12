@@ -3109,4 +3109,12 @@
 - **Reason:** Match-arm lists accept a newline separator after a result expression, so these comments can remain attached without changing the grammar. By contrast, the grammar requires `=>` immediately after a guard expression; line or multiline comments at that boundary introduce a syntax-invalid newline, so no grammar or specification expansion is made for that unsupported case.
 - **Review:** Focused regressions cover line and multiline comments before another arm, a final-arm line comment, nested matches, and fixed-point output. Hostile review found no actionable issues; it spot-checked final-arm comments before closing comments, nested matches, and an open-ended result in a width-broken list, with fixed-point output. A bare non-final open-ended range with a line comment is parser-rejected and remains outside this formatter change's supported inputs.
 - **Human review:** **Review required:** Confirm that result comments stay after the result and break the match-arm list before the following arm or closing brace.
-- **Remaining scope:** Comments attached to interior result-expression tokens, match-arm separators, pattern interiors, and other unsupported comment-bearing syntax.
+- **Remaining scope:** Comments attached to interior result-expression tokens, pattern interiors, and other unsupported comment-bearing syntax.
+
+### IR-429: Preserve comments after match-arm separators
+
+- **Decision:** Preserve line comments and multiline block comments trailing an arm-separating comma, both between arms and after a trailing comma. Force the arm list to break when these comments require a line break; keep single-line block comments inline.
+- **Reason:** The comma is an explicit separator, and the grammar permits a newline after it. A forced broken list flushes line-comment suffixes before the next arm or closing brace while keeping the comment attached to the comma.
+- **Review:** Focused regressions cover line and multiline comments between arms and after a trailing comma, nested matches, and fixed-point output. Hostile review found no actionable issues; it spot-checked trailing-comma comments before closing comments, mixed result and separator comments, consecutive block comments, and nested matches, all reaching a fixed point. The single-line block-comment path remains unchanged.
+- **Human review:** **Review required:** Confirm that comments after arm-separating commas remain attached to those commas and force broken-list layout, including trailing commas.
+- **Remaining scope:** Pattern interiors, result-expression interiors, and other unsupported comment-bearing syntax.
