@@ -3001,11 +3001,11 @@
 
 ### IR-415: Preserve comments after match-guard `if` keywords
 
-- **Decision:** Preserve single-line block comments attached to the `IF_KW` token of a `MATCH_GUARD` between `if` and its guard expression, including in recursively formatted match expressions. Keep line comments, multiline block comments, and comments attached to guard expressions or pattern interiors fail-closed; final-token pattern comments are covered by IR-416.
+- **Decision:** Preserve single-line block comments attached to the `IF_KW` token of a `MATCH_GUARD` between `if` and its guard expression, including in recursively formatted match expressions. Keep line comments, multiline block comments, and comments attached to guard-expression interiors or pattern interiors fail-closed; final-token pattern comments are covered by IR-416.
 - **Reason:** The guard's direct `if` token introduces the expression that follows it. Keeping a single-line block comment in that gap preserves the guard association and leaves the arrow and right-hand-side layout unchanged. Selecting the token from `MATCH_GUARD` avoids confusing it with an `if` expression elsewhere in the arm.
 - **Review:** Regressions cover guard expressions in direct and nested match expressions, canonical spacing, fixed-point output, line and multiline comment refusal, and fail-closed behavior for a comment inside a constructor pattern. Hostile review confirmed that `MATCH_GUARD.IF_KW` and `MATCH_ARM.FAT_ARROW` are tracked independently and that comments appear in their token order; no actionable findings remain. All 349 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
-- **Human review:** **Review required:** Confirm that a single-line block comment after a match guard's `if` stays before the guard expression, while line-breaking comments, pattern-interior comments, and comments on the guard expression remain unsupported.
-- **Remaining scope:** Support comments attached to match guard expressions and other nested pattern tokens, then continue through remaining comment-bearing source syntax.
+- **Human review:** **Review required:** Confirm that a single-line block comment after a match guard's `if` stays before the guard expression, while line-breaking comments and comments on pattern or guard-expression interiors remain unsupported.
+- **Remaining scope:** Support comments inside match guard expressions and other nested pattern tokens, then continue through remaining comment-bearing source syntax.
 
 ### IR-416: Preserve comments after match-arm patterns
 
@@ -3013,4 +3013,12 @@
 - **Reason:** A trailing comment belongs to the pattern's final token, whether that token closes a constructor or is part of a simple pattern. Reading trivia from the AST pattern's actual last token keeps the comment after the complete pattern and before any guard or arm arrow without guessing from pattern kind.
 - **Review:** Regressions cover simple member and nested constructor patterns, a combined pattern/guard/arrow comment sequence, a nested match argument, canonical spacing, and fixed-point output. A parser-valid comment inside a constructor pattern remains fail-closed. Hostile review found no actionable issues and confirmed that pattern, guard `if`, and arm arrow trivia retain their token order. All 351 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
 - **Human review:** **Review required:** Confirm that a single-line block comment on the final token of a match pattern stays after the complete pattern and before its optional guard or arrow, while comments inside the pattern remain unsupported.
-- **Remaining scope:** Support comments attached to match guard expressions and other nested pattern tokens, then continue through remaining comment-bearing source syntax.
+- **Remaining scope:** Support comments inside match guard expressions and other nested pattern tokens, then continue through remaining comment-bearing source syntax.
+
+### IR-417: Preserve comments after match-guard expressions
+
+- **Decision:** Preserve single-line block comments attached to the final token of a match guard's expression after the formatted expression and before the arm's `=>`, including call expressions and guards in nested match expressions. Keep comments attached to interior expression tokens fail-closed.
+- **Reason:** The trailing comment belongs to the guard expression's actual final token. Collecting trivia from that token and appending it after the expression document keeps it between the guard and arm arrow without confusing it with comments after `if` or `=>`.
+- **Review:** Regressions cover call-expression guards in direct and nested match expressions, a combined pattern/guard-keyword/guard-expression/arrow comment sequence, canonical spacing, and fixed-point output. A parser-valid comment inside a guard call argument remains fail-closed. Hostile review found no actionable issues and confirmed independent ownership and source order for all four token positions. All 353 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
+- **Human review:** **Review required:** Confirm that a single-line block comment on the final token of a match guard expression stays after the full expression and before `=>`, while comments on interior expression tokens remain unsupported.
+- **Remaining scope:** Support comments attached to other match-arm tokens, then continue through remaining comment-bearing source syntax.
