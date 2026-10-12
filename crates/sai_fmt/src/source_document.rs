@@ -32,9 +32,14 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let mut units = Vec::with_capacity(items.len());
+    let mut use_declarations = Vec::new();
     let mut expression_group_ids = ExpressionGroupIds::default();
     for item in items {
         let unit = match item {
+            Item::Use(declaration) => {
+                use_declarations.push(use_declaration_document(source, &declaration)?);
+                continue;
+            }
             Item::Function(function) => {
                 function_document(source, &function, &mut expression_group_ids)?
             }
@@ -59,17 +64,30 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
         };
         units.push(unit);
     }
-    if units.is_empty() {
-        return Ok(module_header.map_or_else(
-            || Doc::concat([]),
-            |header| Doc::concat([header, Doc::HardLine]),
-        ));
-    }
+    use_declarations.sort_by(|left, right| {
+        left.is_public
+            .cmp(&right.is_public)
+            .then_with(|| left.sort_key.as_bytes().cmp(right.sort_key.as_bytes()))
+    });
 
-    let mut document =
-        Vec::with_capacity(units.len() * 2 + usize::from(module_header.is_some()) * 2);
+    let mut document = Vec::with_capacity(units.len() * 2 + use_declarations.len() * 2 + 2);
     if let Some(module_header) = module_header {
-        document.extend([module_header, Doc::HardLine, Doc::HardLine]);
+        document.push(module_header);
+        if !use_declarations.is_empty() || !units.is_empty() {
+            document.extend([Doc::HardLine, Doc::HardLine]);
+        }
+    }
+    for (index, declaration) in use_declarations.iter().enumerate() {
+        if index > 0 {
+            document.push(Doc::HardLine);
+            if use_declarations[index - 1].is_public != declaration.is_public {
+                document.push(Doc::HardLine);
+            }
+        }
+        document.push(declaration.document.clone());
+    }
+    if !use_declarations.is_empty() && !units.is_empty() {
+        document.extend([Doc::HardLine, Doc::HardLine]);
     }
     for (index, unit) in units.iter().enumerate() {
         if index > 0 {
@@ -78,7 +96,9 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
                 .text()
                 .get(previous.end..unit.start)
                 .unwrap_or_default();
-            let preserve_blank_line = gap.matches('\n').count() > 1;
+            let trailing_whitespace_start = gap.trim_end_matches(char::is_whitespace).len();
+            let trailing_whitespace = &gap[trailing_whitespace_start..];
+            let preserve_blank_line = trailing_whitespace.matches('\n').count() > 1;
             let separate_with_blank_line =
                 previous.multiline || unit.multiline || preserve_blank_line;
             document.push(Doc::HardLine);
@@ -125,6 +145,12 @@ struct ItemDocument {
     start: usize,
     end: usize,
     multiline: bool,
+}
+
+struct UseDeclarationDocument {
+    document: Doc,
+    sort_key: String,
+    is_public: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -420,6 +446,248 @@ fn module_header_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
     Ok(Doc::concat(documents))
+}
+
+fn use_declaration_document(
+    source: &ParsedSource,
+    declaration: &ast::UseDecl,
+) -> Result<UseDeclarationDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attributes = declaration.attrs().collect::<Vec<_>>();
+    let visibility = declaration.visibility();
+    let alias = declaration.alias();
+    let items = declaration.items();
+    let mut expected_child_ranges = Vec::new();
+    expected_child_ranges.extend(docs.as_ref().map(|docs| docs.syntax().text_range()));
+    expected_child_ranges.extend(
+        attributes
+            .iter()
+            .map(|attribute| attribute.syntax().text_range()),
+    );
+    expected_child_ranges.extend(
+        visibility
+            .as_ref()
+            .map(|visibility| visibility.syntax().text_range()),
+    );
+    expected_child_ranges.extend(alias.as_ref().map(|alias| alias.syntax().text_range()));
+    expected_child_ranges.extend(items.as_ref().map(|items| items.syntax().text_range()));
+    let direct_tokens = direct_token_kinds(declaration.syntax());
+    if declaration
+        .syntax()
+        .children()
+        .map(|child| child.text_range())
+        .ne(expected_child_ranges)
+        || direct_tokens
+            .iter()
+            .copied()
+            .skip_while(|kind| *kind == SyntaxKind::NEWLINE)
+            .collect::<Vec<_>>()
+            != [SyntaxKind::USE_KW, SyntaxKind::PKG_PATH]
+        || direct_tokens
+            .iter()
+            .skip_while(|kind| **kind == SyntaxKind::NEWLINE)
+            .any(|kind| *kind == SyntaxKind::NEWLINE)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let is_public = visibility
+        .as_ref()
+        .is_some_and(|visibility| visibility.pub_token().is_some());
+    let prefix = visibility_prefix(visibility)?;
+    if prefix == "export " {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let package = declaration
+        .package()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if package.syntax().kind() != SyntaxKind::PKG_PATH {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let package = token_text(source, package.syntax())?;
+    let alias = alias
+        .as_ref()
+        .map(|alias| use_alias_document(source, alias))
+        .transpose()?;
+    let items = items
+        .as_ref()
+        .map(|items| use_items_document(source, items))
+        .transpose()?;
+    let suffix = format!(
+        "{}{}",
+        alias.as_ref().map_or("", |(_, text)| text.as_str()),
+        items.as_ref().map_or("", |(_, text)| text.as_str())
+    );
+
+    let mut documents = vec![item_prefix_document(source, docs, attributes)?];
+    documents.extend([
+        Doc::text(format!("{prefix}use ")),
+        Doc::text(package.to_owned()),
+    ]);
+    if let Some((document, _)) = alias {
+        documents.push(document);
+    }
+    if let Some((document, _)) = items {
+        documents.push(document);
+    }
+    Ok(UseDeclarationDocument {
+        document: Doc::concat(documents),
+        sort_key: format!("use {package}{suffix}"),
+        is_public,
+    })
+}
+
+fn use_alias_document(
+    source: &ParsedSource,
+    alias: &ast::UseAlias,
+) -> Result<(Doc, String), SourceDocumentError> {
+    let name = alias.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+    if alias.syntax().children().count() != 1
+        || alias
+            .syntax()
+            .children()
+            .next()
+            .map(|child| child.text_range())
+            != Some(name.syntax().text_range())
+        || direct_token_kinds(alias.syntax()) != [SyntaxKind::AS_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let name = name_node_text(source, name.syntax())?;
+    Ok((
+        Doc::concat([Doc::text(" as "), Doc::text(name.clone())]),
+        format!(" as {name}"),
+    ))
+}
+
+fn use_items_document(
+    source: &ParsedSource,
+    items: &ast::UseItems,
+) -> Result<(Doc, String), SourceDocumentError> {
+    let mut use_items = items.items().collect::<Vec<_>>();
+    if items.syntax().children().count() != use_items.len() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let raw_token_kinds = direct_token_kinds(items.syntax());
+    let token_kinds = raw_token_kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect::<Vec<_>>();
+    let separator_count = token_kinds
+        .iter()
+        .filter(|kind| **kind == SyntaxKind::COMMA)
+        .count()
+        + raw_token_kinds
+            .iter()
+            .filter(|kind| **kind == SyntaxKind::NEWLINE)
+            .count();
+    if token_kinds.len() < 3
+        || token_kinds[0..2] != [SyntaxKind::DOT, SyntaxKind::L_BRACE]
+        || token_kinds.last() != Some(&SyntaxKind::R_BRACE)
+        || token_kinds[2..token_kinds.len() - 1]
+            .iter()
+            .any(|kind| *kind != SyntaxKind::COMMA)
+        || token_kinds[2..token_kinds.len() - 1].len() > use_items.len()
+        || separator_count < use_items.len().saturating_sub(1)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut named_items = use_items
+        .drain(..)
+        .map(|item| {
+            let name = item.name().ok_or(SourceDocumentError::UnsupportedShape)?;
+            let alias = item.alias();
+            let mut expected_child_ranges = vec![name.syntax().text_range()];
+            expected_child_ranges.extend(alias.as_ref().map(|alias| alias.syntax().text_range()));
+            if item
+                .syntax()
+                .children()
+                .map(|child| child.text_range())
+                .ne(expected_child_ranges)
+                || direct_token_kinds(item.syntax())
+                    != if alias.is_some() {
+                        vec![SyntaxKind::AS_KW]
+                    } else {
+                        Vec::new()
+                    }
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            let name = name_ref_text(source, &name, &[SyntaxKind::LIDENT, SyntaxKind::UIDENT])?;
+            let alias = alias
+                .as_ref()
+                .map(|alias| name_node_text(source, alias.syntax()))
+                .transpose()?;
+            Ok((name, alias))
+        })
+        .collect::<Result<Vec<_>, SourceDocumentError>>()?;
+    named_items.sort_by(|left, right| {
+        left.0.as_bytes().cmp(right.0.as_bytes()).then_with(|| {
+            left.1
+                .as_deref()
+                .map(str::as_bytes)
+                .cmp(&right.1.as_deref().map(str::as_bytes))
+        })
+    });
+
+    let flat_items = named_items
+        .iter()
+        .map(|(name, alias)| match alias {
+            Some(alias) => format!("{name} as {alias}"),
+            None => name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let flat_text = format!(".{{{}}}", flat_items.join(", "));
+    if flat_items.is_empty() {
+        return Ok((Doc::text(".{}"), flat_text));
+    }
+
+    let group = GroupId(items.syntax().text_range().start().raw());
+    let mut contents = Vec::with_capacity(flat_items.len() * 2);
+    contents.push(Doc::SoftLine);
+    for (index, item) in flat_items.iter().enumerate() {
+        if index > 0 {
+            contents.extend([
+                Doc::if_broken(group, Doc::text(""), Doc::text(",")),
+                Doc::Line,
+            ]);
+        }
+        contents.push(Doc::text(item.clone()));
+    }
+    Ok((
+        Doc::group(
+            group,
+            Doc::concat([
+                Doc::text(".{"),
+                Doc::indent(Doc::concat(contents)),
+                Doc::SoftLine,
+                Doc::text("}"),
+            ]),
+        ),
+        flat_text,
+    ))
+}
+
+fn name_node_text(
+    source: &ParsedSource,
+    name: &sai_syntax::SyntaxNode,
+) -> Result<String, SourceDocumentError> {
+    let tokens = name
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) => Some(token),
+            SyntaxElement::Node(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if name.children().next().is_some()
+        || tokens.len() != 1
+        || !matches!(tokens[0].kind(), SyntaxKind::LIDENT | SyntaxKind::UIDENT)
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(token_text(source, &tokens[0])?.to_owned())
 }
 
 fn name_ref_text(

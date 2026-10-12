@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use sai_syntax::{
     GreenElement, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TriviaKind,
-    ast::{AstNode, Expr},
+    ast::{AstNode, AstToken, Expr, UseDecl},
 };
 
 use crate::{
@@ -271,6 +271,12 @@ fn unwrapped_parenthesized_expression(node: &SyntaxNode) -> Option<SyntaxNode> {
 fn normalized_children(node: &SyntaxNode) -> Vec<SyntaxElement> {
     let mut children = node.children_with_tokens().collect::<Vec<_>>();
 
+    if node.kind() == SyntaxKind::SOURCE_FILE {
+        normalize_source_file_use_order(&mut children);
+    }
+    if node.kind() == SyntaxKind::USE_ITEMS {
+        normalize_use_item_order(&mut children);
+    }
     if node.kind() == SyntaxKind::FN_DECL {
         normalize_function_clause_order(&mut children);
     }
@@ -301,6 +307,160 @@ fn normalized_children(node: &SyntaxNode) -> Vec<SyntaxElement> {
         }
     }
     children
+}
+
+fn normalize_source_file_use_order(children: &mut Vec<SyntaxElement>) {
+    let uses = children
+        .iter()
+        .filter_map(|element| match element {
+            SyntaxElement::Node(node) if node.kind() == SyntaxKind::USE_DECL => Some(node.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if uses.is_empty() {
+        return;
+    }
+    let mut keyed_uses = uses
+        .into_iter()
+        .map(|node| {
+            let key = use_declaration_normalization_key(&node)
+                .unwrap_or_else(|| (false, normalized_signature(&node)));
+            (key, node)
+        })
+        .collect::<Vec<_>>();
+    keyed_uses.sort_by(|(left, _), (right, _)| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
+    let uses = keyed_uses
+        .into_iter()
+        .map(|(_, node)| node)
+        .collect::<Vec<_>>();
+
+    children.retain(|element| {
+        !matches!(element, SyntaxElement::Node(node) if node.kind() == SyntaxKind::USE_DECL)
+    });
+    let insertion_index = children
+        .iter()
+        .position(|element| {
+            matches!(element, SyntaxElement::Node(node) if node.kind() == SyntaxKind::MODULE_HEADER)
+        })
+        .map_or(0, |index| index + 1);
+    children.splice(
+        insertion_index..insertion_index,
+        uses.into_iter().map(SyntaxElement::Node),
+    );
+}
+
+fn normalize_use_item_order(children: &mut [SyntaxElement]) {
+    let positions = children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, element)| match element {
+            SyntaxElement::Node(node) if node.kind() == SyntaxKind::USE_ITEM => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let items = positions
+        .iter()
+        .filter_map(|&index| match &children[index] {
+            SyntaxElement::Node(node) => Some(node.clone()),
+            SyntaxElement::Token(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut keyed_items = items
+        .into_iter()
+        .map(|node| (normalized_signature(&node), node))
+        .collect::<Vec<_>>();
+    keyed_items.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (position, (_, item)) in positions.into_iter().zip(keyed_items) {
+        children[position] = SyntaxElement::Node(item);
+    }
+}
+
+fn normalized_signature(node: &SyntaxNode) -> String {
+    let elements = syntax_normal_form(node)
+        .into_iter()
+        .map(|event| event.element)
+        .collect::<Vec<_>>();
+    format!("{elements:?}")
+}
+
+fn use_declaration_normalization_key(node: &SyntaxNode) -> Option<(bool, String)> {
+    let declaration = UseDecl::cast(node.clone())?;
+    let is_public = declaration
+        .visibility()
+        .is_some_and(|visibility| visibility.pub_token().is_some());
+    let package = declaration.package()?.syntax().text().to_owned();
+    let alias = if let Some(alias) = declaration.alias() {
+        Some(syntax_name_text(alias.name()?.syntax())?)
+    } else {
+        None
+    };
+    let use_items = declaration.items();
+    let mut items = if let Some(use_items) = &use_items {
+        let items = use_items
+            .items()
+            .map(|item| {
+                let alias = if let Some(alias) = item.alias() {
+                    Some(syntax_name_text(alias.syntax())?)
+                } else {
+                    None
+                };
+                Some((syntax_name_text(item.name()?.syntax())?, alias))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if items.len() != use_items.syntax().children().count() {
+            return None;
+        }
+        items
+    } else {
+        Vec::new()
+    };
+    items.sort_by(|left, right| {
+        left.0.as_bytes().cmp(right.0.as_bytes()).then_with(|| {
+            left.1
+                .as_deref()
+                .map(str::as_bytes)
+                .cmp(&right.1.as_deref().map(str::as_bytes))
+        })
+    });
+    let alias = alias.map_or_else(String::new, |alias| format!(" as {alias}"));
+    let items = if use_items.is_some() {
+        format!(
+            ".{{{}}}",
+            items
+                .into_iter()
+                .map(|(name, alias)| {
+                    alias.map_or(name.clone(), |alias| format!("{name} as {alias}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        String::new()
+    };
+    Some((is_public, format!("{package}{alias}{items}")))
+}
+
+fn syntax_name_text(node: &SyntaxNode) -> Option<String> {
+    if node.children().next().is_some() {
+        return None;
+    }
+    let tokens = node
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) => Some(token),
+            SyntaxElement::Node(_) => None,
+        })
+        .collect::<Vec<_>>();
+    match tokens.as_slice() {
+        [token] if matches!(token.kind(), SyntaxKind::LIDENT | SyntaxKind::UIDENT) => {
+            Some(token.text().to_owned())
+        }
+        _ => None,
+    }
 }
 
 fn is_brace_separated_list(kind: SyntaxKind) -> bool {
@@ -491,6 +651,134 @@ mod tests {
         assert_eq!(
             format_source(b"//! only docs\nunsafe module\n"),
             Ok(String::from("//! only docs\n\nunsafe module\n"))
+        );
+    }
+
+    #[test]
+    fn sorts_and_moves_use_declarations_and_selective_items() {
+        let source = concat!(
+            "use sai:http/client.{HttpError, HttpClient}\n",
+            "fn helper() {}\n",
+            "pub use acme:app/model/user.{UserId, User}\n",
+            "use acme:image/model.{Image}\n",
+            "use sai:core/fmt.{Writer as Sink, FormatSpec}\n",
+        );
+        let expected = concat!(
+            "use acme:image/model.{Image}\n",
+            "use sai:core/fmt.{FormatSpec, Writer as Sink}\n",
+            "use sai:http/client.{HttpClient, HttpError}\n",
+            "\n",
+            "pub use acme:app/model/user.{User, UserId}\n",
+            "\n",
+            "fn helper() {}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("use declarations format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_use_aliases_and_places_them_after_module_headers() {
+        let source = concat!(
+            "//! module\n",
+            "fn helper() {}\n",
+            "pub use sai:core/fmt as fmt\n",
+            "use sai:core as core\n",
+        );
+        let expected = concat!(
+            "//! module\n",
+            "\n",
+            "use sai:core as core\n",
+            "\n",
+            "pub use sai:core/fmt as fmt\n",
+            "\n",
+            "fn helper() {}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("aliased uses format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn breaks_long_use_item_lists_without_commas() {
+        let names = [
+            "ExtremelyLongFormatterOptionAlpha",
+            "ExtremelyLongFormatterOptionBeta",
+            "ExtremelyLongFormatterOptionGamma",
+            "ExtremelyLongFormatterOptionDelta",
+        ];
+        let source = format!(
+            "use sai:core/fmt.{{{}}}",
+            names.into_iter().rev().collect::<Vec<_>>().join(", ")
+        );
+        let expected = concat!(
+            "use sai:core/fmt.{\n",
+            "    ExtremelyLongFormatterOptionAlpha\n",
+            "    ExtremelyLongFormatterOptionBeta\n",
+            "    ExtremelyLongFormatterOptionDelta\n",
+            "    ExtremelyLongFormatterOptionGamma\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("long use item list formats");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn moves_use_docs_and_attributes_with_their_declaration() {
+        let source = concat!(
+            "/// legacy import\n",
+            "@deprecated(\"old\")\n",
+            "pub use sai:legacy\n",
+            "use sai:core\n",
+        );
+        let expected = concat!(
+            "use sai:core\n",
+            "\n",
+            "/// legacy import\n",
+            "@deprecated(\"old\")\n",
+            "pub use sai:legacy\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("use prefixes move with items");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn retains_duplicate_uses_stably_and_removes_selective_list_commas() {
+        let source = concat!(
+            "/// first duplicate\n",
+            "use sai:core\n",
+            "/// second duplicate\n",
+            "use sai:core\n",
+            "use sai:core.{B, A,}\n",
+        );
+        let expected = concat!(
+            "/// first duplicate\n",
+            "use sai:core\n",
+            "/// second duplicate\n",
+            "use sai:core\n",
+            "use sai:core.{A, B}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("duplicate uses are retained");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn ignores_moved_uses_when_preserving_item_blank_lines() {
+        let formatted = format_source(b"fn first() {}\nuse sai:core\nfn second() {}")
+            .expect("interleaved use declaration formats");
+        assert_eq!(formatted, "use sai:core\n\nfn first() {}\nfn second() {}\n");
+    }
+
+    #[test]
+    fn syntax_normal_form_preserves_order_for_equal_use_sort_keys() {
+        let first = parse_source(b"/// z\nuse sai:core\n/// a\nuse sai:core").unwrap();
+        let swapped = parse_source(b"/// a\nuse sai:core\n/// z\nuse sai:core").unwrap();
+        assert_ne!(
+            normal_elements(&syntax_normal_form(first.root())),
+            normal_elements(&syntax_normal_form(swapped.root()))
         );
     }
 
