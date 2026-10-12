@@ -100,7 +100,7 @@ Comments attached to a `match` keyword stay before the scrutinee for match state
 
 Comments trailing the final token of a match scrutinee stay after the scrutinee and before the arm-list opening brace. A trailing line comment or multiline block comment forces the brace onto the next line; comments on interior scrutinee tokens remain unsupported.
 
-Single-line block comments attached to a match arm's `=>` stay between the arrow and its body, including guarded arms and block-like bodies. This also applies when the match expression is nested inside another expression. Line comments and multiline block comments after `=>` remain unsupported. Comments on the pattern, guard, result expression, and comma separator follow the rules below.
+Single-line block comments attached to a match arm's `=>` stay between the arrow and its body, including guarded arms, block-like bodies, and nested match expressions. A line comment or multiline block comment after `=>` stays on the arrow line and moves the body to an indented continuation line. Comments on the pattern, guard, result expression, and comma separator follow the rules below.
 
 Single-line block comments attached to the `if` keyword of a match-arm guard stay between `if` and the guard expression, including when the match expression is nested inside another expression. Line comments and multiline block comments after this `if`, comments attached to pattern interiors, and comments attached to interior tokens of the guard expression, remain unsupported.
 
