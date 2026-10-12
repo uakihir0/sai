@@ -88,6 +88,8 @@ Single-line block comments attached to the `=` in `let` and `var` statements or 
 
 Single-line block comments attached to the type colon in `let` and `var` statements stay between `:` and the type. Comments with line breaks in that position remain unsupported.
 
+Single-line block comments attached to an `if` keyword stay before its condition, including in nested `else if` branches. Comments attached to `else` or other interior control-flow tokens remain unsupported.
+
 - Match-arm tests cover value-preserving formatting for simple-string continuations, triple-quoted strings, and raw strings and byte strings with line breaks. Raw literal content, including its original internal indentation, is emitted exactly.
 - `parse_source` returns a lossless `ParsedSource` on success. Its `SourceInputError::Refused(SourceRefusal)` contains input-limit, lexer, and parser diagnostics. A source larger than 16 MiB produces `IMPLEMENTATION_LIMIT_EXCEEDED`. Parser diagnostics are selected by origin from impl/02 §2.5.12, except `CLAUSE_ORDER`; validation diagnostics and warnings remain available from `ParsedSource::diagnostics()` without refusing formatting. Decode and snapshot failures return `InternalError`. A hard parse failure without a lexer error also returns `InternalError`; if lexical errors were already observed, an unrecoverable parse returns `Refused` with those lexer diagnostics and no parser diagnostics.
 - Because `parse_source` accepts bytes without a caller-supplied file identity, it binds diagnostics to the VFS `<stdin>` source sentinel. A caller that formats a named file must replace that sentinel with the selected file's source reference before presenting diagnostics.
