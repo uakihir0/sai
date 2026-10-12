@@ -900,6 +900,7 @@ fn expression_keyword_token(expression: &Expr) -> Option<SyntaxToken> {
     let (expression, keyword_kind) = match expression {
         Expr::Loop(loop_expr) => (loop_expr.syntax(), SyntaxKind::LOOP_KW),
         Expr::Match(match_expr) => (match_expr.syntax(), SyntaxKind::MATCH_KW),
+        Expr::UnsafeBlock(unsafe_block) => (unsafe_block.syntax(), SyntaxKind::UNSAFE_KW),
         _ => return None,
     };
     expression
@@ -4965,6 +4966,20 @@ fn unsafe_block_expression_document(
     unsafe_block: &ast::UnsafeBlockExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    unsafe_block_expression_document_with_keyword_comments(
+        source,
+        unsafe_block,
+        expression_group_ids,
+        &[],
+    )
+}
+
+fn unsafe_block_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    unsafe_block: &ast::UnsafeBlockExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let body = unsafe_block
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -4973,10 +4988,14 @@ fn unsafe_block_expression_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+    let mut prefix = vec![Doc::text("unsafe")];
+    append_single_line_block_comments(&mut prefix, keyword_comments)?;
+    prefix.push(Doc::text(" "));
+    let prefix = Doc::concat(prefix);
     let statements = body.statements().collect::<Vec<_>>();
     let broken_block = block_document(source, &body, expression_group_ids)?;
     if block_has_comments(&body, &statements)? {
-        return Ok(Doc::concat([Doc::text("unsafe "), broken_block]));
+        return Ok(Doc::concat([prefix, broken_block]));
     }
     if let [Stmt::Expr(statement)] = statements.as_slice() {
         let flat_statement = statement_document(
@@ -4991,14 +5010,15 @@ fn unsafe_block_expression_document(
         let flat_statement = first_choice_layout(&flat_statement);
         return Ok(Doc::choice([
             Doc::concat([
-                Doc::text("unsafe { "),
+                prefix.clone(),
+                Doc::text("{ "),
                 Doc::flat(flat_statement),
                 Doc::text(" }"),
             ]),
-            Doc::concat([Doc::text("unsafe "), broken_block]),
+            Doc::concat([prefix, broken_block]),
         ]));
     }
-    Ok(Doc::concat([Doc::text("unsafe "), broken_block]))
+    Ok(Doc::concat([prefix, broken_block]))
 }
 
 fn statement_document(
@@ -5295,6 +5315,14 @@ fn statement_document(
                         expression_group_ids,
                         keyword_comments,
                     ),
+                    Expr::UnsafeBlock(unsafe_block) => {
+                        unsafe_block_expression_document_with_keyword_comments(
+                            source,
+                            unsafe_block,
+                            expression_group_ids,
+                            keyword_comments,
+                        )
+                    }
                     _ => Err(SourceDocumentError::UnsupportedShape),
                 };
             }
@@ -5348,6 +5376,14 @@ fn right_hand_side_after_operator_document(
                 expression_group_ids,
                 comments.expression_keyword,
             )?,
+            Expr::UnsafeBlock(unsafe_block) => {
+                unsafe_block_expression_document_with_keyword_comments(
+                    source,
+                    unsafe_block,
+                    expression_group_ids,
+                    comments.expression_keyword,
+                )?
+            }
             _ => return Err(SourceDocumentError::UnsupportedShape),
         }
     };

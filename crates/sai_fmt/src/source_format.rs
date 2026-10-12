@@ -1407,6 +1407,50 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_unsafe_keywords() {
+        let source = concat!(
+            "fn protected(){\n",
+            "unsafe/* statement */{operate()}\n",
+            "let value=unsafe/* initializer */{read()}\n",
+            "value=unsafe/* assigned */{write()}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn protected() {\n",
+            "    unsafe /* statement */ { operate() }\n",
+            "    let value = unsafe /* initializer */ { read() }\n",
+            "    value = unsafe /* assigned */ { write() }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("unsafe keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_unsafe_keywords() {
+        for source in [
+            "fn f() {\n    unsafe // block\n        {operate()}\n}\n",
+            "fn f() {\n    unsafe /* block\n        comment */ {operate()}\n}\n",
+            "fn f() {\n    let value=unsafe // block\n        {read()}\n}\n",
+            "fn f() {\n    let value=unsafe /* block\n        comment */ {read()}\n}\n",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_unsafe_keyword_comments_nested_in_composite_expressions() {
+        let source = "fn f() {\n    let value=consume(unsafe/* nested */{operate()})\n}\n";
+        assert!(format_source(source.as_bytes()).is_err(), "{source}");
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",
