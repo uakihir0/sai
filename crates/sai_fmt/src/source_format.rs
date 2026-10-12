@@ -1400,6 +1400,53 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_match_arm_arrows() {
+        let source = concat!(
+            "fn f(value:State,ready:Bool){\n",
+            "match value{\n",
+            ".Ready=>/* direct */1,\n",
+            ".Failed if ready=>/* guarded */2,\n",
+            "_=>0\n",
+            "}\n",
+            "match value{.Ready=>/* block */{1},_=>0}\n",
+            "let selected=consume(match value{_=>/* nested */0})\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn f(value: State, ready: Bool) {\n",
+            "    match value { .Ready => /* direct */ 1, .Failed if ready => /* guarded */ 2, _ => 0 }\n",
+            "    match value {\n",
+            "        .Ready => /* block */ {\n",
+            "            1\n",
+            "        }\n",
+            "        _ => 0\n",
+            "    }\n",
+            "    let selected = consume(match value { _ => /* nested */ 0 })\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("match arm arrow comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_match_arm_arrows() {
+        for source in [
+            "fn f(value:State) {\n    match value{.Ready=> // result\n        1,_=>0}\n}\n",
+            "fn f(value:State) {\n    match value{.Ready=> /* result\n        continued */ 1,_=>0}\n}\n",
+            "fn f(value:State,ready:Bool) {\n    match value{.Ready if/* guard */ready=>1,_=>0}\n}\n",
+        ] {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_match_keyword_comments_nested_in_composite_expressions() {
         let source =
             "fn f(value:State) {\n    let selected=consume(match/* nested */value{_=>0})\n}\n";

@@ -563,6 +563,25 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
             ));
         }
     }
+    for node in root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::MATCH_ARM)
+    {
+        if let Some(token) = node
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::FAT_ARROW => Some(token),
+                _ => None,
+            })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
     owners
 }
 
@@ -3728,7 +3747,7 @@ fn if_expression_document_with_keyword_comments(
         }
         documents.push(Doc::text(" else"));
         let else_keyword_comments =
-            trailing_comments_after_direct_keyword(else_branch.syntax(), SyntaxKind::ELSE_KW)?;
+            trailing_comments_after_direct_token(else_branch.syntax(), SyntaxKind::ELSE_KW)?;
         append_single_line_block_comments(&mut documents, &else_keyword_comments)?;
         documents.push(Doc::text(" "));
         if let Some(block) = block {
@@ -3749,10 +3768,10 @@ fn if_expression_document_with_keyword_comments(
 fn else_if_keyword_comments(
     if_expr: &ast::IfExpr,
 ) -> Result<Vec<SourceComment>, SourceDocumentError> {
-    trailing_comments_after_direct_keyword(if_expr.syntax(), SyntaxKind::IF_KW)
+    trailing_comments_after_direct_token(if_expr.syntax(), SyntaxKind::IF_KW)
 }
 
-fn trailing_comments_after_direct_keyword(
+fn trailing_comments_after_direct_token(
     node: &SyntaxNode,
     kind: SyntaxKind,
 ) -> Result<Vec<SourceComment>, SourceDocumentError> {
@@ -3959,6 +3978,8 @@ fn match_arm_document(
         ]);
     }
     documents.push(Doc::text(" =>"));
+    let arrow_comments = trailing_comments_after_direct_token(arm.syntax(), SyntaxKind::FAT_ARROW)?;
+    append_single_line_block_comments(&mut documents, &arrow_comments)?;
 
     let body = expression_document(
         source,
@@ -5165,7 +5186,7 @@ fn statement_document(
                 {
                     return Err(SourceDocumentError::UnsupportedShape);
                 }
-                let keyword_comments = trailing_comments_after_direct_keyword(
+                let keyword_comments = trailing_comments_after_direct_token(
                     else_clause.syntax(),
                     SyntaxKind::ELSE_KW,
                 )?;
