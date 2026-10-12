@@ -1246,6 +1246,28 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_while_keywords() {
+        let source = concat!(
+            "fn loops(flag:Bool,maybe:Option<I32>){\n",
+            "while/* guard */flag{}\n",
+            "'scan:while/* binding */let Some(value)=maybe{break 'scan}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn loops(flag: Bool, maybe: Option<I32>) {\n",
+            "    while /* guard */ flag {}\n",
+            "    'scan: while /* binding */ let Some(value) = maybe {\n",
+            "        break 'scan\n",
+            "    }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("while keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

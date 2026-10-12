@@ -746,6 +746,18 @@ fn block_comment_targets(
                 ListCommentTarget::AfterTypeColon(index),
             );
         }
+        if let Some(keyword_token) = block_statement_while_keyword_token(statement) {
+            owner_tokens.push(keyword_token.clone());
+            targets.insert(
+                (
+                    false,
+                    keyword_token.kind(),
+                    keyword_token.text_range().start().to_usize(),
+                    keyword_token.text_range().end().to_usize(),
+                ),
+                ListCommentTarget::AfterKeyword(index),
+            );
+        }
         let last_token = statement
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -804,6 +816,22 @@ fn block_statement_type_colon_token(statement: &SyntaxNode) -> Option<SyntaxToke
         .children_with_tokens()
         .find_map(|element| match element {
             SyntaxElement::Token(token) if token.kind() == SyntaxKind::COLON => Some(token),
+            _ => None,
+        })
+}
+
+fn block_statement_while_keyword_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+    let Stmt::Expr(statement) = ast::Stmt::cast(statement.clone())? else {
+        return None;
+    };
+    let Expr::While(while_expr) = statement.expression()? else {
+        return None;
+    };
+    while_expr
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::WHILE_KW => Some(token),
             _ => None,
         })
 }
@@ -3907,6 +3935,15 @@ fn while_expression_document(
     while_expr: &ast::WhileExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    while_expression_document_with_keyword_comments(source, while_expr, expression_group_ids, &[])
+}
+
+fn while_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    while_expr: &ast::WhileExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let label = while_expr.label();
     let condition = while_expr
         .condition()
@@ -3928,8 +3965,10 @@ fn while_expression_document(
     if let Some(label) = label {
         documents.push(loop_label_document(&label)?);
     }
+    documents.push(Doc::text("while"));
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
     documents.extend([
-        Doc::text("while "),
+        Doc::text(" "),
         condition_document(source, &condition, expression_group_ids)?,
         Doc::text(" "),
         block_document(source, &body, expression_group_ids)?,
@@ -5083,6 +5122,12 @@ fn statement_document(
                     Expr::If(if_expr) => if_expression_document_with_keyword_comments(
                         source,
                         if_expr,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
+                    Expr::While(while_expr) => while_expression_document_with_keyword_comments(
+                        source,
+                        while_expr,
                         expression_group_ids,
                         keyword_comments,
                     ),
