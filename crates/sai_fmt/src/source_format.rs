@@ -704,13 +704,9 @@ mod tests {
     }
 
     #[test]
-    fn keeps_comments_inside_items_fail_closed() {
-        let source = "fn f() {\n    let value = /* inside a statement */ 1\n}";
-        assert_eq!(
-            format_source(source.as_bytes()),
-            Err(SourceFormatError::UnsupportedShape),
-            "{source}"
-        );
+    fn keeps_comments_on_other_statement_interior_tokens_fail_closed() {
+        let source = "fn f() {\n    let value /* inside a statement */ = 1\n}";
+        assert!(format_source(source.as_bytes()).is_err(), "{source}");
     }
 
     #[test]
@@ -1166,6 +1162,41 @@ mod tests {
             format_source(source.as_bytes()).expect("trailing comment remains attached");
         assert_eq!(formatted, expected);
         assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_single_line_block_comments_after_assignment_operators() {
+        let source = concat!(
+            "fn assignments(){\n",
+            "let value=/* initialized */1\n",
+            "var count=/* initial count */0\n",
+            "count+=/* increment */1\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn assignments() {\n",
+            "    let value = /* initialized */ 1\n",
+            "    var count = /* initial count */ 0\n",
+            "    count += /* increment */ 1\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("assignment operator comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_assignment_operators() {
+        for source in [
+            "fn bind() {\n    let value = // initializer\n        1\n}\n",
+            "fn bind() {\n    let value = /* initializer\n        continued */ 1\n}\n",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape)
+            );
+        }
     }
 
     #[test]

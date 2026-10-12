@@ -428,6 +428,7 @@ enum ListCommentTarget {
     OpeningTrailing,
     BeforeMember(usize),
     AfterKeyword(usize),
+    AfterOperator(usize),
     AfterMember(usize),
     Closing,
 }
@@ -447,6 +448,7 @@ struct ListComments {
     opening_trailing: Vec<SourceComment>,
     before: Vec<Vec<SourceComment>>,
     after_keyword: Vec<Vec<SourceComment>>,
+    after_operator: Vec<Vec<SourceComment>>,
     after: Vec<Vec<SourceComment>>,
     closing: Vec<SourceComment>,
 }
@@ -459,6 +461,10 @@ impl ListComments {
             || self.before.iter().any(|comments| !comments.is_empty())
             || self
                 .after_keyword
+                .iter()
+                .any(|comments| !comments.is_empty())
+            || self
+                .after_operator
                 .iter()
                 .any(|comments| !comments.is_empty())
             || self.after.iter().any(|comments| !comments.is_empty())
@@ -688,6 +694,18 @@ fn block_comment_targets(
                 ListCommentTarget::AfterKeyword(index),
             );
         }
+        if let Some(operator_token) = block_statement_operator_token(statement) {
+            owner_tokens.push(operator_token.clone());
+            targets.insert(
+                (
+                    false,
+                    operator_token.kind(),
+                    operator_token.text_range().start().to_usize(),
+                    operator_token.text_range().end().to_usize(),
+                ),
+                ListCommentTarget::AfterOperator(index),
+            );
+        }
         let last_token = statement
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -717,6 +735,22 @@ fn block_comment_targets(
         targets,
         owner_tokens,
     })
+}
+
+fn block_statement_operator_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+    match statement.kind() {
+        SyntaxKind::LET_STMT | SyntaxKind::VAR_STMT => {
+            statement
+                .children_with_tokens()
+                .find_map(|element| match element {
+                    SyntaxElement::Token(token) if token.kind() == SyntaxKind::EQ => Some(token),
+                    _ => None,
+                })
+        }
+        SyntaxKind::ASSIGN_STMT => ast::AssignStmt::cast(statement.clone())
+            .and_then(|statement| statement.op().map(|(operator, _)| operator)),
+        _ => None,
+    }
 }
 
 fn brace_list_delimiters(list: &SyntaxNode) -> Option<(SyntaxToken, SyntaxToken)> {
@@ -788,6 +822,7 @@ fn collect_brace_unit_comments(
         opening_trailing: Vec::new(),
         before: vec![Vec::new(); member_count],
         after_keyword: vec![Vec::new(); member_count],
+        after_operator: vec![Vec::new(); member_count],
         after: vec![Vec::new(); member_count],
         closing: Vec::new(),
     };
@@ -808,6 +843,9 @@ fn collect_brace_unit_comments(
             Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
             Some(ListCommentTarget::AfterKeyword(index)) => {
                 comments.after_keyword[index].push(comment)
+            }
+            Some(ListCommentTarget::AfterOperator(index)) => {
+                comments.after_operator[index].push(comment)
             }
             Some(ListCommentTarget::AfterMember(index)) => comments.after[index].push(comment),
             Some(ListCommentTarget::Closing) => comments.closing.push(comment),
@@ -3366,6 +3404,7 @@ fn block_document(
                 source,
                 statement,
                 &comments.after_keyword[index],
+                &comments.after_operator[index],
                 expression_group_ids,
             )
         })
@@ -4505,6 +4544,7 @@ fn closure_expression_document(
             source,
             &Stmt::Expr(statement.clone()),
             &[],
+            &[],
             expression_group_ids,
         )?;
         if flat_document_width(&header).is_some() && flat_document_width(&flat_statement).is_some()
@@ -4542,6 +4582,7 @@ fn closure_body_forces_break(
         let document = statement_document(
             source,
             &Stmt::Expr(statement.clone()),
+            &[],
             &[],
             expression_group_ids,
         )?;
@@ -4676,6 +4717,7 @@ fn unsafe_block_expression_document(
             source,
             &Stmt::Expr(statement.clone()),
             &[],
+            &[],
             expression_group_ids,
         )?;
         let flat_statement = first_choice_layout(&flat_statement);
@@ -4695,6 +4737,7 @@ fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
     keyword_comments: &[SourceComment],
+    operator_comments: &[SourceComment],
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
     match statement {
@@ -4767,23 +4810,16 @@ fn statement_document(
             if let Some(ty) = ty {
                 binding.extend([Doc::text(": "), type_document(source, &ty)?]);
             }
-            let initializer_document = expression_document(
+            binding.push(Doc::text(" ="));
+            binding.push(right_hand_side_after_operator_document(
                 source,
                 &initializer,
                 ExpressionContext::Unprotected,
                 expression_group_ids,
-            )?;
-            let initializer_document = if let Some(else_suffix) = else_suffix {
-                right_hand_side_document_from_document_with_suffix(
-                    &initializer,
-                    initializer_document,
-                    true,
-                    else_suffix,
-                )
-            } else {
-                right_hand_side_document_from_document(&initializer, initializer_document, true)
-            };
-            binding.extend([Doc::text(" ="), initializer_document]);
+                true,
+                else_suffix,
+                operator_comments,
+            )?);
             Ok(Doc::concat(binding))
         }
         Stmt::Var(statement) => {
@@ -4823,16 +4859,16 @@ fn statement_document(
             if let Some(ty) = ty {
                 binding.extend([Doc::text(": "), type_document(source, &ty)?]);
             }
-            binding.extend([
-                Doc::text(" ="),
-                right_hand_side_document(
-                    source,
-                    &initializer,
-                    ExpressionContext::Unprotected,
-                    expression_group_ids,
-                    true,
-                )?,
-            ]);
+            binding.push(Doc::text(" ="));
+            binding.push(right_hand_side_after_operator_document(
+                source,
+                &initializer,
+                ExpressionContext::Unprotected,
+                expression_group_ids,
+                true,
+                None,
+                operator_comments,
+            )?);
             Ok(Doc::concat(binding))
         }
         Stmt::Assign(statement) => {
@@ -4852,7 +4888,7 @@ fn statement_document(
             if statement.syntax().children().count() != 2 || operator_tokens != [operator.kind()] {
                 return Err(SourceDocumentError::UnsupportedShape);
             }
-            Ok(Doc::concat([
+            let mut documents = vec![
                 expression_document(
                     source,
                     &lhs,
@@ -4861,14 +4897,17 @@ fn statement_document(
                 )?,
                 Doc::text(" "),
                 Doc::text(operator.text()),
-                right_hand_side_document(
-                    source,
-                    &rhs,
-                    ExpressionContext::Unprotected,
-                    expression_group_ids,
-                    true,
-                )?,
-            ]))
+            ];
+            documents.push(right_hand_side_after_operator_document(
+                source,
+                &rhs,
+                ExpressionContext::Unprotected,
+                expression_group_ids,
+                true,
+                None,
+                operator_comments,
+            )?);
+            Ok(Doc::concat(documents))
         }
         Stmt::Assert(statement) => {
             let condition = statement
@@ -4963,7 +5002,29 @@ fn right_hand_side_document(
     ))
 }
 
-fn append_control_keyword_comments(
+fn right_hand_side_after_operator_document(
+    source: &ParsedSource,
+    expression: &Expr,
+    context: ExpressionContext,
+    expression_group_ids: &mut ExpressionGroupIds,
+    allow_move: bool,
+    suffix: Option<Doc>,
+    operator_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
+    let mut documents = Vec::new();
+    append_single_line_block_comments(&mut documents, operator_comments)?;
+    let expression_document =
+        expression_document(source, expression, context, expression_group_ids)?;
+    documents.push(right_hand_side_document_from_document_with_optional_suffix(
+        expression,
+        expression_document,
+        allow_move,
+        suffix,
+    ));
+    Ok(Doc::concat(documents))
+}
+
+fn append_single_line_block_comments(
     documents: &mut Vec<Doc>,
     comments: &[SourceComment],
 ) -> Result<(), SourceDocumentError> {
@@ -4995,7 +5056,7 @@ fn return_expression_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let mut documents = vec![Doc::text("return")];
-    append_control_keyword_comments(&mut documents, keyword_comments)?;
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
     if let Some(value) = value {
         documents.push(right_hand_side_document(
             source,
@@ -5031,7 +5092,7 @@ fn break_expression_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let mut documents = vec![Doc::text("break")];
-    append_control_keyword_comments(&mut documents, keyword_comments)?;
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
     if let Some(label) = label {
         documents.push(Doc::text(" "));
         documents.push(Doc::text(label.syntax().text().to_string()));
@@ -5065,7 +5126,7 @@ fn continue_expression_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let mut documents = vec![Doc::text("continue")];
-    append_control_keyword_comments(&mut documents, keyword_comments)?;
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
     if let Some(label) = label {
         documents.push(Doc::text(" "));
         documents.push(Doc::text(label.syntax().text().to_string()));
@@ -5080,20 +5141,6 @@ fn right_hand_side_document_from_document(
 ) -> Doc {
     right_hand_side_document_from_document_with_optional_suffix(
         expression, document, allow_move, None,
-    )
-}
-
-fn right_hand_side_document_from_document_with_suffix(
-    expression: &Expr,
-    document: Doc,
-    allow_move: bool,
-    suffix: Doc,
-) -> Doc {
-    right_hand_side_document_from_document_with_optional_suffix(
-        expression,
-        document,
-        allow_move,
-        Some(suffix),
     )
 }
 
