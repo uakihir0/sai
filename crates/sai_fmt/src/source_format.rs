@@ -466,6 +466,35 @@ mod tests {
     }
 
     #[test]
+    fn formats_module_headers_and_separates_their_parts() {
+        for (source, expected) in [
+            (b"//! module docs  \n".as_slice(), "//! module docs\n"),
+            (b"unsafe module\n", "unsafe module\n"),
+            (
+                b"//! first\n//! second\nunsafe module\nfn f(){}",
+                "//! first\n//! second\n\nunsafe module\n\nfn f() {}\n",
+            ),
+            (
+                b"//! module docs\nfn f(){}",
+                "//! module docs\n\nfn f() {}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("module header formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn formats_empty_source_and_module_header_only_files() {
+        assert_eq!(format_source(b""), Ok(String::new()));
+        assert_eq!(
+            format_source(b"//! only docs\nunsafe module\n"),
+            Ok(String::from("//! only docs\n\nunsafe module\n"))
+        );
+    }
+
+    #[test]
     fn syntax_normal_form_ignores_permitted_integer_and_list_changes() {
         let before = parse_source(b"fn f(x:I32,){let n=0xff\nx + n}").unwrap();
         let after = parse_source(b"fn f(x: I32) {\n    let n = 0xFF\n    (x + n)\n}\n").unwrap();

@@ -23,11 +23,12 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
 
     let file = ast::SourceFile::cast(source.root().clone())
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    if file.module_header().is_some() {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
+    let module_header = file
+        .module_header()
+        .map(|header| module_header_document(source, &header))
+        .transpose()?;
     let items = file.items().collect::<Vec<_>>();
-    if source.root().children().count() != items.len() {
+    if source.root().children().count() != items.len() + usize::from(module_header.is_some()) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let mut units = Vec::with_capacity(items.len());
@@ -59,10 +60,17 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
         units.push(unit);
     }
     if units.is_empty() {
-        return Ok(Doc::concat([]));
+        return Ok(module_header.map_or_else(
+            || Doc::concat([]),
+            |header| Doc::concat([header, Doc::HardLine]),
+        ));
     }
 
-    let mut document = Vec::with_capacity(units.len() * 2 - 1);
+    let mut document =
+        Vec::with_capacity(units.len() * 2 + usize::from(module_header.is_some()) * 2);
+    if let Some(module_header) = module_header {
+        document.extend([module_header, Doc::HardLine, Doc::HardLine]);
+    }
     for (index, unit) in units.iter().enumerate() {
         if index > 0 {
             let previous = &units[index - 1];
@@ -328,12 +336,20 @@ fn item_prefix_document(
 }
 
 fn docs_document(source: &ParsedSource, docs: &ast::Docs) -> Result<Doc, SourceDocumentError> {
+    docs_document_with_kind(source, docs, SyntaxKind::DOC_OUTER)
+}
+
+fn docs_document_with_kind(
+    source: &ParsedSource,
+    docs: &ast::Docs,
+    expected_kind: SyntaxKind,
+) -> Result<Doc, SourceDocumentError> {
     let mut documents = Vec::new();
     for element in docs.syntax().children_with_tokens() {
         let SyntaxElement::Token(token) = element else {
             return Err(SourceDocumentError::UnsupportedShape);
         };
-        if token.kind() != SyntaxKind::DOC_OUTER {
+        if token.kind() != expected_kind {
             return Err(SourceDocumentError::UnsupportedShape);
         }
         if !documents.is_empty() {
@@ -344,6 +360,61 @@ fn docs_document(source: &ParsedSource, docs: &ast::Docs) -> Result<Doc, SourceD
                 .trim_end_matches([' ', '\t'])
                 .to_owned(),
         ));
+    }
+    if documents.is_empty() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat(documents))
+}
+
+fn module_header_document(
+    source: &ParsedSource,
+    header: &ast::ModuleHeader,
+) -> Result<Doc, SourceDocumentError> {
+    let docs = header.docs();
+    let has_docs = docs.is_some();
+    if header.syntax().children().count() != usize::from(has_docs) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let tokens = header
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) => Some(token),
+            SyntaxElement::Node(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let unsafe_token = header.unsafe_token();
+    let expected_kinds = if unsafe_token.is_some() {
+        vec![
+            SyntaxKind::UNSAFE_KW,
+            SyntaxKind::LIDENT,
+            SyntaxKind::NEWLINE,
+        ]
+    } else {
+        Vec::new()
+    };
+    if tokens.iter().map(SyntaxToken::kind).collect::<Vec<_>>() != expected_kinds {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+
+    let mut documents = Vec::with_capacity(3);
+    if let Some(docs) = docs {
+        documents.push(docs_document_with_kind(
+            source,
+            &docs,
+            SyntaxKind::DOC_INNER,
+        )?);
+    }
+    if unsafe_token.is_some() {
+        if has_docs {
+            documents.extend([Doc::HardLine, Doc::HardLine]);
+        }
+        let module_token = tokens.get(1).ok_or(SourceDocumentError::UnsupportedShape)?;
+        if token_text(source, module_token)? != "module" {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.push(Doc::text("unsafe module"));
     }
     if documents.is_empty() {
         return Err(SourceDocumentError::UnsupportedShape);
