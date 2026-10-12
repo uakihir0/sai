@@ -108,7 +108,7 @@ Single-line block comments trailing the final token of a match-guard expression 
 
 Single-line block comments trailing the final token of a match arm's result expression stay after the formatted expression, including block-like results and results in nested match expressions. Line comments, multiline block comments, and comments attached to interior tokens of the result expression remain unsupported.
 
-Single-line block comments trailing an arm-separating comma stay after the comma and before the next arm, including in flat and broken match lists. Line comments, multiline block comments, and comments after a trailing comma remain unsupported.
+Single-line block comments trailing an arm-separating comma stay after the comma and before the next arm, including in flat and broken match lists. A comment after a trailing comma stays before the closing brace. Line comments and multiline block comments remain unsupported.
 
 Single-line block comments attached to an `unsafe` keyword stay before its block for unsafe expressions used as statements or directly as a `let`/`var` initializer or assignment right-hand side. Comments with line breaks remain unsupported. Unsafe comments nested inside composite expressions remain unsupported.
 

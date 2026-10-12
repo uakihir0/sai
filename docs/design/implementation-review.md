@@ -3029,7 +3029,15 @@
 - **Reason:** The trailing comment belongs to the result expression's actual final token. Collecting trivia from that token and appending it after the complete result document keeps it before the arm separator while ensuring conditional parentheses and block layout remain inside the comment's scope.
 - **Review:** Regressions cover a literal result, a block-like result in a nested match, canonical spacing, fixed-point output, parser-valid line and multiline comment refusals, and a parser-valid comment inside a result call. Hostile review found no actionable issues. All 356 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
 - **Human review:** **Review required:** Confirm that a single-line block comment on the final token of a match arm's result expression stays after the complete result and before its separator, while line-breaking comments and result-expression interior comments remain unsupported.
-- **Remaining scope:** Support comments before match arms and after trailing commas, then continue through remaining comment-bearing source syntax.
+- **Remaining scope:** Support comments before match arms, then continue through remaining comment-bearing source syntax.
+
+### IR-420: Preserve comments after trailing match-arm commas
+
+- **Decision:** Preserve single-line block comments attached to a trailing comma after the final match arm before the closing brace, including single-arm lists and nested match expressions whose layout is forced to break. Keep line comments and multiline block comments fail-closed.
+- **Reason:** The comment belongs to the final arm-list separator. A suffix slot after the last arm keeps the comma and comment together before the closing brace in both flat and broken layouts.
+- **Review:** Regressions cover a single-arm flat match, a nested broken match with a block result, fixed-point output, and parser-valid line and multiline comment refusals after both inter-arm and trailing commas. Hostile review found no actionable issues and confirmed that the final suffix is rendered in both layouts while empty lists retain the previous output. All 359 `sai_fmt` tests and the full workspace tests, including doc tests, pass; workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
+- **Human review:** **Review required:** Confirm that a single-line block comment after a trailing match-arm comma stays after the comma and before the closing brace in flat and broken lists, while line-breaking comments remain unsupported.
+- **Remaining scope:** Support comments before match arms, then continue through remaining comment-bearing source syntax.
 
 ### IR-419: Preserve comments after match-arm separators
 
