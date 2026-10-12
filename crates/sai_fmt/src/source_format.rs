@@ -1718,6 +1718,63 @@ mod tests {
     }
 
     #[test]
+    fn formats_comments_before_match_arm_list_closing_braces() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1/* result */\n// closing arm list\n}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1 /* result */\n",
+                    "        // closing arm list\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{.Ready=>2,/* trailing arm separator */\n\n/* closing nested list */\n})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(\n",
+                    "        match value {\n",
+                    "            .Ready => 2, /* trailing arm separator */\n",
+                    "\n",
+                    "            /* closing nested list */\n",
+                    "        },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{\n\n/* empty list */\n}\nmatch other{.Ready=>3\n/* closing\ncontinued */\n}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        /* empty list */\n",
+                    "    }\n",
+                    "    match other {\n",
+                    "        .Ready => 3\n",
+                    "        /* closing\n",
+                    "continued */\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("comments before a match-arm-list close are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_match_keyword_comments_nested_in_composite_expressions() {
         let source =
             "fn f(value:State) {\n    let selected=consume(match/* nested */value{_=>0})\n}\n";

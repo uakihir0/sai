@@ -627,6 +627,14 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
         if !match_arm_list_elements_match(&list, &arms) {
             continue;
         }
+        if let Some((_, closing)) = brace_list_delimiters(&node) {
+            owners.insert((
+                true,
+                closing.kind(),
+                closing.text_range().start().to_usize(),
+                closing.text_range().end().to_usize(),
+            ));
+        }
         if !arms.is_empty()
             && let Some(token) =
                 list.syntax()
@@ -3975,6 +3983,8 @@ fn match_expression_document_with_keyword_comments(
     let separator_comment_documents =
         match_arm_separator_comment_documents(&arms, match_arms.len())?;
     let opening_comments = match_arm_list_opening_comments(&arms, match_arms.len())?;
+    let closing_comment_documents =
+        match_arm_list_closing_comment_documents(source, &arms, &match_arms)?;
     let force_break = arm_documents
         .iter()
         .any(document_contains_unavoidable_forced_break);
@@ -4008,6 +4018,7 @@ fn match_expression_document_with_keyword_comments(
             arm_documents,
             force_break,
             &separator_comment_documents,
+            &closing_comment_documents,
         ),
     ]);
     Ok(Doc::concat(documents))
@@ -4126,6 +4137,64 @@ fn match_arm_list_opening_comments(
         })
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     trailing_comments_after_token(&opening)
+}
+
+fn match_arm_list_closing_comment_documents(
+    source: &ParsedSource,
+    list: &ast::MatchArmList,
+    arms: &[ast::MatchArm],
+) -> Result<Vec<Doc>, SourceDocumentError> {
+    let (_, closing) =
+        brace_list_delimiters(list.syntax()).ok_or(SourceDocumentError::UnsupportedShape)?;
+    let comments = leading_comments_before_token(&closing)?;
+    if comments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let previous_end = if let Some(last_arm) = arms.last() {
+        let final_comma = list
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|element| match element {
+                SyntaxElement::Token(token)
+                    if token.kind() == SyntaxKind::COMMA
+                        && token.text_range().start() >= last_arm.syntax().text_range().end() =>
+                {
+                    Some(token)
+                }
+                _ => None,
+            })
+            .last();
+        let trailing_comma_comments = final_comma
+            .as_ref()
+            .map(trailing_comments_after_token)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(comment) = trailing_comma_comments.last() {
+            Some(comment.range.end)
+        } else {
+            let last_token = last_arm
+                .expression()
+                .and_then(|expression| expression.syntax().last_token())
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let trailing_result_comments = trailing_comments_after_token(&last_token)?;
+            trailing_result_comments
+                .last()
+                .map(|comment| comment.range.end)
+                .or_else(|| Some(last_token.text_range().end().to_usize()))
+        }
+    } else {
+        None
+    };
+
+    let mut documents = Vec::new();
+    if let Some(previous_end) = previous_end {
+        append_comment_documents(&mut documents, &comments, source.text(), Some(previous_end))?;
+    } else {
+        documents.push(Doc::HardLine);
+        append_comment_documents(&mut documents, &comments, source.text(), None)?;
+    }
+    Ok(documents)
 }
 
 fn match_arm_document(
@@ -8045,7 +8114,7 @@ fn brace_list_document_with_forced_break(
     items: Vec<Doc>,
     force_break: bool,
 ) -> Doc {
-    brace_list_document_with_separator_suffixes(group, items, force_break, &[])
+    brace_list_document_with_separator_suffixes(group, items, force_break, &[], &[])
 }
 
 fn brace_list_document_with_separator_suffixes(
@@ -8053,9 +8122,21 @@ fn brace_list_document_with_separator_suffixes(
     items: Vec<Doc>,
     force_break: bool,
     separator_suffixes: &[Vec<Doc>],
+    closing_suffix: &[Doc],
 ) -> Doc {
     if items.is_empty() {
-        return Doc::text("{}");
+        if closing_suffix.is_empty() {
+            return Doc::text("{}");
+        }
+        return Doc::group(
+            group,
+            Doc::concat([
+                Doc::text("{"),
+                Doc::indent(Doc::concat(closing_suffix.to_vec())),
+                Doc::HardLine,
+                Doc::text("}"),
+            ]),
+        );
     }
     if force_break {
         let mut contents = vec![Doc::HardLine];
@@ -8071,6 +8152,7 @@ fn brace_list_document_with_separator_suffixes(
                 contents.push(Doc::concat(suffix.clone()));
             }
         }
+        contents.extend_from_slice(closing_suffix);
         return Doc::group(
             group,
             Doc::concat([
@@ -8109,6 +8191,7 @@ fn brace_list_document_with_separator_suffixes(
             contents.push(Doc::concat(suffix.clone()));
         }
     }
+    contents.extend_from_slice(closing_suffix);
     Doc::group(
         group,
         Doc::concat([
