@@ -567,6 +567,18 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
         .descendants()
         .filter(|node| node.kind() == SyntaxKind::MATCH_ARM)
     {
+        let pattern = ast::MatchArm::cast(node.clone()).and_then(|arm| arm.pattern());
+        if let Some(token) = pattern
+            .as_ref()
+            .and_then(|pattern| pattern.syntax().first_token())
+        {
+            owners.insert((
+                true,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
         if let Some(token) = ast::MatchArm::cast(node.clone())
             .and_then(|arm| arm.pattern())
             .and_then(|pattern| pattern.syntax().last_token())
@@ -614,6 +626,24 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
         let arms = list.arms().collect::<Vec<_>>();
         if !match_arm_list_elements_match(&list, &arms) {
             continue;
+        }
+        if !arms.is_empty()
+            && let Some(token) =
+                list.syntax()
+                    .children_with_tokens()
+                    .find_map(|element| match element {
+                        SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_BRACE => {
+                            Some(token)
+                        }
+                        _ => None,
+                    })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
         }
         let mut next_arm_index = 0;
         let mut previous_arm_index = None;
@@ -3881,6 +3911,16 @@ fn trailing_comments_after_token(
         .collect())
 }
 
+fn leading_comments_before_token(
+    token: &SyntaxToken,
+) -> Result<Vec<SourceComment>, SourceDocumentError> {
+    let comments = collect_comments_from_tokens(std::slice::from_ref(token))?;
+    Ok(comments
+        .into_iter()
+        .filter(|comment| comment.is_leading)
+        .collect())
+}
+
 fn match_expression_document(
     source: &ParsedSource,
     match_expr: &ast::MatchExpr,
@@ -3934,9 +3974,23 @@ fn match_expression_document_with_keyword_comments(
     }
     let separator_comment_documents =
         match_arm_separator_comment_documents(&arms, match_arms.len())?;
+    let opening_comments = match_arm_list_opening_comments(&arms, match_arms.len())?;
     let force_break = arm_documents
         .iter()
         .any(document_contains_unavoidable_forced_break);
+    if !opening_comments.is_empty() {
+        let mut first_arm_prefix = Vec::new();
+        append_single_line_block_comments_without_leading_space(
+            &mut first_arm_prefix,
+            &opening_comments,
+        )?;
+        first_arm_prefix.push(Doc::text(" "));
+        let first_arm = arm_documents
+            .first_mut()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        first_arm_prefix.push(std::mem::replace(first_arm, Doc::concat([])));
+        *first_arm = Doc::concat(first_arm_prefix);
+    }
 
     let mut documents = vec![Doc::text("match")];
     append_single_line_block_comments(&mut documents, keyword_comments)?;
@@ -4056,6 +4110,24 @@ fn match_arm_separator_comment_documents(
     Ok(separator_documents)
 }
 
+fn match_arm_list_opening_comments(
+    list: &ast::MatchArmList,
+    arm_count: usize,
+) -> Result<Vec<SourceComment>, SourceDocumentError> {
+    if arm_count == 0 {
+        return Ok(Vec::new());
+    }
+    let opening = list
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_BRACE => Some(token),
+            _ => None,
+        })
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    trailing_comments_after_token(&opening)
+}
+
 fn match_arm_document(
     source: &ParsedSource,
     arm: &ast::MatchArm,
@@ -4087,7 +4159,20 @@ fn match_arm_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
 
-    let mut documents = vec![pattern_document(source, &pattern, expression_group_ids)?];
+    let pattern_first_token = pattern
+        .syntax()
+        .first_token()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let leading_pattern_comments = leading_comments_before_token(&pattern_first_token)?;
+    let mut documents = Vec::new();
+    append_single_line_block_comments_without_leading_space(
+        &mut documents,
+        &leading_pattern_comments,
+    )?;
+    if !leading_pattern_comments.is_empty() {
+        documents.push(Doc::text(" "));
+    }
+    documents.push(pattern_document(source, &pattern, expression_group_ids)?);
     let pattern_last_token = pattern
         .syntax()
         .last_token()
@@ -5709,11 +5794,28 @@ fn append_single_line_block_comments(
     documents: &mut Vec<Doc>,
     comments: &[SourceComment],
 ) -> Result<(), SourceDocumentError> {
-    for comment in comments {
+    append_single_line_block_comments_with_spacing(documents, comments, true)
+}
+
+fn append_single_line_block_comments_without_leading_space(
+    documents: &mut Vec<Doc>,
+    comments: &[SourceComment],
+) -> Result<(), SourceDocumentError> {
+    append_single_line_block_comments_with_spacing(documents, comments, false)
+}
+
+fn append_single_line_block_comments_with_spacing(
+    documents: &mut Vec<Doc>,
+    comments: &[SourceComment],
+    first_comment_has_leading_space: bool,
+) -> Result<(), SourceDocumentError> {
+    for (index, comment) in comments.iter().enumerate() {
         if comment.kind != TriviaKind::BlockComment || comment.text.contains('\n') {
             return Err(SourceDocumentError::UnsupportedShape);
         }
-        documents.push(Doc::text(" "));
+        if first_comment_has_leading_space || index > 0 {
+            documents.push(Doc::text(" "));
+        }
         documents.push(Doc::verbatim(comment.text.clone()));
     }
     Ok(())
