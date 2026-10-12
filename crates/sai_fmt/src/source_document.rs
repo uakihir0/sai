@@ -758,6 +758,18 @@ fn block_comment_targets(
                 ListCommentTarget::AfterKeyword(index),
             );
         }
+        if let Some(keyword_token) = block_statement_for_keyword_token(statement) {
+            owner_tokens.push(keyword_token.clone());
+            targets.insert(
+                (
+                    false,
+                    keyword_token.kind(),
+                    keyword_token.text_range().start().to_usize(),
+                    keyword_token.text_range().end().to_usize(),
+                ),
+                ListCommentTarget::AfterKeyword(index),
+            );
+        }
         let last_token = statement
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -832,6 +844,22 @@ fn block_statement_while_keyword_token(statement: &SyntaxNode) -> Option<SyntaxT
         .children_with_tokens()
         .find_map(|element| match element {
             SyntaxElement::Token(token) if token.kind() == SyntaxKind::WHILE_KW => Some(token),
+            _ => None,
+        })
+}
+
+fn block_statement_for_keyword_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+    let Stmt::Expr(statement) = ast::Stmt::cast(statement.clone())? else {
+        return None;
+    };
+    let Expr::For(for_expr) = statement.expression()? else {
+        return None;
+    };
+    for_expr
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::FOR_KW => Some(token),
             _ => None,
         })
 }
@@ -4496,6 +4524,15 @@ fn for_expression_document(
     for_expr: &ast::ForExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    for_expression_document_with_keyword_comments(source, for_expr, expression_group_ids, &[])
+}
+
+fn for_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    for_expr: &ast::ForExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let label = for_expr.label();
     let pattern = for_expr
         .pattern()
@@ -4526,7 +4563,9 @@ fn for_expression_document(
     if let Some(label) = label {
         documents.push(loop_label_document(&label)?);
     }
-    documents.push(Doc::text(if is_await { "for await " } else { "for " }));
+    documents.push(Doc::text("for"));
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
+    documents.push(Doc::text(if is_await { " await " } else { " " }));
     documents.push(pattern_document(source, &pattern, expression_group_ids)?);
     documents.push(Doc::text(" in "));
     documents.push(expression_document(
@@ -5128,6 +5167,12 @@ fn statement_document(
                     Expr::While(while_expr) => while_expression_document_with_keyword_comments(
                         source,
                         while_expr,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
+                    Expr::For(for_expr) => for_expression_document_with_keyword_comments(
+                        source,
+                        for_expr,
                         expression_group_ids,
                         keyword_comments,
                     ),

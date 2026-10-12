@@ -1268,6 +1268,28 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_for_keywords() {
+        let source = concat!(
+            "fn iterations(values:Vec<I32>){\n",
+            "for/* each */value in values{}\n",
+            "'scan:for/* awaited */await value in values{break 'scan}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn iterations(values: Vec<I32>) {\n",
+            "    for /* each */ value in values {}\n",
+            "    'scan: for /* awaited */ await value in values {\n",
+            "        break 'scan\n",
+            "    }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("for keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",
