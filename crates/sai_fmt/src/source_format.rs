@@ -2037,12 +2037,79 @@ mod tests {
     }
 
     #[test]
-    fn refuses_line_and_multiline_comments_before_match_arm_patterns() {
+    fn formats_line_and_multiline_comments_before_match_arm_patterns() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1\n// next\n_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1\n",
+                    "        // next\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1\n/* next\ncontinued */_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1\n",
+                    "        /* next\n",
+                    "continued */\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{.Ready=>1\n// next\n\n_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        .Ready => 1\n",
+                    "        // next\n",
+                    "\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{.Ready=>1\n// nested\n_=>0})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(\n",
+                    "        match value {\n",
+                    "            .Ready => 1\n",
+                    "            // nested\n",
+                    "            _ => 0\n",
+                    "        },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("line and multiline comments before match arm patterns are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_match_arm_opening_braces() {
         for source in [
             "fn f(value:State) {\n    match value{// opening\n        _=>0}\n}\n",
             "fn f(value:State) {\n    match value{/* opening\n        continued */_=>0}\n}\n",
-            "fn f(value:State) {\n    match value{.Ready=>1\n        // next\n        _=>0}\n}\n",
-            "fn f(value:State) {\n    match value{.Ready=>1\n        /* next\n        continued */_=>0}\n}\n",
         ] {
             assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
             assert_eq!(

@@ -4320,12 +4320,30 @@ fn match_arm_document(
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let leading_pattern_comments = leading_comments_before_token(&pattern_first_token)?;
     let mut documents = Vec::new();
-    append_single_line_block_comments_without_leading_space(
-        &mut documents,
-        &leading_pattern_comments,
-    )?;
-    if !leading_pattern_comments.is_empty() {
-        documents.push(Doc::text(" "));
+    if source_comments_require_line_break(&leading_pattern_comments) {
+        append_comment_documents(
+            &mut documents,
+            &leading_pattern_comments,
+            source.text(),
+            None,
+        )?;
+        let last_comment_end = leading_pattern_comments
+            .last()
+            .map(|comment| comment.range.end);
+        append_comment_gap(
+            &mut documents,
+            source.text(),
+            last_comment_end,
+            Some(pattern_first_token.text_range().start().to_usize()),
+        )?;
+    } else {
+        append_single_line_block_comments_without_leading_space(
+            &mut documents,
+            &leading_pattern_comments,
+        )?;
+        if !leading_pattern_comments.is_empty() {
+            documents.push(Doc::text(" "));
+        }
     }
     documents.push(pattern_document(source, &pattern, expression_group_ids)?);
     let pattern_last_token = pattern
