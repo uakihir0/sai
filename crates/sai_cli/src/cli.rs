@@ -6296,8 +6296,8 @@ mod tests {
 
     #[test]
     fn fmt_formats_source_stdin_and_emits_the_json_result_contract() {
-        let source = b"fn greet(name:Str){}";
-        let expected = "fn greet(name: Str) {}\n";
+        let source = b"fn greet(name:Str){} // signature";
+        let expected = "fn greet(name: Str) {} // signature\n";
         let (exit_code, stdout, stderr) = invoke_with_stdin(&["fmt", "-"], source);
 
         assert_eq!(exit_code, 0);
@@ -6309,7 +6309,7 @@ mod tests {
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"kind\":\"fmt\""));
         assert!(stdout.contains("\"check\":false,\"files\":1,\"changed\":[\"<stdin>\"]"));
-        assert!(stdout.contains("\"output\":\"fn greet(name: Str) {}\\n\""));
+        assert!(stdout.contains("\"output\":\"fn greet(name: Str) {} // signature\\n\""));
         assert!(stdout.contains("\"exit_code\":0"));
     }
 
@@ -6352,7 +6352,7 @@ mod tests {
         ));
 
         let (exit_code, stdout, stderr) =
-            invoke_with_stdin(&["--format=json", "fmt", "-"], b"fn f() {} // trailing");
+            invoke_with_stdin(&["--format=json", "fmt", "-"], b"const ANSWER: I32 = 42");
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
@@ -7216,13 +7216,13 @@ mod tests {
     #[test]
     fn fmt_source_paths_distinguish_refusals_from_unsupported_shapes() {
         let directory = TestDirectory::new();
-        let comment = directory.child("comment.sai");
+        let unsupported = directory.child("unsupported.sai");
         let broken = directory.child("source.sai");
-        let comment_source = b"fn f() {} // trailing";
+        let unsupported_source = b"const ANSWER: I32 = 42";
         let broken_source = b"\xef\xbb\xbffn broken(";
-        fs::write(&comment, comment_source).unwrap();
+        fs::write(&unsupported, unsupported_source).unwrap();
         fs::write(&broken, broken_source).unwrap();
-        let comment_path = comment.to_str().expect("temporary path is UTF-8");
+        let unsupported_path = unsupported.to_str().expect("temporary path is UTF-8");
         let broken_path = broken.to_str().expect("temporary path is UTF-8");
         let working_directory = std::env::current_dir().unwrap();
         let canonical_broken = fs::canonicalize(&broken).unwrap();
@@ -7231,11 +7231,11 @@ mod tests {
         let broken_reference_json = super::escape_json(&broken_reference);
 
         let (exit_code, stdout, stderr) =
-            invoke(&["--format=json", "fmt", comment_path, broken_path]);
+            invoke(&["--format=json", "fmt", unsupported_path, broken_path]);
 
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
-        assert_eq!(fs::read(comment).unwrap(), comment_source);
+        assert_eq!(fs::read(unsupported).unwrap(), unsupported_source);
         assert_eq!(fs::read(broken).unwrap(), broken_source);
         assert!(
             stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),

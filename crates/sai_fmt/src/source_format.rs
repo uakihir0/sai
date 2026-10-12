@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn reports_valid_but_unsupported_shapes_explicitly() {
         assert_eq!(
-            format_source(b"fn f() {} // trailing"),
+            format_source(b"const ANSWER: I32 = 42"),
             Err(SourceFormatError::UnsupportedShape)
         );
     }
@@ -673,16 +673,59 @@ mod tests {
     }
 
     #[test]
-    fn keeps_comments_inside_items_and_inline_trailing_comments_fail_closed() {
-        for source in [
-            b"fn f() { // inside\n    1\n}".as_slice(),
-            b"fn f() {} // inline",
-            b"// attached to declaration\nfn f() {}",
+    fn keeps_comments_inside_items_fail_closed() {
+        let source = b"fn f() { // inside\n    1\n}".as_slice();
+        assert_eq!(
+            format_source(source),
+            Err(SourceFormatError::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn attached_comments_move_with_top_level_declarations() {
+        let source = concat!(
+            "// function comment\n",
+            "fn helper(){}\n",
+            "// import comment\n",
+            "use sai:z // import note\n",
+            "use sai:a",
+        );
+        let expected = concat!(
+            "use sai:a\n",
+            "// import comment\n",
+            "use sai:z // import note\n",
+            "\n",
+            "// function comment\n",
+            "fn helper() {}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("attached comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_trailing_top_level_line_and_block_comments() {
+        for (source, expected) in [
+            (
+                b"fn first(){} // trailing\nfn second(){}".as_slice(),
+                "fn first() {} // trailing\n\nfn second() {}\n",
+            ),
+            (
+                b"fn first(){} /* trailing */\nfn second(){}",
+                "fn first() {} /* trailing */\nfn second() {}\n",
+            ),
+            (
+                b"fn first(){} /* multi\n line */\nfn second(){}",
+                "fn first() {} /* multi\n line */\n\nfn second() {}\n",
+            ),
+            (
+                b"fn first(){} // trailing\n// eof\n",
+                "fn first() {} // trailing\n// eof\n",
+            ),
         ] {
-            assert_eq!(
-                format_source(source),
-                Err(SourceFormatError::UnsupportedShape)
-            );
+            let formatted = format_source(source).expect("top-level trailing comments format");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
         }
     }
 

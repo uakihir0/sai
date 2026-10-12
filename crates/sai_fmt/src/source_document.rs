@@ -1,10 +1,10 @@
 use std::ops::Range;
 
 use sai_syntax::{
-    GreenElement, GreenNode, SyntaxElement, SyntaxKind, SyntaxToken, TriviaKind,
+    GreenElement, GreenNode, GreenTrivia, SyntaxElement, SyntaxKind, SyntaxToken, TriviaKind,
     ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Stmt},
 };
-use sai_vfs::TextRange;
+use sai_vfs::{TextRange, TextSize};
 
 use crate::{Doc, GroupId, ParsedSource, printer::MAX_LINE_WIDTH};
 
@@ -21,28 +21,61 @@ pub(super) enum SourceDocumentError {
 pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocumentError> {
     let file = ast::SourceFile::cast(source.root().clone())
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let module_header = file
-        .module_header()
-        .map(|header| module_header_document(source, &header))
-        .transpose()?;
+    let module_header_node = file.module_header();
+    let has_module_header = module_header_node.is_some();
     let top_level_ranges = file
         .syntax()
         .children()
         .map(|child| child.text_range())
         .collect::<Vec<_>>();
     let items = file.items().collect::<Vec<_>>();
-    if source.root().children().count() != items.len() + usize::from(module_header.is_some()) {
+    if source.root().children().count() != items.len() + usize::from(has_module_header) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let outer_comments =
-        collect_outer_comments(source.root().green(), &top_level_ranges, source.text())?;
+    let mut comments =
+        collect_top_level_comments(source.root().green(), &top_level_ranges, source.text())?;
+    let mut module_header = module_header_node
+        .as_ref()
+        .map(|header| module_header_document(source, header))
+        .transpose()?;
+    if let (Some(document), Some(range)) = (module_header.as_mut(), top_level_ranges.first()) {
+        *document = decorate_top_level_document(
+            std::mem::replace(document, Doc::concat([])),
+            &comments.leading[0],
+            &comments.trailing[0],
+            source.text(),
+            *range,
+        )?
+        .0;
+    }
     let mut units = Vec::with_capacity(items.len());
     let mut use_declarations = Vec::new();
     let mut expression_group_ids = ExpressionGroupIds::default();
-    for item in items {
+    for (item_index, item) in items.into_iter().enumerate() {
+        let top_level_index = item_index + usize::from(has_module_header);
+        let range = *top_level_ranges
+            .get(top_level_index)
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        let leading_comments = comments
+            .leading
+            .get_mut(top_level_index)
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        let trailing_comments = comments
+            .trailing
+            .get_mut(top_level_index)
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
         let unit = match item {
             Item::Use(declaration) => {
-                use_declarations.push(use_declaration_document(source, &declaration)?);
+                let mut declaration = use_declaration_document(source, &declaration)?;
+                declaration.document = decorate_top_level_document(
+                    declaration.document,
+                    leading_comments,
+                    trailing_comments,
+                    source.text(),
+                    range,
+                )?
+                .0;
+                use_declarations.push(declaration);
                 continue;
             }
             Item::Function(function) => {
@@ -67,7 +100,12 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             }
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
-        units.push(unit);
+        units.push(decorate_item_document(
+            unit,
+            leading_comments,
+            trailing_comments,
+            source.text(),
+        )?);
     }
     use_declarations.sort_by(|left, right| {
         left.is_public
@@ -76,16 +114,13 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
     });
 
     let mut document = Vec::with_capacity(units.len() * 2 + use_declarations.len() * 2 + 2);
-    if !outer_comments.leading.is_empty() {
-        append_comment_documents(&mut document, &outer_comments.leading, source.text(), None)?;
+    if !comments.file_header.is_empty() {
+        append_comment_documents(&mut document, &comments.file_header, source.text(), None)?;
         if let Some(first_range) = top_level_ranges.first() {
             append_comment_gap(
                 &mut document,
                 source.text(),
-                outer_comments
-                    .leading
-                    .last()
-                    .map(|comment| comment.range.end),
+                comments.file_header.last().map(|comment| comment.range.end),
                 Some(first_range.start().to_usize()),
             )?;
         }
@@ -127,103 +162,188 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
         }
         document.push(unit.document.clone());
     }
-    if !outer_comments.eof.is_empty() {
-        let last_content_end = top_level_ranges.last().map(|range| range.end().to_usize());
+    if !comments.eof.is_empty() {
+        let last_index = top_level_ranges.len().saturating_sub(1);
+        let last_content_end = top_level_ranges.last().map(|range| {
+            comments
+                .trailing
+                .get(last_index)
+                .and_then(|comments| comments.last())
+                .map_or_else(|| range.end().to_usize(), |comment| comment.range.end)
+        });
         append_comment_gap(
             &mut document,
             source.text(),
             last_content_end,
-            outer_comments
-                .eof
-                .first()
-                .map(|comment| comment.range.start),
+            comments.eof.first().map(|comment| comment.range.start),
         )?;
-        append_comment_documents(&mut document, &outer_comments.eof, source.text(), None)?;
+        append_comment_documents(&mut document, &comments.eof, source.text(), None)?;
     }
     Ok(Doc::concat(document))
 }
 
 #[derive(Default)]
-struct OuterComments {
-    leading: Vec<SourceComment>,
+struct TopLevelComments {
+    file_header: Vec<SourceComment>,
+    leading: Vec<Vec<SourceComment>>,
+    trailing: Vec<Vec<SourceComment>>,
     eof: Vec<SourceComment>,
 }
 
+#[derive(Clone)]
 struct SourceComment {
     range: Range<usize>,
     text: String,
+    kind: TriviaKind,
 }
 
-fn collect_outer_comments(
+fn collect_top_level_comments(
     root: &GreenNode,
     top_level_ranges: &[TextRange],
     source: &str,
-) -> Result<OuterComments, SourceDocumentError> {
-    let first_content_start = top_level_ranges
-        .first()
-        .map_or(source.len(), |range| range.start().to_usize());
-    let has_content = !top_level_ranges.is_empty();
-    let mut comments = OuterComments::default();
+) -> Result<TopLevelComments, SourceDocumentError> {
+    let mut comments = TopLevelComments {
+        leading: vec![Vec::new(); top_level_ranges.len()],
+        trailing: vec![Vec::new(); top_level_ranges.len()],
+        ..TopLevelComments::default()
+    };
+    let mut leading_candidates = Vec::new();
+    let mut trailing_candidates = Vec::new();
     let mut cursor = 0_usize;
     let mut pending = root.children().iter().rev().collect::<Vec<_>>();
     while let Some(element) = pending.pop() {
         match element {
             GreenElement::Node(node) => pending.extend(node.children().iter().rev()),
             GreenElement::Token(token) => {
-                for (trivia, is_leading) in token
-                    .leading_trivia()
-                    .iter()
-                    .map(|trivia| (trivia, true))
-                    .chain(token.trailing_trivia().iter().map(|trivia| (trivia, false)))
-                {
-                    let start = cursor;
-                    cursor = cursor
-                        .checked_add(trivia.text().len())
-                        .ok_or(SourceDocumentError::UnsupportedShape)?;
-                    match trivia.kind() {
-                        TriviaKind::LineComment | TriviaKind::BlockComment => {
-                            let text = trivia.text();
-                            let comment = SourceComment {
-                                range: start..cursor,
-                                text: normalize_comment_text(text),
-                            };
-                            if is_leading && comment.range.end <= first_content_start {
-                                comments.leading.push(comment);
-                            } else if has_content && is_leading && token.kind() == SyntaxKind::EOF {
-                                comments.eof.push(comment);
-                            } else {
-                                return Err(SourceDocumentError::UnsupportedShape);
-                            }
-                        }
-                        TriviaKind::Shebang => {
-                            return Err(SourceDocumentError::UnsupportedShape);
-                        }
-                        TriviaKind::Whitespace | TriviaKind::LineBreak | TriviaKind::Skipped => {}
-                    }
+                for trivia in token.leading_trivia() {
+                    scan_source_trivia(
+                        trivia,
+                        true,
+                        token.kind(),
+                        &mut cursor,
+                        &mut comments.eof,
+                        &mut leading_candidates,
+                        &mut trailing_candidates,
+                    )?;
                 }
                 cursor = cursor
                     .checked_add(token.text().len())
                     .ok_or(SourceDocumentError::UnsupportedShape)?;
+                for trivia in token.trailing_trivia() {
+                    scan_source_trivia(
+                        trivia,
+                        false,
+                        token.kind(),
+                        &mut cursor,
+                        &mut comments.eof,
+                        &mut leading_candidates,
+                        &mut trailing_candidates,
+                    )?;
+                }
             }
         }
     }
-    if has_content && !comments.leading.is_empty() {
-        let last_comment_end = comments
-            .leading
+
+    for comment in leading_candidates {
+        let node_index = top_level_ranges
+            .iter()
+            .position(|range| comment.range.end <= range.start().to_usize())
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        if node_index > 0 && comment.range.start < top_level_ranges[node_index - 1].end().to_usize()
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        comments.leading[node_index].push(comment);
+    }
+    for (node_index, group) in comments.leading.iter_mut().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let node_start = top_level_ranges[node_index].start().to_usize();
+        let last_comment_end = group
             .last()
             .map(|comment| comment.range.end)
             .ok_or(SourceDocumentError::UnsupportedShape)?;
         let gap = source
-            .get(last_comment_end..first_content_start)
+            .get(last_comment_end..node_start)
             .ok_or(SourceDocumentError::UnsupportedShape)?;
-        if line_break_count(gap) <= 1 {
-            return Err(SourceDocumentError::UnsupportedShape);
+        if line_break_count(gap) > 1 {
+            if node_index != 0 {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            comments.file_header = std::mem::take(group);
+        } else {
+            for pair in group.windows(2) {
+                let gap = source
+                    .get(pair[0].range.end..pair[1].range.start)
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                if line_break_count(gap) > 1 {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+            }
         }
     }
-    if cursor != source.len() || !has_content && !comments.eof.is_empty() {
+    for comment in trailing_candidates {
+        let node_index = top_level_ranges
+            .iter()
+            .rposition(|range| range.end().to_usize() <= comment.range.start)
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        if top_level_ranges
+            .get(node_index + 1)
+            .is_some_and(|next| comment.range.end > next.start().to_usize())
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        comments.trailing[node_index].push(comment);
+    }
+    if cursor != source.len() {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    if top_level_ranges.is_empty() {
+        comments.file_header = std::mem::take(&mut comments.eof);
+    } else if let Some(last_range) = top_level_ranges.last()
+        && comments
+            .eof
+            .first()
+            .is_some_and(|comment| comment.range.start < last_range.end().to_usize())
+    {
         return Err(SourceDocumentError::UnsupportedShape);
     }
     Ok(comments)
+}
+
+fn scan_source_trivia(
+    trivia: &GreenTrivia,
+    is_leading: bool,
+    token_kind: SyntaxKind,
+    cursor: &mut usize,
+    eof_comments: &mut Vec<SourceComment>,
+    leading_candidates: &mut Vec<SourceComment>,
+    trailing_candidates: &mut Vec<SourceComment>,
+) -> Result<(), SourceDocumentError> {
+    let start = *cursor;
+    *cursor = cursor
+        .checked_add(trivia.text().len())
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    match trivia.kind() {
+        TriviaKind::LineComment | TriviaKind::BlockComment => {
+            let comment = SourceComment {
+                range: start..*cursor,
+                text: normalize_comment_text(trivia.text()),
+                kind: trivia.kind(),
+            };
+            if is_leading && token_kind == SyntaxKind::EOF {
+                eof_comments.push(comment);
+            } else if is_leading {
+                leading_candidates.push(comment);
+            } else {
+                trailing_candidates.push(comment);
+            }
+        }
+        TriviaKind::Shebang => return Err(SourceDocumentError::UnsupportedShape),
+        TriviaKind::Whitespace | TriviaKind::LineBreak | TriviaKind::Skipped => {}
+    }
+    Ok(())
 }
 
 fn normalize_comment_text(text: &str) -> String {
@@ -278,6 +398,67 @@ fn append_comment_gap(
 
 fn line_break_count(text: &str) -> usize {
     text.bytes().filter(|byte| *byte == b'\n').count()
+}
+
+fn decorate_top_level_document(
+    document: Doc,
+    leading_comments: &[SourceComment],
+    trailing_comments: &[SourceComment],
+    source: &str,
+    range: TextRange,
+) -> Result<(Doc, bool), SourceDocumentError> {
+    let mut documents = Vec::new();
+    if !leading_comments.is_empty() {
+        append_comment_documents(&mut documents, leading_comments, source, None)?;
+        append_comment_gap(
+            &mut documents,
+            source,
+            leading_comments.last().map(|comment| comment.range.end),
+            Some(range.start().to_usize()),
+        )?;
+    }
+    documents.push(document);
+    let mut multiline = !leading_comments.is_empty();
+    for comment in trailing_comments {
+        if comment.kind == TriviaKind::LineComment {
+            documents.push(Doc::line_suffix(Doc::text(format!(" {}", comment.text))));
+            multiline = true;
+        } else {
+            documents.push(Doc::text(" "));
+            documents.push(Doc::verbatim(comment.text.clone()));
+            multiline |= comment.text.contains('\n');
+        }
+    }
+    Ok((Doc::concat(documents), multiline))
+}
+
+fn decorate_item_document(
+    mut unit: ItemDocument,
+    leading_comments: &[SourceComment],
+    trailing_comments: &[SourceComment],
+    source: &str,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let range = TextRange::new(
+        TextSize::from_usize(unit.start).ok_or(SourceDocumentError::UnsupportedShape)?,
+        TextSize::from_usize(unit.end).ok_or(SourceDocumentError::UnsupportedShape)?,
+    )
+    .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let (document, comments_multiline) = decorate_top_level_document(
+        unit.document,
+        leading_comments,
+        trailing_comments,
+        source,
+        range,
+    )?;
+    unit.document = document;
+    if let Some(comment) = leading_comments.first() {
+        unit.start = comment.range.start;
+    }
+    if let Some(comment) = trailing_comments.last() {
+        unit.end = comment.range.end;
+    }
+    unit.multiline |= comments_multiline;
+    Ok(unit)
 }
 
 struct ItemDocument {
@@ -9699,15 +9880,17 @@ mod tests {
         );
         assert_eq!(
             format_shape(b"// header\nfn f(){let x=1\nx}"),
-            Err(SourceDocumentError::UnsupportedShape)
+            Ok(String::from(
+                "// header\nfn f() {\n    let x = 1\n    x\n}\n"
+            ))
         );
         assert_eq!(
             format_shape(b"fn f(){} // trailing"),
-            Err(SourceDocumentError::UnsupportedShape)
+            Ok(String::from("fn f() {} // trailing\n"))
         );
         assert_eq!(
             format_shape(b"fn f(){} /* trailing */"),
-            Err(SourceDocumentError::UnsupportedShape)
+            Ok(String::from("fn f() {} /* trailing */\n"))
         );
         assert_eq!(
             format_shape(b"fn f(){}\n/// trailing"),
