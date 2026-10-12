@@ -4017,9 +4017,22 @@ fn match_expression_document_with_keyword_comments(
     let opening_comments = match_arm_list_opening_comments(&arms, match_arms.len())?;
     let closing_comment_documents =
         match_arm_list_closing_comment_documents(source, &arms, &match_arms)?;
-    let force_break = arm_documents
+    let mut force_break = arm_documents
         .iter()
         .any(document_contains_unavoidable_forced_break);
+    for arm in &match_arms {
+        let result_last_token = arm
+            .expression()
+            .and_then(|expression| expression.syntax().last_token())
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        if trailing_comments_after_token(&result_last_token)?
+            .iter()
+            .any(|comment| comment.kind == TriviaKind::LineComment)
+        {
+            force_break = true;
+            break;
+        }
+    }
     if !opening_comments.is_empty() {
         let mut first_arm_prefix = Vec::new();
         append_single_line_block_comments_without_leading_space(
@@ -4335,7 +4348,7 @@ fn match_arm_document(
         documents.push(Doc::text(" if"));
         let guard_keyword_comments =
             trailing_comments_after_direct_token(guard.syntax(), SyntaxKind::IF_KW)?;
-        append_match_arm_introducer_comments(&mut documents, &guard_keyword_comments);
+        append_match_arm_comment_run(&mut documents, &guard_keyword_comments);
         let guard_expression_document = expression_document(
             source,
             &guard_expression,
@@ -4362,7 +4375,7 @@ fn match_arm_document(
     }
     documents.push(Doc::text(" =>"));
     let arrow_comments = trailing_comments_after_direct_token(arm.syntax(), SyntaxKind::FAT_ARROW)?;
-    append_match_arm_introducer_comments(&mut documents, &arrow_comments);
+    append_match_arm_comment_run(&mut documents, &arrow_comments);
     let arrow_comments_require_line_break = arrow_comments.iter().any(|comment| {
         comment.kind == TriviaKind::LineComment
             || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
@@ -4398,11 +4411,18 @@ fn match_arm_document(
         .last_token()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let expression_comments = trailing_comments_after_token(&expression_last_token)?;
-    append_single_line_block_comments(&mut documents, &expression_comments)?;
+    if expression_comments.iter().any(|comment| {
+        comment.kind == TriviaKind::LineComment
+            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
+    }) {
+        append_match_arm_comment_run(&mut documents, &expression_comments);
+    } else {
+        append_single_line_block_comments(&mut documents, &expression_comments)?;
+    }
     Ok(Doc::concat(documents))
 }
 
-fn append_match_arm_introducer_comments(document: &mut Vec<Doc>, comments: &[SourceComment]) {
+fn append_match_arm_comment_run(document: &mut Vec<Doc>, comments: &[SourceComment]) {
     let mut previous_comment_requires_line_break = false;
     for comment in comments {
         if previous_comment_requires_line_break {
@@ -4415,9 +4435,9 @@ fn append_match_arm_introducer_comments(document: &mut Vec<Doc>, comments: &[Sou
         } else {
             document.push(Doc::verbatim(comment.text.clone()));
         }
-        // Keep comments after a match-arm introducer together after block
-        // comments. Breaking there can reattach the next comment to the
-        // following expression as leading trivia and break a second pass.
+        // Keep a trailing comment run together after block comments. Breaking
+        // there can reattach the next comment as leading trivia and break a
+        // second formatting pass.
         previous_comment_requires_line_break = comment.kind == TriviaKind::LineComment;
     }
 }
