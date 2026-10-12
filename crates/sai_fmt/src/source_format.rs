@@ -705,16 +705,84 @@ mod tests {
 
     #[test]
     fn keeps_comments_inside_items_fail_closed() {
-        for source in [
-            "fn f() { // inside\n    1\n}",
-            "fn f() {\n    let value = /* inside a statement */ 1\n}",
-        ] {
-            assert_eq!(
-                format_source(source.as_bytes()),
-                Err(SourceFormatError::UnsupportedShape),
-                "{source}"
-            );
-        }
+        let source = "fn f() {\n    let value = /* inside a statement */ 1\n}";
+        assert_eq!(
+            format_source(source.as_bytes()),
+            Err(SourceFormatError::UnsupportedShape),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn formats_comments_attached_to_block_opening_braces() {
+        let source = concat!(
+            "fn line() { // opening line\n",
+            "    1\n",
+            "}\n",
+            "fn block() {/* opening block */\n",
+            "    2\n",
+            "}\n",
+            "fn multiline() { /* first line\n",
+            "    second line */\n",
+            "    3\n",
+            "}\n",
+            "fn empty() { // only content\n",
+            "}\n",
+            "fn repeated() { /* first\n",
+            "second */ /* tail */\n",
+            "    4\n",
+            "}\n",
+            "type User { // fields\n",
+            "    id: U32\n",
+            "}\n",
+            "enum State { /* variants */\n",
+            "    Ready\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn line() { // opening line\n",
+            "    1\n",
+            "}\n",
+            "\n",
+            "fn block() { /* opening block */\n",
+            "    2\n",
+            "}\n",
+            "\n",
+            "fn multiline() { /* first line\n",
+            "    second line */\n",
+            "    3\n",
+            "}\n",
+            "\n",
+            "fn empty() { // only content\n",
+            "}\n",
+            "\n",
+            "fn repeated() { /* first\n",
+            "second */\n",
+            "    /* tail */\n",
+            "    4\n",
+            "}\n",
+            "\n",
+            "type User { // fields\n",
+            "    id: U32\n",
+            "}\n",
+            "\n",
+            "enum State { /* variants */\n",
+            "    Ready\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("opening brace comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn keeps_comments_before_block_opening_braces_fail_closed() {
+        let source = "fn f()\n// before body\n{\n    1\n}";
+        assert_eq!(
+            format_source(source.as_bytes()),
+            Err(SourceFormatError::UnsupportedShape),
+            "{source}"
+        );
     }
 
     #[test]

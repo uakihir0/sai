@@ -424,6 +424,7 @@ fn collect_comment_candidates(
 
 #[derive(Clone, Copy)]
 enum ListCommentTarget {
+    Opening,
     BeforeMember(usize),
     AfterMember(usize),
     Closing,
@@ -440,6 +441,7 @@ struct BraceCommentTargets {
 
 #[derive(Default)]
 struct ListComments {
+    opening: Vec<SourceComment>,
     before: Vec<Vec<SourceComment>>,
     after: Vec<Vec<SourceComment>>,
     closing: Vec<SourceComment>,
@@ -447,7 +449,8 @@ struct ListComments {
 
 impl ListComments {
     fn has_comments(&self) -> bool {
-        !self.closing.is_empty()
+        !self.opening.is_empty()
+            || !self.closing.is_empty()
             || self.before.iter().any(|comments| !comments.is_empty())
             || self.after.iter().any(|comments| !comments.is_empty())
     }
@@ -513,7 +516,16 @@ fn list_comment_targets(
     let opening_end = opening.text_range().end().to_usize();
     let closing_start = closing.text_range().start().to_usize();
     let mut targets = HashMap::with_capacity(members.len() * 2 + 1);
-    let mut owner_tokens = vec![closing.clone()];
+    let mut owner_tokens = vec![opening.clone(), closing.clone()];
+    targets.insert(
+        (
+            false,
+            opening.kind(),
+            opening.text_range().start().to_usize(),
+            opening.text_range().end().to_usize(),
+        ),
+        ListCommentTarget::Opening,
+    );
     for (index, member) in members.iter().enumerate() {
         if member.kind() != member_kind {
             return Err(SourceDocumentError::UnsupportedShape);
@@ -612,7 +624,16 @@ fn block_comment_targets(
     let opening_end = opening.text_range().end().to_usize();
     let closing_start = closing.text_range().start().to_usize();
     let mut targets = HashMap::with_capacity(statements.len() * 2 + 1);
-    let mut owner_tokens = vec![closing.clone()];
+    let mut owner_tokens = vec![opening.clone(), closing.clone()];
+    targets.insert(
+        (
+            false,
+            opening.kind(),
+            opening.text_range().start().to_usize(),
+            opening.text_range().end().to_usize(),
+        ),
+        ListCommentTarget::Opening,
+    );
     for (index, statement) in statements.iter().enumerate() {
         if !ast::Stmt::can_cast(statement.kind()) {
             return Err(SourceDocumentError::UnsupportedShape);
@@ -716,6 +737,7 @@ fn collect_brace_unit_comments(
         owner_tokens,
     } = targets;
     let mut comments = ListComments {
+        opening: Vec::new(),
         before: vec![Vec::new(); member_count],
         after: vec![Vec::new(); member_count],
         closing: Vec::new(),
@@ -728,6 +750,7 @@ fn collect_brace_unit_comments(
         }
         let target = targets.get(&comment_owner_key(&comment)).copied();
         match target {
+            Some(ListCommentTarget::Opening) => comments.opening.push(comment),
             Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
             Some(ListCommentTarget::AfterMember(index)) => comments.after[index].push(comment),
             Some(ListCommentTarget::Closing) => comments.closing.push(comment),
@@ -2559,18 +2582,23 @@ fn record_fields_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    broken_brace_list_document(source, members, &comments.closing)
+    broken_brace_list_document(source, members, &comments.opening, &comments.closing)
 }
 
 fn broken_brace_list_document(
     source: &ParsedSource,
     members: Vec<(usize, usize, Doc)>,
+    opening_comments: &[SourceComment],
     closing_comments: &[SourceComment],
 ) -> Result<Doc, SourceDocumentError> {
-    if members.is_empty() && closing_comments.is_empty() {
+    if members.is_empty() && opening_comments.is_empty() && closing_comments.is_empty() {
         return Ok(Doc::text("{}"));
     }
-    let mut body = vec![Doc::HardLine];
+    let mut body = Vec::new();
+    append_trailing_comment_documents(&mut body, opening_comments);
+    if !members.is_empty() || !closing_comments.is_empty() {
+        body.push(Doc::HardLine);
+    }
     for (index, (start, _, document)) in members.iter().enumerate() {
         if index > 0 {
             let (_, previous_end, _) = &members[index - 1];
@@ -2630,26 +2658,30 @@ fn decorate_list_member_document(
         output_start = leading_comments[0].range.start;
     }
     documents.push(document);
-    let mut trailing_comment_requires_line_break = false;
-    for comment in trailing_comments {
-        if trailing_comment_requires_line_break {
-            documents.push(Doc::HardLine);
-        }
-        if comment.kind == TriviaKind::LineComment && !trailing_comment_requires_line_break {
-            documents.push(Doc::line_suffix(Doc::text(format!(" {}", comment.text))));
-        } else {
-            if !trailing_comment_requires_line_break {
-                documents.push(Doc::text(" "));
-            }
-            documents.push(Doc::verbatim(comment.text.clone()));
-        }
-        trailing_comment_requires_line_break = comment.kind == TriviaKind::LineComment
-            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'));
-    }
+    append_trailing_comment_documents(&mut documents, trailing_comments);
     let output_end = trailing_comments
         .last()
         .map_or(end, |comment| comment.range.end);
     Ok((output_start, output_end, Doc::concat(documents)))
+}
+
+fn append_trailing_comment_documents(document: &mut Vec<Doc>, comments: &[SourceComment]) {
+    let mut trailing_comment_requires_line_break = false;
+    for comment in comments {
+        if trailing_comment_requires_line_break {
+            document.push(Doc::HardLine);
+        }
+        if comment.kind == TriviaKind::LineComment && !trailing_comment_requires_line_break {
+            document.push(Doc::line_suffix(Doc::text(format!(" {}", comment.text))));
+        } else {
+            if !trailing_comment_requires_line_break {
+                document.push(Doc::text(" "));
+            }
+            document.push(Doc::verbatim(comment.text.clone()));
+        }
+        trailing_comment_requires_line_break = comment.kind == TriviaKind::LineComment
+            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'));
+    }
 }
 
 fn record_field_document(
@@ -2781,7 +2813,8 @@ fn enum_decl_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let variants = broken_brace_list_document(source, members, &comments.closing)?;
+    let variants =
+        broken_brace_list_document(source, members, &comments.opening, &comments.closing)?;
 
     let mut documents = vec![Doc::text(format!(
         "{visibility_prefix}enum {}",
@@ -3204,7 +3237,7 @@ fn block_document(
         .map(|statement| statement.syntax().clone())
         .collect::<Vec<_>>();
     let comments = collect_block_comments(block.syntax(), &statement_nodes)?;
-    if statements.is_empty() && comments.closing.is_empty() {
+    if statements.is_empty() && comments.opening.is_empty() && comments.closing.is_empty() {
         return Ok(Doc::text("{}"));
     }
 
@@ -3228,7 +3261,7 @@ fn block_document(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    broken_brace_list_document(source, members, &comments.closing)
+    broken_brace_list_document(source, members, &comments.opening, &comments.closing)
 }
 
 fn block_expression_document(
