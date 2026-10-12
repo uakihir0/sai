@@ -1435,7 +1435,42 @@ mod tests {
         for source in [
             "fn f(value:State) {\n    match value{.Ready=> // result\n        1,_=>0}\n}\n",
             "fn f(value:State) {\n    match value{.Ready=> /* result\n        continued */ 1,_=>0}\n}\n",
-            "fn f(value:State,ready:Bool) {\n    match value{.Ready if/* guard */ready=>1,_=>0}\n}\n",
+        ] {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn formats_single_line_block_comments_after_match_guard_if_keywords() {
+        let source = concat!(
+            "fn f(value:State,ready:Bool){\n",
+            "match value{.Ready if/* guard */ready=>1,_=>0}\n",
+            "let selected=consume(match value{.Ready if/* nested */ready=>2,_=>0})\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn f(value: State, ready: Bool) {\n",
+            "    match value { .Ready if /* guard */ ready => 1, _ => 0 }\n",
+            "    let selected = consume(match value { .Ready if /* nested */ ready => 2, _ => 0 })\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("match guard keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_match_guard_if_keywords() {
+        for source in [
+            "fn f(value:State,ready:Bool) {\n    match value{.Ready if // guard\n        ready=>1,_=>0}\n}\n",
+            "fn f(value:State,ready:Bool) {\n    match value{.Ready if /* guard\n        continued */ ready=>1,_=>0}\n}\n",
+            "fn f(value:State,ready:Bool) {\n    match value{.Ready/* pattern */ if ready=>1,_=>0}\n}\n",
         ] {
             assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
             assert_eq!(

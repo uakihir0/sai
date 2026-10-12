@@ -582,6 +582,25 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
             ));
         }
     }
+    for node in root
+        .descendants()
+        .filter(|node| node.kind() == SyntaxKind::MATCH_GUARD)
+    {
+        if let Some(token) = node
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::IF_KW => Some(token),
+                _ => None,
+            })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
     owners
 }
 
@@ -3967,8 +3986,12 @@ fn match_arm_document(
         {
             return Err(SourceDocumentError::UnsupportedShape);
         }
+        documents.push(Doc::text(" if"));
+        let guard_keyword_comments =
+            trailing_comments_after_direct_token(guard.syntax(), SyntaxKind::IF_KW)?;
+        append_single_line_block_comments(&mut documents, &guard_keyword_comments)?;
         documents.extend([
-            Doc::text(" if "),
+            Doc::text(" "),
             expression_document(
                 source,
                 &guard_expression,
