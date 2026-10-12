@@ -1589,6 +1589,71 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_else_keywords() {
+        for (source, expected) in [
+            (
+                "fn f(flag:Bool){if flag{}else/* fallback */{}}",
+                "fn f(flag: Bool) {\n    if flag {} else /* fallback */ {}\n}\n",
+            ),
+            (
+                "fn f(flag:Bool){if flag{}else/* alternate */if/* nested */flag{}else/* final */{}}",
+                concat!(
+                    "fn f(flag: Bool) {\n",
+                    "    if flag {} else /* alternate */ if /* nested */ flag {} else /* final */ {}\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(maybe:Option<I32>){let Some(value)=maybe else/* missing */{}}",
+                "fn f(maybe: Option<I32>) {\n    let Some(value) = maybe else /* missing */ {}\n}\n",
+            ),
+            (
+                "fn f(flag:Bool){let selected=if flag{1}else/* fallback */{2}\nselected=if flag{3}else/* assigned */{4}}",
+                concat!(
+                    "fn f(flag: Bool) {\n",
+                    "    let selected = if flag {\n",
+                    "        1\n",
+                    "    } else /* fallback */ {\n",
+                    "        2\n",
+                    "    }\n",
+                    "    selected = if flag {\n",
+                    "        3\n",
+                    "    } else /* assigned */ {\n",
+                    "        4\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(flag:Bool){let value=consume(if flag{}else/* nested */{})}",
+                "fn f(flag: Bool) {\n    let value = consume(if flag {} else /* nested */ {})\n}\n",
+            ),
+        ] {
+            let formatted = format_source(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_else_keywords() {
+        for source in [
+            "fn f(flag:Bool) {\n    if flag{}else // fallback\n        {}\n}\n",
+            "fn f(flag:Bool) {\n    if flag{}else /* fallback\n        continued */ {}\n}\n",
+            "fn f(maybe:Option<I32>) {\n    let Some(value)=maybe else // missing\n        {}\n}\n",
+            "fn f(maybe:Option<I32>) {\n    let Some(value)=maybe else /* missing\n        value */ {}\n}\n",
+        ] {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

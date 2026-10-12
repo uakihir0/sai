@@ -544,6 +544,25 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
             ));
         }
     }
+    for node in root
+        .descendants()
+        .filter(|node| matches!(node.kind(), SyntaxKind::ELSE_BRANCH | SyntaxKind::LET_ELSE))
+    {
+        if let Some(token) = node
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::ELSE_KW => Some(token),
+                _ => None,
+            })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
     owners
 }
 
@@ -3707,7 +3726,11 @@ fn if_expression_document_with_keyword_comments(
         if block.is_some() == else_if.is_some() {
             return Err(SourceDocumentError::UnsupportedShape);
         }
-        documents.push(Doc::text(" else "));
+        documents.push(Doc::text(" else"));
+        let else_keyword_comments =
+            trailing_comments_after_direct_keyword(else_branch.syntax(), SyntaxKind::ELSE_KW)?;
+        append_single_line_block_comments(&mut documents, &else_keyword_comments)?;
+        documents.push(Doc::text(" "));
         if let Some(block) = block {
             documents.push(block_document(source, &block, expression_group_ids)?);
         } else if let Some(else_if) = else_if {
@@ -3726,15 +3749,22 @@ fn if_expression_document_with_keyword_comments(
 fn else_if_keyword_comments(
     if_expr: &ast::IfExpr,
 ) -> Result<Vec<SourceComment>, SourceDocumentError> {
-    let keyword = if_expr
-        .syntax()
+    trailing_comments_after_direct_keyword(if_expr.syntax(), SyntaxKind::IF_KW)
+}
+
+fn trailing_comments_after_direct_keyword(
+    node: &SyntaxNode,
+    kind: SyntaxKind,
+) -> Result<Vec<SourceComment>, SourceDocumentError> {
+    let keyword = node
         .children_with_tokens()
         .find_map(|element| match element {
-            SyntaxElement::Token(token) if token.kind() == SyntaxKind::IF_KW => Some(token),
+            SyntaxElement::Token(token) if token.kind() == kind => Some(token),
             _ => None,
         })
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    Ok(collect_comments_from_tokens(&[keyword])?
+    let comments = collect_comments_from_tokens(&[keyword])?;
+    Ok(comments
         .into_iter()
         .filter(|comment| !comment.is_leading)
         .collect())
@@ -5135,10 +5165,17 @@ fn statement_document(
                 {
                     return Err(SourceDocumentError::UnsupportedShape);
                 }
-                Some(Doc::concat([
-                    Doc::text(" else "),
+                let keyword_comments = trailing_comments_after_direct_keyword(
+                    else_clause.syntax(),
+                    SyntaxKind::ELSE_KW,
+                )?;
+                let mut documents = vec![Doc::text(" else")];
+                append_single_line_block_comments(&mut documents, &keyword_comments)?;
+                documents.extend([
+                    Doc::text(" "),
                     block_document(source, &block, expression_group_ids)?,
-                ]))
+                ]);
+                Some(Doc::concat(documents))
             } else {
                 None
             };
