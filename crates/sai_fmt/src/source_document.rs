@@ -717,6 +717,7 @@ fn block_comment_targets(
                 | SyntaxKind::BREAK_KW
                 | SyntaxKind::CONTINUE_KW
                 | SyntaxKind::IF_KW
+                | SyntaxKind::MATCH_KW
         ) {
             targets.insert(
                 (
@@ -776,7 +777,7 @@ fn block_comment_targets(
                 ListCommentTarget::AfterKeyword(index),
             );
         }
-        if let Some(keyword_token) = block_statement_loop_keyword_token(statement) {
+        if let Some(keyword_token) = block_statement_expression_keyword_token(statement) {
             owner_tokens.push(keyword_token.clone());
             targets.insert(
                 (
@@ -788,7 +789,8 @@ fn block_comment_targets(
                 ListCommentTarget::AfterKeyword(index),
             );
         }
-        if let Some(keyword_token) = block_statement_initializer_loop_keyword_token(statement) {
+        if let Some(keyword_token) = block_statement_initializer_expression_keyword_token(statement)
+        {
             owner_tokens.push(keyword_token.clone());
             targets.insert(
                 (
@@ -894,23 +896,30 @@ fn block_statement_for_keyword_token(statement: &SyntaxNode) -> Option<SyntaxTok
         })
 }
 
-fn block_statement_loop_keyword_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
-    let Stmt::Expr(statement) = ast::Stmt::cast(statement.clone())? else {
-        return None;
+fn expression_keyword_token(expression: &Expr) -> Option<SyntaxToken> {
+    let (expression, keyword_kind) = match expression {
+        Expr::Loop(loop_expr) => (loop_expr.syntax(), SyntaxKind::LOOP_KW),
+        Expr::Match(match_expr) => (match_expr.syntax(), SyntaxKind::MATCH_KW),
+        _ => return None,
     };
-    let Expr::Loop(loop_expr) = statement.expression()? else {
-        return None;
-    };
-    loop_expr
-        .syntax()
+    expression
         .children_with_tokens()
         .find_map(|element| match element {
-            SyntaxElement::Token(token) if token.kind() == SyntaxKind::LOOP_KW => Some(token),
+            SyntaxElement::Token(token) if token.kind() == keyword_kind => Some(token),
             _ => None,
         })
 }
 
-fn block_statement_initializer_loop_keyword_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+fn block_statement_expression_keyword_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+    let Stmt::Expr(statement) = ast::Stmt::cast(statement.clone())? else {
+        return None;
+    };
+    expression_keyword_token(&statement.expression()?)
+}
+
+fn block_statement_initializer_expression_keyword_token(
+    statement: &SyntaxNode,
+) -> Option<SyntaxToken> {
     let statement = ast::Stmt::cast(statement.clone())?;
     let expression = match statement {
         Stmt::Let(statement) => statement.initializer()?,
@@ -918,16 +927,7 @@ fn block_statement_initializer_loop_keyword_token(statement: &SyntaxNode) -> Opt
         Stmt::Assign(statement) => statement.rhs()?,
         _ => return None,
     };
-    let Expr::Loop(loop_expr) = expression else {
-        return None;
-    };
-    loop_expr
-        .syntax()
-        .children_with_tokens()
-        .find_map(|element| match element {
-            SyntaxElement::Token(token) if token.kind() == SyntaxKind::LOOP_KW => Some(token),
-            _ => None,
-        })
+    expression_keyword_token(&expression)
 }
 
 fn brace_list_delimiters(list: &SyntaxNode) -> Option<(SyntaxToken, SyntaxToken)> {
@@ -3729,6 +3729,15 @@ fn match_expression_document(
     match_expr: &ast::MatchExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    match_expression_document_with_keyword_comments(source, match_expr, expression_group_ids, &[])
+}
+
+fn match_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    match_expr: &ast::MatchExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let scrutinee = match_expr
         .scrutinee()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -3770,8 +3779,10 @@ fn match_expression_document(
         .iter()
         .any(document_contains_unavoidable_forced_break);
 
-    Ok(Doc::concat([
-        Doc::text("match "),
+    let mut documents = vec![Doc::text("match")];
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
+    documents.extend([
+        Doc::text(" "),
         expression_document(
             source,
             &scrutinee,
@@ -3780,7 +3791,8 @@ fn match_expression_document(
         )?,
         Doc::text(" "),
         brace_list_document_with_forced_break(list_group, arm_documents, force_break),
-    ]))
+    ]);
+    Ok(Doc::concat(documents))
 }
 
 fn match_arm_list_elements_match(list: &ast::MatchArmList, arms: &[ast::MatchArm]) -> bool {
@@ -5277,6 +5289,12 @@ fn statement_document(
                         expression_group_ids,
                         keyword_comments,
                     ),
+                    Expr::Match(match_expr) => match_expression_document_with_keyword_comments(
+                        source,
+                        match_expr,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
                     _ => Err(SourceDocumentError::UnsupportedShape),
                 };
             }
@@ -5316,15 +5334,22 @@ fn right_hand_side_after_operator_document(
     append_single_line_block_comments(&mut documents, comments.operator)?;
     let expression_document = if comments.expression_keyword.is_empty() {
         expression_document(source, expression, context, expression_group_ids)?
-    } else if let Expr::Loop(loop_expr) = expression {
-        loop_expression_document_with_keyword_comments(
-            source,
-            loop_expr,
-            expression_group_ids,
-            comments.expression_keyword,
-        )?
     } else {
-        return Err(SourceDocumentError::UnsupportedShape);
+        match expression {
+            Expr::Loop(loop_expr) => loop_expression_document_with_keyword_comments(
+                source,
+                loop_expr,
+                expression_group_ids,
+                comments.expression_keyword,
+            )?,
+            Expr::Match(match_expr) => match_expression_document_with_keyword_comments(
+                source,
+                match_expr,
+                expression_group_ids,
+                comments.expression_keyword,
+            )?,
+            _ => return Err(SourceDocumentError::UnsupportedShape),
+        }
     };
     documents.push(right_hand_side_document_from_document_with_optional_suffix(
         expression,

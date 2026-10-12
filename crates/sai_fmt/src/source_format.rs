@@ -1360,6 +1360,53 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_match_keywords() {
+        let source = concat!(
+            "fn decisions(value:State){\n",
+            "match/* statement */value{.Ready=>1,_=>0}\n",
+            "let selected=match/* initializer */value{.Ready=>1,_=>0}\n",
+            "var other=match/* mutable */value{.Ready=>2,_=>3}\n",
+            "other=match/* assigned */value{.Ready=>4,_=>5}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn decisions(value: State) {\n",
+            "    match /* statement */ value { .Ready => 1, _ => 0 }\n",
+            "    let selected = match /* initializer */ value { .Ready => 1, _ => 0 }\n",
+            "    var other = match /* mutable */ value { .Ready => 2, _ => 3 }\n",
+            "    other = match /* assigned */ value { .Ready => 4, _ => 5 }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("match keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_match_keywords() {
+        for source in [
+            "fn f(value:State) {\n    match // value\n        value{_=>0}\n}\n",
+            "fn f(value:State) {\n    match /* selected\n        value */ value{_=>0}\n}\n",
+            "fn f(value:State) {\n    let selected=match // value\n        value{_=>0}\n}\n",
+            "fn f(value:State) {\n    let selected=match /* selected\n        value */ value{_=>0}\n}\n",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_match_keyword_comments_nested_in_composite_expressions() {
+        let source =
+            "fn f(value:State) {\n    let selected=consume(match/* nested */value{_=>0})\n}\n";
+        assert!(format_source(source.as_bytes()).is_err(), "{source}");
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",
