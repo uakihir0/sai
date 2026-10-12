@@ -686,6 +686,22 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
     }
     for node in root
         .descendants()
+        .filter(|node| node.kind() == SyntaxKind::MATCH_EXPR)
+    {
+        if let Some(token) = ast::MatchExpr::cast(node.clone())
+            .and_then(|match_expr| match_expr.scrutinee())
+            .and_then(|scrutinee| scrutinee.syntax().last_token())
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
+    for node in root
+        .descendants()
         .filter(|node| node.kind() == SyntaxKind::MATCH_GUARD)
     {
         if let Some(token) = ast::MatchGuard::cast(node.clone())
@@ -3978,6 +3994,14 @@ fn match_expression_document_with_keyword_comments(
     }
 
     let list_group = GroupId(arms.syntax().text_range().start().raw());
+    let scrutinee_comments = trailing_comments_after_token(
+        &scrutinee
+            .syntax()
+            .last_token()
+            .ok_or(SourceDocumentError::UnsupportedShape)?,
+    )?;
+    let opening_leading_comment_documents =
+        match_arm_list_opening_leading_comment_documents(source, &arms)?;
     let mut arm_documents = Vec::with_capacity(match_arms.len());
     for (index, arm) in match_arms.iter().enumerate() {
         arm_documents.push(match_arm_document(
@@ -3990,8 +4014,6 @@ fn match_expression_document_with_keyword_comments(
     }
     let separator_comment_documents =
         match_arm_separator_comment_documents(&arms, match_arms.len())?;
-    let opening_leading_comment_documents =
-        match_arm_list_opening_leading_comment_documents(source, &arms)?;
     let opening_comments = match_arm_list_opening_comments(&arms, match_arms.len())?;
     let closing_comment_documents =
         match_arm_list_closing_comment_documents(source, &arms, &match_arms)?;
@@ -4023,8 +4045,16 @@ fn match_expression_document_with_keyword_comments(
             expression_group_ids,
         )?,
     ]);
+    append_trailing_comment_documents(&mut documents, &scrutinee_comments);
     if opening_leading_comment_documents.is_empty() {
-        documents.push(Doc::text(" "));
+        if scrutinee_comments.last().is_some_and(|comment| {
+            comment.kind == TriviaKind::LineComment
+                || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
+        }) {
+            documents.push(Doc::HardLine);
+        } else {
+            documents.push(Doc::text(" "));
+        }
     } else {
         documents.extend(opening_leading_comment_documents);
     }

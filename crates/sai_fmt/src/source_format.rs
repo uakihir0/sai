@@ -1400,6 +1400,87 @@ mod tests {
     }
 
     #[test]
+    fn formats_comments_after_match_scrutinees() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value/* scrutinee */{.Ready=>1}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value /* scrutinee */ { .Ready => 1 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value// scrutinee\n{.Ready=>1}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value // scrutinee\n",
+                    "    { .Ready => 1 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value/* scrutinee\ncontinued */{.Ready=>2}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value /* scrutinee\n",
+                    "continued */\n",
+                    "    { .Ready => 2 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value/* nested */{.Ready=>3})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(match value /* nested */ { .Ready => 3 })\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch choose(value)/* complex scrutinee */{.Ready=>5}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match choose(value) /* complex scrutinee */ { .Ready => 5 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value/* scrutinee */\n\n// opening brace\n{.Ready=>4}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value /* scrutinee */\n",
+                    "    // opening brace\n",
+                    "    { .Ready => 4 }\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted =
+                format_source(source.as_bytes()).expect("match scrutinee comments are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_comments_inside_match_scrutinee_expressions() {
+        let source = "fn f(value:State){\nmatch choose(/* interior */value){.Ready=>1}\n}\n";
+        assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+        assert_eq!(
+            format_source(source.as_bytes()),
+            Err(SourceFormatError::UnsupportedShape),
+            "{source}"
+        );
+    }
+
+    #[test]
     fn formats_single_line_block_comments_after_match_arm_arrows() {
         let source = concat!(
             "fn f(value:State,ready:Bool){\n",
