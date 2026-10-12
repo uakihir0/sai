@@ -735,11 +735,57 @@ mod tests {
     }
 
     #[test]
+    fn detached_top_level_comments_stay_between_their_neighboring_items() {
+        for (source, expected) in [
+            (
+                b"fn first(){}\n\n// section\n\nfn second(){}".as_slice(),
+                "fn first() {}\n\n// section\n\nfn second() {}\n",
+            ),
+            (
+                b"fn first(){}\n\n// detached\n\n// attached\nfn second(){}",
+                "fn first() {}\n\n// detached\n\n// attached\nfn second() {}\n",
+            ),
+            (
+                b"fn first(){}\n// section one\n// section two\n\nfn second(){}",
+                "fn first() {}\n// section one\n// section two\n\nfn second() {}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("detached comments format");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn detached_comments_from_use_declarations_precede_the_sorted_use_block() {
+        let source = concat!(
+            "fn helper(){}\n",
+            "use sai:z // attached\n",
+            "// second section\n\n",
+            "use sai:a\n",
+            "// third section\n\n",
+            "use sai:m",
+        );
+        let expected = concat!(
+            "// second section\n\n",
+            "// third section\n\n",
+            "use sai:a\n",
+            "use sai:m\n",
+            "use sai:z // attached\n",
+            "\n",
+            "fn helper() {}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("detached use comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn formats_trailing_top_level_line_and_block_comments() {
         for (source, expected) in [
             (
                 b"fn first(){} // trailing\nfn second(){}".as_slice(),
-                "fn first() {} // trailing\n\nfn second() {}\n",
+                "fn first() {} // trailing\nfn second() {}\n",
             ),
             (
                 b"fn first(){} /* trailing */\nfn second(){}",

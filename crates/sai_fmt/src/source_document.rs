@@ -50,6 +50,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
     }
     let mut units = Vec::with_capacity(items.len());
     let mut use_declarations = Vec::new();
+    let mut detached_use_comments = Vec::new();
     let mut expression_group_ids = ExpressionGroupIds::default();
     for (item_index, item) in items.into_iter().enumerate() {
         let top_level_index = item_index + usize::from(has_module_header);
@@ -64,8 +65,13 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             .trailing
             .get_mut(top_level_index)
             .ok_or(SourceDocumentError::UnsupportedShape)?;
+        let detached_comments = comments
+            .detached_before
+            .get_mut(top_level_index)
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
         let unit = match item {
             Item::Use(declaration) => {
+                detached_use_comments.append(detached_comments);
                 let mut declaration = use_declaration_document(source, &declaration)?;
                 declaration.document = decorate_top_level_document(
                     declaration.document,
@@ -100,6 +106,12 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             }
             _ => return Err(SourceDocumentError::UnsupportedShape),
         };
+        if !detached_comments.is_empty() {
+            units.push(detached_comment_item_document(
+                detached_comments,
+                source.text(),
+            )?);
+        }
         units.push(decorate_item_document(
             unit,
             leading_comments,
@@ -152,7 +164,13 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
     }
     if let Some(module_header) = module_header {
         document.push(module_header);
-        if !use_declarations.is_empty() || !units.is_empty() {
+        if !detached_use_comments.is_empty() || !use_declarations.is_empty() || !units.is_empty() {
+            document.extend([Doc::HardLine, Doc::HardLine]);
+        }
+    }
+    if !detached_use_comments.is_empty() {
+        append_comment_documents(&mut document, &detached_use_comments, source.text(), None)?;
+        if !use_declarations.is_empty() {
             document.extend([Doc::HardLine, Doc::HardLine]);
         }
     }
@@ -211,6 +229,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
 struct TopLevelComments {
     shebang: Option<SourceComment>,
     file_header: Vec<SourceComment>,
+    detached_before: Vec<Vec<SourceComment>>,
     leading: Vec<Vec<SourceComment>>,
     trailing: Vec<Vec<SourceComment>>,
     eof: Vec<SourceComment>,
@@ -237,6 +256,7 @@ fn collect_top_level_comments(
     source: &str,
 ) -> Result<TopLevelComments, SourceDocumentError> {
     let mut comments = TopLevelComments {
+        detached_before: vec![Vec::new(); top_level_ranges.len()],
         leading: vec![Vec::new(); top_level_ranges.len()],
         trailing: vec![Vec::new(); top_level_ranges.len()],
         ..TopLevelComments::default()
@@ -286,19 +306,27 @@ fn collect_top_level_comments(
         let gap = source
             .get(last_comment_end..node_start)
             .ok_or(SourceDocumentError::UnsupportedShape)?;
-        if line_break_count(gap) > 1 {
-            if node_index != 0 {
-                return Err(SourceDocumentError::UnsupportedShape);
-            }
-            comments.file_header = std::mem::take(group);
+        let mut detached_count = if line_break_count(gap) > 1 {
+            group.len()
         } else {
-            for pair in group.windows(2) {
+            0
+        };
+        if detached_count == 0 {
+            for (comment_index, pair) in group.windows(2).enumerate() {
                 let gap = source
                     .get(pair[0].range.end..pair[1].range.start)
                     .ok_or(SourceDocumentError::UnsupportedShape)?;
                 if line_break_count(gap) > 1 {
-                    return Err(SourceDocumentError::UnsupportedShape);
+                    detached_count = comment_index + 1;
                 }
+            }
+        }
+        if detached_count > 0 {
+            let detached = group.drain(..detached_count).collect::<Vec<_>>();
+            if node_index == 0 {
+                comments.file_header = detached;
+            } else {
+                comments.detached_before[node_index] = detached;
             }
         }
     }
@@ -448,7 +476,6 @@ fn decorate_top_level_document(
     for comment in trailing_comments {
         if comment.kind == TriviaKind::LineComment {
             documents.push(Doc::line_suffix(Doc::text(format!(" {}", comment.text))));
-            multiline = true;
         } else {
             documents.push(Doc::text(" "));
             documents.push(Doc::verbatim(comment.text.clone()));
@@ -492,6 +519,26 @@ struct ItemDocument {
     start: usize,
     end: usize,
     multiline: bool,
+}
+
+fn detached_comment_item_document(
+    comments: &[SourceComment],
+    source: &str,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let first = comments
+        .first()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let last = comments
+        .last()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let mut documents = Vec::new();
+    append_comment_documents(&mut documents, comments, source, None)?;
+    Ok(ItemDocument {
+        document: Doc::concat(documents),
+        start: first.range.start,
+        end: last.range.end,
+        multiline: false,
+    })
 }
 
 struct UseDeclarationDocument {
