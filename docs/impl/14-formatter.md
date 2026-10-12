@@ -112,6 +112,8 @@ Single-line block comments trailing an arm-separating comma stay after the comma
 
 Single-line block comments attached to the opening brace or leading trivia of a match-arm pattern stay before the pattern, including for arms separated by newlines and matches nested in other expressions. Line comments, multiline block comments, and comments attached to pattern-interior tokens remain unsupported.
 
+Own-line comments in the leading trivia of a match-arm list's closing brace stay before that brace, including line comments and multiline block comments in empty, non-empty, and nested match lists. Blank-line gaps between the final arm and these comments are preserved. A comment-only list is broken without a blank line after its opening brace.
+
 Single-line block comments attached to an `unsafe` keyword stay before its block for unsafe expressions used as statements or directly as a `let`/`var` initializer or assignment right-hand side. Comments with line breaks remain unsupported. Unsafe comments nested inside composite expressions remain unsupported.
 
 Single-line block comments attached to an `async` keyword stay before its optional `move` modifier and block for async block expressions used as statements or directly as a `let`/`var` initializer or assignment right-hand side. Comments with line breaks remain unsupported. Async comments nested inside composite expressions remain unsupported.
