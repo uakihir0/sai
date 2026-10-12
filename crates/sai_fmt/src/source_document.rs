@@ -597,6 +597,17 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
         .descendants()
         .filter(|node| node.kind() == SyntaxKind::MATCH_GUARD)
     {
+        if let Some(token) = ast::MatchGuard::cast(node.clone())
+            .and_then(|guard| guard.expression())
+            .and_then(|expression| expression.syntax().last_token())
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
         if let Some(token) = node
             .children_with_tokens()
             .find_map(|element| match element {
@@ -4022,6 +4033,12 @@ fn match_arm_document(
                 expression_group_ids,
             )?,
         ]);
+        let guard_last_token = guard_expression
+            .syntax()
+            .last_token()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        let guard_expression_comments = trailing_comments_after_token(&guard_last_token)?;
+        append_single_line_block_comments(&mut documents, &guard_expression_comments)?;
     }
     documents.push(Doc::text(" =>"));
     let arrow_comments = trailing_comments_after_direct_token(arm.syntax(), SyntaxKind::FAT_ARROW)?;
