@@ -1222,6 +1222,30 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_if_keywords() {
+        let source = concat!(
+            "fn branches(flag:Bool,maybe:Option<I32>){\n",
+            "if/* guard */flag{}\n",
+            "if/* binding */let Some(value)=maybe{value}\n",
+            "if flag{}else if/* fallback */flag{}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn branches(flag: Bool, maybe: Option<I32>) {\n",
+            "    if /* guard */ flag {}\n",
+            "    if /* binding */ let Some(value) = maybe {\n",
+            "        value\n",
+            "    }\n",
+            "    if flag {} else if /* fallback */ flag {}\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("if keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

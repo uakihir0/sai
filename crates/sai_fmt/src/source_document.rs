@@ -517,6 +517,27 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
             owners.extend(targets.targets.into_keys());
         }
     }
+    for node in root.descendants().filter(|node| {
+        node.kind() == SyntaxKind::IF_EXPR
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == SyntaxKind::ELSE_BRANCH)
+    }) {
+        if let Some(token) = node
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::IF_KW => Some(token),
+                _ => None,
+            })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
     owners
 }
 
@@ -689,6 +710,7 @@ fn block_comment_targets(
                 | SyntaxKind::RETURN_KW
                 | SyntaxKind::BREAK_KW
                 | SyntaxKind::CONTINUE_KW
+                | SyntaxKind::IF_KW
         ) {
             targets.insert(
                 (
@@ -3493,6 +3515,15 @@ fn if_expression_document(
     if_expr: &ast::IfExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    if_expression_document_with_keyword_comments(source, if_expr, expression_group_ids, &[])
+}
+
+fn if_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    if_expr: &ast::IfExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let condition = if_expr
         .condition()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -3510,12 +3541,14 @@ fn if_expression_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
 
-    let mut documents = vec![
-        Doc::text("if "),
+    let mut documents = vec![Doc::text("if")];
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
+    documents.extend([
+        Doc::text(" "),
         condition_document(source, &condition, expression_group_ids)?,
         Doc::text(" "),
         block_document(source, &then_branch, expression_group_ids)?,
-    ];
+    ]);
     if let Some(else_branch) = else_branch {
         if else_branch.syntax().children().count() != 1
             || direct_token_kinds(else_branch.syntax())
@@ -3535,14 +3568,33 @@ fn if_expression_document(
         if let Some(block) = block {
             documents.push(block_document(source, &block, expression_group_ids)?);
         } else if let Some(else_if) = else_if {
-            documents.push(if_expression_document(
+            let keyword_comments = else_if_keyword_comments(&else_if)?;
+            documents.push(if_expression_document_with_keyword_comments(
                 source,
                 &else_if,
                 expression_group_ids,
+                &keyword_comments,
             )?);
         }
     }
     Ok(Doc::concat(documents))
+}
+
+fn else_if_keyword_comments(
+    if_expr: &ast::IfExpr,
+) -> Result<Vec<SourceComment>, SourceDocumentError> {
+    let keyword = if_expr
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::IF_KW => Some(token),
+            _ => None,
+        })
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    Ok(collect_comments_from_tokens(&[keyword])?
+        .into_iter()
+        .filter(|comment| !comment.is_leading)
+        .collect())
 }
 
 fn match_expression_document(
@@ -5028,6 +5080,12 @@ fn statement_document(
                     Expr::Continue(continue_expr) => {
                         continue_expression_document(continue_expr, keyword_comments)
                     }
+                    Expr::If(if_expr) => if_expression_document_with_keyword_comments(
+                        source,
+                        if_expr,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
                     _ => Err(SourceDocumentError::UnsupportedShape),
                 };
             }
