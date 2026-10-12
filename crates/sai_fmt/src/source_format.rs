@@ -1290,6 +1290,76 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_loop_keywords() {
+        let source = concat!(
+            "fn repetitions(){\n",
+            "loop/* forever */{}\n",
+            "'scan:loop/* body */{break 'scan}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn repetitions() {\n",
+            "    loop /* forever */ {}\n",
+            "    'scan: loop /* body */ {\n",
+            "        break 'scan\n",
+            "    }\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("loop keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_loop_keyword_comments_at_root_of_binding_and_assignment_values() {
+        let source = concat!(
+            "fn loop_values(){\n",
+            "let value=loop/* initializer */{}\n",
+            "var other=loop/* mutable */{}\n",
+            "other+=loop/* assigned */{}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn loop_values() {\n",
+            "    let value = loop /* initializer */ {}\n",
+            "    var other = loop /* mutable */ {}\n",
+            "    other += loop /* assigned */ {}\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("root loop value comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_line_and_multiline_comments_after_loop_keywords() {
+        for source in [
+            "fn f() {\n    loop // forever\n    {}\n}\n",
+            "fn f() {\n    loop /* forever\n        continued */ {}\n}\n",
+            "fn f() {\n    let value = loop // forever\n        {}\n}\n",
+            "fn f() {\n    let value = loop /* forever\n        continued */ {}\n}\n",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_loop_keyword_comments_nested_in_composite_expressions() {
+        for source in [
+            "fn f() {\n    let value = consume(loop/* nested */{})\n}\n",
+            "fn f() {\n    let values = [loop/* nested */{}]\n}\n",
+        ] {
+            assert!(format_source(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

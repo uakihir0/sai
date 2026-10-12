@@ -428,6 +428,7 @@ enum ListCommentTarget {
     OpeningTrailing,
     BeforeMember(usize),
     AfterKeyword(usize),
+    AfterExpressionKeyword(usize),
     AfterTypeColon(usize),
     AfterOperator(usize),
     AfterMember(usize),
@@ -449,6 +450,7 @@ struct ListComments {
     opening_trailing: Vec<SourceComment>,
     before: Vec<Vec<SourceComment>>,
     after_keyword: Vec<Vec<SourceComment>>,
+    after_expression_keyword: Vec<Vec<SourceComment>>,
     after_type_colon: Vec<Vec<SourceComment>>,
     after_operator: Vec<Vec<SourceComment>>,
     after: Vec<Vec<SourceComment>>,
@@ -463,6 +465,10 @@ impl ListComments {
             || self.before.iter().any(|comments| !comments.is_empty())
             || self
                 .after_keyword
+                .iter()
+                .any(|comments| !comments.is_empty())
+            || self
+                .after_expression_keyword
                 .iter()
                 .any(|comments| !comments.is_empty())
             || self
@@ -770,6 +776,30 @@ fn block_comment_targets(
                 ListCommentTarget::AfterKeyword(index),
             );
         }
+        if let Some(keyword_token) = block_statement_loop_keyword_token(statement) {
+            owner_tokens.push(keyword_token.clone());
+            targets.insert(
+                (
+                    false,
+                    keyword_token.kind(),
+                    keyword_token.text_range().start().to_usize(),
+                    keyword_token.text_range().end().to_usize(),
+                ),
+                ListCommentTarget::AfterKeyword(index),
+            );
+        }
+        if let Some(keyword_token) = block_statement_initializer_loop_keyword_token(statement) {
+            owner_tokens.push(keyword_token.clone());
+            targets.insert(
+                (
+                    false,
+                    keyword_token.kind(),
+                    keyword_token.text_range().start().to_usize(),
+                    keyword_token.text_range().end().to_usize(),
+                ),
+                ListCommentTarget::AfterExpressionKeyword(index),
+            );
+        }
         let last_token = statement
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -864,6 +894,42 @@ fn block_statement_for_keyword_token(statement: &SyntaxNode) -> Option<SyntaxTok
         })
 }
 
+fn block_statement_loop_keyword_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+    let Stmt::Expr(statement) = ast::Stmt::cast(statement.clone())? else {
+        return None;
+    };
+    let Expr::Loop(loop_expr) = statement.expression()? else {
+        return None;
+    };
+    loop_expr
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::LOOP_KW => Some(token),
+            _ => None,
+        })
+}
+
+fn block_statement_initializer_loop_keyword_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+    let statement = ast::Stmt::cast(statement.clone())?;
+    let expression = match statement {
+        Stmt::Let(statement) => statement.initializer()?,
+        Stmt::Var(statement) => statement.initializer()?,
+        Stmt::Assign(statement) => statement.rhs()?,
+        _ => return None,
+    };
+    let Expr::Loop(loop_expr) = expression else {
+        return None;
+    };
+    loop_expr
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::LOOP_KW => Some(token),
+            _ => None,
+        })
+}
+
 fn brace_list_delimiters(list: &SyntaxNode) -> Option<(SyntaxToken, SyntaxToken)> {
     let direct_tokens = list
         .children_with_tokens()
@@ -933,6 +999,7 @@ fn collect_brace_unit_comments(
         opening_trailing: Vec::new(),
         before: vec![Vec::new(); member_count],
         after_keyword: vec![Vec::new(); member_count],
+        after_expression_keyword: vec![Vec::new(); member_count],
         after_type_colon: vec![Vec::new(); member_count],
         after_operator: vec![Vec::new(); member_count],
         after: vec![Vec::new(); member_count],
@@ -955,6 +1022,9 @@ fn collect_brace_unit_comments(
             Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
             Some(ListCommentTarget::AfterKeyword(index)) => {
                 comments.after_keyword[index].push(comment)
+            }
+            Some(ListCommentTarget::AfterExpressionKeyword(index)) => {
+                comments.after_expression_keyword[index].push(comment)
             }
             Some(ListCommentTarget::AfterTypeColon(index)) => {
                 comments.after_type_colon[index].push(comment)
@@ -3519,6 +3589,7 @@ fn block_document(
                 source,
                 statement,
                 &comments.after_keyword[index],
+                &comments.after_expression_keyword[index],
                 &comments.after_type_colon[index],
                 &comments.after_operator[index],
                 expression_group_ids,
@@ -3933,6 +4004,15 @@ fn loop_expression_document(
     loop_expr: &ast::LoopExpr,
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
+    loop_expression_document_with_keyword_comments(source, loop_expr, expression_group_ids, &[])
+}
+
+fn loop_expression_document_with_keyword_comments(
+    source: &ParsedSource,
+    loop_expr: &ast::LoopExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+    keyword_comments: &[SourceComment],
+) -> Result<Doc, SourceDocumentError> {
     let label = loop_expr.label();
     let body = loop_expr
         .body()
@@ -3951,8 +4031,10 @@ fn loop_expression_document(
     if let Some(label) = label {
         documents.push(loop_label_document(&label)?);
     }
+    documents.push(Doc::text("loop"));
+    append_single_line_block_comments(&mut documents, keyword_comments)?;
     documents.extend([
-        Doc::text("loop "),
+        Doc::text(" "),
         block_document(source, &body, expression_group_ids)?,
     ]);
     Ok(Doc::concat(documents))
@@ -4714,6 +4796,7 @@ fn closure_expression_document(
             &[],
             &[],
             &[],
+            &[],
             expression_group_ids,
         )?;
         if flat_document_width(&header).is_some() && flat_document_width(&flat_statement).is_some()
@@ -4751,6 +4834,7 @@ fn closure_body_forces_break(
         let document = statement_document(
             source,
             &Stmt::Expr(statement.clone()),
+            &[],
             &[],
             &[],
             &[],
@@ -4889,6 +4973,7 @@ fn unsafe_block_expression_document(
             &[],
             &[],
             &[],
+            &[],
             expression_group_ids,
         )?;
         let flat_statement = first_choice_layout(&flat_statement);
@@ -4908,6 +4993,7 @@ fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
     keyword_comments: &[SourceComment],
+    expression_keyword_comments: &[SourceComment],
     type_colon_comments: &[SourceComment],
     operator_comments: &[SourceComment],
     expression_group_ids: &mut ExpressionGroupIds,
@@ -4995,7 +5081,10 @@ fn statement_document(
                 expression_group_ids,
                 true,
                 else_suffix,
-                operator_comments,
+                RightHandSideComments {
+                    operator: operator_comments,
+                    expression_keyword: expression_keyword_comments,
+                },
             )?);
             Ok(Doc::concat(binding))
         }
@@ -5049,7 +5138,10 @@ fn statement_document(
                 expression_group_ids,
                 true,
                 None,
-                operator_comments,
+                RightHandSideComments {
+                    operator: operator_comments,
+                    expression_keyword: expression_keyword_comments,
+                },
             )?);
             Ok(Doc::concat(binding))
         }
@@ -5087,7 +5179,10 @@ fn statement_document(
                 expression_group_ids,
                 true,
                 None,
-                operator_comments,
+                RightHandSideComments {
+                    operator: operator_comments,
+                    expression_keyword: expression_keyword_comments,
+                },
             )?);
             Ok(Doc::concat(documents))
         }
@@ -5176,6 +5271,12 @@ fn statement_document(
                         expression_group_ids,
                         keyword_comments,
                     ),
+                    Expr::Loop(loop_expr) => loop_expression_document_with_keyword_comments(
+                        source,
+                        loop_expr,
+                        expression_group_ids,
+                        keyword_comments,
+                    ),
                     _ => Err(SourceDocumentError::UnsupportedShape),
                 };
             }
@@ -5209,12 +5310,22 @@ fn right_hand_side_after_operator_document(
     expression_group_ids: &mut ExpressionGroupIds,
     allow_move: bool,
     suffix: Option<Doc>,
-    operator_comments: &[SourceComment],
+    comments: RightHandSideComments<'_>,
 ) -> Result<Doc, SourceDocumentError> {
     let mut documents = Vec::new();
-    append_single_line_block_comments(&mut documents, operator_comments)?;
-    let expression_document =
-        expression_document(source, expression, context, expression_group_ids)?;
+    append_single_line_block_comments(&mut documents, comments.operator)?;
+    let expression_document = if comments.expression_keyword.is_empty() {
+        expression_document(source, expression, context, expression_group_ids)?
+    } else if let Expr::Loop(loop_expr) = expression {
+        loop_expression_document_with_keyword_comments(
+            source,
+            loop_expr,
+            expression_group_ids,
+            comments.expression_keyword,
+        )?
+    } else {
+        return Err(SourceDocumentError::UnsupportedShape);
+    };
     documents.push(right_hand_side_document_from_document_with_optional_suffix(
         expression,
         expression_document,
@@ -5222,6 +5333,11 @@ fn right_hand_side_after_operator_document(
         suffix,
     ));
     Ok(Doc::concat(documents))
+}
+
+struct RightHandSideComments<'a> {
+    operator: &'a [SourceComment],
+    expression_keyword: &'a [SourceComment],
 }
 
 fn append_single_line_block_comments(
