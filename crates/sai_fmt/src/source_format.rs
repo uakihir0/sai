@@ -1384,19 +1384,32 @@ mod tests {
     }
 
     #[test]
-    fn refuses_line_and_multiline_comments_after_match_keywords() {
-        for source in [
-            "fn f(value:State) {\n    match // value\n        value{_=>0}\n}\n",
-            "fn f(value:State) {\n    match /* selected\n        value */ value{_=>0}\n}\n",
-            "fn f(value:State) {\n    let selected=match // value\n        value{_=>0}\n}\n",
-            "fn f(value:State) {\n    let selected=match /* selected\n        value */ value{_=>0}\n}\n",
-        ] {
-            assert_eq!(
-                format_source(source.as_bytes()),
-                Err(SourceFormatError::UnsupportedShape),
-                "{source}"
-            );
-        }
+    fn formats_line_and_multiline_comments_after_match_keywords() {
+        let source = concat!(
+            "fn f(value:State){\n",
+            "match // statement\n",
+            "value{_=>0}\n",
+            "let selected=match /* initializer\n",
+            "continued */value{_=>1}\n",
+            "other=match // assignment\n",
+            "value{_=>2}\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn f(value: State) {\n",
+            "    match // statement\n",
+            "    value { _ => 0 }\n",
+            "    let selected = match /* initializer\n",
+            "continued */\n",
+            "    value { _ => 1 }\n",
+            "    other = match // assignment\n",
+            "    value { _ => 2 }\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes())
+            .expect("line and multiline match keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
     }
 
     #[test]
@@ -1920,9 +1933,14 @@ mod tests {
 
     #[test]
     fn refuses_match_keyword_comments_nested_in_composite_expressions() {
-        let source =
-            "fn f(value:State) {\n    let selected=consume(match/* nested */value{_=>0})\n}\n";
-        assert!(format_source(source.as_bytes()).is_err(), "{source}");
+        for source in [
+            "fn f(value:State) {\n    let selected=consume(match/* nested */value{_=>0})\n}\n",
+            "fn f(value:State) {\n    let selected=consume(match // nested\n        value{_=>0})\n}\n",
+            "fn f(value:State) {\n    let selected=consume(match /* nested\n        continued */ value{_=>0})\n}\n",
+        ] {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert!(format_source(source.as_bytes()).is_err(), "{source}");
+        }
     }
 
     #[test]

@@ -4035,16 +4035,21 @@ fn match_expression_document_with_keyword_comments(
     }
 
     let mut documents = vec![Doc::text("match")];
-    append_single_line_block_comments(&mut documents, keyword_comments)?;
-    documents.extend([
-        Doc::text(" "),
-        expression_document(
-            source,
-            &scrutinee,
-            ExpressionContext::Unprotected,
-            expression_group_ids,
-        )?,
-    ]);
+    append_trailing_comment_documents(&mut documents, keyword_comments);
+    if keyword_comments.last().is_some_and(|comment| {
+        comment.kind == TriviaKind::LineComment
+            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
+    }) {
+        documents.push(Doc::HardLine);
+    } else {
+        documents.push(Doc::text(" "));
+    }
+    documents.push(expression_document(
+        source,
+        &scrutinee,
+        ExpressionContext::Unprotected,
+        expression_group_ids,
+    )?);
     append_trailing_comment_documents(&mut documents, &scrutinee_comments);
     if opening_leading_comment_documents.is_empty() {
         if scrutinee_comments.last().is_some_and(|comment| {
