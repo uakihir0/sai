@@ -606,6 +606,40 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
     }
     for node in root
         .descendants()
+        .filter(|node| node.kind() == SyntaxKind::MATCH_ARM_LIST)
+    {
+        let Some(list) = ast::MatchArmList::cast(node.clone()) else {
+            continue;
+        };
+        let arms = list.arms().collect::<Vec<_>>();
+        if !match_arm_list_elements_match(&list, &arms) {
+            continue;
+        }
+        let mut next_arm_index = 0;
+        let mut previous_arm_index = None;
+        for element in list.syntax().children_with_tokens() {
+            match element {
+                SyntaxElement::Node(arm) if arm.kind() == SyntaxKind::MATCH_ARM => {
+                    previous_arm_index = Some(next_arm_index);
+                    next_arm_index += 1;
+                }
+                SyntaxElement::Token(token)
+                    if token.kind() == SyntaxKind::COMMA
+                        && previous_arm_index.is_some_and(|index| index + 1 < arms.len()) =>
+                {
+                    owners.insert((
+                        false,
+                        token.kind(),
+                        token.text_range().start().to_usize(),
+                        token.text_range().end().to_usize(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    for node in root
+        .descendants()
         .filter(|node| node.kind() == SyntaxKind::MATCH_GUARD)
     {
         if let Some(token) = ast::MatchGuard::cast(node.clone())
@@ -3898,6 +3932,8 @@ fn match_expression_document_with_keyword_comments(
             expression_group_ids,
         )?);
     }
+    let separator_comment_documents =
+        match_arm_separator_comment_documents(&arms, match_arms.len())?;
     let force_break = arm_documents
         .iter()
         .any(document_contains_unavoidable_forced_break);
@@ -3913,7 +3949,12 @@ fn match_expression_document_with_keyword_comments(
             expression_group_ids,
         )?,
         Doc::text(" "),
-        brace_list_document_with_forced_break(list_group, arm_documents, force_break),
+        brace_list_document_with_separator_suffixes(
+            list_group,
+            arm_documents,
+            force_break,
+            &separator_comment_documents,
+        ),
     ]);
     Ok(Doc::concat(documents))
 }
@@ -3978,6 +4019,41 @@ fn match_arm_list_elements_match(list: &ast::MatchArmList, arms: &[ast::MatchArm
     }
     cursor += 1;
     cursor == elements.len()
+}
+
+fn match_arm_separator_comment_documents(
+    list: &ast::MatchArmList,
+    arm_count: usize,
+) -> Result<Vec<Vec<Doc>>, SourceDocumentError> {
+    let mut separator_documents = vec![Vec::new(); arm_count.saturating_sub(1)];
+    let mut next_arm_index = 0;
+    let mut previous_arm_index = None;
+    for element in list.syntax().children_with_tokens() {
+        match element {
+            SyntaxElement::Node(arm) if arm.kind() == SyntaxKind::MATCH_ARM => {
+                previous_arm_index = Some(next_arm_index);
+                next_arm_index += 1;
+            }
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA => {
+                let comments = trailing_comments_after_token(&token)?;
+                if comments.is_empty() {
+                    continue;
+                }
+                let separator_index = previous_arm_index
+                    .filter(|index| index + 1 < arm_count)
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                if !separator_documents[separator_index].is_empty() {
+                    return Err(SourceDocumentError::UnsupportedShape);
+                }
+                append_single_line_block_comments(
+                    &mut separator_documents[separator_index],
+                    &comments,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(separator_documents)
 }
 
 fn match_arm_document(
@@ -7867,6 +7943,15 @@ fn brace_list_document_with_forced_break(
     items: Vec<Doc>,
     force_break: bool,
 ) -> Doc {
+    brace_list_document_with_separator_suffixes(group, items, force_break, &[])
+}
+
+fn brace_list_document_with_separator_suffixes(
+    group: GroupId,
+    items: Vec<Doc>,
+    force_break: bool,
+    separator_suffixes: &[Vec<Doc>],
+) -> Doc {
     if items.is_empty() {
         return Doc::text("{}");
     }
@@ -7877,6 +7962,12 @@ fn brace_list_document_with_forced_break(
                 contents.push(Doc::HardLine);
             }
             contents.push(item);
+            if let Some(suffix) = separator_suffixes.get(index)
+                && !suffix.is_empty()
+            {
+                contents.push(Doc::text(","));
+                contents.push(Doc::concat(suffix.clone()));
+            }
         }
         return Doc::group(
             group,
@@ -7893,7 +7984,16 @@ fn brace_list_document_with_forced_break(
     contents.push(Doc::Line);
     for (index, item) in items.into_iter().enumerate() {
         if index > 0 {
-            contents.push(Doc::if_broken(group, Doc::text(""), Doc::text(",")));
+            let separator_index = index - 1;
+            if let Some(suffix) = separator_suffixes
+                .get(separator_index)
+                .filter(|suffix| !suffix.is_empty())
+            {
+                contents.push(Doc::text(","));
+                contents.push(Doc::concat(suffix.clone()));
+            } else {
+                contents.push(Doc::if_broken(group, Doc::text(""), Doc::text(",")));
+            }
             contents.push(Doc::Line);
         }
         contents.push(item);
