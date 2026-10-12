@@ -626,6 +626,67 @@ mod tests {
     }
 
     #[test]
+    fn formats_file_leading_and_eof_comments() {
+        for (source, expected) in [
+            (
+                b"// file header  \n\nfn f(){}".as_slice(),
+                "// file header\n\nfn f() {}\n",
+            ),
+            (
+                b"// file header\n\nfn f(){}",
+                "// file header\n\nfn f() {}\n",
+            ),
+            (
+                b"fn f(){}\n// eof comment  \n",
+                "fn f() {}\n// eof comment\n",
+            ),
+            (
+                b"fn f(){}\n\n// eof comment\n",
+                "fn f() {}\n\n// eof comment\n",
+            ),
+            (
+                b"use sai:http\n/// misplaced",
+                "use sai:http\n/// misplaced\n",
+            ),
+            (b"// comment-only file".as_slice(), "// comment-only file\n"),
+            (
+                b"// license\n\nfn f(){}\nuse sai:core",
+                "// license\n\nuse sai:core\n\nfn f() {}\n",
+            ),
+            (
+                b"// license\n\n//! module\nfn f(){}",
+                "// license\n\n//! module\n\nfn f() {}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("outer comments format");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn formats_multiline_file_leading_block_comments_verbatim() {
+        let formatted = format_source(b"/* header\n * continued  \n */\n\nfn f(){}")
+            .expect("leading block comment formats");
+        assert_eq!(formatted, "/* header\n * continued\n */\n\nfn f() {}\n");
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn keeps_comments_inside_items_and_inline_trailing_comments_fail_closed() {
+        for source in [
+            b"fn f() { // inside\n    1\n}".as_slice(),
+            b"fn f() {} // inline",
+            b"// attached to declaration\nfn f() {}",
+        ] {
+            assert_eq!(
+                format_source(source),
+                Err(SourceFormatError::UnsupportedShape)
+            );
+        }
+    }
+
+    #[test]
     fn formats_module_headers_and_separates_their_parts() {
         for (source, expected) in [
             (b"//! module docs  \n".as_slice(), "//! module docs\n"),
