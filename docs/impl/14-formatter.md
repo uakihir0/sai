@@ -112,7 +112,7 @@ Single-line block comments trailing the final token of a match arm's result expr
 
 Single-line block comments trailing an arm-separating comma stay after the comma and before the next arm. Line comments and multiline block comments also stay after the comma and force the match-arm list to break. Comments after a trailing comma stay before the closing brace.
 
-Single-line block comments attached to a match-arm pattern's leading trivia stay before the pattern, including for arms separated by newlines and matches nested in other expressions. Own-line line comments and multiline block comments in that leading trivia also stay before the pattern, preserving blank-line gaps. Line and multiline comments trailing the opening-brace token, and comments attached to pattern-interior tokens, remain unsupported.
+Single-line block comments attached to a match-arm pattern's leading trivia stay before the pattern, including for arms separated by newlines and matches nested in other expressions. Own-line line comments and multiline block comments in that leading trivia also stay before the pattern, preserving blank-line gaps. Line and multiline comments trailing the opening-brace token of a non-empty match-arm list stay after the brace and before the first pattern, forcing the list to break. Such trailing comments on an empty match-arm list, and comments attached to pattern-interior tokens, remain unsupported.
 
 Own-line comments in the leading trivia of a match-arm list's opening brace stay before that brace, including line and multiline block comments in empty, non-empty, and nested match lists. Blank-line gaps between these comments and the opening brace are preserved.
 

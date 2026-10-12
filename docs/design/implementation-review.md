@@ -3123,6 +3123,14 @@
 
 - **Decision:** Preserve own-line line comments and multiline block comments in a pattern's leading trivia before the pattern. Retain blank-line gaps between these comments and the pattern. Keep the existing inline single-line block-comment behavior.
 - **Reason:** These comments introduce an arm and belong visually before its pattern. A hard line after the leading comment run forces a broken arm list and keeps the pattern separate from the comment.
-- **Review:** Focused regressions cover line and multiline block comments, blank gaps, nested matches, and fixed-point output. Hostile review found no actionable issues; it confirmed the hard line breaks the arm list, blank-line gaps are retained, and opening-brace trailing comments stay on the refusal path. First-arm and nested-match outputs reach a fixed point.
+- **Review:** Focused regressions cover line and multiline block comments, blank gaps, nested matches, and fixed-point output. Hostile review found no actionable issues; it confirmed the hard line breaks the arm list and blank-line gaps are retained. Opening-brace trailing comments were outside this increment; IR-431 handles them for non-empty lists. First-arm and nested-match outputs reach a fixed point.
 - **Human review:** **Review required:** Confirm that own-line comments before a match-arm pattern remain before it and retain blank-line gaps.
-- **Remaining scope:** Line and multiline comments trailing the match-arm list's opening brace, pattern-interior comments, and other unsupported comment-bearing syntax.
+- **Remaining scope:** Trailing opening-brace comments on empty match-arm lists, pattern-interior comments, and other unsupported comment-bearing syntax.
+
+### IR-431: Preserve comments after match-arm list opening braces
+
+- **Decision:** Preserve line comments and multiline block comments trailing the opening brace of a non-empty match-arm list. Place them on their own line before the first arm and force the list to break; keep existing single-line block comments inline. Empty-list opening-brace trailing comments remain unsupported.
+- **Reason:** These comments follow the opening delimiter and precede the first pattern. A broken list gives line comments a stable line boundary and keeps the first arm distinct from the comment.
+- **Review:** Focused regressions cover line and multiline comments, nested matches, blank-line gaps, a single-line opening comment followed by a leading pattern line comment, and fixed-point output. Initial hostile review found that mixed opening-brace and pattern-leading comments could fail fixed-point verification; the renderer now inserts a hard line before line or multiline pattern-leading comments and forces a broken list. Re-review found no actionable issues and confirmed fixed-point output with blank-line gaps and a closing comment. Empty-list opening-brace comments remain fail-closed.
+- **Human review:** **Review required:** Confirm that comments trailing the opening brace of a non-empty arm list appear before its first pattern and force broken layout.
+- **Remaining scope:** Empty-list opening-brace trailing comments, pattern-interior comments, and other unsupported comment-bearing syntax.
