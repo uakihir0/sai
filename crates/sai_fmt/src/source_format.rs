@@ -1063,6 +1063,34 @@ mod tests {
     }
 
     #[test]
+    fn formats_comments_after_let_and_var_keywords() {
+        let source = concat!(
+            "fn bindings() {\n",
+            "    let /* immutable */ value = 1\n",
+            "    var /* mutable */ count = 2\n",
+            "    let // split the binding\n",
+            "    other = 3\n",
+            "    let /* multiline\n",
+            "continued */ final_value = 4\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn bindings() {\n",
+            "    let /* immutable */ value = 1\n",
+            "    var /* mutable */ count = 2\n",
+            "    let // split the binding\n",
+            "    other = 3\n",
+            "    let /* multiline\n",
+            "continued */\n",
+            "    final_value = 4\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("keyword comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

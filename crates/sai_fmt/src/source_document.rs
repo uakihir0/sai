@@ -427,6 +427,7 @@ enum ListCommentTarget {
     OpeningLeading,
     OpeningTrailing,
     BeforeMember(usize),
+    AfterKeyword(usize),
     AfterMember(usize),
     Closing,
 }
@@ -445,6 +446,7 @@ struct ListComments {
     opening_leading: Vec<SourceComment>,
     opening_trailing: Vec<SourceComment>,
     before: Vec<Vec<SourceComment>>,
+    after_keyword: Vec<Vec<SourceComment>>,
     after: Vec<Vec<SourceComment>>,
     closing: Vec<SourceComment>,
 }
@@ -455,6 +457,10 @@ impl ListComments {
             || !self.opening_trailing.is_empty()
             || !self.closing.is_empty()
             || self.before.iter().any(|comments| !comments.is_empty())
+            || self
+                .after_keyword
+                .iter()
+                .any(|comments| !comments.is_empty())
             || self.after.iter().any(|comments| !comments.is_empty())
     }
 }
@@ -663,6 +669,17 @@ fn block_comment_targets(
             ),
             ListCommentTarget::BeforeMember(index),
         );
+        if matches!(first_token.kind(), SyntaxKind::LET_KW | SyntaxKind::VAR_KW) {
+            targets.insert(
+                (
+                    false,
+                    first_token.kind(),
+                    first_token.text_range().start().to_usize(),
+                    first_token.text_range().end().to_usize(),
+                ),
+                ListCommentTarget::AfterKeyword(index),
+            );
+        }
         let last_token = statement
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -762,6 +779,7 @@ fn collect_brace_unit_comments(
         opening_leading: Vec::new(),
         opening_trailing: Vec::new(),
         before: vec![Vec::new(); member_count],
+        after_keyword: vec![Vec::new(); member_count],
         after: vec![Vec::new(); member_count],
         closing: Vec::new(),
     };
@@ -780,6 +798,9 @@ fn collect_brace_unit_comments(
             Some(ListCommentTarget::OpeningLeading) => {}
             Some(ListCommentTarget::OpeningTrailing) => comments.opening_trailing.push(comment),
             Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
+            Some(ListCommentTarget::AfterKeyword(index)) => {
+                comments.after_keyword[index].push(comment)
+            }
             Some(ListCommentTarget::AfterMember(index)) => comments.after[index].push(comment),
             Some(ListCommentTarget::Closing) => comments.closing.push(comment),
             None => {}
@@ -2744,6 +2765,29 @@ fn append_trailing_comment_documents(document: &mut Vec<Doc>, comments: &[Source
     }
 }
 
+fn append_comments_between_tokens(document: &mut Vec<Doc>, comments: &[SourceComment]) -> bool {
+    let mut previous_comment_requires_break = false;
+    for comment in comments {
+        if previous_comment_requires_break {
+            document.push(Doc::HardLine);
+        }
+        if comment.kind == TriviaKind::LineComment {
+            document.push(Doc::line_suffix(Doc::text(format!(" {}", comment.text))));
+        } else {
+            if !previous_comment_requires_break {
+                document.push(Doc::text(" "));
+            }
+            document.push(Doc::verbatim(comment.text.clone()));
+        }
+        previous_comment_requires_break = comment.kind == TriviaKind::LineComment
+            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'));
+    }
+    if previous_comment_requires_break {
+        document.push(Doc::HardLine);
+    }
+    previous_comment_requires_break
+}
+
 fn record_field_document(
     source: &ParsedSource,
     field: &ast::FieldDecl,
@@ -3308,7 +3352,15 @@ fn block_document(
 
     let documents = statements
         .iter()
-        .map(|statement| statement_document(source, statement, expression_group_ids))
+        .enumerate()
+        .map(|(index, statement)| {
+            statement_document(
+                source,
+                statement,
+                &comments.after_keyword[index],
+                expression_group_ids,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let members = statements
         .iter()
@@ -4441,8 +4493,12 @@ fn closure_expression_document(
         return Ok(Doc::concat([header, Doc::text(" "), broken_block]));
     }
     if let [Stmt::Expr(statement)] = statements.as_slice() {
-        let flat_statement =
-            statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
+        let flat_statement = statement_document(
+            source,
+            &Stmt::Expr(statement.clone()),
+            &[],
+            expression_group_ids,
+        )?;
         if flat_document_width(&header).is_some() && flat_document_width(&flat_statement).is_some()
         {
             return Ok(Doc::choice([
@@ -4475,8 +4531,12 @@ fn closure_body_forces_break(
         return Ok(false);
     }
     if let [Stmt::Expr(statement)] = statements.as_slice() {
-        let document =
-            statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
+        let document = statement_document(
+            source,
+            &Stmt::Expr(statement.clone()),
+            &[],
+            expression_group_ids,
+        )?;
         return Ok(flat_document_width(&document).is_none());
     }
     Ok(true)
@@ -4604,8 +4664,12 @@ fn unsafe_block_expression_document(
         return Ok(Doc::concat([Doc::text("unsafe "), broken_block]));
     }
     if let [Stmt::Expr(statement)] = statements.as_slice() {
-        let flat_statement =
-            statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
+        let flat_statement = statement_document(
+            source,
+            &Stmt::Expr(statement.clone()),
+            &[],
+            expression_group_ids,
+        )?;
         let flat_statement = first_choice_layout(&flat_statement);
         return Ok(Doc::choice([
             Doc::concat([
@@ -4622,6 +4686,7 @@ fn unsafe_block_expression_document(
 fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
+    keyword_comments: &[SourceComment],
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
     match statement {
@@ -4684,10 +4749,13 @@ fn statement_document(
             } else {
                 None
             };
-            let mut binding = vec![
-                Doc::text("let "),
-                pattern_document(source, &pattern, expression_group_ids)?,
-            ];
+            let mut binding = vec![Doc::text("let")];
+            let keyword_comment_break =
+                append_comments_between_tokens(&mut binding, keyword_comments);
+            if !keyword_comment_break {
+                binding.push(Doc::text(" "));
+            }
+            binding.push(pattern_document(source, &pattern, expression_group_ids)?);
             if let Some(ty) = ty {
                 binding.extend([Doc::text(": "), type_document(source, &ty)?]);
             }
@@ -4737,10 +4805,13 @@ fn statement_document(
             {
                 return Err(SourceDocumentError::UnsupportedShape);
             }
-            let mut binding = vec![
-                Doc::text("var "),
-                Doc::text(node_text(source, name.syntax())),
-            ];
+            let mut binding = vec![Doc::text("var")];
+            let keyword_comment_break =
+                append_comments_between_tokens(&mut binding, keyword_comments);
+            if !keyword_comment_break {
+                binding.push(Doc::text(" "));
+            }
+            binding.push(Doc::text(node_text(source, name.syntax())));
             if let Some(ty) = ty {
                 binding.extend([Doc::text(": "), type_document(source, &ty)?]);
             }
