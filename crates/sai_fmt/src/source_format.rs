@@ -1450,12 +1450,14 @@ mod tests {
         let source = concat!(
             "fn f(value:State,ready:Bool){\n",
             "match value{.Ready if/* guard */ready=>1,_=>0}\n",
+            "match value{.Ready/* pattern */if ready=>1,_=>0}\n",
             "let selected=consume(match value{.Ready if/* nested */ready=>2,_=>0})\n",
             "}\n",
         );
         let expected = concat!(
             "fn f(value: State, ready: Bool) {\n",
             "    match value { .Ready if /* guard */ ready => 1, _ => 0 }\n",
+            "    match value { .Ready /* pattern */ if ready => 1, _ => 0 }\n",
             "    let selected = consume(match value { .Ready if /* nested */ ready => 2, _ => 0 })\n",
             "}\n",
         );
@@ -1470,7 +1472,6 @@ mod tests {
         for source in [
             "fn f(value:State,ready:Bool) {\n    match value{.Ready if // guard\n        ready=>1,_=>0}\n}\n",
             "fn f(value:State,ready:Bool) {\n    match value{.Ready if /* guard\n        continued */ ready=>1,_=>0}\n}\n",
-            "fn f(value:State,ready:Bool) {\n    match value{.Ready/* pattern */ if ready=>1,_=>0}\n}\n",
         ] {
             assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
             assert_eq!(
@@ -1479,6 +1480,42 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn formats_single_line_block_comments_after_match_patterns() {
+        let source = concat!(
+            "fn f(value:State){\n",
+            "match value{.Ready/* simple */if/* guard */ready=>/* body */1,Some(item)/* constructor */=>item,_=>0}\n",
+            "let selected=consume(match value{Some(item)/* nested */=>item,_=>0})\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn f(value: State) {\n",
+            "    match value {\n",
+            "        .Ready /* simple */ if /* guard */ ready => /* body */ 1\n",
+            "        Some(item) /* constructor */ => item\n",
+            "        _ => 0\n",
+            "    }\n",
+            "    let selected = consume(match value { Some(item) /* nested */ => item, _ => 0 })\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("match pattern comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn refuses_comments_inside_match_patterns() {
+        let source =
+            "fn f(value:State) {\n    match value{Some(/* interior */item)=>item,_=>0}\n}\n";
+        assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+        assert_eq!(
+            format_source(source.as_bytes()),
+            Err(SourceFormatError::UnsupportedShape),
+            "{source}"
+        );
     }
 
     #[test]

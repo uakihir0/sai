@@ -567,6 +567,17 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
         .descendants()
         .filter(|node| node.kind() == SyntaxKind::MATCH_ARM)
     {
+        if let Some(token) = ast::MatchArm::cast(node.clone())
+            .and_then(|arm| arm.pattern())
+            .and_then(|pattern| pattern.syntax().last_token())
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
         if let Some(token) = node
             .children_with_tokens()
             .find_map(|element| match element {
@@ -3801,7 +3812,13 @@ fn trailing_comments_after_direct_token(
             _ => None,
         })
         .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let comments = collect_comments_from_tokens(&[keyword])?;
+    trailing_comments_after_token(&keyword)
+}
+
+fn trailing_comments_after_token(
+    token: &SyntaxToken,
+) -> Result<Vec<SourceComment>, SourceDocumentError> {
+    let comments = collect_comments_from_tokens(std::slice::from_ref(token))?;
     Ok(comments
         .into_iter()
         .filter(|comment| !comment.is_leading)
@@ -3973,6 +3990,12 @@ fn match_arm_document(
     }
 
     let mut documents = vec![pattern_document(source, &pattern, expression_group_ids)?];
+    let pattern_last_token = pattern
+        .syntax()
+        .last_token()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let pattern_comments = trailing_comments_after_token(&pattern_last_token)?;
+    append_single_line_block_comments(&mut documents, &pattern_comments)?;
     if let Some(guard) = guard {
         let guard_expression = guard
             .expression()
