@@ -88,7 +88,7 @@ Single-line block comments attached to the `=` in `let` and `var` statements or 
 
 Single-line block comments attached to the type colon in `let` and `var` statements stay between `:` and the type. Comments with line breaks in that position remain unsupported.
 
-Single-line block comments attached to an `if` keyword stay before its condition, including in nested `else if` branches. Comments attached to `else` or other interior control-flow tokens remain unsupported.
+Single-line block comments attached to an `if` keyword stay before its condition, including in nested `else if` branches. Single-line block comments attached to `else` stay before the block or nested `if` that follows it, including when the `if` expression is nested inside another expression. Single-line block comments attached to the `else` keyword of a `let … else` statement stay before its block. Line comments and multiline block comments after `else`, and comments attached to other interior control-flow tokens, remain unsupported.
 
 Single-line block comments attached to a `while` keyword stay before its condition, including labeled `while` and `while let` forms. Comments with line breaks or comments on other control-flow tokens remain unsupported.
 
