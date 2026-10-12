@@ -625,7 +625,7 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
                 }
                 SyntaxElement::Token(token)
                     if token.kind() == SyntaxKind::COMMA
-                        && previous_arm_index.is_some_and(|index| index + 1 < arms.len()) =>
+                        && previous_arm_index.is_some_and(|index| index < arms.len()) =>
                 {
                     owners.insert((
                         false,
@@ -4025,7 +4025,7 @@ fn match_arm_separator_comment_documents(
     list: &ast::MatchArmList,
     arm_count: usize,
 ) -> Result<Vec<Vec<Doc>>, SourceDocumentError> {
-    let mut separator_documents = vec![Vec::new(); arm_count.saturating_sub(1)];
+    let mut separator_documents = vec![Vec::new(); arm_count];
     let mut next_arm_index = 0;
     let mut previous_arm_index = None;
     for element in list.syntax().children_with_tokens() {
@@ -4040,7 +4040,7 @@ fn match_arm_separator_comment_documents(
                     continue;
                 }
                 let separator_index = previous_arm_index
-                    .filter(|index| index + 1 < arm_count)
+                    .filter(|index| *index < arm_count)
                     .ok_or(SourceDocumentError::UnsupportedShape)?;
                 if !separator_documents[separator_index].is_empty() {
                     return Err(SourceDocumentError::UnsupportedShape);
@@ -7980,6 +7980,7 @@ fn brace_list_document_with_separator_suffixes(
         );
     }
 
+    let item_count = items.len();
     let mut contents = Vec::with_capacity(items.len() * 2 + 1);
     contents.push(Doc::Line);
     for (index, item) in items.into_iter().enumerate() {
@@ -7997,6 +7998,14 @@ fn brace_list_document_with_separator_suffixes(
             contents.push(Doc::Line);
         }
         contents.push(item);
+        if index + 1 == item_count
+            && let Some(suffix) = separator_suffixes
+                .get(index)
+                .filter(|suffix| !suffix.is_empty())
+        {
+            contents.push(Doc::text(","));
+            contents.push(Doc::concat(suffix.clone()));
+        }
     }
     Doc::group(
         group,

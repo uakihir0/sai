@@ -1635,6 +1635,8 @@ mod tests {
         for source in [
             "fn f(value:State) {\n    match value{.Ready=>1, // next\n        _=>0}\n}\n",
             "fn f(value:State) {\n    match value{.Ready=>1,/* next\n        continued */_=>0}\n}\n",
+            "fn f(value:State) {\n    match value{.Ready=>1, // trailing\n    }\n}\n",
+            "fn f(value:State) {\n    match value{.Ready=>1,/* trailing\n        continued */\n    }\n}\n",
         ] {
             assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
             assert_eq!(
@@ -1646,14 +1648,29 @@ mod tests {
     }
 
     #[test]
-    fn refuses_comments_after_trailing_match_arm_separators() {
-        let source = "fn f(value:State) {\n    match value{.Ready=>1,/* trailing */}\n}\n";
-        assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
-        assert_eq!(
-            format_source(source.as_bytes()),
-            Err(SourceFormatError::UnsupportedShape),
-            "{source}"
+    fn formats_single_line_block_comments_after_trailing_match_arm_separators() {
+        let source = concat!(
+            "fn f(value:State){\n",
+            "match value{.Ready=>1,/* trailing */}\n",
+            "let selected=consume(match value{.Ready=>{perform()},/* nested */})\n",
+            "}\n",
         );
+        let expected = concat!(
+            "fn f(value: State) {\n",
+            "    match value { .Ready => 1, /* trailing */ }\n",
+            "    let selected = consume(\n",
+            "        match value {\n",
+            "            .Ready => {\n",
+            "                perform()\n",
+            "            }, /* nested */\n",
+            "        },\n",
+            "    )\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes())
+            .expect("trailing match arm separator comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
     }
 
     #[test]
