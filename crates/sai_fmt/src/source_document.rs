@@ -4335,16 +4335,24 @@ fn match_arm_document(
         documents.push(Doc::text(" if"));
         let guard_keyword_comments =
             trailing_comments_after_direct_token(guard.syntax(), SyntaxKind::IF_KW)?;
-        append_single_line_block_comments(&mut documents, &guard_keyword_comments)?;
-        documents.extend([
-            Doc::text(" "),
-            expression_document(
-                source,
-                &guard_expression,
-                ExpressionContext::Unprotected,
-                expression_group_ids,
-            )?,
-        ]);
+        append_match_arm_introducer_comments(&mut documents, &guard_keyword_comments);
+        let guard_expression_document = expression_document(
+            source,
+            &guard_expression,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?;
+        if guard_keyword_comments.iter().any(|comment| {
+            comment.kind == TriviaKind::LineComment
+                || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
+        }) {
+            documents.push(Doc::indent(Doc::concat([
+                Doc::HardLine,
+                guard_expression_document,
+            ])));
+        } else {
+            documents.extend([Doc::text(" "), guard_expression_document]);
+        }
         let guard_last_token = guard_expression
             .syntax()
             .last_token()
@@ -4354,7 +4362,7 @@ fn match_arm_document(
     }
     documents.push(Doc::text(" =>"));
     let arrow_comments = trailing_comments_after_direct_token(arm.syntax(), SyntaxKind::FAT_ARROW)?;
-    append_match_arm_arrow_comments(&mut documents, &arrow_comments);
+    append_match_arm_introducer_comments(&mut documents, &arrow_comments);
     let arrow_comments_require_line_break = arrow_comments.iter().any(|comment| {
         comment.kind == TriviaKind::LineComment
             || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
@@ -4394,7 +4402,7 @@ fn match_arm_document(
     Ok(Doc::concat(documents))
 }
 
-fn append_match_arm_arrow_comments(document: &mut Vec<Doc>, comments: &[SourceComment]) {
+fn append_match_arm_introducer_comments(document: &mut Vec<Doc>, comments: &[SourceComment]) {
     let mut previous_comment_requires_line_break = false;
     for comment in comments {
         if previous_comment_requires_line_break {
@@ -4407,9 +4415,9 @@ fn append_match_arm_arrow_comments(document: &mut Vec<Doc>, comments: &[SourceCo
         } else {
             document.push(Doc::verbatim(comment.text.clone()));
         }
-        // Keep a trailing arrow comment run together after block comments.
-        // Breaking there can reattach the next comment to the body as leading
-        // trivia, making the formatted match arm unsupported on a second pass.
+        // Keep comments after a match-arm introducer together after block
+        // comments. Breaking there can reattach the next comment to the
+        // following expression as leading trivia and break a second pass.
         previous_comment_requires_line_break = comment.kind == TriviaKind::LineComment;
     }
 }

@@ -1630,15 +1630,70 @@ mod tests {
     }
 
     #[test]
-    fn refuses_line_and_multiline_comments_after_match_guard_if_keywords() {
-        for source in [
-            "fn f(value:State,ready:Bool) {\n    match value{.Ready if // guard\n        ready=>1,_=>0}\n}\n",
-            "fn f(value:State,ready:Bool) {\n    match value{.Ready if /* guard\n        continued */ ready=>1,_=>0}\n}\n",
-        ] {
+    fn formats_line_and_multiline_comments_after_match_guard_if_keywords() {
+        let sources = [
+            (
+                "fn f(value:State,ready:Bool){\nmatch value{.Ready if // guard\nready=>1,_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State, ready: Bool) {\n",
+                    "    match value {\n",
+                    "        .Ready if // guard\n",
+                    "            ready => 1\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State,ready:Bool){\nmatch value{.Ready if /* guard\ncontinued */ready=>1,_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State, ready: Bool) {\n",
+                    "    match value {\n",
+                    "        .Ready if /* guard\n",
+                    "continued */\n",
+                    "            ready => 1\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State,ready:Bool){\nmatch value{.Ready if /* guard\ncontinued */ /* tail */ready=>1,_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State, ready: Bool) {\n",
+                    "    match value {\n",
+                    "        .Ready if /* guard\n",
+                    "continued */ /* tail */\n",
+                    "            ready => 1\n",
+                    "        _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State,ready:Bool){\nlet selected=consume(match value{.Ready if /* nested\ncontinued */ready=>2,_=>0})\n}\n",
+                concat!(
+                    "fn f(value: State, ready: Bool) {\n",
+                    "    let selected = consume(\n",
+                    "        match value {\n",
+                    "            .Ready if /* nested\n",
+                    "continued */\n",
+                    "                ready => 2\n",
+                    "            _ => 0\n",
+                    "        },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
             assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("line and multiline match-guard keyword comments are supported");
+            assert_eq!(formatted, expected, "{source}");
             assert_eq!(
-                format_source(source.as_bytes()),
-                Err(SourceFormatError::UnsupportedShape),
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
                 "{source}"
             );
         }
