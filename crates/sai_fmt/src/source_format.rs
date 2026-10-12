@@ -705,11 +705,16 @@ mod tests {
 
     #[test]
     fn keeps_comments_inside_items_fail_closed() {
-        let source = b"fn f() { // inside\n    1\n}".as_slice();
-        assert_eq!(
-            format_source(source),
-            Err(SourceFormatError::UnsupportedShape)
-        );
+        for source in [
+            "fn f() { // inside\n    1\n}",
+            "fn f() {\n    let value = /* inside a statement */ 1\n}",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -855,6 +860,92 @@ mod tests {
             "} /* enum note */\n",
         );
         let formatted = format_source(source.as_bytes()).expect("trailing comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_comments_at_block_statement_boundaries() {
+        let source = concat!(
+            "fn work() {\n",
+            "    // initialize\n",
+            "    let value = 1\n",
+            "\n",
+            "    // return this value\n",
+            "    value // expression note\n",
+            "    // before the closing brace\n",
+            "}\n",
+            "fn empty() {\n",
+            "    // the only block content\n",
+            "}\n",
+            "fn nested() {\n",
+            "    if true {\n",
+            "        // nested statement\n",
+            "        2\n",
+            "    }\n",
+            "}\n",
+            "fn closure() {\n",
+            "    let run = fn() {\n",
+            "        // closure statement\n",
+            "        3\n",
+            "    }\n",
+            "}\n",
+            "fn unsafe_call() {\n",
+            "    unsafe {\n",
+            "        // unsafe statement\n",
+            "        operation()\n",
+            "    }\n",
+            "}\n",
+            "fn chain(xs: Vec<Item>) {\n",
+            "    xs.map(fn() {\n",
+            "        // comment-only closure\n",
+            "    }).filter(keep)\n",
+            "}",
+        );
+        let expected = concat!(
+            "fn work() {\n",
+            "    // initialize\n",
+            "    let value = 1\n",
+            "\n",
+            "    // return this value\n",
+            "    value // expression note\n",
+            "    // before the closing brace\n",
+            "}\n",
+            "\n",
+            "fn empty() {\n",
+            "    // the only block content\n",
+            "}\n",
+            "\n",
+            "fn nested() {\n",
+            "    if true {\n",
+            "        // nested statement\n",
+            "        2\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "fn closure() {\n",
+            "    let run = fn() {\n",
+            "        // closure statement\n",
+            "        3\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "fn unsafe_call() {\n",
+            "    unsafe {\n",
+            "        // unsafe statement\n",
+            "        operation()\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "fn chain(xs: Vec<Item>) {\n",
+            "    xs\n",
+            "        .map(fn() {\n",
+            "            // comment-only closure\n",
+            "        })\n",
+            "        .filter(keep)\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("block comments format");
         assert_eq!(formatted, expected);
         assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
     }

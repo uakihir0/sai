@@ -265,13 +265,13 @@ fn collect_top_level_comments(
         ..TopLevelComments::default()
     };
     let candidates = collect_comment_candidates(source.root().green(), 0, source.text().len())?;
-    let supported_list_comment_owners = supported_list_comment_owners(source.root());
+    let supported_comment_owners = supported_comment_owners(source.root());
 
     comments.eof = candidates.eof;
     comments.shebang = candidates.shebang;
     for comment in candidates.leading {
         if top_level_range_containing(top_level_ranges, &comment).is_some() {
-            if supported_list_comment_owners.contains(&comment_owner_key(&comment)) {
+            if supported_comment_owners.contains(&comment_owner_key(&comment)) {
                 continue;
             }
             return Err(SourceDocumentError::UnsupportedShape);
@@ -327,7 +327,7 @@ fn collect_top_level_comments(
     }
     for comment in candidates.trailing {
         if top_level_range_containing(top_level_ranges, &comment).is_some() {
-            if supported_list_comment_owners.contains(&comment_owner_key(&comment)) {
+            if supported_comment_owners.contains(&comment_owner_key(&comment)) {
                 continue;
             }
             return Err(SourceDocumentError::UnsupportedShape);
@@ -431,11 +431,26 @@ enum ListCommentTarget {
 
 type CommentOwnerKey = (bool, SyntaxKind, usize, usize);
 
+struct BraceCommentTargets {
+    interior_start: usize,
+    interior_end: usize,
+    targets: HashMap<CommentOwnerKey, ListCommentTarget>,
+    owner_tokens: Vec<SyntaxToken>,
+}
+
 #[derive(Default)]
 struct ListComments {
     before: Vec<Vec<SourceComment>>,
     after: Vec<Vec<SourceComment>>,
     closing: Vec<SourceComment>,
+}
+
+impl ListComments {
+    fn has_comments(&self) -> bool {
+        !self.closing.is_empty()
+            || self.before.iter().any(|comments| !comments.is_empty())
+            || self.after.iter().any(|comments| !comments.is_empty())
+    }
 }
 
 fn comment_owner_key(comment: &SourceComment) -> CommentOwnerKey {
@@ -447,22 +462,35 @@ fn comment_owner_key(comment: &SourceComment) -> CommentOwnerKey {
     )
 }
 
-fn supported_list_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
+fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
     let mut owners = HashSet::new();
     for node in root.descendants() {
         let member_kind = match (node.kind(), node.parent().map(|parent| parent.kind())) {
             (SyntaxKind::FIELD_LIST, Some(SyntaxKind::STRUCT_DEF | SyntaxKind::RESOURCE_DECL)) => {
-                SyntaxKind::FIELD_DECL
+                Some(SyntaxKind::FIELD_DECL)
             }
-            (SyntaxKind::VARIANT_LIST, Some(SyntaxKind::ENUM_DECL)) => SyntaxKind::VARIANT_DECL,
+            (SyntaxKind::VARIANT_LIST, Some(SyntaxKind::ENUM_DECL)) => {
+                Some(SyntaxKind::VARIANT_DECL)
+            }
+            (SyntaxKind::BLOCK, _) => None,
             _ => continue,
         };
         let members = node
             .children()
-            .filter(|child| child.kind() == member_kind)
+            .filter(|child| {
+                member_kind.map_or_else(
+                    || ast::Stmt::can_cast(child.kind()),
+                    |kind| child.kind() == kind,
+                )
+            })
             .collect::<Vec<_>>();
-        if let Ok((_, _, targets)) = list_comment_targets(&node, &members) {
-            owners.extend(targets.into_keys());
+        let targets = if member_kind.is_some() {
+            list_comment_targets(&node, &members)
+        } else {
+            block_comment_targets(&node, &members)
+        };
+        if let Ok(targets) = targets {
+            owners.extend(targets.targets.into_keys());
         }
     }
     owners
@@ -471,7 +499,7 @@ fn supported_list_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> 
 fn list_comment_targets(
     list: &SyntaxNode,
     members: &[SyntaxNode],
-) -> Result<(usize, usize, HashMap<CommentOwnerKey, ListCommentTarget>), SourceDocumentError> {
+) -> Result<BraceCommentTargets, SourceDocumentError> {
     let parent = list.parent().ok_or(SourceDocumentError::UnsupportedShape)?;
     let member_kind = match (list.kind(), parent.kind()) {
         (SyntaxKind::FIELD_LIST, SyntaxKind::STRUCT_DEF | SyntaxKind::RESOURCE_DECL) => {
@@ -485,6 +513,7 @@ fn list_comment_targets(
     let opening_end = opening.text_range().end().to_usize();
     let closing_start = closing.text_range().start().to_usize();
     let mut targets = HashMap::with_capacity(members.len() * 2 + 1);
+    let mut owner_tokens = vec![closing.clone()];
     for (index, member) in members.iter().enumerate() {
         if member.kind() != member_kind {
             return Err(SourceDocumentError::UnsupportedShape);
@@ -492,6 +521,7 @@ fn list_comment_targets(
         let first_token = member
             .first_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
+        owner_tokens.push(first_token.clone());
         targets.insert(
             (
                 true,
@@ -504,6 +534,7 @@ fn list_comment_targets(
         let last_token = member
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
+        owner_tokens.push(last_token.clone());
         targets.insert(
             (
                 false,
@@ -533,6 +564,7 @@ fn list_comment_targets(
                 next_member += 1;
             }
             SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA => {
+                owner_tokens.push(token.clone());
                 let key = (
                     true,
                     token.kind(),
@@ -560,7 +592,73 @@ fn list_comment_targets(
             _ => {}
         }
     }
-    Ok((opening_end, closing_start, targets))
+    Ok(BraceCommentTargets {
+        interior_start: opening_end,
+        interior_end: closing_start,
+        targets,
+        owner_tokens,
+    })
+}
+
+fn block_comment_targets(
+    block: &SyntaxNode,
+    statements: &[SyntaxNode],
+) -> Result<BraceCommentTargets, SourceDocumentError> {
+    if block.kind() != SyntaxKind::BLOCK {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let (opening, closing) =
+        brace_list_delimiters(block).ok_or(SourceDocumentError::UnsupportedShape)?;
+    let opening_end = opening.text_range().end().to_usize();
+    let closing_start = closing.text_range().start().to_usize();
+    let mut targets = HashMap::with_capacity(statements.len() * 2 + 1);
+    let mut owner_tokens = vec![closing.clone()];
+    for (index, statement) in statements.iter().enumerate() {
+        if !ast::Stmt::can_cast(statement.kind()) {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let first_token = statement
+            .first_token()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        owner_tokens.push(first_token.clone());
+        targets.insert(
+            (
+                true,
+                first_token.kind(),
+                first_token.text_range().start().to_usize(),
+                first_token.text_range().end().to_usize(),
+            ),
+            ListCommentTarget::BeforeMember(index),
+        );
+        let last_token = statement
+            .last_token()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        owner_tokens.push(last_token.clone());
+        targets.insert(
+            (
+                false,
+                last_token.kind(),
+                last_token.text_range().start().to_usize(),
+                last_token.text_range().end().to_usize(),
+            ),
+            ListCommentTarget::AfterMember(index),
+        );
+    }
+    targets.insert(
+        (
+            true,
+            closing.kind(),
+            closing.text_range().start().to_usize(),
+            closing.text_range().end().to_usize(),
+        ),
+        ListCommentTarget::Closing,
+    );
+    Ok(BraceCommentTargets {
+        interior_start: opening_end,
+        interior_end: closing_start,
+        targets,
+        owner_tokens,
+    })
 }
 
 fn brace_list_delimiters(list: &SyntaxNode) -> Option<(SyntaxToken, SyntaxToken)> {
@@ -584,20 +682,45 @@ fn collect_list_comments(
     list: &SyntaxNode,
     members: &[SyntaxNode],
 ) -> Result<ListComments, SourceDocumentError> {
-    let start = list.offset().to_usize();
-    let end = list.full_range().end().to_usize();
-    let candidates = collect_comment_candidates(list.green(), start, end)?;
-    let (interior_start, interior_end, targets) = list_comment_targets(list, members)?;
+    let targets = list_comment_targets(list, members)?;
+    collect_brace_unit_comments(members.len(), targets)
+}
+
+fn collect_block_comments(
+    block: &SyntaxNode,
+    statements: &[SyntaxNode],
+) -> Result<ListComments, SourceDocumentError> {
+    let targets = block_comment_targets(block, statements)?;
+    collect_brace_unit_comments(statements.len(), targets)
+}
+
+fn block_has_comments(
+    block: &ast::Block,
+    statements: &[Stmt],
+) -> Result<bool, SourceDocumentError> {
+    let statement_nodes = statements
+        .iter()
+        .map(|statement| statement.syntax().clone())
+        .collect::<Vec<_>>();
+    Ok(collect_block_comments(block.syntax(), &statement_nodes)?.has_comments())
+}
+
+fn collect_brace_unit_comments(
+    member_count: usize,
+    targets: BraceCommentTargets,
+) -> Result<ListComments, SourceDocumentError> {
+    let BraceCommentTargets {
+        interior_start,
+        interior_end,
+        targets,
+        owner_tokens,
+    } = targets;
     let mut comments = ListComments {
-        before: vec![Vec::new(); members.len()],
-        after: vec![Vec::new(); members.len()],
+        before: vec![Vec::new(); member_count],
+        after: vec![Vec::new(); member_count],
         closing: Vec::new(),
     };
-    let mut candidates = candidates
-        .leading
-        .into_iter()
-        .chain(candidates.trailing)
-        .collect::<Vec<_>>();
+    let mut candidates = collect_comments_from_tokens(&owner_tokens)?;
     candidates.sort_by_key(|comment| comment.range.start);
     for comment in candidates {
         if comment.range.start < interior_start || comment.range.end > interior_end {
@@ -608,8 +731,66 @@ fn collect_list_comments(
             Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
             Some(ListCommentTarget::AfterMember(index)) => comments.after[index].push(comment),
             Some(ListCommentTarget::Closing) => comments.closing.push(comment),
-            None => return Err(SourceDocumentError::UnsupportedShape),
+            None => {}
         }
+    }
+    Ok(comments)
+}
+
+fn collect_comments_from_tokens(
+    tokens: &[SyntaxToken],
+) -> Result<Vec<SourceComment>, SourceDocumentError> {
+    let mut comments = Vec::new();
+    let mut seen_tokens = HashSet::with_capacity(tokens.len());
+    for token in tokens {
+        let range = token.text_range();
+        let token_key = (
+            token.kind(),
+            range.start().to_usize(),
+            range.end().to_usize(),
+        );
+        if !seen_tokens.insert(token_key) {
+            continue;
+        }
+        let green = token.green();
+        let token_start = range.start().to_usize();
+        let token_end = range.end().to_usize();
+        let leading_len = green
+            .leading_trivia()
+            .iter()
+            .try_fold(0_usize, |length, trivia| {
+                length
+                    .checked_add(trivia.text().len())
+                    .ok_or(SourceDocumentError::UnsupportedShape)
+            })?;
+        let mut cursor = token_start
+            .checked_sub(leading_len)
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        let mut candidates = CommentCandidates::default();
+        for trivia in green.leading_trivia() {
+            scan_source_trivia(
+                trivia,
+                true,
+                token.kind(),
+                token_start..token_end,
+                &mut cursor,
+                &mut candidates,
+            )?;
+        }
+        cursor = token_end;
+        for trivia in green.trailing_trivia() {
+            scan_source_trivia(
+                trivia,
+                false,
+                token.kind(),
+                token_start..token_end,
+                &mut cursor,
+                &mut candidates,
+            )?;
+        }
+        comments.extend(candidates.leading);
+        comments.extend(candidates.trailing);
+        comments.extend(candidates.eof);
     }
     Ok(comments)
 }
@@ -3018,32 +3199,36 @@ fn block_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    if statements.is_empty() {
+    let statement_nodes = statements
+        .iter()
+        .map(|statement| statement.syntax().clone())
+        .collect::<Vec<_>>();
+    let comments = collect_block_comments(block.syntax(), &statement_nodes)?;
+    if statements.is_empty() && comments.closing.is_empty() {
         return Ok(Doc::text("{}"));
     }
 
-    let mut body = vec![Doc::HardLine];
-    for (index, statement) in statements.iter().enumerate() {
-        if index > 0 {
-            let previous_end = statements[index - 1].syntax().text_range().end().to_usize();
-            let next_start = statement.syntax().text_range().start().to_usize();
-            let separator = source
-                .text()
-                .get(previous_end..next_start)
-                .ok_or(SourceDocumentError::UnsupportedShape)?;
-            body.push(Doc::HardLine);
-            if separator.matches('\n').count() > 1 {
-                body.push(Doc::HardLine);
-            }
-        }
-        body.push(statement_document(source, statement, expression_group_ids)?);
-    }
-    Ok(Doc::concat([
-        Doc::text("{"),
-        Doc::indent(Doc::concat(body)),
-        Doc::HardLine,
-        Doc::text("}"),
-    ]))
+    let documents = statements
+        .iter()
+        .map(|statement| statement_document(source, statement, expression_group_ids))
+        .collect::<Result<Vec<_>, _>>()?;
+    let members = statements
+        .iter()
+        .zip(documents)
+        .enumerate()
+        .map(|(index, (statement, document))| {
+            let range = statement.syntax().text_range();
+            decorate_list_member_document(
+                source,
+                &comments.before[index],
+                &comments.after[index],
+                range.start().to_usize(),
+                range.end().to_usize(),
+                document,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    broken_brace_list_document(source, members, &comments.closing)
 }
 
 fn block_expression_document(
@@ -4148,6 +4333,9 @@ fn closure_expression_document(
     let header = closure_header_document(source, closure)?;
     let broken_block = block_document(source, &body, expression_group_ids)?;
     let statements = body.statements().collect::<Vec<_>>();
+    if block_has_comments(&body, &statements)? {
+        return Ok(Doc::concat([header, Doc::text(" "), broken_block]));
+    }
     if let [Stmt::Expr(statement)] = statements.as_slice() {
         let flat_statement =
             statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
@@ -4176,6 +4364,9 @@ fn closure_body_forces_break(
         .body()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let statements = body.statements().collect::<Vec<_>>();
+    if block_has_comments(&body, &statements)? {
+        return Ok(true);
+    }
     if statements.is_empty() {
         return Ok(false);
     }
@@ -4305,6 +4496,9 @@ fn unsafe_block_expression_document(
     }
     let statements = body.statements().collect::<Vec<_>>();
     let broken_block = block_document(source, &body, expression_group_ids)?;
+    if block_has_comments(&body, &statements)? {
+        return Ok(Doc::concat([Doc::text("unsafe "), broken_block]));
+    }
     if let [Stmt::Expr(statement)] = statements.as_slice() {
         let flat_statement =
             statement_document(source, &Stmt::Expr(statement.clone()), expression_group_ids)?;
