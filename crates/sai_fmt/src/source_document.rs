@@ -4033,11 +4033,58 @@ fn match_expression_document_with_keyword_comments(
     }
     if !opening_comments.is_empty() {
         let mut first_arm_prefix = Vec::new();
-        append_single_line_block_comments_without_leading_space(
-            &mut first_arm_prefix,
-            &opening_comments,
-        )?;
-        first_arm_prefix.push(Doc::text(" "));
+        if source_comments_require_line_break(&opening_comments) {
+            append_comment_documents(
+                &mut first_arm_prefix,
+                &opening_comments,
+                source.text(),
+                None,
+            )?;
+            let last_comment_end = opening_comments.last().map(|comment| comment.range.end);
+            let first_pattern_token = match_arms
+                .first()
+                .and_then(ast::MatchArm::pattern)
+                .and_then(|pattern| pattern.syntax().first_token())
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let first_pattern_leading_comments =
+                leading_comments_before_token(&first_pattern_token)?;
+            let next_comment_or_pattern = first_pattern_leading_comments
+                .first()
+                .map(|comment| comment.range.start)
+                .unwrap_or_else(|| first_pattern_token.text_range().start().to_usize());
+            append_comment_gap(
+                &mut first_arm_prefix,
+                source.text(),
+                last_comment_end,
+                Some(next_comment_or_pattern),
+            )?;
+            force_break = true;
+        } else {
+            append_single_line_block_comments_without_leading_space(
+                &mut first_arm_prefix,
+                &opening_comments,
+            )?;
+            let first_pattern_token = match_arms
+                .first()
+                .and_then(ast::MatchArm::pattern)
+                .and_then(|pattern| pattern.syntax().first_token())
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let first_pattern_leading_comments =
+                leading_comments_before_token(&first_pattern_token)?;
+            if source_comments_require_line_break(&first_pattern_leading_comments) {
+                append_comment_gap(
+                    &mut first_arm_prefix,
+                    source.text(),
+                    opening_comments.last().map(|comment| comment.range.end),
+                    first_pattern_leading_comments
+                        .first()
+                        .map(|comment| comment.range.start),
+                )?;
+                force_break = true;
+            } else {
+                first_arm_prefix.push(Doc::text(" "));
+            }
+        }
         let first_arm = arm_documents
             .first_mut()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
