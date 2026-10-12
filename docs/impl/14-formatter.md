@@ -96,7 +96,7 @@ Single-line block comments attached to a `for` keyword stay before the pattern, 
 
 Single-line block comments attached to a `loop` keyword stay before the body for labeled or unlabeled loop statements and for loop expressions used directly as a `let`/`var` initializer or assignment right-hand side. Comments with line breaks remain unsupported. Loop comments nested inside composite expressions remain unsupported.
 
-Single-line block comments attached to a `match` keyword stay before the scrutinee for match statements and match expressions used directly as a `let`/`var` initializer or assignment right-hand side. Comments with line breaks remain unsupported. Match comments nested inside composite expressions remain unsupported.
+Comments attached to a `match` keyword stay before the scrutinee for match statements and match expressions used directly as a `let`/`var` initializer or assignment right-hand side. Single-line block comments stay inline; line comments and multiline block comments move the scrutinee to the next line. Match-keyword comments nested inside composite expressions remain unsupported.
 
 Comments trailing the final token of a match scrutinee stay after the scrutinee and before the arm-list opening brace. A trailing line comment or multiline block comment forces the brace onto the next line; comments on interior scrutinee tokens remain unsupported.
 
