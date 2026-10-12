@@ -713,6 +713,153 @@ mod tests {
     }
 
     #[test]
+    fn formats_own_line_comments_between_record_fields_and_enum_variants() {
+        let source = concat!(
+            "type User {\n",
+            "    // attached to id\n",
+            "    id: U32\n",
+            "\n",
+            "    // detached section\n",
+            "\n",
+            "    // attached to name\n",
+            "    name: Str\n",
+            "    // before the closing brace\n",
+            "}\n",
+            "enum State {\n",
+            "    // pending state\n",
+            "    Pending\n",
+            "    /* active state */\n",
+            "    Active\n",
+            "    // before the closing brace\n",
+            "}\n",
+            "type Empty {\n",
+            "    // the only list content\n",
+            "}\n",
+            "resource File {\n",
+            "    // file handle\n",
+            "    handle: U32\n",
+            "}",
+        );
+        let expected = concat!(
+            "type User {\n",
+            "    // attached to id\n",
+            "    id: U32\n",
+            "\n",
+            "    // detached section\n",
+            "\n",
+            "    // attached to name\n",
+            "    name: Str\n",
+            "    // before the closing brace\n",
+            "}\n",
+            "\n",
+            "enum State {\n",
+            "    // pending state\n",
+            "    Pending\n",
+            "    /* active state */\n",
+            "    Active\n",
+            "    // before the closing brace\n",
+            "}\n",
+            "\n",
+            "type Empty {\n",
+            "    // the only list content\n",
+            "}\n",
+            "\n",
+            "resource File {\n",
+            "    // file handle\n",
+            "    handle: U32\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("list comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn comments_inside_list_elements_remain_fail_closed() {
+        for source in [
+            "type User {\n    id: /* inside a field */ U32\n}",
+            "enum State {\n    Pending = /* inside a discriminant */ 1\n}",
+        ] {
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_trailing_comments_on_list_elements_and_removed_commas() {
+        let source = concat!(
+            "type User {\n",
+            "    id: U32, // id comment\n",
+            "    name: Str // name comment\n",
+            "}\n",
+            "enum State {\n",
+            "    Pending, // pending comment\n",
+            "    Active /* active comment */\n",
+            "}\n",
+            "type Repeated {\n",
+            "    id: U32 /* first\n",
+            "continued */ /* second */\n",
+            "}\n",
+            "type FinalBlock {\n",
+            "    id: U32 /* only\n",
+            "continued */\n",
+            "}",
+        );
+        let expected = concat!(
+            "type User {\n",
+            "    id: U32 // id comment\n",
+            "    name: Str // name comment\n",
+            "}\n",
+            "\n",
+            "enum State {\n",
+            "    Pending // pending comment\n",
+            "    Active /* active comment */\n",
+            "}\n",
+            "\n",
+            "type Repeated {\n",
+            "    id: U32 /* first\n",
+            "continued */\n",
+            "    /* second */\n",
+            "}\n",
+            "\n",
+            "type FinalBlock {\n",
+            "    id: U32 /* only\n",
+            "continued */\n",
+            "}\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("trailing list comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn preserves_comments_after_field_and_variant_list_closing_braces() {
+        let source = concat!(
+            "type User {\n",
+            "    id: U32\n",
+            "} // record note\n",
+            "enum State {\n",
+            "    Pending\n",
+            "} /* enum note */",
+        );
+        let expected = concat!(
+            "type User {\n",
+            "    id: U32\n",
+            "} // record note\n",
+            "\n",
+            "enum State {\n",
+            "    Pending\n",
+            "} /* enum note */\n",
+        );
+        let formatted = format_source(source.as_bytes()).expect("trailing comments format");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

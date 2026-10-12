@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use sai_syntax::{
-    GreenElement, GreenNode, GreenTrivia, SyntaxElement, SyntaxKind, SyntaxToken, TriviaKind,
+    GreenElement, GreenNode, GreenTrivia, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
+    TriviaKind,
     ast::{self, AstNode, AstToken, Expr, Item, LiteralToken, Stmt},
 };
 use sai_vfs::{TextRange, TextSize};
@@ -32,8 +34,7 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
     if source.root().children().count() != items.len() + usize::from(has_module_header) {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    let mut comments =
-        collect_top_level_comments(source.root().green(), &top_level_ranges, source.text())?;
+    let mut comments = collect_top_level_comments(source, &top_level_ranges)?;
     let mut module_header = module_header_node
         .as_ref()
         .map(|header| module_header_document(source, header))
@@ -240,6 +241,9 @@ struct SourceComment {
     range: Range<usize>,
     text: String,
     kind: TriviaKind,
+    is_leading: bool,
+    owner_token_kind: SyntaxKind,
+    owner_token_range: Range<usize>,
 }
 
 #[derive(Default)]
@@ -251,9 +255,8 @@ struct CommentCandidates {
 }
 
 fn collect_top_level_comments(
-    root: &GreenNode,
+    source: &ParsedSource,
     top_level_ranges: &[TextRange],
-    source: &str,
 ) -> Result<TopLevelComments, SourceDocumentError> {
     let mut comments = TopLevelComments {
         detached_before: vec![Vec::new(); top_level_ranges.len()],
@@ -261,33 +264,23 @@ fn collect_top_level_comments(
         trailing: vec![Vec::new(); top_level_ranges.len()],
         ..TopLevelComments::default()
     };
-    let mut candidates = CommentCandidates::default();
-    let mut cursor = 0_usize;
-    let mut pending = root.children().iter().rev().collect::<Vec<_>>();
-    while let Some(element) = pending.pop() {
-        match element {
-            GreenElement::Node(node) => pending.extend(node.children().iter().rev()),
-            GreenElement::Token(token) => {
-                for trivia in token.leading_trivia() {
-                    scan_source_trivia(trivia, true, token.kind(), &mut cursor, &mut candidates)?;
-                }
-                cursor = cursor
-                    .checked_add(token.text().len())
-                    .ok_or(SourceDocumentError::UnsupportedShape)?;
-                for trivia in token.trailing_trivia() {
-                    scan_source_trivia(trivia, false, token.kind(), &mut cursor, &mut candidates)?;
-                }
-            }
-        }
-    }
+    let candidates = collect_comment_candidates(source.root().green(), 0, source.text().len())?;
+    let supported_list_comment_owners = supported_list_comment_owners(source.root());
 
     comments.eof = candidates.eof;
     comments.shebang = candidates.shebang;
     for comment in candidates.leading {
-        let node_index = top_level_ranges
-            .iter()
-            .position(|range| comment.range.end <= range.start().to_usize())
-            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        if top_level_range_containing(top_level_ranges, &comment).is_some() {
+            if supported_list_comment_owners.contains(&comment_owner_key(&comment)) {
+                continue;
+            }
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let node_index =
+            top_level_ranges.partition_point(|range| range.start().to_usize() < comment.range.end);
+        if node_index >= top_level_ranges.len() {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
         if node_index > 0 && comment.range.start < top_level_ranges[node_index - 1].end().to_usize()
         {
             return Err(SourceDocumentError::UnsupportedShape);
@@ -304,6 +297,7 @@ fn collect_top_level_comments(
             .map(|comment| comment.range.end)
             .ok_or(SourceDocumentError::UnsupportedShape)?;
         let gap = source
+            .text()
             .get(last_comment_end..node_start)
             .ok_or(SourceDocumentError::UnsupportedShape)?;
         let mut detached_count = if line_break_count(gap) > 1 {
@@ -314,6 +308,7 @@ fn collect_top_level_comments(
         if detached_count == 0 {
             for (comment_index, pair) in group.windows(2).enumerate() {
                 let gap = source
+                    .text()
                     .get(pair[0].range.end..pair[1].range.start)
                     .ok_or(SourceDocumentError::UnsupportedShape)?;
                 if line_break_count(gap) > 1 {
@@ -331,9 +326,15 @@ fn collect_top_level_comments(
         }
     }
     for comment in candidates.trailing {
+        if top_level_range_containing(top_level_ranges, &comment).is_some() {
+            if supported_list_comment_owners.contains(&comment_owner_key(&comment)) {
+                continue;
+            }
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
         let node_index = top_level_ranges
-            .iter()
-            .rposition(|range| range.end().to_usize() <= comment.range.start)
+            .partition_point(|range| range.end().to_usize() <= comment.range.start)
+            .checked_sub(1)
             .ok_or(SourceDocumentError::UnsupportedShape)?;
         if top_level_ranges
             .get(node_index + 1)
@@ -342,9 +343,6 @@ fn collect_top_level_comments(
             return Err(SourceDocumentError::UnsupportedShape);
         }
         comments.trailing[node_index].push(comment);
-    }
-    if cursor != source.len() {
-        return Err(SourceDocumentError::UnsupportedShape);
     }
     if top_level_ranges.is_empty() {
         comments.file_header = std::mem::take(&mut comments.eof);
@@ -359,10 +357,268 @@ fn collect_top_level_comments(
     Ok(comments)
 }
 
+fn top_level_range_containing(ranges: &[TextRange], comment: &SourceComment) -> Option<usize> {
+    let index = ranges
+        .partition_point(|range| range.start().to_usize() <= comment.range.start)
+        .checked_sub(1)?;
+    ranges
+        .get(index)
+        .and_then(|range| (comment.range.end <= range.end().to_usize()).then_some(index))
+}
+
+fn collect_comment_candidates(
+    root: &GreenNode,
+    start: usize,
+    expected_end: usize,
+) -> Result<CommentCandidates, SourceDocumentError> {
+    let mut candidates = CommentCandidates::default();
+    let mut cursor = start;
+    let mut pending = root.children().iter().rev().collect::<Vec<_>>();
+    while let Some(element) = pending.pop() {
+        match element {
+            GreenElement::Node(node) => pending.extend(node.children().iter().rev()),
+            GreenElement::Token(token) => {
+                let token_start = cursor
+                    .checked_add(
+                        token
+                            .leading_trivia()
+                            .iter()
+                            .map(|trivia| trivia.text().len())
+                            .sum::<usize>(),
+                    )
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                let token_end = token_start
+                    .checked_add(token.text().len())
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                for trivia in token.leading_trivia() {
+                    scan_source_trivia(
+                        trivia,
+                        true,
+                        token.kind(),
+                        token_start..token_end,
+                        &mut cursor,
+                        &mut candidates,
+                    )?;
+                }
+                cursor = cursor
+                    .checked_add(token.text().len())
+                    .ok_or(SourceDocumentError::UnsupportedShape)?;
+                for trivia in token.trailing_trivia() {
+                    scan_source_trivia(
+                        trivia,
+                        false,
+                        token.kind(),
+                        token_start..token_end,
+                        &mut cursor,
+                        &mut candidates,
+                    )?;
+                }
+            }
+        }
+    }
+    if cursor != expected_end {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(candidates)
+}
+
+#[derive(Clone, Copy)]
+enum ListCommentTarget {
+    BeforeMember(usize),
+    AfterMember(usize),
+    Closing,
+}
+
+type CommentOwnerKey = (bool, SyntaxKind, usize, usize);
+
+#[derive(Default)]
+struct ListComments {
+    before: Vec<Vec<SourceComment>>,
+    after: Vec<Vec<SourceComment>>,
+    closing: Vec<SourceComment>,
+}
+
+fn comment_owner_key(comment: &SourceComment) -> CommentOwnerKey {
+    (
+        comment.is_leading,
+        comment.owner_token_kind,
+        comment.owner_token_range.start,
+        comment.owner_token_range.end,
+    )
+}
+
+fn supported_list_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
+    let mut owners = HashSet::new();
+    for node in root.descendants() {
+        let member_kind = match (node.kind(), node.parent().map(|parent| parent.kind())) {
+            (SyntaxKind::FIELD_LIST, Some(SyntaxKind::STRUCT_DEF | SyntaxKind::RESOURCE_DECL)) => {
+                SyntaxKind::FIELD_DECL
+            }
+            (SyntaxKind::VARIANT_LIST, Some(SyntaxKind::ENUM_DECL)) => SyntaxKind::VARIANT_DECL,
+            _ => continue,
+        };
+        let members = node
+            .children()
+            .filter(|child| child.kind() == member_kind)
+            .collect::<Vec<_>>();
+        if let Ok((_, _, targets)) = list_comment_targets(&node, &members) {
+            owners.extend(targets.into_keys());
+        }
+    }
+    owners
+}
+
+fn list_comment_targets(
+    list: &SyntaxNode,
+    members: &[SyntaxNode],
+) -> Result<(usize, usize, HashMap<CommentOwnerKey, ListCommentTarget>), SourceDocumentError> {
+    let parent = list.parent().ok_or(SourceDocumentError::UnsupportedShape)?;
+    let member_kind = match (list.kind(), parent.kind()) {
+        (SyntaxKind::FIELD_LIST, SyntaxKind::STRUCT_DEF | SyntaxKind::RESOURCE_DECL) => {
+            SyntaxKind::FIELD_DECL
+        }
+        (SyntaxKind::VARIANT_LIST, SyntaxKind::ENUM_DECL) => SyntaxKind::VARIANT_DECL,
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    let (opening, closing) =
+        brace_list_delimiters(list).ok_or(SourceDocumentError::UnsupportedShape)?;
+    let opening_end = opening.text_range().end().to_usize();
+    let closing_start = closing.text_range().start().to_usize();
+    let mut targets = HashMap::with_capacity(members.len() * 2 + 1);
+    for (index, member) in members.iter().enumerate() {
+        if member.kind() != member_kind {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        let first_token = member
+            .first_token()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        targets.insert(
+            (
+                true,
+                first_token.kind(),
+                first_token.text_range().start().to_usize(),
+                first_token.text_range().end().to_usize(),
+            ),
+            ListCommentTarget::BeforeMember(index),
+        );
+        let last_token = member
+            .last_token()
+            .ok_or(SourceDocumentError::UnsupportedShape)?;
+        targets.insert(
+            (
+                false,
+                last_token.kind(),
+                last_token.text_range().start().to_usize(),
+                last_token.text_range().end().to_usize(),
+            ),
+            ListCommentTarget::AfterMember(index),
+        );
+    }
+    targets.insert(
+        (
+            true,
+            closing.kind(),
+            closing.text_range().start().to_usize(),
+            closing.text_range().end().to_usize(),
+        ),
+        ListCommentTarget::Closing,
+    );
+
+    let mut previous_member = None;
+    let mut next_member = 0_usize;
+    for element in list.children_with_tokens() {
+        match element {
+            SyntaxElement::Node(node) if node.kind() == member_kind => {
+                previous_member = Some(next_member);
+                next_member += 1;
+            }
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA => {
+                let key = (
+                    true,
+                    token.kind(),
+                    token.text_range().start().to_usize(),
+                    token.text_range().end().to_usize(),
+                );
+                let target = if next_member < members.len() {
+                    ListCommentTarget::BeforeMember(next_member)
+                } else {
+                    ListCommentTarget::Closing
+                };
+                targets.insert(key, target);
+                if let Some(previous_member) = previous_member {
+                    targets.insert(
+                        (
+                            false,
+                            token.kind(),
+                            token.text_range().start().to_usize(),
+                            token.text_range().end().to_usize(),
+                        ),
+                        ListCommentTarget::AfterMember(previous_member),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((opening_end, closing_start, targets))
+}
+
+fn brace_list_delimiters(list: &SyntaxNode) -> Option<(SyntaxToken, SyntaxToken)> {
+    let direct_tokens = list
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) => Some(token),
+            SyntaxElement::Node(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let opening = direct_tokens
+        .iter()
+        .find(|token| token.kind() == SyntaxKind::L_BRACE)?;
+    let closing = direct_tokens
+        .iter()
+        .rfind(|token| token.kind() == SyntaxKind::R_BRACE)?;
+    Some(((*opening).clone(), (*closing).clone()))
+}
+
+fn collect_list_comments(
+    list: &SyntaxNode,
+    members: &[SyntaxNode],
+) -> Result<ListComments, SourceDocumentError> {
+    let start = list.offset().to_usize();
+    let end = list.full_range().end().to_usize();
+    let candidates = collect_comment_candidates(list.green(), start, end)?;
+    let (interior_start, interior_end, targets) = list_comment_targets(list, members)?;
+    let mut comments = ListComments {
+        before: vec![Vec::new(); members.len()],
+        after: vec![Vec::new(); members.len()],
+        closing: Vec::new(),
+    };
+    let mut candidates = candidates
+        .leading
+        .into_iter()
+        .chain(candidates.trailing)
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|comment| comment.range.start);
+    for comment in candidates {
+        if comment.range.start < interior_start || comment.range.end > interior_end {
+            continue;
+        }
+        let target = targets.get(&comment_owner_key(&comment)).copied();
+        match target {
+            Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
+            Some(ListCommentTarget::AfterMember(index)) => comments.after[index].push(comment),
+            Some(ListCommentTarget::Closing) => comments.closing.push(comment),
+            None => return Err(SourceDocumentError::UnsupportedShape),
+        }
+    }
+    Ok(comments)
+}
+
 fn scan_source_trivia(
     trivia: &GreenTrivia,
     is_leading: bool,
     token_kind: SyntaxKind,
+    owner_token_range: Range<usize>,
     cursor: &mut usize,
     candidates: &mut CommentCandidates,
 ) -> Result<(), SourceDocumentError> {
@@ -376,6 +632,9 @@ fn scan_source_trivia(
                 range: start..*cursor,
                 text: normalize_comment_text(trivia.text()),
                 kind: trivia.kind(),
+                is_leading,
+                owner_token_kind: token_kind,
+                owner_token_range,
             };
             if is_leading && token_kind == SyntaxKind::EOF {
                 candidates.eof.push(comment);
@@ -393,6 +652,9 @@ fn scan_source_trivia(
                 range: start..*cursor,
                 text: normalize_comment_text(trivia.text()),
                 kind: TriviaKind::Shebang,
+                is_leading,
+                owner_token_kind: token_kind,
+                owner_token_range,
             });
         }
         TriviaKind::Whitespace | TriviaKind::LineBreak | TriviaKind::Skipped => {}
@@ -2073,6 +2335,10 @@ fn record_fields_document(
     fields: &ast::FieldList,
 ) -> Result<Doc, SourceDocumentError> {
     let declarations = fields.fields().collect::<Vec<_>>();
+    let declaration_nodes = declarations
+        .iter()
+        .map(|declaration| declaration.syntax().clone())
+        .collect::<Vec<_>>();
     let tokens = direct_token_kinds(fields.syntax());
     if tokens.len() < 2
         || tokens.first() != Some(&SyntaxKind::L_BRACE)
@@ -2091,6 +2357,7 @@ fn record_fields_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
 
+    let comments = collect_list_comments(fields.syntax(), &declaration_nodes)?;
     let documents = declarations
         .iter()
         .map(|declaration| record_field_document(source, declaration))
@@ -2098,19 +2365,28 @@ fn record_fields_document(
     let members = declarations
         .iter()
         .zip(documents)
-        .map(|(declaration, document)| {
+        .enumerate()
+        .map(|(index, (declaration, document))| {
             let range = declaration.syntax().text_range();
-            (range.start().to_usize(), range.end().to_usize(), document)
+            decorate_list_member_document(
+                source,
+                &comments.before[index],
+                &comments.after[index],
+                range.start().to_usize(),
+                range.end().to_usize(),
+                document,
+            )
         })
-        .collect();
-    broken_brace_list_document(source, members)
+        .collect::<Result<Vec<_>, _>>()?;
+    broken_brace_list_document(source, members, &comments.closing)
 }
 
 fn broken_brace_list_document(
     source: &ParsedSource,
     members: Vec<(usize, usize, Doc)>,
+    closing_comments: &[SourceComment],
 ) -> Result<Doc, SourceDocumentError> {
-    if members.is_empty() {
+    if members.is_empty() && closing_comments.is_empty() {
         return Ok(Doc::text("{}"));
     }
     let mut body = vec![Doc::HardLine];
@@ -2128,12 +2404,71 @@ fn broken_brace_list_document(
         }
         body.push(document.clone());
     }
+    if !closing_comments.is_empty() {
+        if let Some((_, previous_end, _)) = members.last() {
+            let gap = source
+                .text()
+                .get(*previous_end..closing_comments[0].range.start)
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            body.push(Doc::HardLine);
+            if gap.matches('\n').count() > 1 {
+                body.push(Doc::HardLine);
+            }
+        }
+        append_comment_documents(&mut body, closing_comments, source.text(), None)?;
+    }
     Ok(Doc::concat([
         Doc::text("{"),
         Doc::indent(Doc::concat(body)),
         Doc::HardLine,
         Doc::text("}"),
     ]))
+}
+
+fn decorate_list_member_document(
+    source: &ParsedSource,
+    leading_comments: &[SourceComment],
+    trailing_comments: &[SourceComment],
+    start: usize,
+    end: usize,
+    document: Doc,
+) -> Result<(usize, usize, Doc), SourceDocumentError> {
+    if leading_comments.is_empty() && trailing_comments.is_empty() {
+        return Ok((start, end, document));
+    }
+    let mut documents = Vec::new();
+    let mut output_start = start;
+    if !leading_comments.is_empty() {
+        append_comment_documents(&mut documents, leading_comments, source.text(), None)?;
+        append_comment_gap(
+            &mut documents,
+            source.text(),
+            leading_comments.last().map(|comment| comment.range.end),
+            Some(start),
+        )?;
+        output_start = leading_comments[0].range.start;
+    }
+    documents.push(document);
+    let mut trailing_comment_requires_line_break = false;
+    for comment in trailing_comments {
+        if trailing_comment_requires_line_break {
+            documents.push(Doc::HardLine);
+        }
+        if comment.kind == TriviaKind::LineComment && !trailing_comment_requires_line_break {
+            documents.push(Doc::line_suffix(Doc::text(format!(" {}", comment.text))));
+        } else {
+            if !trailing_comment_requires_line_break {
+                documents.push(Doc::text(" "));
+            }
+            documents.push(Doc::verbatim(comment.text.clone()));
+        }
+        trailing_comment_requires_line_break = comment.kind == TriviaKind::LineComment
+            || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'));
+    }
+    let output_end = trailing_comments
+        .last()
+        .map_or(end, |comment| comment.range.end);
+    Ok((output_start, output_end, Doc::concat(documents)))
 }
 
 fn record_field_document(
@@ -2240,6 +2575,11 @@ fn enum_decl_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+    let declaration_nodes = declarations
+        .iter()
+        .map(|declaration| declaration.syntax().clone())
+        .collect::<Vec<_>>();
+    let comments = collect_list_comments(variants.syntax(), &declaration_nodes)?;
     let documents = declarations
         .iter()
         .map(|variant| enum_variant_document(source, variant))
@@ -2247,12 +2587,20 @@ fn enum_decl_document(
     let members = declarations
         .iter()
         .zip(documents)
-        .map(|(variant, document)| {
+        .enumerate()
+        .map(|(index, (variant, document))| {
             let range = variant.syntax().text_range();
-            (range.start().to_usize(), range.end().to_usize(), document)
+            decorate_list_member_document(
+                source,
+                &comments.before[index],
+                &comments.after[index],
+                range.start().to_usize(),
+                range.end().to_usize(),
+                document,
+            )
         })
-        .collect();
-    let variants = broken_brace_list_document(source, members)?;
+        .collect::<Result<Vec<_>, _>>()?;
+    let variants = broken_brace_list_document(source, members, &comments.closing)?;
 
     let mut documents = vec![Doc::text(format!(
         "{visibility_prefix}enum {}",
