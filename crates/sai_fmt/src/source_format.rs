@@ -1200,6 +1200,28 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_binding_type_colons() {
+        let source = concat!(
+            "fn binding_types(){\n",
+            "let value:/* integer */I32=1\n",
+            "var count:/* counter */USize=0\n",
+            "let/* typed */code:/* identifier */I32=/* initial value */1\n",
+            "}\n",
+        );
+        let expected = concat!(
+            "fn binding_types() {\n",
+            "    let value: /* integer */ I32 = 1\n",
+            "    var count: /* counter */ USize = 0\n",
+            "    let /* typed */ code: /* identifier */ I32 = /* initial value */ 1\n",
+            "}\n",
+        );
+        let formatted =
+            format_source(source.as_bytes()).expect("type colon comments are supported");
+        assert_eq!(formatted, expected);
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
     fn attached_comments_move_with_top_level_declarations() {
         let source = concat!(
             "// function comment\n",

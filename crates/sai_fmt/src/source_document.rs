@@ -428,6 +428,7 @@ enum ListCommentTarget {
     OpeningTrailing,
     BeforeMember(usize),
     AfterKeyword(usize),
+    AfterTypeColon(usize),
     AfterOperator(usize),
     AfterMember(usize),
     Closing,
@@ -448,6 +449,7 @@ struct ListComments {
     opening_trailing: Vec<SourceComment>,
     before: Vec<Vec<SourceComment>>,
     after_keyword: Vec<Vec<SourceComment>>,
+    after_type_colon: Vec<Vec<SourceComment>>,
     after_operator: Vec<Vec<SourceComment>>,
     after: Vec<Vec<SourceComment>>,
     closing: Vec<SourceComment>,
@@ -461,6 +463,10 @@ impl ListComments {
             || self.before.iter().any(|comments| !comments.is_empty())
             || self
                 .after_keyword
+                .iter()
+                .any(|comments| !comments.is_empty())
+            || self
+                .after_type_colon
                 .iter()
                 .any(|comments| !comments.is_empty())
             || self
@@ -706,6 +712,18 @@ fn block_comment_targets(
                 ListCommentTarget::AfterOperator(index),
             );
         }
+        if let Some(type_colon_token) = block_statement_type_colon_token(statement) {
+            owner_tokens.push(type_colon_token.clone());
+            targets.insert(
+                (
+                    false,
+                    type_colon_token.kind(),
+                    type_colon_token.text_range().start().to_usize(),
+                    type_colon_token.text_range().end().to_usize(),
+                ),
+                ListCommentTarget::AfterTypeColon(index),
+            );
+        }
         let last_token = statement
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?;
@@ -751,6 +769,21 @@ fn block_statement_operator_token(statement: &SyntaxNode) -> Option<SyntaxToken>
             .and_then(|statement| statement.op().map(|(operator, _)| operator)),
         _ => None,
     }
+}
+
+fn block_statement_type_colon_token(statement: &SyntaxNode) -> Option<SyntaxToken> {
+    if !matches!(
+        statement.kind(),
+        SyntaxKind::LET_STMT | SyntaxKind::VAR_STMT
+    ) {
+        return None;
+    }
+    statement
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::COLON => Some(token),
+            _ => None,
+        })
 }
 
 fn brace_list_delimiters(list: &SyntaxNode) -> Option<(SyntaxToken, SyntaxToken)> {
@@ -822,6 +855,7 @@ fn collect_brace_unit_comments(
         opening_trailing: Vec::new(),
         before: vec![Vec::new(); member_count],
         after_keyword: vec![Vec::new(); member_count],
+        after_type_colon: vec![Vec::new(); member_count],
         after_operator: vec![Vec::new(); member_count],
         after: vec![Vec::new(); member_count],
         closing: Vec::new(),
@@ -843,6 +877,9 @@ fn collect_brace_unit_comments(
             Some(ListCommentTarget::BeforeMember(index)) => comments.before[index].push(comment),
             Some(ListCommentTarget::AfterKeyword(index)) => {
                 comments.after_keyword[index].push(comment)
+            }
+            Some(ListCommentTarget::AfterTypeColon(index)) => {
+                comments.after_type_colon[index].push(comment)
             }
             Some(ListCommentTarget::AfterOperator(index)) => {
                 comments.after_operator[index].push(comment)
@@ -3404,6 +3441,7 @@ fn block_document(
                 source,
                 statement,
                 &comments.after_keyword[index],
+                &comments.after_type_colon[index],
                 &comments.after_operator[index],
                 expression_group_ids,
             )
@@ -4545,6 +4583,7 @@ fn closure_expression_document(
             &Stmt::Expr(statement.clone()),
             &[],
             &[],
+            &[],
             expression_group_ids,
         )?;
         if flat_document_width(&header).is_some() && flat_document_width(&flat_statement).is_some()
@@ -4582,6 +4621,7 @@ fn closure_body_forces_break(
         let document = statement_document(
             source,
             &Stmt::Expr(statement.clone()),
+            &[],
             &[],
             &[],
             expression_group_ids,
@@ -4718,6 +4758,7 @@ fn unsafe_block_expression_document(
             &Stmt::Expr(statement.clone()),
             &[],
             &[],
+            &[],
             expression_group_ids,
         )?;
         let flat_statement = first_choice_layout(&flat_statement);
@@ -4737,6 +4778,7 @@ fn statement_document(
     source: &ParsedSource,
     statement: &Stmt,
     keyword_comments: &[SourceComment],
+    type_colon_comments: &[SourceComment],
     operator_comments: &[SourceComment],
     expression_group_ids: &mut ExpressionGroupIds,
 ) -> Result<Doc, SourceDocumentError> {
@@ -4808,7 +4850,12 @@ fn statement_document(
             }
             binding.push(pattern_document(source, &pattern, expression_group_ids)?);
             if let Some(ty) = ty {
-                binding.extend([Doc::text(": "), type_document(source, &ty)?]);
+                binding.push(Doc::text(":"));
+                append_single_line_block_comments(&mut binding, type_colon_comments)?;
+                binding.push(Doc::text(" "));
+                binding.push(type_document(source, &ty)?);
+            } else if !type_colon_comments.is_empty() {
+                return Err(SourceDocumentError::UnsupportedShape);
             }
             binding.push(Doc::text(" ="));
             binding.push(right_hand_side_after_operator_document(
@@ -4857,7 +4904,12 @@ fn statement_document(
             }
             binding.push(Doc::text(node_text(source, name.syntax())));
             if let Some(ty) = ty {
-                binding.extend([Doc::text(": "), type_document(source, &ty)?]);
+                binding.push(Doc::text(":"));
+                append_single_line_block_comments(&mut binding, type_colon_comments)?;
+                binding.push(Doc::text(" "));
+                binding.push(type_document(source, &ty)?);
+            } else if !type_colon_comments.is_empty() {
+                return Err(SourceDocumentError::UnsupportedShape);
             }
             binding.push(Doc::text(" ="));
             binding.push(right_hand_side_after_operator_document(
