@@ -635,25 +635,27 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
             ));
         }
     }
-    for node in root
-        .descendants()
-        .filter(|node| node.kind() == SyntaxKind::CTOR_PAT_ARGS)
-    {
-        let argument_count = node.children().count();
-        if argument_count == 0
-            || !comma_delimited_tokens_match(
-                &node,
-                SyntaxKind::L_PAREN,
-                SyntaxKind::R_PAREN,
-                argument_count,
-            )
-        {
+    for node in root.descendants().filter(|node| {
+        matches!(
+            node.kind(),
+            SyntaxKind::CTOR_PAT_ARGS | SyntaxKind::TUPLE_PAT | SyntaxKind::SLICE_PAT
+        )
+    }) {
+        let (open, close) = match node.kind() {
+            SyntaxKind::CTOR_PAT_ARGS | SyntaxKind::TUPLE_PAT => {
+                (SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)
+            }
+            SyntaxKind::SLICE_PAT => (SyntaxKind::L_BRACKET, SyntaxKind::R_BRACKET),
+            _ => continue,
+        };
+        let item_count = node.children().count();
+        if item_count == 0 || !comma_delimited_tokens_match(&node, open, close, item_count) {
             continue;
         }
         if let Some(token) = node
             .children_with_tokens()
             .find_map(|element| match element {
-                SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_PAREN => Some(token),
+                SyntaxElement::Token(token) if token.kind() == open => Some(token),
                 _ => None,
             })
         {
@@ -5054,12 +5056,15 @@ fn tuple_pattern_document(
         .into_iter()
         .map(|element| pattern_document(source, &element, expression_group_ids))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(delimited_list_document(
+    let opening_suffix = delimited_pattern_opening_suffix(tuple.syntax(), SyntaxKind::L_PAREN)?;
+    Ok(delimited_list_document_with_options_and_opening_suffix(
         expression_group_ids.next(),
         "(",
         ")",
         documents,
         true,
+        true,
+        opening_suffix,
     ))
 }
 
@@ -5094,13 +5099,33 @@ fn slice_pattern_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    Ok(delimited_list_document(
+    let opening_suffix = delimited_pattern_opening_suffix(slice.syntax(), SyntaxKind::L_BRACKET)?;
+    Ok(delimited_list_document_with_options_and_opening_suffix(
         expression_group_ids.next(),
         "[",
         "]",
         documents,
+        true,
         false,
+        opening_suffix,
     ))
+}
+
+fn delimited_pattern_opening_suffix(
+    node: &SyntaxNode,
+    opening_kind: SyntaxKind,
+) -> Result<Vec<Doc>, SourceDocumentError> {
+    let opening = node
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == opening_kind => Some(token),
+            _ => None,
+        })
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let comments = trailing_comments_after_token(&opening)?;
+    let mut suffix = Vec::new();
+    append_single_line_block_comments_without_leading_space(&mut suffix, &comments)?;
+    Ok(suffix)
 }
 
 fn rest_pattern_document(
@@ -5196,22 +5221,7 @@ fn constructor_pattern_arguments_document(
     let final_is_rest = children
         .last()
         .is_some_and(|child| ast::RestPat::can_cast(child.kind()));
-    let opening = arguments
-        .syntax()
-        .children_with_tokens()
-        .find_map(|element| match element {
-            SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_PAREN => Some(token),
-            _ => None,
-        })
-        .ok_or(SourceDocumentError::UnsupportedShape)?;
-    let opening_comments = trailing_comments_after_token(&opening)?;
-    let mut opening_suffix = Vec::new();
-    if !opening_comments.is_empty() {
-        append_single_line_block_comments_without_leading_space(
-            &mut opening_suffix,
-            &opening_comments,
-        )?;
-    }
+    let opening_suffix = delimited_pattern_opening_suffix(arguments.syntax(), SyntaxKind::L_PAREN)?;
     Ok(delimited_list_document_with_options_and_opening_suffix(
         expression_group_ids.next(),
         "(",

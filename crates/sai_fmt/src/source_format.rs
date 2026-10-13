@@ -1893,6 +1893,98 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_tuple_and_slice_pattern_openers() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{(/* tuple */first,second)=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value { (/* tuple */ first, second) => 0 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{[/* slice */first,second]=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value { [/* slice */ first, second] => 0 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{(/* tuple */first_argument,second_argument,third_argument,fourth_argument,fifth_argument)=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        (/* tuple */\n",
+                    "            first_argument,\n",
+                    "            second_argument,\n",
+                    "            third_argument,\n",
+                    "            fourth_argument,\n",
+                    "            fifth_argument,\n",
+                    "        ) => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{[/* slice */first_argument,second_argument,third_argument,fourth_argument,fifth_argument]=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        [/* slice */\n",
+                    "            first_argument,\n",
+                    "            second_argument,\n",
+                    "            third_argument,\n",
+                    "            fourth_argument,\n",
+                    "            fifth_argument,\n",
+                    "        ] => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{[/* nested */item]=>item,_=>0})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(match value { [/* nested */ item] => item, _ => 0 })\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("tuple and slice pattern opener comments are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_unsupported_comments_after_tuple_and_slice_pattern_openers() {
+        let sources = [
+            "fn f(value:State){\nmatch value{(// tuple\nfirst,second)=>0}\n}\n",
+            "fn f(value:State){\nmatch value{(/* tuple\ncontinued */first,second)=>0}\n}\n",
+            "fn f(value:State){\nmatch value{[// slice\nfirst,second]=>0}\n}\n",
+            "fn f(value:State){\nmatch value{[/* slice\ncontinued */first,second]=>0}\n}\n",
+            "fn f(value:State){\nmatch value{[/* empty */]=>0}\n}\n",
+        ];
+        for source in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn formats_single_line_block_comments_after_match_guard_expressions() {
         let source = concat!(
             "fn f(value:State){\n",
