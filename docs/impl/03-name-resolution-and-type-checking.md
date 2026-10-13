@@ -168,7 +168,7 @@ The package identity used for `use` resolution comes from the `package` field of
 
 **CLI integration update (IR-463).** Phase 1 validates every surviving `@export_name` against each item's actual syntactic target, including non-export functions, nested entries and component-target checks; invalid targets therefore produce `INVALID_ATTRIBUTE_TARGET` instead of the Stage 0 feature-gate diagnostic. Explicit root-core and test-build context controls export-table collection, not target validation. Ordinary root-package core-module checks build the export-name table and report duplicate/reserved names. Component builds and test analysis do not create that table or run package export-name uniqueness checks. The narrow HIR API does not change the general Stage 1 attribute gate. Core-module lowering does not yet consume the table.
 
-**CLI integration update (IR-464).** After Phase 1 declaration collection, the driver walks only target-filtered `UseEntry`s and runs the local module-target adapter. `sai check` reports `USE_OF_CURRENT_MODULE` and `UNKNOWN_MODULE` at the full `PKG_PATH` span. It leaves malformed paths to parser diagnostics, missing roots to the module-tree pass, foreign identities to package selection, and interface targets to interface resolution. Unknown local paths carry the longest matched module or namespace prefix and every direct child module in spelling order, as required by spec/04 §4.3.2; a note names the matched prefix even when it has no child modules. `lib` and kebab segments receive their specified help, and the CLI preserves each help child when a diagnostic has more than one. This is a one-shot CLI bridge: it does not bind imports, resolve foreign packages, or compute the Phase 2 fixpoint.
+**CLI integration update (IR-464).** After Phase 1 declaration collection, the driver walks only target-filtered `UseEntry`s and runs the local module-target adapter. `sai check` reports `USE_OF_CURRENT_MODULE` and `UNKNOWN_MODULE` at the full `PKG_PATH` span. It leaves malformed paths to parser diagnostics, missing roots to the module-tree pass, and foreign identities to package selection. The adapter suppresses an unknown-module diagnostic when the final local segment names an interface declared in its exact parent module; IR-466 below records the Phase 3 binding of that local interface alias. Unknown local paths carry the longest matched module or namespace prefix and every direct child module in spelling order, as required by spec/04 §4.3.2; a note names the matched prefix even when it has no child modules. `lib` and kebab segments receive their specified help, and the CLI preserves each help child when a diagnostic has more than one. That target-diagnostic slice did not bind imports or compute the Phase 2 fixpoint; IR-466 below records the later, narrower alias binding step.
 
 ## 3.3 Item collection and imports
 
@@ -230,6 +230,32 @@ For each module in `ModuleId` order, Phase 1 walks the module's `ItemTree` ([imp
 
 Member namespaces of items (variants, associated functions, fields, trait items) are not built here. They are part of `adt_def`, `trait_def` and `inherent_impls` (§3.6, §3.9), because their duplicate rules are owned by spec/05 and some of them depend on impls.
 
+**Temporary CLI Phase 3 slice (IR-466).** The driver currently extends these
+Phase 1 scopes only with same-package module and interface aliases. Its
+`Phase1ModuleScopes` facade has `declared`, a hash-map `scope`, and an
+`imports` list; it does not yet contain the final member namespace `X(M)` or
+re-export fixpoint state. A module alias uses its target module's canonical
+`DefId`, represented for now as `Res::Def(DefKind::Module, def_id)`; a local
+interface alias uses its declaring interface's `DefId` as
+`Res::Def(DefKind::Interface, def_id)`. Explicit aliases keep their spelling;
+otherwise the last path segment or package name is used, with hyphens changed
+to underscores. For a parseable use path, binding-name keyword/reserved-name
+checks happen before target resolution, so a name is checked even when its
+target is unknown or foreign. `PUB_USE_WITHOUT_ITEMS` is reported for every
+retained `pub use` without an item list, even when `PKG_PATH` is absent. When
+the path token exists, the diagnostic uses its range before malformed-path
+resolution is deferred; when it is absent, the diagnostic uses the full
+`UseDecl` span. Item-only uses do not bind their target. Alias
+bindings remain private to their module, even when an alias appears on a
+`pub use` that also has an item list. The pass reports `REDUNDANT_IMPORT` for
+an alias that already names the same target and `DUPLICATE_BINDING` for a
+conflict with another entity. A newly inserted local module or interface
+alias named `panic` or `unreachable` also produces `SHADOWS_PRELUDE`. The
+imports it records are aliases only (`item_index: None`, `test_only: false`).
+Foreign package targets, item imports, test-only classification, prelude
+checks for declarations and item aliases, prelude checks on foreign targets,
+the full prelude table, and the re-export lookup/fixpoint remain unimplemented.
+
 ### 3.3.3 Phase 2: the import fixpoint
 
 Phase 2 resolves every `use` declaration of every module and computes the member namespaces `X(M)` with the memoized `lookup(M, x)` of spec/04 §4.5.4. The implementation:
@@ -240,9 +266,9 @@ Phase 2 resolves every `use` declaration of every module and computes the member
 
 The module-only path step is implemented by `sai_resolve::module_target::resolve_module_target`. Given path symbols after the package identity, it performs exact spelling lookup through modules and namespace directories, maps an empty path to the package root, and rejects the current module. Unknown paths carry the longest matched prefix and byte-ordered direct module candidates; malformed child IDs fail as an invalid module tree.
 
-The temporary CLI bridge is `sai_resolve::use_target_diagnostics::collect_local_use_target_diagnostics`, called after Phase 1 by the driver. It uses each filtered use's AST ID to recover the whole `PKG_PATH` token range, then converts only local current-module and unknown-module errors to diagnostics. It suppresses malformed-token duplicates, the module-tree-owned missing-root case, foreign package identities and unresolved paths whose final segment names an interface declared by the parent module. Candidate data uses `matched_prefix` and `module_candidates`. For `UNKNOWN_MODULE`, spec/04 §4.3.2 step 2.3 requires the full direct-child module list; this exact list takes precedence over impl/11 N-H-5's edit-distance heuristic for general name suggestions.
+The temporary CLI bridge is `sai_resolve::use_target_diagnostics::collect_local_use_target_diagnostics`, called after Phase 1 by the driver. It uses each filtered use's AST ID to recover the whole `PKG_PATH` token range, then converts only local current-module and unknown-module errors to diagnostics. It suppresses malformed-token duplicates, the module-tree-owned missing-root case, foreign package identities and unresolved paths whose final segment names an interface declared by the parent module. The Phase 3 slice also resolves such a local interface alias to its declaring interface `DefId`. Candidate data uses `matched_prefix` and `module_candidates`. For `UNKNOWN_MODULE`, spec/04 §4.3.2 step 2.3 requires the full direct-child module list; this exact list takes precedence over impl/11 N-H-5's edit-distance heuristic for general name suggestions.
 
-The §4.3.3 binding-name step is implemented by `sai_resolve::use_binding::derive_use_binding_name`. Explicit aliases retain their symbol; an unaliased target derives its final path segment or package name and maps hyphens to underscores. An item-only `UseItems` list has no module binding; an empty list is rejected by the parser under spec/03 §3.1.1 and §3.4, and HIR still preserves its presence for error recovery in the stable item-tree shape. Derived strict keywords and reserved words return `RequiresAlias`; Phase 3 still owns the source diagnostic and binding insertion.
+The §4.3.3 binding-name step is implemented by `sai_resolve::use_binding::derive_use_binding_name`. Explicit aliases retain their symbol; an unaliased target derives its final path segment or package name and maps hyphens to underscores. An item-only `UseItems` list has no module binding; an empty list is rejected by the parser under spec/03 §3.1.1 and §3.4, and HIR still preserves its presence for error recovery in the stable item-tree shape. Derived strict keywords and reserved words return `RequiresAlias`; the temporary local Phase 3 pass checks the binding name before resolving its target and inserts successful local module or interface aliases. The binding and diagnostics for listed items remain unimplemented.
 
 The §4.3.4 item-alias case-class check is implemented by `sai_resolve::use_item_binding::derive_use_item_binding`. It preserves the source and binding symbols and returns whether their lexer-defined case classes differ; Phase 3 owns the `ALIAS_CASE_MISMATCH` diagnostic and binding insertion. The shared `sai_syntax::identifier_case_kind` helper keeps this check aligned with lexing, including Unicode uppercase and titlecase letters.
 
