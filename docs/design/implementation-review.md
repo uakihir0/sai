@@ -3454,3 +3454,11 @@
 - **Review:** The review found the defect with a `test """` name followed by `{}`, and with an `extern` module name followed by a block. The new test `refuses_multiline_block_string_names_before_a_block` pins both forms. The existing formatter test suite passes with 391 tests.
 - **Human review:** **Review required:** Decide whether the canonical form should place the `{` on its own line after the closing `"""`, or whether the spec should forbid multiline names in these positions. The current refusal keeps the output free of invented layout until the decision is made.
 - **Remaining scope:** Layout of a block after a multiline name; `var _` closure parameters remain refused as recorded in IR-448.
+
+### IR-452: Run formatting and workspace tests across supported desktop operating systems
+
+- **Decision:** Add a GitHub Actions workflow that runs `cargo fmt --all -- --check` and `cargo test --workspace --locked` on pushes to `main` and pull requests. Run both checks on `ubuntu-latest`, `macos-latest`, and `windows-latest`; do not cache Cargo build artifacts.
+- **Reason:** The workspace explicitly implements Unix and Windows filesystem behavior, and uses standard-library platform-specific paths behind `cfg` gates. Testing all three hosted operating systems exercises those supported implementations. Avoiding a target-directory cache bounds retained artifacts and keeps CI setup simple; the locked test command preserves dependency reproducibility.
+- **Review:** The workflow uses read-only repository permissions, cancels superseded runs, and permits all matrix jobs to report independently. No local workflow linter is installed; YAML syntax will be parsed before commit.
+- **Human review:** **Review required:** Confirm that every pull request should run the full workspace suite on all three hosted operating systems, including the associated CI runtime and cost.
+- **Remaining scope:** Add Stage 0 bootstrap and normative conformance gates when the project reaches the corresponding documented milestones.
