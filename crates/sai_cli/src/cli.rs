@@ -6404,7 +6404,7 @@ mod tests {
         ));
 
         let (exit_code, stdout, stderr) =
-            invoke_with_stdin(&["--format=json", "fmt", "-"], b"const ANSWER: I32 = 42");
+            invoke_with_stdin(&["--format=json", "fmt", "-"], b"fn f(){fn(var _){}}");
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
@@ -7270,7 +7270,7 @@ mod tests {
         let directory = TestDirectory::new();
         let unsupported = directory.child("unsupported.sai");
         let broken = directory.child("source.sai");
-        let unsupported_source = b"const ANSWER: I32 = 42";
+        let unsupported_source = b"fn f(){fn(var _){}}";
         let broken_source = b"\xef\xbb\xbffn broken(";
         fs::write(&unsupported, unsupported_source).unwrap();
         fs::write(&broken, broken_source).unwrap();

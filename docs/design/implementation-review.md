@@ -3334,3 +3334,115 @@
 - **Review:** The summary already embedded for `--list` (`EXPLAIN_CODE_SUMMARIES`, generated from Appendix A by `tools/update_summary_snapshot.py`) can supply the Summary section once examples exist.
 - **Human review:** **Review required:** Decide where the examples and fixes live (owner documents, or a checked table), and who writes them for the registered codes.
 - **Remaining scope:** Author and compile-check the Example and Fix blocks of every code, then generate the Markdown record from them with a script under `tools/`.
+
+### IR-437: Format top-level const declarations
+
+- **Decision:** Format `const NAME: Type = expr` with visibility, outer docs, and attributes through the item prefix. The initializer uses the right-hand-side layout of §14.9.7 (flat, moved, broken, overflow), and the type is printed by the type builder. Comments inside the declaration remain fail-closed.
+- **Reason:** §14.7.6 gives the canonical form `const NAME: Type = expr` and says that the initializer follows §14.9.7. Reusing the shared right-hand-side builder keeps const initializers in line with `let`, `var`, and alias right-hand sides.
+- **Review:** Focused regressions cover flat output, visibility, docs and attributes, blank-line gaps between consecutive consts, a long initializer that moves into the parenthesized operator-chain layout, and fixed-point output. The existing test that used `const ANSWER: I32 = 42` as an unsupported example now uses `const ANSWER: I32 = /* answer */ 42`, which still exercises a comment gap. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that a long const initializer uses the parenthesized operator-chain layout of §14.9.3 after `=`, and that the existing unsupported-shape test now documents a comment gap rather than a missing item kind.
+- **Remaining scope:** Comments inside const declarations, including comments between `=` and the initializer. Two `sai_cli` tests, `fmt_reports_source_stdin_refusals_and_unsupported_shapes` and `fmt_source_paths_distinguish_refusals_from_unsupported_shapes` (`crates/sai_cli/src/cli.rs`), still use `const ANSWER: I32 = 42` as the valid-but-unsupported example. They fail after this step because const now formats. Updating them needs a change in `crates/sai_cli`, which is outside this stream, so it is left for the CLI owner.
+
+### IR-438: Format invariant predicates as a brace list
+
+- **Decision:** Print `invariant Name { p1, p2 }` with the predicates as a brace list (§14.5.4): flat with `, ` separators when it fits, otherwise one predicate per line without commas. An open-ended range that is not the last predicate is parenthesized only in the broken layout, through an `IfBroken` on the list group.
+- **Reason:** §14.7.6 gives the brace-list form, and N-H-81 makes invariant predicates flat when they fit. §14.5.4 rule 5 requires parentheses only where a line break would not end the element, so the flat form keeps `a.., b` unchanged.
+- **Review:** Focused regressions cover flat and broken lists, trailing commas, doc comments and attributes, multiple invariants, and open-ended ranges in flat and broken lists, with fixed-point checks. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that open-ended range predicates are parenthesized only when the predicate list breaks.
+- **Remaining scope:** Comments inside an invariant predicate list, which remain fail-closed.
+
+### IR-439: Keep effect `covers` sets on the declaration line
+
+- **Decision:** Print `effect name covers { a, b }` on one line, with the covers set as a brace list. The grammar accepts a line break before `covers` (`nl "covers"`), but the formatter does not use it.
+- **Reason:** §14.7.6 gives `effect name covers { a, b }` as the canonical form. Keeping `covers` on the declaration line matches the other keyword-led clauses and prevents an extra line break from changing the layout.
+- **Review:** Focused regressions cover a plain effect, `pub` visibility, an empty covers set, a flat covers set, a broken covers set, docs and attributes, and fixed-point output. The grammar's optional line break before `covers` is not exercised. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that `covers` stays on the declaration line even when the source places it on the next line.
+- **Remaining scope:** Comments inside an effect declaration or its covers set.
+
+### IR-440: Format world import, export, and include items
+
+- **Decision:** Print each world item as its outer docs and attributes, then the keyword (`import`, `export`, or `include`), then either a world reference or a function head. Function heads reuse the function-declaration layout without a body, so world functions get no clauses (the grammar refuses clauses on interface and world functions). `include` takes only a world reference. The world body is a broken item list (§14.5.5).
+- **Reason:** §14.7.6 gives the canonical forms of world items, and §14.5.5 makes item bodies broken even with one item. Reusing the function-head builder keeps `import fn now() -> U64` in the same layout as other function heads.
+- **Review:** Focused regressions cover empty and populated worlds, `pub` visibility, docs and attributes on items, package references and dotted module references, function imports and exports with a broken parameter list, and fixed-point output. Attributes on world items are validation errors, so they are formatted, not refused. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that world function items print with no clauses, and that docs and attributes on world items stay on their own lines.
+- **Remaining scope:** Comments inside world bodies, including trailing comments on world items, which remain fail-closed.
+
+### IR-441: Print world references verbatim or as dotted module paths
+
+- **Decision:** A world reference that is a package path prints its `PKG_PATH` token verbatim. A module-path reference prints its segments joined by `.`, using the existing module-path builder.
+- **Reason:** A package path is a single token with its own syntax (`wasi:http/outgoing-handler`), and §14.4.1 keeps it as written. A module path is a sequence of names joined by dots, which the module-path builder already prints canonically.
+- **Review:** Covered by the world regressions for package and module references, with fixed-point output.
+- **Human review:** **Review required:** Confirm that package paths are kept verbatim and module paths are printed with no spaces around dots.
+- **Remaining scope:** None for this item kind.
+
+### IR-442: Format extern blocks with function heads
+
+- **Decision:** Print `unsafe? extern "abi" module "name" {`, followed by the members as function heads in a broken item body, and `}`. The ABI and module strings go through the literal builder, so multiline strings keep their shape. An empty block prints `{}`.
+- **Reason:** §14.7.6 gives the canonical form, and §14.5.5 makes item bodies broken. Reusing the item-body and function-head builders keeps extern members in the same layout as interface members.
+- **Review:** Focused regressions cover an empty block, an unsafe block with a module name, docs and attributes on members, a blank line between members, and fixed-point output. Extern `"C"` blocks are refused by the parser with a Stage 7 diagnostic, so they are not formatted. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that extern members print as heads with no body and that blank lines between members are kept.
+- **Remaining scope:** Comments inside extern blocks, which remain fail-closed.
+
+### IR-443: Format test declarations with a broken block
+
+- **Decision:** Print `test "name" {`, the block, and `}`. The name goes through the literal builder, and the block uses the ordinary block layout (§14.8.1).
+- **Reason:** §14.7.6 gives `test "name" {` + block + `}`. The name is a string token, so it shares the string handling of other literals.
+- **Review:** Focused regressions cover a populated test, an empty test, a test after a function with docs and attributes, and fixed-point output. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that a test name is printed with the literal builder and that the block follows after one space.
+- **Remaining scope:** Comments inside test blocks, which remain fail-closed through the block builder.
+
+### IR-444: Format property declarations with one space before the parameters
+
+- **Decision:** Print `property "name" (params) {`, with one space between the name and `(` (§14.4.2 rule 15), the parameter list as an ordinary parameter list, one space, and the block. The parameter list uses the parameter-list builder, so `var` parameters are kept and an empty list prints `()`.
+- **Reason:** §14.7.6 gives `property "name" (params) {` + block + `}`, and §14.4.2 rule 15 requires one space between the name string and `(`.
+- **Review:** Focused regressions cover a single parameter, an empty parameter list, a `var` parameter with another parameter, and fixed-point output. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that a property name is followed by one space and the parameters, and that `var` parameters keep their keyword.
+- **Remaining scope:** Attributes on property parameters, which the parameter builder refuses; comments inside properties.
+
+### IR-445: Keep comments inside the new item kinds fail-closed
+
+- **Decision:** Comments inside const, invariant, effect, world, extern, test, and property declarations are not formatted. Outer docs, attributes, and comments before or after the whole declaration keep the existing top-level comment rules.
+- **Reason:** The comment rules of §14.6 are position-specific in the implementation, and each new item body needs its own owner registration. Keeping them fail-closed avoids moving a comment in a layout that was not reviewed.
+- **Review:** Covered by the existing unsupported-shape test, which now uses a comment inside a const initializer. Comments at top-level boundaries of these items keep the behavior of the other item kinds. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that comments inside the new item kinds are refused rather than moved, and that the remaining comment gaps are accepted as an implementation limit for this stage.
+- **Remaining scope:** Comments inside the new item kinds, which need owner registration and layout rules per position.
+
+### IR-446: Format cast expressions with one space around `as`
+
+- **Decision:** Print `expr as Type` with one space on each side of `as`. The operand is formatted without protection, and the type uses the type builder. Parentheses written by the author are kept.
+- **Reason:** The parser binds `as` tighter than every binary operator, so an unparenthesized operand is never a binary chain that could need parentheses. Rule 12 of §14.4.2 gives one space around `as`.
+- **Review:** Focused regressions cover casts in a let initializer, a call argument with an operator chain, a parenthesized operator operand, and a cast inside a closure body, with fixed-point output. Casts are reported by the validation pass (`NO_AS_CAST`), so they are formatted, not refused. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that `a + b as I64` is printed without added parentheses, because the parser binds `as` tighter than `+`.
+- **Remaining scope:** Comments inside cast expressions, which remain fail-closed.
+
+### IR-447: Format `Self` value expressions as verbatim leaves
+
+- **Decision:** Print a `Self` value expression (`Self(0, 0)`, `Self.new(1)`) as the token `Self`. The following field, call, or index is formatted by the existing postfix builders.
+- **Reason:** The parser produces `Self` as a leaf expression with no segments; `.new` and the call are postfix operations on it. Printing the leaf verbatim keeps the postfix builders responsible for the layout.
+- **Review:** Focused regressions cover `Self` in a call and in a path, inside an impl with two methods, and fixed-point output. The arm mirrors the existing `self` value arm. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that `Self` values need no special layout beyond the postfix builders.
+- **Remaining scope:** Comments inside `Self` expressions.
+
+### IR-448: Format underscore closure parameters with and without types
+
+- **Decision:** Print a closure parameter `_` or `_: Type`, following the rule for function parameters (§14.7.4 rule 2). `var _` remains fail-closed, as the existing test `keeps_malformed_closure_parameters_fail_closed` requires.
+- **Reason:** The grammar accepts `_` with a type in closure parameters, and the formatter must format every parsed file (§14.2.3). Keeping `var _` fail-closed preserves the decision that the existing test records.
+- **Review:** Focused regressions cover `_`, `_: I32`, and a mixed closure list with a named `var` parameter, plus fixed-point output. The existing test for `var _` still passes unchanged. No independent review has been run yet.
+- **Human review:** **Review required:** Confirm that `_: Type` closure parameters are accepted, and that `var _` is still refused by design.
+- **Remaining scope:** `var _` closure parameters, which the existing test keeps fail-closed.
+
+### IR-449: Hard parse failures of non-item files report an internal error
+
+- **Decision:** No change. A file whose top level is an expression, such as `http.get(url).await`, returns `INTERNAL_COMPILER_ERROR` ("source formatter could not render input") from the CLI, because the parser recovers without producing a diagnostic that the formatter can report.
+- **Reason:** The formatter contract (§14.1.1, §14.2.2) refuses on parser diagnostics. The current path, documented in §14.1.1 for hard parse failures, does not produce such a diagnostic, so the file is neither formatted nor refused with a location.
+- **Review:** Observed while probing the chapter's `sai` examples: the draft-reconciliation example shows the case. Not covered by a regression test.
+- **Human review:** **Review required:** Confirm whether a top-level expression should be refused with a parser diagnostic (owned by the parser and the formatter entry point), instead of an internal error.
+- **Remaining scope:** Parser diagnostics for top-level non-item tokens.
+
+### IR-450: Remaining unsupported shapes after this step
+
+- **Decision:** Record the remaining `UnsupportedShape` sites of `source_document.rs` by family. Every probed comment-free grammar form formats, so the remaining sites are comment positions (leading and trailing comments on tokens inside items, clauses, types, patterns, matches, and blocks), structural guards that fire on comment-bearing or recovered trees, and the documented `var _` closure parameter.
+- **Reason:** The probe of comment-free snippets and the spec's `sai` blocks shows that comments cause almost every remaining fail-closed case. The grouping by enclosing function is: about 145 item and item-body guards, 93 expression and operator guards, 78 comment guards, 55 type, bound, generic, and clause guards, 39 pattern guards, 37 statement and control guards, 20 attribute and doc guards, 14 closure guards, and 7 others (488 sites in total; the families are assigned by enclosing function name, so the counts are approximate).
+- **Review:** The counts come from a grep of `UnsupportedShape` grouped by the enclosing function, taken after this step. The spec corpus was extracted from `docs/spec`, `docs/impl`, and `docs/design`, excluding fences marked `noncanonical` or `rejected`. Of the 287 extracted blocks, 256 format and are fixed points, and 11 are refused by the parser (fragments, invalid examples, and the top-level expression of IR-449). Of the 20 blocks that do not format, 18 contain a comment; the other 2 are `extern "C"` blocks that the parser refuses for Stage 7.
+- **Human review:** **Review required:** Confirm that comment placement is the main remaining gap, and that the comment owners of §14.6 need a dedicated stage.
+- **Remaining scope:** Comment placement across the constructs listed above; `var _` closure parameters.
