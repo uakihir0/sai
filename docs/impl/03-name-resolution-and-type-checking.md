@@ -225,6 +225,7 @@ For each module in `ModuleId` order, Phase 1 walks the module's `ItemTree` ([imp
 
 - A second declaration of a bound name is `DUPLICATE_BINDING` on the later name, with a related location on the earlier one (spec/04 §4.4.3). The earlier binding stays.
 - A declaration named like a reserved type name is `RESERVED_TYPE_NAME` (spec/04 §4.4.4). The item is collected but not bound.
+- A first declaration with any other name from the shadowable prelude table (spec/16 §16.4) is `SHADOWS_PRELUDE` at its name. Reserved names take precedence, and a later duplicate receives only `DUPLICATE_BINDING`. During the temporary Phase 3 merge, if an earlier successful local alias or item import already owns that name, the declaration's Phase 1 shadow warning is removed; the source-order winner alone receives the prelude warning.
 - An interface declaration whose exact spelling matches a direct module-file child is `MODULE_INTERFACE_CONFLICT` on the interface name (spec/04 §4.3.2). A namespace directory without a module file at that path does not conflict.
 - **Test names** ([spec/14](../spec/14-testing.md) §14.2.3). Each `Test` and `Property` entry that survives `@target` is checked when the walk reaches it, in every build, with or without test analysis. Its name is the string of the `Test(name)` or `Property(name)` component of its `DefPath` ([impl/02](02-frontend-ast-hir.md) §2.8.2), which is the value of its `STRING` token. A name that is empty or contains a character of general category `Cc` is `INVALID_TEST_NAME`, at the string. Otherwise the name is compared, by code points, with the names of the earlier tests and properties of the same module that passed the first check. An equal name is `DUPLICATE_TEST_NAME`, at the later string, with a note at the earlier one. A `test` and a `property` are compared with each other. An invalid name is not compared, so one declaration gets at most one of the two codes. The check reads only the item tree, so its result does not depend on test analysis (spec/14 §14.2.3 item 5).
 
@@ -258,9 +259,31 @@ receives `DUPLICATE_BINDING` and the earlier binding remains. Same-entity
 imports produce `REDUNDANT_IMPORT`; unresolved local items include up to three
 nearby names from the resolved member namespace.
 
+**Prelude shadow diagnostics (IR-468).** Phase 1 checks declarations against
+the exact shadowable-name list in spec/16 §16.4. Reserved type names and
+`Send`/`Share` are excluded; the reserved-name diagnostic takes precedence.
+The prelude provider's declaration at its canonical item path does not warn;
+other declarations get `SHADOWS_PRELUDE` unless an earlier source-order
+binding already owns the name. Later duplicates get `DUPLICATE_BINDING`
+alone. Successfully inserted local module and interface aliases use the same
+list, as do local item imports that denote a different entity from the prelude
+binding. The grammar permits only lowercase aliases for these module targets,
+so only `panic` and `unreachable` can
+collide in this alias form.
+
+When compiling the exact `sai:core` or `sai:alloc` package, local definition
+paths are compared with the canonical prelude item path: an exact reimport
+produces `REDUNDANT_IMPORT` and leaves the implicit prelude binding in place.
+Re-export chains retain that identity through their original `DefId`. Foreign
+imports remain deferred until external item and prelude identities are
+available.
+
 Foreign package and interface member tables remain deferred, as do test-only
-classification, the full prelude checks for declarations and item aliases,
+classification, identity checks for imports from foreign targets,
 declared-requirement checks, and the final `package_scopes(PackageId)` query.
+The resolver does not yet build the complete canonical prelude
+`BTreeMap<Symbol, Res>` described in §3.3.7; the current bridge compares local
+definition paths for the supported item-import cases.
 When a foreign/interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign/interface item as deferred; a complete package resolver
