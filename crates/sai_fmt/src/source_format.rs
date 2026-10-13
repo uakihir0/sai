@@ -620,9 +620,279 @@ mod tests {
     #[test]
     fn reports_valid_but_unsupported_shapes_explicitly() {
         assert_eq!(
-            format_source(b"const ANSWER: I32 = 42"),
+            format_source(b"const ANSWER: I32 = /* answer */ 42"),
             Err(SourceFormatError::UnsupportedShape)
         );
+    }
+
+    #[test]
+    fn formats_const_declarations_in_canonical_layout() {
+        for (source, expected) in [
+            (
+                b"const ANSWER: I32 = 42".as_slice(),
+                "const ANSWER: I32 = 42\n",
+            ),
+            (
+                b"pub const  LIMIT :U32=  0xff",
+                "pub const LIMIT: U32 = 0xFF\n",
+            ),
+            (
+                b"/// Limit.\n@deprecated(\"old\")\npub const X: I32 = 1",
+                "/// Limit.\n@deprecated(\"old\")\npub const X: I32 = 1\n",
+            ),
+            (
+                b"const A: I32 = 1\nconst B: I32 = 2\n\n\nfn f() {}",
+                "const A: I32 = 1\nconst B: I32 = 2\n\nfn f() {}\n",
+            ),
+            (b"const EMPTY: Str = \"\"", "const EMPTY: Str = \"\"\n"),
+        ] {
+            let formatted = format_source(source).expect("const declaration formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn formats_invariant_declarations_as_predicate_brace_lists() {
+        for (source, expected) in [
+            (
+                b"invariant Range { self >= 0, self <= 100 }".as_slice(),
+                "invariant Range { self >= 0, self <= 100 }\n",
+            ),
+            (
+                b"invariant Range{\nself>=0\nself<=100,\n}",
+                "invariant Range { self >= 0, self <= 100 }\n",
+            ),
+            (
+                b"/// Bounds.\n@deprecated(\"old\")\ninvariant Range { self >= 0 }",
+                "/// Bounds.\n@deprecated(\"old\")\ninvariant Range { self >= 0 }\n",
+            ),
+            (
+                b"invariant Range { self >= 0 }\ninvariant Bounded { self <= 100 }",
+                "invariant Range { self >= 0 }\ninvariant Bounded { self <= 100 }\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("invariant formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn parenthesizes_open_ranges_only_in_broken_invariant_lists() {
+        let flat = format_source(b"invariant R { a.., b }").expect("flat open range formats");
+        assert_eq!(flat, "invariant R { a.., b }\n");
+        assert_eq!(format_source(flat.as_bytes()), Ok(flat));
+        let source = b"invariant Bounds { first_bound_with_a_long_name.., second_bound_with_a_long_name, third_bound_name(self) }";
+        let formatted = format_source(source).expect("broken open range formats");
+        assert_eq!(
+            formatted,
+            "invariant Bounds {\n    (first_bound_with_a_long_name..)\n    second_bound_with_a_long_name\n    third_bound_name(self)\n}\n"
+        );
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn breaks_long_invariant_predicates_one_per_line_without_commas() {
+        let source = b"invariant Ledger { balance_after_every_transaction_is_non_negative(self), total_matches_sum_of_entries(self), audit_trail_is_complete(self) }";
+        let formatted = format_source(source).expect("long invariant formats");
+        assert_eq!(
+            formatted,
+            "invariant Ledger {\n    balance_after_every_transaction_is_non_negative(self)\n    total_matches_sum_of_entries(self)\n    audit_trail_is_complete(self)\n}\n"
+        );
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_effect_declarations_with_covers_sets() {
+        for (source, expected) in [
+            (b"effect io".as_slice(), "effect io\n"),
+            (b"pub  effect http", "pub effect http\n"),
+            (
+                b"effect io covers{net.http,alloc}",
+                "effect io covers { net.http, alloc }\n",
+            ),
+            (b"effect io covers {}", "effect io covers {}\n"),
+            (
+                b"/// Input and output.\n@deprecated(\"old\")\neffect io",
+                "/// Input and output.\n@deprecated(\"old\")\neffect io\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("effect declaration formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn breaks_long_effect_covers_sets_one_effect_per_line() {
+        let source = b"effect storage covers { storage.read_metadata, storage.write_objects, storage.sync_journal, storage.compact_segments, storage.rotate_keys }";
+        let formatted = format_source(source).expect("long effect formats");
+        assert_eq!(
+            formatted,
+            "effect storage covers {\n    storage.read_metadata\n    storage.write_objects\n    storage.sync_journal\n    storage.compact_segments\n    storage.rotate_keys\n}\n"
+        );
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_world_declarations_with_one_item_per_line() {
+        for (source, expected) in [
+            (b"world client {}".as_slice(), "world client {}\n"),
+            (
+                b"world client {\nimport wasi:http/outgoing-handler\nexport users\ninclude base\n}",
+                "world client {\n    import wasi:http/outgoing-handler\n    export users\n    include base\n}\n",
+            ),
+            (
+                b"pub world client{import app.model}",
+                "pub world client {\n    import app.model\n}\n",
+            ),
+            (
+                b"world api {\n    import fn now() -> U64\n    export fn handle(request: Request) -> Response\n}",
+                "world api {\n    import fn now() -> U64\n    export fn handle(request: Request) -> Response\n}\n",
+            ),
+            (
+                b"/// Client world.\n@deprecated(\"old\")\nworld client {\n    import wasi:http/outgoing-handler\n}",
+                "/// Client world.\n@deprecated(\"old\")\nworld client {\n    import wasi:http/outgoing-handler\n}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("world declaration formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn breaks_long_world_function_heads_by_parameters() {
+        let source = b"world api {\n    export fn handle_request(request: borrow Request, deadline: Deadline, retries: RetryPolicy, tracing: TraceContext) -> Response\n}";
+        let formatted = format_source(source).expect("long world export formats");
+        assert_eq!(
+            formatted,
+            "world api {\n    export fn handle_request(\n        request: borrow Request,\n        deadline: Deadline,\n        retries: RetryPolicy,\n        tracing: TraceContext,\n    ) -> Response\n}\n"
+        );
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_extern_blocks_with_function_heads() {
+        for (source, expected) in [
+            (
+                b"extern \"wasm\" module \"env\" {}".as_slice(),
+                "extern \"wasm\" module \"env\" {}\n",
+            ),
+            (
+                b"unsafe extern \"wasm\" module \"libc\" {\nfn strlen(s: borrow U8) -> Usize\nfn abs(x: I32) -> I32\n}",
+                "unsafe extern \"wasm\" module \"libc\" {\n    fn strlen(s: borrow U8) -> Usize\n    fn abs(x: I32) -> I32\n}\n",
+            ),
+            (
+                b"extern \"wasm\"module\"env\"{\n@import_name(\"now\")\nfn clock_now() -> U64\n\n/// Sleeps.\nfn sleep(ms: U32)\n}",
+                "extern \"wasm\" module \"env\" {\n    @import_name(\"now\")\n    fn clock_now() -> U64\n\n    /// Sleeps.\n    fn sleep(ms: U32)\n}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("extern block formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn formats_test_declarations_with_broken_blocks() {
+        for (source, expected) in [
+            (
+                b"test \"adds\" {\nlet total = 1 + 2\nassert total == 3\n}".as_slice(),
+                "test \"adds\" {\n    let total = 1 + 2\n    assert total == 3\n}\n",
+            ),
+            (b"test \"empty\"{}", "test \"empty\" {}\n"),
+            (
+                b"/// Checks the adder.\n@ignore\ntest \"adds\"\n{\n    assert add(1, 2) == 3\n}\nfn add(a: I32, b: I32) -> I32 { a + b }",
+                "/// Checks the adder.\n@ignore\ntest \"adds\" {\n    assert add(1, 2) == 3\n}\n\nfn add(a: I32, b: I32) -> I32 {\n    a + b\n}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("test declaration formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn formats_property_declarations_with_one_space_before_parameters() {
+        for (source, expected) in [
+            (
+                b"property \"reverse twice\" (xs: Vec<I32>) {\nreverse(reverse(xs.clone())) == xs\n}".as_slice(),
+                "property \"reverse twice\" (xs: Vec<I32>) {\n    reverse(reverse(xs.clone())) == xs\n}\n",
+            ),
+            (b"property \"unit\"(){true}", "property \"unit\" () {\n    true\n}\n"),
+            (
+                b"property \"sorted\"(var xs: Vec<I32>, n: U32) {\nlet ys = sort(xs)\nys.len() == xs.len()\n}",
+                "property \"sorted\" (var xs: Vec<I32>, n: U32) {\n    let ys = sort(xs)\n    ys.len() == xs.len()\n}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("property declaration formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn formats_cast_expressions_with_spaces_around_as() {
+        for (source, expected) in [
+            (
+                b"fn f(i:I32)->USize{let n=i   as   USize\nn}".as_slice(),
+                "fn f(i: I32) -> USize {\n    let n = i as USize\n    n\n}\n",
+            ),
+            (
+                b"fn f(a: I32, b: I32) -> I64 {\n    g(a + b as I64, (a + b) as I64)\n}",
+                "fn f(a: I32, b: I32) -> I64 {\n    g(a + b as I64, (a + b) as I64)\n}\n",
+            ),
+            (
+                b"fn f(xs: Vec<I32>) -> Vec<I64> {\n    xs.map(fn(x) { x as I64 })\n}",
+                "fn f(xs: Vec<I32>) -> Vec<I64> {\n    xs.map(fn(x) { x as I64 })\n}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("cast expression formats");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn formats_self_type_value_expressions_in_calls_and_paths() {
+        let source = b"impl Pair {\n    fn zero() -> Self {\n        Self(0,0)\n    }\n    fn one() -> Self {\n        Self.new( 1 )\n    }\n}";
+        let formatted = format_source(source).expect("Self values format");
+        assert_eq!(
+            formatted,
+            "impl Pair {\n    fn zero() -> Self {\n        Self(0, 0)\n    }\n    fn one() -> Self {\n        Self.new(1)\n    }\n}\n"
+        );
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+    }
+
+    #[test]
+    fn formats_underscore_closure_parameters_with_and_without_types() {
+        for (source, expected) in [
+            (
+                b"fn f() {\n    let g = fn(_, _: I32) { }\n}".as_slice(),
+                "fn f() {\n    let g = fn(_, _: I32) {}\n}\n",
+            ),
+            (
+                b"fn f() {\n    let g = fn(var x: I32, _: I32) -> I32 { x }\n}",
+                "fn f() {\n    let g = fn(var x: I32, _: I32) -> I32 { x }\n}\n",
+            ),
+        ] {
+            let formatted = format_source(source).expect("closure parameters format");
+            assert_eq!(formatted, expected);
+            assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
+        }
+    }
+
+    #[test]
+    fn breaks_long_const_initializers_like_right_hand_sides() {
+        let source = b"const TOTAL: I64 = first_subtotal_value * second_subtotal_value + third_subtotal_value * fourth_subtotal_value + fifth";
+        let formatted = format_source(source).expect("long const formats");
+        assert_eq!(
+            formatted,
+            "const TOTAL: I64 = (\n    first_subtotal_value * second_subtotal_value\n    + third_subtotal_value * fourth_subtotal_value\n    + fifth\n)\n"
+        );
+        assert_eq!(format_source(formatted.as_bytes()), Ok(formatted));
     }
 
     #[test]

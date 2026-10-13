@@ -105,7 +105,25 @@ pub(super) fn source_document(source: &ParsedSource) -> Result<Doc, SourceDocume
             Item::Type(declaration) => {
                 type_decl_document(source, &declaration, &mut expression_group_ids)?
             }
-            _ => return Err(SourceDocumentError::UnsupportedShape),
+            Item::Const(declaration) => {
+                const_decl_document(source, &declaration, &mut expression_group_ids)?
+            }
+            Item::Invariant(declaration) => {
+                invariant_decl_document(source, &declaration, &mut expression_group_ids)?
+            }
+            Item::Effect(declaration) => effect_decl_document(source, &declaration)?,
+            Item::World(declaration) => {
+                world_decl_document(source, &declaration, &mut expression_group_ids)?
+            }
+            Item::ExternBlock(declaration) => {
+                extern_block_document(source, &declaration, &mut expression_group_ids)?
+            }
+            Item::Test(declaration) => {
+                test_decl_document(source, &declaration, &mut expression_group_ids)?
+            }
+            Item::Property(declaration) => {
+                property_decl_document(source, &declaration, &mut expression_group_ids)?
+            }
         };
         if !detached_comments.is_empty() {
             units.push(detached_comment_item_document(
@@ -3681,6 +3699,495 @@ fn item_list_body_document(
     ]))
 }
 
+fn significant_token_kinds(node: &sai_syntax::SyntaxNode) -> Vec<SyntaxKind> {
+    direct_token_kinds(node)
+        .into_iter()
+        .filter(|kind| *kind != SyntaxKind::NEWLINE)
+        .collect()
+}
+
+fn item_document_for_node(
+    document: Doc,
+    node: &sai_syntax::SyntaxNode,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let range = node.text_range();
+    let multiline = crate::print(&document)
+        .map_err(|_| SourceDocumentError::UnsupportedShape)?
+        .trim_end_matches('\n')
+        .contains('\n');
+    Ok(ItemDocument {
+        document,
+        start: range.start().to_usize(),
+        end: range.end().to_usize(),
+        multiline,
+    })
+}
+
+fn const_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::ConstDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attrs = declaration.attrs().collect::<Vec<_>>();
+    let prefix = item_prefix_document(source, docs.clone(), attrs.iter().cloned())?;
+    let visibility_prefix = visibility_prefix(declaration.visibility())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let ty = declaration
+        .ty()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let initializer = declaration
+        .initializer()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if significant_token_kinds(declaration.syntax())
+        != [SyntaxKind::CONST_KW, SyntaxKind::COLON, SyntaxKind::EQ]
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+                .into_iter()
+                .chain(
+                    declaration
+                        .visibility()
+                        .map(|visibility| visibility.syntax().text_range()),
+                )
+                .chain([
+                    name.syntax().text_range(),
+                    ty.syntax().text_range(),
+                    initializer.syntax().text_range(),
+                ]))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let value = right_hand_side_document(
+        source,
+        &initializer,
+        ExpressionContext::Unprotected,
+        expression_group_ids,
+        true,
+    )?;
+    let document = Doc::concat([
+        prefix,
+        Doc::text(format!(
+            "{visibility_prefix}const {}:",
+            node_text(source, name.syntax())
+        )),
+        Doc::text(" "),
+        type_document(source, &ty)?,
+        Doc::text(" ="),
+        value,
+    ]);
+    item_document_for_node(document, declaration.syntax())
+}
+
+fn invariant_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::InvariantDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attrs = declaration.attrs().collect::<Vec<_>>();
+    let prefix = item_prefix_document(source, docs.clone(), attrs.iter().cloned())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let predicates = declaration
+        .predicates()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let expressions = predicates.expressions().collect::<Vec<_>>();
+    let list_tokens = significant_token_kinds(predicates.syntax());
+    let separators_only = list_tokens
+        .get(1..list_tokens.len().saturating_sub(1))
+        .is_some_and(|middle| middle.iter().all(|kind| *kind == SyntaxKind::COMMA));
+    if !has_contextual_token(source, declaration.syntax(), "invariant")?
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+                .into_iter()
+                .chain([name.syntax().text_range(), predicates.syntax().text_range()]))
+        || expressions.is_empty()
+        || predicates.syntax().children().count() != expressions.len()
+        || list_tokens.first() != Some(&SyntaxKind::L_BRACE)
+        || list_tokens.last() != Some(&SyntaxKind::R_BRACE)
+        || !separators_only
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let group = GroupId(predicates.syntax().text_range().start().raw());
+    let last_index = expressions.len() - 1;
+    let mut predicate_documents = Vec::with_capacity(expressions.len());
+    for (index, expression) in expressions.iter().enumerate() {
+        let document = expression_document(
+            source,
+            expression,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?;
+        // In a broken list, an open-ended range would not be ended by its line break
+        // (§14.5.4 rule 5), so it is parenthesized only then.
+        predicate_documents.push(
+            if index < last_index && is_open_ended_range_expression(expression) {
+                Doc::if_broken(
+                    group,
+                    Doc::concat([Doc::text("("), document.clone(), Doc::text(")")]),
+                    document,
+                )
+            } else {
+                document
+            },
+        );
+    }
+    let document = Doc::concat([
+        prefix,
+        Doc::text(format!("invariant {} ", node_text(source, name.syntax()))),
+        brace_list_document(group, predicate_documents),
+    ]);
+    item_document_for_node(document, declaration.syntax())
+}
+
+fn effect_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::EffectDecl,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attrs = declaration.attrs().collect::<Vec<_>>();
+    let prefix = item_prefix_document(source, docs.clone(), attrs.iter().cloned())?;
+    let visibility_prefix = visibility_prefix(declaration.visibility())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let covers = declaration.covers();
+    if !has_contextual_token(source, declaration.syntax(), "effect")?
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+                .into_iter()
+                .chain(
+                    declaration
+                        .visibility()
+                        .map(|visibility| visibility.syntax().text_range()),
+                )
+                .chain([name.syntax().text_range()])
+                .chain(covers.as_ref().map(|covers| covers.syntax().text_range())))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let mut documents = vec![Doc::text(format!(
+        "{visibility_prefix}effect {}",
+        node_text(source, name.syntax())
+    ))];
+    if let Some(covers) = covers {
+        let set = covers.set().ok_or(SourceDocumentError::UnsupportedShape)?;
+        if covers.syntax().children().count() != 1
+            || !has_contextual_token(source, covers.syntax(), "covers")?
+        {
+            return Err(SourceDocumentError::UnsupportedShape);
+        }
+        documents.extend([Doc::text(" covers "), effect_set_document(source, &set)?]);
+    }
+    let document = Doc::concat([prefix, Doc::concat(documents)]);
+    item_document_for_node(document, declaration.syntax())
+}
+
+fn world_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::WorldDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attrs = declaration.attrs().collect::<Vec<_>>();
+    let prefix = item_prefix_document(source, docs.clone(), attrs.iter().cloned())?;
+    let visibility_prefix = visibility_prefix(declaration.visibility())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let items = declaration
+        .items()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if !has_contextual_token(source, declaration.syntax(), "world")?
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+                .into_iter()
+                .chain(
+                    declaration
+                        .visibility()
+                        .map(|visibility| visibility.syntax().text_range()),
+                )
+                .chain([name.syntax().text_range(), items.syntax().text_range()]))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let item_body = item_list_body_document(
+        source,
+        &items,
+        expression_group_ids,
+        |child, expression_group_ids| world_item_document(source, child, expression_group_ids),
+    )?;
+    let document = Doc::concat([
+        prefix,
+        Doc::text(format!(
+            "{visibility_prefix}world {} ",
+            node_text(source, name.syntax())
+        )),
+        item_body,
+    ]);
+    item_document_for_node(document, declaration.syntax())
+}
+
+fn world_item_document(
+    source: &ParsedSource,
+    item: sai_syntax::SyntaxNode,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let (keyword, allows_function) = match item.kind() {
+        SyntaxKind::WORLD_IMPORT => ("import", true),
+        SyntaxKind::WORLD_EXPORT => ("export", true),
+        SyntaxKind::WORLD_INCLUDE => ("include", false),
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    let keyword_matches = match keyword {
+        "export" => significant_token_kinds(&item) == [SyntaxKind::EXPORT_KW],
+        _ => has_contextual_token(source, &item, keyword)?,
+    };
+    let docs = item.children().find_map(ast::Docs::cast);
+    let attrs = item
+        .children()
+        .filter_map(ast::Attribute::cast)
+        .collect::<Vec<_>>();
+    let function = item.children().find_map(ast::FnDecl::cast);
+    let reference = item.children().find_map(ast::WorldRef::cast);
+    let (body_range, body_document) = match (function, reference) {
+        (Some(function), None) if allows_function => {
+            let range = function.syntax().text_range();
+            (
+                range,
+                function_document(source, &function, expression_group_ids)?.document,
+            )
+        }
+        (None, Some(reference)) => (
+            reference.syntax().text_range(),
+            world_ref_document(source, &reference)?,
+        ),
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    if !keyword_matches
+        || item
+            .children()
+            .map(|child| child.text_range())
+            .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+                .into_iter()
+                .chain([body_range]))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let prefix = item_prefix_document(source, docs, attrs)?;
+    let document = Doc::concat([prefix, Doc::text(format!("{keyword} ")), body_document]);
+    item_document_for_node(document, &item)
+}
+
+fn extern_block_document(
+    source: &ParsedSource,
+    declaration: &ast::ExternBlock,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attrs = declaration.attrs().collect::<Vec<_>>();
+    let prefix = item_prefix_document(source, docs.clone(), attrs.iter().cloned())?;
+    let items = declaration
+        .items()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let abi = declaration
+        .abi()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let module = declaration.module();
+    let unsafe_prefix = match significant_token_kinds(declaration.syntax()).as_slice() {
+        [
+            SyntaxKind::UNSAFE_KW,
+            SyntaxKind::EXTERN_KW,
+            SyntaxKind::STRING,
+        ] => "unsafe ",
+        [SyntaxKind::EXTERN_KW, SyntaxKind::STRING] => "",
+        _ => return Err(SourceDocumentError::UnsupportedShape),
+    };
+    if declaration
+        .syntax()
+        .children()
+        .map(|child| child.text_range())
+        .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+            .into_iter()
+            .chain(module.as_ref().map(|module| module.syntax().text_range()))
+            .chain([items.syntax().text_range()]))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let module_document = module
+        .as_ref()
+        .map(|module| extern_module_document(source, module))
+        .transpose()?
+        .unwrap_or_else(|| Doc::text(""));
+    let item_body = item_list_body_document(
+        source,
+        &items,
+        expression_group_ids,
+        |child, expression_group_ids| match child.kind() {
+            SyntaxKind::FN_DECL => function_document(
+                source,
+                &ast::FnDecl::cast(child).ok_or(SourceDocumentError::UnsupportedShape)?,
+                expression_group_ids,
+            ),
+            _ => Err(SourceDocumentError::UnsupportedShape),
+        },
+    )?;
+    let document = Doc::concat([
+        prefix,
+        Doc::text(format!("{unsafe_prefix}extern ")),
+        literal_document(source, LiteralToken::String(abi))?,
+        module_document,
+        Doc::text(" "),
+        item_body,
+    ]);
+    item_document_for_node(document, declaration.syntax())
+}
+
+fn extern_module_document(
+    source: &ParsedSource,
+    module: &ast::ExternModule,
+) -> Result<Doc, SourceDocumentError> {
+    let value = module
+        .value()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if significant_token_kinds(module.syntax()) != [SyntaxKind::LIDENT, SyntaxKind::STRING]
+        || module.syntax().children().count() != 0
+        || !module.syntax().children_with_tokens().any(|element| {
+            matches!(element, SyntaxElement::Token(token) if token.kind() == SyntaxKind::LIDENT && token.text() == "module")
+        })
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(Doc::concat([
+        Doc::text(" module "),
+        literal_document(source, LiteralToken::String(value))?,
+    ]))
+}
+
+fn test_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::TestDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attrs = declaration.attrs().collect::<Vec<_>>();
+    let prefix = item_prefix_document(source, docs.clone(), attrs.iter().cloned())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let body = declaration
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if significant_token_kinds(declaration.syntax()) != [SyntaxKind::LIDENT, SyntaxKind::STRING]
+        || !has_leading_contextual_token(declaration.syntax(), "test")
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+                .into_iter()
+                .chain([body.syntax().text_range()]))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let name_document = literal_document(source, LiteralToken::String(name))?;
+    let body_document = block_document(source, &body, expression_group_ids)?;
+    let document = Doc::concat([
+        prefix,
+        Doc::text("test "),
+        name_document,
+        Doc::text(" "),
+        body_document,
+    ]);
+    item_document_for_node(document, declaration.syntax())
+}
+
+fn property_decl_document(
+    source: &ParsedSource,
+    declaration: &ast::PropertyDecl,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<ItemDocument, SourceDocumentError> {
+    let docs = declaration.docs();
+    let attrs = declaration.attrs().collect::<Vec<_>>();
+    let prefix = item_prefix_document(source, docs.clone(), attrs.iter().cloned())?;
+    let name = declaration
+        .name()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let params = declaration
+        .params()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let body = declaration
+        .body()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    if significant_token_kinds(declaration.syntax()) != [SyntaxKind::LIDENT, SyntaxKind::STRING]
+        || !has_leading_contextual_token(declaration.syntax(), "property")
+        || declaration
+            .syntax()
+            .children()
+            .map(|child| child.text_range())
+            .ne(item_prefix_child_ranges(docs.as_ref(), &attrs)
+                .into_iter()
+                .chain([params.syntax().text_range(), body.syntax().text_range()]))
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    let name_document = literal_document(source, LiteralToken::String(name))?;
+    let params_document = parameter_list_document(source, &params)?;
+    let body_document = block_document(source, &body, expression_group_ids)?;
+    let document = Doc::concat([
+        prefix,
+        Doc::text("property "),
+        name_document,
+        Doc::text(" "),
+        params_document,
+        Doc::text(" "),
+        body_document,
+    ]);
+    item_document_for_node(document, declaration.syntax())
+}
+
+fn has_leading_contextual_token(node: &sai_syntax::SyntaxNode, spelling: &str) -> bool {
+    node.children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() != SyntaxKind::NEWLINE => Some(token),
+            SyntaxElement::Token(_) | SyntaxElement::Node(_) => None,
+        })
+        .is_some_and(|token| token.kind() == SyntaxKind::LIDENT && token.text() == spelling)
+}
+
+fn world_ref_document(
+    source: &ParsedSource,
+    reference: &ast::WorldRef,
+) -> Result<Doc, SourceDocumentError> {
+    let child_count = reference.syntax().children().count();
+    match (
+        significant_token_kinds(reference.syntax()).as_slice(),
+        reference.mod_path(),
+    ) {
+        ([SyntaxKind::PKG_PATH], None) if child_count == 0 => {
+            Ok(Doc::text(node_text(source, reference.syntax())))
+        }
+        ([], Some(path)) if child_count == 1 => mod_path_document(source, &path),
+        _ => Err(SourceDocumentError::UnsupportedShape),
+    }
+}
+
 fn assoc_type_decl_document(
     source: &ParsedSource,
     declaration: &ast::AssocTypeDecl,
@@ -5433,17 +5940,17 @@ fn closure_parameter_document(
     }
     let mut documents = Vec::with_capacity(4);
     match token.kind() {
-        SyntaxKind::UNDERSCORE if !mutable && ty.is_none() => {
-            return Ok(Doc::text("_"));
-        }
+        // `var _` stays fail-closed (`keeps_malformed_closure_parameters_fail_closed`);
+        // `_` with a type follows the rule of function parameters (§14.7.4 rule 2).
+        SyntaxKind::UNDERSCORE if !mutable => {}
         SyntaxKind::LIDENT => {
             if mutable {
                 documents.push(Doc::text("var "));
             }
-            documents.push(Doc::text(node_text(source, name.syntax())));
         }
         _ => return Err(SourceDocumentError::UnsupportedShape),
     }
+    documents.push(Doc::text(node_text(source, name.syntax())));
     if let Some(ty) = ty {
         documents.extend([Doc::text(": "), type_document(source, &ty)?]);
     }
@@ -6643,6 +7150,34 @@ fn contract_clause_document(
     ]))
 }
 
+fn cast_expression_document(
+    source: &ParsedSource,
+    cast: &ast::CastExpr,
+    expression_group_ids: &mut ExpressionGroupIds,
+) -> Result<Doc, SourceDocumentError> {
+    let operand = cast
+        .expression()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let ty = cast.ty().ok_or(SourceDocumentError::UnsupportedShape)?;
+    if cast.syntax().children().count() != 2
+        || significant_token_kinds(cast.syntax()) != [SyntaxKind::AS_KW]
+    {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    // The parser binds `as` tighter than every binary operator, so the operand is
+    // never an unparenthesized binary chain that could need parentheses.
+    Ok(Doc::concat([
+        expression_document(
+            source,
+            &operand,
+            ExpressionContext::Unprotected,
+            expression_group_ids,
+        )?,
+        Doc::text(" as "),
+        type_document(source, &ty)?,
+    ]))
+}
+
 fn expression_document(
     source: &ParsedSource,
     expression: &Expr,
@@ -6835,6 +7370,15 @@ fn expression_document(
         Expr::Prefix(prefix) => {
             prefix_expression_document(source, prefix, context, expression_group_ids)
         }
+        Expr::SelfType(self_type) => {
+            if self_type.syntax().children().count() != 0
+                || direct_token_kinds(self_type.syntax()) != [SyntaxKind::SELF_TYPE_KW]
+            {
+                return Err(SourceDocumentError::UnsupportedShape);
+            }
+            Ok(Doc::text(node_text(source, self_type.syntax())))
+        }
+        Expr::Cast(cast) => cast_expression_document(source, cast, expression_group_ids),
         Expr::Range(range) => {
             range_expression_document(source, range, context, expression_group_ids)
         }
