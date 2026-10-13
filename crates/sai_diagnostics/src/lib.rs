@@ -5,7 +5,12 @@ use std::collections::BTreeSet;
 
 use sai_stable_hash::{StableHash, StableHasher};
 
+mod human;
 mod lint_levels;
+pub use human::{
+    Snippet, SnippetAnnotation, SnippetMark, SnippetRow, SourceSnippets, SummaryCounts,
+    render_diagnostic, render_summary,
+};
 pub use lint_levels::{
     LintPolicies, LintResolution, LintResolutionContext, LintResolutionError, ManifestLintLevel,
     OverrideLintLevel, ScopedLintLevel, apply_deny_warnings, resolve_lint_occurrence,
@@ -2320,6 +2325,66 @@ mod tests {
                 operation_result: None,
             },
         )
+    }
+
+    struct NoSourceText;
+
+    impl SourceSnippets for NoSourceText {
+        fn position(&self, _location: &Location) -> Option<(usize, usize)> {
+            None
+        }
+
+        fn snippet(
+            &self,
+            _file: &SourceRef,
+            _annotations: &[SnippetAnnotation],
+        ) -> Option<Snippet> {
+            None
+        }
+    }
+
+    #[test]
+    fn rendered_fix_titles_are_help_lines_after_the_producer_children() {
+        let primary = test_location(None);
+        let edit = TextEdit {
+            file: primary.file.clone(),
+            range: primary.span,
+            new_text: "name".to_owned(),
+        };
+        let snapshot = snapshot_for(&primary, std::slice::from_ref(&edit));
+        let fix = test_fix(
+            "replace with `name`",
+            Applicability::MaybeIncorrect,
+            replace_node_operation(),
+            vec![edit],
+            vec![],
+            &primary,
+            &snapshot,
+        )
+        .expect("the fix matches its edits");
+        let mut diagnostic = Diagnostic::new(
+            Code::from_name("UNKNOWN_FIELD").expect("registered code"),
+            Severity::Error,
+            "`User` has no field `username`",
+            Some(primary),
+        )
+        .with_workspace_snapshot(&snapshot)
+        .expect("the primary location is in the snapshot");
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message: "a fact about the field".to_owned(),
+                location: None,
+            })
+            .expect("the child has no location");
+        diagnostic.push_fix(fix).expect("fixes match the snapshot");
+
+        let rendered = crate::render_diagnostic(&diagnostic, &NoSourceText, false);
+
+        assert!(
+            rendered
+                .contains("  = note: a fact about the field\n  = help: replace with `name`\n\n")
+        );
     }
 
     #[test]
