@@ -3174,3 +3174,83 @@
 - **Review:** Focused regressions cover all three pattern list forms, flat and broken output, combined opener and separator comments, fixed-point output, and refusal of line comments, multiline block comments, and trailing-comma comments. Hostile review found no actionable issues; it confirmed that only the `item_count - 1` element-separating commas are registered and rendered, leaving a trailing comma unsupported. The workspace suite passed before the clippy-driven helper-arity cleanup; after that cleanup, all 375 formatter tests, workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
 - **Human review:** **Review required:** Confirm that single-line block comments after element-separating commas stay after those commas and before the next pattern element, while comments after trailing commas remain unsupported.
 - **Remaining scope:** Other comments attached to pattern-interior tokens and other unsupported comment-bearing syntax.
+
+### IR-480: Report unknown file-scope tokens instead of aborting the parse
+
+- **Decision:** At file scope, a token that no item production accepts is reported as `EXPECTED_TOKEN` with the message "expected an item" at that token. The token is always consumed. The following tokens, up to the next line-start item at bracket depth 0 or EOF, are wrapped with it in one `ERROR` node. The block path is unchanged.
+- **Reason:** `item()` returned `UnsupportedItem` for such tokens, and `parse_source_file` propagated it as `ParseError::Parser`, so the `parse` query panicked on any file with a stray top-level token. §2.5.4 and the item row of §2.5.11 require a recoverable diagnostic and that synchronization set, and appendix A has no more specific code. Consuming the first token prevents a stall when `line_starts_top_level_item` accepts a keyword such as `async` that `item()` rejects.
+- **Review:** Parser tests cover a leading unknown line, a visibility followed by a non-item, a bracket group that hides a line-start `fn`, a bare `async` on its own line, two unknown lines, and `pub` at EOF. A `lib.rs` test checks the public `parse` entry point. `cargo test -p sai_syntax`, `cargo fmt --all -- --check`, and `cargo clippy -p sai_syntax --all-targets -- -D warnings` pass.
+- **Human review:** **Review required:** Confirm that `EXPECTED_TOKEN` with the message "expected an item" is the intended code for an unknown file-scope token, and that one unknown line swallows the following lines up to the next item-start line instead of producing one diagnostic per line.
+- **Remaining scope:** The diagnostic carries no expected-set data, as the file-scope closer diagnostic does. When `export` precedes a non-function, `INVALID_EXPORT_TARGET` and this diagnostic are both reported, at different tokens.
+
+### IR-481: Keep lexer error tokens at file scope silent
+
+- **Decision:** A lexer `ERROR` token at file scope is wrapped alone in an `ERROR` node without a parser diagnostic. A following unknown token is still diagnosed.
+- **Reason:** §2.4.12 item 4 requires one diagnostic for a malformed byte sequence. Reporting `EXPECTED_TOKEN` as well broke `sai_fmt`'s `refuses_lexical_errors_with_the_lexer_diagnostics`, which requires lexical errors to produce no syntax errors. Wrapping only the token keeps later garbage diagnosable.
+- **Review:** `lexer_error_token_at_file_scope_has_no_second_parser_diagnostic` covers a `;` at file scope. `cargo test -p sai_fmt` passes after this change.
+- **Human review:** **Review required:** Confirm that a stray `;` or invalid UTF-8 at file scope produces only the lexical diagnostic, and that an unknown token after it still gets its own parser diagnostic.
+- **Remaining scope:** A visibility marker directly followed by a lexer `ERROR` token gets no separate diagnostic for the dangling `pub` or `export`. Other `ERROR` tokens in statement and expression positions follow their existing rules, which this change does not audit.
+
+### IR-482: Report `unsafe` without a block as a missing brace
+
+- **Decision:** `unsafe` in expression position that is not followed by `{` reports `EXPECTED_TOKEN` at the following token and wraps `unsafe` in an `ERROR` node. No `UNSAFE_BLOCK_EXPR` is built. This replaces the `UnsupportedSyntax` error.
+- **Reason:** spec/03 has only the `'unsafe' Block` form, so the old error did not reject a grammar construct. It failed the whole parse for a user error such as `unsafe y`.
+- **Review:** `unsafe_without_a_block_in_expression_position_reports_the_missing_brace` checks one diagnostic at the operand, no `UNSAFE_BLOCK_EXPR`, and the surviving `LET_STMT`.
+- **Human review:** **Review required:** Confirm that the diagnostic for `unsafe` followed by a non-brace points at the following token, not at `unsafe`.
+- **Remaining scope:** None.
+
+### IR-483: Report `move` without `fn` as a missing `fn`
+
+- **Decision:** `move` in expression position that is not followed by `fn` reports `EXPECTED_TOKEN` at the following token and wraps `move` in an `ERROR` node. `move fn` still parses as `CLOSURE_EXPR`.
+- **Reason:** spec/03 `ClosureExpr ::= 'move'? 'fn' ...` is the only Stage 0 form that starts with `move`. `async move` blocks are handled by `async_block_expr`.
+- **Review:** `move_without_fn_in_expression_position_reports_the_missing_fn` covers the error. The existing `function_parser_builds_closures_and_async_blocks` covers `move fn`.
+- **Human review:** **Review required:** Confirm that a `move` followed by a non-`fn` token is reported at that token as `EXPECTED_TOKEN`.
+- **Remaining scope:** None.
+
+### IR-484: Report a leading `.await` as a missing operand
+
+- **Decision:** A `.await` without an operand is reported as `EXPECTED_EXPRESSION` at the `.`, by the default missing-operand path. The postfix loop then attaches `.await` to the empty `ERROR` operand. The `UnsupportedSyntax` arm for this case is removed.
+- **Reason:** spec/03 has no primary production that starts with `.await`. `.await` is a postfix form. Reusing the missing-operand path keeps one diagnostic and adds no node kind.
+- **Review:** `await_without_a_receiver_reports_a_missing_expression` checks one `EXPECTED_EXPRESSION` at the `.` and an `AWAIT_EXPR` in the tree.
+- **Human review:** **Review required:** Confirm that an `AWAIT_EXPR` over an empty `ERROR` operand is acceptable to downstream lowering, since the parser reports the missing operand.
+- **Remaining scope:** None for the parser.
+
+### IR-485: Remove `ParserError::UnsupportedSyntax`
+
+- **Decision:** The `UnsupportedSyntax` variant is deleted, because no production constructs it now.
+- **Reason:** Any remaining construction would propagate through `parse_green_source` and panic the parse query in `lib.rs`. A variant that nothing constructs is removed, not kept as a trap. `UnsupportedItem` stays, because both recovery paths match on it.
+- **Review:** The crate builds with clippy at `-D warnings`, and a grep finds no remaining construction in `crates/sai_syntax`.
+- **Human review:** **Review required:** Confirm that no code outside `sai_syntax` matches on `ParserError::UnsupportedSyntax`.
+- **Remaining scope:** `UnsupportedItem` is still produced when no item production accepts a token, and both recovery paths handle it.
+
+### IR-486: Mark the completed-marker `precede` check unreachable
+
+- **Decision:** The `panic!` in `Marker::precede` becomes `unreachable!`, stating the invariant: a completed marker names a `Start` event, because only `complete_marker` writes `Start`, and `abandon_marker` rewrites only uncompleted `Tombstone` events. The other assertions in the cursor and marker machinery (`bump`, `precede`, event positions) are unchanged.
+- **Reason:** Gap (c) requires production panics to be proven unreachable or turned into diagnostics. This one can be proven from the marker code alone.
+- **Review:** Checked by reading `complete_marker` and `abandon_marker` in `parser.rs`. The `sai_syntax` suite passes.
+- **Human review:** **Review required:** Confirm that the remaining assertions, such as `bump` at EOF, are unreachable from every source input. They were not proven exhaustively.
+- **Remaining scope:** Convert the remaining assertion sites to `unreachable!` with invariant messages, after an exhaustive review of the token-cursor callers.
+
+### IR-487: Keep async closures out of Stage 0 and treat `move fn` as already implemented
+
+- **Decision:** Async closures stay unimplemented. `async fn(...)` and `async move fn(...)` keep reporting `NO_ASYNC_CLOSURE`, with an `ERROR` node around `async` and the closure. A bare `move fn` closure was never rejected, so it needs no change.
+- **Reason:** spec/11 §11.2.5 (N-I-1) says there are no async closures, and spec/03 `ClosureExpr` has no `async` form. spec/03 line 450 makes `'move'? 'fn'` Stage 0, and the existing dispatch parses it as `CLOSURE_EXPR`.
+- **Review:** The existing `async_closures_report_the_specific_diagnostic` test passes unchanged. `function_parser_builds_closures_and_async_blocks` already covers `move fn`.
+- **Human review:** **Review required:** Confirm that the async-closure gap is closed by the existing `NO_ASYNC_CLOSURE` diagnostic and not by an implementation.
+- **Remaining scope:** The fix that §2.5.6 describes is not attached (see IR-489).
+
+### IR-488: Keep block recovery for rejected items silent
+
+- **Decision:** `parse_item_in_block` still recovers `UnsupportedItem` silently. Only file scope reports the new `EXPECTED_TOKEN`.
+- **Reason:** `ITEM_IN_BLOCK` has already reported the block item, so a second diagnostic would be a cascade (§2.5.11). File scope has no other report for the token.
+- **Review:** The existing block-recovery tests pass unchanged. No new test pins a `pub` followed by a non-item inside a block.
+- **Human review:** **Review required:** Confirm that `pub` followed by a non-item inside a block reports `ITEM_IN_BLOCK` only.
+- **Remaining scope:** None.
+
+### IR-489: Defer the `NO_ASYNC_CLOSURE` fix
+
+- **Decision:** `NO_ASYNC_CLOSURE` is reported without the fix that §2.5.6 describes, which deletes `async`, wraps the body in `async move`, and deletes `-> T`.
+- **Reason:** A structured fix needs snapshot-aware fix planning. The only fix path in `parse_green_source` replaces one token with a lexical planner, and §2.5.5 names the same dependency for `ITEM_IN_BLOCK`.
+- **Review:** Checked by reading `parse_green_source` and `bind_green_parse`. No test covers the fix, because none exists.
+- **Human review:** **Review required:** Decide whether this fix waits for CST-identity fix planning, or whether a lexical multi-token edit should be added now.
+- **Remaining scope:** Implement the fix with the snapshot-aware planner.
