@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod module_target;
 pub mod package_scopes;
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};

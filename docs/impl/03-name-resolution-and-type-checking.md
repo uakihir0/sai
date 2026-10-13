@@ -218,6 +218,8 @@ Member namespaces of items (variants, associated functions, fields, trait items)
 
 Phase 2 resolves every `use` declaration of every module and computes the member namespaces `X(M)` with the memoized `lookup(M, x)` of spec/04 §4.5.4. The implementation:
 
+The module-only path step is implemented by `sai_resolve::module_target::resolve_module_target`. Given path symbols after the package identity, it performs exact spelling lookup through modules and namespace directories, maps an empty path to the package root, and rejects the current module. Unknown paths carry the longest matched prefix and byte-ordered direct module candidates; malformed child IDs fail as an invalid module tree. Package selection, interfaces, dependencies, WIT, import bindings, diagnostics, and invocation from this Phase remain to be integrated.
+
 ```rust
 enum LookupState { InProgress, Done(Option<Binding>) }   // None: no member `x`; Some(Binding{res: Res::Err}) = ⊥
 struct ImportResolver<'a> {
