@@ -556,6 +556,22 @@ pub struct LintAttr {
     pub span: Span,
 }
 
+/// The validated value of one `@export_name` attribute.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedExportName {
+    /// The decoded, non-empty string supplied to the attribute.
+    pub value: String,
+    /// Source span of the string token, including its delimiters.
+    pub string_span: Span,
+}
+
+/// Result of validating only `@export_name` attributes for one target.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExportNameValidation {
+    pub export_name: Option<ValidatedExportName>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetPredicate {
     Target(String),
@@ -662,6 +678,7 @@ impl TargetCfg {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ValidatedAttrs {
     pub derives: Vec<(LangItem, Span)>,
+    pub export_name: Option<ValidatedExportName>,
     pub inline: Option<(InlineHint, Span)>,
     pub cold: Option<Span>,
     pub must_use: Option<(Option<String>, Span)>,
@@ -699,6 +716,30 @@ pub fn validate_attrs(
         snapshot,
         IMPLEMENTED_ATTRIBUTE_STAGE,
     )
+}
+
+/// Validates and returns only an `@export_name` attribute for a target.
+///
+/// This narrow API validates `@export_name` at its declared schema stage while
+/// leaving [`IMPLEMENTED_ATTRIBUTE_STAGE`] unchanged. All other attributes in
+/// `attributes` are ignored here; callers continue to use [`validate_attrs`]
+/// for the attributes implemented by the general HIR pipeline.
+pub fn validate_export_name(
+    attributes: &[RawAttr],
+    target: Option<AttributeTarget>,
+    symbols: &Interner,
+    snapshot: &VfsWorkspaceSnapshot,
+) -> Result<ExportNameValidation, AttrValidationError> {
+    let export_name_attributes = attributes
+        .iter()
+        .filter(|attribute| attribute.name == AttrName::ExportName)
+        .cloned()
+        .collect::<Vec<_>>();
+    let validated = validate_attrs_at_stage(&export_name_attributes, target, symbols, snapshot, 1)?;
+    Ok(ExportNameValidation {
+        export_name: validated.export_name,
+        diagnostics: validated.diagnostics,
+    })
 }
 
 pub(crate) fn validate_attrs_at_stage(
@@ -893,6 +934,7 @@ struct AcceptedAttribute {
 enum PreparedAttribute {
     Derives(Vec<(Symbol, Span)>),
     ValidatedDerives(Vec<(LangItem, Span)>),
+    ExportName(ValidatedExportName),
     Inline(InlineHint),
     Cold,
     MustUse(Option<String>),
@@ -1562,6 +1604,26 @@ fn prepare_attribute(
     };
 
     let prepared = match attribute.name {
+        AttrName::ExportName => match attribute.args.as_deref() {
+            Some([RawAttrArg::Str { value, span }]) if !value.is_empty() => {
+                Some(PreparedAttribute::ExportName(ValidatedExportName {
+                    value: value.clone(),
+                    string_span: *span,
+                }))
+            }
+            Some([RawAttrArg::Str { span, .. }]) => {
+                invalid(*span, "one non-empty string", diagnostics)?;
+                None
+            }
+            _ => {
+                invalid(
+                    invalid_argument_span(attribute),
+                    "one non-empty string",
+                    diagnostics,
+                )?;
+                None
+            }
+        },
         AttrName::Inline => match attribute.args.as_deref() {
             None => Some(PreparedAttribute::Inline(InlineHint::Hint)),
             Some(
@@ -1812,8 +1874,7 @@ fn prepare_attribute(
             }
             Some(PreparedAttribute::Derives(derives))
         }
-        AttrName::ExportName
-        | AttrName::ImportName
+        AttrName::ImportName
         | AttrName::Flags
         | AttrName::Cases
         | AttrName::Seed
@@ -1997,6 +2058,9 @@ fn apply_prepared(
     match prepared {
         PreparedAttribute::ValidatedDerives(derives) => {
             validated.derives.extend(derives);
+        }
+        PreparedAttribute::ExportName(export_name) => {
+            validated.export_name = Some(export_name);
         }
         PreparedAttribute::Inline(hint) => validated.inline = Some((hint, attribute.span)),
         PreparedAttribute::Cold => validated.cold = Some(attribute.span),
@@ -2269,6 +2333,13 @@ mod tests {
             module_level: true,
             has_body: true,
             ..AttributeTarget::new(TargetKind::Fn)
+        }
+    }
+
+    fn exported_function_target() -> AttributeTarget {
+        AttributeTarget {
+            is_exported: true,
+            ..function_target()
         }
     }
 
@@ -2850,6 +2921,150 @@ mod tests {
             validated.diagnostics[0].code,
             Code::DuplicateAttributeArgument
         );
+    }
+
+    #[test]
+    fn export_name_api_decodes_only_export_name_without_changing_stage_zero() {
+        let source = concat!(
+            "@export_name(\"wire\\u{3A}name\")\n",
+            "@import_name(\"ignored\")\n",
+            "@panic_hook\n",
+            "@inline\n",
+            "fn f() {}\n",
+        );
+        let (attributes, symbols, snapshot) = collect_raw_attrs(Arc::new(
+            SourceFile::new(sai_vfs::FileId::new(46), source, false).expect("source"),
+        ));
+
+        let export_name = validate_export_name(
+            &attributes,
+            Some(exported_function_target()),
+            &symbols,
+            &snapshot,
+        )
+        .expect("narrow export-name validation");
+        let value = export_name.export_name.expect("validated export name");
+        assert_eq!(value.value, "wire:name");
+        let string_start = u32::try_from(source.find("\"wire\\u{3A}name\"").expect("string token"))
+            .expect("source offset fits");
+        assert_eq!(
+            value.string_span.range.start(),
+            sai_vfs::TextSize::new(string_start)
+        );
+        assert_eq!(
+            value.string_span.range.end(),
+            sai_vfs::TextSize::new(
+                string_start + u32::try_from("\"wire\\u{3A}name\"".len()).expect("length fits")
+            )
+        );
+        assert!(export_name.diagnostics.is_empty());
+        assert_eq!(IMPLEMENTED_ATTRIBUTE_STAGE, 0);
+
+        let stage_zero = validate_attrs(
+            &attributes,
+            Some(exported_function_target()),
+            &symbols,
+            &snapshot,
+        )
+        .expect("ordinary stage-zero validation");
+        assert!(stage_zero.export_name.is_none());
+        assert_eq!(
+            stage_zero.inline.map(|(hint, _)| hint),
+            Some(InlineHint::Hint)
+        );
+        assert_eq!(
+            stage_zero
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+                .count(),
+            3,
+            "the general validator must continue gating Stage 1 attributes"
+        );
+    }
+
+    #[test]
+    fn export_name_api_rejects_empty_and_malformed_arguments() {
+        for attribute in [
+            "@export_name(\"\")",
+            "@export_name",
+            "@export_name()",
+            "@export_name(42)",
+            "@export_name(\"one\", \"two\")",
+        ] {
+            let source = format!("{attribute}\nfn f() {{}}\n");
+            let (attributes, symbols, snapshot) = collect_raw_attrs(Arc::new(
+                SourceFile::new(sai_vfs::FileId::new(47), source.as_str(), false).expect("source"),
+            ));
+            let validation = validate_export_name(
+                &attributes,
+                Some(exported_function_target()),
+                &symbols,
+                &snapshot,
+            )
+            .expect("validation");
+            assert!(validation.export_name.is_none(), "{attribute}");
+            assert_eq!(validation.diagnostics.len(), 1, "{attribute}");
+            assert_eq!(
+                validation.diagnostics[0].code,
+                Code::InvalidAttributeArgument,
+                "{attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_name_api_checks_export_target_and_duplicate_attributes() {
+        let source = "@export_name(\"first\")\n@export_name(\"second\")\nfn f() {}\n";
+        let (attributes, symbols, snapshot) = collect_raw_attrs(Arc::new(
+            SourceFile::new(sai_vfs::FileId::new(48), source, false).expect("source"),
+        ));
+
+        let mis_target = validate_export_name(
+            &attributes[..1],
+            Some(function_target()),
+            &symbols,
+            &snapshot,
+        )
+        .expect("mis-target validation");
+        assert!(mis_target.export_name.is_none());
+        assert_eq!(mis_target.diagnostics.len(), 1);
+        assert_eq!(mis_target.diagnostics[0].code, Code::InvalidAttributeTarget);
+
+        let repeated = validate_export_name(
+            &attributes,
+            Some(exported_function_target()),
+            &symbols,
+            &snapshot,
+        )
+        .expect("repeated validation");
+        assert_eq!(
+            repeated.export_name.expect("first valid attribute").value,
+            "first"
+        );
+        assert_eq!(repeated.diagnostics.len(), 1);
+        assert_eq!(repeated.diagnostics[0].code, Code::DuplicateAttribute);
+    }
+
+    #[test]
+    fn export_name_api_discards_error_marked_attributes() {
+        let source = "@export_name(\"otherwise valid\")\nfn f() {}\n";
+        let (mut attributes, symbols, snapshot) = collect_raw_attrs(Arc::new(
+            SourceFile::new(sai_vfs::FileId::new(49), source, false).expect("source"),
+        ));
+        let export_name = attributes.first_mut().expect("attribute");
+        assert_eq!(export_name.name, AttrName::ExportName);
+        export_name.has_error = true;
+
+        let validation = validate_export_name(
+            &attributes,
+            Some(exported_function_target()),
+            &symbols,
+            &snapshot,
+        )
+        .expect("error-marked validation");
+        assert!(validation.export_name.is_none());
+        assert!(validation.diagnostics.is_empty());
     }
 
     #[test]
