@@ -1724,6 +1724,63 @@ mod tests {
     }
 
     #[test]
+    fn formats_single_line_block_comments_after_constructor_pattern_open_parens() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{Some(/* argument */item)=>item}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value { Some(/* argument */ item) => item }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{Some(/* nested */item)=>item,_=>0})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(match value { Some(/* nested */ item) => item, _ => 0 })\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{Some(/* first */ /* second */item)=>item}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value { Some(/* first */ /* second */ item) => item }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{Some(/* arguments */first_argument,second_argument,third_argument,fourth_argument,fifth_argument)=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        Some(/* arguments */\n",
+                    "            first_argument,\n",
+                    "            second_argument,\n",
+                    "            third_argument,\n",
+                    "            fourth_argument,\n",
+                    "            fifth_argument,\n",
+                    "        ) => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("constructor-pattern opening-parenthesis comments are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn formats_block_comments_after_at_pattern_tokens() {
         let sources = [
             (
@@ -1809,13 +1866,30 @@ mod tests {
     #[test]
     fn refuses_comments_inside_match_patterns() {
         let source =
-            "fn f(value:State) {\n    match value{Some(/* interior */item)=>item,_=>0}\n}\n";
+            "fn f(value:State) {\n    match value{Some(item/* interior */)=>item,_=>0}\n}\n";
         assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
         assert_eq!(
             format_source(source.as_bytes()),
             Err(SourceFormatError::UnsupportedShape),
             "{source}"
         );
+    }
+
+    #[test]
+    fn refuses_unsupported_comments_after_constructor_pattern_open_parens() {
+        let sources = [
+            "fn f(value:State){\nmatch value{Some(// arguments\nitem)=>item}\n}\n",
+            "fn f(value:State){\nmatch value{Some(/* arguments\ncontinued */item)=>item}\n}\n",
+            "fn f(value:State){\nmatch value{Some(/* arguments */)=>0}\n}\n",
+        ];
+        for source in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            assert_eq!(
+                format_source(source.as_bytes()),
+                Err(SourceFormatError::UnsupportedShape),
+                "{source}"
+            );
+        }
     }
 
     #[test]

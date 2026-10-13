@@ -637,6 +637,36 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
     }
     for node in root
         .descendants()
+        .filter(|node| node.kind() == SyntaxKind::CTOR_PAT_ARGS)
+    {
+        let argument_count = node.children().count();
+        if argument_count == 0
+            || !comma_delimited_tokens_match(
+                &node,
+                SyntaxKind::L_PAREN,
+                SyntaxKind::R_PAREN,
+                argument_count,
+            )
+        {
+            continue;
+        }
+        if let Some(token) = node
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_PAREN => Some(token),
+                _ => None,
+            })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
+    for node in root
+        .descendants()
         .filter(|node| node.kind() == SyntaxKind::MATCH_ARM_LIST)
     {
         let Some(list) = ast::MatchArmList::cast(node.clone()) else {
@@ -5166,13 +5196,30 @@ fn constructor_pattern_arguments_document(
     let final_is_rest = children
         .last()
         .is_some_and(|child| ast::RestPat::can_cast(child.kind()));
-    Ok(delimited_list_document_with_options(
+    let opening = arguments
+        .syntax()
+        .children_with_tokens()
+        .find_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_PAREN => Some(token),
+            _ => None,
+        })
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    let opening_comments = trailing_comments_after_token(&opening)?;
+    let mut opening_suffix = Vec::new();
+    if !opening_comments.is_empty() {
+        append_single_line_block_comments_without_leading_space(
+            &mut opening_suffix,
+            &opening_comments,
+        )?;
+    }
+    Ok(delimited_list_document_with_options_and_opening_suffix(
         expression_group_ids.next(),
         "(",
         ")",
         documents,
         !final_is_rest,
         false,
+        opening_suffix,
     ))
 }
 
@@ -8152,11 +8199,39 @@ fn delimited_list_document_with_options(
     trailing_comma_when_broken: bool,
     keep_singleton_comma: bool,
 ) -> Doc {
+    delimited_list_document_with_options_and_opening_suffix(
+        group,
+        open,
+        close,
+        items,
+        trailing_comma_when_broken,
+        keep_singleton_comma,
+        Vec::new(),
+    )
+}
+
+fn delimited_list_document_with_options_and_opening_suffix(
+    group: GroupId,
+    open: &str,
+    close: &str,
+    items: Vec<Doc>,
+    trailing_comma_when_broken: bool,
+    keep_singleton_comma: bool,
+    opening_suffix: Vec<Doc>,
+) -> Doc {
     if items.is_empty() {
-        return Doc::concat([Doc::text(open), Doc::text(close)]);
+        return Doc::concat([
+            Doc::text(open),
+            Doc::concat(opening_suffix),
+            Doc::text(close),
+        ]);
     }
     let mut contents = Vec::with_capacity(items.len() * 2 + 2);
-    contents.push(Doc::SoftLine);
+    contents.push(if opening_suffix.is_empty() {
+        Doc::SoftLine
+    } else {
+        Doc::Line
+    });
     for (index, item) in items.iter().cloned().enumerate() {
         if index > 0 {
             contents.push(Doc::text(","));
@@ -8177,6 +8252,7 @@ fn delimited_list_document_with_options(
         group,
         Doc::concat([
             Doc::text(open),
+            Doc::concat(opening_suffix),
             Doc::indent(Doc::concat(contents)),
             Doc::SoftLine,
             Doc::text(close),
