@@ -371,6 +371,22 @@ pub struct DeclaredRequirement {
 
 The entries are sorted by identity bytes. An entry that the contract queries reject (for example `DUPLICATE_REQUIREMENT`, package/01 §1.10.4) keeps its first occurrence only; the contract diagnostics are reported by package/01, never here. A change of `sai.package` that does not change this list leaves `package_scopes` green.
 
+**Tracked requirement query (IR-471).** `RootDatabase` now exposes
+`declared_requirements(PackageId)` over the exact manifest bytes and
+`PackageRole` supplied for that package. The underlying query uses the stable
+`PackageKey` and tracks both values as inputs. It sorts by identity bytes,
+keeps the first source-order occurrence of a repeated identity, preserves
+`only` targets in manifest order, and retains `requires test` entries for
+dependency manifests. It parses with a zero retained-diagnostic limit, rejects
+recovered entries from syntactically invalid manifests, and verifies that a
+valid manifest header matches the package identity and compatibility line.
+Requirement identities and target names stay as strings in the cached value
+so it does not retain session-local symbols; the resolver can intern target
+names when it consumes this value. Manifest diagnostics remain owned by the
+package-contract validation pass. The Phase 3 import collector does not yet
+read this query, so test-only binding classification and inactive-dependency
+diagnostics remain deferred.
+
 **Inactive dependencies** ([spec/04](../spec/04-modules-and-names.md) §4.3.2 step 1.3). In step 1, after rules 1.1 and 1.2 found no target, let `K` be the `ns:pkg` part of the `PKG_PATH`. If `package_graph` has no active edge of the current package named `K`, and `declared_requirements(P)` has an entry `r` with `r.identity = K`, `r.test = false` and `r.only = Some(T)` where `T` does not contain the target of `target_cfg(P)` (§3.3.1), the use is `INACTIVE_DEPENDENCY`, at the `PKG_PATH`. The help lists the targets of `T` in contract order and suggests `@target` on the `use` and on the items that need it ([spec/15](../spec/15-attributes-and-lints.md) §15.11). The entry records an error, its bindings get `Res::Err`, and step 4 reports nothing for its items. Otherwise the rule does not apply, and a `K` without an active edge falls through to `UNKNOWN_PACKAGE`. A `use` that `@target` removed was never collected (§3.3.1), so it is never checked. An entry with `r.test = true` is a test-only use and follows the next paragraph instead, so a test dependency with an `only` list that excludes the target is also never `INACTIVE_DEPENDENCY` in a build without test analysis.
 
 **Test-only uses** ([spec/14](../spec/14-testing.md) §14.2.5, N-E-65). A `UseEntry` is **test-only** when the `ns:pkg` part of its `PKG_PATH` is the identity of an entry with `test = true` in `declared_requirements(P)`. This is read in every build, also for a dependency, whose test edges are never in the graph. Test analysis is **active for `P`** when `build_config` has test code active ([impl/01](01-architecture.md) §1.1.1) and `P` is one of the packages selected for test analysis (the `tests` list of [impl/08](08-effect-and-capability-analysis.md) §8.7.1). Before step 1, Phase 2 classifies every test-only entry in source order:
