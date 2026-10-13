@@ -21,6 +21,9 @@ use sai_resolve::package_scopes::{FilteredModule, PackageScopesError, collect_ph
 pub use sai_resolve::package_scopes::{
     Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
 };
+use sai_resolve::use_target_diagnostics::{
+    UseTargetDiagnosticsError, collect_local_use_target_diagnostics,
+};
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
@@ -222,6 +225,7 @@ pub enum Phase1CollectionError {
     ItemTree(ItemTreeQueryError),
     TargetFilter(TargetFilterError),
     PackageScopes(PackageScopesError),
+    UseTargetDiagnostics(UseTargetDiagnosticsError),
     DefPathInterner(DefPathInternerError),
     MissingSnapshotFile(FileId),
     TooManyModules,
@@ -248,6 +252,12 @@ impl From<TargetFilterError> for Phase1CollectionError {
 impl From<PackageScopesError> for Phase1CollectionError {
     fn from(error: PackageScopesError) -> Self {
         Self::PackageScopes(error)
+    }
+}
+
+impl From<UseTargetDiagnosticsError> for Phase1CollectionError {
+    fn from(error: UseTargetDiagnosticsError) -> Self {
+        Self::UseTargetDiagnostics(error)
     }
 }
 
@@ -881,7 +891,7 @@ impl RootDatabase {
             .get(&module_tree.package)
             .expect("the package definition-path interner was just installed");
 
-        collect_phase1(
+        let mut scopes = collect_phase1(
             module_tree,
             &module_inputs,
             Phase1CollectionConfig {
@@ -893,7 +903,29 @@ impl RootDatabase {
             &self.symbols,
             def_paths,
         )
-        .map_err(Into::into)
+        .map_err(Phase1CollectionError::from)?;
+        let use_target_diagnostics = collect_local_use_target_diagnostics(
+            module_tree,
+            &module_inputs,
+            &scopes,
+            &self.packages,
+            &self.symbols,
+        )?;
+        scopes.diagnostics.extend(use_target_diagnostics);
+        scopes
+            .diagnostics
+            .sort_by(|left, right| match (left.primary(), right.primary()) {
+                (Some(left), Some(right)) => left
+                    .file
+                    .path
+                    .as_bytes()
+                    .cmp(right.file.path.as_bytes())
+                    .then_with(|| left.span.range.start().cmp(&right.span.range.start())),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            });
+        Ok(scopes)
     }
 
     /// Resolves a definition ID created in this database's Phase 1 results.

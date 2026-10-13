@@ -1298,7 +1298,7 @@ fn module_tree_check_diagnostics(
             severity: diagnostic.severity,
             package: Some(package_identity.to_owned()),
             related: Vec::new(),
-            children: check_child_notes(diagnostic, &source_by_key, include_source_lines),
+            children: check_additional_children(diagnostic, &source_by_key, include_source_lines),
         });
     }
 
@@ -1420,7 +1420,7 @@ fn phase1_check_diagnostics(
                 })
             })
             .collect();
-        let children = check_child_notes(diagnostic, source_by_key, include_source_lines);
+        let children = check_additional_children(diagnostic, source_by_key, include_source_lines);
         match diagnostic.severity {
             sai_diagnostics::Severity::Error => errors = errors.saturating_add(1),
             sai_diagnostics::Severity::Warning => warnings = warnings.saturating_add(1),
@@ -1437,15 +1437,26 @@ fn phase1_check_diagnostics(
     (diagnostics, errors, warnings, infos)
 }
 
-fn check_child_notes(
+fn check_additional_children(
     diagnostic: &sai_diagnostics::Diagnostic,
     source_by_key: &HashMap<String, (String, Arc<[u8]>)>,
     include_source_lines: bool,
 ) -> Vec<CheckChild> {
+    let mut first_help_is_primary = false;
     diagnostic
         .children()
         .iter()
-        .filter(|child| child.kind == sai_diagnostics::ChildKind::Note)
+        .filter(|child| {
+            if child.kind != sai_diagnostics::ChildKind::Help {
+                return true;
+            }
+            if first_help_is_primary {
+                true
+            } else {
+                first_help_is_primary = true;
+                false
+            }
+        })
         .map(|child| {
             let location = child.location.as_ref().map(|location| {
                 let (display_path, source) = source_by_key
@@ -1692,10 +1703,21 @@ fn check_source_diagnostics(
             }
         };
         cli_diagnostic.primary_label = diagnostic.primary_label.clone();
+        let mut first_help_is_primary = false;
         let children = diagnostic
             .children()
             .iter()
-            .filter(|child| child.kind == sai_diagnostics::ChildKind::Note)
+            .filter(|child| {
+                if child.kind != sai_diagnostics::ChildKind::Help {
+                    return true;
+                }
+                if first_help_is_primary {
+                    true
+                } else {
+                    first_help_is_primary = true;
+                    false
+                }
+            })
             .map(|child| {
                 let location = child.location.as_ref().map(|location| {
                     let range = decoded_source_range_to_original(
@@ -7801,6 +7823,14 @@ mod tests {
         directory
     }
 
+    fn check_diagnostic_lines<'a>(stdout: &'a str, code: &str) -> Vec<&'a str> {
+        let marker = format!("\"code\":\"{code}\"");
+        stdout
+            .lines()
+            .filter(|line| line.contains(&marker))
+            .collect()
+    }
+
     fn set_check_targets(package: &Path, targets: &str) {
         let manifest_path = package.join("sai.package");
         let manifest = fs::read_to_string(&manifest_path).expect("read package manifest fixture");
@@ -8304,6 +8334,288 @@ mod tests {
     }
 
     #[test]
+    fn check_resolves_local_root_and_nested_module_targets_and_rejects_current_modules() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let root_source = "use acme:check\nuse acme:check/model\n";
+        let model_source = "use acme:check\nuse acme:check/model\n";
+        fs::write(package.join("src/lib.sai"), root_source).expect("write root uses");
+        fs::write(package.join("src/model.sai"), model_source).expect("write nested uses");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let current_module = check_diagnostic_lines(&stdout, "USE_OF_CURRENT_MODULE");
+        assert_eq!(current_module.len(), 2, "{stdout}");
+        assert!(current_module.iter().any(|line| {
+            let start = root_source.find("acme:check").expect("root self-use");
+            line.contains("\"path\":\"src/lib.sai\"")
+                && line.contains(&format!("\"start\":{{\"byte\":{start},"))
+        }));
+        assert!(current_module.iter().any(|line| {
+            let start = model_source
+                .rfind("acme:check/model")
+                .expect("nested self-use");
+            line.contains("\"path\":\"src/model.sai\"")
+                && line.contains(&format!("\"start\":{{\"byte\":{start},"))
+        }));
+        assert!(
+            check_diagnostic_lines(&stdout, "UNKNOWN_MODULE").is_empty(),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_reports_local_unknown_module_candidates_and_full_pkg_path_span() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let source = concat!(
+            "use acme:check/absent\n",
+            "use acme:check/area/absent\n",
+            "use acme:check/model/absent\n",
+        );
+        fs::write(package.join("src/lib.sai"), source).expect("write unknown module use");
+        // Reverse creation order so the JSON candidate order proves it is based
+        // on source spelling rather than filesystem creation order.
+        fs::write(package.join("src/zeta.sai"), "fn zeta() {}\n").expect("write zeta module");
+        fs::write(package.join("src/alpha.sai"), "fn alpha() {}\n").expect("write alpha module");
+        fs::create_dir_all(package.join("src/area")).expect("create namespace directory");
+        fs::write(package.join("src/area/child.sai"), "fn child() {}\n")
+            .expect("write namespace child module");
+        fs::write(package.join("src/model.sai"), "fn model() {}\n")
+            .expect("write module without child modules");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let unknown = check_diagnostic_lines(&stdout, "UNKNOWN_MODULE");
+        assert_eq!(unknown.len(), 3, "{stdout}");
+        let pkg_path = "acme:check/absent";
+        let root_start = source.find(pkg_path).expect("root package path");
+        let root_end = root_start + pkg_path.len();
+        let root_unknown = unknown
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{root_start},")))
+            .expect("root unknown module diagnostic");
+        assert!(root_unknown.contains("\"path\":\"src/lib.sai\""));
+        assert!(root_unknown.contains(&format!("\"end\":{{\"byte\":{root_end},")));
+        assert!(
+            root_unknown.contains(
+                "\"data\":{\"matched_prefix\":[],\"module_candidates\":[\"alpha\",\"model\",\"zeta\"]}"
+            ),
+            "{root_unknown}"
+        );
+
+        let nested_path = "acme:check/area/absent";
+        let nested_start = source.find(nested_path).expect("namespace package path");
+        let nested_unknown = unknown
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{nested_start},")))
+            .expect("namespace unknown module diagnostic");
+        assert!(
+            nested_unknown.contains(
+                "\"data\":{\"matched_prefix\":[\"area\"],\"module_candidates\":[\"child\"]}"
+            ),
+            "{nested_unknown}"
+        );
+        let empty_prefix_path = "acme:check/model/absent";
+        let empty_prefix_start = source.find(empty_prefix_path).expect("matched module path");
+        let empty_prefix_unknown = unknown
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{empty_prefix_start},")))
+            .expect("unknown module below a module with no children");
+        assert!(
+            empty_prefix_unknown
+                .contains("\"data\":{\"matched_prefix\":[\"model\"],\"module_candidates\":[]}"),
+            "{empty_prefix_unknown}"
+        );
+        assert!(
+            empty_prefix_unknown.contains("no modules directly under `model`"),
+            "{empty_prefix_unknown}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+
+        let (human_exit_code, human_stdout, human_stderr) =
+            invoke(&["--format=human", "--directory", package_path, "check"]);
+        assert_eq!(human_exit_code, 1);
+        let human_output = format!("{human_stdout}{human_stderr}");
+        assert!(
+            human_output.contains("no modules directly under `model`"),
+            "{human_output}"
+        );
+    }
+
+    #[test]
+    fn check_adds_root_and_kebab_path_help_without_normalizing_module_segments() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let source = concat!(
+            "use acme:check/lib\n",
+            "use acme:check/some-module\n",
+            "use acme:check/lib/some-module\n",
+        );
+        fs::write(package.join("src/lib.sai"), source).expect("write invalid path uses");
+        fs::write(package.join("src/some_module.sai"), "fn some_module() {}\n")
+            .expect("write snake-case module");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let unknown = check_diagnostic_lines(&stdout, "UNKNOWN_MODULE");
+        assert_eq!(unknown.len(), 3, "{stdout}");
+        let root_start = source.find("acme:check/lib").expect("root path");
+        let root_help = unknown
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{root_start},")))
+            .expect("`lib` path diagnostic");
+        assert!(
+            root_help.contains(
+                "\"kind\":\"help\",\"message\":\"the root module is named by the package identity alone\""
+            ),
+            "{root_help}"
+        );
+        let kebab_start = source.find("acme:check/some-module").expect("kebab path");
+        let kebab_help = unknown
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{kebab_start},")))
+            .expect("kebab path diagnostic");
+        assert!(
+            kebab_help.contains("acme:check/some_module"),
+            "{kebab_help}"
+        );
+        let combined_start = source
+            .find("acme:check/lib/some-module")
+            .expect("path with both help messages");
+        let combined_help = unknown
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{combined_start},")))
+            .expect("combined help diagnostic");
+        assert!(
+            combined_help.contains("the root module is named by the package identity alone"),
+            "{combined_help}"
+        );
+        assert!(
+            combined_help.contains("acme:check/lib/some_module"),
+            "{combined_help}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+
+        let (human_exit_code, human_stdout, human_stderr) =
+            invoke(&["--format=human", "--directory", package_path, "check"]);
+        assert_eq!(human_exit_code, 1);
+        let human_output = format!("{human_stdout}{human_stderr}");
+        assert!(
+            human_output.contains("help: the root module is named by the package identity alone"),
+            "{human_output}"
+        );
+        assert!(
+            human_output.contains("help: try `acme:check/lib/some_module`"),
+            "{human_output}"
+        );
+    }
+
+    #[test]
+    fn check_defers_interface_targets_and_skips_foreign_filtered_and_malformed_uses() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        set_check_targets(&package, "wasm32-core, wasm32-wasi");
+        fs::write(package.join("src/lib.sai"), "interface codec {}\n")
+            .expect("write local interface");
+        let client_source = concat!(
+            "use acme:check/codec\n",
+            "use other:package/missing\n",
+            "use acme:check/visible_missing\n",
+            "@target(\"wasm32-core\")\n",
+            "use acme:check/missing\n",
+            "use acme:check/Some\n",
+        );
+        fs::write(package.join("src/client.sai"), client_source)
+            .expect("write deferred and filtered uses");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-wasi",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "MALFORMED_PACKAGE_PATH").len(),
+            1,
+            "{stdout}"
+        );
+        let unknown = check_diagnostic_lines(&stdout, "UNKNOWN_MODULE");
+        assert_eq!(unknown.len(), 1, "{stdout}");
+        let expected_start = client_source
+            .find("acme:check/visible_missing")
+            .expect("unfiltered local missing module");
+        assert!(
+            unknown[0].contains(&format!("\"start\":{{\"byte\":{expected_start},")),
+            "{unknown:?}"
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "UNKNOWN_PACKAGE").is_empty(),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_validates_export_name_targets_on_component_targets_without_export_uniqueness() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        set_check_targets(&package, "wasm32-core, wasm32-wasi");
+        fs::write(
+            package.join("src/lib.sai"),
+            concat!(
+                "@export_name(\"ordinary\")\n",
+                "fn ordinary() {}\n",
+                "@export_name(\"duplicate\")\n",
+                "export fn first() {}\n",
+                "@export_name(\"duplicate\")\n",
+                "export fn second() {}\n",
+            ),
+        )
+        .expect("write component export-name validation fixture");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-wasi",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "INVALID_ATTRIBUTE_TARGET").len(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "DUPLICATE_EXPORT_NAME").is_empty(),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
     fn check_filters_phase1_declarations_using_selected_target_capabilities() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -8712,6 +9024,10 @@ mod tests {
         assert_eq!(
             stdout.matches("\"code\":\"MISSING_ROOT_MODULE\"").count(),
             1
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "UNKNOWN_MODULE").is_empty(),
+            "{stdout}"
         );
         assert!(stdout.contains("\"path\":\"sai.package\""));
         assert!(stdout.contains("\"line\":1"));

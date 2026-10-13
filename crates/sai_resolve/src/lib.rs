@@ -6,6 +6,7 @@ pub mod use_binding;
 pub mod use_item_binding;
 pub mod use_path;
 pub mod use_target;
+pub mod use_target_diagnostics;
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
 use sai_intern::{InternError, Interner, PackageId, PackageIdError, PackageInterner, Symbol};

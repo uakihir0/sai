@@ -67,6 +67,30 @@ pub fn resolve_use_target(
     tree: &ModuleTree,
     symbols: &Interner,
 ) -> Result<UseTarget, UseTargetError> {
+    let parsed = parse_use_path(entry, symbols)?;
+    resolve_parsed_use_target(
+        &parsed,
+        current_package_key,
+        packages,
+        current_module,
+        tree,
+        symbols,
+    )
+}
+
+/// Resolves a previously parsed use path against the current package.
+///
+/// Keeping this entry point separate lets diagnostic collection retain the
+/// parsed segments for interface deferral and suggestions without parsing the
+/// same `PKG_PATH` twice.
+pub(crate) fn resolve_parsed_use_target(
+    parsed: &ParsedUsePath,
+    current_package_key: &PackageKey,
+    packages: &PackageInterner,
+    current_module: ModuleId,
+    tree: &ModuleTree,
+    symbols: &Interner,
+) -> Result<UseTarget, UseTargetError> {
     let tree_package_key = packages.resolve(tree.package)?;
     if tree_package_key.as_ref() != current_package_key.as_str() {
         return Err(UseTargetError::PackageKeyMismatch {
@@ -76,9 +100,8 @@ pub fn resolve_use_target(
     }
     let current_package_identity = versionless_sai_identity(current_package_key)?;
 
-    let parsed = parse_use_path(entry, symbols)?;
     if parsed.package_identity != current_package_identity {
-        return Ok(UseTarget::ForeignPackage(parsed));
+        return Ok(UseTarget::ForeignPackage(parsed.clone()));
     }
 
     let module = resolve_module_target(tree, current_module, &parsed.segments, symbols)?;
