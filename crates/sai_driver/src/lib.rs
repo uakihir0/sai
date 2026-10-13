@@ -1425,9 +1425,8 @@ mod tests {
 
         let root = concat!(
             "use acme:phase1/child\n",
-            "use acme:phase1/child as explicit_child.{child}\n",
-            "use acme:phase1/child.{child}\n",
-            "pub use acme:phase1/child as reexport_alias.{child}\n",
+            "use acme:phase1/child as explicit_child\n",
+            "pub use acme:phase1/child as reexport_alias.{public_child}\n",
             "@target(\"wasm64-core\")\n",
             "use acme:phase1/child as wasm64_child\n",
             "@target(\"wasm64-core\")\n",
@@ -1435,7 +1434,7 @@ mod tests {
             "fn choose() {}\n",
         )
         .as_bytes();
-        let child = b"fn child() {}\n";
+        let child = b"pub fn public_child() {}\n";
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root, child);
 
         let wasm32 = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -1483,7 +1482,7 @@ mod tests {
         assert_eq!(explicit_child_alias_def, child_alias_def);
         assert_eq!(reexport_alias_def, child_alias_def);
         assert!(module_alias_def(&database, root_module_scopes, "wasm64_child").is_none());
-        assert_eq!(root_module_scopes.imports.len(), 3);
+        assert_eq!(root_module_scopes.imports.len(), 4);
         let import_names = root_module_scopes
             .imports
             .iter()
@@ -1494,12 +1493,23 @@ mod tests {
                     .to_string()
             })
             .collect::<Vec<_>>();
-        assert_eq!(import_names, ["child", "explicit_child", "reexport_alias"]);
+        assert_eq!(
+            import_names,
+            ["child", "explicit_child", "reexport_alias", "public_child"]
+        );
+        assert_eq!(
+            root_module_scopes
+                .imports
+                .iter()
+                .map(|import| import.item_index)
+                .collect::<Vec<_>>(),
+            [None, None, None, Some(0)]
+        );
         assert!(
             root_module_scopes
                 .imports
                 .iter()
-                .all(|import| import.item_index.is_none() && !import.test_only)
+                .all(|import| !import.test_only)
         );
         assert_eq!(
             root_module_scopes
@@ -1507,7 +1517,7 @@ mod tests {
                 .iter()
                 .map(|import| import.is_pub)
                 .collect::<Vec<_>>(),
-            [false, false, true]
+            [false, false, true, true]
         );
         let reexport_symbol = root_module_scopes.imports[2].name;
         assert_eq!(
@@ -1518,17 +1528,54 @@ mod tests {
             Some(sai_hir::Visibility::Private)
         );
         for (raw_import_index, import) in root_module_scopes.imports.iter().enumerate() {
+            let expected_origin = if import.item_index.is_some() {
+                sai_resolve::package_scopes::BindingOrigin::PubUse {
+                    import: sai_resolve::package_scopes::ImportIndex(raw_import_index as u32),
+                }
+            } else {
+                sai_resolve::package_scopes::BindingOrigin::Use {
+                    import: sai_resolve::package_scopes::ImportIndex(raw_import_index as u32),
+                }
+            };
             assert_eq!(
                 root_module_scopes
                     .scope
                     .get(&import.name)
                     .map(|binding| binding.origin),
-                Some(sai_resolve::package_scopes::BindingOrigin::Use {
-                    import: sai_resolve::package_scopes::ImportIndex(raw_import_index as u32)
-                })
+                Some(expected_origin)
             );
         }
-        let child_def = phase1_function_def(&database, &wasm32_scopes, child_module, "child");
+        let child_def =
+            phase1_function_def(&database, &wasm32_scopes, child_module, "public_child");
+        let reexported_child = root_module_scopes
+            .scope
+            .iter()
+            .find_map(|(symbol, binding)| {
+                let name = database.resolve_symbol(*symbol).ok()?;
+                (name.as_ref() == "public_child").then_some(binding.res)
+            })
+            .expect("listed public item is imported into the root scope");
+        assert_eq!(
+            reexported_child,
+            sai_resolve::package_scopes::Res::Def(
+                sai_resolve::package_scopes::DefKind::Fn,
+                child_def,
+            )
+        );
+        assert_eq!(
+            root_module_scopes
+                .members
+                .get(
+                    &root_module_scopes
+                        .imports
+                        .iter()
+                        .find(|import| import.item_index.is_some())
+                        .unwrap()
+                        .name
+                )
+                .map(|binding| binding.res),
+            Some(reexported_child)
+        );
         assert!(
             database
                 .resolve_def_path(child_def)
@@ -1569,7 +1616,7 @@ mod tests {
             .expect("target-filtered declarations report a duplicate binding");
         let wasm64_root_scopes = &wasm64_scopes.modules[ModuleId::ROOT.raw() as usize];
         assert!(module_alias_def(&database, wasm64_root_scopes, "wasm64_child").is_some());
-        assert_eq!(wasm64_root_scopes.imports.len(), 4);
+        assert_eq!(wasm64_root_scopes.imports.len(), 5);
         assert_eq!(
             duplicate.primary().map(|location| location.file.snapshot),
             Some(Some(17))

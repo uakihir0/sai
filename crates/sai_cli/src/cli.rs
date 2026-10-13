@@ -8457,6 +8457,137 @@ mod tests {
     }
 
     #[test]
+    fn check_resolves_local_item_imports_and_reexports() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let root_source = concat!(
+            "use acme:check/model.{PublicType, public_fn as local_fn, private_fn}\n",
+            "use acme:check/bridge.{public_fn as chained_fn}\n",
+            "use acme:check/model.{public_fn as local_fn}\n",
+            "use acme:check/model.{public_fn as clash}\n",
+            "fn clash() {}\n",
+            "use acme:check/model.{PublicType as publicType}\n",
+            "use acme:check/model.{public_fn as repeated, public_fn as repeated}\n",
+            "use acme:check/model.{public_fn as same, private_fn as same}\n",
+            "use acme:check/model.{Missing}\n",
+            "pub use acme:check/model.{public_fn as public_api}\n",
+            "pub use acme:check/model.{private_fn as private_api}\n",
+            "pub use acme:check/model as public_fn.{public_fn}\n",
+        );
+        fs::write(package.join("src/lib.sai"), root_source).expect("write item imports");
+        fs::write(
+            package.join("src/model.sai"),
+            concat!(
+                "pub type PublicType {}\n",
+                "pub fn public_fn() {}\n",
+                "fn private_fn() {}\n",
+            ),
+        )
+        .expect("write imported module");
+        fs::write(
+            package.join("src/facade.sai"),
+            "pub use acme:check/model.{public_fn as from_model}\n",
+        )
+        .expect("write first re-export");
+        fs::write(
+            package.join("src/bridge.sai"),
+            "pub use acme:check/facade.{from_model as public_fn}\n",
+        )
+        .expect("write re-export chain");
+        fs::write(
+            package.join("src/consumer.sai"),
+            "use acme:check.{public_api, public_fn as forwarded_fn}\n",
+        )
+        .expect("write external re-export consumer");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "REDUNDANT_IMPORT").len(),
+            2,
+            "{stdout}"
+        );
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "DUPLICATE_BINDING").len(),
+            3,
+            "{stdout}"
+        );
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "ALIAS_CASE_MISMATCH").len(),
+            1,
+            "{stdout}"
+        );
+        let unresolved = check_diagnostic_lines(&stdout, "UNRESOLVED_IMPORT");
+        assert_eq!(unresolved.len(), 1, "{stdout}");
+        let missing_name_start = root_source
+            .find("Missing")
+            .expect("missing item import is retained");
+        assert!(
+            unresolved[0].contains(&format!("\"start\":{{\"byte\":{missing_name_start},")),
+            "{stdout}"
+        );
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "PRIVATE_REEXPORT").len(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "PRIVATE_ITEM").is_empty(),
+            "{stdout}"
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "UNKNOWN_MODULE").is_empty(),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_reports_local_pub_use_cycles_once() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(package.join("src/lib.sai"), "use acme:check/a.{from_b}\n")
+            .expect("write cycle entry point");
+        fs::write(
+            package.join("src/a.sai"),
+            "pub use acme:check/b.{from_a as from_b}\n",
+        )
+        .expect("write first cycle edge");
+        fs::write(
+            package.join("src/b.sai"),
+            "pub use acme:check/a.{from_b as from_a}\n",
+        )
+        .expect("write second cycle edge");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let cycles = check_diagnostic_lines(&stdout, "REEXPORT_CYCLE");
+        assert_eq!(cycles.len(), 1, "{stdout}");
+        assert!(
+            cycles[0].contains("\"path\":\"src/a.sai\"")
+                && cycles[0].contains("\"path\":\"src/b.sai\""),
+            "{stdout}"
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "UNRESOLVED_IMPORT").is_empty(),
+            "{stdout}"
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "UNKNOWN_MODULE").is_empty(),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
     fn check_reports_local_unknown_module_candidates_and_full_pkg_path_span() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
