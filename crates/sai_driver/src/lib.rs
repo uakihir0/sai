@@ -1695,6 +1695,82 @@ mod tests {
     }
 
     #[test]
+    fn phase1_driver_bridge_resolves_local_interface_members_by_canonical_id() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            b"pub interface codec { type Request {} fn send() }\n",
+            b"use acme:phase1/codec.{Request, send}\n",
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let scopes = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 scopes collect local interface members");
+        let root_scope = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let child_scope = &scopes.modules[ModuleId::from_raw(1).raw() as usize];
+        let interface_def = root_scope
+            .declared
+            .iter()
+            .find_map(|(symbol, binding)| {
+                let name = database.resolve_symbol(*symbol).ok()?;
+                if name.as_ref() != "codec" {
+                    return None;
+                }
+                match binding.res {
+                    sai_resolve::package_scopes::Res::Def(
+                        sai_resolve::package_scopes::DefKind::Interface,
+                        def_id,
+                    ) => Some(def_id),
+                    _ => None,
+                }
+            })
+            .expect("the root interface has a canonical definition");
+        let interface_scope = scopes
+            .interfaces
+            .get(&interface_def)
+            .expect("Phase 1 collects the local interface member table");
+        for (name, kind) in [
+            ("Request", sai_resolve::package_scopes::DefKind::Struct),
+            ("send", sai_resolve::package_scopes::DefKind::Fn),
+        ] {
+            let (symbol, member) = interface_scope
+                .members
+                .iter()
+                .find_map(|(symbol, binding)| {
+                    let spelling = database.resolve_symbol(*symbol).ok()?;
+                    (spelling.as_ref() == name).then_some((*symbol, binding))
+                })
+                .expect("interface member is present by name");
+            assert_eq!(
+                child_scope.scope.get(&symbol).map(|binding| binding.res),
+                Some(member.res),
+                "the child import keeps the canonical interface member resolution"
+            );
+            assert_eq!(member.visibility, sai_hir::Visibility::Pub);
+            let sai_resolve::package_scopes::Res::Def(actual_kind, def_id) = member.res else {
+                panic!("interface member resolves to a definition");
+            };
+            assert_eq!(actual_kind, kind);
+            assert!(
+                database
+                    .resolve_def_path(def_id)
+                    .expect("member DefPath resolves")
+                    .is_some()
+            );
+            assert!(!root_scope.members.contains_key(&symbol));
+        }
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::UnresolvedImport)
+        );
+    }
+
+    #[test]
     fn phase1_driver_bridge_rejects_a_snapshot_with_mismatched_module_bytes() {
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(b"fn original() {}\n", b"fn child() {}\n");

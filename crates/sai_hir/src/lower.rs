@@ -2170,8 +2170,18 @@ pub fn lower_interface_item_owner<'hir>(
         .def_paths
         .resolve(owner.def_id)?
         .ok_or(DefPathInternerError::ParentDefinitionNotFound)?;
-    let source_disambiguator =
-        interface_child_disambiguator(interface_entry, interface_item_entry, &component)?;
+    let source_disambiguator = crate::item_tree::interface_member_path_disambiguator(
+        interface_entry,
+        interface_item_entry,
+    )
+    .map_err(|error| match error {
+        crate::item_tree::InterfaceMemberPathError::ItemTreeMismatch => {
+            HirLoweringError::ItemTreeEntryMismatch
+        }
+        crate::item_tree::InterfaceMemberPathError::TooManyDefinitions => {
+            HirLoweringError::DefPath(DefPathInternerError::TooManyDefinitions)
+        }
+    })?;
     if item_path.data().get(..interface_path.data().len()) != Some(interface_path.data())
         || item_path.data().len() != interface_path.data().len() + 1
         || !matches!(
@@ -2672,11 +2682,16 @@ pub fn lower_interface_resource_member_owner<'hir>(
         DefPathData::TypeNs(resource_entry.name),
         context,
     )?;
-    let resource_disambiguator = interface_child_disambiguator(
-        interface_entry,
-        resource_entry,
-        &DefPathData::TypeNs(resource_entry.name),
-    )?;
+    let resource_disambiguator =
+        crate::item_tree::interface_member_path_disambiguator(interface_entry, resource_entry)
+            .map_err(|error| match error {
+                crate::item_tree::InterfaceMemberPathError::ItemTreeMismatch => {
+                    HirLoweringError::ItemTreeEntryMismatch
+                }
+                crate::item_tree::InterfaceMemberPathError::TooManyDefinitions => {
+                    HirLoweringError::DefPath(DefPathInternerError::TooManyDefinitions)
+                }
+            })?;
     if resource_path.data().get(..interface_path.data().len()) != Some(interface_path.data())
         || resource_path.data().len() != interface_path.data().len() + 1
         || !matches!(
@@ -4720,35 +4735,6 @@ fn world_entry_disambiguator<'hir>(
             continue;
         }
         if ast_id == entry.ast_id {
-            return Ok(disambiguator);
-        }
-        disambiguator = disambiguator
-            .checked_add(1)
-            .ok_or(DefPathInternerError::TooManyDefinitions)?;
-    }
-    Err(HirLoweringError::ItemTreeEntryMismatch)
-}
-
-fn interface_child_disambiguator(
-    interface_entry: &crate::item_tree::ItemTreeEntry,
-    item_entry: &crate::item_tree::ItemTreeEntry,
-    component: &DefPathData,
-) -> Result<u32, HirLoweringError> {
-    let mut disambiguator = 0u32;
-    for candidate in &interface_entry.children {
-        let candidate_component = match candidate.kind {
-            ItemTreeKind::Struct
-            | ItemTreeKind::Alias
-            | ItemTreeKind::Refined
-            | ItemTreeKind::Enum
-            | ItemTreeKind::Resource => DefPathData::TypeNs(candidate.name),
-            ItemTreeKind::InterfaceFn => DefPathData::ValueNs(candidate.name),
-            _ => continue,
-        };
-        if candidate_component != *component {
-            continue;
-        }
-        if candidate.ast_id == item_entry.ast_id {
             return Ok(disambiguator);
         }
         disambiguator = disambiguator

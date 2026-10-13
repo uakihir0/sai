@@ -3,9 +3,9 @@
 //! Callers provide item trees that have already passed `@target` filtering.
 //! [`collect_phase1`] builds direct declaration scopes. The
 //! [`collect_local_module_alias_bindings`] pass then inserts local module
-//! aliases, resolves item imports from local modules, and computes local
-//! `pub use` members. Dependency targets, interface member tables, test-only
-//! imports, and the canonical prelude table remain deferred.
+//! aliases, resolves item imports from local modules and interfaces, and
+//! computes local `pub use` members. Dependency targets, test-only imports,
+//! and the canonical prelude table remain deferred.
 //! Extern-function children are checked against their validated target
 //! attributes here because they are represented as children of an extern block
 //! in the item tree.
@@ -22,7 +22,10 @@ use sai_diagnostics::{
 use sai_hir::attrs::{
     AttributeTarget, TargetCfg, TargetKind, ValidatedExportName, validate_export_name,
 };
-use sai_hir::item_tree::{AttrName, ErasedAstId, ItemTreeKind, TargetFilterResult, UseEntry};
+use sai_hir::item_tree::{
+    AttrName, ErasedAstId, ItemTreeKind, TargetFilterResult, UseEntry,
+    interface_member_path_component, interface_member_path_disambiguator,
+};
 use sai_hir::{
     DefId, DefPath, DefPathData, DefPathError, DefPathInterner, DefPathInternerError,
     DisambiguatedDefPathData, LocalDefId, PackageId, Symbol, Visibility,
@@ -116,6 +119,7 @@ struct PendingLocalUseItem {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingItemTarget {
     LocalModule(ModuleId),
+    LocalInterface(DefId),
     Deferred,
     Unavailable,
 }
@@ -147,9 +151,17 @@ pub struct Phase1ModuleScopes {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceScope {
+    /// Direct interface members keyed by their source spelling.
+    pub members: HashMap<Symbol, Binding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Phase1PackageScopes {
     /// Module index is the corresponding `ModuleId::raw()` value.
     pub modules: Vec<Phase1ModuleScopes>,
+    /// Direct members of local interfaces, keyed by canonical interface ID.
+    pub interfaces: HashMap<DefId, InterfaceScope>,
     /// First definition for each export name in a root core-module build.
     pub exports: BTreeMap<String, LocalDefId>,
     /// Target-attribute and Phase-1 declaration diagnostics, sorted by
@@ -288,6 +300,7 @@ pub fn collect_phase1(
 
     let package_identity = packages.resolve(module_tree.package)?.to_string();
     let mut scopes = Vec::with_capacity(module_tree.modules.len());
+    let mut interfaces = HashMap::new();
     let mut diagnostics = Vec::new();
     let mut export_candidates = Vec::new();
 
@@ -459,6 +472,19 @@ pub fn collect_phase1(
                         symbols,
                         def_paths,
                     )?;
+                    if entry.kind == ItemTreeKind::Interface {
+                        let interface_scope = collect_interface_members(
+                            entry,
+                            local_def_id,
+                            input,
+                            target_cfg,
+                            &package_identity,
+                            &mut module_diagnostics,
+                            symbols,
+                            def_paths,
+                        )?;
+                        interfaces.insert(local_def_id.to_def_id(), interface_scope);
+                    }
                     if entry.kind == ItemTreeKind::Interface
                         && interface_conflicts_with_module_file(module, entry.name, symbols)?
                     {
@@ -543,6 +569,7 @@ pub fn collect_phase1(
 
     Ok(Phase1PackageScopes {
         modules: scopes,
+        interfaces,
         exports,
         diagnostics,
     })
@@ -550,9 +577,10 @@ pub fn collect_phase1(
 
 /// Resolves package-local use aliases and item imports.
 ///
-/// Local module targets have module-member lookup and `pub use` re-export
-/// support. Foreign and interface item tables are retained as deferred import
-/// records. The target-diagnostic pass owns unknown/current-module errors.
+/// Local module and interface targets have member lookup; module `pub use`
+/// declarations can re-export members from either target. Foreign item tables
+/// are retained as deferred import records. The target-diagnostic pass owns
+/// unknown/current-module errors.
 pub fn collect_local_module_alias_bindings(
     module_tree: &ModuleTree,
     module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
@@ -667,7 +695,7 @@ pub fn collect_local_module_alias_bindings(
                     match local_interface_target(module_tree, scopes, &parsed) {
                         Some(def_id) => (
                             Some(Res::Def(DefKind::Interface, def_id)),
-                            PendingItemTarget::Deferred,
+                            PendingItemTarget::LocalInterface(def_id),
                         ),
                         None => (None, PendingItemTarget::Unavailable),
                     }
@@ -1157,11 +1185,13 @@ impl LocalModuleMemberResolver<'_> {
             return Ok(());
         }
 
-        let target_module = match item.target {
-            PendingItemTarget::LocalModule(module) => module,
+        let result = match item.target {
+            PendingItemTarget::LocalModule(module) => self.lookup(module, item.source_name)?,
+            PendingItemTarget::LocalInterface(interface) => {
+                self.lookup_interface_member(interface, item.source_name)?
+            }
             PendingItemTarget::Deferred => {
-                // Foreign packages and local interfaces do not have a
-                // member table in this slice.
+                // Foreign package member tables are not available in this slice.
                 return Ok(());
             }
             PendingItemTarget::Unavailable => {
@@ -1178,7 +1208,6 @@ impl LocalModuleMemberResolver<'_> {
             .ok_or(PackageScopesError::InvalidModuleTree)?;
         debug_assert_eq!(recorded_import.item_index, Some(item.item_index));
         debug_assert_eq!(recorded_import.name, item.binding_name);
-        let result = self.lookup(target_module, item.source_name)?;
         let target_binding = match result {
             LocalMemberLookup::Found(binding) => binding,
             LocalMemberLookup::Cycle => {
@@ -1238,6 +1267,24 @@ impl LocalModuleMemberResolver<'_> {
         Ok(())
     }
 
+    fn lookup_interface_member(
+        &self,
+        interface: DefId,
+        name: Symbol,
+    ) -> Result<LocalMemberLookup, PackageScopesError> {
+        let scope = self
+            .scopes
+            .interfaces
+            .get(&interface)
+            .ok_or(PackageScopesError::InvalidModuleTree)?;
+        Ok(scope
+            .members
+            .get(&name)
+            .cloned()
+            .map(LocalMemberLookup::Found)
+            .unwrap_or(LocalMemberLookup::Missing))
+    }
+
     fn lookup(
         &mut self,
         module: ModuleId,
@@ -1274,21 +1321,26 @@ impl LocalModuleMemberResolver<'_> {
                 .get(pub_use_index)
                 .ok_or(PackageScopesError::InvalidModuleTree)?
                 .clone();
-            let target_module = match edge.target {
-                PendingItemTarget::LocalModule(target_module) => target_module,
+            let target = match edge.target {
+                PendingItemTarget::LocalModule(target_module) => {
+                    self.stack.push(LocalMemberFrame {
+                        module,
+                        name,
+                        pub_use_index,
+                    });
+                    let target = self.lookup(target_module, edge.source_name)?;
+                    self.stack.pop();
+                    target
+                }
+                PendingItemTarget::LocalInterface(interface) => {
+                    self.lookup_interface_member(interface, edge.source_name)?
+                }
                 PendingItemTarget::Deferred => {
                     saw_deferred = true;
                     continue;
                 }
                 PendingItemTarget::Unavailable => continue,
             };
-            self.stack.push(LocalMemberFrame {
-                module,
-                name,
-                pub_use_index,
-            });
-            let target = self.lookup(target_module, edge.source_name)?;
-            self.stack.pop();
             match target {
                 LocalMemberLookup::Found(binding) if binding.visibility == Visibility::Pub => {
                     self.set_import_res(edge.module, edge.import, binding.res)?;
@@ -1423,6 +1475,9 @@ impl LocalModuleMemberResolver<'_> {
         let name = self.symbols.resolve(item.source_name)?;
         let candidates = match item.target {
             PendingItemTarget::LocalModule(module) => self.suggested_member_names(module, &name)?,
+            PendingItemTarget::LocalInterface(interface) => {
+                self.suggested_interface_member_names(interface, &name)?
+            }
             PendingItemTarget::Deferred | PendingItemTarget::Unavailable => Vec::new(),
         };
         let mut diagnostic = use_binding_diagnostic(
@@ -1509,6 +1564,57 @@ impl LocalModuleMemberResolver<'_> {
             .filter_map(|(source_order, symbol, spelling)| {
                 seen.insert(symbol)
                     .then(|| (damerau_levenshtein(name, &spelling), source_order, spelling))
+            })
+            .filter(|(distance, _, _)| *distance <= 2)
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.as_bytes().cmp(right.2.as_bytes()))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(3)
+            .map(|(_, _, spelling)| spelling)
+            .collect())
+    }
+
+    fn suggested_interface_member_names(
+        &self,
+        interface: DefId,
+        name: &str,
+    ) -> Result<Vec<String>, PackageScopesError> {
+        let scope = self
+            .scopes
+            .interfaces
+            .get(&interface)
+            .ok_or(PackageScopesError::InvalidModuleTree)?;
+        let mut names = scope
+            .members
+            .iter()
+            .map(|(symbol, binding)| {
+                Ok((
+                    binding.name_span.range.start().raw(),
+                    *symbol,
+                    self.symbols.resolve(*symbol)?.to_string(),
+                ))
+            })
+            .collect::<Result<Vec<_>, PackageScopesError>>()?;
+        names.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.2.as_bytes().cmp(right.2.as_bytes()))
+        });
+        let mut seen = std::collections::HashSet::new();
+        let mut ranked = names
+            .into_iter()
+            .filter_map(|(source_order, symbol, spelling)| {
+                if is_reserved_type_name(&spelling) || !seen.insert(symbol) {
+                    None
+                } else {
+                    Some((damerau_levenshtein(name, &spelling), source_order, spelling))
+                }
             })
             .filter(|(distance, _, _)| *distance <= 2)
             .collect::<Vec<_>>();
@@ -2212,6 +2318,141 @@ fn syntax_matches_source(root: &GreenNode, source: &str) -> bool {
     matches_node(root, source, &mut offset) && offset == source.len()
 }
 
+fn collect_interface_members(
+    interface: &sai_hir::item_tree::ItemTreeEntry,
+    interface_id: LocalDefId,
+    input: &FilteredModule<'_>,
+    target_cfg: &TargetCfg,
+    package_identity: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    symbols: &Interner,
+    def_paths: &DefPathInterner,
+) -> Result<InterfaceScope, PackageScopesError> {
+    let mut children = Vec::new();
+    let mut retained_entries = Vec::new();
+    for (index, entry) in interface.children.iter().enumerate() {
+        let Some(component) = interface_member_path_component(entry) else {
+            continue;
+        };
+        let disambiguator =
+            interface_member_path_disambiguator(interface, entry).map_err(|error| match error {
+                sai_hir::item_tree::InterfaceMemberPathError::ItemTreeMismatch => {
+                    PackageScopesError::NameMismatch
+                }
+                sai_hir::item_tree::InterfaceMemberPathError::TooManyDefinitions => {
+                    PackageScopesError::TooManyDefinitions
+                }
+            })?;
+        if !child_survives_target(entry, input, target_cfg)? {
+            continue;
+        }
+        children.push((component, disambiguator));
+        retained_entries.push(index);
+    }
+
+    let member_ids = def_paths.intern_children(interface_id, &children)?;
+    if member_ids.len() != retained_entries.len() {
+        return Err(PackageScopesError::InvalidModuleTree);
+    }
+
+    let mut members = HashMap::new();
+    let mut declared_locations = HashMap::new();
+    let interface_visibility = interface.vis;
+    for (child_index, member_id) in retained_entries.into_iter().zip(member_ids) {
+        let entry = interface
+            .children
+            .get(child_index)
+            .ok_or(PackageScopesError::InvalidModuleTree)?;
+        let Some(kind) = interface_member_def_kind(entry.kind) else {
+            return Err(PackageScopesError::InvalidModuleTree);
+        };
+        bind_interface_member(
+            entry,
+            kind,
+            member_id,
+            input,
+            package_identity,
+            &mut members,
+            &mut declared_locations,
+            diagnostics,
+            symbols,
+            interface_visibility,
+        )?;
+    }
+
+    Ok(InterfaceScope { members })
+}
+
+fn interface_member_def_kind(kind: ItemTreeKind) -> Option<DefKind> {
+    Some(match kind {
+        ItemTreeKind::Struct => DefKind::Struct,
+        ItemTreeKind::Alias => DefKind::Alias,
+        ItemTreeKind::Refined => DefKind::Refined,
+        ItemTreeKind::Enum => DefKind::Enum,
+        ItemTreeKind::Resource => DefKind::Resource,
+        ItemTreeKind::InterfaceFn => DefKind::Fn,
+        _ => return None,
+    })
+}
+
+fn bind_interface_member(
+    entry: &sai_hir::item_tree::ItemTreeEntry,
+    kind: DefKind,
+    local_def_id: LocalDefId,
+    input: &FilteredModule<'_>,
+    package_identity: &str,
+    members: &mut HashMap<Symbol, Binding>,
+    declared_locations: &mut HashMap<Symbol, Location>,
+    diagnostics: &mut Vec<Diagnostic>,
+    symbols: &Interner,
+    visibility: Visibility,
+) -> Result<(), PackageScopesError> {
+    if entry.name.is_error() {
+        return Ok(());
+    }
+    let name = symbols.resolve(entry.name)?;
+    let (name_span, location) = declaration_name_location(entry, input)?;
+    if is_reserved_type_name(name.as_ref()) {
+        diagnostics.push(declaration_diagnostic(
+            Code::ReservedTypeName,
+            format!("`{name}` is a reserved type name"),
+            "reserved name",
+            location,
+            package_identity,
+        ));
+        return Ok(());
+    }
+    if let Some(previous) = declared_locations.get(&entry.name) {
+        let mut diagnostic = declaration_diagnostic(
+            Code::DuplicateBinding,
+            format!("`{name}` is declared more than once in this interface"),
+            "duplicate declaration",
+            location,
+            package_identity,
+        );
+        diagnostic
+            .push_related(Related::DeclaredHere {
+                location: previous.clone(),
+                what: "first declaration".to_owned(),
+            })
+            .expect("diagnostics without a source snapshot accept related locations");
+        diagnostics.push(diagnostic);
+        return Ok(());
+    }
+
+    declared_locations.insert(entry.name, location);
+    members.insert(
+        entry.name,
+        Binding {
+            res: Res::Def(kind, local_def_id.to_def_id()),
+            name_span,
+            origin: BindingOrigin::Decl,
+            visibility,
+        },
+    );
+    Ok(())
+}
+
 fn bind_declaration(
     entry: &sai_hir::item_tree::ItemTreeEntry,
     kind: DefKind,
@@ -2430,9 +2671,11 @@ fn declaration_name_location(
 ) -> Result<(Span, Location), PackageScopesError> {
     let syntax = resolve_entry_syntax(entry, input)?;
     let range = match entry.kind {
-        ItemTreeKind::Function | ItemTreeKind::ExternFn => ast::FnDecl::cast(syntax)
-            .and_then(|declaration| declaration.name())
-            .map(|name| name.syntax().text_range()),
+        ItemTreeKind::Function | ItemTreeKind::ExternFn | ItemTreeKind::InterfaceFn => {
+            ast::FnDecl::cast(syntax)
+                .and_then(|declaration| declaration.name())
+                .map(|name| name.syntax().text_range())
+        }
         ItemTreeKind::Struct | ItemTreeKind::Alias | ItemTreeKind::Refined => {
             ast::TypeDecl::cast(syntax)
                 .and_then(|declaration| declaration.name())
@@ -2444,8 +2687,9 @@ fn declaration_name_location(
         ItemTreeKind::Distinct => ast::DistinctDecl::cast(syntax)
             .and_then(|declaration| declaration.name())
             .map(|name| name.syntax().text_range()),
-        ItemTreeKind::Resource => ast::ResourceDecl::cast(syntax)
+        ItemTreeKind::Resource => ast::IfaceResource::cast(syntax.clone())
             .and_then(|declaration| declaration.name())
+            .or_else(|| ast::ResourceDecl::cast(syntax).and_then(|declaration| declaration.name()))
             .map(|name| name.syntax().text_range()),
         ItemTreeKind::Trait => ast::TraitDecl::cast(syntax)
             .and_then(|declaration| declaration.name())
@@ -2990,6 +3234,233 @@ mod tests {
     }
 
     #[test]
+    fn local_interface_item_imports_use_canonical_ids_and_inherit_visibility() {
+        let source = concat!(
+            "pub interface codec {\n",
+            "    type Request {}\n",
+            "    fn send()\n",
+            "}\n",
+            "use acme:phase1/codec.{Request, send}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, paths) = fixture.collect_with_local_modules_and_paths(&[]);
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let codec = fixture.symbols.intern("codec").unwrap();
+        let request = fixture.symbols.intern("Request").unwrap();
+        let send = fixture.symbols.intern("send").unwrap();
+        let interface = match root.declared[&codec].res {
+            Res::Def(DefKind::Interface, def_id) => def_id,
+            resolution => panic!("expected local interface definition, got {resolution:?}"),
+        };
+        let interface_scope = &scopes.interfaces[&interface];
+        let request_binding = &interface_scope.members[&request];
+        let send_binding = &interface_scope.members[&send];
+
+        assert_eq!(request_binding.visibility, Visibility::Pub);
+        assert_eq!(send_binding.visibility, Visibility::Pub);
+        assert_eq!(root.scope[&request].res, request_binding.res);
+        assert_eq!(root.scope[&send].res, send_binding.res);
+        assert!(!root.members.contains_key(&request));
+        assert!(!root.members.contains_key(&send));
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::UnresolvedImport)
+        );
+
+        let request_def = match request_binding.res {
+            Res::Def(DefKind::Struct, def_id) => def_id,
+            resolution => panic!("expected interface record, got {resolution:?}"),
+        };
+        let send_def = match send_binding.res {
+            Res::Def(DefKind::Fn, def_id) => def_id,
+            resolution => panic!("expected interface function, got {resolution:?}"),
+        };
+        let interface_path = paths.resolve_def_id(interface).unwrap().unwrap();
+        let request_path = paths.resolve_def_id(request_def).unwrap().unwrap();
+        let send_path = paths.resolve_def_id(send_def).unwrap().unwrap();
+        assert_eq!(
+            request_path.data().get(..interface_path.data().len()),
+            Some(interface_path.data())
+        );
+        assert_eq!(
+            request_path.data().last().unwrap().data,
+            DefPathData::TypeNs(request)
+        );
+        assert_eq!(
+            send_path.data().get(..interface_path.data().len()),
+            Some(interface_path.data())
+        );
+        assert_eq!(
+            send_path.data().last().unwrap().data,
+            DefPathData::ValueNs(send)
+        );
+        let interface_entry = fixture
+            .filtered
+            .item_tree
+            .items
+            .iter()
+            .find(|entry| entry.kind == ItemTreeKind::Interface && entry.name == codec)
+            .unwrap();
+        for (name, path) in [(request, request_path), (send, send_path)] {
+            let member = interface_entry
+                .children
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap();
+            let expected_component = interface_member_path_component(member).unwrap();
+            let expected_disambiguator =
+                interface_member_path_disambiguator(interface_entry, member).unwrap();
+            assert_eq!(path.data().last().unwrap().data, expected_component);
+            assert_eq!(
+                path.data().last().unwrap().disambiguator,
+                expected_disambiguator
+            );
+        }
+    }
+
+    #[test]
+    fn local_interface_imports_cover_all_module_member_kinds() {
+        let source = concat!(
+            "pub interface codec {\n",
+            "    type Request {}\n",
+            "    type RequestAlias = Request\n",
+            "    enum State { Ready }\n",
+            "    resource Stream { fn close() }\n",
+            "    fn send()\n",
+            "}\n",
+            "use acme:phase1/codec as api.{Request, RequestAlias, State, Stream, send}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, paths) = fixture.collect_with_local_modules_and_paths(&[]);
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let codec = fixture.symbols.intern("codec").unwrap();
+        let imported: [(&str, DefKind, fn(Symbol) -> DefPathData); 5] = [
+            ("Request", DefKind::Struct, DefPathData::TypeNs),
+            ("RequestAlias", DefKind::Alias, DefPathData::TypeNs),
+            ("State", DefKind::Enum, DefPathData::TypeNs),
+            ("Stream", DefKind::Resource, DefPathData::TypeNs),
+            ("send", DefKind::Fn, DefPathData::ValueNs),
+        ];
+        let interface = match root.declared[&codec].res {
+            Res::Def(DefKind::Interface, def_id) => def_id,
+            resolution => panic!("expected local interface definition, got {resolution:?}"),
+        };
+        let interface_path = paths.resolve_def_id(interface).unwrap().unwrap();
+        let interface_scope = &scopes.interfaces[&interface];
+        let alias = fixture.symbols.intern("api").unwrap();
+        assert_eq!(root.scope[&alias].res, root.declared[&codec].res);
+
+        for (name, kind, component) in imported {
+            let name_symbol = fixture.symbols.intern(name).unwrap();
+            let member = &interface_scope.members[&name_symbol];
+            let imported_binding = &root.scope[&name_symbol];
+            assert_eq!(imported_binding.res, member.res);
+            assert_eq!(member.visibility, Visibility::Pub);
+            assert!(!root.members.contains_key(&name_symbol));
+            let def_id = match member.res {
+                Res::Def(actual_kind, def_id) => {
+                    assert_eq!(actual_kind, kind);
+                    def_id
+                }
+                resolution => panic!("expected interface item definition, got {resolution:?}"),
+            };
+            let path = paths.resolve_def_id(def_id).unwrap().unwrap();
+            assert_eq!(
+                path.data().get(..interface_path.data().len()),
+                Some(interface_path.data())
+            );
+            assert_eq!(path.data().last().unwrap().data, component(name_symbol));
+        }
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::UnresolvedImport)
+        );
+    }
+
+    #[test]
+    fn local_interface_duplicates_keep_first_member_and_report_the_later_name() {
+        let source = concat!(
+            "interface codec {\n",
+            "    type State {}\n",
+            "    enum State { Ready }\n",
+            "}\n",
+            "use acme:phase1/codec.{State}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let scopes = fixture.collect_with_local_modules(&[]);
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let codec = fixture.symbols.intern("codec").unwrap();
+        let state = fixture.symbols.intern("State").unwrap();
+        let interface = match root.declared[&codec].res {
+            Res::Def(DefKind::Interface, def_id) => def_id,
+            resolution => panic!("expected local interface definition, got {resolution:?}"),
+        };
+        let member = &scopes.interfaces[&interface].members[&state];
+        assert!(matches!(member.res, Res::Def(DefKind::Struct, _)));
+        assert_eq!(root.scope[&state].res, member.res);
+        let duplicates = scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(
+            duplicates[0].primary().unwrap().span.range.start().raw(),
+            source.find("enum State").unwrap() as u32 + "enum ".len() as u32
+        );
+        assert!(duplicates[0].related().iter().any(|related| matches!(
+            related,
+            Related::DeclaredHere { location, .. }
+                if location.span.range.start().raw() == source.find("type State").unwrap() as u32 + "type ".len() as u32
+        )));
+    }
+
+    #[test]
+    fn local_interface_public_reexports_preserve_identity_and_private_ones_fail() {
+        let root = concat!(
+            "pub interface codec { type Request {} }\n",
+            "interface private_api { type Hidden {} }\n",
+            "pub use acme:phase1/codec.{Request as PublicRequest}\n",
+            "pub use acme:phase1/private_api.{Hidden as Leaked}\n",
+        );
+        let fixture = Fixture::new(root, "wasm32-core");
+        let scopes = fixture
+            .collect_with_local_modules(&[("consumer", "use acme:phase1.{PublicRequest}\n")]);
+        let root_scope = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let consumer_scope = &scopes.modules[1];
+        let codec = fixture.symbols.intern("codec").unwrap();
+        let request = fixture.symbols.intern("Request").unwrap();
+        let public_request = fixture.symbols.intern("PublicRequest").unwrap();
+        let leaked = fixture.symbols.intern("Leaked").unwrap();
+        let consumer_request = fixture.symbols.intern("PublicRequest").unwrap();
+        let interface = match root_scope.declared[&codec].res {
+            Res::Def(DefKind::Interface, def_id) => def_id,
+            resolution => panic!("expected local interface definition, got {resolution:?}"),
+        };
+        let request_res = scopes.interfaces[&interface].members[&request].res;
+        let reexport = &root_scope.members[&public_request];
+        assert_eq!(reexport.res, request_res);
+        assert_eq!(reexport.visibility, Visibility::Pub);
+        assert_eq!(consumer_scope.scope[&consumer_request].res, request_res);
+        assert!(!root_scope.members.contains_key(&leaked));
+        assert!(root_scope.imports.iter().any(|import| {
+            import.name == leaked && import.res == Res::Err && import.item_index == Some(0)
+        }));
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::PrivateReexport)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn local_pub_use_chains_populate_members_and_preserve_definition_identity() {
         let fixture = Fixture::new("use acme:phase1/bridge.{public_fn}\n", "wasm32-core");
         let scopes = fixture.collect_with_local_modules(&[
@@ -3221,25 +3692,88 @@ mod tests {
     }
 
     #[test]
-    fn deferred_foreign_and_interface_item_tables_do_not_become_unresolved() {
-        let fixture = Fixture::new(
-            concat!(
-                "interface codec {}\n",
-                "use acme:phase1/codec.{Image}\n",
-                "use foreign:package/remote.{Remote}\n",
-                "use acme:phase1/facade.{Image}\n",
-            ),
-            "wasm32-core",
+    fn interface_member_reexports_can_follow_a_cyclic_candidate() {
+        let root = concat!(
+            "pub interface codec { type Item {} }\n",
+            "use acme:phase1/a.{item}\n",
         );
-        let scopes = fixture
-            .collect_with_local_modules(&[("facade", "pub use acme:phase1/codec.{Image}\n")]);
+        let fixture = Fixture::new(root, "wasm32-core");
+        let scopes = fixture.collect_with_local_modules(&[
+            (
+                "a",
+                concat!(
+                    "pub use acme:phase1/b.{other as item}\n",
+                    "pub use acme:phase1/codec.{Item as item}\n",
+                ),
+            ),
+            ("b", "pub use acme:phase1/a.{item as other}\n"),
+        ]);
 
+        let root_scope = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let a_scope = &scopes.modules[1];
+        let codec = fixture.symbols.intern("codec").unwrap();
+        let item = fixture.symbols.intern("item").unwrap();
+        let interface_item = fixture.symbols.intern("Item").unwrap();
+        let interface = match root_scope.declared[&codec].res {
+            Res::Def(DefKind::Interface, def_id) => def_id,
+            resolution => panic!("expected local interface definition, got {resolution:?}"),
+        };
+        let canonical_item = scopes.interfaces[&interface].members[&interface_item].res;
+
+        assert_eq!(a_scope.members[&item].res, canonical_item);
+        assert_eq!(root_scope.scope[&item].res, canonical_item);
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ReexportCycle)
+                .count(),
+            1
+        );
         assert!(
             scopes
                 .diagnostics
                 .iter()
                 .all(|diagnostic| diagnostic.code != Code::UnresolvedImport)
         );
+    }
+
+    #[test]
+    fn missing_local_interface_members_are_checked_but_foreign_imports_remain_deferred() {
+        let source = concat!(
+            "interface codec {}\n",
+            "use acme:phase1/codec.{Image}\n",
+            "use foreign:package/remote.{Remote}\n",
+            "use acme:phase1/facade.{Image}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let scopes = fixture
+            .collect_with_local_modules(&[("facade", "pub use acme:phase1/codec.{Image}\n")]);
+
+        let unresolved = scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::UnresolvedImport)
+            .collect::<Vec<_>>();
+        assert!(!unresolved.is_empty());
+        let local_member_start = source.find("Image").unwrap() as u32;
+        assert!(unresolved.iter().any(|diagnostic| {
+            diagnostic
+                .primary()
+                .is_some_and(|location| location.span.range.start().raw() == local_member_start)
+        }));
+        let foreign_import_start = source.find("use foreign").unwrap() as u32;
+        let foreign_import_end = foreign_import_start
+            + source[foreign_import_start as usize..].find('\n').unwrap() as u32;
+        assert!(unresolved.iter().all(|diagnostic| {
+            !diagnostic.primary().is_some_and(|location| {
+                let start = location.span.range.start().raw();
+                let end = location.span.range.end().raw();
+                location.span.file == fixture.file
+                    && start < foreign_import_end
+                    && foreign_import_start < end
+            })
+        }));
         assert!(
             scopes.modules[0]
                 .imports

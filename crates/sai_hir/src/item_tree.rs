@@ -1,3 +1,4 @@
+use crate::DefPathData;
 use crate::attrs::{
     AttrValidationError, AttributeTarget, ExternAbi, ImplKind, TargetCfg, TargetKind,
     ValidatedAttrs, validate_attrs,
@@ -266,6 +267,51 @@ pub struct ItemTreeEntry {
     pub children: Vec<ItemTreeEntry>,
     /// Present for impl blocks only (§2.8.2).
     pub header_hash: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceMemberPathError {
+    ItemTreeMismatch,
+    TooManyDefinitions,
+}
+
+/// Returns the DefPath component used by a direct member of an interface.
+///
+/// This is shared by resolver collection and HIR lowering so imported
+/// interface members and lowered owners use the same canonical identity.
+pub fn interface_member_path_component(entry: &ItemTreeEntry) -> Option<DefPathData> {
+    Some(match entry.kind {
+        ItemTreeKind::Struct
+        | ItemTreeKind::Alias
+        | ItemTreeKind::Refined
+        | ItemTreeKind::Enum
+        | ItemTreeKind::Resource => DefPathData::TypeNs(entry.name),
+        ItemTreeKind::InterfaceFn => DefPathData::ValueNs(entry.name),
+        _ => return None,
+    })
+}
+
+/// Returns the source-ordered DefPath disambiguator for a direct interface
+/// member, matching the lowering identity rules.
+pub fn interface_member_path_disambiguator(
+    interface: &ItemTreeEntry,
+    member: &ItemTreeEntry,
+) -> Result<u32, InterfaceMemberPathError> {
+    let component = interface_member_path_component(member)
+        .ok_or(InterfaceMemberPathError::ItemTreeMismatch)?;
+    let mut disambiguator = 0u32;
+    for candidate in &interface.children {
+        if interface_member_path_component(candidate).as_ref() != Some(&component) {
+            continue;
+        }
+        if candidate.ast_id == member.ast_id {
+            return Ok(disambiguator);
+        }
+        disambiguator = disambiguator
+            .checked_add(1)
+            .ok_or(InterfaceMemberPathError::TooManyDefinitions)?;
+    }
+    Err(InterfaceMemberPathError::ItemTreeMismatch)
 }
 
 #[derive(Clone, Debug)]
