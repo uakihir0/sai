@@ -497,6 +497,10 @@ pub struct DefPathInterner {
 }
 
 impl DefPathInterner {
+    pub const fn package(&self) -> PackageId {
+        self.package
+    }
+
     pub fn new(
         package: PackageId,
         packages: &PackageInterner,

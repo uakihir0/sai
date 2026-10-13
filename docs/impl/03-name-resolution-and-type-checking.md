@@ -182,12 +182,15 @@ pub struct PackageScopes {
     pub diagnostics: Vec<Diagnostic>,               // includes WIT_ITEM_SHADOWED (impl/16 §16.4.5)
 }
 pub struct ModuleScopes {
-    pub declared: BTreeMap<Symbol, Binding>,        // D(M)
+    pub declared: HashMap<Symbol, Binding>,         // D(M); lookup only, never iterated for output
     pub members: BTreeMap<Symbol, Binding>,         // X(M): D(M) plus `pub use` bindings
     pub scope: BTreeMap<Symbol, Binding>,           // S(M) = D(M) ∪ U(M)
     pub imports: Vec<ImportBinding>,                // every binding introduced by a `use`, in source order
 }
-pub struct Binding { pub res: Res, pub name_span: Span, pub origin: BindingOrigin }
+pub struct Binding {
+    pub res: Res, pub name_span: Span, pub origin: BindingOrigin,
+    pub visibility: Visibility,                    // effective visibility for access checks
+}
 pub enum BindingOrigin { Decl, Use { import: ImportIndex }, PubUse { import: ImportIndex } }
 pub struct ImportBinding {
     pub use_ast_id: ErasedAstId,
@@ -199,7 +202,11 @@ pub struct ImportBinding {
 }
 ```
 
-For each module in `ModuleId` order, Phase 1 walks the module's `ItemTree` ([impl/02](02-frontend-ast-hir.md) §2.8.7) entries in source order and, for each item that survives `@target` and introduces a binding (spec/04 §4.4.1), inserts `name ↦ Res::Def(kind, def_id)` into `declared`. Extern functions are bound individually; the extern block, impls, invariants, tests and properties bind nothing. Items with the error name (`Symbol::ERROR`) are collected but never bound.
+`declared` is keyed by session-local `Symbol` for direct lookup. Its hash-map
+iteration order is never used to assign identities or emit diagnostics;
+diagnostics are sorted by source-relative file path and offset.
+
+For each module in `ModuleId` order, Phase 1 walks the module's `ItemTree` ([impl/02](02-frontend-ast-hir.md) §2.8.7) entries in source order and, for each item that survives `@target` and introduces a binding (spec/04 §4.4.1), inserts `name ↦ Res::Def(kind, def_id)` into `declared`. Extern functions are bound individually and always receive package-private effective visibility, even when the parser retained and diagnosed a visibility marker; the extern block, impls, invariants, tests and properties bind nothing. A named item whose `NAME` is missing retains a DefPath component containing `Symbol::ERROR` and its source-order disambiguator so its body can still be lowered and checked, but it is never bound. Test and property paths use the decoded string token; when the token is absent, no name is fabricated.
 
 - A second declaration of a bound name is `DUPLICATE_BINDING` on the later name, with a related location on the earlier one (spec/04 §4.4.3). The earlier binding stays.
 - A declaration named like a reserved type name is `RESERVED_TYPE_NAME` (spec/04 §4.4.4). The item is collected but not bound.

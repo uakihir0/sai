@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod package_scopes;
+
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
 use sai_intern::{InternError, Interner, PackageId, PackageIdError, PackageInterner, Symbol};
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
