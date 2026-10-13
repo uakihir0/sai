@@ -470,6 +470,7 @@ impl StableHash for Phase1PackageScopesIdentity {
         self.namespaces.stable_hash(hasher);
         self.target_name.stable_hash(hasher);
         self.target_capabilities.stable_hash(hasher);
+        self.build_context.is_root_package.stable_hash(hasher);
         self.build_context
             .is_root_core_module_build
             .stable_hash(hasher);
@@ -936,6 +937,7 @@ fn collect_prepared_phase1_package_scopes(
             .collect::<Vec<_>>(),
         &prepared.target_cfg,
         prepared.build_context.analyzes_tests,
+        prepared.build_context.is_root_package,
     )?;
     scopes.diagnostics.extend(module_alias_diagnostics);
     sort_phase1_diagnostics(&mut scopes.diagnostics);
@@ -2358,6 +2360,74 @@ mod tests {
             !Arc::ptr_eq(&second_memo, &third_memo),
             "changing normalized requirements invalidates package scopes"
         );
+    }
+
+    #[test]
+    fn package_scopes_query_tracks_root_package_context_for_test_edges() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            b"use acme:test-support/fixtures as fixtures\n",
+            b"fn child() {}\n",
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let root_context = Phase1BuildContext {
+            is_root_package: true,
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let root_scopes = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                root_context,
+                Arc::clone(&manifest),
+                PackageRole::Root,
+            )
+            .expect("root test dependencies are classified");
+        assert!(root_scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != sai_diagnostics::Code::TestDependencyUnavailable
+        }));
+
+        let member_context = Phase1BuildContext {
+            is_root_package: false,
+            ..root_context
+        };
+        let member_scopes = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                member_context,
+                Arc::clone(&manifest),
+                PackageRole::Root,
+            )
+            .expect("non-root test dependencies are rejected");
+        assert!(member_scopes.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::TestDependencyUnavailable
+        }));
+        assert!(member_scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != sai_diagnostics::Code::UnknownPackage
+                && diagnostic.code != sai_diagnostics::Code::UnknownModule
+                && diagnostic.code != sai_diagnostics::Code::UnresolvedImport
+        }));
+
+        let repeated_root = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                root_context,
+                manifest,
+                PackageRole::Root,
+            )
+            .expect("the root result remains distinct from the member result");
+        assert!(repeated_root.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != sai_diagnostics::Code::TestDependencyUnavailable
+        }));
     }
 
     #[test]

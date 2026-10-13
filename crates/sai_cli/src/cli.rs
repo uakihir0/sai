@@ -1157,7 +1157,7 @@ fn module_tree_check_diagnostics(
     include_source_lines: bool,
     root_inspection_incomplete: bool,
     target_cfg: Option<&TargetCfg>,
-    is_test_build: bool,
+    analyzes_tests: bool,
 ) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
     let package_key_value =
         PackageKey::new(package_key).map_err(|error| format!("invalid package key: {error:?}"))?;
@@ -1333,12 +1333,13 @@ fn module_tree_check_diagnostics(
                     &workspace_snapshot,
                     target_cfg,
                     sai_driver::Phase1BuildContext {
+                        is_root_package: true,
                         is_root_core_module_build: matches!(
                             target_cfg.target_name(),
                             "wasm32-core" | "wasm64-core"
                         ),
-                        is_test_build,
-                        analyzes_tests: is_test_build,
+                        is_test_build: false,
+                        analyzes_tests,
                     },
                     Arc::clone(manifest_source),
                     sai_package::manifest::PackageRole::Root,
@@ -9091,6 +9092,7 @@ mod tests {
         assert_eq!(test_exit, 1);
         assert!(test_stderr.is_empty());
         assert!(!test_stdout.contains("\"code\":\"DUPLICATE_EXPORT_NAME\""));
+        assert!(test_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
         assert!(test_stdout.contains("\"code\":\"INVALID_ATTRIBUTE_TARGET\""));
         assert_eq!(test_wasi_exit, 1);
         assert!(test_wasi_stderr.is_empty());

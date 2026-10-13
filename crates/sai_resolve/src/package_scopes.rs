@@ -192,6 +192,13 @@ pub struct Phase1PackageScopes {
 /// Build context needed for Phase 1 checks whose rules depend on the artifact.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Phase1BuildContext {
+    /// Whether the package whose scopes are collected is the root of the
+    /// active package graph.
+    ///
+    /// Test dependency edges are available only for this package. This is
+    /// independent of whether the current package is producing a core-module
+    /// or test-build artifact.
+    pub is_root_package: bool,
     /// Whether this is the root package of a core-module build.
     ///
     /// This is false for dependencies, component builds, native builds, and
@@ -338,12 +345,14 @@ pub fn collect_phase1(
         validate_module_input(module_id, module.file, input, snapshot)?;
 
         let mut module_diagnostics = input.filtered.diagnostics.clone();
-        let canonical_module_path =
-            if build_context.is_root_core_module_build && !build_context.is_test_build {
-                canonical_module_path(module, symbols)?
-            } else {
-                String::new()
-            };
+        let canonical_module_path = if build_context.is_root_core_module_build
+            && !build_context.is_test_build
+            && !build_context.analyzes_tests
+        {
+            canonical_module_path(module, symbols)?
+        } else {
+            String::new()
+        };
         let module_path = module
             .path
             .iter()
@@ -526,6 +535,7 @@ pub fn collect_phase1(
                     }
                     if build_context.is_root_core_module_build
                         && !build_context.is_test_build
+                        && !build_context.analyzes_tests
                         && entry.kind == ItemTreeKind::Function
                         && entry.vis == Visibility::Export
                         && let Some(candidate) = collect_export_candidate(
@@ -615,6 +625,7 @@ pub fn collect_local_module_alias_bindings(
     requirements: &[PackageUseRequirement],
     target_cfg: &TargetCfg,
     analyzes_tests: bool,
+    is_root_package: bool,
 ) -> Result<Vec<Diagnostic>, PackageScopesError> {
     if module_tree.modules.len() != scopes.modules.len()
         || def_paths.package() != module_tree.package
@@ -714,6 +725,7 @@ pub fn collect_local_module_alias_bindings(
                         .iter()
                         .any(|target| target == target_cfg.target_name())
                 });
+            let test_dependency_unavailable = test_only && analyzes_tests && !is_root_package;
             let binding_name = match derive_use_binding_name(entry, symbols) {
                 Ok(binding_name) => binding_name,
                 Err(UseBindingNameError::Intern(error)) => {
@@ -734,6 +746,13 @@ pub fn collect_local_module_alias_bindings(
 
             let (target_res, target) = if test_only && !analyzes_tests {
                 (None, PendingItemTarget::TestOnly)
+            } else if test_dependency_unavailable {
+                diagnostics.push(test_dependency_unavailable_diagnostic(
+                    source_location(input, path_range)?,
+                    &parsed.package_identity,
+                    &package_identity,
+                ));
+                (None, PendingItemTarget::Unavailable)
             } else if let Some(targets) = inactive_targets {
                 diagnostics.push(inactive_dependency_diagnostic(
                     source_location(input, path_range)?,
@@ -2275,6 +2294,34 @@ fn test_dependency_outside_test_diagnostic(
     diagnostic
 }
 
+fn test_dependency_unavailable_diagnostic(
+    location: Location,
+    identity: &str,
+    package_identity: &str,
+) -> Diagnostic {
+    let mut diagnostic = use_binding_diagnostic(
+        Code::TestDependencyUnavailable,
+        Severity::Error,
+        format!("test dependency `{identity}` is unavailable because this package is not the root"),
+        "test dependency use",
+        location,
+        package_identity,
+    );
+    diagnostic
+        .data
+        .insert("dependency".to_owned(), Value::String(identity.to_owned()));
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Help,
+            message:
+                "test dependencies are available only for the root package; run `sai test` in this package's directory"
+                    .to_owned(),
+            location: None,
+        })
+        .expect("a diagnostic without a workspace snapshot accepts help children");
+    diagnostic
+}
+
 fn use_binding_diagnostic(
     code: Code,
     severity: Severity,
@@ -3213,6 +3260,21 @@ mod tests {
             requirements: &[PackageUseRequirement],
             analyzes_tests: bool,
         ) -> (Phase1PackageScopes, DefPathInterner) {
+            self.collect_with_local_modules_and_paths_and_requirements_for_package(
+                module_sources,
+                requirements,
+                analyzes_tests,
+                true,
+            )
+        }
+
+        fn collect_with_local_modules_and_paths_and_requirements_for_package(
+            &self,
+            module_sources: &[(&str, &str)],
+            requirements: &[PackageUseRequirement],
+            analyzes_tests: bool,
+            is_root_package: bool,
+        ) -> (Phase1PackageScopes, DefPathInterner) {
             struct ExtraInput {
                 module_name: Symbol,
                 file: FileId,
@@ -3337,7 +3399,10 @@ mod tests {
                 Phase1CollectionConfig {
                     snapshot: &snapshot,
                     target_cfg: &self.target_cfg,
-                    build_context: Phase1BuildContext::default(),
+                    build_context: Phase1BuildContext {
+                        is_root_package,
+                        ..Phase1BuildContext::default()
+                    },
                 },
                 &self.packages,
                 &self.symbols,
@@ -3364,6 +3429,7 @@ mod tests {
                 requirements,
                 &self.target_cfg,
                 analyzes_tests,
+                is_root_package,
             )
             .expect("local use items collect");
             scopes.diagnostics.extend(local_import_diagnostics);
@@ -3696,6 +3762,68 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn test_dependency_use_in_a_non_root_package_is_unavailable_without_cascades() {
+        let source = "use acme:test-support.{missing as local}\nfn local() {}\n";
+        let fixture = Fixture::new(source, "wasm32-core");
+        let requirements = [PackageUseRequirement {
+            identity: "acme:test-support".to_owned(),
+            only: Some(Arc::from(["wasm32-wasi".to_owned()])),
+            test: true,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_requirements_for_package(
+                &[],
+                &requirements,
+                true,
+                false,
+            );
+        let diagnostic = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::TestDependencyUnavailable)
+            .expect("non-root test analysis reports the unavailable test edge");
+        let path = "acme:test-support";
+        let start = source.find(path).unwrap() as u32;
+        assert_eq!(
+            diagnostic.primary().unwrap().span.range,
+            TextRange::new(
+                TextSize::new(start),
+                TextSize::new(start + path.len() as u32)
+            )
+            .unwrap(),
+            "the diagnostic covers the complete PKG_PATH"
+        );
+        assert!(diagnostic.children().iter().any(|child| {
+            child.kind == ChildKind::Help
+                && child.message.contains("only for the root package")
+                && child.message.contains("`sai test`")
+        }));
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        assert_eq!(root.imports.len(), 1);
+        assert!(root.imports[0].test_only);
+        assert_eq!(
+            root.imports[0].res,
+            Res::TestOnly(ImportIndex(0)),
+            "the unavailable binding is retained to avoid reference cascades"
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == Code::DuplicateBinding })
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.code,
+                Code::InactiveDependency
+                    | Code::UnknownPackage
+                    | Code::UnknownModule
+                    | Code::UnresolvedImport
+            )
+        }));
     }
 
     #[test]
@@ -5051,6 +5179,7 @@ mod tests {
             "wasm32-wasi",
         );
         let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_package: false,
             is_root_core_module_build: false,
             is_test_build: true,
             analyzes_tests: false,
