@@ -8798,6 +8798,7 @@ mod tests {
         let source = concat!(
             "use acme:test-support/missing as fixtures\n",
             "use acme:test-support/missing.{Missing as fixtures}\n",
+            "pub use acme:test-support/exports.{Missing as public_fixture}\n",
         );
         fs::write(package.join("src/lib.sai"), source).expect("write test-only imports");
 
@@ -8811,12 +8812,21 @@ mod tests {
             1,
             "{stdout}"
         );
+        let public_test_use = check_diagnostic_lines(&stdout, "TEST_DEPENDENCY_OUTSIDE_TEST");
+        assert_eq!(public_test_use.len(), 1, "{stdout}");
+        let path_start = source
+            .find("acme:test-support/exports")
+            .expect("public test-only package path");
+        assert!(
+            public_test_use[0].contains("\"path\":\"src/lib.sai\"")
+                && public_test_use[0].contains(&format!("\"start\":{{\"byte\":{path_start},")),
+            "{public_test_use:?}"
+        );
         for code in [
             "UNKNOWN_PACKAGE",
             "UNKNOWN_MODULE",
             "UNRESOLVED_IMPORT",
             "INACTIVE_DEPENDENCY",
-            "TEST_DEPENDENCY_OUTSIDE_TEST",
         ] {
             assert!(
                 check_diagnostic_lines(&stdout, code).is_empty(),
