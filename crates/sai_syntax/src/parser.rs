@@ -140,7 +140,6 @@ pub enum ParserError {
     EmptyExpectedSet,
     InvalidExpectedKind { kind: SyntaxKind },
     UnsupportedItem { position: usize, kind: SyntaxKind },
-    UnsupportedSyntax { position: usize, kind: SyntaxKind },
 }
 
 impl<'src, 'tokens> Parser<'src, 'tokens> {
@@ -714,7 +713,9 @@ impl CompletedMarker {
             .get(self.position as usize)
             .expect("completed parser marker position is valid");
         let Event::Start { forward_parent, .. } = event else {
-            panic!("completed parser marker no longer points to a start event");
+            unreachable!(
+                "completed markers name Start events: complete_marker is the only writer of Start, and abandon_marker only rewrites uncompleted Tombstones"
+            );
         };
         assert!(
             forward_parent.is_none(),
@@ -7859,6 +7860,230 @@ let byte_non_ascii = b"€"
             1
         );
         assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
+    fn unknown_top_level_token_is_reported_and_recovers_at_the_next_item() {
+        let source = "let x = 1\nfn main() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(output.errors[0].message, "expected an item");
+        let range = output.errors[0]
+            .primary()
+            .expect("the diagnostic has a primary location")
+            .span
+            .range;
+        assert_eq!(range.start().to_usize(), 0);
+        assert_eq!(range.end().to_usize(), 3);
+        let error_text = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ERROR && !node.text_range().is_empty())
+            .map(|node| {
+                let range = node.text_range();
+                source[range.start().to_usize()..range.end().to_usize()].to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(error_text, ["let x = 1"]);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            output.root.text_len(),
+            TextSize::from_usize(source.len()).expect("source fits TextSize")
+        );
+    }
+
+    #[test]
+    fn unknown_token_after_visibility_keeps_the_visibility_and_recovers_the_next_item() {
+        let output = parse_file("pub 1\nfn next() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::VISIBILITY)
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_group_hides_line_starts_inside_its_brackets() {
+        let source = "foo(\nfn bar() {}\n)\nfn next() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        let function_text = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+            .map(|node| {
+                let range = node.text_range();
+                source[range.start().to_usize()..range.end().to_usize()].to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(function_text, ["fn next() {}"]);
+        let group_text = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ERROR && !node.text_range().is_empty())
+            .map(|node| {
+                let range = node.text_range();
+                source[range.start().to_usize()..range.end().to_usize()].to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(group_text, ["foo(\nfn bar() {}\n)"]);
+    }
+
+    #[test]
+    fn bare_async_at_file_scope_is_consumed_without_stalling() {
+        let output = parse_file("async x\nfn next() {}\n");
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn each_unknown_line_start_token_at_file_scope_gets_its_own_diagnostic() {
+        let output = parse_file("foo\nasync x\nfn next() {}\n");
+
+        assert_eq!(output.errors.len(), 2);
+        assert!(
+            output
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code == Code::ExpectedToken)
+        );
+    }
+
+    #[test]
+    fn visibility_at_end_of_file_reports_a_missing_item() {
+        let source = "pub";
+        let output = parse_file(source);
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            output.root.text_len(),
+            TextSize::from_usize(source.len()).expect("source fits TextSize")
+        );
+    }
+
+    #[test]
+    fn lexer_error_token_at_file_scope_has_no_second_parser_diagnostic() {
+        let source = ";\nfn next() {}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert!(output.errors.is_empty());
+        let error_text = root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::ERROR && !node.text_range().is_empty())
+            .map(|node| {
+                let range = node.text_range();
+                source[range.start().to_usize()..range.end().to_usize()].to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(error_text, [";"]);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::FN_DECL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unsafe_without_a_block_in_expression_position_reports_the_missing_brace() {
+        let source = "fn f() {\n    let x = unsafe y\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        let range = output.errors[0]
+            .primary()
+            .expect("the diagnostic has a primary location")
+            .span
+            .range;
+        assert_eq!(
+            range.start().to_usize(),
+            source.find("y\n").expect("operand")
+        );
+        assert!(
+            !root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::UNSAFE_BLOCK_EXPR)
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::LET_STMT)
+        );
+    }
+
+    #[test]
+    fn move_without_fn_in_expression_position_reports_the_missing_fn() {
+        let source = "fn f() {\n    let x = move y\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        let range = output.errors[0]
+            .primary()
+            .expect("the diagnostic has a primary location")
+            .span
+            .range;
+        assert_eq!(
+            range.start().to_usize(),
+            source.find("y\n").expect("operand")
+        );
+        assert!(
+            !root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::CLOSURE_EXPR)
+        );
+    }
+
+    #[test]
+    fn await_without_a_receiver_reports_a_missing_expression() {
+        let source = "fn f() {\n    let x = .await\n}\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root.clone());
+
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].code, Code::ExpectedExpression);
+        let range = output.errors[0]
+            .primary()
+            .expect("the diagnostic has a primary location")
+            .span
+            .range;
+        assert_eq!(
+            range.start().to_usize(),
+            source.find(".await").expect("await")
+        );
+        assert!(
+            root.descendants()
+                .any(|node| node.kind() == SyntaxKind::AWAIT_EXPR)
+        );
     }
 
     #[test]

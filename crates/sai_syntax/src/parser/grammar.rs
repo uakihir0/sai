@@ -181,9 +181,10 @@ enum ImplTargetKind {
 impl Parser<'_, '_> {
     /// Parses the currently implemented source-file grammar into parser events.
     ///
-    /// Item and expression forms are supported as their grammar routines are
-    /// implemented. Unsupported forms return [`ParserError::UnsupportedItem`]
-    /// or [`ParserError::UnsupportedSyntax`] for the enclosing recovery path.
+    /// A token that no item production accepts returns
+    /// [`ParserError::UnsupportedItem`]. The file-level recovery path reports it
+    /// as `EXPECTED_TOKEN`, and the block-level path recovers it silently after
+    /// `ITEM_IN_BLOCK`.
     pub fn parse_source_file(&mut self) -> Result<(), ParserError> {
         if self.diagnostic_source.is_none() {
             return Err(ParserError::MissingDiagnosticSource);
@@ -225,7 +226,14 @@ impl Parser<'_, '_> {
                 self.recover_unexpected_top_level_closer()?;
                 continue;
             }
-            self.item()?;
+            match self.item() {
+                Ok(_) => {}
+                Err(ParserError::UnsupportedItem { .. }) => {
+                    self.recover_unexpected_top_level_item()?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             if !self.at(SyntaxKind::EOF) && !self.eat_nl() && !self.line_starts_top_level_item() {
                 if self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
                     while self.at_any(&[SyntaxKind::DOC_OUTER, SyntaxKind::DOC_INNER]) {
@@ -256,6 +264,53 @@ impl Parser<'_, '_> {
         )?;
         let error = self.start();
         self.bump();
+        error.complete(self, SyntaxKind::ERROR)?;
+        Ok(())
+    }
+
+    /// Reports a token that cannot start an item at file scope, then wraps it and
+    /// the following tokens up to the next line-start item in one `ERROR` node.
+    ///
+    /// The offending token is always consumed, so recovery makes progress even
+    /// when the token itself looks like an item start to `line_starts_top_level_item`.
+    /// A lexer `ERROR` token already has its lexical diagnostic (§2.4.12), so it is
+    /// wrapped alone and without a second parser diagnostic.
+    fn recover_unexpected_top_level_item(&mut self) -> Result<(), ParserError> {
+        if self.at(SyntaxKind::ERROR) {
+            let error = self.start();
+            self.bump();
+            error.complete(self, SyntaxKind::ERROR)?;
+            return Ok(());
+        }
+        let range = self
+            .current_token()
+            .map(|token| token.range)
+            .ok_or(ParserError::InvalidDiagnosticSpan)?;
+        self.emit_parser_diagnostic(
+            sai_diagnostics::Code::ExpectedToken,
+            range,
+            "expected an item",
+        )?;
+        let error = self.start();
+        if !self.at(SyntaxKind::EOF) {
+            self.bump();
+        }
+        let mut bracket_depth = 0usize;
+        while !self.at(SyntaxKind::EOF) {
+            if bracket_depth == 0 && self.line_starts_top_level_item() {
+                break;
+            }
+            match self.current() {
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACKET | SyntaxKind::L_BRACE => {
+                    bracket_depth += 1;
+                }
+                SyntaxKind::R_PAREN | SyntaxKind::R_BRACKET | SyntaxKind::R_BRACE => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            self.bump();
+        }
         error.complete(self, SyntaxKind::ERROR)?;
         Ok(())
     }
@@ -5816,10 +5871,8 @@ impl Parser<'_, '_> {
                 let expression = self.start();
                 self.bump();
                 if !self.at(SyntaxKind::L_BRACE) {
-                    let position = self.position;
-                    let kind = self.current();
-                    expression.abandon(self)?;
-                    return Err(ParserError::UnsupportedSyntax { position, kind });
+                    self.expect(SyntaxKind::L_BRACE)?;
+                    return expression.complete(self, SyntaxKind::ERROR);
                 }
                 if let Err(error) = self.with_no_block_operand(false, |parser| parser.block()) {
                     expression.abandon(self)?;
@@ -5829,12 +5882,6 @@ impl Parser<'_, '_> {
             }
             SyntaxKind::DOT2 | SyntaxKind::DOT2EQ => self.prefix_range_expr(),
             SyntaxKind::DOT if self.nth(1) == SyntaxKind::UIDENT => self.implicit_member_expr(),
-            SyntaxKind::DOT if self.nth(1) == SyntaxKind::AWAIT_KW => {
-                Err(ParserError::UnsupportedSyntax {
-                    position: self.position,
-                    kind: SyntaxKind::DOT,
-                })
-            }
             SyntaxKind::L_BRACKET => {
                 self.with_no_block_operand(false, |parser| parser.array_expr())
             }
@@ -5849,10 +5896,12 @@ impl Parser<'_, '_> {
             SyntaxKind::FN_KW => self.closure_expr(),
             SyntaxKind::ASYNC_KW => self.async_block_expr(),
             SyntaxKind::FSTRING_START => self.fstring_expr(),
-            SyntaxKind::MOVE_KW => Err(ParserError::UnsupportedSyntax {
-                position: self.position,
-                kind: self.current(),
-            }),
+            SyntaxKind::MOVE_KW => {
+                let expression = self.start();
+                self.bump();
+                self.expect(SyntaxKind::FN_KW)?;
+                expression.complete(self, SyntaxKind::ERROR)
+            }
             _ => self.missing_expression(),
         }
     }

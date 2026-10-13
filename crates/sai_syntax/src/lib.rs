@@ -4584,6 +4584,15 @@ mod tests {
     }
 
     #[test]
+    fn unknown_file_scope_token_is_a_parse_diagnostic_not_a_parse_failure() {
+        let (_snapshot, parsed) = parse_text("let x = 1\nfn main() {}\n");
+
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].code, Code::ExpectedToken);
+        assert_eq!(parsed.parser_diagnostics.len(), 1);
+    }
+
+    #[test]
     fn syntax_parse_query_memoizes_rebinds_and_invalidates_by_source() {
         let key = FileKey::new("sai:core", "src/main.sai").expect("stable key");
         let bytes: Arc<[u8]> = Arc::from(
