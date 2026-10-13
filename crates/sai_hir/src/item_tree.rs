@@ -1473,7 +1473,12 @@ impl<'a> ItemAttributeValidation<'a> {
     }
 }
 
-fn entry_attribute_target(
+/// Derives the complete attribute target for one item-tree entry.
+///
+/// This is shared with narrow later-stage validators that must diagnose an
+/// attribute on its actual syntactic target without enabling general
+/// validation for that stage.
+pub fn entry_attribute_target(
     entry: &ItemTreeEntry,
     module_level: bool,
     file: FileId,

@@ -7,9 +7,13 @@
 //! extern block in the item tree.
 
 use super::{ChildEntry, ModuleData};
-use sai_diagnostics::{Code, Diagnostic, Location, Related, Severity, SourceRef};
-use sai_hir::attrs::TargetCfg;
-use sai_hir::item_tree::{ItemTreeKind, TargetFilterResult};
+use sai_diagnostics::{
+    Child, ChildKind, Code, Diagnostic, Location, Related, Severity, SourceRef, Value,
+};
+use sai_hir::attrs::{
+    AttributeTarget, TargetCfg, TargetKind, ValidatedExportName, validate_export_name,
+};
+use sai_hir::item_tree::{AttrName, ItemTreeKind, TargetFilterResult};
 use sai_hir::{
     DefId, DefPath, DefPathData, DefPathError, DefPathInterner, DefPathInternerError,
     DisambiguatedDefPathData, LocalDefId, PackageId, Symbol, Visibility,
@@ -89,10 +93,34 @@ pub struct Phase1ModuleScopes {
 pub struct Phase1PackageScopes {
     /// Module index is the corresponding `ModuleId::raw()` value.
     pub modules: Vec<Phase1ModuleScopes>,
+    /// First definition for each export name in a root core-module build.
+    pub exports: BTreeMap<String, LocalDefId>,
     /// Target-attribute and Phase-1 declaration diagnostics, sorted by
     /// source-relative file path and byte offset. Module-tree diagnostics
     /// remain owned by `module_tree`.
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Build context needed for Phase 1 checks whose rules depend on the artifact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Phase1BuildContext {
+    /// Whether this is the root package of a core-module build.
+    ///
+    /// This is false for dependencies, component builds, native builds, and
+    /// callers that do not yet provide artifact context.
+    pub is_root_core_module_build: bool,
+    /// Whether this analysis includes the test harness.
+    ///
+    /// Test analysis validates `@export_name` targets for every Wasm target
+    /// but does not define the package's core-module export namespace.
+    pub is_test_build: bool,
+}
+
+/// Snapshot and build metadata shared by one Phase-1 package collection.
+pub struct Phase1CollectionConfig<'a> {
+    pub snapshot: &'a sai_vfs::WorkspaceSnapshot,
+    pub target_cfg: &'a TargetCfg,
+    pub build_context: Phase1BuildContext,
 }
 
 impl Phase1PackageScopes {
@@ -122,6 +150,8 @@ pub enum PackageScopesError {
     MissingName,
     NameMismatch,
     InvalidSourceRange,
+    Attribute(sai_hir::attrs::AttrValidationError),
+    TargetFilter(sai_hir::item_tree::TargetFilterError),
     Package(PackageIdError),
     DefPathValidation(DefPathError),
     Interner(InternError),
@@ -148,6 +178,12 @@ impl From<InternError> for PackageScopesError {
     }
 }
 
+impl From<sai_hir::attrs::AttrValidationError> for PackageScopesError {
+    fn from(error: sai_hir::attrs::AttrValidationError) -> Self {
+        Self::Attribute(error)
+    }
+}
+
 impl From<DefPathInternerError> for PackageScopesError {
     fn from(error: DefPathInternerError) -> Self {
         Self::DefPath(error)
@@ -166,11 +202,16 @@ impl From<DefPathInternerError> for PackageScopesError {
 pub fn collect_phase1(
     module_tree: &super::ModuleTree,
     module_inputs: &BTreeMap<super::ModuleId, FilteredModule<'_>>,
-    target_cfg: &TargetCfg,
+    config: Phase1CollectionConfig<'_>,
     packages: &PackageInterner,
     symbols: &Interner,
     def_paths: &DefPathInterner,
 ) -> Result<Phase1PackageScopes, PackageScopesError> {
+    let Phase1CollectionConfig {
+        snapshot,
+        target_cfg,
+        build_context,
+    } = config;
     if module_tree.modules.len() > u32::MAX as usize {
         return Err(PackageScopesError::TooManyModules);
     }
@@ -181,6 +222,7 @@ pub fn collect_phase1(
     let package_identity = packages.resolve(module_tree.package)?.to_string();
     let mut scopes = Vec::with_capacity(module_tree.modules.len());
     let mut diagnostics = Vec::new();
+    let mut export_candidates = Vec::new();
 
     for (raw_module_id, module) in module_tree.modules.iter().enumerate() {
         let module_id = super::ModuleId::from_raw(
@@ -189,9 +231,15 @@ pub fn collect_phase1(
         let input = module_inputs
             .get(&module_id)
             .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
-        validate_module_input(module_id, module.file, input)?;
+        validate_module_input(module_id, module.file, input, snapshot)?;
 
         let mut module_diagnostics = input.filtered.diagnostics.clone();
+        let canonical_module_path =
+            if build_context.is_root_core_module_build && !build_context.is_test_build {
+                canonical_module_path(module, symbols)?
+            } else {
+                String::new()
+            };
         let module_path = module
             .path
             .iter()
@@ -206,7 +254,34 @@ pub fn collect_phase1(
         let mut module_scopes = Phase1ModuleScopes::default();
         let mut test_names = BTreeMap::<String, Location>::new();
 
+        let validate_export_names =
+            build_context.is_root_core_module_build || build_context.is_test_build;
+        if validate_export_names {
+            for use_entry in &input.filtered.item_tree.uses {
+                validate_export_name_on_use(
+                    &use_entry.raw_attrs,
+                    snapshot,
+                    &package_identity,
+                    symbols,
+                    &mut module_diagnostics,
+                )?;
+            }
+        }
+
         for entry in &input.filtered.item_tree.items {
+            let validated_export_name = if validate_export_names {
+                validate_export_name_tree(
+                    entry,
+                    true,
+                    input,
+                    snapshot,
+                    &package_identity,
+                    symbols,
+                    &mut module_diagnostics,
+                )?
+            } else {
+                None
+            };
             match entry.kind {
                 ItemTreeKind::ExternBlock => {
                     let component = extern_block_component(entry, input, symbols)?;
@@ -326,6 +401,21 @@ pub fn collect_phase1(
                             &package_identity,
                         ));
                     }
+                    if build_context.is_root_core_module_build
+                        && !build_context.is_test_build
+                        && entry.kind == ItemTreeKind::Function
+                        && entry.vis == Visibility::Export
+                        && let Some(candidate) = collect_export_candidate(
+                            entry,
+                            local_def_id,
+                            &canonical_module_path,
+                            input,
+                            symbols,
+                            validated_export_name,
+                        )?
+                    {
+                        export_candidates.push(candidate);
+                    }
                     bind_declaration(
                         entry,
                         kind,
@@ -357,6 +447,12 @@ pub fn collect_phase1(
         }
     }
 
+    let exports = collect_exports(
+        export_candidates,
+        snapshot,
+        &package_identity,
+        &mut diagnostics,
+    )?;
     diagnostics.sort_by(|left, right| match (left.primary(), right.primary()) {
         (Some(left), Some(right)) => left
             .file
@@ -371,6 +467,7 @@ pub fn collect_phase1(
 
     Ok(Phase1PackageScopes {
         modules: scopes,
+        exports,
         diagnostics,
     })
 }
@@ -390,17 +487,213 @@ fn interface_conflicts_with_module_file(
     ))
 }
 
+struct ExportCandidate {
+    module_path: String,
+    source_offset: u32,
+    name: String,
+    def_id: LocalDefId,
+    location: Location,
+}
+
+fn canonical_module_path(
+    module: &ModuleData,
+    symbols: &Interner,
+) -> Result<String, PackageScopesError> {
+    module
+        .path
+        .iter()
+        .map(|symbol| symbols.resolve(*symbol).map(|name| name.to_string()))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|segments| segments.join("/"))
+        .map_err(Into::into)
+}
+
+fn validate_export_name_tree(
+    entry: &sai_hir::item_tree::ItemTreeEntry,
+    module_level: bool,
+    input: &FilteredModule<'_>,
+    snapshot: &sai_vfs::WorkspaceSnapshot,
+    package_identity: &str,
+    symbols: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Option<ValidatedExportName>, PackageScopesError> {
+    let target = sai_hir::item_tree::entry_attribute_target(
+        entry,
+        module_level,
+        input.source.id(),
+        input.root,
+        input.ast_ids,
+    )
+    .map_err(PackageScopesError::TargetFilter)?;
+    let validated = validate_export_name(&entry.raw_attrs, target, symbols, snapshot)?;
+    suppress_export_name_feature_gate(&entry.raw_attrs, diagnostics);
+    for mut diagnostic in validated.diagnostics {
+        diagnostic.package = Some(package_identity.to_owned());
+        diagnostics.push(diagnostic);
+    }
+    for child in &entry.children {
+        validate_export_name_tree(
+            child,
+            false,
+            input,
+            snapshot,
+            package_identity,
+            symbols,
+            diagnostics,
+        )?;
+    }
+    Ok(validated.export_name)
+}
+
+fn validate_export_name_on_use(
+    attributes: &[sai_hir::item_tree::RawAttr],
+    snapshot: &sai_vfs::WorkspaceSnapshot,
+    package_identity: &str,
+    symbols: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), PackageScopesError> {
+    let mut target = AttributeTarget::new(TargetKind::Use);
+    target.module_level = true;
+    let validated = validate_export_name(attributes, Some(target), symbols, snapshot)?;
+    suppress_export_name_feature_gate(attributes, diagnostics);
+    for mut diagnostic in validated.diagnostics {
+        diagnostic.package = Some(package_identity.to_owned());
+        diagnostics.push(diagnostic);
+    }
+    Ok(())
+}
+
+fn suppress_export_name_feature_gate(
+    attributes: &[sai_hir::item_tree::RawAttr],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let export_attribute_spans = attributes
+        .iter()
+        .filter(|attribute| attribute.name == AttrName::ExportName && !attribute.has_error)
+        .map(|attribute| attribute.span)
+        .collect::<Vec<_>>();
+    diagnostics.retain(|diagnostic| {
+        !(diagnostic.code == Code::FeatureNotImplemented
+            && matches!(
+                diagnostic.data.get("feature"),
+                Some(Value::String(feature)) if feature == "attribute @export_name"
+            )
+            && diagnostic
+                .primary()
+                .is_some_and(|primary| export_attribute_spans.contains(&primary.span)))
+    });
+}
+
+fn collect_export_candidate(
+    entry: &sai_hir::item_tree::ItemTreeEntry,
+    def_id: LocalDefId,
+    module_path: &str,
+    input: &FilteredModule<'_>,
+    symbols: &Interner,
+    export_name: Option<ValidatedExportName>,
+) -> Result<Option<ExportCandidate>, PackageScopesError> {
+    if entry.name.is_error() {
+        return Ok(None);
+    }
+    let (name, location) = if let Some(export_name) = export_name {
+        (
+            export_name.value,
+            source_location(input, export_name.string_span.range)?,
+        )
+    } else {
+        let (_, location) = declaration_name_location(entry, input)?;
+        (symbols.resolve(entry.name)?.to_string(), location)
+    };
+    let source_offset = location.span.range.start().raw();
+    Ok(Some(ExportCandidate {
+        module_path: module_path.to_owned(),
+        source_offset,
+        name,
+        def_id,
+        location,
+    }))
+}
+
+fn collect_exports(
+    mut candidates: Vec<ExportCandidate>,
+    snapshot: &sai_vfs::WorkspaceSnapshot,
+    package_identity: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<BTreeMap<String, LocalDefId>, PackageScopesError> {
+    candidates.sort_by(|left, right| {
+        left.module_path
+            .as_bytes()
+            .cmp(right.module_path.as_bytes())
+            .then_with(|| left.source_offset.cmp(&right.source_offset))
+    });
+
+    let mut exports = BTreeMap::new();
+    let mut first_by_name = BTreeMap::<String, Location>::new();
+    for candidate in candidates {
+        let first = first_by_name.get(&candidate.name).cloned();
+        if first.is_none() {
+            first_by_name.insert(candidate.name.clone(), candidate.location.clone());
+            exports.insert(candidate.name.clone(), candidate.def_id);
+        }
+        if first.is_some() || candidate.name == "memory" {
+            let mut diagnostic = Diagnostic::new(
+                Code::DuplicateExportName,
+                Severity::Error,
+                format!("export name `{}` is not unique", candidate.name),
+                Some(candidate.location),
+            );
+            diagnostic.primary_label = if candidate.name == "memory" {
+                "reserved export name"
+            } else {
+                "duplicate export name"
+            }
+            .to_owned();
+            diagnostic.package = Some(package_identity.to_owned());
+            diagnostic = diagnostic
+                .with_workspace_snapshot(snapshot)
+                .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+            if let Some(location) = first {
+                diagnostic
+                    .push_related(Related::DeclaredHere {
+                        location,
+                        what: "first export with this name".to_owned(),
+                    })
+                    .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+            }
+            if candidate.name == "memory" {
+                diagnostic
+                    .push_child(Child {
+                        kind: ChildKind::Note,
+                        message: "linear memory is exported under the name `memory`".to_owned(),
+                        location: None,
+                    })
+                    .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+            }
+            diagnostics.push(diagnostic);
+        }
+    }
+    Ok(exports)
+}
+
 fn validate_module_input(
     module_id: super::ModuleId,
     file: FileId,
     input: &FilteredModule<'_>,
+    snapshot: &sai_vfs::WorkspaceSnapshot,
 ) -> Result<(), PackageScopesError> {
     let item_tree = &input.filtered.item_tree;
+    let snapshot_file = snapshot.file(file);
     if item_tree.file != file
         || !item_tree.matches_ast_ids(input.ast_ids)
         || !input.ast_ids.matches_root(file, input.root)
         || input.source.id() != file
         || !syntax_matches_source(input.root.green(), input.source.text())
+        || snapshot_file.is_none_or(|snapshot_file| {
+            snapshot_file.path() != input.source_ref.path
+                || snapshot_file.package() != input.source_ref.package.as_deref()
+                || snapshot_file.document_version() != input.source_ref.snapshot
+                || snapshot_file.source().text() != input.source.text()
+        })
     {
         return Err(PackageScopesError::InvalidModuleInput(module_id));
     }
@@ -811,6 +1104,7 @@ mod tests {
         packages: PackageInterner,
         symbols: Interner,
         file: FileId,
+        snapshot: WorkspaceSnapshot,
         source: SourceFile,
         parsed: Parse,
         ast_ids: ast::AstIdMap,
@@ -858,6 +1152,7 @@ mod tests {
                 packages: package_interner,
                 symbols,
                 file,
+                snapshot,
                 source,
                 parsed,
                 ast_ids,
@@ -867,6 +1162,13 @@ mod tests {
         }
 
         fn collect(&self) -> (Phase1PackageScopes, DefPathInterner) {
+            self.collect_with_context(Phase1BuildContext::default())
+        }
+
+        fn collect_with_context(
+            &self,
+            build_context: Phase1BuildContext,
+        ) -> (Phase1PackageScopes, DefPathInterner) {
             let tree = ModuleTree {
                 package: self.package,
                 modules: vec![ModuleData {
@@ -889,7 +1191,7 @@ mod tests {
                     source: &self.source,
                     source_ref: SourceRef {
                         path: "src/lib.sai".to_owned(),
-                        package: Some("acme:phase1".to_owned()),
+                        package: None,
                         snapshot: None,
                     },
                 },
@@ -897,7 +1199,11 @@ mod tests {
             let result = collect_phase1(
                 &tree,
                 &inputs,
-                &self.target_cfg,
+                Phase1CollectionConfig {
+                    snapshot: &self.snapshot,
+                    target_cfg: &self.target_cfg,
+                    build_context,
+                },
                 &self.packages,
                 &self.symbols,
                 &paths,
@@ -1053,6 +1359,314 @@ mod tests {
     }
 
     #[test]
+    fn collects_export_names_and_reports_duplicates_at_the_later_name() {
+        let source = concat!(
+            "export fn first() {}\n",
+            "@export_name(\"first\")\n",
+            "export fn second() {}\n",
+            "@export_name(\"first\")\n",
+            "export fn third() {}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        });
+
+        assert_eq!(scopes.exports.len(), 1);
+        assert!(scopes.exports.contains_key("first"));
+        let duplicates = scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::DuplicateExportName)
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+
+        let first_name_offset =
+            sai_vfs::TextSize::new(u32::try_from(source.find("first()").unwrap()).unwrap());
+        let duplicate_offsets = [
+            source.find("\"first\"").unwrap(),
+            source.rfind("\"first\"").unwrap(),
+        ];
+        for (duplicate, expected_offset) in duplicates.iter().zip(duplicate_offsets) {
+            let primary = duplicate.primary().expect("duplicate has a primary");
+            let expected_offset = u32::try_from(expected_offset).unwrap();
+            assert_eq!(
+                primary.span.range.start(),
+                sai_vfs::TextSize::new(expected_offset)
+            );
+            assert_eq!(
+                primary.span.range.end(),
+                sai_vfs::TextSize::new(expected_offset + "\"first\"".len() as u32)
+            );
+            assert!(matches!(
+                duplicate.related().first(),
+                Some(Related::DeclaredHere { location, what })
+                    if what == "first export with this name"
+                        && location.span.range.start() == first_name_offset
+            ));
+        }
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                diagnostic.code != Code::FeatureNotImplemented
+                    || !matches!(
+                        diagnostic.data.get("feature"),
+                        Some(Value::String(feature)) if feature == "attribute @export_name"
+                    )
+            }),
+            "valid @export_name must not keep the Stage 0 feature-gate diagnostic"
+        );
+    }
+
+    #[test]
+    fn reserves_memory_and_compares_explicit_names_by_utf8_bytes() {
+        let source = concat!(
+            "export fn memory() {}\n",
+            "@export_name(\"memory\") export fn explicit_memory() {}\n",
+            "@export_name(\"é\") export fn precomposed() {}\n",
+            "@export_name(\"e\\u{301}\") export fn decomposed() {}\n",
+            "export fn r#type() {}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        });
+        assert!(scopes.exports.contains_key("memory"));
+        assert!(scopes.exports.contains_key("é"));
+        assert!(scopes.exports.contains_key("e\u{301}"));
+        assert!(scopes.exports.contains_key("type"));
+        assert!(!scopes.exports.contains_key("r#type"));
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateExportName)
+                .count(),
+            2
+        );
+        for diagnostic in scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::DuplicateExportName)
+        {
+            assert!(
+                diagnostic
+                    .children()
+                    .iter()
+                    .any(|child| child.kind == ChildKind::Note
+                        && child.message.contains("linear memory")),
+                "reserved-memory diagnostic should explain the reserved name"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_export_name_falls_back_to_the_normalized_function_name() {
+        let source = "@export_name(\"\")\nexport fn same() {}\nexport fn same() {}\n";
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        });
+
+        assert!(scopes.exports.contains_key("same"));
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::InvalidAttributeArgument)
+        );
+        let duplicate = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::DuplicateExportName)
+            .expect("the later default name collides");
+        assert_eq!(
+            duplicate.primary().unwrap().span.range.start(),
+            sai_vfs::TextSize::new(u32::try_from(source.rfind("same()").unwrap()).unwrap())
+        );
+    }
+
+    #[test]
+    fn export_name_reports_invalid_targets_instead_of_the_stage_gate() {
+        let source = concat!(
+            "@export_name(\"wire\")\n",
+            "pub fn ordinary() {}\n",
+            "@export_name(\"record-wire\")\n",
+            "type Data {}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        });
+
+        assert!(scopes.exports.is_empty());
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+                .count(),
+            2
+        );
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                diagnostic.code != Code::FeatureNotImplemented
+                    || !matches!(
+                        diagnostic.data.get("feature"),
+                        Some(Value::String(feature)) if feature == "attribute @export_name"
+                    )
+            }),
+            "Stage 1 target validation should replace the Stage 0 gate"
+        );
+    }
+
+    #[test]
+    fn test_build_validates_export_names_without_building_package_exports() {
+        let fixture = Fixture::new(
+            concat!(
+                "@export_name(\"wire\")\n",
+                "export fn first() {}\n",
+                "@export_name(\"wire\")\n",
+                "export fn second() {}\n",
+                "@export_name(\"invalid-target\")\n",
+                "fn ordinary() {}\n",
+            ),
+            "wasm32-wasi",
+        );
+        let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_core_module_build: false,
+            is_test_build: true,
+        });
+
+        assert!(scopes.exports.is_empty());
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::DuplicateExportName)
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+                .count(),
+            1
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Code::FeatureNotImplemented
+                || !matches!(
+                    diagnostic.data.get("feature"),
+                    Some(Value::String(feature)) if feature == "attribute @export_name"
+                )
+        }));
+    }
+
+    #[test]
+    fn export_name_collection_uses_target_filtered_items_and_explicit_build_context() {
+        let fixture = Fixture::new(
+            concat!(
+                "@target(\"wasm64-core\")\n",
+                "export fn shared() {}\n",
+                "export fn shared() {}\n",
+            ),
+            "wasm32-core",
+        );
+        let (core_scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        });
+        assert_eq!(core_scopes.exports.len(), 1);
+        assert!(core_scopes.exports.contains_key("shared"));
+        assert!(
+            core_scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::DuplicateExportName)
+        );
+
+        let both_survive = Fixture::new(
+            "export fn shared() {}\nexport fn shared() {}\n",
+            "wasm32-core",
+        );
+        let (non_core_scopes, _) = both_survive.collect();
+        assert!(non_core_scopes.exports.is_empty());
+        assert!(
+            non_core_scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::DuplicateExportName)
+        );
+    }
+
+    #[test]
+    fn export_duplicates_follow_canonical_module_path_before_source_offset() {
+        let fixture = Fixture::new("export fn alpha() {}\nexport fn beta() {}\n", "wasm32-core");
+        let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        });
+        let def_id = *scopes
+            .exports
+            .get("alpha")
+            .expect("first exported definition");
+        let input = FilteredModule {
+            filtered: &fixture.filtered,
+            ast_ids: &fixture.ast_ids,
+            root: &fixture.parsed.root,
+            source: &fixture.source,
+            source_ref: SourceRef {
+                path: "src/lib.sai".to_owned(),
+                package: None,
+                snapshot: None,
+            },
+        };
+        let later_offset = u32::try_from(fixture.source.text().find("beta()").unwrap()).unwrap();
+        let earlier_offset = u32::try_from(fixture.source.text().find("alpha()").unwrap()).unwrap();
+        let candidate_with_path = |module_path: &str, offset: u32| {
+            let range = TextRange::new(
+                sai_vfs::TextSize::new(offset),
+                sai_vfs::TextSize::new(offset + 5),
+            )
+            .expect("candidate span is valid");
+            ExportCandidate {
+                module_path: module_path.to_owned(),
+                source_offset: offset,
+                name: "shared".to_owned(),
+                def_id,
+                location: source_location(&input, range).expect("candidate location"),
+            }
+        };
+        let mut diagnostics = Vec::new();
+        collect_exports(
+            vec![
+                candidate_with_path("z", earlier_offset),
+                candidate_with_path("a", later_offset),
+            ],
+            &fixture.snapshot,
+            "acme:phase1",
+            &mut diagnostics,
+        )
+        .expect("collect duplicate exports");
+
+        assert_eq!(diagnostics.len(), 1);
+        let primary = diagnostics[0].primary().expect("duplicate primary");
+        assert_eq!(
+            primary.span.range.start(),
+            sai_vfs::TextSize::new(earlier_offset),
+            "the later canonical module path is diagnosed despite its earlier source offset"
+        );
+        assert!(matches!(
+            diagnostics[0].related().first(),
+            Some(Related::DeclaredHere { location, .. })
+                if location.span.range.start() == sai_vfs::TextSize::new(later_offset)
+        ));
+    }
+
+    #[test]
     fn duplicate_binding_keeps_the_first_and_reports_both_name_locations() {
         let fixture = Fixture::new("fn same() {}\nfn same() {}\n", "wasm32-core");
         let (scopes, paths) = fixture.collect();
@@ -1186,6 +1800,7 @@ mod tests {
             packages,
             symbols,
             file,
+            snapshot,
             source,
             parsed,
             ast_ids,
@@ -1222,12 +1837,12 @@ mod tests {
             (
                 FileId::new(62),
                 "src/a/b.sai",
-                "fn nested() {}\nfn nested() {}\n",
+                "fn nested() {}\nfn nested() {}\nexport fn shared() {}\n",
             ),
             (
                 FileId::new(63),
                 "src/a.sai",
-                "fn sibling() {}\nfn sibling() {}\n",
+                "fn sibling() {}\nfn sibling() {}\nexport fn shared() {}\n",
             ),
         ];
         let sources = specs
@@ -1312,7 +1927,7 @@ mod tests {
                         source: &module.source,
                         source_ref: SourceRef {
                             path: module.path.clone(),
-                            package: Some("acme:phase1".to_owned()),
+                            package: None,
                             snapshot: None,
                         },
                     },
@@ -1322,7 +1937,14 @@ mod tests {
         let scopes = collect_phase1(
             &module_tree,
             &inputs,
-            &target_cfg,
+            Phase1CollectionConfig {
+                snapshot: &snapshot,
+                target_cfg: &target_cfg,
+                build_context: Phase1BuildContext {
+                    is_root_core_module_build: true,
+                    ..Phase1BuildContext::default()
+                },
+            },
             &packages,
             &symbols,
             &paths,
@@ -1336,6 +1958,21 @@ mod tests {
         assert_eq!(duplicates.len(), 2);
         assert_eq!(duplicates[0].primary().unwrap().file.path, "src/a.sai");
         assert_eq!(duplicates[1].primary().unwrap().file.path, "src/a/b.sai");
+        let export_duplicates = scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::DuplicateExportName)
+            .collect::<Vec<_>>();
+        assert_eq!(export_duplicates.len(), 1);
+        assert_eq!(
+            export_duplicates[0].primary().unwrap().file.path,
+            "src/a/b.sai"
+        );
+        assert!(matches!(
+            export_duplicates[0].related().first(),
+            Some(Related::DeclaredHere { location, .. })
+                if location.file.path == "src/a.sai"
+        ));
     }
 
     #[test]
@@ -1541,6 +2178,7 @@ mod tests {
             packages,
             symbols,
             file,
+            snapshot,
             source,
             parsed,
             ast_ids,
@@ -1579,7 +2217,7 @@ mod tests {
                 source: &stale_source,
                 source_ref: SourceRef {
                     path: "src/lib.sai".to_owned(),
-                    package: Some("acme:phase1".to_owned()),
+                    package: None,
                     snapshot: None,
                 },
             },
@@ -1588,7 +2226,11 @@ mod tests {
             collect_phase1(
                 &tree,
                 &inputs,
-                &fixture.target_cfg,
+                Phase1CollectionConfig {
+                    snapshot: &fixture.snapshot,
+                    target_cfg: &fixture.target_cfg,
+                    build_context: Phase1BuildContext::default(),
+                },
                 &fixture.packages,
                 &fixture.symbols,
                 &paths
@@ -1614,8 +2256,22 @@ mod tests {
         };
         let inputs = BTreeMap::new();
         let target_cfg = TargetCfg::new("wasm32-core", std::iter::empty::<&str>()).unwrap();
+        let source = Arc::new(SourceFile::new(FileId::new(0), "", false).unwrap());
+        let snapshot =
+            WorkspaceSnapshot::new([SnapshotFile::new(source, "src/lib.sai", None, None)]).unwrap();
         assert!(matches!(
-            collect_phase1(&tree, &inputs, &target_cfg, &packages, &symbols, &paths),
+            collect_phase1(
+                &tree,
+                &inputs,
+                Phase1CollectionConfig {
+                    snapshot: &snapshot,
+                    target_cfg: &target_cfg,
+                    build_context: Phase1BuildContext::default(),
+                },
+                &packages,
+                &symbols,
+                &paths
+            ),
             Err(PackageScopesError::PackageMismatch)
         ));
     }

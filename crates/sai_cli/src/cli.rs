@@ -45,11 +45,18 @@ struct CheckDiagnostic {
     severity: sai_diagnostics::Severity,
     package: Option<String>,
     related: Vec<CheckRelated>,
+    children: Vec<CheckChild>,
 }
 
 struct CheckRelated {
     location: CliLocation,
     what: String,
+}
+
+struct CheckChild {
+    kind: sai_diagnostics::ChildKind,
+    message: String,
+    location: Option<CliLocation>,
 }
 
 struct CliLocation {
@@ -733,6 +740,9 @@ fn run_check(
                                         include_source_lines,
                                         root_inspection_incomplete,
                                         target_cfg.as_ref(),
+                                        command_tail(command)
+                                            .iter()
+                                            .any(|(argument, _)| argument == "--tests"),
                                     );
                                     push_module_tree_check_result(
                                         &mut diagnostics,
@@ -1147,6 +1157,7 @@ fn module_tree_check_diagnostics(
     include_source_lines: bool,
     root_inspection_incomplete: bool,
     target_cfg: Option<&TargetCfg>,
+    is_test_build: bool,
 ) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
     let package_key_value =
         PackageKey::new(package_key).map_err(|error| format!("invalid package key: {error:?}"))?;
@@ -1287,6 +1298,7 @@ fn module_tree_check_diagnostics(
             severity: diagnostic.severity,
             package: Some(package_identity.to_owned()),
             related: Vec::new(),
+            children: check_child_notes(diagnostic, &source_by_key, include_source_lines),
         });
     }
 
@@ -1316,7 +1328,18 @@ fn module_tree_check_diagnostics(
             let workspace_snapshot = WorkspaceSnapshot::new(snapshot_files)
                 .map_err(|error| format!("could not create source snapshot: {error:?}"))?;
             let phase1 = database
-                .collect_phase1_package_scopes(&module_tree, &workspace_snapshot, target_cfg)
+                .collect_phase1_package_scopes(
+                    &module_tree,
+                    &workspace_snapshot,
+                    target_cfg,
+                    sai_driver::Phase1BuildContext {
+                        is_root_core_module_build: matches!(
+                            target_cfg.target_name(),
+                            "wasm32-core" | "wasm64-core"
+                        ),
+                        is_test_build,
+                    },
+                )
                 .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
@@ -1397,6 +1420,7 @@ fn phase1_check_diagnostics(
                 })
             })
             .collect();
+        let children = check_child_notes(diagnostic, source_by_key, include_source_lines);
         match diagnostic.severity {
             sai_diagnostics::Severity::Error => errors = errors.saturating_add(1),
             sai_diagnostics::Severity::Warning => warnings = warnings.saturating_add(1),
@@ -1407,9 +1431,41 @@ fn phase1_check_diagnostics(
             severity: diagnostic.severity,
             package: Some(package_identity.to_owned()),
             related,
+            children,
         });
     }
     (diagnostics, errors, warnings, infos)
+}
+
+fn check_child_notes(
+    diagnostic: &sai_diagnostics::Diagnostic,
+    source_by_key: &HashMap<String, (String, Arc<[u8]>)>,
+    include_source_lines: bool,
+) -> Vec<CheckChild> {
+    diagnostic
+        .children()
+        .iter()
+        .filter(|child| child.kind == sai_diagnostics::ChildKind::Note)
+        .map(|child| {
+            let location = child.location.as_ref().map(|location| {
+                let (display_path, source) = source_by_key
+                    .get(&location.file.path)
+                    .cloned()
+                    .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
+                let mut source_index = CliSourceIndex::new(source);
+                source_index.location(
+                    &display_path,
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize(),
+                    include_source_lines,
+                )
+            });
+            CheckChild {
+                kind: child.kind,
+                message: child.message.clone(),
+                location,
+            }
+        })
+        .collect()
 }
 
 fn missing_source_root_module_tree(
@@ -1434,6 +1490,7 @@ fn missing_source_root_module_tree(
         include_source_lines,
         false,
         None,
+        false,
     )
 }
 
@@ -1523,6 +1580,7 @@ fn package_manifest_check_diagnostics(
             severity: sai_diagnostics::Severity::Error,
             package: package_identity.clone(),
             related: Vec::new(),
+            children: Vec::new(),
         });
     }
     for error in parsed.errors() {
@@ -1543,6 +1601,7 @@ fn package_manifest_check_diagnostics(
             severity: sai_diagnostics::Severity::Error,
             package: package_identity.clone(),
             related: Vec::new(),
+            children: Vec::new(),
         });
     }
     for warning in parsed.warnings() {
@@ -1567,6 +1626,7 @@ fn package_manifest_check_diagnostics(
             severity: sai_diagnostics::Severity::Warning,
             package: package_identity.clone(),
             related: Vec::new(),
+            children: Vec::new(),
         });
     }
     (
@@ -1632,6 +1692,26 @@ fn check_source_diagnostics(
             }
         };
         cli_diagnostic.primary_label = diagnostic.primary_label.clone();
+        let children = diagnostic
+            .children()
+            .iter()
+            .filter(|child| child.kind == sai_diagnostics::ChildKind::Note)
+            .map(|child| {
+                let location = child.location.as_ref().map(|location| {
+                    let range = decoded_source_range_to_original(
+                        decoded_source.as_ref(),
+                        location.span.range.start().to_usize()
+                            ..location.span.range.end().to_usize(),
+                    );
+                    source_index.location(source_path, range, include_source_lines)
+                });
+                CheckChild {
+                    kind: child.kind,
+                    message: child.message.clone(),
+                    location,
+                }
+            })
+            .collect();
         match diagnostic.severity {
             sai_diagnostics::Severity::Error => errors = errors.saturating_add(1),
             sai_diagnostics::Severity::Warning => warnings = warnings.saturating_add(1),
@@ -1642,6 +1722,7 @@ fn check_source_diagnostics(
             severity: diagnostic.severity,
             package: package_identity.map(str::to_owned),
             related: Vec::new(),
+            children,
         });
     }
     (diagnostics, errors, warnings, infos)
@@ -1653,6 +1734,7 @@ fn check_cli_diagnostic(diagnostic: CliDiagnostic) -> CheckDiagnostic {
         severity: sai_diagnostics::Severity::Error,
         package: None,
         related: Vec::new(),
+        children: Vec::new(),
     }
 }
 
@@ -1691,7 +1773,7 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
         argument_index: None,
         argument: String::new(),
         help: Some(format!(
-            "root-package syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented; {} remain unavailable",
+            "root-package syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented; {} remain unavailable",
             unsupported.join(", ")
         )),
         data: Some(format!(
@@ -1752,6 +1834,7 @@ fn report_check_diagnostics(
                 let snippets = CliSnippets {
                     diagnostic: &diagnostic.diagnostic,
                     related: &diagnostic.related,
+                    children: &diagnostic.children,
                 };
                 let text = sai_diagnostics::render_diagnostic(
                     &shared,
@@ -1888,15 +1971,30 @@ fn write_json_check_diagnostic_records(
         } else {
             "{}".to_owned()
         };
-        let children = diagnostic.help.as_ref().map_or_else(
-            || "[]".to_owned(),
-            |help| {
-                format!(
-                    "[{{\"kind\":\"help\",\"message\":\"{}\",\"location\":null}}]",
-                    escape_json(help)
-                )
-            },
-        );
+        let mut child_records = Vec::new();
+        if let Some(help) = &diagnostic.help {
+            child_records.push(format!(
+                "{{\"kind\":\"help\",\"message\":\"{}\",\"location\":null}}",
+                escape_json(help)
+            ));
+        }
+        child_records.extend(check_diagnostic.children.iter().map(|child| {
+            let kind = match child.kind {
+                sai_diagnostics::ChildKind::Note => "note",
+                sai_diagnostics::ChildKind::Help => "help",
+            };
+            let location = child.location.as_ref().map_or_else(
+                || "null".to_owned(),
+                |location| {
+                    json_location_with_package(location, check_diagnostic.package.as_deref())
+                },
+            );
+            format!(
+                "{{\"kind\":\"{kind}\",\"message\":\"{}\",\"location\":{location}}}",
+                escape_json(&child.message)
+            )
+        }));
+        let children = format!("[{}]", child_records.join(","));
         let primary = diagnostic.primary.as_ref().map_or_else(
             || "null".to_owned(),
             |location| json_location_with_package(location, check_diagnostic.package.as_deref()),
@@ -7037,6 +7135,7 @@ fn write_human_diagnostics(
         let snippets = CliSnippets {
             diagnostic,
             related: &[],
+            children: &[],
         };
         match sai_diagnostics::Code::from_name(diagnostic.code) {
             Some(code) => {
@@ -7131,6 +7230,21 @@ fn shared_check_diagnostic(
             })
             .expect("a diagnostic without a workspace snapshot accepts related locations");
     }
+    for child in &diagnostic.children {
+        let location = child.location.as_ref().map(|location| {
+            sai_diagnostics::Location::new(
+                location.path.clone(),
+                cli_span(location.start.byte, location.end.byte),
+            )
+        });
+        shared
+            .push_child(sai_diagnostics::Child {
+                kind: child.kind,
+                message: child.message.clone(),
+                location,
+            })
+            .expect("a diagnostic without a workspace snapshot accepts children");
+    }
     shared
 }
 
@@ -7150,6 +7264,7 @@ fn cli_span(start: usize, end: usize) -> sai_diagnostics::Span {
 struct CliSnippets<'a> {
     diagnostic: &'a CliDiagnostic,
     related: &'a [CheckRelated],
+    children: &'a [CheckChild],
 }
 
 impl sai_diagnostics::SourceSnippets for CliSnippets<'_> {
@@ -7161,10 +7276,22 @@ impl sai_diagnostics::SourceSnippets for CliSnippets<'_> {
         {
             return Some((primary.start.line, primary.start.col));
         }
-        self.related.iter().find_map(|related| {
-            (related.location.path == location.file.path && related.location.start.byte == start)
-                .then_some((related.location.start.line, related.location.start.col))
-        })
+        self.related
+            .iter()
+            .find_map(|related| {
+                (related.location.path == location.file.path
+                    && related.location.start.byte == start)
+                    .then_some((related.location.start.line, related.location.start.col))
+            })
+            .or_else(|| {
+                self.children.iter().find_map(|child| {
+                    child.location.as_ref().and_then(|child_location| {
+                        (child_location.path == location.file.path
+                            && child_location.start.byte == start)
+                            .then_some((child_location.start.line, child_location.start.col))
+                    })
+                })
+            })
     }
 
     fn snippet(
@@ -7729,6 +7856,7 @@ mod tests {
             severity,
             package,
             related: Vec::new(),
+            children: Vec::new(),
         }
     }
 
@@ -8071,7 +8199,7 @@ mod tests {
         assert!(stdout.contains("\"stage\":0,\"feature\":\"sai check\""));
         assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
         assert!(stdout.contains(
-            "syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented"
+            "syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented"
         ));
         assert!(stdout.contains("module-tree validation"));
         assert!(stdout.contains("test-only analysis"));
@@ -8121,7 +8249,7 @@ mod tests {
         assert!(stdout.contains("\"line\":1"));
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
         assert!(stdout.contains(
-            "syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented"
+            "syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented"
         ));
         assert!(stdout.contains("\"exit_code\":1"));
 
@@ -8141,7 +8269,7 @@ mod tests {
         assert!(incomplete_diagnostic.contains("\"primary\":null"));
         assert!(
             incomplete_diagnostic.contains(
-                "syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented"
+                "syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented"
             )
         );
         assert!(incomplete_diagnostic.contains("\"symbol\":null,\"package\":null}"));
@@ -8211,6 +8339,96 @@ mod tests {
         assert!(!wasi_stdout.contains("\"code\":\"DUPLICATE_BINDING\""));
         assert!(!core_stdout.contains("\"code\":\"TARGET_NOT_DECLARED\""));
         assert!(!wasi_stdout.contains("\"code\":\"TARGET_NOT_DECLARED\""));
+    }
+
+    #[test]
+    fn check_reports_duplicate_core_export_names_only_for_core_targets() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        set_check_targets(&package, "wasm32-core, wasm32-wasi");
+        let source = concat!(
+            "@export_name(\"wire\")\n",
+            "export fn first() {}\n",
+            "@export_name(\"wire\")\n",
+            "export fn second() {}\n",
+            "export fn memory() {}\n",
+            "@export_name(\"invalid-target\")\n",
+            "fn ordinary() {}\n",
+        );
+        fs::write(package.join("src/lib.sai"), source).expect("write exported functions");
+
+        let (core_exit, core_stdout, core_stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-core",
+        ]);
+        let (component_exit, component_stdout, component_stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-wasi",
+        ]);
+        let (test_exit, test_stdout, test_stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--tests",
+            "--target=wasm32-core",
+        ]);
+        let (test_wasi_exit, test_wasi_stdout, test_wasi_stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--tests",
+            "--target=wasm32-wasi",
+        ]);
+        let (human_exit, _, human_stderr) =
+            invoke(&["--directory", package_path, "check", "--target=wasm32-core"]);
+
+        assert_eq!(core_exit, 1);
+        assert!(core_stderr.is_empty());
+        let export_diagnostics = core_stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"DUPLICATE_EXPORT_NAME\""))
+            .collect::<Vec<_>>();
+        assert_eq!(export_diagnostics.len(), 2, "{core_stdout}");
+        let duplicate = export_diagnostics
+            .iter()
+            .find(|line| line.contains("export name `wire`"))
+            .expect("duplicate explicit export is reported");
+        let duplicate_start = source.find("\"wire\"").unwrap();
+        assert!(duplicate.contains(&format!("\"start\":{{\"byte\":{duplicate_start},")));
+        assert!(duplicate.contains("\"what\":\"first export with this name\""));
+        let memory = export_diagnostics
+            .iter()
+            .find(|line| line.contains("export name `memory`"))
+            .expect("reserved memory export is reported");
+        assert!(
+            memory.contains("linear memory is exported under the name `memory`"),
+            "{memory}"
+        );
+        assert_eq!(human_exit, 1);
+        assert!(human_stderr.contains("linear memory is exported under the name `memory`"));
+
+        assert_eq!(component_exit, 1);
+        assert!(component_stderr.is_empty());
+        assert!(!component_stdout.contains("\"code\":\"DUPLICATE_EXPORT_NAME\""));
+        assert_eq!(test_exit, 1);
+        assert!(test_stderr.is_empty());
+        assert!(!test_stdout.contains("\"code\":\"DUPLICATE_EXPORT_NAME\""));
+        assert!(test_stdout.contains("\"code\":\"INVALID_ATTRIBUTE_TARGET\""));
+        assert_eq!(test_wasi_exit, 1);
+        assert!(test_wasi_stderr.is_empty());
+        assert!(!test_wasi_stdout.contains("\"code\":\"DUPLICATE_EXPORT_NAME\""));
+        assert!(test_wasi_stdout.contains("\"code\":\"INVALID_ATTRIBUTE_TARGET\""));
+        assert!(!core_stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+        assert!(!component_stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
     }
 
     #[test]

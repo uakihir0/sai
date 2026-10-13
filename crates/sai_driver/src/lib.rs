@@ -17,8 +17,10 @@ use sai_package::mvs_diagnostics::{
     root_dependency_cycle_diagnostics, version_conflict_diagnostics,
 };
 use sai_query::{Durability, QueryDatabase, QueryError};
-pub use sai_resolve::package_scopes::Phase1PackageScopes;
 use sai_resolve::package_scopes::{FilteredModule, PackageScopesError, collect_phase1};
+pub use sai_resolve::package_scopes::{
+    Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
+};
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
@@ -804,6 +806,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         target_cfg: &TargetCfg,
+        build_context: Phase1BuildContext,
     ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
         if module_tree.modules.len() > u32::MAX as usize {
             return Err(Phase1CollectionError::TooManyModules);
@@ -881,7 +884,11 @@ impl RootDatabase {
         collect_phase1(
             module_tree,
             &module_inputs,
-            target_cfg,
+            Phase1CollectionConfig {
+                snapshot,
+                target_cfg,
+                build_context,
+            },
             &self.packages,
             &self.symbols,
             def_paths,
@@ -1359,7 +1366,12 @@ mod tests {
 
         let wasm32 = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let wasm32_scopes = database
-            .collect_phase1_package_scopes(&module_tree, &snapshot, &wasm32)
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &wasm32,
+                Phase1BuildContext::default(),
+            )
             .expect("Phase 1 scopes collect for both modules");
         assert_eq!(wasm32_scopes.modules.len(), 2);
         assert!(
@@ -1389,7 +1401,12 @@ mod tests {
         );
 
         let repeated = database
-            .collect_phase1_package_scopes(&module_tree, &snapshot, &wasm32)
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &wasm32,
+                Phase1BuildContext::default(),
+            )
             .expect("Phase 1 can run again in the same database");
         let repeated_choose = phase1_function_def(&database, &repeated, ModuleId::ROOT, "choose");
         assert_eq!(repeated_choose, choose_def);
@@ -1402,7 +1419,12 @@ mod tests {
 
         let wasm64 = target_cfg_for_check("wasm64-core").expect("target config is valid");
         let wasm64_scopes = database
-            .collect_phase1_package_scopes(&module_tree, &snapshot, &wasm64)
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &wasm64,
+                Phase1BuildContext::default(),
+            )
             .expect("Phase 1 scopes collect for wasm64");
         let duplicate = wasm64_scopes
             .diagnostics
@@ -1459,7 +1481,12 @@ mod tests {
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
 
         assert_eq!(
-            database.collect_phase1_package_scopes(&module_tree, &stale_snapshot, &target_cfg),
+            database.collect_phase1_package_scopes(
+                &module_tree,
+                &stale_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            ),
             Err(Phase1CollectionError::Parse(
                 ParseQueryError::SnapshotSourceMismatch
             ))
