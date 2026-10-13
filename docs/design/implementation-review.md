@@ -3254,6 +3254,7 @@
 - **Review:** Checked by reading `parse_green_source` and `bind_green_parse`. No test covers the fix, because none exists.
 - **Human review:** **Review required:** Decide whether this fix waits for CST-identity fix planning, or whether a lexical multi-token edit should be added now.
 - **Remaining scope:** Implement the fix with the snapshot-aware planner.
+
 ### IR-500: Render human diagnostics from one shared layout
 
 - **Decision:** `sai_diagnostics::human` owns the §11.10 layout for `Diagnostic`: the heading, location lines, gutters, labels grouped by file, child notes and helps, the level note, notes and labels from related entries, fix titles as help lines, and the summary line. The caller implements `SourceSnippets`, which gives line and column positions and the rows of each snippet. Display columns depend on the text (tab stops, East Asian width, escaped controls, windows of long lines), and the renderer does not hold that text.
