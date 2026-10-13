@@ -2185,6 +2185,89 @@ mod tests {
     }
 
     #[test]
+    fn formats_comments_after_opening_braces_of_empty_match_arm_lists() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{// empty list\n}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        // empty list\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{/* empty\ncontinued */}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        /* empty\n",
+                    "continued */\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{/* inline */}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        /* inline */\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{/* opening */\n// closing\n}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        /* opening */\n",
+                    "        // closing\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{/* opening */\n\n// closing\n}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        /* opening */\n",
+                    "\n",
+                    "        // closing\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{// nested empty\n})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(\n",
+                    "        match value {\n",
+                    "            // nested empty\n",
+                    "        },\n",
+                    "    )\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted = format_source(source.as_bytes())
+                .expect("opening-brace comments on empty match-arm lists are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn formats_comments_before_match_arm_list_closing_braces() {
         let sources = [
             (

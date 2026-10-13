@@ -643,16 +643,15 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
                 closing.text_range().end().to_usize(),
             ));
         }
-        if !arms.is_empty()
-            && let Some(token) =
-                list.syntax()
-                    .children_with_tokens()
-                    .find_map(|element| match element {
-                        SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_BRACE => {
-                            Some(token)
-                        }
-                        _ => None,
-                    })
+        if let Some(token) =
+            list.syntax()
+                .children_with_tokens()
+                .find_map(|element| match element {
+                    SyntaxElement::Token(token) if token.kind() == SyntaxKind::L_BRACE => {
+                        Some(token)
+                    }
+                    _ => None,
+                })
         {
             owners.insert((
                 false,
@@ -4014,9 +4013,9 @@ fn match_expression_document_with_keyword_comments(
     }
     let (separator_comment_documents, separator_comments_require_line_break) =
         match_arm_separator_comment_documents(&arms, match_arms.len())?;
-    let opening_comments = match_arm_list_opening_comments(&arms, match_arms.len())?;
+    let opening_comments = match_arm_list_opening_comments(&arms)?;
     let closing_comment_documents =
-        match_arm_list_closing_comment_documents(source, &arms, &match_arms)?;
+        match_arm_list_closing_comment_documents(source, &arms, &match_arms, &opening_comments)?;
     let mut force_break = separator_comments_require_line_break
         || arm_documents
             .iter()
@@ -4031,7 +4030,7 @@ fn match_expression_document_with_keyword_comments(
             break;
         }
     }
-    if !opening_comments.is_empty() {
+    if !opening_comments.is_empty() && !match_arms.is_empty() {
         let mut first_arm_prefix = Vec::new();
         if source_comments_require_line_break(&opening_comments) {
             append_comment_documents(
@@ -4234,11 +4233,7 @@ fn match_arm_separator_comment_documents(
 
 fn match_arm_list_opening_comments(
     list: &ast::MatchArmList,
-    arm_count: usize,
 ) -> Result<Vec<SourceComment>, SourceDocumentError> {
-    if arm_count == 0 {
-        return Ok(Vec::new());
-    }
     let opening = list
         .syntax()
         .children_with_tokens()
@@ -4276,12 +4271,27 @@ fn match_arm_list_closing_comment_documents(
     source: &ParsedSource,
     list: &ast::MatchArmList,
     arms: &[ast::MatchArm],
+    opening_comments: &[SourceComment],
 ) -> Result<Vec<Doc>, SourceDocumentError> {
     let (_, closing) =
         brace_list_delimiters(list.syntax()).ok_or(SourceDocumentError::UnsupportedShape)?;
     let comments = leading_comments_before_token(&closing)?;
-    if comments.is_empty() {
+    if comments.is_empty() && !(arms.is_empty() && !opening_comments.is_empty()) {
         return Ok(Vec::new());
+    }
+
+    if arms.is_empty() {
+        let mut documents = vec![Doc::HardLine];
+        append_comment_documents(&mut documents, opening_comments, source.text(), None)?;
+        if !comments.is_empty() {
+            append_comment_documents(
+                &mut documents,
+                &comments,
+                source.text(),
+                opening_comments.last().map(|comment| comment.range.end),
+            )?;
+        }
+        return Ok(documents);
     }
 
     let previous_end = if let Some(last_arm) = arms.last() {
