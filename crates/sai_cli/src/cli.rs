@@ -8370,6 +8370,93 @@ mod tests {
     }
 
     #[test]
+    fn check_binds_local_module_aliases_and_reports_scope_conflicts() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let source = concat!(
+            "use acme:check/model\n",
+            "use acme:check/model\n",
+            "fn clash() {}\n",
+            "use acme:check/model as clash\n",
+            "interface codec {}\n",
+            "use acme:check/codec as api\n",
+            "use acme:check/codec as api\n",
+            "use acme:check/panic\n",
+            "use acme:check/type\n",
+            "use other:package/type\n",
+            "pub use acme:check/model\n",
+            "pub use acme:check/missing\n",
+            "pub use other:package/remote\n",
+            "pub use acme:check/Some\n",
+            "pub use\n",
+            "use acme:check/model.{child}\n",
+        );
+        fs::write(package.join("src/lib.sai"), source).expect("write module aliases");
+        fs::write(package.join("src/model.sai"), "fn child() {}\n").expect("write imported module");
+        fs::write(package.join("src/panic.sai"), "fn recover() {}\n")
+            .expect("write module that shadows a prelude name");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let redundant = check_diagnostic_lines(&stdout, "REDUNDANT_IMPORT");
+        assert_eq!(redundant.len(), 2, "{stdout}");
+        assert!(
+            redundant[0].contains("\"severity\":\"warning\""),
+            "{stdout}"
+        );
+        let duplicate = check_diagnostic_lines(&stdout, "DUPLICATE_BINDING");
+        assert_eq!(duplicate.len(), 1, "{stdout}");
+        let clash_name_start = source.find("as clash").expect("explicit alias") + "as ".len();
+        assert!(
+            duplicate[0].contains("\"path\":\"src/lib.sai\"")
+                && duplicate[0].contains(&format!("\"start\":{{\"byte\":{clash_name_start},")),
+            "{stdout}"
+        );
+        assert!(
+            duplicate[0].contains("\"related\":[{\"kind\":\"declared_here\""),
+            "{stdout}"
+        );
+        let pub_use_without_items = check_diagnostic_lines(&stdout, "PUB_USE_WITHOUT_ITEMS");
+        assert_eq!(pub_use_without_items.len(), 5, "{stdout}");
+        let missing_path_start = source.rfind("pub use\n").expect("missing package path");
+        assert!(
+            pub_use_without_items.iter().any(|line| {
+                line.contains(&format!("\"start\":{{\"byte\":{missing_path_start},"))
+            }),
+            "{stdout}"
+        );
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "UNKNOWN_MODULE").len(),
+            2,
+            "{stdout}"
+        );
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "USE_BINDING_IS_KEYWORD").len(),
+            2,
+            "{stdout}"
+        );
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "SHADOWS_PRELUDE").len(),
+            1,
+            "{stdout}"
+        );
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "MALFORMED_PACKAGE_PATH").len(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            check_diagnostic_lines(&stdout, "UNKNOWN_PACKAGE").is_empty(),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
     fn check_reports_local_unknown_module_candidates_and_full_pkg_path_span() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);

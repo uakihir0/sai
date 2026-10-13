@@ -143,7 +143,7 @@ pub fn collect_local_use_target_diagnostics(
     Ok(diagnostics)
 }
 
-fn use_package_path_range(
+pub(crate) fn use_package_path_range(
     entry: &UseEntry,
     input: &FilteredModule<'_>,
 ) -> Result<Option<(TextRange, bool)>, PackageScopesError> {

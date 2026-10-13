@@ -17,7 +17,9 @@ use sai_package::mvs_diagnostics::{
     root_dependency_cycle_diagnostics, version_conflict_diagnostics,
 };
 use sai_query::{Durability, QueryDatabase, QueryError};
-use sai_resolve::package_scopes::{FilteredModule, PackageScopesError, collect_phase1};
+use sai_resolve::package_scopes::{
+    FilteredModule, PackageScopesError, collect_local_module_alias_bindings, collect_phase1,
+};
 pub use sai_resolve::package_scopes::{
     Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
 };
@@ -912,6 +914,15 @@ impl RootDatabase {
             &self.symbols,
         )?;
         scopes.diagnostics.extend(use_target_diagnostics);
+        let module_alias_diagnostics = collect_local_module_alias_bindings(
+            module_tree,
+            &module_inputs,
+            &mut scopes,
+            &self.packages,
+            &self.symbols,
+        )
+        .map_err(Phase1CollectionError::from)?;
+        scopes.diagnostics.extend(module_alias_diagnostics);
         scopes
             .diagnostics
             .sort_by(|left, right| match (left.primary(), right.primary()) {
@@ -1392,7 +1403,38 @@ mod tests {
 
     #[test]
     fn phase1_driver_bridge_filters_targets_and_reuses_package_def_paths() {
-        let root = b"@target(\"wasm64-core\")\nfn choose() {}\nfn choose() {}\n";
+        fn module_alias_def(
+            database: &RootDatabase,
+            scope: &sai_resolve::package_scopes::Phase1ModuleScopes,
+            alias: &str,
+        ) -> Option<DefId> {
+            scope.scope.iter().find_map(|(symbol, binding)| {
+                let name = database.resolve_symbol(*symbol).ok()?;
+                if name.as_ref() != alias {
+                    return None;
+                }
+                match binding.res {
+                    sai_resolve::package_scopes::Res::Def(
+                        sai_resolve::package_scopes::DefKind::Module,
+                        def_id,
+                    ) => Some(def_id),
+                    _ => None,
+                }
+            })
+        }
+
+        let root = concat!(
+            "use acme:phase1/child\n",
+            "use acme:phase1/child as explicit_child.{child}\n",
+            "use acme:phase1/child.{child}\n",
+            "pub use acme:phase1/child as reexport_alias.{child}\n",
+            "@target(\"wasm64-core\")\n",
+            "use acme:phase1/child as wasm64_child\n",
+            "@target(\"wasm64-core\")\n",
+            "fn choose() {}\n",
+            "fn choose() {}\n",
+        )
+        .as_bytes();
         let child = b"fn child() {}\n";
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root, child);
 
@@ -1424,6 +1466,68 @@ mod tests {
             .position(|module| module.file != module_tree.modules[0].file)
             .map(|index| ModuleId::from_raw(index as u32))
             .expect("child module exists");
+        let root_module_scopes = &wasm32_scopes.modules[ModuleId::ROOT.raw() as usize];
+        let child_alias_def = module_alias_def(&database, root_module_scopes, "child")
+            .expect("the derived local module alias is in the root scope");
+        let explicit_child_alias_def =
+            module_alias_def(&database, root_module_scopes, "explicit_child")
+                .expect("the explicit local module alias is in the root scope");
+        let reexport_alias_def = module_alias_def(&database, root_module_scopes, "reexport_alias")
+            .expect("the pub-use alias remains a local module alias");
+        assert_eq!(
+            child_alias_def,
+            wasm32_scopes.modules[child_module.raw() as usize]
+                .module_def_id
+                .to_def_id()
+        );
+        assert_eq!(explicit_child_alias_def, child_alias_def);
+        assert_eq!(reexport_alias_def, child_alias_def);
+        assert!(module_alias_def(&database, root_module_scopes, "wasm64_child").is_none());
+        assert_eq!(root_module_scopes.imports.len(), 3);
+        let import_names = root_module_scopes
+            .imports
+            .iter()
+            .map(|import| {
+                database
+                    .resolve_symbol(import.name)
+                    .expect("import names resolve")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(import_names, ["child", "explicit_child", "reexport_alias"]);
+        assert!(
+            root_module_scopes
+                .imports
+                .iter()
+                .all(|import| import.item_index.is_none() && !import.test_only)
+        );
+        assert_eq!(
+            root_module_scopes
+                .imports
+                .iter()
+                .map(|import| import.is_pub)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        let reexport_symbol = root_module_scopes.imports[2].name;
+        assert_eq!(
+            root_module_scopes
+                .scope
+                .get(&reexport_symbol)
+                .map(|binding| binding.visibility),
+            Some(sai_hir::Visibility::Private)
+        );
+        for (raw_import_index, import) in root_module_scopes.imports.iter().enumerate() {
+            assert_eq!(
+                root_module_scopes
+                    .scope
+                    .get(&import.name)
+                    .map(|binding| binding.origin),
+                Some(sai_resolve::package_scopes::BindingOrigin::Use {
+                    import: sai_resolve::package_scopes::ImportIndex(raw_import_index as u32)
+                })
+            );
+        }
         let child_def = phase1_function_def(&database, &wasm32_scopes, child_module, "child");
         assert!(
             database
@@ -1463,6 +1567,9 @@ mod tests {
             .iter()
             .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::DuplicateBinding)
             .expect("target-filtered declarations report a duplicate binding");
+        let wasm64_root_scopes = &wasm64_scopes.modules[ModuleId::ROOT.raw() as usize];
+        assert!(module_alias_def(&database, wasm64_root_scopes, "wasm64_child").is_some());
+        assert_eq!(wasm64_root_scopes.imports.len(), 4);
         assert_eq!(
             duplicate.primary().map(|location| location.file.snapshot),
             Some(Some(17))
@@ -1477,6 +1584,65 @@ mod tests {
         assert_eq!(
             previous_declaration.map(|location| location.file.snapshot),
             Some(Some(17))
+        );
+    }
+
+    #[test]
+    fn phase1_driver_bridge_binds_local_interface_aliases() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"interface codec {}\n", b"use acme:phase1/codec as api\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let scopes = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 scopes collect for local interface alias");
+        let root_scope = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let interface_def = root_scope
+            .declared
+            .iter()
+            .find_map(|(symbol, binding)| {
+                let name = database.resolve_symbol(*symbol).ok()?;
+                if name.as_ref() != "codec" {
+                    return None;
+                }
+                match binding.res {
+                    sai_resolve::package_scopes::Res::Def(
+                        sai_resolve::package_scopes::DefKind::Interface,
+                        def_id,
+                    ) => Some(def_id),
+                    _ => None,
+                }
+            })
+            .expect("the root interface has a canonical definition");
+        let child_scope = &scopes.modules[1];
+        let alias_def = child_scope
+            .scope
+            .iter()
+            .find_map(|(symbol, binding)| {
+                let name = database.resolve_symbol(*symbol).ok()?;
+                if name.as_ref() != "api" {
+                    return None;
+                }
+                match binding.res {
+                    sai_resolve::package_scopes::Res::Def(
+                        sai_resolve::package_scopes::DefKind::Interface,
+                        def_id,
+                    ) => Some(def_id),
+                    _ => None,
+                }
+            })
+            .expect("the interface alias resolves in the importing module");
+        assert_eq!(alias_def, interface_def);
+        assert_eq!(child_scope.imports.len(), 1);
+        assert!(
+            !scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnknownModule)
         );
     }
 

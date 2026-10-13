@@ -1,19 +1,27 @@
-//! Phase 1 of package scope construction: collect module-level declarations.
+//! Phase 1 declaration collection and the current local module-alias bridge.
 //!
 //! Callers provide item trees that have already passed `@target` filtering.
-//! This module does not resolve `use` declarations or compute the import
-//! fixpoint. Extern-function children are checked against their validated
-//! target attributes here because they are represented as children of an
-//! extern block in the item tree.
+//! [`collect_phase1`] builds direct declaration scopes. The temporary
+//! [`collect_local_module_alias_bindings`] pass then inserts aliases for
+//! resolved modules and interfaces in the current package; dependency targets,
+//! item imports, full prelude checks, and the re-export fixpoint remain
+//! deferred.
+//! Extern-function children are checked against their validated target
+//! attributes here because they are represented as children of an extern block
+//! in the item tree.
 
-use super::{ChildEntry, ModuleData};
+use super::{ChildEntry, ModuleData, ModuleId, ModuleTree};
+use crate::module_target::ModuleTargetError;
+use crate::use_binding::{UseBindingNameError, derive_use_binding_name};
+use crate::use_path::{ParsedUsePath, UsePathError, parse_use_path};
+use crate::use_target::{UseTarget, UseTargetError, resolve_parsed_use_target};
 use sai_diagnostics::{
     Child, ChildKind, Code, Diagnostic, Location, Related, Severity, SourceRef, Value,
 };
 use sai_hir::attrs::{
     AttributeTarget, TargetCfg, TargetKind, ValidatedExportName, validate_export_name,
 };
-use sai_hir::item_tree::{AttrName, ItemTreeKind, TargetFilterResult};
+use sai_hir::item_tree::{AttrName, ErasedAstId, ItemTreeKind, TargetFilterResult, UseEntry};
 use sai_hir::{
     DefId, DefPath, DefPathData, DefPathError, DefPathInterner, DefPathInternerError,
     DisambiguatedDefPathData, LocalDefId, PackageId, Symbol, Visibility,
@@ -23,15 +31,15 @@ use sai_syntax::{
     GreenElement, GreenNode, SyntaxNode,
     ast::{self, AstNode, AstToken},
 };
-use sai_vfs::{FileId, SourceFile, Span, TextRange};
+use sai_vfs::{FileId, PackageKey, SourceFile, Span, TextRange, TextSize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// The entity kind stored by a declaration binding.
 ///
-/// The variants match the name-resolution model in impl/03 §3.4. The
-/// Phase-1 collector currently constructs only module-level item kinds.
+/// The variants match the name-resolution model in impl/03 §3.4. The current
+/// collectors construct module-level items and local modules.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DefKind {
     Fn,
@@ -55,12 +63,14 @@ pub enum DefKind {
     Closure,
     AsyncBlock,
     AssocTy,
+    Module,
 }
 
 /// A resolved entity used in module namespace bindings.
 ///
-/// The later resolver phases extend this with imports, locals, and primitive
-/// types. Phase 1 only creates definition bindings.
+/// Later resolver phases extend this with interfaces, imported items, locals,
+/// and primitive types. Current declaration and local-module-alias passes
+/// construct definition resolutions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Res {
     Def(DefKind, DefId),
@@ -70,6 +80,21 @@ pub enum Res {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BindingOrigin {
     Decl,
+    Use { import: ImportIndex },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ImportIndex(pub u32);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportBinding {
+    pub use_ast_id: ErasedAstId,
+    pub item_index: Option<u32>,
+    pub name: Symbol,
+    pub name_span: Span,
+    pub res: Res,
+    pub is_pub: bool,
+    pub test_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +115,10 @@ pub struct Phase1ModuleScopes {
     /// Direct lookup by session-local symbol. This map is not traversed to
     /// generate output; all diagnostic ordering comes from the source walk.
     pub declared: HashMap<Symbol, Binding>,
+    /// Module-level scope after local module aliases have been inserted.
+    pub scope: HashMap<Symbol, Binding>,
+    /// Use bindings retained in source order for later resolution stages.
+    pub imports: Vec<ImportBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,9 +185,13 @@ pub enum PackageScopesError {
     Attribute(sai_hir::attrs::AttrValidationError),
     TargetFilter(sai_hir::item_tree::TargetFilterError),
     Package(PackageIdError),
+    PackageKey(sai_vfs::PackageKeyError),
     DefPathValidation(DefPathError),
     Interner(InternError),
     Symbol(LookupError),
+    InvalidModuleTree,
+    InvalidCurrentModule,
+    UnsupportedPackageKey,
     DefPath(DefPathInternerError),
     TooManyDefinitions,
 }
@@ -166,6 +199,12 @@ pub enum PackageScopesError {
 impl From<PackageIdError> for PackageScopesError {
     fn from(error: PackageIdError) -> Self {
         Self::Package(error)
+    }
+}
+
+impl From<sai_vfs::PackageKeyError> for PackageScopesError {
+    fn from(error: sai_vfs::PackageKeyError) -> Self {
+        Self::PackageKey(error)
     }
 }
 
@@ -264,6 +303,8 @@ pub fn collect_phase1(
         let mut module_scopes = Phase1ModuleScopes {
             module_def_id,
             declared: HashMap::new(),
+            scope: HashMap::new(),
+            imports: Vec::new(),
         };
         let mut test_names = BTreeMap::<String, Location>::new();
 
@@ -442,6 +483,7 @@ pub fn collect_phase1(
                 .map(|primary| primary.span.range.start().raw())
                 .unwrap_or(u32::MAX)
         });
+        module_scopes.scope = module_scopes.declared.clone();
         diagnostics.extend(module_diagnostics);
         scopes.push(module_scopes);
     }
@@ -477,6 +519,305 @@ pub fn collect_phase1(
     })
 }
 
+/// Inserts package-local module and interface aliases into each module's scope.
+///
+/// Dependency targets and item imports remain deferred. The target-diagnostic
+/// pass owns unknown/current-module errors; this pass binds only resolved
+/// targets declared in this package.
+pub fn collect_local_module_alias_bindings(
+    module_tree: &ModuleTree,
+    module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
+    scopes: &mut Phase1PackageScopes,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> Result<Vec<Diagnostic>, PackageScopesError> {
+    if module_tree.modules.len() != scopes.modules.len() {
+        return Err(PackageScopesError::PackageMismatch);
+    }
+    if module_tree.modules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let package_key_spelling = packages.resolve(module_tree.package)?;
+    let package_key = PackageKey::new(package_key_spelling.to_string())
+        .map_err(PackageScopesError::PackageKey)?;
+    let package_identity = package_key_spelling.to_string();
+    let module_def_ids = scopes
+        .modules
+        .iter()
+        .map(|module| module.module_def_id)
+        .collect::<Vec<_>>();
+    let mut diagnostics = Vec::new();
+
+    for raw_module_id in 0..module_tree.modules.len() {
+        let module_id = ModuleId::from_raw(
+            u32::try_from(raw_module_id).map_err(|_| PackageScopesError::TooManyModules)?,
+        );
+        let input = module_inputs
+            .get(&module_id)
+            .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
+
+        for entry in &input.filtered.item_tree.uses {
+            let Some((path_range, has_error)) =
+                crate::use_target_diagnostics::use_package_path_range(entry, input)?
+            else {
+                if entry.is_pub && !entry.has_items {
+                    let use_range = use_declaration_range(entry, input)?;
+                    diagnostics.push(pub_use_without_items_diagnostic(
+                        source_location(input, use_range)?,
+                        &package_identity,
+                    ));
+                }
+                continue;
+            };
+            if entry.is_pub && !entry.has_items {
+                diagnostics.push(pub_use_without_items_diagnostic(
+                    source_location(input, path_range)?,
+                    &package_identity,
+                ));
+                continue;
+            }
+            if has_error {
+                continue;
+            }
+            let parsed = match parse_use_path(entry, symbols) {
+                Ok(parsed) => parsed,
+                Err(UsePathError::Intern(error)) => {
+                    return Err(PackageScopesError::Interner(error));
+                }
+                Err(_) => continue,
+            };
+            let binding_name = match derive_use_binding_name(entry, symbols) {
+                Ok(Some(binding_name)) => binding_name,
+                Ok(None) => continue,
+                Err(UseBindingNameError::Intern(error)) => {
+                    return Err(PackageScopesError::Interner(error));
+                }
+                Err(UseBindingNameError::Symbol(error)) => {
+                    return Err(PackageScopesError::Symbol(error));
+                }
+                Err(UseBindingNameError::Path(UsePathError::Intern(error))) => {
+                    return Err(PackageScopesError::Interner(error));
+                }
+                Err(
+                    UseBindingNameError::Path(_)
+                    | UseBindingNameError::MissingSymbol
+                    | UseBindingNameError::MalformedParsedPath,
+                ) => continue,
+            };
+            let name = binding_name.symbol();
+            let name_spelling = symbols.resolve(name)?;
+            let name_range = use_binding_name_range(entry, input, &parsed, path_range, symbols)?;
+            let name_span = Span::new(input.filtered.item_tree.file, name_range);
+            let location = source_location(input, name_range)?;
+
+            if binding_name.requires_alias() {
+                let mut diagnostic = use_binding_diagnostic(
+                    Code::UseBindingIsKeyword,
+                    Severity::Error,
+                    format!(
+                        "derived use binding `{name_spelling}` is a keyword or reserved word; an alias is required"
+                    ),
+                    "binding name",
+                    location,
+                    &package_identity,
+                );
+                diagnostic
+                    .data
+                    .insert("name".to_owned(), Value::String(name_spelling.to_string()));
+                let module_scopes = scopes
+                    .modules
+                    .get_mut(raw_module_id)
+                    .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
+                push_import_binding(module_scopes, entry, name, name_span, Res::Err)?;
+                diagnostics.push(diagnostic);
+                continue;
+            }
+            if is_reserved_type_name(&name_spelling) {
+                diagnostics.push(use_binding_diagnostic(
+                    Code::ReservedTypeName,
+                    Severity::Error,
+                    format!("`{name_spelling}` is a reserved type name"),
+                    "reserved name",
+                    location,
+                    &package_identity,
+                ));
+                let module_scopes = scopes
+                    .modules
+                    .get_mut(raw_module_id)
+                    .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
+                push_import_binding(module_scopes, entry, name, name_span, Res::Err)?;
+                continue;
+            }
+
+            let target_res = match resolve_parsed_use_target(
+                &parsed,
+                &package_key,
+                packages,
+                module_id,
+                module_tree,
+                symbols,
+            ) {
+                Ok(UseTarget::LocalModule(target)) => {
+                    let target_def_id = module_def_ids
+                        .get(target.raw() as usize)
+                        .ok_or(PackageScopesError::MissingModuleInput(target))?;
+                    Some(Res::Def(DefKind::Module, target_def_id.to_def_id()))
+                }
+                Ok(UseTarget::ForeignPackage(_)) => None,
+                Err(UseTargetError::Path(UsePathError::Intern(error))) => {
+                    return Err(PackageScopesError::Interner(error));
+                }
+                Err(UseTargetError::Path(_)) => None,
+                Err(UseTargetError::Module(
+                    ModuleTargetError::MissingRootModule | ModuleTargetError::UseOfCurrentModule(_),
+                )) => None,
+                Err(UseTargetError::Module(ModuleTargetError::UnknownModule { .. })) => {
+                    local_interface_target(module_tree, scopes, &parsed)
+                        .map(|def_id| Res::Def(DefKind::Interface, def_id))
+                }
+                Err(UseTargetError::Module(ModuleTargetError::InvalidModuleTree)) => {
+                    return Err(PackageScopesError::InvalidModuleTree);
+                }
+                Err(UseTargetError::Module(ModuleTargetError::InvalidCurrentModule)) => {
+                    return Err(PackageScopesError::InvalidCurrentModule);
+                }
+                Err(UseTargetError::Module(ModuleTargetError::Symbol(error))) => {
+                    return Err(PackageScopesError::Symbol(error));
+                }
+                Err(UseTargetError::PackageInterner(error)) => {
+                    return Err(PackageScopesError::Package(error));
+                }
+                Err(UseTargetError::PackageKeyMismatch { .. }) => {
+                    return Err(PackageScopesError::PackageMismatch);
+                }
+                Err(UseTargetError::UnsupportedPackageKey(_)) => {
+                    return Err(PackageScopesError::UnsupportedPackageKey);
+                }
+            };
+            let Some(res) = target_res else {
+                continue;
+            };
+            let module_scopes = scopes
+                .modules
+                .get_mut(raw_module_id)
+                .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
+            let previous = module_scopes.scope.get(&name).cloned();
+            match previous {
+                Some(previous) if previous.res == res => {
+                    push_import_binding(module_scopes, entry, name, name_span, res)?;
+                    diagnostics.push(use_binding_diagnostic(
+                        Code::RedundantImport,
+                        Severity::Warning,
+                        format!("module alias `{name_spelling}` already denotes the same target"),
+                        "redundant import",
+                        location,
+                        &package_identity,
+                    ));
+                }
+                Some(previous) => {
+                    let mut diagnostic = use_binding_diagnostic(
+                        Code::DuplicateBinding,
+                        Severity::Error,
+                        format!("`{name_spelling}` is already bound in this module"),
+                        "duplicate binding",
+                        location,
+                        &package_identity,
+                    );
+                    let previous_location = source_location(input, previous.name_span.range)?;
+                    diagnostic
+                        .push_related(Related::DeclaredHere {
+                            location: previous_location,
+                            what: "earlier binding".to_owned(),
+                        })
+                        .expect("diagnostics without a source snapshot accept related locations");
+                    push_import_binding(module_scopes, entry, name, name_span, Res::Err)?;
+                    diagnostics.push(diagnostic);
+                }
+                None => {
+                    let import = push_import_binding(module_scopes, entry, name, name_span, res)?;
+                    module_scopes.scope.insert(
+                        name,
+                        Binding {
+                            res,
+                            name_span,
+                            origin: BindingOrigin::Use { import },
+                            visibility: Visibility::Private,
+                        },
+                    );
+                    if is_prelude_module_alias_name(&name_spelling) {
+                        diagnostics.push(use_binding_diagnostic(
+                            Code::ShadowsPrelude,
+                            Severity::Warning,
+                            format!("module alias `{name_spelling}` shadows a prelude binding"),
+                            "prelude shadow",
+                            location,
+                            &package_identity,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+fn local_interface_target(
+    module_tree: &ModuleTree,
+    scopes: &Phase1PackageScopes,
+    path: &ParsedUsePath,
+) -> Option<DefId> {
+    let interface_name = path.segments.last().copied()?;
+    let parent_path = &path.segments[..path.segments.len() - 1];
+    let parent_index = module_tree
+        .modules
+        .iter()
+        .position(|module| module.path.as_slice() == parent_path)?;
+    let binding = scopes
+        .modules
+        .get(parent_index)?
+        .declared
+        .get(&interface_name)?;
+    match binding.res {
+        Res::Def(DefKind::Interface, def_id) => Some(def_id),
+        Res::Def(_, _) | Res::Err => None,
+    }
+}
+
+/// Only lowercase prelude names can collide with a syntactically valid module
+/// alias. The exact prelude's lowercase names are `panic` and `unreachable`;
+/// item and declaration bindings use the complete prelude table in later
+/// resolver work.
+fn is_prelude_module_alias_name(name: &str) -> bool {
+    matches!(name, "panic" | "unreachable")
+}
+
+fn use_declaration_range(
+    entry: &UseEntry,
+    input: &FilteredModule<'_>,
+) -> Result<TextRange, PackageScopesError> {
+    let file = input.filtered.item_tree.file;
+    let syntax = input
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(file, input.root))
+        .ok_or(PackageScopesError::MissingAstNode)?;
+    let use_decl = ast::UseDecl::cast(syntax).ok_or(PackageScopesError::MissingAstNode)?;
+    Ok(use_decl.syntax().text_range())
+}
+
+fn pub_use_without_items_diagnostic(location: Location, package_identity: &str) -> Diagnostic {
+    use_binding_diagnostic(
+        Code::PubUseWithoutItems,
+        Severity::Error,
+        "`pub use` requires an item list",
+        "public use",
+        location,
+        package_identity,
+    )
+}
+
 fn interface_conflicts_with_module_file(
     module: &ModuleData,
     interface_name: Symbol,
@@ -490,6 +831,104 @@ fn interface_conflicts_with_module_file(
         module.children.get(name.as_ref()),
         Some(ChildEntry::Module(_) | ChildEntry::Both(_, _))
     ))
+}
+
+fn use_binding_name_range(
+    entry: &UseEntry,
+    input: &FilteredModule<'_>,
+    parsed: &ParsedUsePath,
+    package_path_range: TextRange,
+    symbols: &Interner,
+) -> Result<TextRange, PackageScopesError> {
+    let file = input.filtered.item_tree.file;
+    let syntax = input
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(file, input.root))
+        .ok_or(PackageScopesError::MissingAstNode)?;
+    let use_decl = ast::UseDecl::cast(syntax).ok_or(PackageScopesError::NameMismatch)?;
+    if entry.alias.is_some() {
+        return use_decl
+            .alias()
+            .and_then(|alias| alias.name())
+            .map(|name| name.syntax().text_range())
+            .ok_or(PackageScopesError::MissingName);
+    }
+
+    let spelling = if let Some(segment) = parsed.segments.last() {
+        symbols.resolve(*segment)?.to_string()
+    } else {
+        parsed
+            .package_identity
+            .rsplit_once(':')
+            .map(|(_, package)| package.to_owned())
+            .ok_or(PackageScopesError::NameMismatch)?
+    };
+    let relative_start = if parsed.segments.is_empty() {
+        entry.pkg_path.rfind(':')
+    } else {
+        entry
+            .pkg_path
+            .rfind('/')
+            .or_else(|| entry.pkg_path.rfind(':'))
+    }
+    .and_then(|offset| offset.checked_add(1))
+    .ok_or(PackageScopesError::InvalidSourceRange)?;
+    if entry.pkg_path.get(relative_start..) != Some(spelling.as_str()) {
+        return Err(PackageScopesError::NameMismatch);
+    }
+
+    let start = package_path_range
+        .start()
+        .raw()
+        .checked_add(
+            u32::try_from(relative_start).map_err(|_| PackageScopesError::InvalidSourceRange)?,
+        )
+        .ok_or(PackageScopesError::InvalidSourceRange)?;
+    let end = start
+        .checked_add(
+            u32::try_from(spelling.len()).map_err(|_| PackageScopesError::InvalidSourceRange)?,
+        )
+        .ok_or(PackageScopesError::InvalidSourceRange)?;
+    TextRange::new(TextSize::new(start), TextSize::new(end))
+        .ok_or(PackageScopesError::InvalidSourceRange)
+}
+
+fn push_import_binding(
+    module_scopes: &mut Phase1ModuleScopes,
+    entry: &UseEntry,
+    name: Symbol,
+    name_span: Span,
+    res: Res,
+) -> Result<ImportIndex, PackageScopesError> {
+    let import = ImportIndex(
+        u32::try_from(module_scopes.imports.len())
+            .map_err(|_| PackageScopesError::TooManyDefinitions)?,
+    );
+    module_scopes.imports.push(ImportBinding {
+        use_ast_id: entry.ast_id,
+        item_index: None,
+        name,
+        name_span,
+        res,
+        is_pub: entry.is_pub,
+        test_only: false,
+    });
+    Ok(import)
+}
+
+fn use_binding_diagnostic(
+    code: Code,
+    severity: Severity,
+    message: impl Into<String>,
+    primary_label: &str,
+    location: Location,
+    package_identity: &str,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::new(code, severity, message, Some(location));
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.package = Some(package_identity.to_owned());
+    diagnostic
 }
 
 struct ExportCandidate {
