@@ -618,6 +618,25 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_top_level_expression_with_an_expected_item_diagnostic() {
+        let Err(SourceFormatError::Refused(refusal)) = format_source(b"http.get(url).await\n")
+        else {
+            panic!("a top-level expression must be refused as invalid source");
+        };
+
+        let [diagnostic] = refusal.syntax_errors.as_slice() else {
+            panic!("the top-level expression should produce one parser diagnostic");
+        };
+        assert_eq!(diagnostic.code, Code::ExpectedToken);
+        assert_eq!(diagnostic.message, "expected an item");
+        let location = diagnostic
+            .primary()
+            .expect("the unexpected expression needs a source location");
+        assert_eq!(location.span.range.start().to_usize(), 0);
+        assert_eq!(location.span.range.end().to_usize(), 4);
+    }
+
+    #[test]
     fn reports_valid_but_unsupported_shapes_explicitly() {
         assert_eq!(
             format_source(b"const ANSWER: I32 = /* answer */ 42"),

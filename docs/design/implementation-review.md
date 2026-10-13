@@ -3431,13 +3431,13 @@
 - **Human review:** **Review required:** Confirm that `_: Type` closure parameters are accepted, and that `var _` is still refused by design.
 - **Remaining scope:** `var _` closure parameters, which the existing test keeps fail-closed.
 
-### IR-449: Hard parse failures of non-item files report an internal error
+### IR-449: Refuse top-level expressions with a parser diagnostic
 
-- **Decision:** No change. A file whose top level is an expression, such as `http.get(url).await`, returns `INTERNAL_COMPILER_ERROR` ("source formatter could not render input") from the CLI, because the parser recovers without producing a diagnostic that the formatter can report.
-- **Reason:** The formatter contract (§14.1.1, §14.2.2) refuses on parser diagnostics. The current path, documented in §14.1.1 for hard parse failures, does not produce such a diagnostic, so the file is neither formatted nor refused with a location.
-- **Review:** Observed while probing the chapter's `sai` examples: the draft-reconciliation example shows the case. Not covered by a regression test.
-- **Human review:** **Review required:** Confirm whether a top-level expression should be refused with a parser diagnostic (owned by the parser and the formatter entry point), instead of an internal error.
-- **Remaining scope:** Parser diagnostics for top-level non-item tokens.
+- **Decision:** Refuse a top-level expression such as `http.get(url).await` with `EXPECTED_TOKEN` (`expected an item`) at its first token. Do not surface an internal compiler error from `sai fmt`.
+- **Reason:** A source file requires item declarations. File-scope recovery already has the exact source context needed to report this grammar error, and formatter input rules refuse parser errors with their locations.
+- **Review:** Verified `sai --format=json fmt -` reports `EXPECTED_TOKEN` at byte range `0..4` for the example. Added `refuses_a_top_level_expression_with_an_expected_item_diagnostic` to pin the formatter API's refusal code, message, and span.
+- **Human review:** **Review required:** Confirm that `EXPECTED_TOKEN` with the message `expected an item` is the preferred diagnostic for top-level expressions.
+- **Remaining scope:** None identified for this case.
 
 ### IR-450: Remaining unsupported shapes after this step
 
