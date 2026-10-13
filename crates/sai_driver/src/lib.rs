@@ -15,6 +15,7 @@ use sai_package::mvs_diagnostics::{
     root_dependency_cycle_diagnostics, version_conflict_diagnostics,
 };
 use sai_query::{Durability, QueryDatabase, QueryError};
+use sai_resolve::{ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
@@ -40,6 +41,7 @@ pub struct RootDatabase {
     vfs: VfsInputs,
     syntax: SyntaxQueries,
     hir: ItemTreeQueries,
+    resolve: ModuleTreeQueries<VfsInputs>,
     packages: PackageInterner,
     files: FileInterner,
     symbols: Interner,
@@ -157,6 +159,7 @@ pub mod package_validation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RootDatabaseError {
     Query(QueryError),
+    ModuleTree(ModuleTreeQueryError),
     Package(PackageIdError),
     PackageKey(PackageKeyError),
     FileInterner(FileInternerError),
@@ -278,6 +281,12 @@ impl From<QueryError> for RootDatabaseError {
     }
 }
 
+impl From<ModuleTreeQueryError> for RootDatabaseError {
+    fn from(error: ModuleTreeQueryError) -> Self {
+        Self::ModuleTree(error)
+    }
+}
+
 impl From<PackageIdError> for RootDatabaseError {
     fn from(error: PackageIdError) -> Self {
         Self::Package(error)
@@ -373,11 +382,13 @@ impl RootDatabase {
         let vfs = VfsInputs::new()?;
         let syntax = SyntaxQueries::new(vfs.clone())?;
         let hir = ItemTreeQueries::new(syntax.clone())?;
+        let resolve = ModuleTreeQueries::new(vfs.clone())?;
         Ok(Self {
             query_database: QueryDatabase::new(),
             vfs,
             syntax,
             hir,
+            resolve,
             packages: PackageInterner::new(),
             files: FileInterner::new(),
             symbols: Interner::new(),
@@ -612,6 +623,40 @@ impl RootDatabase {
             source_directory_exists: snapshot.source_directory_exists(),
             entries,
         }))
+    }
+
+    /// Computes the Stage 0 module tree for a package's configured source directory.
+    ///
+    /// `package_field` locates the `package` field in `sai.package`, which is
+    /// the primary location used by `MISSING_ROOT_MODULE`.
+    pub fn module_tree(
+        &mut self,
+        package_id: PackageId,
+        source_directory: PackageSourceDirectory,
+        package_field: Option<sai_diagnostics::Location>,
+    ) -> Result<Arc<ModuleTree>, RootDatabaseError> {
+        let interned = self.intern_package_files(package_id, source_directory)?;
+        let file_ids = interned
+            .as_ref()
+            .into_iter()
+            .flat_map(InternedPackageFiles::entries)
+            .filter_map(|entry| {
+                entry
+                    .file_id()
+                    .map(|file_id| (entry.path().as_str().to_owned(), file_id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.resolve
+            .module_tree(
+                &mut self.query_database,
+                package_id,
+                &self.packages,
+                &self.files,
+                &self.symbols,
+                &file_ids,
+                package_field,
+            )
+            .map_err(RootDatabaseError::from)
     }
 
     /// Reads WIT paths and interns them as session-local file IDs.
@@ -3213,5 +3258,74 @@ mod tests {
             .expect("source file ID resolves in this session");
         assert_eq!(stable_key.package_key(), "acme:app#0.1");
         assert_eq!(stable_key.path(), "src/nested/lib.sai");
+    }
+
+    #[test]
+    fn root_database_computes_the_tracked_module_tree_for_package_source() {
+        let mut database = RootDatabase::new().expect("root database initializes");
+        let package_id = database
+            .intern_package("acme:app#0.1")
+            .expect("package is interned");
+        let package_key = PackageKey::new("acme:app#0.1").expect("package key is valid");
+        assert!(
+            database
+                .set_package_files(
+                    package_key,
+                    PackageFilesSnapshot::new(
+                        true,
+                        [
+                            sai_vfs::PackageFileEntry::new(
+                                "lib.sai",
+                                PackageFileKind::File,
+                            )
+                            .expect("root module path is valid"),
+                            sai_vfs::PackageFileEntry::new(
+                                "model",
+                                PackageFileKind::Directory,
+                            )
+                            .expect("namespace path is valid"),
+                            sai_vfs::PackageFileEntry::new(
+                                "model/user.sai",
+                                PackageFileKind::File,
+                            )
+                            .expect("module path is valid"),
+                        ],
+                    )
+                    .expect("source inventory is valid"),
+                    Durability::Low,
+                )
+                .expect("source inventory is set")
+        );
+
+        let tree = database
+            .module_tree(
+                package_id,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                None,
+            )
+            .expect("tracked module tree is computed");
+        assert_eq!(tree.modules.len(), 2);
+        assert_eq!(
+            database
+                .file_key(tree.modules[0].file)
+                .expect("root file ID resolves")
+                .path(),
+            "src/lib.sai"
+        );
+        let user_path = tree.modules[1]
+            .path
+            .iter()
+            .map(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .expect("module path symbol resolves")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_path, ["model", "user"]);
+        assert_eq!(
+            tree.modules[1].parent_dir,
+            Some(sai_resolve::ModuleId::ROOT)
+        );
     }
 }

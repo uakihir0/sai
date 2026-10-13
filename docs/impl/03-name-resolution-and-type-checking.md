@@ -105,21 +105,28 @@ A construct of a higher stage than the toolchain implements is reported as `FEAT
 ### 3.2.1 Data structures
 
 ```rust
+pub struct ModuleId(u32);
+pub struct NamespaceId(u32);
 pub struct ModuleTree {
     pub package: PackageId,
-    pub modules: IndexVec<ModuleId, ModuleData>,   // ModuleId(0) is the root; then pre-order, children in byte order
+    pub modules: Vec<ModuleData>,                  // ModuleId(0) is the root; remaining IDs follow the depth-first file walk
+    pub namespaces: Vec<NamespaceData>,
     pub diagnostics: Vec<Diagnostic>,
 }
 pub struct ModuleData {
     pub path: Vec<Symbol>,                         // empty for the root
     pub file: FileId,                              // the `.sai` file of the module
     pub parent_dir: Option<ModuleId>,              // nearest enclosing module by path prefix, for display only (spec/04 §4.2.5)
-    pub children: BTreeMap<Symbol, ChildEntry>,    // next path segment → module and/or namespace directory
+    pub children: BTreeMap<String, ChildEntry>,    // source-spelling order: next segment → module and/or namespace directory
+}
+pub struct NamespaceData {
+    pub path: Vec<Symbol>,
+    pub children: BTreeMap<String, ChildEntry>,    // source-spelling order
 }
 pub enum ChildEntry { Module(ModuleId), Namespace(NamespaceId), Both(ModuleId, NamespaceId) }
 ```
 
-`ModuleId` is local to a package. A module's global identity is its `DefId`, whose `DefPath` consists of one `Module` component per path segment ([impl/02](02-frontend-ast-hir.md) §2.8.2). `children` and namespace entries exist only to produce the `UNKNOWN_MODULE` listing of spec/04 §4.3.2 step 2.3. They never make a submodule a member of its parent.
+`ModuleId` and `NamespaceId` are local to a package and index their respective vectors. A module's global identity is its `DefId`, whose `DefPath` consists of one `Module` component per path segment ([impl/02](02-frontend-ast-hir.md) §2.8.2). Child maps use source spellings rather than session-local `Symbol` IDs: this keeps map iteration in byte order regardless of interning history. A consumer starting with a `Symbol` resolves it to its spelling before looking up a child. `children` and namespace entries exist only to produce the `UNKNOWN_MODULE` listing of spec/04 §4.3.2 step 2.3. They never make a submodule a member of its parent.
 
 ### 3.2.2 Algorithm
 
@@ -134,7 +141,7 @@ pub enum ChildEntry { Module(ModuleId), Namespace(NamespaceId), Both(ModuleId, N
 7. After the walk, if no root was found, report `MISSING_ROOT_MODULE` (step 9).
 8. Directories without a sibling file become namespaces (step 10). Empty directories produce no entry (step 11).
 
-Modules are numbered in the order in which their files are visited, which is the pre-order of the walk with entries in byte order. Because every valid segment is lowercase ASCII, two valid modules never differ only by case, and the numbering is the same on every file system.
+The root is `ModuleId(0)`. Other modules are numbered in depth-first file-system entry order, with entries in each directory visited in byte order. A directory is visited before a later sibling file whose name extends the directory name; for example, when `a/` and `a.sai` are siblings, modules below `a/` are numbered before module `a`. Because every valid segment is lowercase ASCII, two valid modules never differ only by case, and the numbering is the same on every file system.
 
 ### 3.2.3 Diagnostic locations (N-E-23)
 

@@ -1,0 +1,13 @@
+[package]
+name = "sai_resolve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sai_diagnostics = { path = "../sai_diagnostics" }
+sai_intern = { path = "../sai_intern" }
+sai_query = { path = "../sai_query" }
+sai_stable_hash = { path = "../sai_stable_hash" }
+sai_syntax = { path = "../sai_syntax" }
+sai_vfs = { path = "../sai_vfs" }

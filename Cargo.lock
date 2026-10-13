@@ -3046,6 +3046,7 @@ dependencies = [
  "sai_intern",
  "sai_package",
  "sai_query",
+ "sai_resolve",
  "sai_stable_hash",
  "sai_syntax",
  "sai_vfs",
@@ -3111,6 +3112,18 @@ version = "0.1.0"
 dependencies = [
  "sai_intern",
  "sai_stable_hash",
+]
+
+[[package]]
+name = "sai_resolve"
+version = "0.1.0"
+dependencies = [
+ "sai_diagnostics",
+ "sai_intern",
+ "sai_query",
+ "sai_stable_hash",
+ "sai_syntax",
+ "sai_vfs",
 ]
 
 [[package]]
