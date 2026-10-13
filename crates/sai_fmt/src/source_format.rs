@@ -1724,6 +1724,89 @@ mod tests {
     }
 
     #[test]
+    fn formats_block_comments_after_at_pattern_tokens() {
+        let sources = [
+            (
+                "fn f(value:State){\nmatch value{item@/* binding */_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value { item @ /* binding */ _ => 0 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{item@/* binding\ncontinued */_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        item @ /* binding\n",
+                    "continued */ _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{item@// binding\n_=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        item @ // binding\n",
+                    "            _ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{item@/* block */ // line\nSome(_)/* nested */=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value {\n",
+                    "        item @ /* block */ // line\n",
+                    "            Some(_) /* nested */ => 0\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nmatch value{item@/* binding */Some(_)/* nested */=>0}\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    match value { item @ /* binding */ Some(_) /* nested */ => 0 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet selected=consume(match value{nested@/* nested */_=>1})\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let selected = consume(match value { nested @ /* nested */ _ => 1 })\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "fn f(value:State){\nlet item@/* binding */_=value\nitem\n}\n",
+                concat!(
+                    "fn f(value: State) {\n",
+                    "    let item @ /* binding */ _ = value\n",
+                    "    item\n",
+                    "}\n",
+                ),
+            ),
+        ];
+        for (source, expected) in sources {
+            assert!(crate::parse_source(source.as_bytes()).is_ok(), "{source}");
+            let formatted =
+                format_source(source.as_bytes()).expect("@-pattern block comments are supported");
+            assert_eq!(formatted, expected, "{source}");
+            assert_eq!(
+                format_source(formatted.as_bytes()),
+                Ok(formatted),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_comments_inside_match_patterns() {
         let source =
             "fn f(value:State) {\n    match value{Some(/* interior */item)=>item,_=>0}\n}\n";

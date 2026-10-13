@@ -618,6 +618,25 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
     }
     for node in root
         .descendants()
+        .filter(|node| node.kind() == SyntaxKind::AT_PAT)
+    {
+        if let Some(token) = node
+            .children_with_tokens()
+            .find_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::AT => Some(token),
+                _ => None,
+            })
+        {
+            owners.insert((
+                false,
+                token.kind(),
+                token.text_range().start().to_usize(),
+                token.text_range().end().to_usize(),
+            ));
+        }
+    }
+    for node in root
+        .descendants()
         .filter(|node| node.kind() == SyntaxKind::MATCH_ARM_LIST)
     {
         let Some(list) = ast::MatchArmList::cast(node.clone()) else {
@@ -4708,11 +4727,27 @@ fn pattern_document(
             {
                 return Err(SourceDocumentError::UnsupportedShape);
             }
-            Ok(Doc::concat([
-                binding_pattern_document(source, &binding)?,
-                Doc::text(" @ "),
-                pattern_document(source, &pattern, expression_group_ids)?,
-            ]))
+            let at_token = at_pattern
+                .syntax()
+                .children_with_tokens()
+                .find_map(|element| match element {
+                    SyntaxElement::Token(token) if token.kind() == SyntaxKind::AT => Some(token),
+                    _ => None,
+                })
+                .ok_or(SourceDocumentError::UnsupportedShape)?;
+            let at_comments = trailing_comments_after_token(&at_token)?;
+            let nested_pattern = pattern_document(source, &pattern, expression_group_ids)?;
+            let mut documents = vec![binding_pattern_document(source, &binding)?, Doc::text(" @")];
+            append_match_arm_comment_run(&mut documents, &at_comments);
+            if at_comments
+                .last()
+                .is_some_and(|comment| comment.kind == TriviaKind::LineComment)
+            {
+                documents.push(Doc::indent(Doc::concat([Doc::HardLine, nested_pattern])));
+            } else {
+                documents.extend([Doc::text(" "), nested_pattern]);
+            }
+            Ok(Doc::concat(documents))
         }
         ast::Pattern::Literal(literal) => literal_pattern_document(source, literal),
         ast::Pattern::Range(range) => range_pattern_document(source, range),
