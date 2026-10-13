@@ -254,34 +254,26 @@ pub fn collect_phase1(
         let mut module_scopes = Phase1ModuleScopes::default();
         let mut test_names = BTreeMap::<String, Location>::new();
 
-        let validate_export_names =
-            build_context.is_root_core_module_build || build_context.is_test_build;
-        if validate_export_names {
-            for use_entry in &input.filtered.item_tree.uses {
-                validate_export_name_on_use(
-                    &use_entry.raw_attrs,
-                    snapshot,
-                    &package_identity,
-                    symbols,
-                    &mut module_diagnostics,
-                )?;
-            }
+        for use_entry in &input.filtered.item_tree.uses {
+            validate_export_name_on_use(
+                &use_entry.raw_attrs,
+                snapshot,
+                &package_identity,
+                symbols,
+                &mut module_diagnostics,
+            )?;
         }
 
         for entry in &input.filtered.item_tree.items {
-            let validated_export_name = if validate_export_names {
-                validate_export_name_tree(
-                    entry,
-                    true,
-                    input,
-                    snapshot,
-                    &package_identity,
-                    symbols,
-                    &mut module_diagnostics,
-                )?
-            } else {
-                None
-            };
+            let validated_export_name = validate_export_name_tree(
+                entry,
+                true,
+                input,
+                snapshot,
+                &package_identity,
+                symbols,
+                &mut module_diagnostics,
+            )?;
             match entry.kind {
                 ItemTreeKind::ExternBlock => {
                     let component = extern_block_component(entry, input, symbols)?;
@@ -1555,6 +1547,42 @@ mod tests {
                 .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
                 .count(),
             1
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Code::FeatureNotImplemented
+                || !matches!(
+                    diagnostic.data.get("feature"),
+                    Some(Value::String(feature)) if feature == "attribute @export_name"
+                )
+        }));
+    }
+
+    #[test]
+    fn export_name_targets_are_validated_without_core_uniqueness_context() {
+        let fixture = Fixture::new(
+            concat!(
+                "@export_name(\"wire\") export fn first() {}\n",
+                "@export_name(\"wire\") export fn second() {}\n",
+                "@export_name(\"invalid-target\") fn ordinary() {}\n",
+            ),
+            "wasm32-wasi",
+        );
+        let (scopes, _) = fixture.collect();
+
+        assert!(scopes.exports.is_empty());
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidAttributeTarget)
+                .count(),
+            1
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::DuplicateExportName)
         );
         assert!(scopes.diagnostics.iter().all(|diagnostic| {
             diagnostic.code != Code::FeatureNotImplemented
