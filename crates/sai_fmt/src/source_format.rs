@@ -637,6 +637,29 @@ mod tests {
     }
 
     #[test]
+    fn starts_blocks_after_multiline_strings_on_the_next_line() {
+        for (source, expected) in [
+            (
+                b"fn f(){match \"\"\"\n    key\n    \"\"\"\n    {\"key\"=>true}}".as_slice(),
+                "fn f() {\n    match \"\"\"\n        key\n        \"\"\"\n    { \"key\" => true }\n}\n",
+            ),
+            (
+                b"test \"\"\"\n    sample\n    \"\"\"\n{}".as_slice(),
+                "test \"\"\"\n    sample\n    \"\"\"\n{}\n",
+            ),
+            (
+                b"extern \"wasm\" module \"\"\"\n    env\n    \"\"\"\n{ fn f() }".as_slice(),
+                "extern \"wasm\" module \"\"\"\n    env\n    \"\"\"\n{\n    fn f()\n}\n",
+            ),
+        ] {
+            assert_eq!(
+                format_source(source).expect("multiline string followed by a block formats"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn reports_valid_but_unsupported_shapes_explicitly() {
         assert_eq!(
             format_source(b"const ANSWER: I32 = /* answer */ 42"),

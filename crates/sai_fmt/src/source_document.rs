@@ -4010,6 +4010,11 @@ fn extern_block_document(
         .abi()
         .ok_or(SourceDocumentError::UnsupportedShape)?;
     let module = declaration.module();
+    let module_requires_line_break = module
+        .as_ref()
+        .map(|module| node_ends_with_multiline_block_string(source, module.syntax()))
+        .transpose()?
+        .unwrap_or(false);
     let unsafe_prefix = match significant_token_kinds(declaration.syntax()).as_slice() {
         [
             SyntaxKind::UNSAFE_KW,
@@ -4035,6 +4040,11 @@ fn extern_block_document(
         .map(|module| extern_module_document(source, module))
         .transpose()?
         .unwrap_or_else(|| Doc::text(""));
+    let body_separator = if module_requires_line_break {
+        Doc::HardLine
+    } else {
+        Doc::text(" ")
+    };
     let item_body = item_list_body_document(
         source,
         &items,
@@ -4053,7 +4063,7 @@ fn extern_block_document(
         Doc::text(format!("{unsafe_prefix}extern ")),
         literal_document(source, LiteralToken::String(abi))?,
         module_document,
-        Doc::text(" "),
+        body_separator,
         item_body,
     ]);
     item_document_for_node(document, declaration.syntax())
@@ -4074,24 +4084,28 @@ fn extern_module_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    refuse_multiline_block_string(source, value.syntax())?;
     Ok(Doc::concat([
         Doc::text(" module "),
         literal_document(source, LiteralToken::String(value))?,
     ]))
 }
 
-/// A `"""` string ends its line with its closing delimiter, so a `{` cannot follow it on that
-/// line. No layout of a block after such a name is specified, so the formatter refuses it.
-fn refuse_multiline_block_string(
+fn node_ends_with_multiline_block_string(
+    source: &ParsedSource,
+    node: &SyntaxNode,
+) -> Result<bool, SourceDocumentError> {
+    let token = node
+        .last_token()
+        .ok_or(SourceDocumentError::UnsupportedShape)?;
+    is_multiline_block_string(source, &token)
+}
+
+fn is_multiline_block_string(
     source: &ParsedSource,
     token: &SyntaxToken,
-) -> Result<(), SourceDocumentError> {
+) -> Result<bool, SourceDocumentError> {
     let text = token_text(source, token)?;
-    if text.starts_with("\"\"\"") && text.contains(['\n', '\r']) {
-        return Err(SourceDocumentError::UnsupportedShape);
-    }
-    Ok(())
+    Ok(text.starts_with("\"\"\"") && text.contains(['\n', '\r']))
 }
 
 fn test_decl_document(
@@ -4120,14 +4134,18 @@ fn test_decl_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
-    refuse_multiline_block_string(source, name.syntax())?;
+    let body_separator = if is_multiline_block_string(source, name.syntax())? {
+        Doc::HardLine
+    } else {
+        Doc::text(" ")
+    };
     let name_document = literal_document(source, LiteralToken::String(name))?;
     let body_document = block_document(source, &body, expression_group_ids)?;
     let document = Doc::concat([
         prefix,
         Doc::text("test "),
         name_document,
-        Doc::text(" "),
+        body_separator,
         body_document,
     ]);
     item_document_for_node(document, declaration.syntax())
@@ -4589,6 +4607,8 @@ fn match_expression_document_with_keyword_comments(
             .last_token()
             .ok_or(SourceDocumentError::UnsupportedShape)?,
     )?;
+    let scrutinee_ends_with_multiline_string =
+        node_ends_with_multiline_block_string(source, scrutinee.syntax())?;
     let opening_leading_comment_documents =
         match_arm_list_opening_leading_comment_documents(source, &arms)?;
     let mut arm_documents = Vec::with_capacity(match_arms.len());
@@ -4699,10 +4719,12 @@ fn match_expression_document_with_keyword_comments(
     )?);
     append_trailing_comment_documents(&mut documents, &scrutinee_comments);
     if opening_leading_comment_documents.is_empty() {
-        if scrutinee_comments.last().is_some_and(|comment| {
-            comment.kind == TriviaKind::LineComment
-                || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
-        }) {
+        if scrutinee_ends_with_multiline_string
+            || scrutinee_comments.last().is_some_and(|comment| {
+                comment.kind == TriviaKind::LineComment
+                    || (comment.kind == TriviaKind::BlockComment && comment.text.contains('\n'))
+            })
+        {
             documents.push(Doc::HardLine);
         } else {
             documents.push(Doc::text(" "));
@@ -12359,14 +12381,14 @@ mod tests {
     }
 
     #[test]
-    fn refuses_multiline_block_string_names_before_a_block() {
+    fn places_blocks_after_multiline_string_names_on_the_next_line() {
         assert_eq!(
             format_shape(b"test \"\"\"\n    multi\n    \"\"\"\n{}"),
-            Err(SourceDocumentError::UnsupportedShape)
+            Ok("test \"\"\"\n    multi\n    \"\"\"\n{}\n".to_owned())
         );
         assert_eq!(
             format_shape(b"extern \"wasm\" module \"\"\"\n    e\n    \"\"\"\n{ fn f() }"),
-            Err(SourceDocumentError::UnsupportedShape)
+            Ok("extern \"wasm\" module \"\"\"\n    e\n    \"\"\"\n{\n    fn f()\n}\n".to_owned())
         );
     }
 

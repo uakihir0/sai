@@ -3447,13 +3447,13 @@
 - **Human review:** **Review required:** Confirm that comment placement is the main remaining gap, and that the comment owners of §14.6 need a dedicated stage.
 - **Remaining scope:** Comment placement across the constructs listed above; `var _` closure parameters.
 
-### IR-451: Refuse multiline block-string names before a block
+### IR-451: Start blocks after multiline string tokens on the next line
 
-- **Decision:** A `test` name or an `extern` module name written as a multiline `"""` string is refused with `UnsupportedShape`, and is never printed. The refusal covers only `"""` strings that contain a line break.
-- **Reason:** A `"""` string ends its line with its closing delimiter. Printing ` {` after it, as the single-space layout of §14.7.6 does, produces an unterminated string, so the output fails the verification of §14.11 with an internal error. The specification gives no layout for a block that follows such a name. Moving the `{` to its own line would invent one, so the formatter keeps the item unsupported instead. Single-line `"""` names and raw or continued strings are unaffected, because their closing delimiter does not end the line.
-- **Review:** The review found the defect with a `test """` name followed by `{}`, and with an `extern` module name followed by a block. The new test `refuses_multiline_block_string_names_before_a_block` pins both forms. The existing formatter test suite passes with 391 tests.
-- **Human review:** **Review required:** Decide whether the canonical form should place the `{` on its own line after the closing `"""`, or whether the spec should forbid multiline names in these positions. The current refusal keeps the output free of invented layout until the decision is made.
-- **Remaining scope:** Layout of a block after a multiline name; `var _` closure parameters remain refused as recorded in IR-448.
+- **Decision:** When a `test` name, an `extern` module name, or a `match` scrutinee is a multiline `"""` string, print the following `{` on the next line. Continue to refuse a source shape only when another formatter rule does not support it.
+- **Reason:** The closing `"""` must be alone on its line, while `TestDecl`, `ExternBlock`, and `MatchExpr` permit a newline before their block brace. A same-line space before `{` makes the formatted source invalid and causes output verification to report an internal error. Using the grammar's existing optional newline is deterministic and preserves the syntax without inventing a new construct.
+- **Review:** The adversarial review reproduced the `match` failure (`formatter verification failed: output does not parse`). Added fixed-point formatting coverage for `match`, `test`, and `extern` examples, including the expected next-line brace.
+- **Human review:** **Review required:** Confirm that the next-line brace is the desired canonical exception for multiline string headers and match scrutinees.
+- **Remaining scope:** Other contexts where a multiline string is followed by another token should be reviewed as their layout rules are extended; module-less extern blocks are semantically invalid for Stage 1 `wasm` imports and Stage 7 `C` blocks remain staged, so neither is covered by this rule; `var _` closure parameters remain refused as recorded in IR-448.
 
 ### IR-452: Run formatting and workspace tests across supported desktop operating systems
 
