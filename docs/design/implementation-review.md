@@ -3446,3 +3446,11 @@
 - **Review:** The counts come from a grep of `UnsupportedShape` grouped by the enclosing function, taken after this step. The spec corpus was extracted from `docs/spec`, `docs/impl`, and `docs/design`, excluding fences marked `noncanonical` or `rejected`. Of the 287 extracted blocks, 256 format and are fixed points, and 11 are refused by the parser (fragments, invalid examples, and the top-level expression of IR-449). Of the 20 blocks that do not format, 18 contain a comment; the other 2 are `extern "C"` blocks that the parser refuses for Stage 7.
 - **Human review:** **Review required:** Confirm that comment placement is the main remaining gap, and that the comment owners of §14.6 need a dedicated stage.
 - **Remaining scope:** Comment placement across the constructs listed above; `var _` closure parameters.
+
+### IR-451: Refuse multiline block-string names before a block
+
+- **Decision:** A `test` name or an `extern` module name written as a multiline `"""` string is refused with `UnsupportedShape`, and is never printed. The refusal covers only `"""` strings that contain a line break.
+- **Reason:** A `"""` string ends its line with its closing delimiter. Printing ` {` after it, as the single-space layout of §14.7.6 does, produces an unterminated string, so the output fails the verification of §14.11 with an internal error. The specification gives no layout for a block that follows such a name. Moving the `{` to its own line would invent one, so the formatter keeps the item unsupported instead. Single-line `"""` names and raw or continued strings are unaffected, because their closing delimiter does not end the line.
+- **Review:** The review found the defect with a `test """` name followed by `{}`, and with an `extern` module name followed by a block. The new test `refuses_multiline_block_string_names_before_a_block` pins both forms. The existing formatter test suite passes with 391 tests.
+- **Human review:** **Review required:** Decide whether the canonical form should place the `{` on its own line after the closing `"""`, or whether the spec should forbid multiline names in these positions. The current refusal keeps the output free of invented layout until the decision is made.
+- **Remaining scope:** Layout of a block after a multiline name; `var _` closure parameters remain refused as recorded in IR-448.
