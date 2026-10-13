@@ -666,6 +666,23 @@ fn supported_comment_owners(root: &SyntaxNode) -> HashSet<CommentOwnerKey> {
                 token.text_range().end().to_usize(),
             ));
         }
+        for (comma_index, token) in node
+            .children_with_tokens()
+            .filter_map(|element| match element {
+                SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA => Some(token),
+                _ => None,
+            })
+            .enumerate()
+        {
+            if comma_index + 1 < item_count {
+                owners.insert((
+                    false,
+                    token.kind(),
+                    token.text_range().start().to_usize(),
+                    token.text_range().end().to_usize(),
+                ));
+            }
+        }
     }
     for node in root
         .descendants()
@@ -5057,14 +5074,18 @@ fn tuple_pattern_document(
         .map(|element| pattern_document(source, &element, expression_group_ids))
         .collect::<Result<Vec<_>, _>>()?;
     let opening_suffix = delimited_pattern_opening_suffix(tuple.syntax(), SyntaxKind::L_PAREN)?;
-    Ok(delimited_list_document_with_options_and_opening_suffix(
+    let separator_suffixes = delimited_pattern_separator_suffixes(tuple.syntax(), documents.len())?;
+    Ok(delimited_list_document_with_options_and_suffixes(
         expression_group_ids.next(),
         "(",
         ")",
         documents,
         true,
         true,
-        opening_suffix,
+        DelimitedListSuffixes {
+            opening: opening_suffix,
+            separators: separator_suffixes,
+        },
     ))
 }
 
@@ -5100,14 +5121,18 @@ fn slice_pattern_document(
         return Err(SourceDocumentError::UnsupportedShape);
     }
     let opening_suffix = delimited_pattern_opening_suffix(slice.syntax(), SyntaxKind::L_BRACKET)?;
-    Ok(delimited_list_document_with_options_and_opening_suffix(
+    let separator_suffixes = delimited_pattern_separator_suffixes(slice.syntax(), documents.len())?;
+    Ok(delimited_list_document_with_options_and_suffixes(
         expression_group_ids.next(),
         "[",
         "]",
         documents,
         true,
         false,
-        opening_suffix,
+        DelimitedListSuffixes {
+            opening: opening_suffix,
+            separators: separator_suffixes,
+        },
     ))
 }
 
@@ -5126,6 +5151,33 @@ fn delimited_pattern_opening_suffix(
     let mut suffix = Vec::new();
     append_single_line_block_comments_without_leading_space(&mut suffix, &comments)?;
     Ok(suffix)
+}
+
+fn delimited_pattern_separator_suffixes(
+    node: &SyntaxNode,
+    item_count: usize,
+) -> Result<Vec<Vec<Doc>>, SourceDocumentError> {
+    let separator_count = item_count.saturating_sub(1);
+    let commas = node
+        .children_with_tokens()
+        .filter_map(|element| match element {
+            SyntaxElement::Token(token) if token.kind() == SyntaxKind::COMMA => Some(token),
+            _ => None,
+        })
+        .take(separator_count)
+        .collect::<Vec<_>>();
+    if commas.len() != separator_count {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    commas
+        .into_iter()
+        .map(|comma| {
+            let comments = trailing_comments_after_token(&comma)?;
+            let mut suffix = Vec::new();
+            append_single_line_block_comments(&mut suffix, &comments)?;
+            Ok(suffix)
+        })
+        .collect()
 }
 
 fn rest_pattern_document(
@@ -5222,14 +5274,19 @@ fn constructor_pattern_arguments_document(
         .last()
         .is_some_and(|child| ast::RestPat::can_cast(child.kind()));
     let opening_suffix = delimited_pattern_opening_suffix(arguments.syntax(), SyntaxKind::L_PAREN)?;
-    Ok(delimited_list_document_with_options_and_opening_suffix(
+    let separator_suffixes =
+        delimited_pattern_separator_suffixes(arguments.syntax(), documents.len())?;
+    Ok(delimited_list_document_with_options_and_suffixes(
         expression_group_ids.next(),
         "(",
         ")",
         documents,
         !final_is_rest,
         false,
-        opening_suffix,
+        DelimitedListSuffixes {
+            opening: opening_suffix,
+            separators: separator_suffixes,
+        },
     ))
 }
 
@@ -8229,15 +8286,43 @@ fn delimited_list_document_with_options_and_opening_suffix(
     keep_singleton_comma: bool,
     opening_suffix: Vec<Doc>,
 ) -> Doc {
+    delimited_list_document_with_options_and_suffixes(
+        group,
+        open,
+        close,
+        items,
+        trailing_comma_when_broken,
+        keep_singleton_comma,
+        DelimitedListSuffixes {
+            opening: opening_suffix,
+            separators: Vec::new(),
+        },
+    )
+}
+
+struct DelimitedListSuffixes {
+    opening: Vec<Doc>,
+    separators: Vec<Vec<Doc>>,
+}
+
+fn delimited_list_document_with_options_and_suffixes(
+    group: GroupId,
+    open: &str,
+    close: &str,
+    items: Vec<Doc>,
+    trailing_comma_when_broken: bool,
+    keep_singleton_comma: bool,
+    suffixes: DelimitedListSuffixes,
+) -> Doc {
     if items.is_empty() {
         return Doc::concat([
             Doc::text(open),
-            Doc::concat(opening_suffix),
+            Doc::concat(suffixes.opening),
             Doc::text(close),
         ]);
     }
     let mut contents = Vec::with_capacity(items.len() * 2 + 2);
-    contents.push(if opening_suffix.is_empty() {
+    contents.push(if suffixes.opening.is_empty() {
         Doc::SoftLine
     } else {
         Doc::Line
@@ -8245,6 +8330,9 @@ fn delimited_list_document_with_options_and_opening_suffix(
     for (index, item) in items.iter().cloned().enumerate() {
         if index > 0 {
             contents.push(Doc::text(","));
+            if let Some(suffix) = suffixes.separators.get(index - 1) {
+                contents.extend(suffix.iter().cloned());
+            }
             contents.push(Doc::Line);
         }
         contents.push(item);
@@ -8262,7 +8350,7 @@ fn delimited_list_document_with_options_and_opening_suffix(
         group,
         Doc::concat([
             Doc::text(open),
-            Doc::concat(opening_suffix),
+            Doc::concat(suffixes.opening),
             Doc::indent(Doc::concat(contents)),
             Doc::SoftLine,
             Doc::text(close),
