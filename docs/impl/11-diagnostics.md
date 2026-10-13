@@ -950,6 +950,8 @@ After all diagnostics, if at least one was rendered, the renderer prints one lin
 - `<counts>` joins with `, ` the non-zero entries among `<n> error`/`<n> errors`, `<n> warning`/`<n> warnings`, and `<n> info`, in that order.
 - The counts are taken before the limit is applied, as in the JSON summary.
 
+**Current implementation slice.** `sai_diagnostics::render_diagnostic` implements the layout of §11.10.2 to §11.10.5, §11.10.8, and the notes of §11.8.4 for a `Diagnostic`. The caller supplies positions and snippet rows through `SourceSnippets`. Fix titles print as help lines, but their suggestion snippets (§11.10.6) are not rendered yet (IR-506). The gutter width, the closing gutter bar, and the spacing of children without a primary location follow the examples where the template is ambiguous (IR-501 to IR-503). The `sai_cli` human writer renders every diagnostic through this layout (IR-507).
+
 ### 11.10.9 Complete example
 
 A missing effects declaration (D-EFF-01) with an effect chain and a machine-applicable fix:

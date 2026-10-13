@@ -5374,141 +5374,191 @@ fn write_human_diagnostics(
     total_error_count: usize,
     max_errors: usize,
 ) -> io::Result<()> {
-    for (index, diagnostic) in diagnostics.iter().enumerate() {
-        if index > 0 {
-            writeln!(writer)?;
-        }
-        if color {
-            write!(writer, "\x1b[1;31merror[{}]\x1b[0m: ", diagnostic.code)?;
-        } else {
-            write!(writer, "error[{}]: ", diagnostic.code)?;
-        }
-        writeln!(writer, "{}", diagnostic.message)?;
-        if let Some(location) = &diagnostic.primary {
-            writeln!(
-                writer,
-                "  --> {}:{}:{}",
-                location.path, location.start.line, location.start.col
-            )?;
-            writeln!(writer, "   |")?;
-            if let Some(source_line) = &location.source_line {
-                let number_width = location
-                    .additional_source_lines
-                    .iter()
-                    .filter_map(|row| match row {
-                        CliAdditionalSnippetRow::Source { line_number, .. } => {
-                            Some(line_number.to_string().len())
-                        }
-                        CliAdditionalSnippetRow::Gap => None,
-                    })
-                    .fold(location.start.line.to_string().len(), usize::max);
-                let start_end_col = if location.end.line == location.start.line {
-                    location.end_display_col
-                } else {
-                    source_line.display_width
-                };
-                write_human_source_line(
-                    writer,
-                    location.start.line,
-                    source_line,
-                    Some((location.start_display_col, start_end_col)),
-                    number_width,
-                    (location.end.line == location.start.line)
-                        .then_some(diagnostic.primary_label.as_str()),
-                )?;
-                for row in &location.additional_source_lines {
-                    match row {
-                        CliAdditionalSnippetRow::Gap => writeln!(writer, "...")?,
-                        CliAdditionalSnippetRow::Source {
-                            line_number,
-                            source_line,
-                            annotation,
-                        } => {
-                            write_human_source_line(
-                                writer,
-                                *line_number,
-                                source_line,
-                                *annotation,
-                                number_width,
-                                (*line_number == location.end.line)
-                                    .then_some(diagnostic.primary_label.as_str()),
-                            )?;
-                        }
-                    }
-                }
-                writeln!(writer, "   |")?;
+    let mut rendered = String::new();
+    for diagnostic in diagnostics {
+        let snippets = CliSnippets { diagnostic };
+        match sai_diagnostics::Code::from_name(diagnostic.code) {
+            Some(code) => {
+                let shared = shared_diagnostic(diagnostic, code);
+                rendered.push_str(&sai_diagnostics::render_diagnostic(
+                    &shared, &snippets, color,
+                ));
             }
-        }
-        if let Some(help) = &diagnostic.help {
-            writeln!(writer, "  = help: {help}")?;
+            None => {
+                // The registry lacks some CLI-owned codes, such as WORKSPACE_LOCK_FAILED, which
+                // impl/13 §13.6.7 defines but Appendix A does not list. They keep their own text
+                // in the heading, and the shared layout is reused with a registered placeholder.
+                let shared = shared_diagnostic(diagnostic, UNREGISTERED_CODE_PLACEHOLDER);
+                let text = sai_diagnostics::render_diagnostic(&shared, &snippets, color);
+                rendered.push_str(&text.replacen(
+                    UNREGISTERED_CODE_PLACEHOLDER.as_str(),
+                    diagnostic.code,
+                    1,
+                ));
+            }
         }
     }
     if show_summary && total_error_count > 0 {
-        let error_count = total_error_count;
-        let noun = if error_count == 1 { "error" } else { "errors" };
-        let hidden = error_count.saturating_sub(diagnostics.len());
-        let more = if hidden > 0 && max_errors != 0 {
-            format!("; {hidden} more errors not shown (--max-errors {max_errors})")
-        } else {
-            String::new()
+        let counts = sai_diagnostics::SummaryCounts {
+            errors: total_error_count,
+            hidden_errors: total_error_count.saturating_sub(diagnostics.len()),
+            max_errors,
+            ..sai_diagnostics::SummaryCounts::default()
         };
-        if color {
-            writeln!(
-                writer,
-                "\x1b[1;31m{command_name} failed: {error_count} {noun}{more}\x1b[0m"
-            )?;
-        } else {
-            writeln!(writer, "{command_name} failed: {error_count} {noun}{more}")?;
-        }
+        rendered.push_str(&sai_diagnostics::render_summary(
+            command_name,
+            counts,
+            color,
+        ));
     }
-    Ok(())
+    writer.write_all(rendered.as_bytes())
 }
 
-fn write_human_source_line(
-    writer: &mut impl Write,
+/// The registered code that stands in for a CLI code missing from the registry.
+const UNREGISTERED_CODE_PLACEHOLDER: sai_diagnostics::Code =
+    sai_diagnostics::Code::InternalCompilerError;
+
+/// Converts a CLI diagnostic into the shared model, whose renderer owns the human layout.
+fn shared_diagnostic(
+    diagnostic: &CliDiagnostic,
+    code: sai_diagnostics::Code,
+) -> sai_diagnostics::Diagnostic {
+    let primary = diagnostic.primary.as_ref().map(|location| {
+        sai_diagnostics::Location::new(
+            location.path.clone(),
+            cli_span(location.start.byte, location.end.byte),
+        )
+    });
+    let mut shared = sai_diagnostics::Diagnostic::new(
+        code,
+        sai_diagnostics::Severity::Error,
+        diagnostic.message.clone(),
+        primary,
+    );
+    shared.primary_label = diagnostic.primary_label.clone();
+    if let Some(help) = &diagnostic.help {
+        shared
+            .push_child(sai_diagnostics::Child {
+                kind: sai_diagnostics::ChildKind::Help,
+                message: help.clone(),
+                location: None,
+            })
+            .expect("a diagnostic without a workspace snapshot accepts children");
+    }
+    shared
+}
+
+/// A span over the CLI's source offsets. The shared renderer identifies files by path, so every
+/// CLI location uses the same placeholder file identity.
+fn cli_span(start: usize, end: usize) -> sai_diagnostics::Span {
+    let offset = |value: usize| {
+        sai_diagnostics::TextSize::new(u32::try_from(value).expect("source offsets fit in u32"))
+    };
+    let range =
+        sai_diagnostics::TextRange::new(offset(start), offset(end)).expect("CLI spans are ordered");
+    sai_diagnostics::Span::new(sai_diagnostics::FileId::new(0), range)
+}
+
+/// Supplies the positions and snippet rows of one CLI diagnostic from the source lines that the
+/// CLI rendered when it built the diagnostic.
+struct CliSnippets<'a> {
+    diagnostic: &'a CliDiagnostic,
+}
+
+impl sai_diagnostics::SourceSnippets for CliSnippets<'_> {
+    fn position(&self, location: &sai_diagnostics::Location) -> Option<(usize, usize)> {
+        let primary = self.diagnostic.primary.as_ref()?;
+        let start = usize::try_from(location.span.range.start().raw()).ok()?;
+        (primary.path == location.file.path && primary.start.byte == start)
+            .then_some((primary.start.line, primary.start.col))
+    }
+
+    fn snippet(
+        &self,
+        file: &sai_diagnostics::SourceRef,
+        annotations: &[sai_diagnostics::SnippetAnnotation],
+    ) -> Option<sai_diagnostics::Snippet> {
+        let location = self.diagnostic.primary.as_ref()?;
+        // The CLI attaches no labels, so only its primary snippet has rows.
+        let [only] = annotations else {
+            return None;
+        };
+        if location.path != file.path || !only.primary {
+            return None;
+        }
+        let source_line = location.source_line.as_ref()?;
+        let label = self.diagnostic.primary_label.as_str();
+        let single_line = location.end.line == location.start.line;
+        let end_col = if single_line {
+            location.end_display_col
+        } else {
+            source_line.display_width
+        };
+        let mut rows = vec![snippet_row(
+            location.start.line,
+            source_line,
+            Some((location.start_display_col, end_col)),
+            single_line.then_some(label),
+        )];
+        for row in &location.additional_source_lines {
+            rows.push(match row {
+                CliAdditionalSnippetRow::Gap => sai_diagnostics::SnippetRow::Gap,
+                CliAdditionalSnippetRow::Source {
+                    line_number,
+                    source_line,
+                    annotation,
+                } => snippet_row(
+                    *line_number,
+                    source_line,
+                    *annotation,
+                    (*line_number == location.end.line).then_some(label),
+                ),
+            });
+        }
+        Some(sai_diagnostics::Snippet { rows })
+    }
+}
+
+/// One source row with its primary mark, drawn with the CLI's display-column rules.
+fn snippet_row(
     line_number: usize,
     source_line: &RenderedSourceLine,
     annotation: Option<(usize, usize)>,
-    number_width: usize,
     label: Option<&str>,
-) -> io::Result<()> {
+) -> sai_diagnostics::SnippetRow {
     let (annotation_start, annotation_end) = annotation.unwrap_or_default();
     let (row, window_start, left_clipped, right_clipped, row_width) =
         source_line.window(annotation_start, annotation_end);
     let left_marker = if left_clipped { "..." } else { "" };
     let right_marker = if right_clipped { "..." } else { "" };
-    writeln!(
-        writer,
-        "{:>width$} | {left_marker}{row}{right_marker}",
-        line_number,
-        width = number_width
-    )?;
-    if let Some((annotation_start, annotation_end)) = annotation {
-        write!(writer, "{:>width$} | ", "", width = number_width)?;
-        let start_col = annotation_start.max(window_start);
-        let row_end = window_start + row_width;
-        let visible_end = annotation_end.min(row_end);
-        let mark_col = start_col.saturating_sub(window_start).min(row_width);
-        let mark_width = if annotation_start == annotation_end {
-            1
-        } else {
-            visible_end
-                .saturating_sub(start_col)
-                .max(1)
-                .min(row_width.saturating_sub(mark_col).max(1))
-        };
-        for _ in 0..(usize::from(left_clipped) * 3 + mark_col) {
-            writer.write_all(b" ")?;
-        }
-        for _ in 0..mark_width {
-            writer.write_all(b"^")?;
-        }
-        if let Some(label) = label.filter(|label| !label.is_empty()) {
-            write!(writer, " {label}")?;
-        }
-        writeln!(writer)?;
+    let marks = annotation
+        .map(|(annotation_start, annotation_end)| {
+            let start_col = annotation_start.max(window_start);
+            let row_end = window_start + row_width;
+            let visible_end = annotation_end.min(row_end);
+            let mark_col = start_col.saturating_sub(window_start).min(row_width);
+            let mark_width = if annotation_start == annotation_end {
+                1
+            } else {
+                visible_end
+                    .saturating_sub(start_col)
+                    .max(1)
+                    .min(row_width.saturating_sub(mark_col).max(1))
+            };
+            sai_diagnostics::SnippetMark {
+                column: usize::from(left_clipped) * 3 + mark_col,
+                width: mark_width,
+                primary: true,
+                message: label.unwrap_or_default().to_owned(),
+            }
+        })
+        .into_iter()
+        .collect();
+    sai_diagnostics::SnippetRow::Line {
+        number: line_number,
+        text: format!("{left_marker}{row}{right_marker}"),
+        marks,
     }
-    Ok(())
 }
 
 fn write_json_success_header(writer: &mut impl Write, command_name: &str) -> io::Result<()> {
@@ -8013,25 +8063,120 @@ mod tests {
 
     #[test]
     fn human_source_snippet_draws_an_empty_eof_range_after_the_last_character() {
-        let line = RenderedSourceLine::new(&vec![b'a'; 300]);
+        let source = Arc::<[u8]>::from(vec![b'a'; 300].as_slice());
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("<stdin>", source.len()..source.len(), true);
+        let diagnostic = CliDiagnostic {
+            code: "FORBIDDEN_CHARACTER",
+            message: "forbidden character in manifest".to_owned(),
+            primary: Some(location),
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        };
         let mut rendered = Vec::new();
-        super::write_human_source_line(
-            &mut rendered,
-            1,
-            &line,
-            Some((line.display_width, line.display_width)),
-            1,
-            None,
-        )
-        .expect("render empty end-of-line annotation");
+        write_human_diagnostics(&mut rendered, "sai fmt", &[diagnostic], false, false, 1, 50)
+            .expect("render empty end-of-line annotation");
         let rendered = String::from_utf8(rendered).expect("diagnostic is UTF-8");
-        let mut rows = rendered.lines();
+        // Skip the heading, the location line, and the first gutter line.
+        let mut rows = rendered.lines().skip(3);
         let source_row = rows.next().expect("source row");
         let annotation_row = rows.next().expect("annotation row");
 
         assert_eq!(
             annotation_row.rfind('^'),
             source_row.rfind('a').map(|column| column + 1)
+        );
+    }
+
+    #[test]
+    fn human_diagnostics_follow_the_shared_layout_and_end_each_block_with_a_blank_line() {
+        let source = Arc::<[u8]>::from(&b"fn main() {\n    let x = 1\n}\n"[..]);
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let location = source_index.location("src/lib.sai", 20..21, true);
+        let first = CliDiagnostic {
+            code: "UNKNOWN_FIELD",
+            message: "`User` has no field `x`".to_owned(),
+            primary: Some(location),
+            primary_label: "unknown field".to_owned(),
+            argument_index: None,
+            argument: String::new(),
+            help: Some("replace with `name`".to_owned()),
+            data: None,
+        };
+        let second = CliDiagnostic {
+            code: "UNKNOWN_OPTION",
+            message: "unknown option `--tagret`".to_owned(),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: Some("a similar option exists: `--target`".to_owned()),
+            data: None,
+        };
+        let mut rendered = Vec::new();
+        write_human_diagnostics(
+            &mut rendered,
+            "sai fmt",
+            &[first, second],
+            true,
+            false,
+            2,
+            50,
+        )
+        .expect("render human diagnostics");
+
+        assert_eq!(
+            String::from_utf8(rendered).expect("diagnostics are UTF-8"),
+            concat!(
+                "error[UNKNOWN_FIELD]: `User` has no field `x`\n",
+                " --> src/lib.sai:2:9\n",
+                "  |\n",
+                "2 |     let x = 1\n",
+                "  |         ^ unknown field\n",
+                "  |\n",
+                "  = help: replace with `name`\n",
+                "\n",
+                "error[UNKNOWN_OPTION]: unknown option `--tagret`\n",
+                "  = help: a similar option exists: `--target`\n",
+                "\n",
+                "sai fmt failed: 2 errors\n",
+            )
+        );
+    }
+
+    #[test]
+    fn human_diagnostics_keep_codes_missing_from_the_registry_in_the_heading() {
+        let source = Arc::<[u8]>::from(&b"fn main() {\n    let x = 1\n}\n"[..]);
+        let mut source_index = CliSourceIndex::new(Arc::clone(&source));
+        let diagnostic = CliDiagnostic {
+            code: "WORKSPACE_LOCK_FAILED",
+            message: "could not lock the package".to_owned(),
+            primary: Some(source_index.location("src/lib.sai", 20..21, true)),
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        };
+        let mut rendered = Vec::new();
+        write_human_diagnostics(&mut rendered, "fmt", &[diagnostic], true, false, 1, 50)
+            .expect("render unregistered diagnostic");
+
+        assert_eq!(
+            String::from_utf8(rendered).expect("diagnostics are UTF-8"),
+            concat!(
+                "error[WORKSPACE_LOCK_FAILED]: could not lock the package\n",
+                " --> src/lib.sai:2:9\n",
+                "  |\n",
+                "2 |     let x = 1\n",
+                "  |         ^\n",
+                "  |\n",
+                "\n",
+                "fmt failed: 1 error\n",
+            )
         );
     }
 
