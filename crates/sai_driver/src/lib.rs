@@ -920,6 +920,7 @@ impl RootDatabase {
             &mut scopes,
             &self.packages,
             &self.symbols,
+            def_paths,
         )
         .map_err(Phase1CollectionError::from)?;
         scopes.diagnostics.extend(module_alias_diagnostics);

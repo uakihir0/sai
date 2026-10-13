@@ -5,7 +5,7 @@
 //! [`collect_local_module_alias_bindings`] pass then inserts local module
 //! aliases, resolves item imports from local modules, and computes local
 //! `pub use` members. Dependency targets, interface member tables, test-only
-//! imports, and the complete prelude remain deferred.
+//! imports, and the canonical prelude table remain deferred.
 //! Extern-function children are checked against their validated target
 //! attributes here because they are represented as children of an extern block
 //! in the item tree.
@@ -390,6 +390,7 @@ pub fn collect_phase1(
                             child_id,
                             input,
                             &package_identity,
+                            def_paths,
                             &mut module_scopes,
                             &mut declared_locations,
                             &mut module_diagnostics,
@@ -494,6 +495,7 @@ pub fn collect_phase1(
                         local_def_id,
                         input,
                         &package_identity,
+                        def_paths,
                         &mut module_scopes,
                         &mut declared_locations,
                         &mut module_diagnostics,
@@ -557,8 +559,11 @@ pub fn collect_local_module_alias_bindings(
     scopes: &mut Phase1PackageScopes,
     packages: &PackageInterner,
     symbols: &Interner,
+    def_paths: &DefPathInterner,
 ) -> Result<Vec<Diagnostic>, PackageScopesError> {
-    if module_tree.modules.len() != scopes.modules.len() {
+    if module_tree.modules.len() != scopes.modules.len()
+        || def_paths.package() != module_tree.package
+    {
         return Err(PackageScopesError::PackageMismatch);
     }
     if module_tree.modules.is_empty() {
@@ -808,6 +813,7 @@ pub fn collect_local_module_alias_bindings(
         scopes,
         symbols,
         &package_identity,
+        def_paths,
         &mut diagnostics,
     )?;
 
@@ -894,6 +900,7 @@ fn insert_resolved_imports_into_scopes(
     scopes: &mut Phase1PackageScopes,
     symbols: &Interner,
     package_identity: &str,
+    def_paths: &DefPathInterner,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), PackageScopesError> {
     for (raw_module_id, module_scope) in scopes.modules.iter_mut().enumerate() {
@@ -967,15 +974,48 @@ fn insert_resolved_imports_into_scopes(
             let previous = module_scope.scope.get(&name).cloned();
             match previous {
                 None => {
-                    let is_module_alias = import_index
-                        .and_then(|index| module_scope.imports.get(index.0 as usize))
-                        .is_some_and(|import| import.item_index.is_none());
-                    module_scope.scope.insert(name, binding);
-                    if is_module_alias && is_prelude_module_alias_name(&spelling) {
+                    let import =
+                        import_index.and_then(|index| module_scope.imports.get(index.0 as usize));
+                    let is_module_alias = import.is_some_and(|import| import.item_index.is_none());
+                    let is_item_import = import.is_some_and(|import| import.item_index.is_some());
+                    let is_prelude_reimport = is_item_import
+                        && is_shadowable_prelude_name(&spelling)
+                        && is_same_prelude_entity(
+                            &spelling,
+                            binding.res,
+                            package_identity,
+                            def_paths,
+                            symbols,
+                        )?;
+                    if is_prelude_reimport {
+                        diagnostics.push(use_binding_diagnostic(
+                            Code::RedundantImport,
+                            Severity::Warning,
+                            format!("import `{spelling}` already denotes the prelude item"),
+                            "redundant import",
+                            location.clone(),
+                            package_identity,
+                        ));
+                    } else {
+                        module_scope.scope.insert(name, binding);
+                    }
+                    if is_module_alias && is_shadowable_prelude_name(&spelling) {
                         diagnostics.push(use_binding_diagnostic(
                             Code::ShadowsPrelude,
                             Severity::Warning,
-                            format!("module alias `{spelling}` shadows a prelude binding"),
+                            format!("module binding `{spelling}` shadows a prelude binding"),
+                            "prelude shadow",
+                            location,
+                            package_identity,
+                        ));
+                    } else if is_item_import
+                        && is_shadowable_prelude_name(&spelling)
+                        && !is_prelude_reimport
+                    {
+                        diagnostics.push(use_binding_diagnostic(
+                            Code::ShadowsPrelude,
+                            Severity::Warning,
+                            format!("module binding `{spelling}` shadows a prelude binding"),
                             "prelude shadow",
                             location,
                             package_identity,
@@ -1003,6 +1043,20 @@ fn insert_resolved_imports_into_scopes(
                     }
                 }
                 Some(previous) => {
+                    if matches!(binding.origin, BindingOrigin::Decl)
+                        && matches!(
+                            previous.origin,
+                            BindingOrigin::Use { .. } | BindingOrigin::PubUse { .. }
+                        )
+                        && is_shadowable_prelude_name(&spelling)
+                    {
+                        scopes.diagnostics.retain(|diagnostic| {
+                            diagnostic.code != Code::ShadowsPrelude
+                                || diagnostic
+                                    .primary()
+                                    .is_none_or(|primary| primary.span != binding.name_span)
+                        });
+                    }
                     let mut diagnostic = use_binding_diagnostic(
                         Code::DuplicateBinding,
                         Severity::Error,
@@ -1588,12 +1642,175 @@ fn local_interface_target(
     }
 }
 
-/// Only lowercase prelude names can collide with a syntactically valid module
-/// alias. The exact prelude's lowercase names are `panic` and `unreachable`;
-/// item and declaration bindings use the complete prelude table in later
-/// resolver work.
-fn is_prelude_module_alias_name(name: &str) -> bool {
-    matches!(name, "panic" | "unreachable")
+/// Names that can be shadowed by a module-level declaration or module alias.
+///
+/// Keep this list in sync with spec/16 §16.4. Reserved type names are
+/// deliberately omitted: declarations and imports using them receive
+/// `RESERVED_TYPE_NAME` instead of `SHADOWS_PRELUDE`.
+fn is_shadowable_prelude_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "Str"
+            | "Slice"
+            | "SliceMut"
+            | "Option"
+            | "Some"
+            | "None"
+            | "Result"
+            | "Ok"
+            | "Err"
+            | "Ordering"
+            | "String"
+            | "Vec"
+            | "Bytes"
+            | "Box"
+            | "Copy"
+            | "Clone"
+            | "Default"
+            | "PartialEq"
+            | "Eq"
+            | "PartialOrd"
+            | "Ord"
+            | "Hash"
+            | "From"
+            | "TryFrom"
+            | "Add"
+            | "Sub"
+            | "Mul"
+            | "Div"
+            | "Rem"
+            | "Neg"
+            | "BitAnd"
+            | "BitOr"
+            | "BitXor"
+            | "BitNot"
+            | "Index"
+            | "IndexMut"
+            | "Fn"
+            | "FnMut"
+            | "FnOnce"
+            | "Drop"
+            | "IntoIterator"
+            | "Iterator"
+            | "FromIterator"
+            | "Format"
+            | "ToString"
+            | "Future"
+            | "Stream"
+            | "Arbitrary"
+            | "panic"
+            | "unreachable"
+    )
+}
+
+/// The canonical definition path for prelude names that can denote ordinary
+/// items. Built-in `Array` and the prelude variants are not importable as
+/// module-level items, but their paths are included for exactness.
+fn prelude_item_path(name: &str) -> Option<(&'static str, &'static [(char, &'static str)])> {
+    match name {
+        "Str" => Some(("sai:core", &[('m', "str"), ('t', "Str")])),
+        "Slice" => Some(("sai:core", &[('m', "slice"), ('t', "Slice")])),
+        "SliceMut" => Some(("sai:core", &[('m', "slice"), ('t', "SliceMut")])),
+        "Option" => Some(("sai:core", &[('m', "option"), ('t', "Option")])),
+        "Some" => Some((
+            "sai:core",
+            &[('m', "option"), ('t', "Option"), ('r', "Some")],
+        )),
+        "None" => Some((
+            "sai:core",
+            &[('m', "option"), ('t', "Option"), ('r', "None")],
+        )),
+        "Result" => Some(("sai:core", &[('m', "result"), ('t', "Result")])),
+        "Ok" => Some(("sai:core", &[('m', "result"), ('t', "Result"), ('r', "Ok")])),
+        "Err" => Some((
+            "sai:core",
+            &[('m', "result"), ('t', "Result"), ('r', "Err")],
+        )),
+        "Ordering" => Some(("sai:core", &[('m', "cmp"), ('t', "Ordering")])),
+        "String" => Some(("sai:alloc", &[('m', "string"), ('t', "String")])),
+        "Vec" => Some(("sai:alloc", &[('m', "vec"), ('t', "Vec")])),
+        "Bytes" => Some(("sai:alloc", &[('m', "vec"), ('t', "Bytes")])),
+        "Box" => Some(("sai:alloc", &[('m', "boxed"), ('t', "Box")])),
+        "Copy" => Some(("sai:core", &[('m', "marker"), ('t', "Copy")])),
+        "Clone" => Some(("sai:core", &[('m', "clone"), ('t', "Clone")])),
+        "Default" => Some(("sai:core", &[('m', "default"), ('t', "Default")])),
+        "PartialEq" => Some(("sai:core", &[('m', "cmp"), ('t', "PartialEq")])),
+        "Eq" => Some(("sai:core", &[('m', "cmp"), ('t', "Eq")])),
+        "PartialOrd" => Some(("sai:core", &[('m', "cmp"), ('t', "PartialOrd")])),
+        "Ord" => Some(("sai:core", &[('m', "cmp"), ('t', "Ord")])),
+        "Hash" => Some(("sai:core", &[('m', "hash"), ('t', "Hash")])),
+        "From" => Some(("sai:core", &[('m', "convert"), ('t', "From")])),
+        "TryFrom" => Some(("sai:core", &[('m', "convert"), ('t', "TryFrom")])),
+        "Add" => Some(("sai:core", &[('m', "ops"), ('t', "Add")])),
+        "Sub" => Some(("sai:core", &[('m', "ops"), ('t', "Sub")])),
+        "Mul" => Some(("sai:core", &[('m', "ops"), ('t', "Mul")])),
+        "Div" => Some(("sai:core", &[('m', "ops"), ('t', "Div")])),
+        "Rem" => Some(("sai:core", &[('m', "ops"), ('t', "Rem")])),
+        "Neg" => Some(("sai:core", &[('m', "ops"), ('t', "Neg")])),
+        "BitAnd" => Some(("sai:core", &[('m', "ops"), ('t', "BitAnd")])),
+        "BitOr" => Some(("sai:core", &[('m', "ops"), ('t', "BitOr")])),
+        "BitXor" => Some(("sai:core", &[('m', "ops"), ('t', "BitXor")])),
+        "BitNot" => Some(("sai:core", &[('m', "ops"), ('t', "BitNot")])),
+        "Index" => Some(("sai:core", &[('m', "ops"), ('t', "Index")])),
+        "IndexMut" => Some(("sai:core", &[('m', "ops"), ('t', "IndexMut")])),
+        "Fn" => Some(("sai:core", &[('m', "ops"), ('t', "Fn")])),
+        "FnMut" => Some(("sai:core", &[('m', "ops"), ('t', "FnMut")])),
+        "FnOnce" => Some(("sai:core", &[('m', "ops"), ('t', "FnOnce")])),
+        "Drop" => Some(("sai:core", &[('m', "ops"), ('t', "Drop")])),
+        "IntoIterator" => Some(("sai:core", &[('m', "iter"), ('t', "IntoIterator")])),
+        "Iterator" => Some(("sai:core", &[('m', "iter"), ('t', "Iterator")])),
+        "FromIterator" => Some(("sai:core", &[('m', "iter"), ('t', "FromIterator")])),
+        "Format" => Some(("sai:core", &[('m', "fmt"), ('t', "Format")])),
+        "ToString" => Some(("sai:alloc", &[('m', "fmt"), ('t', "ToString")])),
+        "Future" => Some(("sai:core", &[('m', "future"), ('t', "Future")])),
+        "Stream" => Some(("sai:core", &[('m', "future"), ('t', "Stream")])),
+        "Arbitrary" => Some(("sai:core", &[('m', "testing"), ('t', "Arbitrary")])),
+        "panic" => Some(("sai:core", &[('m', "panic"), ('v', "panic")])),
+        "unreachable" => Some(("sai:core", &[('m', "panic"), ('v', "unreachable")])),
+        "Array" => None,
+        _ => None,
+    }
+}
+
+fn is_same_prelude_entity(
+    name: &str,
+    res: Res,
+    package_identity: &str,
+    def_paths: &DefPathInterner,
+    symbols: &Interner,
+) -> Result<bool, PackageScopesError> {
+    let Some((prelude_package, expected_path)) = prelude_item_path(name) else {
+        return Ok(false);
+    };
+    if package_identity != prelude_package {
+        return Ok(false);
+    }
+    let Res::Def(_, def_id) = res else {
+        return Ok(false);
+    };
+    let Some(path) = def_paths.resolve_def_id(def_id)? else {
+        return Ok(false);
+    };
+    if path.data().len() != expected_path.len() {
+        return Ok(false);
+    }
+    for (actual, (expected_kind, expected_name)) in path.data().iter().zip(expected_path) {
+        let (actual_kind, actual_name) = match actual.data {
+            DefPathData::Module(name) => ('m', name),
+            DefPathData::TypeNs(name) => ('t', name),
+            DefPathData::ValueNs(name) => ('v', name),
+            DefPathData::Variant(name) => ('r', name),
+            _ => return Ok(false),
+        };
+        if actual.disambiguator != 0
+            || actual_kind != *expected_kind
+            || symbols.resolve(actual_name)?.as_ref() != *expected_name
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn use_declaration_range(
@@ -2001,6 +2218,7 @@ fn bind_declaration(
     local_def_id: LocalDefId,
     input: &FilteredModule<'_>,
     package_identity: &str,
+    def_paths: &DefPathInterner,
     module_scopes: &mut Phase1ModuleScopes,
     declared_locations: &mut HashMap<Symbol, Location>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -2040,11 +2258,25 @@ fn bind_declaration(
         return Ok(());
     }
 
+    let res = Res::Def(kind, local_def_id.to_def_id());
+    if is_shadowable_prelude_name(name.as_ref())
+        && !is_same_prelude_entity(name.as_ref(), res, package_identity, def_paths, symbols)?
+    {
+        diagnostics.push(use_binding_diagnostic(
+            Code::ShadowsPrelude,
+            Severity::Warning,
+            format!("module binding `{name}` shadows a prelude binding"),
+            "prelude shadow",
+            location.clone(),
+            package_identity,
+        ));
+    }
+
     declared_locations.insert(entry.name, location);
     module_scopes.declared.insert(
         entry.name,
         Binding {
-            res: Res::Def(kind, local_def_id.to_def_id()),
+            res,
             name_span,
             origin: BindingOrigin::Decl,
             visibility,
@@ -2382,9 +2614,13 @@ mod tests {
 
     impl Fixture {
         fn new(text: &str, target: &str) -> Self {
+            Self::new_with_identity(text, target, "acme:phase1#0.1")
+        }
+
+        fn new_with_identity(text: &str, target: &str, identity: &str) -> Self {
             let package_interner = PackageInterner::new();
             let package = package_interner
-                .intern("acme:phase1#0.1")
+                .intern(identity)
                 .expect("package identity interns");
             let file = FileId::new(41);
             let source = SourceFile::new(file, text, false).expect("source is valid");
@@ -2484,6 +2720,13 @@ mod tests {
             &self,
             module_sources: &[(&str, &str)],
         ) -> Phase1PackageScopes {
+            self.collect_with_local_modules_and_paths(module_sources).0
+        }
+
+        fn collect_with_local_modules_and_paths(
+            &self,
+            module_sources: &[(&str, &str)],
+        ) -> (Phase1PackageScopes, DefPathInterner) {
             struct ExtraInput {
                 module_name: Symbol,
                 file: FileId,
@@ -2631,10 +2874,11 @@ mod tests {
                 &mut scopes,
                 &self.packages,
                 &self.symbols,
+                &paths,
             )
             .expect("local use items collect");
             scopes.diagnostics.extend(local_import_diagnostics);
-            scopes
+            (scopes, paths)
         }
     }
 
@@ -3087,6 +3331,368 @@ mod tests {
         assert!(!interface_conflicts_with_module_file(&nested_module, parent, &symbols).unwrap());
         assert!(
             !interface_conflicts_with_module_file(&nested_module, Symbol::ERROR, &symbols).unwrap()
+        );
+    }
+
+    #[test]
+    fn shadowable_prelude_catalog_matches_spec_16() {
+        let shadowable = [
+            "Array",
+            "Str",
+            "Slice",
+            "SliceMut",
+            "Option",
+            "Some",
+            "None",
+            "Result",
+            "Ok",
+            "Err",
+            "Ordering",
+            "String",
+            "Vec",
+            "Bytes",
+            "Box",
+            "Copy",
+            "Clone",
+            "Default",
+            "PartialEq",
+            "Eq",
+            "PartialOrd",
+            "Ord",
+            "Hash",
+            "From",
+            "TryFrom",
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "Rem",
+            "Neg",
+            "BitAnd",
+            "BitOr",
+            "BitXor",
+            "BitNot",
+            "Index",
+            "IndexMut",
+            "Fn",
+            "FnMut",
+            "FnOnce",
+            "Drop",
+            "IntoIterator",
+            "Iterator",
+            "FromIterator",
+            "Format",
+            "ToString",
+            "Future",
+            "Stream",
+            "Arbitrary",
+            "panic",
+            "unreachable",
+        ];
+        for name in shadowable {
+            assert!(is_shadowable_prelude_name(name), "{name}");
+        }
+
+        for name in [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "F32", "F64",
+            "Bool", "Byte", "Char", "Int", "UInt", "Never", "Send", "Share", "Writer", "Hasher",
+            "Poll",
+        ] {
+            assert!(
+                !is_shadowable_prelude_name(name),
+                "{name} is reserved or absent from the prelude"
+            );
+        }
+    }
+
+    #[test]
+    fn declarations_warn_on_shadowing_prelude_names_after_reserved_and_duplicate_checks() {
+        let source = concat!(
+            "type Option {}\n",
+            "fn panic() {}\n",
+            "type I32 {}\n",
+            "type Send {}\n",
+            "type LocalOnly {}\n",
+            "type Option {}\n",
+            "@target(\"wasm64-core\")\n",
+            "type Vec {}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, _) = fixture.collect();
+        let module = &scopes.modules[0];
+        let shadows = scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+            .collect::<Vec<_>>();
+
+        assert_eq!(shadows.len(), 2, "{:?}", scopes.diagnostics);
+        let shadow_spans = shadows
+            .iter()
+            .map(|diagnostic| diagnostic.primary().unwrap().span.range)
+            .collect::<Vec<_>>();
+        let expected_shadow_spans = ["Option", "panic"].map(|name| {
+            let start = source.find(name).unwrap() as u32;
+            TextRange::new(
+                TextSize::new(start),
+                TextSize::new(start + name.len() as u32),
+            )
+            .unwrap()
+        });
+        assert_eq!(shadow_spans, expected_shadow_spans);
+
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ReservedTypeName)
+                .count(),
+            2
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1
+        );
+
+        for name in ["Option", "panic", "LocalOnly"] {
+            assert!(
+                module
+                    .declared
+                    .contains_key(&fixture.symbols.intern(name).unwrap()),
+                "{name} should be bound"
+            );
+        }
+        for name in ["I32", "Send", "Vec"] {
+            assert!(
+                !module
+                    .declared
+                    .contains_key(&fixture.symbols.intern(name).unwrap()),
+                "{name} should not be bound for this target"
+            );
+        }
+    }
+
+    #[test]
+    fn local_item_imports_distinguish_prelude_reimports_from_shadowing_aliases() {
+        let local_source = "use acme:phase1/model.{PublicType as Option}\n";
+        let local_fixture = Fixture::new(local_source, "wasm32-core");
+        let local_scopes =
+            local_fixture.collect_with_local_modules(&[("model", "pub type PublicType {}\n")]);
+        let local_shadow = local_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+            .expect("a different local item shadows the prelude name");
+        let alias_start = local_source.rfind("Option").unwrap() as u32;
+        assert_eq!(
+            local_shadow.primary().unwrap().span.range,
+            TextRange::new(
+                TextSize::new(alias_start),
+                TextSize::new(alias_start + "Option".len() as u32),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            local_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::RedundantImport)
+                .count(),
+            0
+        );
+
+        let import_before_declaration =
+            "use acme:phase1/model.{PublicType as Option}\ntype Option {}\n";
+        let import_first_fixture = Fixture::new(import_before_declaration, "wasm32-core");
+        let import_first_scopes = import_first_fixture
+            .collect_with_local_modules(&[("model", "pub type PublicType {}\n")]);
+        let import_first_shadow = import_first_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+            .expect("the first item import shadows the prelude");
+        let import_alias_start =
+            (import_before_declaration.find(" as Option").unwrap() + " as ".len()) as u32;
+        assert_eq!(
+            import_first_shadow.primary().unwrap().span.range.start(),
+            TextSize::new(import_alias_start)
+        );
+        assert_eq!(
+            import_first_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+                .count(),
+            1,
+            "the later duplicate declaration does not add a second shadow warning"
+        );
+        assert_eq!(
+            import_first_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1
+        );
+
+        let declaration_before_import =
+            "type Option {}\nuse acme:phase1/model.{PublicType as Option}\n";
+        let declaration_first_fixture = Fixture::new(declaration_before_import, "wasm32-core");
+        let declaration_first_scopes = declaration_first_fixture
+            .collect_with_local_modules(&[("model", "pub type PublicType {}\n")]);
+        let declaration_first_shadow = declaration_first_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+            .expect("the first declaration shadows the prelude");
+        assert_eq!(
+            declaration_first_shadow
+                .primary()
+                .unwrap()
+                .span
+                .range
+                .start(),
+            TextSize::new(declaration_before_import.find("Option").unwrap() as u32)
+        );
+        assert_eq!(
+            declaration_first_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+                .count(),
+            1,
+            "the later duplicate import does not add a second shadow warning"
+        );
+
+        let module_alias_before_declaration = "use acme:phase1/panic\nfn panic() {}\n";
+        let module_alias_first_fixture =
+            Fixture::new(module_alias_before_declaration, "wasm32-core");
+        let module_alias_first_scopes = module_alias_first_fixture
+            .collect_with_local_modules(&[("panic", "fn recover() {}\n")]);
+        let module_alias_first_shadow = module_alias_first_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+            .expect("the first module alias shadows the prelude");
+        assert_eq!(
+            module_alias_first_shadow
+                .primary()
+                .unwrap()
+                .span
+                .range
+                .start(),
+            TextSize::new(module_alias_before_declaration.find("panic").unwrap() as u32)
+        );
+        assert_eq!(
+            module_alias_first_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+                .count(),
+            1,
+            "the later duplicate declaration does not add a second shadow warning"
+        );
+        assert_eq!(
+            module_alias_first_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1
+        );
+
+        let core_source = "use sai:core/option.{Option}\n";
+        let core_fixture = Fixture::new_with_identity(core_source, "wasm32-core", "sai:core");
+        let (core_scopes, core_paths) = core_fixture
+            .collect_with_local_modules_and_paths(&[("option", "pub enum Option {}\n")]);
+        let option_import = core_scopes.modules[ModuleId::ROOT.raw() as usize].imports[0].res;
+        assert!(
+            is_same_prelude_entity(
+                "Option",
+                option_import,
+                "sai:core",
+                &core_paths,
+                &core_fixture.symbols
+            )
+            .unwrap(),
+            "import path: {:?}",
+            match option_import {
+                Res::Def(_, def_id) => core_paths.resolve_def_id(def_id).unwrap(),
+                Res::Err => None,
+            }
+        );
+        assert_eq!(
+            core_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+                .count(),
+            0
+        );
+        assert_eq!(
+            core_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::RedundantImport)
+                .count(),
+            1
+        );
+        assert!(
+            !core_scopes.modules[ModuleId::ROOT.raw() as usize]
+                .scope
+                .contains_key(&core_fixture.symbols.intern("Option").unwrap()),
+            "a redundant prelude import leaves the existing prelude binding in place"
+        );
+
+        let core_reexport_source = "use sai:core/facade.{Option}\n";
+        let core_reexport_fixture =
+            Fixture::new_with_identity(core_reexport_source, "wasm32-core", "sai:core");
+        let core_reexport_scopes = core_reexport_fixture.collect_with_local_modules(&[
+            ("option", "pub enum Option {}\n"),
+            ("facade", "pub use sai:core/option.{Option}\n"),
+        ]);
+        assert_eq!(
+            core_reexport_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+                .count(),
+            0
+        );
+        assert_eq!(
+            core_reexport_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::RedundantImport)
+                .count(),
+            2,
+            "the re-export and its later use keep the original prelude identity"
+        );
+
+        let wrong_core_path = "use sai:core/custom.{LocalOption as Option}\n";
+        let wrong_core_fixture =
+            Fixture::new_with_identity(wrong_core_path, "wasm32-core", "sai:core");
+        let wrong_core_scopes = wrong_core_fixture
+            .collect_with_local_modules(&[("custom", "pub enum LocalOption {}\n")]);
+        assert_eq!(
+            wrong_core_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::ShadowsPrelude)
+                .count(),
+            1
+        );
+        assert_eq!(
+            wrong_core_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::RedundantImport)
+                .count(),
+            0
         );
     }
 

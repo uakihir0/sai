@@ -8383,6 +8383,7 @@ mod tests {
             "use acme:check/codec as api\n",
             "use acme:check/codec as api\n",
             "use acme:check/panic\n",
+            "use acme:check/unreachable\n",
             "use acme:check/type\n",
             "use other:package/type\n",
             "pub use acme:check/model\n",
@@ -8396,6 +8397,8 @@ mod tests {
         fs::write(package.join("src/model.sai"), "fn child() {}\n").expect("write imported module");
         fs::write(package.join("src/panic.sai"), "fn recover() {}\n")
             .expect("write module that shadows a prelude name");
+        fs::write(package.join("src/unreachable.sai"), "fn fail() {}\n")
+            .expect("write another module that shadows a prelude name");
 
         let (exit_code, stdout, stderr) =
             invoke(&["--format=json", "--directory", package_path, "check"]);
@@ -8441,7 +8444,7 @@ mod tests {
         );
         assert_eq!(
             check_diagnostic_lines(&stdout, "SHADOWS_PRELUDE").len(),
-            1,
+            2,
             "{stdout}"
         );
         assert_eq!(
@@ -8453,6 +8456,44 @@ mod tests {
             check_diagnostic_lines(&stdout, "UNKNOWN_PACKAGE").is_empty(),
             "{stdout}"
         );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_reports_prelude_shadow_warnings_for_module_declarations() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let source = concat!(
+            "type Option {}\n",
+            "fn panic() {}\n",
+            "@target(\"wasm64-core\")\n",
+            "type Vec {}\n",
+        );
+        fs::write(package.join("src/lib.sai"), source).expect("write prelude shadows");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1, "{stdout}");
+        assert!(stderr.is_empty());
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "FEATURE_NOT_IMPLEMENTED").len(),
+            1,
+            "{stdout}"
+        );
+        let shadows = check_diagnostic_lines(&stdout, "SHADOWS_PRELUDE");
+        assert_eq!(shadows.len(), 2, "{stdout}");
+        for (line, name) in shadows.iter().zip(["Option", "panic"]) {
+            let start = source.find(name).expect("shadow name is present");
+            assert!(
+                line.contains("\"severity\":\"warning\"")
+                    && line.contains("\"path\":\"src/lib.sai\"")
+                    && line.contains(&format!("\"start\":{{\"byte\":{start},")),
+                "{line}"
+            );
+        }
+        assert!(check_diagnostic_lines(&stdout, "RESERVED_TYPE_NAME").is_empty());
         assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
     }
 
