@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use cap_std::fs::Dir;
 use sai_driver::CancellationToken;
+use sai_vfs::{PackageFileEntry, PackageFileKind};
 
 /// The result of expanding the explicit paths passed to `sai fmt`.
 #[derive(Debug, Default)]
@@ -20,6 +21,10 @@ pub(crate) struct FmtPathSelection {
     pub missing: Vec<(usize, PathBuf)>,
     /// Filesystem paths that could not be inspected during traversal.
     pub errors: Vec<FmtPathSelectionError>,
+    /// Visible package-relative entries recorded during a module-tree walk.
+    pub module_tree_entries: Vec<PackageFileEntry>,
+    /// The selected module-tree root was a symlink and was not followed.
+    pub module_tree_root_symlink: bool,
     /// Traversal stopped because cancellation was requested.
     pub interrupted: bool,
 }
@@ -70,6 +75,7 @@ struct DirectoryWalker<'a> {
     selected_identities: &'a mut HashSet<SelectedPathIdentity>,
     visited_directories: &'a mut HashSet<PathBuf>,
     cancellation: &'a CancellationToken,
+    source_root: PathBuf,
     retain_capabilities: bool,
     traversal_mode: FmtTraversalMode,
 }
@@ -223,6 +229,10 @@ fn select_fmt_paths_inner(
 
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
+            if mode == FmtTraversalMode::ModuleTree {
+                selection.module_tree_root_symlink = true;
+                continue;
+            }
             match fs::metadata(&absolute_path) {
                 Ok(target_metadata) if target_metadata.is_file() => {
                     push_explicit_file(
@@ -255,7 +265,16 @@ fn select_fmt_paths_inner(
                 retain_capabilities,
             );
         } else if file_type.is_dir() {
-            let (root_directory, root) = match open_explicit_directory(&absolute_path) {
+            let opened_root = match mode {
+                FmtTraversalMode::ModuleTree => {
+                    sai_windows_fs::open_directory_path_without_following(&absolute_path)
+                        .map(|root| (Dir::from_std_file(root), absolute_path.clone()))
+                }
+                FmtTraversalMode::ExplicitPaths | FmtTraversalMode::WorkspaceSource => {
+                    open_explicit_directory(&absolute_path)
+                }
+            };
+            let (root_directory, root) = match opened_root {
                 Ok(root) => root,
                 Err(source) => {
                     selection.errors.push(FmtPathSelectionError {
@@ -274,6 +293,7 @@ fn select_fmt_paths_inner(
                 selected_identities: &mut selected_identities,
                 visited_directories: &mut visited_directories,
                 cancellation,
+                source_root: root.clone(),
                 retain_capabilities,
                 traversal_mode: mode,
             }
@@ -394,7 +414,20 @@ impl DirectoryWalker<'_> {
                     }
                 };
 
+                if self.traversal_mode == FmtTraversalMode::ModuleTree
+                    && is_hidden_entry_name(&name)
+                {
+                    continue;
+                }
                 if file_type.is_symlink() {
+                    if self.traversal_mode == FmtTraversalMode::ModuleTree {
+                        push_module_tree_entry(
+                            self.selection,
+                            &self.source_root,
+                            &path,
+                            PackageFileKind::Symlink,
+                        );
+                    }
                     continue;
                 }
                 if file_type.is_dir() {
@@ -405,6 +438,14 @@ impl DirectoryWalker<'_> {
                     };
                     if skip_directory {
                         continue;
+                    }
+                    if self.traversal_mode == FmtTraversalMode::ModuleTree {
+                        push_module_tree_entry(
+                            self.selection,
+                            &self.source_root,
+                            &path,
+                            PackageFileKind::Directory,
+                        );
                     }
                     child_directories.push(PendingDirectory::Child {
                         parent: Arc::clone(&directory),
@@ -418,6 +459,14 @@ impl DirectoryWalker<'_> {
                     FmtTraversalMode::WorkspaceSource => is_source_file(&path),
                     FmtTraversalMode::ModuleTree => is_module_source_file(&path),
                 };
+                if file_type.is_file() && self.traversal_mode == FmtTraversalMode::ModuleTree {
+                    push_module_tree_entry(
+                        self.selection,
+                        &self.source_root,
+                        &path,
+                        PackageFileKind::File,
+                    );
+                }
                 if file_type.is_file() && selected_file {
                     let is_package_manifest = name == "sai.package";
                     push_selected_file(
@@ -436,6 +485,45 @@ impl DirectoryWalker<'_> {
             }
             pending.extend(child_directories.into_iter().rev());
         }
+    }
+}
+
+fn push_module_tree_entry(
+    selection: &mut FmtPathSelection,
+    source_root: &Path,
+    path: &Path,
+    kind: PackageFileKind,
+) {
+    let Ok(relative_path) = path.strip_prefix(source_root) else {
+        selection.errors.push(FmtPathSelectionError {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "module-tree entry escaped its selected source root",
+            ),
+        });
+        return;
+    };
+    let Some(relative_path) = relative_path.to_str() else {
+        selection.errors.push(FmtPathSelectionError {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "module-tree paths must be valid UTF-8",
+            ),
+        });
+        return;
+    };
+    let relative_path = relative_path.replace(std::path::MAIN_SEPARATOR, "/");
+    match PackageFileEntry::new(relative_path, kind) {
+        Ok(entry) => selection.module_tree_entries.push(entry),
+        Err(_) => selection.errors.push(FmtPathSelectionError {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "module-tree path is not a canonical package-relative path",
+            ),
+        }),
     }
 }
 
@@ -969,6 +1057,42 @@ mod tests {
         assert!(selection.files.is_empty());
         assert!(selection.missing.is_empty());
         assert!(selection.errors.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn module_tree_roots_reject_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target");
+        fs::create_dir_all(target.join("src")).unwrap();
+        fs::write(target.join("src/lib.sai"), b"").unwrap();
+        let direct_link = directory.0.join("source-link");
+        symlink(target.join("src"), &direct_link).unwrap();
+
+        let direct_selection = super::select_fmt_module_paths(
+            std::slice::from_ref(&direct_link),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert!(direct_selection.module_tree_root_symlink);
+        assert!(direct_selection.files.is_empty());
+        assert!(direct_selection.module_tree_entries.is_empty());
+        assert!(direct_selection.errors.is_empty());
+
+        let ancestor_link = directory.0.join("alias");
+        symlink(&target, &ancestor_link).unwrap();
+        let ancestor_source = ancestor_link.join("src");
+        let ancestor_selection = super::select_fmt_module_paths(
+            std::slice::from_ref(&ancestor_source),
+            &directory.0,
+            &CancellationToken::default(),
+        );
+        assert!(!ancestor_selection.module_tree_root_symlink);
+        assert!(ancestor_selection.files.is_empty());
+        assert!(ancestor_selection.module_tree_entries.is_empty());
+        assert_eq!(ancestor_selection.errors.len(), 1);
     }
 
     #[test]

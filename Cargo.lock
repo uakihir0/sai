@@ -3021,6 +3021,7 @@ dependencies = [
  "sai_driver",
  "sai_fmt",
  "sai_package",
+ "sai_query",
  "sai_vfs",
  "sai_windows_fs",
  "sha2",

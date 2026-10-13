@@ -13,12 +13,16 @@ use std::time::Duration;
 use crate::args::{ColorChoice, OutputFormat, ParsedArgs, UsageError, UsageErrorKind, parse_args};
 use crate::help::{render_command_help, render_top_level_help, render_version};
 use crate::new_package::parse_new_command;
-use sai_diagnostics::{EXPLAIN_CODE_SUMMARIES, Value, ValueObject};
-use sai_driver::CancellationToken;
+use sai_diagnostics::{EXPLAIN_CODE_SUMMARIES, SourceRef, Value, ValueObject};
 use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
 };
+use sai_driver::{CancellationToken, RootDatabase};
 use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
+use sai_query::Durability;
+use sai_vfs::{
+    PackageFileEntry, PackageFilesSnapshot, PackageKey, PackageRelativePath, PackageSourceDirectory,
+};
 use sha2::{Digest, Sha256};
 use unicode_width::UnicodeWidthChar;
 
@@ -391,6 +395,7 @@ fn run_check(
     let mut total_warnings = 0usize;
     let mut total_infos = 0usize;
     let mut root_identity = None;
+    let mut root_package_key = None;
     let mut package_header_span = None;
     let mut manifest_source = None;
     let include_source_lines = parsed.globals.format == OutputFormat::Human;
@@ -458,6 +463,11 @@ fn run_check(
 
                         if let Some(header) = parse.file().header.as_ref() {
                             root_identity = parsed_root_identity;
+                            root_package_key = Some(format!(
+                                "{}#{}",
+                                header.value.identity,
+                                header.value.version.compatibility_line()
+                            ));
                             package_header_span = Some(header.span.clone());
                             manifest_source = Some(Arc::clone(&source));
                         }
@@ -506,56 +516,77 @@ fn run_check(
             match sai_package::package_path::ContentPackagePath::parse(declared_source) {
                 Ok(relative_source) => {
                     let source_path = package_root.join(relative_source.as_str());
-                    let expected_root_module_path =
-                        expected_root_module_path(relative_source.as_str());
-                    match std::fs::canonicalize(&source_path) {
-                        Ok(source_directory)
-                            if source_directory.starts_with(&package_root)
-                                && std::fs::metadata(&source_directory)
-                                    .is_ok_and(|metadata| metadata.is_dir()) =>
-                        {
-                            let selection = crate::fmt_paths::select_fmt_module_paths(
-                                std::slice::from_ref(&source_directory),
-                                &cwd,
-                                cancellation,
-                            );
-                            if selection.interrupted || cancellation.is_cancelled() {
-                                return report_interrupted(parsed, stdout, stderr);
-                            }
-                            if missing_root_module_is_confirmed(&selection, &source_directory) {
-                                push_missing_root_module_diagnostic(
-                                    &mut diagnostics,
-                                    &mut total_errors,
-                                    manifest_source
-                                        .as_ref()
-                                        .expect("syntax-valid manifest has a header source"),
-                                    &manifest_display_path,
-                                    package_header_span
-                                        .as_ref()
-                                        .expect("syntax-valid root package has a header"),
-                                    &expected_root_module_path,
-                                    include_source_lines,
-                                    root_identity.as_deref(),
-                                );
-                            }
-                            for error in selection.errors {
-                                let path =
-                                    fmt_path_reference(&error.path, &cwd, Some(&package_root));
-                                diagnostics.push(check_diagnostic_with_package(
-                                    check_cli_diagnostic(fmt_io_diagnostic(
-                                        "SOURCE_READ_FAILED",
-                                        &path,
-                                        "could not inspect a source directory entry",
-                                        &error.source,
-                                    )),
-                                    root_identity.as_deref(),
-                                ));
-                                total_errors = total_errors.saturating_add(1);
-                            }
-                            for (_, missing_path) in selection.missing {
-                                let path =
-                                    fmt_path_reference(&missing_path, &cwd, Some(&package_root));
-                                diagnostics.push(check_diagnostic_with_package(
+                    match source_path_contains_symlink(&package_root, relative_source.as_str()) {
+                        Ok(true) => {
+                            diagnostics.push(module_tree_source_root_symlink_diagnostic(
+                                relative_source.as_str(),
+                                root_identity.as_deref(),
+                            ));
+                            total_errors = total_errors.saturating_add(1);
+                        }
+                        Ok(false) => {
+                            match std::fs::canonicalize(&source_path) {
+                                Ok(canonical_source_directory)
+                                    if canonical_source_directory.starts_with(&package_root)
+                                        && std::fs::metadata(&canonical_source_directory)
+                                            .is_ok_and(|metadata| metadata.is_dir()) =>
+                                {
+                                    // Preserve the manifest-declared path for
+                                    // diagnostics. The module-tree walker opens
+                                    // every component without following links.
+                                    let source_directory = source_path.clone();
+                                    let selection = crate::fmt_paths::select_fmt_module_paths(
+                                        std::slice::from_ref(&source_directory),
+                                        &cwd,
+                                        cancellation,
+                                    );
+                                    if selection.interrupted || cancellation.is_cancelled() {
+                                        return report_interrupted(parsed, stdout, stderr);
+                                    }
+                                    let root_module_path = source_directory.join("lib.sai");
+                                    let root_is_symlink = selection.module_tree_root_symlink;
+                                    let root_inspection_incomplete = root_is_symlink
+                                        || selection.errors.iter().any(|error| {
+                                            error.path == source_directory
+                                                || error.path == root_module_path
+                                        })
+                                        || selection.missing.iter().any(|(_, path)| {
+                                            path == &source_directory || path == &root_module_path
+                                        });
+                                    if root_is_symlink {
+                                        diagnostics.push(
+                                            module_tree_source_root_symlink_diagnostic(
+                                                relative_source.as_str(),
+                                                root_identity.as_deref(),
+                                            ),
+                                        );
+                                        total_errors = total_errors.saturating_add(1);
+                                    }
+                                    let module_tree_entries = selection.module_tree_entries;
+                                    for error in selection.errors {
+                                        let path = fmt_path_reference(
+                                            &error.path,
+                                            &cwd,
+                                            Some(&package_root),
+                                        );
+                                        diagnostics.push(check_diagnostic_with_package(
+                                            check_cli_diagnostic(fmt_io_diagnostic(
+                                                "SOURCE_READ_FAILED",
+                                                &path,
+                                                "could not inspect a source directory entry",
+                                                &error.source,
+                                            )),
+                                            root_identity.as_deref(),
+                                        ));
+                                        total_errors = total_errors.saturating_add(1);
+                                    }
+                                    for (_, missing_path) in selection.missing {
+                                        let path = fmt_path_reference(
+                                            &missing_path,
+                                            &cwd,
+                                            Some(&package_root),
+                                        );
+                                        diagnostics.push(check_diagnostic_with_package(
                                     check_cli_diagnostic(fmt_io_diagnostic(
                                         "SOURCE_READ_FAILED",
                                         &path,
@@ -567,126 +598,183 @@ fn run_check(
                                     )),
                                     root_identity.as_deref(),
                                 ));
-                                total_errors = total_errors.saturating_add(1);
-                            }
+                                        total_errors = total_errors.saturating_add(1);
+                                    }
 
-                            let mut source_inputs = Vec::new();
-                            for selected in selection.files {
-                                if selected.is_package_manifest
-                                    || selected
-                                        .path
-                                        .extension()
-                                        .is_none_or(|extension| extension != "sai")
-                                    || !is_visible_check_source_file(
-                                        &selected.path,
-                                        &source_directory,
-                                    )
-                                {
-                                    continue;
-                                }
-                                if cancellation.is_cancelled() {
-                                    return report_interrupted(parsed, stdout, stderr);
-                                }
-                                let source_display_path =
-                                    fmt_path_reference(&selected.path, &cwd, Some(&package_root));
-                                let mut file =
-                                    selected_check_file(selected, source_display_path.clone());
-                                match open_selected_fmt_file(&mut file) {
-                                    Ok(source_file) => match read_file_limited(
-                                        source_file,
-                                        sai_vfs::MAX_SOURCE_BYTES,
-                                        cancellation,
-                                    ) {
-                                        Ok(source) => source_inputs
-                                            .push((source_display_path, Arc::<[u8]>::from(source))),
-                                        Err(StdinReadError::Interrupted) => {
+                                    let mut source_inputs = Vec::new();
+                                    let mut module_tree_sources = Vec::new();
+                                    for selected in selection.files {
+                                        if selected.is_package_manifest
+                                            || selected
+                                                .path
+                                                .extension()
+                                                .is_none_or(|extension| extension != "sai")
+                                            || !is_visible_check_source_file(
+                                                &selected.path,
+                                                &source_directory,
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                        if cancellation.is_cancelled() {
                                             return report_interrupted(parsed, stdout, stderr);
                                         }
-                                        Err(StdinReadError::Io(error)) => {
-                                            diagnostics.push(check_diagnostic_with_package(
-                                                check_cli_diagnostic(fmt_io_diagnostic(
-                                                    "SOURCE_READ_FAILED",
-                                                    &source_display_path,
-                                                    "could not read a source file",
-                                                    &error,
-                                                )),
-                                                root_identity.as_deref(),
-                                            ));
-                                            total_errors = total_errors.saturating_add(1);
+                                        let source_display_path = fmt_path_reference(
+                                            &selected.path,
+                                            &cwd,
+                                            Some(&package_root),
+                                        );
+                                        let source_key_path = package_source_file_key_path(
+                                            &selected.path,
+                                            &source_directory,
+                                            relative_source.as_str(),
+                                        )
+                                        .unwrap_or_else(|| source_display_path.clone());
+                                        let mut file = selected_check_file(
+                                            selected,
+                                            source_display_path.clone(),
+                                        );
+                                        match open_selected_fmt_file(&mut file) {
+                                            Ok(source_file) => {
+                                                match read_file_limited(
+                                                    source_file,
+                                                    sai_vfs::MAX_SOURCE_BYTES,
+                                                    cancellation,
+                                                ) {
+                                                    Ok(source) => {
+                                                        let source: Arc<[u8]> = source.into();
+                                                        source_inputs.push((
+                                                            source_display_path.clone(),
+                                                            Arc::clone(&source),
+                                                        ));
+                                                        module_tree_sources.push((
+                                                            source_key_path,
+                                                            source_display_path,
+                                                            source,
+                                                        ));
+                                                    }
+                                                    Err(StdinReadError::Interrupted) => {
+                                                        return report_interrupted(
+                                                            parsed, stdout, stderr,
+                                                        );
+                                                    }
+                                                    Err(StdinReadError::Io(error)) => {
+                                                        diagnostics.push(check_diagnostic_with_package(
+                                                    check_cli_diagnostic(fmt_io_diagnostic(
+                                                        "SOURCE_READ_FAILED",
+                                                        &source_display_path,
+                                                        "could not read a source file",
+                                                        &error,
+                                                    )),
+                                                    root_identity.as_deref(),
+                                                ));
+                                                        total_errors =
+                                                            total_errors.saturating_add(1);
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => {
+                                                diagnostics.push(check_diagnostic_with_package(
+                                                    check_cli_diagnostic(fmt_io_diagnostic(
+                                                        "SOURCE_READ_FAILED",
+                                                        &source_display_path,
+                                                        "could not open a source file",
+                                                        &error,
+                                                    )),
+                                                    root_identity.as_deref(),
+                                                ));
+                                                total_errors = total_errors.saturating_add(1);
+                                            }
                                         }
-                                    },
-                                    Err(error) => {
-                                        diagnostics.push(check_diagnostic_with_package(
-                                            check_cli_diagnostic(fmt_io_diagnostic(
-                                                "SOURCE_READ_FAILED",
-                                                &source_display_path,
-                                                "could not open a source file",
-                                                &error,
-                                            )),
-                                            root_identity.as_deref(),
-                                        ));
-                                        total_errors = total_errors.saturating_add(1);
                                     }
-                                }
-                            }
-                            for (source_display_path, source) in source_inputs {
-                                if cancellation.is_cancelled() {
-                                    return report_interrupted(parsed, stdout, stderr);
-                                }
-                                match sai_fmt::parse_source(&source) {
-                                    Ok(parsed_source) => {
-                                        let (source_diagnostics, errors, warnings, infos) =
-                                            check_source_diagnostics(
-                                                &source,
-                                                &source_display_path,
-                                                parsed_source.diagnostics(),
-                                                include_source_lines,
-                                                root_identity.as_deref(),
-                                            );
-                                        diagnostics.extend(source_diagnostics);
-                                        total_errors = total_errors.saturating_add(errors);
-                                        total_warnings = total_warnings.saturating_add(warnings);
-                                        total_infos = total_infos.saturating_add(infos);
-                                    }
-                                    Err(sai_fmt::SourceInputError::Refused(refusal)) => {
-                                        let batch = source_format_diagnostics(
-                                            &source,
-                                            &source_display_path,
-                                            sai_fmt::SourceFormatError::Refused(refusal),
-                                            parsed.globals.max_errors,
-                                            include_source_lines,
-                                        );
-                                        total_errors =
-                                            total_errors.saturating_add(batch.total_error_count);
-                                        diagnostics.extend(
-                                            batch
-                                                .diagnostics
-                                                .into_iter()
-                                                .map(check_cli_diagnostic)
-                                                .map(|diagnostic| {
-                                                    check_diagnostic_with_package(
-                                                        diagnostic,
+                                    let tree_result = module_tree_check_diagnostics(
+                                        root_package_key.as_deref().expect(
+                                            "a syntax-valid package has a stable package key",
+                                        ),
+                                        relative_source.as_str(),
+                                        true,
+                                        module_tree_entries,
+                                        package_header_span
+                                            .as_ref()
+                                            .expect("syntax-valid root package has a header"),
+                                        &manifest_display_path,
+                                        manifest_source
+                                            .as_ref()
+                                            .expect("syntax-valid manifest has a header source"),
+                                        &module_tree_sources,
+                                        root_identity
+                                            .as_deref()
+                                            .expect("a syntax-valid package has an identity"),
+                                        include_source_lines,
+                                        root_inspection_incomplete,
+                                    );
+                                    push_module_tree_check_result(
+                                        &mut diagnostics,
+                                        &mut total_errors,
+                                        &mut total_warnings,
+                                        &mut total_infos,
+                                        tree_result,
+                                        root_identity.as_deref(),
+                                    );
+                                    for (source_display_path, source) in source_inputs {
+                                        if cancellation.is_cancelled() {
+                                            return report_interrupted(parsed, stdout, stderr);
+                                        }
+                                        match sai_fmt::parse_source(&source) {
+                                            Ok(parsed_source) => {
+                                                let (source_diagnostics, errors, warnings, infos) =
+                                                    check_source_diagnostics(
+                                                        &source,
+                                                        &source_display_path,
+                                                        parsed_source.diagnostics(),
+                                                        include_source_lines,
                                                         root_identity.as_deref(),
-                                                    )
-                                                }),
-                                        );
-                                    }
-                                    Err(sai_fmt::SourceInputError::InternalError) => {
-                                        diagnostics.push(check_diagnostic_with_package(
-                                            check_internal_diagnostic(
-                                                "source parser failed internally",
-                                                None,
-                                            ),
-                                            root_identity.as_deref(),
-                                        ));
-                                        total_errors = total_errors.saturating_add(1);
+                                                    );
+                                                diagnostics.extend(source_diagnostics);
+                                                total_errors = total_errors.saturating_add(errors);
+                                                total_warnings =
+                                                    total_warnings.saturating_add(warnings);
+                                                total_infos = total_infos.saturating_add(infos);
+                                            }
+                                            Err(sai_fmt::SourceInputError::Refused(refusal)) => {
+                                                let batch = source_format_diagnostics(
+                                                    &source,
+                                                    &source_display_path,
+                                                    sai_fmt::SourceFormatError::Refused(refusal),
+                                                    parsed.globals.max_errors,
+                                                    include_source_lines,
+                                                );
+                                                total_errors = total_errors
+                                                    .saturating_add(batch.total_error_count);
+                                                diagnostics.extend(
+                                                    batch
+                                                        .diagnostics
+                                                        .into_iter()
+                                                        .map(check_cli_diagnostic)
+                                                        .map(|diagnostic| {
+                                                            check_diagnostic_with_package(
+                                                                diagnostic,
+                                                                root_identity.as_deref(),
+                                                            )
+                                                        }),
+                                                );
+                                            }
+                                            Err(sai_fmt::SourceInputError::InternalError) => {
+                                                diagnostics.push(check_diagnostic_with_package(
+                                                    check_internal_diagnostic(
+                                                        "source parser failed internally",
+                                                        None,
+                                                    ),
+                                                    root_identity.as_deref(),
+                                                ));
+                                                total_errors = total_errors.saturating_add(1);
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                        Ok(source_directory) => {
-                            if !source_directory.starts_with(&package_root) {
-                                diagnostics.push(check_diagnostic_with_package(
+                                Ok(source_directory) => {
+                                    if !source_directory.starts_with(&package_root) {
+                                        diagnostics.push(check_diagnostic_with_package(
                                     check_cli_diagnostic(fmt_io_diagnostic(
                                         "INVALID_PACKAGE_PATH",
                                         &manifest_display_path,
@@ -698,43 +786,67 @@ fn run_check(
                                     )),
                                     root_identity.as_deref(),
                                 ));
-                                total_errors = total_errors.saturating_add(1);
-                            } else {
-                                match std::fs::metadata(&source_directory) {
-                                    Ok(metadata) if !metadata.is_dir() => {
-                                        push_missing_root_module_diagnostic(
-                                            &mut diagnostics,
-                                            &mut total_errors,
-                                            manifest_source.as_ref().expect(
-                                                "syntax-valid manifest has a header source",
+                                        total_errors = total_errors.saturating_add(1);
+                                    } else {
+                                        match std::fs::metadata(&source_directory) {
+                                            Ok(metadata) if !metadata.is_dir() => {
+                                                let tree_result = missing_source_root_module_tree(
+                                            root_package_key.as_deref().expect(
+                                                "a syntax-valid package has a stable package key",
                                             ),
-                                            &manifest_display_path,
+                                            relative_source.as_str(),
                                             package_header_span
                                                 .as_ref()
                                                 .expect("syntax-valid root package has a header"),
-                                            &expected_root_module_path,
-                                            include_source_lines,
-                                            root_identity.as_deref(),
-                                        );
-                                    }
-                                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                                        push_missing_root_module_diagnostic(
-                                            &mut diagnostics,
-                                            &mut total_errors,
+                                            &manifest_display_path,
                                             manifest_source.as_ref().expect(
                                                 "syntax-valid manifest has a header source",
                                             ),
-                                            &manifest_display_path,
+                                            root_identity
+                                                .as_deref()
+                                                .expect("a syntax-valid package has an identity"),
+                                            include_source_lines,
+                                        );
+                                                push_module_tree_check_result(
+                                                    &mut diagnostics,
+                                                    &mut total_errors,
+                                                    &mut total_warnings,
+                                                    &mut total_infos,
+                                                    tree_result,
+                                                    root_identity.as_deref(),
+                                                );
+                                            }
+                                            Err(error)
+                                                if error.kind() == io::ErrorKind::NotFound =>
+                                            {
+                                                let tree_result = missing_source_root_module_tree(
+                                            root_package_key.as_deref().expect(
+                                                "a syntax-valid package has a stable package key",
+                                            ),
+                                            relative_source.as_str(),
                                             package_header_span
                                                 .as_ref()
                                                 .expect("syntax-valid root package has a header"),
-                                            &expected_root_module_path,
+                                            &manifest_display_path,
+                                            manifest_source.as_ref().expect(
+                                                "syntax-valid manifest has a header source",
+                                            ),
+                                            root_identity
+                                                .as_deref()
+                                                .expect("a syntax-valid package has an identity"),
                                             include_source_lines,
-                                            root_identity.as_deref(),
                                         );
-                                    }
-                                    Ok(_) => {
-                                        diagnostics.push(check_diagnostic_with_package(
+                                                push_module_tree_check_result(
+                                                    &mut diagnostics,
+                                                    &mut total_errors,
+                                                    &mut total_warnings,
+                                                    &mut total_infos,
+                                                    tree_result,
+                                                    root_identity.as_deref(),
+                                                );
+                                            }
+                                            Ok(_) => {
+                                                diagnostics.push(check_diagnostic_with_package(
                                             check_cli_diagnostic(fmt_io_diagnostic(
                                                 "SOURCE_READ_FAILED",
                                                 &fmt_path_reference(
@@ -749,10 +861,10 @@ fn run_check(
                                             )),
                                             root_identity.as_deref(),
                                         ));
-                                        total_errors = total_errors.saturating_add(1);
-                                    }
-                                    Err(error) => {
-                                        diagnostics.push(check_diagnostic_with_package(
+                                                total_errors = total_errors.saturating_add(1);
+                                            }
+                                            Err(error) => {
+                                                diagnostics.push(check_diagnostic_with_package(
                                             check_cli_diagnostic(fmt_io_diagnostic(
                                                 "SOURCE_READ_FAILED",
                                                 &fmt_path_reference(
@@ -765,26 +877,60 @@ fn run_check(
                                             )),
                                             root_identity.as_deref(),
                                         ));
-                                        total_errors = total_errors.saturating_add(1);
+                                                total_errors = total_errors.saturating_add(1);
+                                            }
+                                        }
                                     }
                                 }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                                    ) =>
+                                {
+                                    let tree_result = missing_source_root_module_tree(
+                                        root_package_key.as_deref().expect(
+                                            "a syntax-valid package has a stable package key",
+                                        ),
+                                        relative_source.as_str(),
+                                        package_header_span
+                                            .as_ref()
+                                            .expect("syntax-valid root package has a header"),
+                                        &manifest_display_path,
+                                        manifest_source
+                                            .as_ref()
+                                            .expect("syntax-valid manifest has a header source"),
+                                        root_identity
+                                            .as_deref()
+                                            .expect("a syntax-valid package has an identity"),
+                                        include_source_lines,
+                                    );
+                                    push_module_tree_check_result(
+                                        &mut diagnostics,
+                                        &mut total_errors,
+                                        &mut total_warnings,
+                                        &mut total_infos,
+                                        tree_result,
+                                        root_identity.as_deref(),
+                                    );
+                                }
+                                Err(error) => {
+                                    diagnostics.push(check_diagnostic_with_package(
+                                        check_cli_diagnostic(fmt_io_diagnostic(
+                                            "SOURCE_READ_FAILED",
+                                            &fmt_path_reference(
+                                                &source_path,
+                                                &cwd,
+                                                Some(&package_root),
+                                            ),
+                                            "could not inspect the declared source directory",
+                                            &error,
+                                        )),
+                                        root_identity.as_deref(),
+                                    ));
+                                    total_errors = total_errors.saturating_add(1);
+                                }
                             }
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            push_missing_root_module_diagnostic(
-                                &mut diagnostics,
-                                &mut total_errors,
-                                manifest_source
-                                    .as_ref()
-                                    .expect("syntax-valid manifest has a header source"),
-                                &manifest_display_path,
-                                package_header_span
-                                    .as_ref()
-                                    .expect("syntax-valid root package has a header"),
-                                &expected_root_module_path,
-                                include_source_lines,
-                                root_identity.as_deref(),
-                            );
                         }
                         Err(error) => {
                             diagnostics.push(check_diagnostic_with_package(
@@ -853,50 +999,262 @@ fn selected_check_file(
     }
 }
 
-fn missing_root_module_diagnostic(
-    manifest_source: &Arc<[u8]>,
-    manifest_path: &str,
-    package_header_span: std::ops::Range<usize>,
-    expected_path: &str,
-    include_source_line: bool,
-    package_identity: Option<&str>,
-) -> CheckDiagnostic {
-    let mut source_index = CliSourceIndex::new(Arc::clone(manifest_source));
-    let mut diagnostic = cli_source_diagnostic(
-        &mut source_index,
-        FmtDiagnosticSource {
-            path: manifest_path,
-            include_source_line,
-        },
-        "MISSING_ROOT_MODULE",
-        format!("package has no root module at `{expected_path}`"),
-        package_header_span,
-        Some(format!("{{\"path\":\"{}\"}}", escape_json(expected_path))),
-        None,
-    );
-    diagnostic.primary_label = "package".to_owned();
-    check_diagnostic_with_package(check_cli_diagnostic(diagnostic), package_identity)
+fn source_path_contains_symlink(package_root: &Path, source_directory: &str) -> io::Result<bool> {
+    if source_directory == "." {
+        return Ok(false);
+    }
+
+    let mut path = package_root.to_path_buf();
+    for component in source_directory.split('/') {
+        path.push(component);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(true);
+        }
+        if !metadata.is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(false)
 }
 
-fn push_missing_root_module_diagnostic(
+fn module_tree_source_root_symlink_diagnostic(
+    source_directory: &str,
+    package_identity: Option<&str>,
+) -> CheckDiagnostic {
+    let mut data = ValueObject::new();
+    data.insert(
+        "path".to_owned(),
+        Value::String(source_directory.to_owned()),
+    );
+    check_diagnostic_with_package(
+        check_cli_diagnostic(CliDiagnostic {
+            code: "SYMLINK_IN_SOURCE",
+            message: "symbolic link in source directory".to_owned(),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: Some(source_value_object_json(&data)),
+        }),
+        package_identity,
+    )
+}
+
+fn module_tree_check_diagnostics(
+    package_key: &str,
+    source_directory: &str,
+    source_directory_exists: bool,
+    entries: Vec<PackageFileEntry>,
+    package_header_span: &std::ops::Range<usize>,
+    manifest_path: &str,
+    manifest_source: &Arc<[u8]>,
+    source_inputs: &[(String, String, Arc<[u8]>)],
+    package_identity: &str,
+    include_source_lines: bool,
+    root_inspection_incomplete: bool,
+) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
+    let package_key_value =
+        PackageKey::new(package_key).map_err(|error| format!("invalid package key: {error:?}"))?;
+    let source_directory_value = PackageSourceDirectory::new(source_directory.to_owned())
+        .map_err(|error| format!("invalid source directory: {error:?}"))?;
+    let snapshot = PackageFilesSnapshot::new(source_directory_exists, entries)
+        .map_err(|error| format!("invalid package source inventory: {error:?}"))?;
+
+    let mut database = RootDatabase::new()
+        .map_err(|error| format!("could not initialize query database: {error:?}"))?;
+    let package_id = database
+        .intern_package(package_key_value.as_str())
+        .map_err(|error| format!("could not intern package key: {error:?}"))?;
+    database
+        .set_package_files(package_key_value, snapshot, Durability::Low)
+        .map_err(|error| format!("could not set package source inventory: {error:?}"))?;
+
+    let manifest_file_id = database
+        .intern_package_file(
+            package_id,
+            PackageRelativePath::new("sai.package")
+                .map_err(|error| format!("invalid package manifest path: {error:?}"))?,
+        )
+        .map_err(|error| format!("could not intern package manifest: {error:?}"))?;
+    let start = u32::try_from(package_header_span.start)
+        .map_err(|_| "package header span start exceeds the source limit".to_owned())?;
+    let end = u32::try_from(package_header_span.end)
+        .map_err(|_| "package header span end exceeds the source limit".to_owned())?;
+    let range = sai_diagnostics::TextRange::new(
+        sai_diagnostics::TextSize::new(start),
+        sai_diagnostics::TextSize::new(end),
+    )
+    .ok_or_else(|| "package header span is reversed".to_owned())?;
+    let package_field = sai_diagnostics::Location {
+        file: SourceRef {
+            path: manifest_path.to_owned(),
+            package: Some(package_identity.to_owned()),
+            snapshot: None,
+        },
+        span: sai_diagnostics::Span::new(manifest_file_id, range),
+    };
+    let module_tree = database
+        .module_tree(package_id, source_directory_value, Some(package_field))
+        .map_err(|error| format!("module-tree query failed: {error:?}"))?;
+
+    let mut source_by_key = HashMap::new();
+    source_by_key.insert(
+        manifest_path.to_owned(),
+        (manifest_path.to_owned(), Arc::clone(manifest_source)),
+    );
+    for (key_path, display_path, source) in source_inputs {
+        source_by_key.insert(key_path.clone(), (display_path.clone(), Arc::clone(source)));
+    }
+
+    let mut diagnostics = Vec::with_capacity(module_tree.diagnostics.len());
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut infos = 0usize;
+    for diagnostic in module_tree.diagnostics.iter() {
+        if root_inspection_incomplete && diagnostic.code.as_str() == "MISSING_ROOT_MODULE" {
+            continue;
+        }
+        let mut data = diagnostic.data.clone();
+        if diagnostic.code.as_str() == "MISSING_ROOT_MODULE"
+            && let Some(Value::String(path)) = data.get_mut("path")
+        {
+            *path = if source_directory == "." {
+                path.clone()
+            } else {
+                format!("{source_directory}/{path}")
+            };
+        }
+        let help = diagnostic
+            .children()
+            .iter()
+            .find(|child| child.kind == sai_diagnostics::ChildKind::Help)
+            .map(|child| child.message.clone());
+        let mut cli_diagnostic = if let Some(primary) = diagnostic.primary() {
+            let (display_path, source) = source_by_key
+                .get(&primary.file.path)
+                .cloned()
+                .unwrap_or_else(|| (primary.file.path.clone(), Arc::from([])));
+            let mut source_index = CliSourceIndex::new(source);
+            cli_source_diagnostic(
+                &mut source_index,
+                FmtDiagnosticSource {
+                    path: &display_path,
+                    include_source_line: include_source_lines,
+                },
+                diagnostic.code.as_str(),
+                diagnostic.message.clone(),
+                primary.span.range.start().to_usize()..primary.span.range.end().to_usize(),
+                (!data.is_empty()).then(|| source_value_object_json(&data)),
+                help,
+            )
+        } else {
+            CliDiagnostic {
+                code: diagnostic.code.as_str(),
+                message: diagnostic.message.clone(),
+                primary: None,
+                primary_label: String::new(),
+                argument_index: None,
+                argument: String::new(),
+                help,
+                data: (!data.is_empty()).then(|| source_value_object_json(&data)),
+            }
+        };
+        cli_diagnostic.primary_label = if diagnostic.code.as_str() == "MISSING_ROOT_MODULE" {
+            "package".to_owned()
+        } else {
+            diagnostic.primary_label.clone()
+        };
+        match diagnostic.severity {
+            sai_diagnostics::Severity::Error => errors = errors.saturating_add(1),
+            sai_diagnostics::Severity::Warning => warnings = warnings.saturating_add(1),
+            sai_diagnostics::Severity::Info => infos = infos.saturating_add(1),
+        }
+        diagnostics.push(CheckDiagnostic {
+            diagnostic: cli_diagnostic,
+            severity: diagnostic.severity,
+            package: Some(package_identity.to_owned()),
+        });
+    }
+    Ok((diagnostics, errors, warnings, infos))
+}
+
+fn missing_source_root_module_tree(
+    package_key: &str,
+    source_directory: &str,
+    package_header_span: &std::ops::Range<usize>,
+    manifest_path: &str,
+    manifest_source: &Arc<[u8]>,
+    package_identity: &str,
+    include_source_lines: bool,
+) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
+    module_tree_check_diagnostics(
+        package_key,
+        source_directory,
+        false,
+        Vec::new(),
+        package_header_span,
+        manifest_path,
+        manifest_source,
+        &[],
+        package_identity,
+        include_source_lines,
+        false,
+    )
+}
+
+fn push_module_tree_check_result(
     diagnostics: &mut Vec<CheckDiagnostic>,
     total_error_count: &mut usize,
-    manifest_source: &Arc<[u8]>,
-    manifest_path: &str,
-    package_header_span: &std::ops::Range<usize>,
-    expected_path: &str,
-    include_source_line: bool,
+    total_warning_count: &mut usize,
+    total_info_count: &mut usize,
+    result: Result<(Vec<CheckDiagnostic>, usize, usize, usize), String>,
     package_identity: Option<&str>,
 ) {
-    diagnostics.push(missing_root_module_diagnostic(
-        manifest_source,
-        manifest_path,
-        package_header_span.clone(),
-        expected_path,
-        include_source_line,
-        package_identity,
-    ));
-    *total_error_count = total_error_count.saturating_add(1);
+    match result {
+        Ok((tree_diagnostics, errors, warnings, infos)) => {
+            diagnostics.extend(tree_diagnostics);
+            *total_error_count = total_error_count.saturating_add(errors);
+            *total_warning_count = total_warning_count.saturating_add(warnings);
+            *total_info_count = total_info_count.saturating_add(infos);
+        }
+        Err(error) => {
+            diagnostics.push(check_diagnostic_with_package(
+                check_internal_diagnostic(
+                    &format!("module-tree integration failed: {error}"),
+                    None,
+                ),
+                package_identity,
+            ));
+            *total_error_count = total_error_count.saturating_add(1);
+        }
+    }
+}
+
+fn package_source_file_key_path(
+    file_path: &Path,
+    source_directory: &Path,
+    declared_source_directory: &str,
+) -> Option<String> {
+    let relative_path = file_path.strip_prefix(source_directory).ok()?.to_str()?;
+    let relative_path = relative_path.replace(std::path::MAIN_SEPARATOR, "/");
+    Some(if declared_source_directory == "." {
+        relative_path
+    } else {
+        format!("{declared_source_directory}/{relative_path}")
+    })
 }
 
 fn is_visible_check_source_file(path: &Path, source_directory: &Path) -> bool {
@@ -906,37 +1264,6 @@ fn is_visible_check_source_file(path: &Path, source_directory: &Path) -> bool {
     !relative_path
         .components()
         .any(|component| component.as_os_str().as_encoded_bytes().starts_with(b"."))
-}
-
-fn expected_root_module_path(source_directory: &str) -> String {
-    if source_directory == "." {
-        "lib.sai".to_owned()
-    } else {
-        format!("{source_directory}/lib.sai")
-    }
-}
-
-fn missing_root_module_is_confirmed(
-    selection: &crate::fmt_paths::FmtPathSelection,
-    source_directory: &Path,
-) -> bool {
-    let root_module_path = source_directory.join("lib.sai");
-    if selection
-        .files
-        .iter()
-        .any(|selected| selected.path == root_module_path && !selected.is_package_manifest)
-    {
-        return false;
-    }
-    let inspection_failed = selection
-        .errors
-        .iter()
-        .any(|error| error.path == *source_directory || error.path == root_module_path)
-        || selection
-            .missing
-            .iter()
-            .any(|(_, path)| path == source_directory || path == &root_module_path);
-    !inspection_failed
 }
 
 fn package_identity(parsed: &sai_package::manifest::PackageParseOutput) -> Option<String> {
@@ -1120,7 +1447,6 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
         "type checking",
         "dependency and workspace analysis",
         "lints",
-        "module-tree validation",
     ];
     let tail = command_tail(command);
     if tail.iter().any(|(argument, _)| argument == "--tests") {
@@ -1138,7 +1464,7 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
         argument_index: None,
         argument: String::new(),
         help: Some(format!(
-            "root-package syntax parsing is the only implemented analysis; {} remain unavailable",
+            "root-package syntax parsing and module-tree validation are implemented; {} remain unavailable",
             unsupported.join(", ")
         )),
         data: Some(format!(
@@ -6968,10 +7294,9 @@ mod tests {
         CancellationAwareStdin, CheckDiagnostic, CliDiagnostic, CliLocation, CliPosition,
         CliSourceIndex, EXPLAIN_CODE_SUMMARIES, RenderedSourceLine, StdinBroker, StdinReadError,
         cli_position, compare_check_diagnostics, fmt_path_selection_signature, human_file_path,
-        internal_fmt_diagnostic, missing_root_module_is_confirmed, parse_args, relative_path,
-        report_fmt_diagnostics, run, run_new_with_creator, run_with_cancellation,
-        run_with_cancellation_and_input, write_file_atomically_in_directory,
-        write_human_diagnostics,
+        internal_fmt_diagnostic, parse_args, relative_path, report_fmt_diagnostics, run,
+        run_new_with_creator, run_with_cancellation, run_with_cancellation_and_input,
+        write_file_atomically_in_directory, write_human_diagnostics,
     };
     use sai_diagnostics::{Value, ValueObject};
     use sai_driver::CancellationToken;
@@ -7143,40 +7468,6 @@ mod tests {
         assert!(record.contains("\"primary\":null"));
         assert!(record.contains("\"package\":\"acme:check@0.1.0\"}"));
         assert!(!record.contains("\"file\":"));
-    }
-
-    #[test]
-    fn missing_root_module_is_not_reported_when_source_inspection_failed() {
-        let source_directory = PathBuf::from("/package/src");
-        let mut selection = crate::fmt_paths::FmtPathSelection::default();
-
-        assert!(missing_root_module_is_confirmed(
-            &selection,
-            &source_directory
-        ));
-
-        selection
-            .errors
-            .push(crate::fmt_paths::FmtPathSelectionError {
-                path: source_directory.clone(),
-                source: io::Error::other("could not enumerate source root"),
-            });
-        assert!(!missing_root_module_is_confirmed(
-            &selection,
-            &source_directory
-        ));
-
-        selection.errors.clear();
-        selection
-            .errors
-            .push(crate::fmt_paths::FmtPathSelectionError {
-                path: source_directory.join("lib.sai"),
-                source: io::Error::other("could not inspect root module"),
-            });
-        assert!(!missing_root_module_is_confirmed(
-            &selection,
-            &source_directory
-        ));
     }
 
     #[test]
@@ -7495,7 +7786,7 @@ mod tests {
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
         assert!(stdout.contains("\"stage\":0,\"feature\":\"sai check\""));
         assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
-        assert!(stdout.contains("only implemented analysis"));
+        assert!(stdout.contains("syntax parsing and module-tree validation are implemented"));
         assert!(stdout.contains("module-tree validation"));
         assert!(stdout.contains("test-only analysis"));
         assert!(stdout.contains("`--fix`"));
@@ -7543,7 +7834,7 @@ mod tests {
         assert!(stdout.contains("\"path\":\"src/lib.sai\""));
         assert!(stdout.contains("\"line\":1"));
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
-        assert!(stdout.contains("only implemented analysis"));
+        assert!(stdout.contains("syntax parsing and module-tree validation are implemented"));
         assert!(stdout.contains("\"exit_code\":1"));
 
         let parse_diagnostic = stdout
@@ -7560,7 +7851,139 @@ mod tests {
             .find(|line| line.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""))
             .expect("incomplete-analysis diagnostic is present");
         assert!(incomplete_diagnostic.contains("\"primary\":null"));
+        assert!(
+            incomplete_diagnostic
+                .contains("syntax parsing and module-tree validation are implemented")
+        );
         assert!(incomplete_diagnostic.contains("\"symbol\":null,\"package\":null}"));
+    }
+
+    #[test]
+    fn check_reports_module_tree_errors_and_keeps_parser_diagnostics_in_json() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(package.join("src/Bad.sai"), b"fn {\n").expect("write malformed module");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"INVALID_MODULE_NAME\""));
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(stdout.contains("\"path\":\"Bad.sai\",\"segment\":\"Bad\""));
+        assert!(stdout.contains("\"path\":\"src/Bad.sai\""));
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_reports_source_symlinks_as_locationless_module_tree_diagnostics() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        symlink(package.join("src/lib.sai"), package.join("src/linked.sai"))
+            .expect("create source symlink");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let diagnostic = stdout
+            .lines()
+            .find(|line| line.contains("\"code\":\"SYMLINK_IN_SOURCE\""))
+            .expect("source symlink diagnostic is present");
+        assert!(diagnostic.contains("\"primary\":null"));
+        assert!(diagnostic.contains("\"path\":\"linked.sai\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_rejects_a_symlinked_source_root_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let source_target = package.join("source-target");
+        fs::rename(package.join("src"), &source_target).expect("move source directory");
+        symlink(&source_target, package.join("src")).expect("link declared source root");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let diagnostics = stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"SYMLINK_IN_SOURCE\""))
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("\"primary\":null"));
+        assert!(diagnostics[0].contains("\"path\":\"src\""));
+        assert!(!stdout.contains("\"code\":\"MISSING_ROOT_MODULE\""));
+        assert!(!stdout.contains("\"path\":\"source-target/lib.sai\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_rejects_symlink_ancestors_of_the_declared_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let actual_directory = package.join("actual");
+        fs::create_dir(&actual_directory).expect("create source target directory");
+        fs::rename(package.join("src"), actual_directory.join("src"))
+            .expect("move source below target directory");
+        fs::write(actual_directory.join("src/lib.sai"), b"fn {\n")
+            .expect("make the linked target syntactically invalid");
+        symlink(&actual_directory, package.join("alias")).expect("link source ancestor");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path)
+            .expect("read package manifest")
+            .replace("source \"src\"", "source \"alias/src\"");
+        fs::write(&manifest_path, manifest).expect("update source directory declaration");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let diagnostics = stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"SYMLINK_IN_SOURCE\""))
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("\"primary\":null"));
+        assert!(diagnostics[0].contains("\"path\":\"alias/src\""));
+        assert!(!stdout.contains("\"path\":\"actual/src/lib.sai\""));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_reports_module_tree_inventory_paths_it_cannot_represent() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(package.join("src/bad\\name.sai"), b"fn valid() {}\n")
+            .expect("write source with an unrepresentable package path");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"SOURCE_READ_FAILED\""));
+        assert!(stdout.contains("canonical package-relative path"));
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
     }
 
     #[test]
@@ -7591,6 +8014,10 @@ mod tests {
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"MISSING_ROOT_MODULE\""));
+        assert_eq!(
+            stdout.matches("\"code\":\"MISSING_ROOT_MODULE\"").count(),
+            1
+        );
         assert!(stdout.contains("\"path\":\"sai.package\""));
         assert!(stdout.contains("\"line\":1"));
         assert!(stdout.contains("\"data\":{\"path\":\"src/lib.sai\"}"));
@@ -7668,10 +8095,40 @@ mod tests {
             assert_eq!(exit_code, 1);
             assert!(stderr.is_empty());
             assert!(stdout.contains("\"code\":\"MISSING_ROOT_MODULE\""));
+            assert_eq!(
+                stdout.matches("\"code\":\"MISSING_ROOT_MODULE\"").count(),
+                1
+            );
             assert!(stdout.contains("\"path\":\"sai.package\""));
             assert!(stdout.contains("\"line\":1"));
             assert!(stdout.contains("\"data\":{\"path\":\"src/lib.sai\"}"));
         }
+    }
+
+    #[test]
+    fn check_reports_missing_root_when_source_path_crosses_a_file() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::remove_dir_all(package.join("src")).expect("remove source directory");
+        fs::write(package.join("src"), b"not a directory").expect("replace source with a file");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path)
+            .expect("read package manifest")
+            .replace("source \"src\"", "source \"src/nested\"");
+        fs::write(&manifest_path, manifest).expect("update source directory declaration");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout.matches("\"code\":\"MISSING_ROOT_MODULE\"").count(),
+            1
+        );
+        assert!(stdout.contains("\"data\":{\"path\":\"src/nested/lib.sai\"}"));
+        assert!(!stdout.contains("\"code\":\"SOURCE_READ_FAILED\""));
     }
 
     #[test]
