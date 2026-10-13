@@ -464,6 +464,8 @@ JSON result: one record of kind `check`, after the diagnostics.
 
 Exit codes: 0 if no error was reported; 1 otherwise.
 
+**Current implementation slice.** `sai check` parses visible root-package `.sai` files, validates the module tree, and performs target-filtered Phase 1 declaration collection for the selected target. The target defaults to the first manifest target; `--target` selects a known target and reports `TARGET_NOT_DECLARED` when the package omits it. Phase 1 reports declaration and test/property-name diagnostics, with earlier declarations linked as related locations. Import resolution, dependency analysis, type checking, lints, fixes, and successful `check` result records remain unavailable and are represented by `FEATURE_NOT_IMPLEMENTED`.
+
 ### 13.6.3 `sai build`
 
 ```text

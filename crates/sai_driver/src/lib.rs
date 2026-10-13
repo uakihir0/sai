@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use sai_diagnostics::{Diagnostic, OverrideLintLevel, SourceRef, source_text_status_diagnostic};
-use sai_hir::item_tree::ItemTree;
+pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
+use sai_hir::item_tree::{ItemTree, TargetFilterError, TargetFilterResult};
+use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
 use sai_package::manifest::PackageRole;
@@ -15,7 +17,9 @@ use sai_package::mvs_diagnostics::{
     root_dependency_cycle_diagnostics, version_conflict_diagnostics,
 };
 use sai_query::{Durability, QueryDatabase, QueryError};
-use sai_resolve::{ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
+pub use sai_resolve::package_scopes::Phase1PackageScopes;
+use sai_resolve::package_scopes::{FilteredModule, PackageScopesError, collect_phase1};
+use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
@@ -23,7 +27,7 @@ use sai_vfs::{
     PackageSourcePath, SnapshotFile, SourceDecodeError, SourceFile, SourceText, VfsInputSnapshot,
     VfsInputUpdate, VfsInputs, WitFilesSnapshot, WorkspaceSnapshot, WorkspaceSnapshotError,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Owns the query runtime and the session state for the implemented frontend.
@@ -45,6 +49,9 @@ pub struct RootDatabase {
     packages: PackageInterner,
     files: FileInterner,
     symbols: Interner,
+    /// Retained for the lifetime of this database so every `DefId` returned
+    /// by Phase 1 remains associated with its original package-local paths.
+    def_paths: HashMap<PackageId, DefPathInterner>,
 }
 
 /// Owns the CLI's cancellation state and installs the process interrupt handler.
@@ -53,6 +60,27 @@ pub struct InterruptHandler {
 }
 
 pub type CancellationToken = sai_query::CancellationToken;
+
+/// Builds the target facts used by `sai check` for a target's core-module
+/// analysis.
+///
+/// The check command analyzes the core-module column for core targets.
+/// `host` therefore applies only to core targets; WASI targets have no
+/// artifact-specific predicates here. Wasm64 always supplies `memory64`, and
+/// native targets supply `native_ffi` and `process`.
+pub fn target_cfg_for_check(target: &str) -> Result<TargetCfg, TargetCfgError> {
+    let capabilities: &[&str] = match target {
+        "wasm32-core" => &["host"],
+        "wasm64-core" => &["host", "memory64"],
+        "wasm32-wasi" => &[],
+        "wasm64-wasi" => &["memory64"],
+        "x86_64-linux" | "aarch64-linux" | "aarch64-macos" | "x86_64-windows" => {
+            &["native_ffi", "process"]
+        }
+        _ => &[],
+    };
+    TargetCfg::new(target, capabilities.iter().copied())
+}
 
 impl InterruptHandler {
     /// Installs SIGINT/Ctrl-C handling. Every interrupt requests cancellation;
@@ -183,6 +211,48 @@ pub enum RootDatabaseError {
         found_package_key: String,
         found_path: String,
     },
+}
+
+/// A failure while assembling snapshot-bound inputs for Phase 1 collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Phase1CollectionError {
+    Parse(ParseQueryError),
+    ItemTree(ItemTreeQueryError),
+    TargetFilter(TargetFilterError),
+    PackageScopes(PackageScopesError),
+    DefPathInterner(DefPathInternerError),
+    MissingSnapshotFile(FileId),
+    TooManyModules,
+}
+
+impl From<ParseQueryError> for Phase1CollectionError {
+    fn from(error: ParseQueryError) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl From<ItemTreeQueryError> for Phase1CollectionError {
+    fn from(error: ItemTreeQueryError) -> Self {
+        Self::ItemTree(error)
+    }
+}
+
+impl From<TargetFilterError> for Phase1CollectionError {
+    fn from(error: TargetFilterError) -> Self {
+        Self::TargetFilter(error)
+    }
+}
+
+impl From<PackageScopesError> for Phase1CollectionError {
+    fn from(error: PackageScopesError) -> Self {
+        Self::PackageScopes(error)
+    }
+}
+
+impl From<DefPathInternerError> for Phase1CollectionError {
+    fn from(error: DefPathInternerError) -> Self {
+        Self::DefPathInterner(error)
+    }
 }
 
 /// Reload diagnostics together with the workspace snapshot containing every
@@ -392,6 +462,7 @@ impl RootDatabase {
             packages: PackageInterner::new(),
             files: FileInterner::new(),
             symbols: Interner::new(),
+            def_paths: HashMap::new(),
         })
     }
 
@@ -721,6 +792,114 @@ impl RootDatabase {
         )
     }
 
+    /// Builds target-filtered declaration scopes for every module in
+    /// `module_tree`, using source and AST data bound to `snapshot`.
+    ///
+    /// This is the Phase 1 boundary only: it does not resolve `use`
+    /// declarations or compute import fixpoints. The database retains one
+    /// definition-path interner per package so `DefId`s in the returned
+    /// scopes can be resolved throughout this database's lifetime.
+    pub fn collect_phase1_package_scopes(
+        &mut self,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+    ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
+        if module_tree.modules.len() > u32::MAX as usize {
+            return Err(Phase1CollectionError::TooManyModules);
+        }
+
+        struct OwnedModuleInput {
+            filtered: TargetFilterResult,
+            ast_ids: sai_syntax::ast::AstIdMap,
+            root: sai_syntax::SyntaxNode,
+            source: Arc<SourceFile>,
+            source_ref: SourceRef,
+        }
+
+        let mut owned_inputs = Vec::with_capacity(module_tree.modules.len());
+        for module in &module_tree.modules {
+            let snapshot_file = snapshot
+                .file(module.file)
+                .ok_or(Phase1CollectionError::MissingSnapshotFile(module.file))?;
+            let source = Arc::clone(snapshot_file.source());
+            let parsed = self.parse_file(snapshot, module.file)?;
+            let ast_ids = self.ast_id_map(snapshot, module.file)?;
+            let item_tree = self.def_collector(snapshot, module.file)?;
+            let filtered = item_tree.filter_for_target(
+                source.text(),
+                &parsed.root,
+                &ast_ids,
+                &self.symbols,
+                snapshot,
+                target_cfg,
+            )?;
+            owned_inputs.push(OwnedModuleInput {
+                filtered,
+                ast_ids,
+                root: parsed.root,
+                source,
+                source_ref: SourceRef {
+                    path: snapshot_file.path().to_owned(),
+                    package: snapshot_file.package().map(str::to_owned),
+                    // SourceRef.snapshot is the caller's document version;
+                    // WorkspaceSnapshot IDs remain an internal binding.
+                    snapshot: snapshot_file.document_version(),
+                },
+            });
+        }
+
+        let module_inputs = owned_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                let raw =
+                    u32::try_from(index).map_err(|_| Phase1CollectionError::TooManyModules)?;
+                Ok((
+                    ModuleId::from_raw(raw),
+                    FilteredModule {
+                        filtered: &input.filtered,
+                        ast_ids: &input.ast_ids,
+                        root: &input.root,
+                        source: input.source.as_ref(),
+                        source_ref: input.source_ref.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, Phase1CollectionError>>()?;
+
+        if !self.def_paths.contains_key(&module_tree.package) {
+            let interner =
+                DefPathInterner::new(module_tree.package, &self.packages, &self.symbols)?;
+            self.def_paths.insert(module_tree.package, interner);
+        }
+        let def_paths = self
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the package definition-path interner was just installed");
+
+        collect_phase1(
+            module_tree,
+            &module_inputs,
+            target_cfg,
+            &self.packages,
+            &self.symbols,
+            def_paths,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Resolves a definition ID created in this database's Phase 1 results.
+    ///
+    /// Foreign IDs and IDs for packages that have not collected declarations
+    /// in this database return `Ok(None)`.
+    pub fn resolve_def_path(&self, def_id: DefId) -> Result<Option<DefPath>, DefPathInternerError> {
+        match self.def_paths.get(&def_id.package) {
+            Some(def_paths) => def_paths.resolve_def_id(def_id),
+            None => Ok(None),
+        }
+    }
+
     /// Builds source-bound diagnostics for the MVS package graph.
     ///
     /// The manifest map must cover every contract visited by selection,
@@ -997,7 +1176,9 @@ mod tests {
     use sai_package::validation::PackageValidationContext;
     use sai_package::version::Version;
     use sai_package::version_req::VersionReq;
-    use sai_vfs::{PackageRelativePath, SnapshotFile, SourceFile, WorkspaceSnapshot};
+    use sai_vfs::{
+        PackageFileEntry, PackageRelativePath, SnapshotFile, SourceFile, WorkspaceSnapshot,
+    };
 
     struct TestDirectory(std::path::PathBuf);
 
@@ -1026,6 +1207,263 @@ mod tests {
             Some(version),
         )])
         .expect("workspace snapshot is valid")
+    }
+
+    fn phase1_fixture(
+        root_contents: &[u8],
+        child_contents: &[u8],
+    ) -> (RootDatabase, ModuleTree, WorkspaceSnapshot, PackageId) {
+        const PACKAGE_KEY: &str = "acme:phase1#1";
+        const PACKAGE_IDENTITY: &str = "acme:phase1@1.0.0";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package(PACKAGE_KEY)
+            .expect("package identity interns");
+        let package_key = PackageKey::new(PACKAGE_KEY).expect("package key is valid");
+        database
+            .set_package_files(
+                package_key,
+                PackageFilesSnapshot::new(
+                    true,
+                    [
+                        PackageFileEntry::new("lib.sai", PackageFileKind::File)
+                            .expect("root entry is valid"),
+                        PackageFileEntry::new("child.sai", PackageFileKind::File)
+                            .expect("child entry is valid"),
+                    ],
+                )
+                .expect("package source inventory is valid"),
+                Durability::Low,
+            )
+            .expect("package inventory is recorded");
+        database
+            .set_file_contents(
+                FileKey::new(PACKAGE_KEY, "src/lib.sai").expect("root file key is valid"),
+                Arc::from(root_contents),
+                Durability::Low,
+            )
+            .expect("root source is recorded");
+        database
+            .set_file_contents(
+                FileKey::new(PACKAGE_KEY, "src/child.sai").expect("child file key is valid"),
+                Arc::from(child_contents),
+                Durability::Low,
+            )
+            .expect("child source is recorded");
+
+        let module_tree = database
+            .module_tree(
+                package,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                None,
+            )
+            .expect("module tree is constructed");
+        assert_eq!(module_tree.modules.len(), 2);
+        let snapshot = WorkspaceSnapshot::new(
+            module_tree
+                .modules
+                .iter()
+                .map(|module| {
+                    let key = database
+                        .file_key(module.file)
+                        .expect("module has a stable file key")
+                        .clone();
+                    let contents = match database
+                        .file_contents(key.clone())
+                        .expect("source input can be read")
+                    {
+                        Some(FileContents::Bytes(contents)) => contents,
+                        other => panic!("module source bytes are missing: {other:?}"),
+                    };
+                    SnapshotFile::new(
+                        Arc::new(
+                            SourceFile::decode(module.file, &contents)
+                                .expect("module source decodes"),
+                        ),
+                        key.path().to_owned(),
+                        Some(PACKAGE_IDENTITY.to_owned()),
+                        Some(17),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("workspace snapshot is valid");
+        (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    fn phase1_function_def(
+        database: &RootDatabase,
+        scopes: &Phase1PackageScopes,
+        module: ModuleId,
+        name: &str,
+    ) -> DefId {
+        use sai_resolve::package_scopes::{DefKind, Res};
+
+        scopes
+            .module(module)
+            .expect("module scopes exist")
+            .declared
+            .iter()
+            .find_map(|(symbol, binding)| {
+                let symbol_name = database.resolve_symbol(*symbol).ok()?;
+                if symbol_name.as_ref() != name {
+                    return None;
+                }
+                match binding.res {
+                    Res::Def(DefKind::Fn, def_id) => Some(def_id),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| panic!("function `{name}` was not declared"))
+    }
+
+    #[test]
+    fn check_target_configs_match_artifact_capabilities() {
+        assert!(
+            target_cfg_for_check("wasm32-core")
+                .expect("target is known")
+                .capabilities()
+                .contains("host")
+        );
+        let wasm64_core = target_cfg_for_check("wasm64-core").expect("target is known");
+        assert!(wasm64_core.capabilities().contains("host"));
+        assert!(wasm64_core.capabilities().contains("memory64"));
+        assert!(
+            target_cfg_for_check("wasm32-wasi")
+                .expect("target is known")
+                .capabilities()
+                .is_empty()
+        );
+        assert_eq!(
+            target_cfg_for_check("wasm64-wasi")
+                .expect("target is known")
+                .capabilities(),
+            &BTreeSet::from(["memory64".to_owned()])
+        );
+        let native = target_cfg_for_check("aarch64-macos").expect("target is known");
+        assert_eq!(
+            native.capabilities(),
+            &BTreeSet::from(["native_ffi".to_owned(), "process".to_owned()])
+        );
+        assert_eq!(
+            target_cfg_for_check("not-a-target"),
+            Err(TargetCfgError::UnknownTarget)
+        );
+    }
+
+    #[test]
+    fn phase1_driver_bridge_filters_targets_and_reuses_package_def_paths() {
+        let root = b"@target(\"wasm64-core\")\nfn choose() {}\nfn choose() {}\n";
+        let child = b"fn child() {}\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root, child);
+
+        let wasm32 = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wasm32_scopes = database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &wasm32)
+            .expect("Phase 1 scopes collect for both modules");
+        assert_eq!(wasm32_scopes.modules.len(), 2);
+        assert!(
+            !wasm32_scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::DuplicateBinding)
+        );
+
+        let choose_def = phase1_function_def(&database, &wasm32_scopes, ModuleId::ROOT, "choose");
+        let choose_path = database
+            .resolve_def_path(choose_def)
+            .expect("definition path resolves")
+            .expect("definition was created by this database");
+        let child_module = module_tree
+            .modules
+            .iter()
+            .position(|module| module.file != module_tree.modules[0].file)
+            .map(|index| ModuleId::from_raw(index as u32))
+            .expect("child module exists");
+        let child_def = phase1_function_def(&database, &wasm32_scopes, child_module, "child");
+        assert!(
+            database
+                .resolve_def_path(child_def)
+                .expect("child definition path resolves")
+                .is_some()
+        );
+
+        let repeated = database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &wasm32)
+            .expect("Phase 1 can run again in the same database");
+        let repeated_choose = phase1_function_def(&database, &repeated, ModuleId::ROOT, "choose");
+        assert_eq!(repeated_choose, choose_def);
+        assert_eq!(
+            database
+                .resolve_def_path(repeated_choose)
+                .expect("repeated definition path resolves"),
+            Some(choose_path)
+        );
+
+        let wasm64 = target_cfg_for_check("wasm64-core").expect("target config is valid");
+        let wasm64_scopes = database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &wasm64)
+            .expect("Phase 1 scopes collect for wasm64");
+        let duplicate = wasm64_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::DuplicateBinding)
+            .expect("target-filtered declarations report a duplicate binding");
+        assert_eq!(
+            duplicate.primary().map(|location| location.file.snapshot),
+            Some(Some(17))
+        );
+        let previous_declaration = duplicate
+            .related()
+            .iter()
+            .find_map(|related| match related {
+                sai_diagnostics::Related::DeclaredHere { location, .. } => Some(location),
+                _ => None,
+            });
+        assert_eq!(
+            previous_declaration.map(|location| location.file.snapshot),
+            Some(Some(17))
+        );
+    }
+
+    #[test]
+    fn phase1_driver_bridge_rejects_a_snapshot_with_mismatched_module_bytes() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"fn original() {}\n", b"fn child() {}\n");
+        let stale_snapshot = WorkspaceSnapshot::new(
+            module_tree
+                .modules
+                .iter()
+                .map(|module| {
+                    let original = snapshot
+                        .file(module.file)
+                        .expect("fixture snapshot contains each module");
+                    let source = if module.file == module_tree.modules[0].file {
+                        Arc::new(
+                            SourceFile::decode(module.file, b"fn stale() {}\n")
+                                .expect("stale source decodes"),
+                        )
+                    } else {
+                        Arc::clone(original.source())
+                    };
+                    SnapshotFile::new(
+                        source,
+                        original.path().to_owned(),
+                        original.package().map(str::to_owned),
+                        original.document_version(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("stale workspace snapshot is structurally valid");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+
+        assert_eq!(
+            database.collect_phase1_package_scopes(&module_tree, &stale_snapshot, &target_cfg),
+            Err(Phase1CollectionError::Parse(
+                ParseQueryError::SnapshotSourceMismatch
+            ))
+        );
     }
 
     #[test]

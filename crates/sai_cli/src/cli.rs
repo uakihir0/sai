@@ -17,11 +17,12 @@ use sai_diagnostics::{EXPLAIN_CODE_SUMMARIES, SourceRef, Value, ValueObject};
 use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
 };
-use sai_driver::{CancellationToken, RootDatabase};
+use sai_driver::{CancellationToken, RootDatabase, TargetCfg};
 use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 use sai_query::Durability;
 use sai_vfs::{
-    PackageFileEntry, PackageFilesSnapshot, PackageKey, PackageRelativePath, PackageSourceDirectory,
+    FileContents, FileKey, PackageFileEntry, PackageFilesSnapshot, PackageKey, PackageRelativePath,
+    PackageSourceDirectory, SnapshotFile, SourceFile, VfsInputSnapshot, WorkspaceSnapshot,
 };
 use sha2::{Digest, Sha256};
 use unicode_width::UnicodeWidthChar;
@@ -43,6 +44,12 @@ struct CheckDiagnostic {
     diagnostic: CliDiagnostic,
     severity: sai_diagnostics::Severity,
     package: Option<String>,
+    related: Vec<CheckRelated>,
+}
+
+struct CheckRelated {
+    location: CliLocation,
+    what: String,
 }
 
 struct CliLocation {
@@ -687,6 +694,24 @@ fn run_check(
                                             }
                                         }
                                     }
+                                    let declared_targets = manifest_target_names(&manifest);
+                                    let target_override = check_target_override(command);
+                                    let selected_target = target_override
+                                        .clone()
+                                        .or_else(|| declared_targets.first().cloned());
+                                    if let Some(target) = target_override.as_deref()
+                                        && !declared_targets.iter().any(|item| item == target)
+                                    {
+                                        diagnostics.push(check_diagnostic_with_package(
+                                            check_target_not_declared_diagnostic(target),
+                                            root_identity.as_deref(),
+                                        ));
+                                        total_errors = total_errors.saturating_add(1);
+                                    }
+                                    let target_cfg =
+                                        selected_target.as_deref().and_then(|target| {
+                                            sai_driver::target_cfg_for_check(target).ok()
+                                        });
                                     let tree_result = module_tree_check_diagnostics(
                                         root_package_key.as_deref().expect(
                                             "a syntax-valid package has a stable package key",
@@ -707,6 +732,7 @@ fn run_check(
                                             .expect("a syntax-valid package has an identity"),
                                         include_source_lines,
                                         root_inspection_incomplete,
+                                        target_cfg.as_ref(),
                                     );
                                     push_module_tree_check_result(
                                         &mut diagnostics,
@@ -1053,6 +1079,61 @@ fn module_tree_source_root_symlink_diagnostic(
     )
 }
 
+fn manifest_target_names(manifest: &sai_package::manifest::PackageParseOutput) -> Vec<String> {
+    manifest
+        .file()
+        .declarations
+        .iter()
+        .find_map(|declaration| {
+            if let sai_package::manifest::PackageDeclaration::Targets(targets) = &declaration.value
+            {
+                Some(
+                    targets
+                        .iter()
+                        .map(|target| target.value.to_string())
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn check_target_override(command: &crate::args::ParsedCommand) -> Option<String> {
+    let tail = command_tail(command);
+    let mut index = 0;
+    while index < tail.len() {
+        let argument = tail[index].0.to_str()?;
+        if argument == "--" {
+            break;
+        }
+        if let Some(target) = argument.strip_prefix("--target=") {
+            return Some(target.to_owned());
+        }
+        if argument == "--target" {
+            return tail.get(index + 1)?.0.to_str().map(str::to_owned);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn check_target_not_declared_diagnostic(target: &str) -> CheckDiagnostic {
+    let mut data = ValueObject::new();
+    data.insert("target".to_owned(), Value::String(target.to_owned()));
+    check_cli_diagnostic(CliDiagnostic {
+        code: "TARGET_NOT_DECLARED",
+        message: format!("target `{target}` is not declared by this package"),
+        primary: None,
+        primary_label: String::new(),
+        argument_index: None,
+        argument: String::new(),
+        help: None,
+        data: Some(source_value_object_json(&data)),
+    })
+}
+
 fn module_tree_check_diagnostics(
     package_key: &str,
     source_directory: &str,
@@ -1065,12 +1146,13 @@ fn module_tree_check_diagnostics(
     package_identity: &str,
     include_source_lines: bool,
     root_inspection_incomplete: bool,
+    target_cfg: Option<&TargetCfg>,
 ) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
     let package_key_value =
         PackageKey::new(package_key).map_err(|error| format!("invalid package key: {error:?}"))?;
     let source_directory_value = PackageSourceDirectory::new(source_directory.to_owned())
         .map_err(|error| format!("invalid source directory: {error:?}"))?;
-    let snapshot = PackageFilesSnapshot::new(source_directory_exists, entries)
+    let package_files = PackageFilesSnapshot::new(source_directory_exists, entries)
         .map_err(|error| format!("invalid package source inventory: {error:?}"))?;
 
     let mut database = RootDatabase::new()
@@ -1078,9 +1160,27 @@ fn module_tree_check_diagnostics(
     let package_id = database
         .intern_package(package_key_value.as_str())
         .map_err(|error| format!("could not intern package key: {error:?}"))?;
+    let vfs_files = source_inputs
+        .iter()
+        .filter_map(|(key_path, _, source)| {
+            FileKey::new(package_key_value.as_str(), key_path.clone())
+                .ok()
+                .map(|key| {
+                    (
+                        key,
+                        FileContents::Bytes(Arc::clone(source)),
+                        Durability::Low,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let input_snapshot = VfsInputSnapshot::new(vfs_files)
+        .map_err(|error| format!("invalid package source inputs: {error:?}"))?
+        .with_package_files([(package_key_value.clone(), package_files, Durability::Low)])
+        .map_err(|error| format!("invalid package source inventory inputs: {error:?}"))?;
     database
-        .set_package_files(package_key_value, snapshot, Durability::Low)
-        .map_err(|error| format!("could not set package source inventory: {error:?}"))?;
+        .replace_vfs_snapshot(None, &input_snapshot)
+        .map_err(|error| format!("could not set package source inputs: {error:?}"))?;
 
     let manifest_file_id = database
         .intern_package_file(
@@ -1186,9 +1286,130 @@ fn module_tree_check_diagnostics(
             diagnostic: cli_diagnostic,
             severity: diagnostic.severity,
             package: Some(package_identity.to_owned()),
+            related: Vec::new(),
         });
     }
+
+    if let Some(target_cfg) = target_cfg
+        && !module_tree.modules.is_empty()
+    {
+        let mut snapshot_files = Vec::with_capacity(module_tree.modules.len());
+        let mut complete_snapshot = true;
+        for module in &module_tree.modules {
+            let file_key = database
+                .file_key(module.file)
+                .ok_or_else(|| format!("module-tree file {} is not interned", module.file.raw()))?;
+            let Some((_, source)) = source_by_key.get(file_key.path()) else {
+                complete_snapshot = false;
+                break;
+            };
+            let source = SourceFile::decode(module.file, source)
+                .map_err(|error| format!("could not decode {}: {error:?}", file_key.path()))?;
+            snapshot_files.push(SnapshotFile::new(
+                Arc::new(source),
+                file_key.path().to_owned(),
+                Some(package_identity.to_owned()),
+                None,
+            ));
+        }
+        if complete_snapshot {
+            let workspace_snapshot = WorkspaceSnapshot::new(snapshot_files)
+                .map_err(|error| format!("could not create source snapshot: {error:?}"))?;
+            let phase1 = database
+                .collect_phase1_package_scopes(&module_tree, &workspace_snapshot, target_cfg)
+                .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
+            let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
+                phase1_check_diagnostics(
+                    &phase1.diagnostics,
+                    &source_by_key,
+                    package_identity,
+                    include_source_lines,
+                );
+            diagnostics.extend(phase1_diagnostics);
+            errors = errors.saturating_add(phase1_errors);
+            warnings = warnings.saturating_add(phase1_warnings);
+            infos = infos.saturating_add(phase1_infos);
+        }
+    }
     Ok((diagnostics, errors, warnings, infos))
+}
+
+fn phase1_check_diagnostics(
+    parsed: &[sai_diagnostics::Diagnostic],
+    source_by_key: &HashMap<String, (String, Arc<[u8]>)>,
+    package_identity: &str,
+    include_source_lines: bool,
+) -> (Vec<CheckDiagnostic>, usize, usize, usize) {
+    let mut diagnostics = Vec::with_capacity(parsed.len());
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut infos = 0usize;
+    for diagnostic in parsed {
+        let primary = diagnostic.primary().map(|location| {
+            let (display_path, source) = source_by_key
+                .get(&location.file.path)
+                .cloned()
+                .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
+            let mut source_index = CliSourceIndex::new(source);
+            source_index.location(
+                &display_path,
+                location.span.range.start().to_usize()..location.span.range.end().to_usize(),
+                include_source_lines,
+            )
+        });
+        let mut cli_diagnostic = CliDiagnostic {
+            code: diagnostic.code.as_str(),
+            message: diagnostic.message.clone(),
+            primary,
+            primary_label: diagnostic.primary_label.clone(),
+            argument_index: None,
+            argument: String::new(),
+            help: diagnostic
+                .children()
+                .iter()
+                .find(|child| child.kind == sai_diagnostics::ChildKind::Help)
+                .map(|child| child.message.clone()),
+            data: (!diagnostic.data.is_empty()).then(|| source_value_object_json(&diagnostic.data)),
+        };
+        if cli_diagnostic.primary.is_none() {
+            cli_diagnostic.primary_label.clear();
+        }
+        let related = diagnostic
+            .related()
+            .iter()
+            .filter_map(|related| {
+                let sai_diagnostics::Related::DeclaredHere { location, what } = related else {
+                    return None;
+                };
+                let (display_path, source) = source_by_key
+                    .get(&location.file.path)
+                    .cloned()
+                    .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
+                let mut source_index = CliSourceIndex::new(source);
+                Some(CheckRelated {
+                    location: source_index.location(
+                        &display_path,
+                        location.span.range.start().to_usize()
+                            ..location.span.range.end().to_usize(),
+                        include_source_lines,
+                    ),
+                    what: what.clone(),
+                })
+            })
+            .collect();
+        match diagnostic.severity {
+            sai_diagnostics::Severity::Error => errors = errors.saturating_add(1),
+            sai_diagnostics::Severity::Warning => warnings = warnings.saturating_add(1),
+            sai_diagnostics::Severity::Info => infos = infos.saturating_add(1),
+        }
+        diagnostics.push(CheckDiagnostic {
+            diagnostic: cli_diagnostic,
+            severity: diagnostic.severity,
+            package: Some(package_identity.to_owned()),
+            related,
+        });
+    }
+    (diagnostics, errors, warnings, infos)
 }
 
 fn missing_source_root_module_tree(
@@ -1212,6 +1433,7 @@ fn missing_source_root_module_tree(
         package_identity,
         include_source_lines,
         false,
+        None,
     )
 }
 
@@ -1300,6 +1522,7 @@ fn package_manifest_check_diagnostics(
             ),
             severity: sai_diagnostics::Severity::Error,
             package: package_identity.clone(),
+            related: Vec::new(),
         });
     }
     for error in parsed.errors() {
@@ -1319,6 +1542,7 @@ fn package_manifest_check_diagnostics(
             ),
             severity: sai_diagnostics::Severity::Error,
             package: package_identity.clone(),
+            related: Vec::new(),
         });
     }
     for warning in parsed.warnings() {
@@ -1342,6 +1566,7 @@ fn package_manifest_check_diagnostics(
             ),
             severity: sai_diagnostics::Severity::Warning,
             package: package_identity.clone(),
+            related: Vec::new(),
         });
     }
     (
@@ -1416,6 +1641,7 @@ fn check_source_diagnostics(
             diagnostic: cli_diagnostic,
             severity: diagnostic.severity,
             package: package_identity.map(str::to_owned),
+            related: Vec::new(),
         });
     }
     (diagnostics, errors, warnings, infos)
@@ -1426,6 +1652,7 @@ fn check_cli_diagnostic(diagnostic: CliDiagnostic) -> CheckDiagnostic {
         diagnostic,
         severity: sai_diagnostics::Severity::Error,
         package: None,
+        related: Vec::new(),
     }
 }
 
@@ -1443,7 +1670,7 @@ fn check_internal_diagnostic(description: &str, primary: Option<CliLocation>) ->
 
 fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDiagnostic {
     let mut unsupported = vec![
-        "name resolution",
+        "import and use resolution",
         "type checking",
         "dependency and workspace analysis",
         "lints",
@@ -1464,7 +1691,7 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
         argument_index: None,
         argument: String::new(),
         help: Some(format!(
-            "root-package syntax parsing and module-tree validation are implemented; {} remain unavailable",
+            "root-package syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented; {} remain unavailable",
             unsupported.join(", ")
         )),
         data: Some(format!(
@@ -1518,16 +1745,13 @@ fn report_check_diagnostics(
             for diagnostic in &diagnostics {
                 let code = sai_diagnostics::Code::from_name(diagnostic.diagnostic.code)
                     .unwrap_or(UNREGISTERED_CODE_PLACEHOLDER);
-                let mut shared = shared_diagnostic_with_severity(
-                    &diagnostic.diagnostic,
-                    code,
-                    diagnostic.severity,
-                );
+                let mut shared = shared_check_diagnostic(diagnostic, code);
                 if code == UNREGISTERED_CODE_PLACEHOLDER {
                     shared.code = UNREGISTERED_CODE_PLACEHOLDER;
                 }
                 let snippets = CliSnippets {
                     diagnostic: &diagnostic.diagnostic,
+                    related: &diagnostic.related,
                 };
                 let text = sai_diagnostics::render_diagnostic(
                     &shared,
@@ -1686,9 +1910,25 @@ fn write_json_check_diagnostic_records(
             sai_diagnostics::Severity::Warning => "warning",
             sai_diagnostics::Severity::Info => "info",
         };
+        let related = format!(
+            "[{}]",
+            check_diagnostic
+                .related
+                .iter()
+                .map(|related| format!(
+                    "{{\"kind\":\"declared_here\",\"location\":{},\"what\":\"{}\"}}",
+                    json_location_with_package(
+                        &related.location,
+                        check_diagnostic.package.as_deref(),
+                    ),
+                    escape_json(&related.what),
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         writeln!(
             writer,
-            "{{\"type\":\"diagnostic\",\"code\":\"{}\",\"severity\":\"{severity}\",\"level\":null,\"message\":\"{}\",\"primary\":{},\"primary_label\":\"{}\",\"labels\":[],\"children\":{},\"fixes\":[],\"related\":[],\"data\":{},\"node\":null,\"symbol\":null,\"package\":{package}}}",
+            "{{\"type\":\"diagnostic\",\"code\":\"{}\",\"severity\":\"{severity}\",\"level\":null,\"message\":\"{}\",\"primary\":{},\"primary_label\":\"{}\",\"labels\":[],\"children\":{},\"fixes\":[],\"related\":{related},\"data\":{},\"node\":null,\"symbol\":null,\"package\":{package}}}",
             diagnostic.code,
             escape_json(&diagnostic.message),
             primary,
@@ -6794,7 +7034,10 @@ fn write_human_diagnostics(
 ) -> io::Result<()> {
     let mut rendered = String::new();
     for diagnostic in diagnostics {
-        let snippets = CliSnippets { diagnostic };
+        let snippets = CliSnippets {
+            diagnostic,
+            related: &[],
+        };
         match sai_diagnostics::Code::from_name(diagnostic.code) {
             Some(code) => {
                 let shared = shared_diagnostic(diagnostic, code);
@@ -6870,6 +7113,27 @@ fn shared_diagnostic_with_severity(
     shared
 }
 
+fn shared_check_diagnostic(
+    diagnostic: &CheckDiagnostic,
+    code: sai_diagnostics::Code,
+) -> sai_diagnostics::Diagnostic {
+    let mut shared =
+        shared_diagnostic_with_severity(&diagnostic.diagnostic, code, diagnostic.severity);
+    for related in &diagnostic.related {
+        let location = sai_diagnostics::Location::new(
+            related.location.path.clone(),
+            cli_span(related.location.start.byte, related.location.end.byte),
+        );
+        shared
+            .push_related(sai_diagnostics::Related::DeclaredHere {
+                location,
+                what: related.what.clone(),
+            })
+            .expect("a diagnostic without a workspace snapshot accepts related locations");
+    }
+    shared
+}
+
 /// A span over the CLI's source offsets. The shared renderer identifies files by path, so every
 /// CLI location uses the same placeholder file identity.
 fn cli_span(start: usize, end: usize) -> sai_diagnostics::Span {
@@ -6885,14 +7149,22 @@ fn cli_span(start: usize, end: usize) -> sai_diagnostics::Span {
 /// CLI rendered when it built the diagnostic.
 struct CliSnippets<'a> {
     diagnostic: &'a CliDiagnostic,
+    related: &'a [CheckRelated],
 }
 
 impl sai_diagnostics::SourceSnippets for CliSnippets<'_> {
     fn position(&self, location: &sai_diagnostics::Location) -> Option<(usize, usize)> {
-        let primary = self.diagnostic.primary.as_ref()?;
         let start = usize::try_from(location.span.range.start().raw()).ok()?;
-        (primary.path == location.file.path && primary.start.byte == start)
-            .then_some((primary.start.line, primary.start.col))
+        if let Some(primary) = self.diagnostic.primary.as_ref()
+            && primary.path == location.file.path
+            && primary.start.byte == start
+        {
+            return Some((primary.start.line, primary.start.col));
+        }
+        self.related.iter().find_map(|related| {
+            (related.location.path == location.file.path && related.location.start.byte == start)
+                .then_some((related.location.start.line, related.location.start.col))
+        })
     }
 
     fn snippet(
@@ -7402,6 +7674,17 @@ mod tests {
         directory
     }
 
+    fn set_check_targets(package: &Path, targets: &str) {
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read package manifest fixture");
+        let updated = manifest.replace(
+            "targets { wasm32-wasi }",
+            &format!("targets {{ {targets} }}"),
+        );
+        assert_ne!(manifest, updated, "target declaration is present");
+        fs::write(manifest_path, updated).expect("write target declaration");
+    }
+
     fn check_diagnostic_for_order(
         code: &'static str,
         severity: sai_diagnostics::Severity,
@@ -7445,6 +7728,7 @@ mod tests {
             },
             severity,
             package,
+            related: Vec::new(),
         }
     }
 
@@ -7786,7 +8070,9 @@ mod tests {
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
         assert!(stdout.contains("\"stage\":0,\"feature\":\"sai check\""));
         assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
-        assert!(stdout.contains("syntax parsing and module-tree validation are implemented"));
+        assert!(stdout.contains(
+            "syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented"
+        ));
         assert!(stdout.contains("module-tree validation"));
         assert!(stdout.contains("test-only analysis"));
         assert!(stdout.contains("`--fix`"));
@@ -7834,7 +8120,9 @@ mod tests {
         assert!(stdout.contains("\"path\":\"src/lib.sai\""));
         assert!(stdout.contains("\"line\":1"));
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
-        assert!(stdout.contains("syntax parsing and module-tree validation are implemented"));
+        assert!(stdout.contains(
+            "syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented"
+        ));
         assert!(stdout.contains("\"exit_code\":1"));
 
         let parse_diagnostic = stdout
@@ -7852,10 +8140,139 @@ mod tests {
             .expect("incomplete-analysis diagnostic is present");
         assert!(incomplete_diagnostic.contains("\"primary\":null"));
         assert!(
-            incomplete_diagnostic
-                .contains("syntax parsing and module-tree validation are implemented")
+            incomplete_diagnostic.contains(
+                "syntax parsing, module-tree validation, target filtering, and Phase 1 declarations are implemented"
+            )
         );
         assert!(incomplete_diagnostic.contains("\"symbol\":null,\"package\":null}"));
+    }
+
+    #[test]
+    fn check_reports_phase1_duplicate_binding_with_first_declaration_related_location() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(
+            package.join("src/lib.sai"),
+            b"fn repeated() {}\nfn repeated() {}\n",
+        )
+        .expect("write duplicate declarations");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let duplicate = stdout
+            .lines()
+            .find(|line| line.contains("\"code\":\"DUPLICATE_BINDING\""))
+            .expect("Phase 1 duplicate binding is reported");
+        assert!(duplicate.contains("\"path\":\"src/lib.sai\",\"package\":\"acme:check@0.1.0\""));
+        assert!(duplicate.contains("\"start\":{\"byte\":20,\"line\":2"));
+        assert!(duplicate.contains("\"related\":[{\"kind\":\"declared_here\""));
+        assert!(duplicate.contains("\"what\":\"first declaration\""));
+        assert!(duplicate.contains("\"start\":{\"byte\":3,\"line\":1"));
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_filters_phase1_declarations_using_selected_target_capabilities() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        set_check_targets(&package, "wasm32-core, wasm32-wasi");
+        fs::write(
+            package.join("src/lib.sai"),
+            b"@target(host)\nfn selected() {}\nfn selected() {}\n",
+        )
+        .expect("write target-filtered declarations");
+
+        let (core_exit, core_stdout, core_stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-core",
+        ]);
+        let (wasi_exit, wasi_stdout, wasi_stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+        ]);
+
+        assert_eq!(core_exit, 1);
+        assert!(core_stderr.is_empty());
+        assert!(core_stdout.contains("\"code\":\"DUPLICATE_BINDING\""));
+        assert_eq!(wasi_exit, 1);
+        assert!(wasi_stderr.is_empty());
+        assert!(!wasi_stdout.contains("\"code\":\"DUPLICATE_BINDING\""));
+        assert!(!core_stdout.contains("\"code\":\"TARGET_NOT_DECLARED\""));
+        assert!(!wasi_stdout.contains("\"code\":\"TARGET_NOT_DECLARED\""));
+    }
+
+    #[test]
+    fn check_reports_a_known_target_missing_from_the_manifest() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        set_check_targets(&package, "wasm64-core");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-core",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let diagnostic = stdout
+            .lines()
+            .find(|line| line.contains("\"code\":\"TARGET_NOT_DECLARED\""))
+            .expect("undeclared target is a package diagnostic");
+        assert!(diagnostic.contains("\"message\":\"target `wasm32-core` is not declared"));
+        assert!(diagnostic.contains("\"target\":\"wasm32-core\""));
+        assert!(diagnostic.contains("\"package\":\"acme:check@0.1.0\""));
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_reports_phase1_reserved_types_and_test_name_errors() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(
+            package.join("src/lib.sai"),
+            concat!(
+                "type I32 {}\n",
+                "test \"\" {}\n",
+                "test \"\\n\" {}\n",
+                "test \"shared\" {}\n",
+                "property \"shared\"() {}\n",
+            ),
+        )
+        .expect("write declarations with invalid test names");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"RESERVED_TYPE_NAME\""));
+        assert_eq!(stdout.matches("\"code\":\"INVALID_TEST_NAME\"").count(), 2);
+        assert_eq!(
+            stdout.matches("\"code\":\"DUPLICATE_TEST_NAME\"").count(),
+            1
+        );
+        let duplicate = stdout
+            .lines()
+            .find(|line| line.contains("\"code\":\"DUPLICATE_TEST_NAME\""))
+            .expect("cross-kind duplicate test name is reported");
+        assert!(duplicate.contains("\"what\":\"first test or property with this name\""));
     }
 
     #[test]
