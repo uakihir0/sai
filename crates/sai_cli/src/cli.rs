@@ -1328,7 +1328,7 @@ fn module_tree_check_diagnostics(
             let workspace_snapshot = WorkspaceSnapshot::new(snapshot_files)
                 .map_err(|error| format!("could not create source snapshot: {error:?}"))?;
             let phase1 = database
-                .collect_phase1_package_scopes(
+                .collect_phase1_package_scopes_with_manifest(
                     &module_tree,
                     &workspace_snapshot,
                     target_cfg,
@@ -1338,7 +1338,10 @@ fn module_tree_check_diagnostics(
                             "wasm32-core" | "wasm64-core"
                         ),
                         is_test_build,
+                        analyzes_tests: is_test_build,
                     },
+                    Arc::clone(manifest_source),
+                    sai_package::manifest::PackageRole::Root,
                 )
                 .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
@@ -8781,6 +8784,91 @@ mod tests {
             human_output.contains("help: try `acme:check/lib/some_module`"),
             "{human_output}"
         );
+    }
+
+    #[test]
+    fn check_keeps_test_only_imports_unresolved_without_test_analysis() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let mut manifest = fs::read_to_string(&manifest_path).expect("read package manifest");
+        manifest.push_str("\nrequires test { acme:test-support @ ^1 }\n");
+        fs::write(manifest_path, manifest).expect("declare test dependency");
+        let source = concat!(
+            "use acme:test-support/missing as fixtures\n",
+            "use acme:test-support/missing.{Missing as fixtures}\n",
+        );
+        fs::write(package.join("src/lib.sai"), source).expect("write test-only imports");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            check_diagnostic_lines(&stdout, "DUPLICATE_BINDING").len(),
+            1,
+            "{stdout}"
+        );
+        for code in [
+            "UNKNOWN_PACKAGE",
+            "UNKNOWN_MODULE",
+            "UNRESOLVED_IMPORT",
+            "INACTIVE_DEPENDENCY",
+            "TEST_DEPENDENCY_OUTSIDE_TEST",
+        ] {
+            assert!(
+                check_diagnostic_lines(&stdout, code).is_empty(),
+                "{code}: {stdout}"
+            );
+        }
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_reports_inactive_declared_dependency_at_its_package_path() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        set_check_targets(&package, "wasm32-core, wasm32-wasi");
+        let manifest_path = package.join("sai.package");
+        let mut manifest = fs::read_to_string(&manifest_path).expect("read package manifest");
+        manifest.push_str("\nrequires { acme:targeted @ ^1 only { wasm32-wasi } }\n");
+        fs::write(manifest_path, manifest).expect("declare target-restricted dependency");
+        let source = "use acme:targeted/module.{Missing as local}\n";
+        fs::write(package.join("src/lib.sai"), source).expect("write inactive dependency use");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-core",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let inactive = check_diagnostic_lines(&stdout, "INACTIVE_DEPENDENCY");
+        assert_eq!(inactive.len(), 1, "{stdout}");
+        let path_start = source.find("acme:targeted/module").expect("package path");
+        assert!(
+            inactive[0].contains("\"path\":\"src/lib.sai\"")
+                && inactive[0].contains(&format!("\"start\":{{\"byte\":{path_start},")),
+            "{inactive:?}"
+        );
+        assert!(
+            inactive[0].contains("wasm32-wasi")
+                && inactive[0].contains("add a matching `@target(...)`"),
+            "{inactive:?}"
+        );
+        for code in ["UNKNOWN_PACKAGE", "UNKNOWN_MODULE", "UNRESOLVED_IMPORT"] {
+            assert!(
+                check_diagnostic_lines(&stdout, code).is_empty(),
+                "{code}: {stdout}"
+            );
+        }
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
     }
 
     #[test]

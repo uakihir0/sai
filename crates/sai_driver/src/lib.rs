@@ -21,8 +21,8 @@ use sai_package::mvs_diagnostics::{
 };
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_resolve::package_scopes::{
-    FilteredModule, PackageScopesError, collect_local_module_alias_bindings, collect_phase1,
-    suppress_export_name_feature_gate,
+    FilteredModule, PackageScopesError, PackageUseRequirement, collect_local_module_alias_bindings,
+    collect_phase1, suppress_export_name_feature_gate,
 };
 pub use sai_resolve::package_scopes::{
     Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
@@ -288,6 +288,7 @@ struct Phase1PackageScopesIdentity {
     target_name: String,
     target_capabilities: BTreeSet<String>,
     build_context: Phase1BuildContext,
+    declared_requirements: Option<Vec<DeclaredRequirement>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -325,6 +326,7 @@ struct PreparedPhase1PackageScopes {
     snapshot: WorkspaceSnapshot,
     target_cfg: TargetCfg,
     build_context: Phase1BuildContext,
+    declared_requirements: Option<Arc<[DeclaredRequirement]>>,
     modules: Vec<OwnedPhase1ModuleInput>,
     def_paths: Arc<DefPathInterner>,
 }
@@ -472,6 +474,8 @@ impl StableHash for Phase1PackageScopesIdentity {
             .is_root_core_module_build
             .stable_hash(hasher);
         self.build_context.is_test_build.stable_hash(hasher);
+        self.build_context.analyzes_tests.stable_hash(hasher);
+        self.declared_requirements.stable_hash(hasher);
     }
 }
 
@@ -690,6 +694,7 @@ pub enum Phase1CollectionError {
     TooManyModules,
     SnapshotBoundDiagnosticHasFixes,
     Query(QueryError),
+    DeclaredRequirements(DeclaredRequirementsError),
 }
 
 impl From<ParseQueryError> for Phase1CollectionError {
@@ -734,12 +739,19 @@ impl From<QueryError> for Phase1CollectionError {
     }
 }
 
+impl From<DeclaredRequirementsError> for Phase1CollectionError {
+    fn from(error: DeclaredRequirementsError) -> Self {
+        Self::DeclaredRequirements(error)
+    }
+}
+
 fn phase1_package_scopes_identity(
     package: PackageKey,
     module_tree: &ModuleTree,
     modules: &[OwnedPhase1ModuleInput],
     target_cfg: &TargetCfg,
     build_context: Phase1BuildContext,
+    declared_requirements: Option<&[DeclaredRequirement]>,
     symbols: &Interner,
 ) -> Result<Phase1PackageScopesIdentity, Phase1CollectionError> {
     let modules = module_tree
@@ -804,6 +816,7 @@ fn phase1_package_scopes_identity(
         target_name: target_cfg.target_name().to_owned(),
         target_capabilities: target_cfg.capabilities().clone(),
         build_context,
+        declared_requirements: declared_requirements.map(|requirements| requirements.to_vec()),
     })
 }
 
@@ -910,6 +923,19 @@ fn collect_prepared_phase1_package_scopes(
         packages,
         symbols,
         &prepared.def_paths,
+        &prepared
+            .declared_requirements
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|requirement| PackageUseRequirement {
+                identity: requirement.identity.clone(),
+                only: requirement.only.clone(),
+                test: requirement.test,
+            })
+            .collect::<Vec<_>>(),
+        &prepared.target_cfg,
+        prepared.build_context.analyzes_tests,
     )?;
     scopes.diagnostics.extend(module_alias_diagnostics);
     sort_phase1_diagnostics(&mut scopes.diagnostics);
@@ -1648,6 +1674,63 @@ impl RootDatabase {
         target_cfg: &TargetCfg,
         build_context: Phase1BuildContext,
     ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
+        self.collect_phase1_package_scopes_with_requirements(
+            module_tree,
+            snapshot,
+            target_cfg,
+            build_context,
+            None,
+        )
+    }
+
+    /// Sets the package's exact manifest input, reads its tracked requirement
+    /// query, and collects scopes with those normalized requirements.
+    ///
+    /// Invalid manifests and header/key mismatches produce no requirement
+    /// classifications here; package-manifest validation owns their
+    /// diagnostics. `None` remains distinct from a valid manifest with no
+    /// requirements in the package-scope query input.
+    pub fn collect_phase1_package_scopes_with_manifest(
+        &mut self,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+        build_context: Phase1BuildContext,
+        manifest_bytes: Arc<[u8]>,
+        manifest_role: PackageRole,
+    ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
+        self.set_package_manifest(
+            module_tree.package,
+            manifest_bytes,
+            manifest_role,
+            Durability::Low,
+        )
+        .map_err(Phase1CollectionError::from)?;
+        let requirements = match self.declared_requirements(module_tree.package) {
+            Ok(requirements) => Some(requirements),
+            Err(
+                DeclaredRequirementsError::InvalidManifest { .. }
+                | DeclaredRequirementsError::ManifestPackageMismatch { .. },
+            ) => None,
+            Err(error) => return Err(Phase1CollectionError::from(error)),
+        };
+        self.collect_phase1_package_scopes_with_requirements(
+            module_tree,
+            snapshot,
+            target_cfg,
+            build_context,
+            requirements,
+        )
+    }
+
+    fn collect_phase1_package_scopes_with_requirements(
+        &mut self,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+        build_context: Phase1BuildContext,
+        declared_requirements: Option<Arc<[DeclaredRequirement]>>,
+    ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
         if module_tree.modules.len() > u32::MAX as usize {
             return Err(Phase1CollectionError::TooManyModules);
         }
@@ -1709,6 +1792,7 @@ impl RootDatabase {
             &owned_inputs,
             target_cfg,
             build_context,
+            declared_requirements.as_deref(),
             &self.symbols,
         )?);
         let prepared = Arc::new(PreparedPhase1PackageScopes {
@@ -1716,6 +1800,7 @@ impl RootDatabase {
             snapshot: snapshot.clone(),
             target_cfg: target_cfg.clone(),
             build_context,
+            declared_requirements,
             modules: owned_inputs,
             def_paths,
         });
@@ -2177,6 +2262,131 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    #[test]
+    fn package_scopes_query_tracks_manifest_requirements_and_backdates_unrelated_edits() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            b"use acme:test-support/fixtures as fixtures\n",
+            b"fn child() {}\n",
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext::default();
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let first = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                context,
+                Arc::clone(&manifest),
+                PackageRole::Root,
+            )
+            .expect("manifest-backed package scopes collect");
+        let first_import = &first.modules[0].imports[0];
+        assert!(first_import.test_only);
+        assert!(matches!(
+            first_import.res,
+            sai_resolve::package_scopes::Res::TestOnly(_)
+        ));
+
+        let package_key = PackageKey::new("acme:phase1#1").expect("package key is valid");
+        let first_memo = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("first package-scope memo exists");
+        let unrelated_edit = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              description \"does not alter requirements\"\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let second = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                context,
+                unrelated_edit,
+                PackageRole::Root,
+            )
+            .expect("scopes collect after unrelated manifest edit");
+        assert!(second.modules[0].imports[0].test_only);
+        let second_memo = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("second package-scope memo exists");
+        assert!(
+            Arc::ptr_eq(&first_memo, &second_memo),
+            "manifest edits that preserve the normalized requirements backdate"
+        );
+
+        let restricted = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires { acme:test-support @ ^1 only { wasm32-wasi } }\n"[..],
+        );
+        let third = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                context,
+                restricted,
+                PackageRole::Root,
+            )
+            .expect("scopes collect after the requirement changes");
+        assert!(
+            third
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InactiveDependency)
+        );
+        assert_eq!(
+            third.modules[0].imports[0].res,
+            sai_resolve::package_scopes::Res::Err
+        );
+        let third_memo = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("third package-scope memo exists");
+        assert!(
+            !Arc::ptr_eq(&second_memo, &third_memo),
+            "changing normalized requirements invalidates package scopes"
+        );
+    }
+
+    #[test]
+    fn package_scopes_do_not_classify_requirements_recovered_from_invalid_manifests() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            b"use acme:test-support/fixtures as fixtures\n",
+            b"fn child() {}\n",
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let invalid_manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n\
+              invalid declaration\n"[..],
+        );
+        let scopes = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                invalid_manifest,
+                PackageRole::Root,
+            )
+            .expect("invalid manifest ownership stays with package validation");
+        assert!(scopes.modules[0].imports.is_empty());
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != sai_diagnostics::Code::TestDependencyOutsideTest
+                && diagnostic.code != sai_diagnostics::Code::InactiveDependency
+        }));
     }
 
     #[test]

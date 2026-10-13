@@ -79,6 +79,9 @@ pub enum DefKind {
 pub enum Res {
     Def(DefKind, DefId),
     Err,
+    /// A binding from a `requires test` dependency whose target has not been
+    /// resolved in this build.
+    TestOnly(ImportIndex),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +103,8 @@ pub struct ImportBinding {
     pub res: Res,
     pub is_pub: bool,
     pub test_only: bool,
+    /// Retained so inactive uses still participate in module-scope conflicts.
+    pub inactive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +119,7 @@ struct PendingLocalUseItem {
     binding_span: Span,
     alias_case_mismatch: bool,
     is_pub: bool,
+    test_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,7 +127,20 @@ enum PendingItemTarget {
     LocalModule(ModuleId),
     LocalInterface(DefId),
     Deferred,
+    Inactive,
     Unavailable,
+    TestOnly,
+}
+
+/// The resolver-facing subset of a package requirement.
+///
+/// Package resolution owns the full contract. Name resolution needs only the
+/// versionless identity, target restriction, and test-edge classification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageUseRequirement {
+    pub identity: String,
+    pub only: Option<Arc<[String]>>,
+    pub test: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,11 +197,16 @@ pub struct Phase1BuildContext {
     /// This is false for dependencies, component builds, native builds, and
     /// callers that do not yet provide artifact context.
     pub is_root_core_module_build: bool,
-    /// Whether this analysis includes the test harness.
+    /// Whether the artifact being checked is a test build.
     ///
     /// Test analysis validates `@export_name` targets for every Wasm target
     /// but does not define the package's core-module export namespace.
     pub is_test_build: bool,
+    /// Whether this analysis includes tests and test-only dependency edges.
+    ///
+    /// This can be true for `sai check --tests`, which does not produce a
+    /// test-build artifact.
+    pub analyzes_tests: bool,
 }
 
 /// Snapshot and build metadata shared by one Phase-1 package collection.
@@ -588,6 +612,9 @@ pub fn collect_local_module_alias_bindings(
     packages: &PackageInterner,
     symbols: &Interner,
     def_paths: &DefPathInterner,
+    requirements: &[PackageUseRequirement],
+    target_cfg: &TargetCfg,
+    analyzes_tests: bool,
 ) -> Result<Vec<Diagnostic>, PackageScopesError> {
     if module_tree.modules.len() != scopes.modules.len()
         || def_paths.package() != module_tree.package
@@ -602,6 +629,10 @@ pub fn collect_local_module_alias_bindings(
     let package_key = PackageKey::new(package_key_spelling.to_string())
         .map_err(PackageScopesError::PackageKey)?;
     let package_identity = package_key_spelling.to_string();
+    let current_package_identity = package_key
+        .as_str()
+        .split_once('#')
+        .map_or(package_key.as_str(), |(identity, _)| identity);
     let module_def_ids = scopes
         .modules
         .iter()
@@ -631,6 +662,27 @@ pub fn collect_local_module_alias_bindings(
                 }
                 continue;
             };
+            let raw_package_identity = entry
+                .pkg_path
+                .split_once('/')
+                .map_or(entry.pkg_path.as_str(), |(identity, _)| identity);
+            let raw_requirement = (!has_error)
+                .then(|| {
+                    find_package_use_requirement(
+                        requirements,
+                        raw_package_identity,
+                        current_package_identity,
+                    )
+                })
+                .flatten();
+            let test_only = raw_requirement.is_some_and(|requirement| requirement.test);
+            if test_only && entry.is_pub {
+                diagnostics.push(test_dependency_outside_test_diagnostic(
+                    source_location(input, path_range)?,
+                    raw_package_identity,
+                    &package_identity,
+                ));
+            }
             if entry.is_pub && !entry.has_items {
                 diagnostics.push(pub_use_without_items_diagnostic(
                     source_location(input, path_range)?,
@@ -648,6 +700,20 @@ pub fn collect_local_module_alias_bindings(
                 }
                 Err(_) => continue,
             };
+            let requirement = find_package_use_requirement(
+                requirements,
+                &parsed.package_identity,
+                current_package_identity,
+            );
+            let test_only = requirement.is_some_and(|requirement| requirement.test);
+            let inactive_targets = requirement
+                .filter(|requirement| !requirement.test || analyzes_tests)
+                .and_then(|requirement| requirement.only.as_ref())
+                .filter(|targets| {
+                    !targets
+                        .iter()
+                        .any(|target| target == target_cfg.target_name())
+                });
             let binding_name = match derive_use_binding_name(entry, symbols) {
                 Ok(binding_name) => binding_name,
                 Err(UseBindingNameError::Intern(error)) => {
@@ -666,57 +732,71 @@ pub fn collect_local_module_alias_bindings(
                 ) => None,
             };
 
-            let (target_res, target) = match resolve_parsed_use_target(
-                &parsed,
-                &package_key,
-                packages,
-                module_id,
-                module_tree,
-                symbols,
-            ) {
-                Ok(UseTarget::LocalModule(target)) => {
-                    let target_def_id = module_def_ids
-                        .get(target.raw() as usize)
-                        .ok_or(PackageScopesError::MissingModuleInput(target))?;
-                    (
-                        Some(Res::Def(DefKind::Module, target_def_id.to_def_id())),
-                        PendingItemTarget::LocalModule(target),
-                    )
-                }
-                Ok(UseTarget::ForeignPackage(_)) => (None, PendingItemTarget::Deferred),
-                Err(UseTargetError::Path(UsePathError::Intern(error))) => {
-                    return Err(PackageScopesError::Interner(error));
-                }
-                Err(UseTargetError::Path(_)) => (None, PendingItemTarget::Unavailable),
-                Err(UseTargetError::Module(
-                    ModuleTargetError::MissingRootModule | ModuleTargetError::UseOfCurrentModule(_),
-                )) => (None, PendingItemTarget::Unavailable),
-                Err(UseTargetError::Module(ModuleTargetError::UnknownModule { .. })) => {
-                    match local_interface_target(module_tree, scopes, &parsed) {
-                        Some(def_id) => (
-                            Some(Res::Def(DefKind::Interface, def_id)),
-                            PendingItemTarget::LocalInterface(def_id),
-                        ),
-                        None => (None, PendingItemTarget::Unavailable),
+            let (target_res, target) = if test_only && !analyzes_tests {
+                (None, PendingItemTarget::TestOnly)
+            } else if let Some(targets) = inactive_targets {
+                diagnostics.push(inactive_dependency_diagnostic(
+                    source_location(input, path_range)?,
+                    &parsed.package_identity,
+                    target_cfg.target_name(),
+                    targets,
+                    &package_identity,
+                ));
+                (None, PendingItemTarget::Inactive)
+            } else {
+                match resolve_parsed_use_target(
+                    &parsed,
+                    &package_key,
+                    packages,
+                    module_id,
+                    module_tree,
+                    symbols,
+                ) {
+                    Ok(UseTarget::LocalModule(target)) => {
+                        let target_def_id = module_def_ids
+                            .get(target.raw() as usize)
+                            .ok_or(PackageScopesError::MissingModuleInput(target))?;
+                        (
+                            Some(Res::Def(DefKind::Module, target_def_id.to_def_id())),
+                            PendingItemTarget::LocalModule(target),
+                        )
                     }
-                }
-                Err(UseTargetError::Module(ModuleTargetError::InvalidModuleTree)) => {
-                    return Err(PackageScopesError::InvalidModuleTree);
-                }
-                Err(UseTargetError::Module(ModuleTargetError::InvalidCurrentModule)) => {
-                    return Err(PackageScopesError::InvalidCurrentModule);
-                }
-                Err(UseTargetError::Module(ModuleTargetError::Symbol(error))) => {
-                    return Err(PackageScopesError::Symbol(error));
-                }
-                Err(UseTargetError::PackageInterner(error)) => {
-                    return Err(PackageScopesError::Package(error));
-                }
-                Err(UseTargetError::PackageKeyMismatch { .. }) => {
-                    return Err(PackageScopesError::PackageMismatch);
-                }
-                Err(UseTargetError::UnsupportedPackageKey(_)) => {
-                    return Err(PackageScopesError::UnsupportedPackageKey);
+                    Ok(UseTarget::ForeignPackage(_)) => (None, PendingItemTarget::Deferred),
+                    Err(UseTargetError::Path(UsePathError::Intern(error))) => {
+                        return Err(PackageScopesError::Interner(error));
+                    }
+                    Err(UseTargetError::Path(_)) => (None, PendingItemTarget::Unavailable),
+                    Err(UseTargetError::Module(
+                        ModuleTargetError::MissingRootModule
+                        | ModuleTargetError::UseOfCurrentModule(_),
+                    )) => (None, PendingItemTarget::Unavailable),
+                    Err(UseTargetError::Module(ModuleTargetError::UnknownModule { .. })) => {
+                        match local_interface_target(module_tree, scopes, &parsed) {
+                            Some(def_id) => (
+                                Some(Res::Def(DefKind::Interface, def_id)),
+                                PendingItemTarget::LocalInterface(def_id),
+                            ),
+                            None => (None, PendingItemTarget::Unavailable),
+                        }
+                    }
+                    Err(UseTargetError::Module(ModuleTargetError::InvalidModuleTree)) => {
+                        return Err(PackageScopesError::InvalidModuleTree);
+                    }
+                    Err(UseTargetError::Module(ModuleTargetError::InvalidCurrentModule)) => {
+                        return Err(PackageScopesError::InvalidCurrentModule);
+                    }
+                    Err(UseTargetError::Module(ModuleTargetError::Symbol(error))) => {
+                        return Err(PackageScopesError::Symbol(error));
+                    }
+                    Err(UseTargetError::PackageInterner(error)) => {
+                        return Err(PackageScopesError::Package(error));
+                    }
+                    Err(UseTargetError::PackageKeyMismatch { .. }) => {
+                        return Err(PackageScopesError::PackageMismatch);
+                    }
+                    Err(UseTargetError::UnsupportedPackageKey(_)) => {
+                        return Err(PackageScopesError::UnsupportedPackageKey);
+                    }
                 }
             };
 
@@ -748,7 +828,17 @@ pub fn collect_local_module_alias_bindings(
                         .modules
                         .get_mut(raw_module_id)
                         .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
-                    push_import_binding(module_scopes, entry, None, name, name_span, Res::Err)?;
+                    push_import_binding(
+                        module_scopes,
+                        entry,
+                        None,
+                        name,
+                        name_span,
+                        Res::Err,
+                        false,
+                        false,
+                        false,
+                    )?;
                     valid_binding = false;
                 } else if is_reserved_type_name(&name_spelling) {
                     diagnostics.push(use_binding_diagnostic(
@@ -763,18 +853,38 @@ pub fn collect_local_module_alias_bindings(
                         .modules
                         .get_mut(raw_module_id)
                         .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
-                    push_import_binding(module_scopes, entry, None, name, name_span, Res::Err)?;
+                    push_import_binding(
+                        module_scopes,
+                        entry,
+                        None,
+                        name,
+                        name_span,
+                        Res::Err,
+                        false,
+                        false,
+                        false,
+                    )?;
                     valid_binding = false;
                 }
 
-                if valid_binding {
-                    if let Some(res) = target_res {
-                        let module_scopes = scopes
-                            .modules
-                            .get_mut(raw_module_id)
-                            .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
-                        push_import_binding(module_scopes, entry, None, name, name_span, res)?;
-                    }
+                if valid_binding
+                    && (target_res.is_some() || test_only || target == PendingItemTarget::Inactive)
+                {
+                    let module_scopes = scopes
+                        .modules
+                        .get_mut(raw_module_id)
+                        .ok_or(PackageScopesError::MissingModuleInput(module_id))?;
+                    push_import_binding(
+                        module_scopes,
+                        entry,
+                        None,
+                        name,
+                        name_span,
+                        target_res.unwrap_or(Res::Err),
+                        test_only,
+                        test_only && target != PendingItemTarget::Inactive,
+                        target == PendingItemTarget::Inactive,
+                    )?;
                 }
             }
 
@@ -811,6 +921,9 @@ pub fn collect_local_module_alias_bindings(
                     item_binding.binding_name,
                     binding_span,
                     Res::Err,
+                    test_only,
+                    test_only && target != PendingItemTarget::Inactive,
+                    target == PendingItemTarget::Inactive,
                 )?;
                 pending_items.push(PendingLocalUseItem {
                     module: module_id,
@@ -823,6 +936,7 @@ pub fn collect_local_module_alias_bindings(
                     binding_span,
                     alias_case_mismatch: item_binding.alias_case_mismatch,
                     is_pub: entry.is_pub,
+                    test_only,
                 });
             }
         }
@@ -882,7 +996,15 @@ fn resolve_local_use_items(
 ) -> Result<(), PackageScopesError> {
     let mut pub_use_candidates = HashMap::new();
     for (index, item) in pending.iter().enumerate() {
-        if !item.is_pub || item.target == PendingItemTarget::Unavailable {
+        if !item.is_pub
+            || item.test_only
+            || matches!(
+                item.target,
+                PendingItemTarget::Unavailable
+                    | PendingItemTarget::Inactive
+                    | PendingItemTarget::TestOnly
+            )
+        {
             continue;
         }
         let name = symbols.resolve(item.binding_name)?;
@@ -952,7 +1074,7 @@ fn insert_resolved_imports_into_scopes(
             })
             .collect::<Result<Vec<_>, PackageScopesError>>()?;
         for (raw_import_index, import) in module_scope.imports.iter().enumerate() {
-            if import.res == Res::Err {
+            if import.res == Res::Err && !import.inactive {
                 continue;
             }
             let import_index = ImportIndex(
@@ -1000,6 +1122,21 @@ fn insert_resolved_imports_into_scopes(
         for (_, spelling, name, binding, import_index) in events {
             let location = source_location(input, binding.name_span.range)?;
             let previous = module_scope.scope.get(&name).cloned();
+            let current_is_inactive = import_index.is_some_and(|index| {
+                module_scope
+                    .imports
+                    .get(index.0 as usize)
+                    .is_some_and(|import| import.inactive)
+            });
+            let previous_is_inactive = previous.as_ref().is_some_and(|binding| {
+                let import = match binding.origin {
+                    BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => {
+                        module_scope.imports.get(import.0 as usize)
+                    }
+                    BindingOrigin::Decl => None,
+                };
+                import.is_some_and(|import| import.inactive)
+            });
             match previous {
                 None => {
                     let import =
@@ -1050,7 +1187,11 @@ fn insert_resolved_imports_into_scopes(
                         ));
                     }
                 }
-                Some(previous) if previous.res == binding.res => {
+                Some(previous)
+                    if previous.res == binding.res
+                        && !current_is_inactive
+                        && !previous_is_inactive =>
+                {
                     let redundant_import = import_index
                         .map(|_| (binding.name_span, spelling.clone()))
                         .or_else(|| match previous.origin {
@@ -1194,9 +1335,12 @@ impl LocalModuleMemberResolver<'_> {
                 // Foreign package member tables are not available in this slice.
                 return Ok(());
             }
-            PendingItemTarget::Unavailable => {
+            PendingItemTarget::Inactive
+            | PendingItemTarget::Unavailable
+            | PendingItemTarget::TestOnly => {
                 // The use-target pass owns missing, current-module, and
-                // malformed-target diagnostics.
+                // malformed-target diagnostics. Inactive and test-only
+                // targets were classified before member lookup.
                 return Ok(());
             }
         };
@@ -1339,7 +1483,9 @@ impl LocalModuleMemberResolver<'_> {
                     saw_deferred = true;
                     continue;
                 }
-                PendingItemTarget::Unavailable => continue,
+                PendingItemTarget::Inactive
+                | PendingItemTarget::Unavailable
+                | PendingItemTarget::TestOnly => continue,
             };
             match target {
                 LocalMemberLookup::Found(binding) if binding.visibility == Visibility::Pub => {
@@ -1478,7 +1624,10 @@ impl LocalModuleMemberResolver<'_> {
             PendingItemTarget::LocalInterface(interface) => {
                 self.suggested_interface_member_names(interface, &name)?
             }
-            PendingItemTarget::Deferred | PendingItemTarget::Unavailable => Vec::new(),
+            PendingItemTarget::Deferred
+            | PendingItemTarget::Inactive
+            | PendingItemTarget::Unavailable
+            | PendingItemTarget::TestOnly => Vec::new(),
         };
         let mut diagnostic = use_binding_diagnostic(
             Code::UnresolvedImport,
@@ -1744,7 +1893,7 @@ fn local_interface_target(
         .get(&interface_name)?;
     match binding.res {
         Res::Def(DefKind::Interface, def_id) => Some(def_id),
-        Res::Def(_, _) | Res::Err => None,
+        Res::Def(_, _) | Res::Err | Res::TestOnly(_) => None,
     }
 }
 
@@ -2027,6 +2176,9 @@ fn push_import_binding(
     name: Symbol,
     name_span: Span,
     res: Res,
+    test_only: bool,
+    keep_test_only_resolution: bool,
+    inactive: bool,
 ) -> Result<ImportIndex, PackageScopesError> {
     let import = ImportIndex(
         u32::try_from(module_scopes.imports.len())
@@ -2037,11 +2189,90 @@ fn push_import_binding(
         item_index,
         name,
         name_span,
-        res,
+        res: if keep_test_only_resolution {
+            Res::TestOnly(import)
+        } else {
+            res
+        },
         is_pub: entry.is_pub,
-        test_only: false,
+        test_only,
+        inactive,
     });
     Ok(import)
+}
+
+fn find_package_use_requirement<'a>(
+    requirements: &'a [PackageUseRequirement],
+    identity: &str,
+    current_package_identity: &str,
+) -> Option<&'a PackageUseRequirement> {
+    if identity == current_package_identity || matches!(identity, "sai:core" | "sai:alloc") {
+        return None;
+    }
+    requirements
+        .iter()
+        .find(|requirement| requirement.identity == identity)
+}
+
+fn inactive_dependency_diagnostic(
+    location: Location,
+    identity: &str,
+    target: &str,
+    allowed_targets: &[String],
+    package_identity: &str,
+) -> Diagnostic {
+    let mut diagnostic = use_binding_diagnostic(
+        Code::InactiveDependency,
+        Severity::Error,
+        format!("dependency `{identity}` is inactive for target `{target}`"),
+        "inactive dependency",
+        location,
+        package_identity,
+    );
+    diagnostic
+        .data
+        .insert("dependency".to_owned(), Value::String(identity.to_owned()));
+    diagnostic
+        .data
+        .insert("target".to_owned(), Value::String(target.to_owned()));
+    diagnostic.data.insert(
+        "only".to_owned(),
+        Value::Array(allowed_targets.iter().cloned().map(Value::String).collect()),
+    );
+    let target_list = allowed_targets
+        .iter()
+        .map(|target| format!("`{target}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Help,
+            message: format!(
+                "this dependency is available only for {target_list}; add a matching `@target(...)` to this `use` and the items that need it"
+            ),
+            location: None,
+        })
+        .expect("a diagnostic without a workspace snapshot accepts help children");
+    diagnostic
+}
+
+fn test_dependency_outside_test_diagnostic(
+    location: Location,
+    identity: &str,
+    package_identity: &str,
+) -> Diagnostic {
+    let mut diagnostic = use_binding_diagnostic(
+        Code::TestDependencyOutsideTest,
+        Severity::Error,
+        format!("test dependency `{identity}` cannot be publicly re-exported"),
+        "test dependency use",
+        location,
+        package_identity,
+    );
+    diagnostic
+        .data
+        .insert("dependency".to_owned(), Value::String(identity.to_owned()));
+    diagnostic
 }
 
 fn use_binding_diagnostic(
@@ -2973,6 +3204,15 @@ mod tests {
             &self,
             module_sources: &[(&str, &str)],
         ) -> (Phase1PackageScopes, DefPathInterner) {
+            self.collect_with_local_modules_and_paths_and_requirements(module_sources, &[], false)
+        }
+
+        fn collect_with_local_modules_and_paths_and_requirements(
+            &self,
+            module_sources: &[(&str, &str)],
+            requirements: &[PackageUseRequirement],
+            analyzes_tests: bool,
+        ) -> (Phase1PackageScopes, DefPathInterner) {
             struct ExtraInput {
                 module_name: Symbol,
                 file: FileId,
@@ -3121,6 +3361,9 @@ mod tests {
                 &self.packages,
                 &self.symbols,
                 &paths,
+                requirements,
+                &self.target_cfg,
+                analyzes_tests,
             )
             .expect("local use items collect");
             scopes.diagnostics.extend(local_import_diagnostics);
@@ -3233,6 +3476,277 @@ mod tests {
             missing.data.get("candidates"),
             Some(Value::Array(candidates)) if candidates.is_empty()
         ));
+    }
+
+    #[test]
+    fn test_only_imports_without_test_analysis_bind_unique_unresolved_resolutions() {
+        let source = concat!(
+            "use acme:test-support/missing as test_support\n",
+            "use acme:test-support.{first as helper}\n",
+            "use acme:test-support.{second as helper}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let requirements = [PackageUseRequirement {
+            identity: "acme:test-support".to_owned(),
+            only: Some(Arc::from([
+                "wasm64-core".to_owned(),
+                "wasm32-wasi".to_owned(),
+            ])),
+            test: true,
+        }];
+        let (scopes, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[],
+            &requirements,
+            false,
+        );
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+
+        assert_eq!(root.imports.len(), 3);
+        for (index, import) in root.imports.iter().enumerate() {
+            assert!(import.test_only);
+            if index == 2 {
+                assert_eq!(
+                    import.res,
+                    Res::Err,
+                    "the later duplicate binding becomes erroneous"
+                );
+            } else {
+                assert_eq!(import.res, Res::TestOnly(ImportIndex(index as u32)));
+            }
+        }
+        for name in ["test_support", "helper"] {
+            let symbol = fixture.symbols.intern(name).expect("binding name interns");
+            assert!(matches!(
+                root.scope.get(&symbol).map(|binding| binding.res),
+                Some(Res::TestOnly(_))
+            ));
+        }
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1,
+            "separate test-only imports with one binding name conflict"
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.code,
+                Code::UnknownPackage
+                    | Code::UnknownModule
+                    | Code::UnresolvedImport
+                    | Code::InactiveDependency
+            )
+        }));
+    }
+
+    #[test]
+    fn inactive_dependency_reports_ordered_targets_and_suppresses_item_lookup() {
+        let source = concat!(
+            "use acme:targeted/module.{missing as local_item}\n",
+            "use acme:targeted/module as local_module\n",
+            "fn local_item() {}\n",
+            "fn local_module() {}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let requirements = [PackageUseRequirement {
+            identity: "acme:targeted".to_owned(),
+            only: Some(Arc::from([
+                "wasm64-core".to_owned(),
+                "wasm32-wasi".to_owned(),
+            ])),
+            test: false,
+        }];
+        let (scopes, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[],
+            &requirements,
+            false,
+        );
+        let diagnostic = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::InactiveDependency)
+            .expect("an excluded target reports an inactive dependency");
+        let path = "acme:targeted/module";
+        let start = source.find(path).unwrap() as u32;
+        assert_eq!(
+            diagnostic.primary().unwrap().span.range,
+            TextRange::new(
+                TextSize::new(start),
+                TextSize::new(start + path.len() as u32)
+            )
+            .unwrap(),
+            "the primary span covers the complete PKG_PATH"
+        );
+        assert!(
+            diagnostic.children().iter().any(|child| {
+                child.kind == ChildKind::Help
+                    && child.message.contains("`wasm64-core`, `wasm32-wasi`")
+                    && child.message.contains("this `use` and the items")
+            }),
+            "help preserves manifest target order and suggests target filtering"
+        );
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        assert_eq!(root.imports.len(), 2);
+        assert!(
+            root.imports
+                .iter()
+                .all(|import| { import.res == Res::Err && import.inactive })
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            2,
+            "inactive module and item bindings conflict with declarations"
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Code::UnknownModule
+                && diagnostic.code != Code::UnresolvedImport
+                && diagnostic.code != Code::UnknownPackage
+        }));
+    }
+
+    #[test]
+    fn test_analysis_does_not_reexport_test_only_deferred_items() {
+        let source = "pub use acme:phase1/bridge.{helper}\n";
+        let fixture = Fixture::new(source, "wasm32-core");
+        let requirements = [PackageUseRequirement {
+            identity: "acme:test-support".to_owned(),
+            only: None,
+            test: true,
+        }];
+        let (scopes, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[("bridge", "pub use acme:test-support.{missing as helper}\n")],
+            &requirements,
+            true,
+        );
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let helper = fixture
+            .symbols
+            .intern("helper")
+            .expect("helper name interns");
+
+        assert!(!root.members.contains_key(&helper));
+        assert_eq!(
+            root.imports[0].res,
+            Res::Err,
+            "the local re-export cannot resolve through a test-only pub use"
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::UnresolvedImport)
+                .count(),
+            1,
+            "test-only deferred items do not mask the missing local member"
+        );
+    }
+
+    #[test]
+    fn test_dependency_target_restrictions_apply_only_during_test_analysis() {
+        let source = "use acme:test-support/module.{missing as local}\n";
+        let fixture = Fixture::new(source, "wasm32-core");
+        let requirements = [PackageUseRequirement {
+            identity: "acme:test-support".to_owned(),
+            only: Some(Arc::from(["wasm32-wasi".to_owned()])),
+            test: true,
+        }];
+
+        let (without_tests, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[],
+            &requirements,
+            false,
+        );
+        assert!(without_tests.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Code::InactiveDependency
+                && diagnostic.code != Code::UnknownModule
+                && diagnostic.code != Code::UnresolvedImport
+        }));
+        assert!(without_tests.modules[0].imports[0].test_only);
+        assert!(matches!(
+            without_tests.modules[0].imports[0].res,
+            Res::TestOnly(_)
+        ));
+
+        let (with_tests, _) =
+            fixture.collect_with_local_modules_and_paths_and_requirements(&[], &requirements, true);
+        let inactive = with_tests
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::InactiveDependency)
+            .expect("test analysis applies a test dependency's target restriction");
+        assert_eq!(
+            with_tests.modules[0].imports[0].res,
+            Res::Err,
+            "an inactive test edge is retained as an erroneous test-only binding"
+        );
+        assert!(with_tests.modules[0].imports[0].test_only);
+        let path = "acme:test-support/module";
+        let start = source.find(path).unwrap() as u32;
+        assert_eq!(
+            inactive.primary().unwrap().span.range,
+            TextRange::new(
+                TextSize::new(start),
+                TextSize::new(start + path.len() as u32)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn public_test_dependency_use_is_diagnosed_but_keeps_syntax_bindings() {
+        let source = "pub use acme:test-support.{first as helper, second as helper}\n";
+        let fixture = Fixture::new(source, "wasm32-core");
+        let requirements = [PackageUseRequirement {
+            identity: "acme:test-support".to_owned(),
+            only: None,
+            test: true,
+        }];
+        let (scopes, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[],
+            &requirements,
+            false,
+        );
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let diagnostic = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::TestDependencyOutsideTest)
+            .expect("pub test-only use is rejected in every build");
+        let path = "acme:test-support";
+        let start = source.find(path).unwrap() as u32;
+        assert_eq!(
+            diagnostic.primary().unwrap().span.range,
+            TextRange::new(
+                TextSize::new(start),
+                TextSize::new(start + path.len() as u32)
+            )
+            .unwrap(),
+            "the diagnostic points at the full PKG_PATH"
+        );
+        assert_eq!(root.imports.len(), 2);
+        assert!(root.imports.iter().all(|import| import.test_only));
+        assert!(matches!(root.imports[0].res, Res::TestOnly(_)));
+        assert_eq!(root.imports[1].res, Res::Err);
+        assert!(
+            root.members.is_empty(),
+            "test-only names are not re-exports"
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::DuplicateBinding),
+            "duplicate test-only bindings remain visible to scope insertion"
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Code::UnresolvedImport && diagnostic.code != Code::UnknownModule
+        }));
     }
 
     #[test]
@@ -4158,7 +4672,7 @@ mod tests {
             "import path: {:?}",
             match option_import {
                 Res::Def(_, def_id) => core_paths.resolve_def_id(def_id).unwrap(),
-                Res::Err => None,
+                Res::Err | Res::TestOnly(_) => None,
             }
         );
         assert_eq!(
@@ -4539,6 +5053,7 @@ mod tests {
         let (scopes, _) = fixture.collect_with_context(Phase1BuildContext {
             is_root_core_module_build: false,
             is_test_build: true,
+            analyzes_tests: false,
         });
 
         assert!(scopes.exports.is_empty());
