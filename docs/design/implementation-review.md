@@ -3174,3 +3174,83 @@
 - **Review:** Focused regressions cover all three pattern list forms, flat and broken output, combined opener and separator comments, fixed-point output, and refusal of line comments, multiline block comments, and trailing-comma comments. Hostile review found no actionable issues; it confirmed that only the `item_count - 1` element-separating commas are registered and rendered, leaving a trailing comma unsupported. The workspace suite passed before the clippy-driven helper-arity cleanup; after that cleanup, all 375 formatter tests, workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and `git diff --check` pass.
 - **Human review:** **Review required:** Confirm that single-line block comments after element-separating commas stay after those commas and before the next pattern element, while comments after trailing commas remain unsupported.
 - **Remaining scope:** Other comments attached to pattern-interior tokens and other unsupported comment-bearing syntax.
+
+### IR-500: Render human diagnostics from one shared layout
+
+- **Decision:** `sai_diagnostics::human` owns the §11.10 layout for `Diagnostic`: the heading, location lines, gutters, labels grouped by file, child notes and helps, the level note, notes and labels from related entries, fix titles as help lines, and the summary line. The caller implements `SourceSnippets`, which gives line and column positions and the rows of each snippet. Display columns depend on the text (tab stops, East Asian width, escaped controls, windows of long lines), and the renderer does not hold that text.
+- **Reason:** `docs/impl/11-diagnostics.md` §11.4.1 names `Diagnostic` as the reference representation, and §11.10 fixes the layout. Display width needs a Unicode table. This crate may not take a new dependency, so the snippet engine stays in `sai_cli`.
+- **Review:** The split leaves annotation-row ordering (§11.10.4 rule 4) and the snippet rows to the caller. The layout only places gutters and prefixes. Tests use a test double that returns prepared rows.
+- **Human review:** **Review required:** Confirm that the trait boundary matches the intended split between the normative layout and the terminal-metric code of §11.10.4.
+- **Remaining scope:** Suggestion snippets (IR-506). Ordering, deduplication, and cascade suppression (§11.11) are not part of this renderer. The CLI keeps its emission order.
+
+### IR-501: Count only gutter line numbers toward the gutter width
+
+- **Decision:** The gutter width `W` is the digit count of the largest line number printed in a snippet row, with a minimum of one. Positions in `-->`, `:::`, and `at` locations do not widen the gutter.
+- **Reason:** The §11.10.9 example prints `88:5` in a chain note while its gutter has width one. The phrase "displayed anywhere" in §11.10.2 item 1 is therefore read as the line numbers printed in the gutter.
+- **Review:** A location line with a larger line number than any gutter number does not change the width. Under the other reading, the §11.10.9 example would print a two-digit gutter, which it does not.
+- **Human review:** **Review required:** Confirm that the reading of "displayed" in §11.10.2 item 1 is the gutter reading.
+- **Remaining scope:** None for this rule. The former CLI hard-coded `  -->` and `   |`, which were wrong for one-digit line numbers. Those lines now follow `W`, so a one-digit diagnostic prints ` --> ` and `  |`.
+
+### IR-502: Close each snippet with a gutter bar and end each diagnostic with a blank line
+
+- **Decision:** A snippet block is written as a `G |` line, its rows, and a closing `G |` line. Each diagnostic ends with one empty line, so the summary follows a blank line.
+- **Reason:** The examples of §11.6.4 and §11.10.9 show the closing bar after the primary snippet and before `:::` blocks and children. §11.10.2 item 6 requires the empty line at the end of each diagnostic. The former CLI printed blank lines only between diagnostics.
+- **Review:** Golden tests cover one file, further files, and a diagnostic without a primary location. The CLI test `human_diagnostics_follow_the_shared_layout_and_end_each_block_with_a_blank_line` pins the blank line before the summary.
+- **Human review:** **Review required:** Confirm that the closing `G |` line is intended after every snippet. The §11.10.2 template prints that bar only before children.
+- **Remaining scope:** None.
+
+### IR-503: Print one space before the separator of children without a primary location
+
+- **Decision:** Without a primary location, child lines begin with two spaces and `=`, as in `  = help: ...`. This matches the example of §13.3.5. The gutter used for children is therefore one space, followed by the usual ` = `.
+- **Reason:** §11.10.2 item 2 says the children "use G = two spaces". With the template `G = <kind>` that would print three spaces before `=`, which contradicts the §13.3.5 example and the existing CLI output.
+- **Review:** The golden test `a_diagnostic_without_a_primary_location_uses_two_space_children` pins the output.
+- **Human review:** **Review required:** Confirm that the example, not the phrase "G = two spaces", is authoritative for diagnostics without a primary location.
+- **Remaining scope:** None.
+
+### IR-504: Order children, then the level note, then related notes, then fix titles
+
+- **Decision:** Producer children print first in producer order. Then the level note (§11.3.4) prints, then the notes of related entries, and then at most three fix titles as help lines. Chain notes use the continuation form, so their step lines sit two columns after the note text.
+- **Reason:** §11.10.2 items 4 and 5 fix this order. The §11.10.9 example shows the fix help after the chain note.
+- **Review:** Covered by `renders_the_level_source_as_the_last_note_before_related_notes`, `renders_an_effect_chain_as_a_note_with_aligned_steps`, and `rendered_fix_titles_are_help_lines_after_the_producer_children`.
+- **Human review:** None beyond the order itself.
+- **Remaining scope:** Suggestion snippets for fixes (IR-506).
+
+### IR-505: Wording of level notes, related-entry lines, and labels
+
+- **Decision:** A level note reads `` `CODE` is denied by `@deny(CODE)` `` for an attribute, the example of §11.3.4. A warn level reads `is warned by `@warn(CODE)``. A manifest source reads `by the `lints` block of `sai.package``, a policy source reads `by the `policy` of `sai.package``, a command-line source reads `by `--deny CODE`` or `by `--warn CODE``, and `--deny-warnings` reads `is denied by `--deny-warnings``. Chain lines follow the table of §11.8.4. The last step of a requirement chain prints its name only. A `declared_here` entry prints `<what> is declared here`. The `policy` location of a capability chain is not printed. The elision step `…` is not quoted. Labels for borrow conflicts and moves use `is borrowed here`, `is mutably borrowed here`, `borrow later used here`, and `moved here`.
+- **Reason:** §11.3.4 gives one example, and §11.8.4 gives the chain line table. The spec defines no text for the other notes and labels, so these are judgment calls.
+- **Review:** Golden tests pin the attribute and chain wording. The other wording has no golden test beyond the borrow labels.
+- **Human review:** **Review required:** Confirm the level-note and `declared_here` wording, and whether the `policy` location of a capability chain should be printed.
+- **Remaining scope:** Print the capability `policy` location if the spec assigns it a line.
+
+### IR-506: Suggestion snippets for fixes are not rendered
+
+- **Decision:** A fix prints its title as a help line. Its suggestion snippet (§11.10.6) is not printed.
+- **Reason:** The snippet shows the lines after the edits and underlines inserted text by display width. The renderer does not hold file text, and the display-width tables belong to the caller. No CLI producer creates fixes yet.
+- **Review:** Confirm the deferral. The `SourceSnippets` trait can take a post-edit row method when the first fix producer reaches the CLI.
+- **Human review:** **Review required:** Confirm that help titles alone satisfy the current CLI, and that suggestion snippets wait for a producer of fixes.
+- **Remaining scope:** Implement §11.10.6, with rows of the text after the edits and `~` and `?` marks.
+
+### IR-507: The CLI renders its human diagnostics through the shared model
+
+- **Decision:** `write_human_diagnostics` converts each `CliDiagnostic` into a `sai_diagnostics::Diagnostic` at the rendering boundary, then renders it with `render_diagnostic`. `CliSnippets` supplies the positions and rows from the source lines that the CLI already renders. Every CLI span uses the placeholder `FileId(0)`, because the renderer groups locations by path. The JSON writer is unchanged and still reads `CliDiagnostic`.
+- **Reason:** §11.4.1 defines `Diagnostic` as the reference representation, and IR-005 and IR-006 allow the CLI to render it. Producers do not need to change for the layout. The `sai_fmt` refusals and the usage errors still build CLI records.
+- **Review:** The placeholder file identity is safe only while every CLI location is source-local and grouped by path. `CliDiagnostic` remains a producer-side copy of the model.
+- **Human review:** **Review required:** Confirm that the adapter is an acceptable interim boundary, and that producers will move to `Diagnostic` later.
+- **Remaining scope:** Build `Diagnostic` values in producers, serialize labels, children, related entries, and fixes in JSON (§11.9.4 and §11.9.5), and drop the placeholder `FileId`.
+
+### IR-508: Render WORKSPACE_LOCK_FAILED through a registered placeholder code
+
+- **Decision:** `WORKSPACE_LOCK_FAILED` (impl/13 §13.6.7) is absent from Appendix A, so `Code` cannot name it. The CLI renders such a diagnostic with the registered placeholder `INTERNAL_COMPILER_ERROR` and then replaces the first occurrence, which is the heading code, with the real code text.
+- **Reason:** Appendix A must list every code (§A.1 rules 3 and 4), and that file is in `docs/spec`, outside this stream. Without the fallback, `expect` would panic on a lock failure. Dropping the path would change the heading.
+- **Review:** The placeholder text does not appear in the message of such a diagnostic. The CLI test `human_diagnostics_keep_codes_missing_from_the_registry_in_the_heading` pins the heading.
+- **Human review:** **Review required:** Ask the spec owner to add `WORKSPACE_LOCK_FAILED` to Appendix A and regenerate the summary snapshot. Then remove the fallback.
+- **Remaining scope:** `sai explain WORKSPACE_LOCK_FAILED` reports an unknown code until Appendix A lists it.
+
+### IR-509: `sai explain CODE` stays deferred
+
+- **Decision:** The single-code record is not implemented. `sai explain CODE` still reports `FEATURE_NOT_IMPLEMENTED`, and `sai explain --list` is unchanged. No mechanism was chosen for the Markdown record.
+- **Reason:** §11.13.2 requires Explanation prose, an Example that compiles and produces the code, a Fix that compiles and produces no diagnostic, and See also. Appendix A has only a one-line summary per code. The owner documents contain 74 distinct `rejected:` examples and no verified fixes for the 493 registered codes. A partial record would break rules 1 and 4. The existing test `explain_defers_single_code_markdown_until_full_records_exist` pins the deferral.
+- **Review:** The summary already embedded for `--list` (`EXPLAIN_CODE_SUMMARIES`, generated from Appendix A by `tools/update_summary_snapshot.py`) can supply the Summary section once examples exist.
+- **Human review:** **Review required:** Decide where the examples and fixes live (owner documents, or a checked table), and who writes them for the registered codes.
+- **Remaining scope:** Author and compile-check the Example and Fix blocks of every code, then generate the Markdown record from them with a script under `tools/`.
