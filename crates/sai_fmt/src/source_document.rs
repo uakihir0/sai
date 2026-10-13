@@ -4074,10 +4074,24 @@ fn extern_module_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+    refuse_multiline_block_string(source, value.syntax())?;
     Ok(Doc::concat([
         Doc::text(" module "),
         literal_document(source, LiteralToken::String(value))?,
     ]))
+}
+
+/// A `"""` string ends its line with its closing delimiter, so a `{` cannot follow it on that
+/// line. No layout of a block after such a name is specified, so the formatter refuses it.
+fn refuse_multiline_block_string(
+    source: &ParsedSource,
+    token: &SyntaxToken,
+) -> Result<(), SourceDocumentError> {
+    let text = token_text(source, token)?;
+    if text.starts_with("\"\"\"") && text.contains(['\n', '\r']) {
+        return Err(SourceDocumentError::UnsupportedShape);
+    }
+    Ok(())
 }
 
 fn test_decl_document(
@@ -4106,6 +4120,7 @@ fn test_decl_document(
     {
         return Err(SourceDocumentError::UnsupportedShape);
     }
+    refuse_multiline_block_string(source, name.syntax())?;
     let name_document = literal_document(source, LiteralToken::String(name))?;
     let body_document = block_document(source, &body, expression_group_ids)?;
     let document = Doc::concat([
@@ -12339,6 +12354,18 @@ mod tests {
     fn keeps_malformed_closure_parameters_fail_closed() {
         assert_eq!(
             format_shape(b"fn f(){fn(var _){}}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+    }
+
+    #[test]
+    fn refuses_multiline_block_string_names_before_a_block() {
+        assert_eq!(
+            format_shape(b"test \"\"\"\n    multi\n    \"\"\"\n{}"),
+            Err(SourceDocumentError::UnsupportedShape)
+        );
+        assert_eq!(
+            format_shape(b"extern \"wasm\" module \"\"\"\n    e\n    \"\"\"\n{ fn f() }"),
             Err(SourceDocumentError::UnsupportedShape)
         );
     }
