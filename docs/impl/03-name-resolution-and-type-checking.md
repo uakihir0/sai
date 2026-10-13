@@ -305,6 +305,26 @@ names keep the first binding and diagnose the later name. Missing members of
 local interfaces are `UNRESOLVED_IMPORT`; foreign interface member tables
 remain deferred.
 
+**Tracked local query adapter (IR-470).** The driver now tracks this local
+Phase 1 and Phase 3 slice through an interim `package_scopes` derived query,
+keyed by canonical `PackageKey`. Its input identity covers the package's
+module and namespace topology, source paths and bytes, document versions,
+session-local file IDs, target facts, and build context. File IDs are included
+because source locations in the memo use them. This is deliberately not the
+normative final query: dependency package scopes, declared requirements, WIT
+inputs, the complete prelude, and the final `PackageId` key remain deferred.
+
+Target filtering still runs at the driver boundary because the prepared AST
+contains non-`Send` syntax nodes. Its diagnostics are appended from the
+current request after applying the same `@export_name` stage-gate suppression
+as Phase 1. Workspace-bound diagnostics produced during scope collection are
+detached from the memo and rebound to the caller's snapshot.
+The current bridge fails closed if a snapshot-bound diagnostic carries a fix;
+such fixes need a snapshot-independent representation before this query can
+cache them. The staged input handoff is safe only while query evaluation
+remains synchronous and single-threaded. A parallel query runtime must replace
+that handoff with stable query inputs.
+
 ### 3.3.3 Phase 2: the import fixpoint
 
 Phase 2 resolves every `use` declaration of every module and computes the member namespaces `X(M)` with the memoized `lookup(M, x)` of spec/04 §4.5.4. The implementation:
