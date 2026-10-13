@@ -66,6 +66,218 @@ pub struct RootDatabase {
     /// by Phase 1 remains associated with its original package-local paths.
     def_paths: HashMap<PackageId, Arc<DefPathInterner>>,
     package_scopes: Phase1PackageScopesQueries,
+    declared_requirements: DeclaredRequirementsQueries,
+}
+
+/// A semantically usable direct requirement retained from `sai.package`.
+///
+/// Target spellings stay as strings so query results remain independent of
+/// session-local symbol IDs. The order of `only` targets is manifest order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeclaredRequirement {
+    pub identity: String,
+    pub only: Option<Arc<[String]>>,
+    pub test: bool,
+}
+
+impl StableHash for DeclaredRequirement {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD4);
+        self.identity.stable_hash(hasher);
+        self.only.stable_hash(hasher);
+        self.test.stable_hash(hasher);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeclaredRequirementsInput {
+    source_bytes: Arc<[u8]>,
+    dependency: bool,
+}
+
+impl StableHash for DeclaredRequirementsInput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD3);
+        self.source_bytes.stable_hash(hasher);
+        self.dependency.stable_hash(hasher);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeclaredRequirementsQueryOutput {
+    requirements: Arc<[DeclaredRequirement]>,
+    status: DeclaredRequirementsStatus,
+}
+
+impl StableHash for DeclaredRequirementsQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        self.requirements.stable_hash(hasher);
+        self.status.stable_hash(hasher);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeclaredRequirementsStatus {
+    Valid,
+    InvalidManifest,
+    PackageMismatch {
+        found_identity: String,
+        found_compatibility_line: String,
+    },
+}
+
+impl StableHash for DeclaredRequirementsStatus {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        match self {
+            Self::Valid => hasher.write_tag(0xD5),
+            Self::InvalidManifest => hasher.write_tag(0xD6),
+            Self::PackageMismatch {
+                found_identity,
+                found_compatibility_line,
+            } => {
+                hasher.write_tag(0xD7);
+                found_identity.stable_hash(hasher);
+                found_compatibility_line.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeclaredRequirementsError {
+    Package(PackageIdError),
+    PackageKey(PackageKeyError),
+    Query(QueryError),
+    InvalidManifest {
+        package_key: String,
+    },
+    ManifestPackageMismatch {
+        expected_package_key: String,
+        found_identity: String,
+        found_compatibility_line: String,
+    },
+}
+
+impl From<PackageIdError> for DeclaredRequirementsError {
+    fn from(error: PackageIdError) -> Self {
+        Self::Package(error)
+    }
+}
+
+impl From<PackageKeyError> for DeclaredRequirementsError {
+    fn from(error: PackageKeyError) -> Self {
+        Self::PackageKey(error)
+    }
+}
+
+impl From<QueryError> for DeclaredRequirementsError {
+    fn from(error: QueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
+struct DeclaredRequirementsQueries {
+    input: InputQuery<PackageKey, DeclaredRequirementsInput>,
+    query: DerivedQuery<PackageKey, DeclaredRequirementsQueryOutput>,
+}
+
+impl DeclaredRequirementsQueries {
+    fn new() -> Result<Self, QueryError> {
+        let input = InputQuery::<PackageKey, DeclaredRequirementsInput>::new(
+            "declared_requirements_input",
+            Durability::Low,
+        )?;
+        let query_input = input.clone();
+        let query = DerivedQuery::new(
+            "declared_requirements",
+            move |database: &mut QueryDatabase, key: &PackageKey| {
+                let input = query_input.get(database, key.clone())?;
+                let role = if input.dependency {
+                    PackageRole::Dependency
+                } else {
+                    PackageRole::Root
+                };
+                let parsed = sai_package::manifest::parse_for_role_with_error_limit(
+                    &input.source_bytes,
+                    role,
+                    0,
+                );
+                if !parsed.is_syntax_valid() {
+                    return Ok(DeclaredRequirementsQueryOutput {
+                        requirements: Arc::from([]),
+                        status: DeclaredRequirementsStatus::InvalidManifest,
+                    });
+                }
+                let Some(header) = parsed.file().header.as_ref() else {
+                    return Ok(DeclaredRequirementsQueryOutput {
+                        requirements: Arc::from([]),
+                        status: DeclaredRequirementsStatus::InvalidManifest,
+                    });
+                };
+                let found_identity = header.value.identity.to_string();
+                let found_compatibility_line =
+                    header.value.version.compatibility_line().to_string();
+                if !manifest_matches_package_key(key, &found_identity, &found_compatibility_line) {
+                    return Ok(DeclaredRequirementsQueryOutput {
+                        requirements: Arc::from([]),
+                        status: DeclaredRequirementsStatus::PackageMismatch {
+                            found_identity,
+                            found_compatibility_line,
+                        },
+                    });
+                }
+                let mut by_identity = BTreeMap::<String, DeclaredRequirement>::new();
+                for declaration in &parsed.file().declarations {
+                    let sai_package::manifest::PackageDeclaration::Requires { test, entries } =
+                        &declaration.value
+                    else {
+                        continue;
+                    };
+                    for entry in entries {
+                        let requirement = &entry.value;
+                        let only = requirement.only.as_ref().map(|targets| {
+                            targets
+                                .value
+                                .iter()
+                                .map(|target| target.value.to_string())
+                                .collect::<Vec<_>>()
+                                .into()
+                        });
+                        by_identity
+                            .entry(requirement.package.to_string())
+                            .or_insert(DeclaredRequirement {
+                                identity: requirement.package.to_string(),
+                                only,
+                                test: *test,
+                            });
+                    }
+                }
+                Ok(DeclaredRequirementsQueryOutput {
+                    requirements: Arc::from(
+                        by_identity
+                            .into_values()
+                            .collect::<Vec<DeclaredRequirement>>(),
+                    ),
+                    status: DeclaredRequirementsStatus::Valid,
+                })
+            },
+        )?;
+        Ok(Self { input, query })
+    }
+}
+
+fn manifest_matches_package_key(
+    package_key: &PackageKey,
+    manifest_identity: &str,
+    manifest_compatibility_line: &str,
+) -> bool {
+    if let Some((expected_identity, expected_line)) = package_key.as_str().split_once('#') {
+        return expected_identity == manifest_identity
+            && expected_line == manifest_compatibility_line;
+    }
+
+    matches!(package_key.as_str(), "sai:core" | "sai:alloc")
+        && package_key.as_str() == manifest_identity
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1002,6 +1214,7 @@ impl RootDatabase {
         let symbols = Arc::new(Interner::new());
         let package_scopes =
             Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
+        let declared_requirements = DeclaredRequirementsQueries::new()?;
         Ok(Self {
             query_database: QueryDatabase::new(),
             vfs,
@@ -1013,12 +1226,87 @@ impl RootDatabase {
             symbols,
             def_paths: HashMap::new(),
             package_scopes,
+            declared_requirements,
         })
     }
 
     /// Interns a stable package key for this session.
     pub fn intern_package(&self, package_key: &str) -> Result<PackageId, PackageIdError> {
         self.packages.intern(package_key)
+    }
+
+    /// Sets the exact `sai.package` bytes used by
+    /// [`RootDatabase::declared_requirements`].
+    ///
+    /// The role is part of the tracked input because root and dependency
+    /// manifest parsing has different validation rules. Durability follows
+    /// the package's place in the current build graph.
+    pub fn set_package_manifest(
+        &mut self,
+        package: PackageId,
+        source_bytes: Arc<[u8]>,
+        role: PackageRole,
+        durability: Durability,
+    ) -> Result<bool, DeclaredRequirementsError> {
+        let package_key = self
+            .packages
+            .resolve(package)
+            .map_err(DeclaredRequirementsError::from)?;
+        let package_key =
+            PackageKey::new(package_key.as_ref()).map_err(DeclaredRequirementsError::from)?;
+        self.declared_requirements
+            .input
+            .set_at_durability(
+                &mut self.query_database,
+                package_key,
+                DeclaredRequirementsInput {
+                    source_bytes,
+                    dependency: role == PackageRole::Dependency,
+                },
+                durability,
+            )
+            .map_err(DeclaredRequirementsError::from)
+    }
+
+    /// Returns normalized direct requirements from this package's current
+    /// tracked manifest input, sorted by package identity.
+    ///
+    /// Duplicate identities keep the first declaration, matching the
+    /// manifest contract query's recovery behavior. This query intentionally
+    /// does not return manifest diagnostics; those remain owned by
+    /// `sai.package` validation.
+    pub fn declared_requirements(
+        &mut self,
+        package: PackageId,
+    ) -> Result<Arc<[DeclaredRequirement]>, DeclaredRequirementsError> {
+        let package_key = self
+            .packages
+            .resolve(package)
+            .map_err(DeclaredRequirementsError::from)?;
+        let package_key =
+            PackageKey::new(package_key.as_ref()).map_err(DeclaredRequirementsError::from)?;
+        let expected_package_key = package_key.as_str().to_owned();
+        let output = self
+            .declared_requirements
+            .query
+            .get(&mut self.query_database, package_key)
+            .map_err(DeclaredRequirementsError::from)?;
+        match &output.status {
+            DeclaredRequirementsStatus::Valid => Ok(Arc::clone(&output.requirements)),
+            DeclaredRequirementsStatus::InvalidManifest => {
+                Err(DeclaredRequirementsError::InvalidManifest {
+                    package_key: expected_package_key,
+                })
+            }
+            DeclaredRequirementsStatus::PackageMismatch {
+                found_identity,
+                found_compatibility_line,
+            } => Err(DeclaredRequirementsError::ManifestPackageMismatch {
+                expected_package_key,
+                found_identity: found_identity.clone(),
+                found_compatibility_line: found_compatibility_line.clone(),
+            }),
+        }
     }
 
     /// Interns a stable file key and returns its session-local file ID.
@@ -1889,6 +2177,209 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    #[test]
+    fn declared_requirements_are_sorted_keep_the_first_identity_and_preserve_only_order() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:manifest#1")
+            .expect("package key interns");
+        let source: Arc<[u8]> = Arc::from(
+            &b"package acme:manifest @ 1.0.0\n\
+              requires {\n\
+                  zed:dep @ ^1 only { wasm64-core, wasm32-core }\n\
+                  zed:dep @ ^2 only { native }\n\
+              }\n\
+              requires test { acme:test @ ^1 }\n"[..],
+        );
+
+        database
+            .set_package_manifest(package, source, PackageRole::Root, Durability::Low)
+            .expect("manifest input is set");
+        let requirements = database
+            .declared_requirements(package)
+            .expect("requirements query succeeds");
+
+        assert_eq!(
+            requirements.as_ref(),
+            [
+                DeclaredRequirement {
+                    identity: "acme:test".to_owned(),
+                    only: None,
+                    test: true,
+                },
+                DeclaredRequirement {
+                    identity: "zed:dep".to_owned(),
+                    only: Some(Arc::from([
+                        "wasm64-core".to_owned(),
+                        "wasm32-core".to_owned(),
+                    ])),
+                    test: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_requirements_retain_dependency_test_entries() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:dependency#2")
+            .expect("package key interns");
+        let source: Arc<[u8]> = Arc::from(
+            &b"package acme:dependency @ 2.0.0\n\
+              requires test { acme:test-support @ ^1 only { wasm32-core } }\n"[..],
+        );
+
+        database
+            .set_package_manifest(package, source, PackageRole::Dependency, Durability::Medium)
+            .expect("dependency manifest input is set");
+        let requirements = database
+            .declared_requirements(package)
+            .expect("requirements query succeeds");
+
+        assert_eq!(
+            requirements.as_ref(),
+            [DeclaredRequirement {
+                identity: "acme:test-support".to_owned(),
+                only: Some(Arc::from(["wasm32-core".to_owned()])),
+                test: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn declared_requirements_reject_recovered_entries_from_invalid_manifests() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:invalid-manifest#1")
+            .expect("package key interns");
+        let mut source = b"package acme:invalid-manifest @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n\
+              unexpected declaration\n//"
+            .to_vec();
+        for _ in 0..20_000 {
+            source.extend_from_slice("\u{202e}".as_bytes());
+        }
+        source.push(b'\n');
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(source),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("manifest input is set");
+
+        assert!(matches!(
+            database.declared_requirements(package),
+            Err(DeclaredRequirementsError::InvalidManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn declared_requirements_reject_manifest_identity_and_compatibility_mismatches() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let identity_mismatch = database
+            .intern_package("acme:expected#1")
+            .expect("package key interns");
+        database
+            .set_package_manifest(
+                identity_mismatch,
+                Arc::from(&b"package acme:found @ 1.0.0\nrequires { acme:dep @ ^1 }\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("identity-mismatched manifest input is retained for validation");
+        assert!(matches!(
+            database.declared_requirements(identity_mismatch),
+            Err(DeclaredRequirementsError::ManifestPackageMismatch {
+                expected_package_key,
+                found_identity,
+                found_compatibility_line,
+            }) if expected_package_key == "acme:expected#1"
+                && found_identity == "acme:found"
+                && found_compatibility_line == "1"
+        ));
+
+        let line_mismatch = database
+            .intern_package("acme:found#2")
+            .expect("package key interns");
+        database
+            .set_package_manifest(
+                line_mismatch,
+                Arc::from(&b"package acme:found @ 1.0.0\nrequires { acme:dep @ ^1 }\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("line-mismatched manifest input is retained for validation");
+        assert!(matches!(
+            database.declared_requirements(line_mismatch),
+            Err(DeclaredRequirementsError::ManifestPackageMismatch {
+                expected_package_key,
+                found_identity,
+                found_compatibility_line,
+            }) if expected_package_key == "acme:found#2"
+                && found_identity == "acme:found"
+                && found_compatibility_line == "1"
+        ));
+    }
+
+    #[test]
+    fn declared_requirements_backdate_unrelated_manifest_edits_and_track_semantic_changes() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:incremental#1")
+            .expect("package key interns");
+        let initial: Arc<[u8]> = Arc::from(
+            &b"package acme:incremental @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 only { wasm32-core } }\n"[..],
+        );
+        database
+            .set_package_manifest(package, initial, PackageRole::Root, Durability::Low)
+            .expect("initial manifest input is set");
+        let first = database
+            .declared_requirements(package)
+            .expect("initial requirements query succeeds");
+
+        let unrelated_edit: Arc<[u8]> = Arc::from(
+            &b"package acme:incremental @ 1.0.0\n\
+              description \"same requirements\"\n\
+              requires test { acme:test-support @ ^1 only { wasm32-core } }\n"[..],
+        );
+        database
+            .set_package_manifest(package, unrelated_edit, PackageRole::Root, Durability::Low)
+            .expect("unrelated manifest edit is set");
+        let second = database
+            .declared_requirements(package)
+            .expect("requirements query remains valid");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unrelated manifest fields should backdate the derived value"
+        );
+
+        let changed_requirement: Arc<[u8]> = Arc::from(
+            &b"package acme:incremental @ 1.0.0\n\
+              description \"same requirements\"\n\
+              requires test { acme:test-support @ ^1 only { wasm64-core } }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                package,
+                changed_requirement,
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("changed target restriction is set");
+        let third = database
+            .declared_requirements(package)
+            .expect("changed requirements query succeeds");
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert_eq!(
+            third[0].only.as_deref(),
+            Some(["wasm64-core".to_owned()].as_slice())
+        );
     }
 
     fn phase1_function_def(
