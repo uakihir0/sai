@@ -278,9 +278,9 @@ Re-export chains retain that identity through their original `DefId`. Foreign
 imports remain deferred until external item and prelude identities are
 available.
 
-Foreign package and interface member tables remain deferred, as do test-only
-classification, identity checks for imports from foreign targets,
-declared-requirement checks, and the final `package_scopes(PackageId)` query.
+Foreign package and interface member tables remain deferred, as do active-edge
+identity checks for imports from foreign targets, test-only reference checks,
+and the final `package_scopes(PackageId)` query.
 The resolver does not yet build the complete canonical prelude
 `BTreeMap<Symbol, Res>` described in §3.3.7; the current bridge compares local
 definition paths for the supported item-import cases.
@@ -337,9 +337,9 @@ The module-only path step is implemented by `sai_resolve::module_target::resolve
 
 The temporary CLI bridge is `sai_resolve::use_target_diagnostics::collect_local_use_target_diagnostics`, called after Phase 1 by the driver. It uses each filtered use's AST ID to recover the whole `PKG_PATH` token range, then converts only local current-module and unknown-module errors to diagnostics. It suppresses malformed-token duplicates, the module-tree-owned missing-root case, foreign package identities and unresolved paths whose final segment names an interface declared by the parent module. The Phase 3 slice also resolves such a local interface alias to its declaring interface `DefId`. Candidate data uses `matched_prefix` and `module_candidates`. For `UNKNOWN_MODULE`, spec/04 §4.3.2 step 2.3 requires the full direct-child module list; this exact list takes precedence over impl/11 N-H-5's edit-distance heuristic for general name suggestions.
 
-The §4.3.3 binding-name step is implemented by `sai_resolve::use_binding::derive_use_binding_name`. Explicit aliases retain their symbol; an unaliased target derives its final path segment or package name and maps hyphens to underscores. An item-only `UseItems` list has no module binding; an empty list is rejected by the parser under spec/03 §3.1.1 and §3.4, and HIR still preserves its presence for error recovery in the stable item-tree shape. Derived strict keywords and reserved words return `RequiresAlias`; the temporary local Phase 3 pass checks the binding name before resolving its target and inserts successful local module or interface aliases. Item-list imports are resolved from local module and interface member tables; foreign tables and test-only binding semantics remain deferred.
+The §4.3.3 binding-name step is implemented by `sai_resolve::use_binding::derive_use_binding_name`. Explicit aliases retain their symbol; an unaliased target derives its final path segment or package name and maps hyphens to underscores. An item-only `UseItems` list has no module binding; an empty list is rejected by the parser under spec/03 §3.1.1 and §3.4, and HIR still preserves its presence for error recovery in the stable item-tree shape. Derived strict keywords and reserved words return `RequiresAlias`; the temporary local Phase 3 pass checks the binding name before resolving its target and inserts successful local module or interface aliases. Item-list imports are resolved from local module and interface member tables; IR-472 classifies declared inactive and test-only requirements before local lookup. Foreign member tables remain deferred.
 
-The §4.3.4 item-alias case-class check is implemented by `sai_resolve::use_item_binding::derive_use_item_binding`. It preserves the source and binding symbols and returns whether their lexer-defined case classes differ; Phase 3 owns the `ALIAS_CASE_MISMATCH` diagnostic and binding insertion. The shared `sai_syntax::identifier_case_kind` helper keeps this check aligned with lexing, including Unicode uppercase and titlecase letters. The temporary local Phase 3 bridge resolves item lists against local module and interface member tables, retains canonical entity identity through local re-exports, and defers foreign member lookup and test-only binding semantics.
+The §4.3.4 item-alias case-class check is implemented by `sai_resolve::use_item_binding::derive_use_item_binding`. It preserves the source and binding symbols and returns whether their lexer-defined case classes differ; Phase 3 owns the `ALIAS_CASE_MISMATCH` diagnostic and binding insertion. The shared `sai_syntax::identifier_case_kind` helper keeps this check aligned with lexing, including Unicode uppercase and titlecase letters. The temporary local Phase 3 bridge resolves item lists against local module and interface member tables, retains canonical entity identity through local re-exports, and defers foreign member lookup and references to test-only bindings.
 
 ```rust
 enum LookupState { InProgress, Done(Option<Binding>) }   // None: no member `x`; Some(Binding{res: Res::Err}) = ⊥
@@ -383,11 +383,28 @@ valid manifest header matches the package identity and compatibility line.
 Requirement identities and target names stay as strings in the cached value
 so it does not retain session-local symbols; the resolver can intern target
 names when it consumes this value. Manifest diagnostics remain owned by the
-package-contract validation pass. The Phase 3 import collector does not yet
-read this query, so test-only binding classification and inactive-dependency
-diagnostics remain deferred.
+package-contract validation pass.
+
+**Manifest-backed import classification (IR-472).** The tracked
+`package_scopes` adapter includes the normalized requirements in its identity.
+The current CLI passes the root package's exact manifest bytes and
+`PackageRole::Root` to `collect_phase1_package_scopes_with_manifest`; an
+invalid manifest or a package-key/header mismatch supplies no requirements,
+distinct from a valid empty list. `collect_local_module_alias_bindings` uses
+the declared identity, build target, and test-analysis flag to classify local
+import syntax. The adapter still has no active package graph or foreign
+package scopes, so this is only a manifest-backed prepass.
 
 **Inactive dependencies** ([spec/04](../spec/04-modules-and-names.md) §4.3.2 step 1.3). In step 1, after rules 1.1 and 1.2 found no target, let `K` be the `ns:pkg` part of the `PKG_PATH`. If `package_graph` has no active edge of the current package named `K`, and `declared_requirements(P)` has an entry `r` with `r.identity = K`, `r.test = false` and `r.only = Some(T)` where `T` does not contain the target of `target_cfg(P)` (§3.3.1), the use is `INACTIVE_DEPENDENCY`, at the `PKG_PATH`. The help lists the targets of `T` in contract order and suggests `@target` on the `use` and on the items that need it ([spec/15](../spec/15-attributes-and-lints.md) §15.11). The entry records an error, its bindings get `Res::Err`, and step 4 reports nothing for its items. Otherwise the rule does not apply, and a `K` without an active edge falls through to `UNKNOWN_PACKAGE`. A `use` that `@target` removed was never collected (§3.3.1), so it is never checked. An entry with `r.test = true` is a test-only use and follows the next paragraph instead, so a test dependency with an `only` list that excludes the target is also never `INACTIVE_DEPENDENCY` in a build without test analysis.
+
+The current Stage 0 adapter has no package graph, so the manifest prepass can
+establish only that a declared ordinary dependency is excluded from the
+requested target. It emits `INACTIVE_DEPENDENCY` on the complete `PKG_PATH`,
+preserves manifest target order in help, and suppresses item lookup. Its alias
+and item bindings retain `Res::Err` for later references while still
+participating in duplicate checks. Confirming an active edge before this
+diagnostic, then falling through to `UNKNOWN_PACKAGE` when appropriate,
+requires the future package-graph query.
 
 **Test-only uses** ([spec/14](../spec/14-testing.md) §14.2.5, N-E-65). A `UseEntry` is **test-only** when the `ns:pkg` part of its `PKG_PATH` is the identity of an entry with `test = true` in `declared_requirements(P)`. This is read in every build, also for a dependency, whose test edges are never in the graph. Test analysis is **active for `P`** when `build_config` has test code active ([impl/01](01-architecture.md) §1.1.1) and `P` is one of the packages selected for test analysis (the `tests` list of [impl/08](08-effect-and-capability-analysis.md) §8.7.1). Before step 1, Phase 2 classifies every test-only entry in source order:
 
@@ -396,7 +413,24 @@ diagnostics remain deferred.
 3. If test analysis is active for `P` and `P` is not the root package, the entry is `TEST_DEPENDENCY_UNAVAILABLE`, at the `PKG_PATH` ([impl/13](13-cli.md) §13.2.2), and is then treated as item 4.
 4. Otherwise the entry is not resolved: no package lookup is made and no diagnostic of steps 1 to 4 is reported for it. Each of its bindings (spec/04 §4.3.3, §4.3.4, which depend only on the syntax) is an import binding with `Res::TestOnly(import)`, a resolution that is never equal to any other entity, so Phase 3 reports `DUPLICATE_BINDING` against it but never `REDUNDANT_IMPORT`.
 
-Every binding introduced by a test-only entry, whatever its resolution, has `BindingOrigin::Use { import }` or `PubUse { import }` with `ImportBinding::test_only = true`. References to these bindings are checked by §3.4.10.
+The current adapter implements classification for the root manifest, the
+no-test-analysis sentinel in item 4, and the non-root diagnostic in item 3.
+`Phase1BuildContext::is_root_package` records whether package graph edges are
+available to this package; it is separate from manifest `PackageRole` and the
+artifact flags, and is part of the tracked package-scope query identity. The
+root CLI sets it for its selected package. With test analysis enabled for a
+non-root package, each test-only use gets `TEST_DEPENDENCY_UNAVAILABLE`
+before target-restriction checks, while its syntax-derived names retain unique
+`Res::TestOnly(import)` resolutions. The separate
+`Phase1BuildContext::analyzes_tests` input controls test-edge target
+restrictions independently of `is_test_build`; `sai check --tests` enables
+test analysis but does not mark a test-build artifact. For root test analysis,
+foreign package resolution still cannot complete because active test edges and
+foreign scopes are not wired. A test-only `pub use` is diagnosed at its
+`PKG_PATH` and excluded from local re-export lookup in either mode. Every
+binding introduced by a test-only entry has `ImportBinding::test_only = true`.
+Checking ordinary references to these bindings at their use site, including
+the note back to the import, remains unimplemented (§3.4.10).
 
 ### 3.3.4 Phase 3: module scopes `S(M)`
 
