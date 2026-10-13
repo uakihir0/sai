@@ -8099,6 +8099,19 @@ let byte_non_ascii = b"€"
     }
 
     #[test]
+    fn use_item_lists_require_at_least_one_item() {
+        for source in ["use acme:package.{}\n", "use acme:package.{\n}\n"] {
+            let output = parse_file(source);
+            assert_eq!(
+                output.errors.len(),
+                1,
+                "expected one empty-list error in {source:?}"
+            );
+            assert_eq!(output.errors[0].code, Code::ExpectedToken, "{source:?}");
+        }
+    }
+
+    #[test]
     fn missing_use_items_close_preserves_the_next_top_level_use() {
         let source =
             "use sai:http.{Request,\n/// second import\n@allow(UNUSED_IMPORTS)\nuse sai:other\n";

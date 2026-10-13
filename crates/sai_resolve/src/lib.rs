@@ -2,7 +2,9 @@
 
 pub mod module_target;
 pub mod package_scopes;
+pub mod use_binding;
 pub mod use_path;
+pub mod use_target;
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
 use sai_intern::{InternError, Interner, PackageId, PackageIdError, PackageInterner, Symbol};

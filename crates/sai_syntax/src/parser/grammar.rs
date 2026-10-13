@@ -7975,6 +7975,8 @@ impl Parser<'_, '_> {
         let items = self.start();
         self.bump();
         self.bump();
+        let mut has_item = false;
+        let mut had_invalid_item = false;
 
         while !self.at(SyntaxKind::R_BRACE) && !self.at(SyntaxKind::EOF) {
             if self.line_starts_top_level_item() {
@@ -7993,7 +7995,10 @@ impl Parser<'_, '_> {
             }
             let position = self.position;
             let parsed_item = self.use_item()?;
-            if !parsed_item {
+            if parsed_item {
+                has_item = true;
+            } else {
+                had_invalid_item = true;
                 self.recover_one()?;
             }
             if self.line_starts_top_level_item() {
@@ -8024,6 +8029,9 @@ impl Parser<'_, '_> {
             }
         }
 
+        if !has_item && !had_invalid_item && self.at(SyntaxKind::R_BRACE) {
+            self.expect_any(IDENT_KINDS)?;
+        }
         self.expect(SyntaxKind::R_BRACE)?;
         items.complete(self, SyntaxKind::USE_ITEMS)?;
         Ok(())

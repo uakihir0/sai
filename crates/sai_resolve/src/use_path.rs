@@ -194,6 +194,7 @@ mod tests {
             is_pub: false,
             pkg_path: pkg_path.to_owned(),
             alias: None,
+            has_items: false,
             items: Vec::<UseItem>::new(),
             raw_attrs: Vec::new(),
         }

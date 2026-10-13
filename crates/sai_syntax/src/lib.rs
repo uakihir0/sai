@@ -877,6 +877,14 @@ pub fn is_reserved_identifier(name: &str) -> bool {
     matches!(keyword_class(name), Some(KeywordClass::Reserved(_)))
 }
 
+/// Returns whether a bare, non-raw identifier is a strict keyword.
+///
+/// This uses the same classification as the lexer, so callers do not need to
+/// maintain a second keyword list.
+pub fn is_strict_keyword(name: &str) -> bool {
+    matches!(keyword_class(name), Some(KeywordClass::Strict(_)))
+}
+
 /// Lexes and parses one file, then binds its red root to the exact snapshot
 /// source used by the parser. Returned diagnostics are ordered by source range.
 pub fn parse(snapshot: &WorkspaceSnapshot, file_id: FileId) -> Result<Parse, ParseError> {
@@ -4959,6 +4967,15 @@ mod tests {
         assert!(!is_reserved_identifier("name"));
         assert!(!is_reserved_identifier("result"));
         assert!(!is_reserved_identifier("and"));
+    }
+
+    #[test]
+    fn exposes_strict_keyword_classification() {
+        assert!(is_strict_keyword("and"));
+        assert!(is_strict_keyword("type"));
+        assert!(is_strict_keyword("self"));
+        assert!(!is_strict_keyword("result"));
+        assert!(!is_strict_keyword("fs"));
     }
 
     #[test]

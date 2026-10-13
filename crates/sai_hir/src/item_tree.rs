@@ -232,6 +232,8 @@ pub struct UseEntry {
     pub is_pub: bool,
     pub pkg_path: String,
     pub alias: Option<Symbol>,
+    /// Whether the declaration contains a `UseItems` list, including `{}`.
+    pub has_items: bool,
     pub items: Vec<UseItem>,
     pub raw_attrs: Vec<RawAttr>,
 }
@@ -315,6 +317,7 @@ struct StableUseEntry {
     is_pub: bool,
     pkg_path: String,
     alias: Option<StableSymbol>,
+    has_items: bool,
     items: Vec<StableUseItem>,
     raw_attrs: Vec<StableRawAttr>,
 }
@@ -574,6 +577,7 @@ impl StableUseEntry {
                 .alias
                 .map(|symbol| stable_symbol(symbol, symbols))
                 .transpose()?,
+            has_items: entry.has_items,
             items: entry
                 .items
                 .iter()
@@ -711,11 +715,12 @@ impl StableHash for StableItemTree {
 
 impl StableHash for StableUseEntry {
     fn stable_hash(&self, hasher: &mut StableHasher) {
-        hasher.write_tag(0xD1);
+        hasher.write_tag(0xDA);
         self.ast_id.index().stable_hash(hasher);
         self.is_pub.stable_hash(hasher);
         self.pkg_path.stable_hash(hasher);
         stable_hash_option(&self.alias, hasher);
+        self.has_items.stable_hash(hasher);
         self.items.stable_hash(hasher);
         self.raw_attrs.stable_hash(hasher);
     }
@@ -1704,6 +1709,7 @@ fn collect_use(
             .is_some_and(|visibility| visibility.pub_token().is_some()),
         pkg_path,
         alias,
+        has_items: node.items().is_some(),
         items,
         raw_attrs: raw_attrs(file, source, node.attrs(), symbols)?,
     })
@@ -3591,6 +3597,7 @@ mod tests {
         assert_eq!(tree.uses.len(), 1);
         assert_eq!(tree.uses[0].pkg_path, "sai:core/fmt");
         assert!(tree.uses[0].is_pub);
+        assert!(tree.uses[0].has_items);
         assert_eq!(tree.uses[0].items.len(), 2);
         assert_eq!(
             &*symbols
@@ -3662,6 +3669,60 @@ mod tests {
         assert_eq!(tree.items[6].children[0].kind, ItemTreeKind::ExternFn);
         assert_eq!(tree.items[7].kind, ItemTreeKind::Test);
         assert_eq!(tree.items[8].kind, ItemTreeKind::Property);
+    }
+
+    #[test]
+    fn stable_item_tree_preserves_empty_use_items_presence() {
+        let file = FileId::new(721);
+        let source_without_items = "use acme:package\n";
+        let source_with_empty_items = "use acme:package.{}\n";
+        let (parsed_without, ast_ids_without, symbols, tree_without, _) =
+            collect_with_snapshot(source_without_items, file);
+        let (parsed_with, ast_ids_with, _, tree_with, _) =
+            collect_with_snapshot(source_with_empty_items, file);
+
+        assert!(parsed_without.errors.is_empty());
+        assert_eq!(parsed_with.errors.len(), 1);
+        assert_eq!(
+            parsed_with.errors[0].code,
+            sai_diagnostics::Code::ExpectedToken
+        );
+        assert!(!tree_without.uses[0].has_items);
+        assert!(tree_with.uses[0].has_items);
+        assert!(tree_with.uses[0].items.is_empty());
+
+        let stable_without = tree_without
+            .stable_shape(&symbols)
+            .expect("item tree has a stable shape");
+        let stable_with = tree_with
+            .stable_shape(&symbols)
+            .expect("item tree has a stable shape");
+        assert_ne!(stable_without, stable_with);
+
+        assert_eq!(
+            stable_without
+                .bind_to_snapshot(
+                    file,
+                    source_without_items,
+                    &parsed_without.root,
+                    &ast_ids_without,
+                    &symbols,
+                )
+                .unwrap(),
+            tree_without
+        );
+        assert_eq!(
+            stable_with
+                .bind_to_snapshot(
+                    file,
+                    source_with_empty_items,
+                    &parsed_with.root,
+                    &ast_ids_with,
+                    &symbols,
+                )
+                .unwrap(),
+            tree_with
+        );
     }
 
     #[test]
