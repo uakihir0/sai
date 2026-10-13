@@ -230,31 +230,43 @@ For each module in `ModuleId` order, Phase 1 walks the module's `ItemTree` ([imp
 
 Member namespaces of items (variants, associated functions, fields, trait items) are not built here. They are part of `adt_def`, `trait_def` and `inherent_impls` (§3.6, §3.9), because their duplicate rules are owned by spec/05 and some of them depend on impls.
 
-**Temporary CLI Phase 3 slice (IR-466).** The driver currently extends these
-Phase 1 scopes only with same-package module and interface aliases. Its
-`Phase1ModuleScopes` facade has `declared`, a hash-map `scope`, and an
-`imports` list; it does not yet contain the final member namespace `X(M)` or
-re-export fixpoint state. A module alias uses its target module's canonical
-`DefId`, represented for now as `Res::Def(DefKind::Module, def_id)`; a local
-interface alias uses its declaring interface's `DefId` as
-`Res::Def(DefKind::Interface, def_id)`. Explicit aliases keep their spelling;
+**Temporary CLI Phase 3 slice (IR-467).** The driver extends these Phase 1
+scopes with local module and interface aliases, local module item imports, and
+local `pub use` re-exports. `Phase1ModuleScopes` now includes `declared`,
+`members`, `scope`, and an `imports` list. Module aliases still use canonical
+module `DefId`s as `Res::Def(DefKind::Module, def_id)`; a local interface alias
+uses the declaring interface's `DefId`. Explicit aliases keep their spelling;
 otherwise the last path segment or package name is used, with hyphens changed
-to underscores. For a parseable use path, binding-name keyword/reserved-name
-checks happen before target resolution, so a name is checked even when its
-target is unknown or foreign. `PUB_USE_WITHOUT_ITEMS` is reported for every
-retained `pub use` without an item list, even when `PKG_PATH` is absent. When
-the path token exists, the diagnostic uses its range before malformed-path
-resolution is deferred; when it is absent, the diagnostic uses the full
-`UseDecl` span. Item-only uses do not bind their target. Alias
-bindings remain private to their module, even when an alias appears on a
-`pub use` that also has an item list. The pass reports `REDUNDANT_IMPORT` for
-an alias that already names the same target and `DUPLICATE_BINDING` for a
-conflict with another entity. A newly inserted local module or interface
-alias named `panic` or `unreachable` also produces `SHADOWS_PRELUDE`. The
-imports it records are aliases only (`item_index: None`, `test_only: false`).
-Foreign package targets, item imports, test-only classification, prelude
-checks for declarations and item aliases, prelude checks on foreign targets,
-the full prelude table, and the re-export lookup/fixpoint remain unimplemented.
+to underscores. For parseable paths, binding-name keyword/reserved-name checks
+precede target selection, and `PUB_USE_WITHOUT_ITEMS` is reported for each
+retained `pub use` without an item list, including malformed or missing paths.
+Item-only uses do not bind their target. An alias on a `pub use` remains a
+private module-local binding; only its listed items can enter `members`.
+
+Each local module's `members` is initialized from `declared` and extended only
+by successful local `pub use` items. Ordinary module aliases and item imports
+remain private to their source module and never become members. Item imports
+resolve through direct declarations and local re-export chains, preserve the
+original `Res`/`DefId`, and retain one `ImportBinding` per alias or listed item
+with its source item index and binding-name span. Ordinary same-package imports
+may resolve package-private declarations; `pub use` requires the resolved
+entity to have exact `pub` visibility. The local lookup memo is keyed by
+`(ModuleId, Symbol)`, detects re-export cycles once, and keeps missing,
+deferred, failed, and cyclic lookups distinct. Scope bindings are inserted
+after item resolution in source order, so a later module alias or listed item
+receives `DUPLICATE_BINDING` and the earlier binding remains. Same-entity
+imports produce `REDUNDANT_IMPORT`; unresolved local items include up to three
+nearby names from the resolved member namespace.
+
+Foreign package and interface member tables remain deferred, as do test-only
+classification, the full prelude checks for declarations and item aliases,
+declared-requirement checks, and the final `package_scopes(PackageId)` query.
+When a foreign/interface re-export candidate precedes a known local candidate
+with the same name, this bridge uses the successful local candidate while
+retaining the foreign/interface item as deferred; a complete package resolver
+must replace this temporary recovery rule with the final ordered package
+lookup. Type checking, lints, fixes, and successful `check` result records
+remain unavailable and are represented by `FEATURE_NOT_IMPLEMENTED`.
 
 ### 3.3.3 Phase 2: the import fixpoint
 
