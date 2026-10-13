@@ -71,7 +71,7 @@ struct DirectoryWalker<'a> {
     visited_directories: &'a mut HashSet<PathBuf>,
     cancellation: &'a CancellationToken,
     retain_capabilities: bool,
-    workspace_source: bool,
+    traversal_mode: FmtTraversalMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -79,6 +79,7 @@ enum FmtTraversalMode {
     #[default]
     ExplicitPaths,
     WorkspaceSource,
+    ModuleTree,
 }
 
 /// Expands explicit file and directory arguments using the `sai fmt` rules.
@@ -144,6 +145,24 @@ pub(crate) fn select_fmt_workspace_paths_for_comparison(
         cancellation,
         false,
         FmtTraversalMode::WorkspaceSource,
+    )
+}
+
+/// Selects visible `.sai` files below a declared source root for module parsing.
+///
+/// The declared root itself is traversed even when its basename starts with a
+/// dot. Dot-prefixed entries below it, including their contents, are skipped.
+pub(crate) fn select_fmt_module_paths(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_paths_inner(
+        paths,
+        current_directory,
+        cancellation,
+        true,
+        FmtTraversalMode::ModuleTree,
     )
 }
 
@@ -256,7 +275,7 @@ fn select_fmt_paths_inner(
                 visited_directories: &mut visited_directories,
                 cancellation,
                 retain_capabilities,
-                workspace_source: mode == FmtTraversalMode::WorkspaceSource,
+                traversal_mode: mode,
             }
             .walk(root_directory, root);
             if selection.interrupted {
@@ -379,7 +398,12 @@ impl DirectoryWalker<'_> {
                     continue;
                 }
                 if file_type.is_dir() {
-                    if !self.workspace_source && should_skip_directory(&directory, &name) {
+                    let skip_directory = match self.traversal_mode {
+                        FmtTraversalMode::ExplicitPaths => should_skip_directory(&directory, &name),
+                        FmtTraversalMode::WorkspaceSource => false,
+                        FmtTraversalMode::ModuleTree => is_hidden_entry_name(&name),
+                    };
+                    if skip_directory {
                         continue;
                     }
                     child_directories.push(PendingDirectory::Child {
@@ -389,13 +413,12 @@ impl DirectoryWalker<'_> {
                     });
                     continue;
                 }
-                if file_type.is_file()
-                    && if self.workspace_source {
-                        is_source_file(&path)
-                    } else {
-                        is_formatter_file(&path)
-                    }
-                {
+                let selected_file = match self.traversal_mode {
+                    FmtTraversalMode::ExplicitPaths => is_formatter_file(&path),
+                    FmtTraversalMode::WorkspaceSource => is_source_file(&path),
+                    FmtTraversalMode::ModuleTree => is_module_source_file(&path),
+                };
+                if file_type.is_file() && selected_file {
                     let is_package_manifest = name == "sai.package";
                     push_selected_file(
                         path,
@@ -452,7 +475,7 @@ fn should_skip_root_directory(path: &Path) -> bool {
     let Some(name) = path.file_name() else {
         return false;
     };
-    if is_hidden_directory_name(name) {
+    if is_hidden_entry_name(name) {
         return true;
     }
     if name != "out" {
@@ -467,7 +490,7 @@ fn should_skip_root_directory(path: &Path) -> bool {
 }
 
 fn should_skip_directory(parent: &Dir, name: &OsStr) -> bool {
-    if is_hidden_directory_name(name) {
+    if is_hidden_entry_name(name) {
         return true;
     }
     name == "out"
@@ -476,7 +499,7 @@ fn should_skip_directory(parent: &Dir, name: &OsStr) -> bool {
             .is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
-fn is_hidden_directory_name(name: &OsStr) -> bool {
+fn is_hidden_entry_name(name: &OsStr) -> bool {
     name.as_encoded_bytes().starts_with(b".")
 }
 
@@ -490,6 +513,11 @@ fn is_source_file(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "sai")
 }
 
+fn is_module_source_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| !is_hidden_entry_name(name))
+        && is_source_file(path)
+}
 fn push_explicit_file(
     path: &Path,
     selection: &mut FmtPathSelection,
