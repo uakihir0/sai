@@ -2134,7 +2134,9 @@ fn validate_export_name_on_use(
     Ok(())
 }
 
-fn suppress_export_name_feature_gate(
+/// Removes Stage 0 target-filter gate diagnostics for valid `@export_name`
+/// attributes, whose supported validation is performed by Phase 1.
+pub fn suppress_export_name_feature_gate(
     attributes: &[sai_hir::item_tree::RawAttr],
     diagnostics: &mut Vec<Diagnostic>,
 ) {

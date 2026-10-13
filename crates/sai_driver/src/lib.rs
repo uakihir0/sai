@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use sai_diagnostics::{Diagnostic, OverrideLintLevel, SourceRef, source_text_status_diagnostic};
+use sai_diagnostics::{
+    CauseKey, Child, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related, SourceRef,
+    source_text_status_diagnostic,
+};
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::item_tree::{ItemTree, TargetFilterError, TargetFilterResult};
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
@@ -16,9 +19,10 @@ use sai_package::mvs_diagnostics::{
     mixed_source_identity_failure_diagnostics, mixed_source_reload_failure_diagnostics,
     root_dependency_cycle_diagnostics, version_conflict_diagnostics,
 };
-use sai_query::{Durability, QueryDatabase, QueryError};
+use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_resolve::package_scopes::{
     FilteredModule, PackageScopesError, collect_local_module_alias_bindings, collect_phase1,
+    suppress_export_name_feature_gate,
 };
 pub use sai_resolve::package_scopes::{
     Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
@@ -27,6 +31,7 @@ use sai_resolve::use_target_diagnostics::{
     UseTargetDiagnosticsError, collect_local_use_target_diagnostics,
 };
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
+use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
@@ -34,6 +39,7 @@ use sai_vfs::{
     PackageSourcePath, SnapshotFile, SourceDecodeError, SourceFile, SourceText, VfsInputSnapshot,
     VfsInputUpdate, VfsInputs, WitFilesSnapshot, WorkspaceSnapshot, WorkspaceSnapshotError,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -53,12 +59,251 @@ pub struct RootDatabase {
     syntax: SyntaxQueries,
     hir: ItemTreeQueries,
     resolve: ModuleTreeQueries<VfsInputs>,
-    packages: PackageInterner,
+    packages: Arc<PackageInterner>,
     files: FileInterner,
-    symbols: Interner,
+    symbols: Arc<Interner>,
     /// Retained for the lifetime of this database so every `DefId` returned
     /// by Phase 1 remains associated with its original package-local paths.
-    def_paths: HashMap<PackageId, DefPathInterner>,
+    def_paths: HashMap<PackageId, Arc<DefPathInterner>>,
+    package_scopes: Phase1PackageScopesQueries,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Phase1PackageScopesIdentity {
+    package: PackageKey,
+    modules: Vec<Phase1ModuleIdentity>,
+    namespaces: Vec<Phase1NamespaceIdentity>,
+    target_name: String,
+    target_capabilities: BTreeSet<String>,
+    build_context: Phase1BuildContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Phase1ModuleIdentity {
+    path: Vec<String>,
+    file_id: u32,
+    source_path: String,
+    source_package: Option<String>,
+    document_version: Option<u64>,
+    source_bytes: Arc<[u8]>,
+    parent_dir: Option<u32>,
+    children: Vec<(String, StableChildEntry)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Phase1NamespaceIdentity {
+    path: Vec<String>,
+    children: Vec<(String, StableChildEntry)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StableChildEntry {
+    Module(u32),
+    Namespace(u32),
+    Both(u32, u32),
+}
+
+struct StagedPhase1PackageScopesInput {
+    identity: Arc<Phase1PackageScopesIdentity>,
+    prepared: Arc<PreparedPhase1PackageScopes>,
+}
+
+struct PreparedPhase1PackageScopes {
+    module_tree: ModuleTree,
+    snapshot: WorkspaceSnapshot,
+    target_cfg: TargetCfg,
+    build_context: Phase1BuildContext,
+    modules: Vec<OwnedPhase1ModuleInput>,
+    def_paths: Arc<DefPathInterner>,
+}
+
+thread_local! {
+    static STAGED_PHASE1_PACKAGE_SCOPES: RefCell<HashMap<PackageKey, StagedPhase1PackageScopesInput>> =
+        RefCell::new(HashMap::new());
+}
+
+struct StagedPhase1InputGuard {
+    key: PackageKey,
+    previous: Option<StagedPhase1PackageScopesInput>,
+}
+
+impl StagedPhase1InputGuard {
+    fn install(
+        key: PackageKey,
+        identity: Arc<Phase1PackageScopesIdentity>,
+        prepared: Arc<PreparedPhase1PackageScopes>,
+    ) -> Self {
+        let previous = STAGED_PHASE1_PACKAGE_SCOPES.with(|staged| {
+            staged.borrow_mut().insert(
+                key.clone(),
+                StagedPhase1PackageScopesInput { identity, prepared },
+            )
+        });
+        Self { key, previous }
+    }
+}
+
+impl Drop for StagedPhase1InputGuard {
+    fn drop(&mut self) {
+        STAGED_PHASE1_PACKAGE_SCOPES.with(|staged| {
+            let mut staged = staged.borrow_mut();
+            staged.remove(&self.key);
+            if let Some(previous) = self.previous.take() {
+                staged.insert(self.key.clone(), previous);
+            }
+        });
+    }
+}
+
+struct OwnedPhase1ModuleInput {
+    filtered: TargetFilterResult,
+    ast_ids: sai_syntax::ast::AstIdMap,
+    root: sai_syntax::SyntaxNode,
+    source: Arc<SourceFile>,
+    source_ref: SourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DetachedWorkspaceDiagnostic {
+    code: sai_diagnostics::Code,
+    severity: sai_diagnostics::Severity,
+    message: String,
+    primary: Option<sai_diagnostics::Location>,
+    primary_label: String,
+    labels: Vec<Label>,
+    children: Vec<Child>,
+    related: Vec<Related>,
+    data: sai_diagnostics::ValueObject,
+    node: Option<String>,
+    symbol: Option<String>,
+    package: Option<String>,
+    cause: CauseKey,
+    level: Option<LevelInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Phase1PackageScopesMemo {
+    scopes: Phase1PackageScopes,
+    detached_workspace_diagnostics: Vec<DetachedWorkspaceDiagnostic>,
+}
+
+#[derive(Clone)]
+struct Phase1PackageScopesQueryOutput {
+    identity: Arc<Phase1PackageScopesIdentity>,
+    input_fingerprint: Fingerprint,
+    result: Result<Phase1PackageScopesMemo, Phase1CollectionError>,
+}
+
+impl PartialEq for Phase1PackageScopesQueryOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.result == other.result
+    }
+}
+
+impl Eq for Phase1PackageScopesQueryOutput {}
+
+impl StableHash for Phase1PackageScopesQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        self.input_fingerprint.stable_hash(hasher);
+    }
+}
+
+struct Phase1PackageScopesQueries {
+    input: InputQuery<PackageKey, Phase1PackageScopesIdentity>,
+    query: DerivedQuery<PackageKey, Phase1PackageScopesQueryOutput>,
+}
+
+impl Phase1PackageScopesQueries {
+    fn new(packages: Arc<PackageInterner>, symbols: Arc<Interner>) -> Result<Self, QueryError> {
+        let input = InputQuery::<PackageKey, Phase1PackageScopesIdentity>::new(
+            "package_scopes_input",
+            Durability::Low,
+        )?;
+        let query_input = input.clone();
+        let query = DerivedQuery::new(
+            "package_scopes",
+            move |database: &mut QueryDatabase, key: &PackageKey| {
+                let identity = query_input.get(database, key.clone())?;
+                let staged = STAGED_PHASE1_PACKAGE_SCOPES.with(|staged| {
+                    staged
+                        .borrow()
+                        .get(key)
+                        .filter(|staged| staged.identity.as_ref() == identity.as_ref())
+                        .map(|staged| Arc::clone(&staged.prepared))
+                });
+                let Some(prepared) = staged else {
+                    return Err(QueryError::MissingInput {
+                        query: "package_scopes_prepared_inputs".to_owned(),
+                    });
+                };
+                let result = collect_prepared_phase1_package_scopes(&prepared, &packages, &symbols);
+                Ok(Phase1PackageScopesQueryOutput {
+                    input_fingerprint: fingerprint(identity.as_ref()),
+                    identity,
+                    result,
+                })
+            },
+        )?;
+        Ok(Self { input, query })
+    }
+}
+
+impl StableHash for Phase1PackageScopesIdentity {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD1);
+        self.package.stable_hash(hasher);
+        self.modules.stable_hash(hasher);
+        self.namespaces.stable_hash(hasher);
+        self.target_name.stable_hash(hasher);
+        self.target_capabilities.stable_hash(hasher);
+        self.build_context
+            .is_root_core_module_build
+            .stable_hash(hasher);
+        self.build_context.is_test_build.stable_hash(hasher);
+    }
+}
+
+impl StableHash for Phase1ModuleIdentity {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD2);
+        self.path.stable_hash(hasher);
+        self.file_id.stable_hash(hasher);
+        self.source_path.stable_hash(hasher);
+        self.source_package.stable_hash(hasher);
+        self.document_version.stable_hash(hasher);
+        self.source_bytes.stable_hash(hasher);
+        self.parent_dir.stable_hash(hasher);
+        self.children.stable_hash(hasher);
+    }
+}
+
+impl StableHash for Phase1NamespaceIdentity {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD3);
+        self.path.stable_hash(hasher);
+        self.children.stable_hash(hasher);
+    }
+}
+
+impl StableHash for StableChildEntry {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD4);
+        match self {
+            Self::Module(module) => {
+                hasher.write_tag(0);
+                module.stable_hash(hasher);
+            }
+            Self::Namespace(namespace) => {
+                hasher.write_tag(1);
+                namespace.stable_hash(hasher);
+            }
+            Self::Both(module, namespace) => {
+                hasher.write_tag(2);
+                module.stable_hash(hasher);
+                namespace.stable_hash(hasher);
+            }
+        }
+    }
 }
 
 /// Owns the CLI's cancellation state and installs the process interrupt handler.
@@ -231,6 +476,8 @@ pub enum Phase1CollectionError {
     DefPathInterner(DefPathInternerError),
     MissingSnapshotFile(FileId),
     TooManyModules,
+    SnapshotBoundDiagnosticHasFixes,
+    Query(QueryError),
 }
 
 impl From<ParseQueryError> for Phase1CollectionError {
@@ -267,6 +514,290 @@ impl From<DefPathInternerError> for Phase1CollectionError {
     fn from(error: DefPathInternerError) -> Self {
         Self::DefPathInterner(error)
     }
+}
+
+impl From<QueryError> for Phase1CollectionError {
+    fn from(error: QueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
+fn phase1_package_scopes_identity(
+    package: PackageKey,
+    module_tree: &ModuleTree,
+    modules: &[OwnedPhase1ModuleInput],
+    target_cfg: &TargetCfg,
+    build_context: Phase1BuildContext,
+    symbols: &Interner,
+) -> Result<Phase1PackageScopesIdentity, Phase1CollectionError> {
+    let modules = module_tree
+        .modules
+        .iter()
+        .zip(modules)
+        .map(|(module, input)| {
+            let path = module
+                .path
+                .iter()
+                .map(|symbol| {
+                    symbols
+                        .resolve(*symbol)
+                        .map(|name| name.to_string())
+                        .map_err(PackageScopesError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let children = module
+                .children
+                .iter()
+                .map(|(name, entry)| (name.clone(), stable_child_entry(*entry)))
+                .collect();
+            Ok(Phase1ModuleIdentity {
+                path,
+                file_id: module.file.raw(),
+                source_path: input.source_ref.path.clone(),
+                source_package: input.source_ref.package.clone(),
+                document_version: input.source_ref.snapshot,
+                source_bytes: Arc::from(input.source.raw_bytes()),
+                parent_dir: module.parent_dir.map(ModuleId::raw),
+                children,
+            })
+        })
+        .collect::<Result<Vec<_>, Phase1CollectionError>>()?;
+    let namespaces = module_tree
+        .namespaces
+        .iter()
+        .map(|namespace| {
+            let path = namespace
+                .path
+                .iter()
+                .map(|symbol| {
+                    symbols
+                        .resolve(*symbol)
+                        .map(|name| name.to_string())
+                        .map_err(PackageScopesError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let children = namespace
+                .children
+                .iter()
+                .map(|(name, entry)| (name.clone(), stable_child_entry(*entry)))
+                .collect();
+            Ok(Phase1NamespaceIdentity { path, children })
+        })
+        .collect::<Result<Vec<_>, Phase1CollectionError>>()?;
+
+    Ok(Phase1PackageScopesIdentity {
+        package,
+        modules,
+        namespaces,
+        target_name: target_cfg.target_name().to_owned(),
+        target_capabilities: target_cfg.capabilities().clone(),
+        build_context,
+    })
+}
+
+fn stable_child_entry(entry: sai_resolve::ChildEntry) -> StableChildEntry {
+    match entry {
+        sai_resolve::ChildEntry::Module(module) => StableChildEntry::Module(module.raw()),
+        sai_resolve::ChildEntry::Namespace(namespace) => {
+            StableChildEntry::Namespace(namespace.raw())
+        }
+        sai_resolve::ChildEntry::Both(module, namespace) => {
+            StableChildEntry::Both(module.raw(), namespace.raw())
+        }
+    }
+}
+
+fn current_phase1_target_filter_diagnostics(input: &OwnedPhase1ModuleInput) -> Vec<Diagnostic> {
+    fn suppress_entry_diagnostics(
+        entry: &sai_hir::item_tree::ItemTreeEntry,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        suppress_export_name_feature_gate(&entry.raw_attrs, diagnostics);
+        for child in &entry.children {
+            suppress_entry_diagnostics(child, diagnostics);
+        }
+    }
+
+    let mut diagnostics = input.filtered.diagnostics.clone();
+    for use_entry in &input.filtered.item_tree.uses {
+        suppress_export_name_feature_gate(&use_entry.raw_attrs, &mut diagnostics);
+    }
+    for entry in &input.filtered.item_tree.items {
+        suppress_entry_diagnostics(entry, &mut diagnostics);
+    }
+    diagnostics
+}
+
+fn collect_prepared_phase1_package_scopes(
+    prepared: &PreparedPhase1PackageScopes,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> Result<Phase1PackageScopesMemo, Phase1CollectionError> {
+    if prepared.module_tree.modules.len() > u32::MAX as usize {
+        return Err(Phase1CollectionError::TooManyModules);
+    }
+    let module_inputs = prepared
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let raw = u32::try_from(index).map_err(|_| Phase1CollectionError::TooManyModules)?;
+            Ok((
+                ModuleId::from_raw(raw),
+                FilteredModule {
+                    filtered: &input.filtered,
+                    ast_ids: &input.ast_ids,
+                    root: &input.root,
+                    source: input.source.as_ref(),
+                    source_ref: input.source_ref.clone(),
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, Phase1CollectionError>>()?;
+
+    let mut scopes = collect_phase1(
+        &prepared.module_tree,
+        &module_inputs,
+        Phase1CollectionConfig {
+            snapshot: &prepared.snapshot,
+            target_cfg: &prepared.target_cfg,
+            build_context: prepared.build_context,
+        },
+        packages,
+        symbols,
+        &prepared.def_paths,
+    )?;
+    // Target filtering runs on every public request so its diagnostics always
+    // carry that request's WorkspaceSnapshot. Keep those values out of the
+    // package-scope memo; the adapter appends the freshly prepared diagnostics.
+    for diagnostic in prepared
+        .modules
+        .iter()
+        .flat_map(|input| &input.filtered.diagnostics)
+    {
+        if let Some(index) = scopes
+            .diagnostics
+            .iter()
+            .position(|candidate| candidate == diagnostic)
+        {
+            scopes.diagnostics.remove(index);
+        }
+    }
+    let use_target_diagnostics = collect_local_use_target_diagnostics(
+        &prepared.module_tree,
+        &module_inputs,
+        &scopes,
+        packages,
+        symbols,
+    )?;
+    scopes.diagnostics.extend(use_target_diagnostics);
+    let module_alias_diagnostics = collect_local_module_alias_bindings(
+        &prepared.module_tree,
+        &module_inputs,
+        &mut scopes,
+        packages,
+        symbols,
+        &prepared.def_paths,
+    )?;
+    scopes.diagnostics.extend(module_alias_diagnostics);
+    sort_phase1_diagnostics(&mut scopes.diagnostics);
+
+    // Snapshot-bound diagnostics cannot be retained in this package memo.
+    // Store their source-relative structure, then validate and bind them to
+    // the requesting workspace snapshot in the public adapter.
+    let mut detached_workspace_diagnostics = Vec::new();
+    let mut snapshot_independent_diagnostics = Vec::new();
+    for diagnostic in scopes.diagnostics.drain(..) {
+        if diagnostic.has_workspace_snapshot() {
+            detached_workspace_diagnostics
+                .push(DetachedWorkspaceDiagnostic::from_diagnostic(&diagnostic)?);
+        } else {
+            snapshot_independent_diagnostics.push(diagnostic);
+        }
+    }
+    scopes.diagnostics = snapshot_independent_diagnostics;
+    Ok(Phase1PackageScopesMemo {
+        scopes,
+        detached_workspace_diagnostics,
+    })
+}
+
+impl DetachedWorkspaceDiagnostic {
+    fn from_diagnostic(diagnostic: &Diagnostic) -> Result<Self, Phase1CollectionError> {
+        if !diagnostic.fixes().is_empty() {
+            return Err(Phase1CollectionError::SnapshotBoundDiagnosticHasFixes);
+        }
+        Ok(Self {
+            code: diagnostic.code,
+            severity: diagnostic.severity,
+            message: diagnostic.message.clone(),
+            primary: diagnostic.primary().cloned(),
+            primary_label: diagnostic.primary_label.clone(),
+            labels: diagnostic.labels().to_vec(),
+            children: diagnostic.children().to_vec(),
+            related: diagnostic.related().to_vec(),
+            data: diagnostic.data.clone(),
+            node: diagnostic.node.clone(),
+            symbol: diagnostic.symbol.clone(),
+            package: diagnostic.package.clone(),
+            cause: diagnostic.cause().clone(),
+            level: diagnostic.level().cloned(),
+        })
+    }
+
+    fn bind(&self, snapshot: &WorkspaceSnapshot) -> Result<Diagnostic, PackageScopesError> {
+        let mut diagnostic = Diagnostic::new(
+            self.code,
+            self.severity,
+            self.message.clone(),
+            self.primary.clone(),
+        );
+        diagnostic.primary_label = self.primary_label.clone();
+        diagnostic.data = self.data.clone();
+        diagnostic.node = self.node.clone();
+        diagnostic.symbol = self.symbol.clone();
+        diagnostic.package = self.package.clone();
+        for label in &self.labels {
+            diagnostic
+                .push_label(label.clone())
+                .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+        }
+        for child in &self.children {
+            diagnostic
+                .push_child(child.clone())
+                .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+        }
+        for related in &self.related {
+            diagnostic
+                .push_related(related.clone())
+                .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+        }
+        diagnostic = diagnostic
+            .with_cause(self.cause.clone())
+            .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+        if let Some(level) = &self.level {
+            diagnostic
+                .set_level(Some(level.clone()))
+                .map_err(|_| PackageScopesError::InvalidSourceRange)?;
+        }
+        diagnostic
+            .with_workspace_snapshot(snapshot)
+            .map_err(|_| PackageScopesError::InvalidSourceRange)
+    }
+}
+
+fn sort_phase1_diagnostics(diagnostics: &mut [Diagnostic]) {
+    diagnostics.sort_by(|left, right| match (left.primary(), right.primary()) {
+        (Some(left), Some(right)) => left
+            .file
+            .path
+            .as_bytes()
+            .cmp(right.file.path.as_bytes())
+            .then_with(|| left.span.range.start().cmp(&right.span.range.start())),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
 }
 
 /// Reload diagnostics together with the workspace snapshot containing every
@@ -467,16 +998,21 @@ impl RootDatabase {
         let syntax = SyntaxQueries::new(vfs.clone())?;
         let hir = ItemTreeQueries::new(syntax.clone())?;
         let resolve = ModuleTreeQueries::new(vfs.clone())?;
+        let packages = Arc::new(PackageInterner::new());
+        let symbols = Arc::new(Interner::new());
+        let package_scopes =
+            Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
         Ok(Self {
             query_database: QueryDatabase::new(),
             vfs,
             syntax,
             hir,
             resolve,
-            packages: PackageInterner::new(),
+            packages,
             files: FileInterner::new(),
-            symbols: Interner::new(),
+            symbols,
             def_paths: HashMap::new(),
+            package_scopes,
         })
     }
 
@@ -809,10 +1345,14 @@ impl RootDatabase {
     /// Builds target-filtered declaration scopes for every module in
     /// `module_tree`, using source and AST data bound to `snapshot`.
     ///
-    /// This is the Phase 1 boundary only: it does not resolve `use`
-    /// declarations or compute import fixpoints. The database retains one
-    /// definition-path interner per package so `DefId`s in the returned
-    /// scopes can be resolved throughout this database's lifetime.
+    /// Target filtering prepares this query's source-bound input. Phase 1
+    /// declarations, local use-target diagnostics, and local module/interface
+    /// bindings run in the tracked `package_scopes` query. This remains a
+    /// local-only boundary: it does not load a foreign package graph, inspect
+    /// declared requirements or WIT, or enable Stage 4 behavior.
+    ///
+    /// The database retains one append-only definition-path interner per
+    /// package so returned `DefId`s remain resolvable for its lifetime.
     pub fn collect_phase1_package_scopes(
         &mut self,
         module_tree: &ModuleTree,
@@ -822,14 +1362,6 @@ impl RootDatabase {
     ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
         if module_tree.modules.len() > u32::MAX as usize {
             return Err(Phase1CollectionError::TooManyModules);
-        }
-
-        struct OwnedModuleInput {
-            filtered: TargetFilterResult,
-            ast_ids: sai_syntax::ast::AstIdMap,
-            root: sai_syntax::SyntaxNode,
-            source: Arc<SourceFile>,
-            source_ref: SourceRef,
         }
 
         let mut owned_inputs = Vec::with_capacity(module_tree.modules.len());
@@ -849,7 +1381,7 @@ impl RootDatabase {
                 snapshot,
                 target_cfg,
             )?;
-            owned_inputs.push(OwnedModuleInput {
+            owned_inputs.push(OwnedPhase1ModuleInput {
                 filtered,
                 ast_ids,
                 root: parsed.root,
@@ -864,79 +1396,70 @@ impl RootDatabase {
             });
         }
 
-        let module_inputs = owned_inputs
-            .iter()
-            .enumerate()
-            .map(|(index, input)| {
-                let raw =
-                    u32::try_from(index).map_err(|_| Phase1CollectionError::TooManyModules)?;
-                Ok((
-                    ModuleId::from_raw(raw),
-                    FilteredModule {
-                        filtered: &input.filtered,
-                        ast_ids: &input.ast_ids,
-                        root: &input.root,
-                        source: input.source.as_ref(),
-                        source_ref: input.source_ref.clone(),
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, Phase1CollectionError>>()?;
-
-        if !self.def_paths.contains_key(&module_tree.package) {
-            let interner =
-                DefPathInterner::new(module_tree.package, &self.packages, &self.symbols)?;
-            self.def_paths.insert(module_tree.package, interner);
-        }
-        let def_paths = self
-            .def_paths
-            .get(&module_tree.package)
-            .expect("the package definition-path interner was just installed");
-
-        let mut scopes = collect_phase1(
-            module_tree,
-            &module_inputs,
-            Phase1CollectionConfig {
-                snapshot,
-                target_cfg,
-                build_context,
-            },
-            &self.packages,
-            &self.symbols,
-            def_paths,
+        let package_key = PackageKey::new(
+            self.packages
+                .resolve(module_tree.package)
+                .map_err(PackageScopesError::from)?
+                .as_ref(),
         )
-        .map_err(Phase1CollectionError::from)?;
-        let use_target_diagnostics = collect_local_use_target_diagnostics(
+        .map_err(PackageScopesError::from)?;
+        let def_paths = if let Some(def_paths) = self.def_paths.get(&module_tree.package) {
+            Arc::clone(def_paths)
+        } else {
+            let def_paths = Arc::new(DefPathInterner::new(
+                module_tree.package,
+                &self.packages,
+                &self.symbols,
+            )?);
+            self.def_paths
+                .insert(module_tree.package, Arc::clone(&def_paths));
+            def_paths
+        };
+        let identity = Arc::new(phase1_package_scopes_identity(
+            package_key.clone(),
             module_tree,
-            &module_inputs,
-            &scopes,
-            &self.packages,
+            &owned_inputs,
+            target_cfg,
+            build_context,
             &self.symbols,
+        )?);
+        let prepared = Arc::new(PreparedPhase1PackageScopes {
+            module_tree: module_tree.clone(),
+            snapshot: snapshot.clone(),
+            target_cfg: target_cfg.clone(),
+            build_context,
+            modules: owned_inputs,
+            def_paths,
+        });
+        let _staged_input = StagedPhase1InputGuard::install(
+            package_key.clone(),
+            Arc::clone(&identity),
+            Arc::clone(&prepared),
+        );
+        self.package_scopes.input.set(
+            &mut self.query_database,
+            package_key.clone(),
+            identity.as_ref().clone(),
         )?;
-        scopes.diagnostics.extend(use_target_diagnostics);
-        let module_alias_diagnostics = collect_local_module_alias_bindings(
-            module_tree,
-            &module_inputs,
-            &mut scopes,
-            &self.packages,
-            &self.symbols,
-            def_paths,
-        )
-        .map_err(Phase1CollectionError::from)?;
-        scopes.diagnostics.extend(module_alias_diagnostics);
-        scopes
-            .diagnostics
-            .sort_by(|left, right| match (left.primary(), right.primary()) {
-                (Some(left), Some(right)) => left
-                    .file
-                    .path
-                    .as_bytes()
-                    .cmp(right.file.path.as_bytes())
-                    .then_with(|| left.span.range.start().cmp(&right.span.range.start())),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            });
+        let memo = self
+            .package_scopes
+            .query
+            .get(&mut self.query_database, package_key)?;
+        let memo = memo.result.as_ref().map_err(Clone::clone)?;
+        let mut scopes = memo.scopes.clone();
+        for input in &prepared.modules {
+            scopes
+                .diagnostics
+                .extend(current_phase1_target_filter_diagnostics(input));
+        }
+        for diagnostic in &memo.detached_workspace_diagnostics {
+            scopes.diagnostics.push(
+                diagnostic
+                    .bind(snapshot)
+                    .map_err(Phase1CollectionError::from)?,
+            );
+        }
+        sort_phase1_diagnostics(&mut scopes.diagnostics);
         Ok(scopes)
     }
 
@@ -1260,6 +1783,32 @@ mod tests {
         .expect("workspace snapshot is valid")
     }
 
+    fn snapshot_with_version(snapshot: &WorkspaceSnapshot, version: u64) -> WorkspaceSnapshot {
+        WorkspaceSnapshot::new(snapshot.iter().map(|file| {
+            SnapshotFile::new(
+                Arc::clone(file.source()),
+                file.path().to_owned(),
+                file.package().map(str::to_owned),
+                Some(version),
+            )
+        }))
+        .expect("versioned workspace snapshot is valid")
+    }
+
+    fn snapshot_with_unrelated_file(snapshot: &WorkspaceSnapshot) -> WorkspaceSnapshot {
+        let mut files = snapshot.iter().cloned().collect::<Vec<_>>();
+        files.push(SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(FileId::new(u32::MAX), b"fn unrelated() {}\n")
+                    .expect("unrelated source decodes"),
+            ),
+            "src/unrelated.sai",
+            Some("acme:phase1@1.0.0".to_owned()),
+            Some(1),
+        ));
+        WorkspaceSnapshot::new(files).expect("workspace snapshot with unrelated file is valid")
+    }
+
     fn phase1_fixture(
         root_contents: &[u8],
         child_contents: &[u8],
@@ -1366,6 +1915,24 @@ mod tests {
                 }
             })
             .unwrap_or_else(|| panic!("function `{name}` was not declared"))
+    }
+
+    fn phase1_has_function(
+        database: &RootDatabase,
+        scopes: &Phase1PackageScopes,
+        module: ModuleId,
+        name: &str,
+    ) -> bool {
+        scopes
+            .module(module)
+            .expect("module scopes exist")
+            .declared
+            .keys()
+            .any(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|symbol_name| symbol_name.as_ref() == name)
+            })
     }
 
     #[test]
@@ -1632,6 +2199,240 @@ mod tests {
         assert_eq!(
             previous_declaration.map(|location| location.file.snapshot),
             Some(Some(17))
+        );
+    }
+
+    #[test]
+    fn package_scopes_query_reuses_memo_for_the_same_prepared_input() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(b"fn stable() {}\n", b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let _ = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("phase 1 scopes collect");
+        let package_key = PackageKey::new("acme:phase1#1").expect("package key is valid");
+        let first = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("package scopes query is memoized");
+        let _ = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("the repeated request succeeds");
+        let second = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("repeated package scopes query is memoized");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the derived query should reuse the same memo for identical inputs"
+        );
+    }
+
+    #[test]
+    fn package_scopes_query_invalidates_when_target_configuration_changes() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"@target(\"wasm64-core\")\nfn only_wasm64() {}\n", b"");
+        let wasm32 = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wasm32_scopes = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &wasm32,
+                Phase1BuildContext::default(),
+            )
+            .expect("32-bit target scopes collect");
+        assert!(!phase1_has_function(
+            &database,
+            &wasm32_scopes,
+            ModuleId::ROOT,
+            "only_wasm64"
+        ));
+
+        let wasm64 = target_cfg_for_check("wasm64-core").expect("target config is valid");
+        let wasm64_scopes = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &wasm64,
+                Phase1BuildContext::default(),
+            )
+            .expect("64-bit target scopes collect");
+        assert!(phase1_has_function(
+            &database,
+            &wasm64_scopes,
+            ModuleId::ROOT,
+            "only_wasm64"
+        ));
+    }
+
+    #[test]
+    fn package_scopes_query_rebinds_export_diagnostics_and_invalidates_versions() {
+        let root = concat!(
+            "@export_name(\"duplicate\")\n",
+            "export fn first() {}\n",
+            "@export_name(\"duplicate\")\n",
+            "export fn second() {}\n",
+        );
+        let (mut database, module_tree, first_snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_core_module_build: true,
+            ..Phase1BuildContext::default()
+        };
+        let first_scopes = database
+            .collect_phase1_package_scopes(&module_tree, &first_snapshot, &target, context)
+            .expect("initial scopes collect");
+        assert!(first_scopes.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::DuplicateExportName
+                && diagnostic
+                    .primary()
+                    .is_some_and(|primary| primary.file.snapshot == Some(17))
+        }));
+
+        let same_version_snapshot = snapshot_with_version(&first_snapshot, 17);
+        let rebound_scopes = database
+            .collect_phase1_package_scopes(&module_tree, &same_version_snapshot, &target, context)
+            .expect("same-version snapshot scopes collect");
+        let rebound = rebound_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::DuplicateExportName)
+            .expect("duplicate export diagnostic is present");
+        assert!(
+            rebound
+                .clone()
+                .with_workspace_snapshot(&same_version_snapshot)
+                .is_ok(),
+            "cached export diagnostics bind to the current workspace snapshot"
+        );
+
+        let newer_snapshot = snapshot_with_version(&first_snapshot, 18);
+        let newer_scopes = database
+            .collect_phase1_package_scopes(&module_tree, &newer_snapshot, &target, context)
+            .expect("new document version scopes collect");
+        assert!(newer_scopes.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::DuplicateExportName
+                && diagnostic
+                    .primary()
+                    .is_some_and(|primary| primary.file.snapshot == Some(18))
+        }));
+    }
+
+    #[test]
+    fn package_scopes_query_reuses_memo_and_refreshes_attribute_diagnostics_for_new_snapshots() {
+        let source = concat!(
+            "@derive(Clone)\n",
+            "@export_name(1)\n",
+            "export fn staged() {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            source.as_bytes(),
+            b"@export_name(\"valid\")\nexport fn valid() {}\n",
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let first_scopes = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("initial scopes collect");
+        let first_diagnostic = first_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeArgument)
+            .expect("the invalid export-name argument is diagnosed");
+        assert!(
+            first_diagnostic
+                .clone()
+                .with_workspace_snapshot(&snapshot)
+                .is_ok(),
+            "the first attribute diagnostic is bound to the first snapshot"
+        );
+        assert!(first_diagnostic.has_workspace_snapshot());
+        assert!(first_scopes.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::FeatureNotImplemented
+                && diagnostic
+                    .primary()
+                    .is_some_and(|primary| primary.file.snapshot == Some(17))
+        }));
+        assert!(!first_scopes.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::FeatureNotImplemented
+                && matches!(
+                    diagnostic.data.get("feature"),
+                    Some(sai_diagnostics::Value::String(feature))
+                        if feature == "attribute @export_name"
+                )
+        }));
+        let package_key = PackageKey::new("acme:phase1#1").expect("package key is valid");
+        let first_memo = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("initial package scope memo exists");
+
+        let updated_snapshot = snapshot_with_unrelated_file(&snapshot);
+        let updated_scopes = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &updated_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("updated workspace scopes collect");
+        let updated_diagnostic = updated_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeArgument)
+            .expect("the invalid export-name argument remains diagnosed");
+        assert!(
+            updated_diagnostic
+                .clone()
+                .with_workspace_snapshot(&updated_snapshot)
+                .is_ok(),
+            "attribute diagnostics must bind to the current workspace snapshot"
+        );
+        assert!(updated_diagnostic.has_workspace_snapshot());
+        let rebound_target_filter_diagnostic = updated_scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::FeatureNotImplemented)
+            .expect("the staged derive attribute remains diagnosed");
+        assert!(
+            rebound_target_filter_diagnostic
+                .clone()
+                .with_workspace_snapshot(&updated_snapshot)
+                .is_ok(),
+            "target-filter diagnostics must be freshly bound to the current snapshot"
+        );
+        assert!(!updated_scopes.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::FeatureNotImplemented
+                && matches!(
+                    diagnostic.data.get("feature"),
+                    Some(sai_diagnostics::Value::String(feature))
+                        if feature == "attribute @export_name"
+                )
+        }));
+        let updated_memo = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("updated package scope memo exists");
+        assert!(
+            Arc::ptr_eq(&first_memo, &updated_memo),
+            "unrelated workspace files must not invalidate the package-scope memo"
         );
     }
 

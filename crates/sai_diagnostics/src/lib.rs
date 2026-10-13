@@ -1364,6 +1364,11 @@ impl Diagnostic {
         &self.fixes
     }
 
+    /// Whether this diagnostic is bound to one workspace snapshot.
+    pub fn has_workspace_snapshot(&self) -> bool {
+        self.workspace_snapshot.is_some()
+    }
+
     pub fn level(&self) -> Option<&LevelInfo> {
         self.level.as_ref()
     }
