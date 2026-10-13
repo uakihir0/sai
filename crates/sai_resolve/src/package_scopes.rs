@@ -82,8 +82,11 @@ pub struct Binding {
     pub visibility: Visibility,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Phase1ModuleScopes {
+    /// Canonical local definition path for this module; the package root has
+    /// an empty path.
+    pub module_def_id: LocalDefId,
     /// Direct lookup by session-local symbol. This map is not traversed to
     /// generate output; all diagnostic ordering comes from the source walk.
     pub declared: HashMap<Symbol, Binding>,
@@ -249,9 +252,19 @@ pub fn collect_phase1(
                 disambiguator: 0,
             })
             .collect::<Vec<_>>();
+        let module_def_id = intern_module_def_path(
+            module_tree.package,
+            &module.path,
+            packages,
+            symbols,
+            def_paths,
+        )?;
         let mut module_disambiguators = HashMap::<DefPathData, u32>::new();
         let mut declared_locations = HashMap::<Symbol, Location>::new();
-        let mut module_scopes = Phase1ModuleScopes::default();
+        let mut module_scopes = Phase1ModuleScopes {
+            module_def_id,
+            declared: HashMap::new(),
+        };
         let mut test_names = BTreeMap::<String, Location>::new();
 
         for use_entry in &input.filtered.item_tree.uses {
@@ -1043,6 +1056,26 @@ fn intern_path(
     Ok(def_paths.intern(path)?)
 }
 
+fn intern_module_def_path(
+    package: PackageId,
+    module_path: &[Symbol],
+    packages: &PackageInterner,
+    symbols: &Interner,
+    def_paths: &DefPathInterner,
+) -> Result<LocalDefId, PackageScopesError> {
+    let components = module_path
+        .iter()
+        .copied()
+        .map(|symbol| DisambiguatedDefPathData {
+            data: DefPathData::Module(symbol),
+            disambiguator: 0,
+        })
+        .collect();
+    let path = DefPath::new(package, components, packages, symbols)
+        .map_err(PackageScopesError::DefPathValidation)?;
+    Ok(def_paths.intern(path)?)
+}
+
 fn next_disambiguator(
     disambiguators: &mut HashMap<DefPathData, u32>,
     component: DefPathData,
@@ -1282,6 +1315,11 @@ mod tests {
         );
         let (scopes, paths) = fixture.collect();
         let declared = &scopes.modules[0].declared;
+        let root_module_path = paths
+            .resolve(scopes.modules[0].module_def_id)
+            .unwrap()
+            .unwrap();
+        assert!(root_module_path.data().is_empty());
         let expected = [
             ("run", DefKind::Fn),
             ("Record", DefKind::Struct),
@@ -1348,6 +1386,37 @@ mod tests {
             }) if text(&fixture.symbols, *abi) == "wasm"
                 && text(&fixture.symbols, *module) == "env"
         ));
+    }
+
+    #[test]
+    fn interned_module_definition_paths_follow_canonical_tree_paths() {
+        let fixture = Fixture::new("", "wasm32-core");
+        let ui = fixture.symbols.intern("ui").unwrap();
+        let components = fixture.symbols.intern("components").unwrap();
+        let paths =
+            DefPathInterner::new(fixture.package, &fixture.packages, &fixture.symbols).unwrap();
+        let module = intern_module_def_path(
+            fixture.package,
+            &[ui, components],
+            &fixture.packages,
+            &fixture.symbols,
+            &paths,
+        )
+        .unwrap();
+        let path = paths.resolve(module).unwrap().unwrap();
+        assert_eq!(
+            path.data(),
+            &[
+                DisambiguatedDefPathData {
+                    data: DefPathData::Module(ui),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::Module(components),
+                    disambiguator: 0,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2062,7 +2131,7 @@ mod tests {
         fixture.filtered.item_tree.items[1].name = Symbol::ERROR;
         let (scopes, paths) = fixture.collect();
         assert_eq!(scopes.modules[0].declared.len(), 1);
-        assert_eq!(paths.len().unwrap(), 3);
+        assert_eq!(paths.len().unwrap(), 4);
         assert!(
             scopes.modules[0]
                 .declared
@@ -2107,7 +2176,7 @@ mod tests {
         }
         let (scopes, paths) = fixture.collect();
         assert!(scopes.modules[0].declared.is_empty());
-        assert_eq!(paths.len().unwrap(), 3);
+        assert_eq!(paths.len().unwrap(), 4);
 
         let block_data = DefPathData::ExternBlock {
             abi: fixture.symbols.intern("wasm").unwrap(),
@@ -2154,7 +2223,7 @@ mod tests {
         }
         let (scopes, paths) = fixture.collect();
         assert!(scopes.modules[0].declared.is_empty());
-        assert_eq!(paths.len().unwrap(), 2);
+        assert_eq!(paths.len().unwrap(), 3);
         for component in [
             DefPathData::Test(Arc::from("recoverable test")),
             DefPathData::Property(Arc::from("recoverable property")),
@@ -2215,7 +2284,7 @@ mod tests {
         };
         let (scopes, paths) = fixture.collect();
         assert!(scopes.modules[0].declared.is_empty());
-        assert_eq!(paths.len().unwrap(), 0);
+        assert_eq!(paths.len().unwrap(), 1);
     }
 
     #[test]
