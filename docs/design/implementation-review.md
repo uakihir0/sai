@@ -3125,7 +3125,7 @@
 - **Reason:** These comments introduce an arm and belong visually before its pattern. A hard line after the leading comment run forces a broken arm list and keeps the pattern separate from the comment.
 - **Review:** Focused regressions cover line and multiline block comments, blank gaps, nested matches, and fixed-point output. Hostile review found no actionable issues; it confirmed the hard line breaks the arm list and blank-line gaps are retained. Opening-brace trailing comments were outside this increment; IR-431 handles them for non-empty lists. First-arm and nested-match outputs reach a fixed point.
 - **Human review:** **Review required:** Confirm that own-line comments before a match-arm pattern remain before it and retain blank-line gaps.
-- **Remaining scope:** Pattern-interior comments and other unsupported comment-bearing syntax. IR-432 extends opening-brace comment support to empty lists.
+- **Remaining scope:** Pattern `@` comments and other unsupported comment-bearing syntax. IR-433 handles comments after `@`.
 
 ### IR-431: Preserve comments after match-arm list opening braces
 
@@ -3133,7 +3133,7 @@
 - **Reason:** These comments follow the opening delimiter and precede the first pattern. A broken list gives line comments a stable line boundary and keeps the first arm distinct from the comment.
 - **Review:** Focused regressions cover line and multiline comments, nested matches, blank-line gaps, a single-line opening comment followed by a leading pattern line comment, and fixed-point output. Initial hostile review found that mixed opening-brace and pattern-leading comments could fail fixed-point verification; the renderer now inserts a hard line before line or multiline pattern-leading comments and forces a broken list. Re-review found no actionable issues and confirmed fixed-point output with blank-line gaps and a closing comment. Empty-list opening-brace comments remain fail-closed.
 - **Human review:** **Review required:** Confirm that comments trailing the opening brace of a non-empty arm list appear before its first pattern and force broken layout.
-- **Remaining scope:** Pattern-interior comments and other unsupported comment-bearing syntax. IR-432 handles empty-list opening-brace trailing comments.
+- **Remaining scope:** Pattern `@` comments and other unsupported comment-bearing syntax. IR-433 handles comments after `@`.
 
 ### IR-432: Preserve comments after opening braces of empty match-arm lists
 
@@ -3142,3 +3142,11 @@
 - **Review:** Focused regressions cover line, multiline block, and single-line block comments, mixed opening and closing comments, blank-line gaps, nested matches, and fixed-point output. Hostile review found no actionable issues; it confirmed that the opening-token owner is accepted only for structurally valid match-arm lists, that opening-trailing and closing-leading comments retain source order and blank gaps, and that the focused cases reach a fixed point.
 - **Human review:** **Review required:** Confirm that comments after the opening brace of an empty arm list render inside the braces and retain their source order with closing comments.
 - **Remaining scope:** Pattern-interior comments and other unsupported comment-bearing syntax.
+
+### IR-433: Preserve comments after pattern `@` operators
+
+- **Decision:** Preserve line comments, single-line block comments, and multiline block comments attached to an at-pattern's `@` token. Keep block comments between `@` and the nested pattern; put a pattern following a line comment on an indented continuation line. Apply this to every formatter-supported context that renders an at-pattern.
+- **Reason:** The parser accepts a line break after `@`, and the operator binds a nested pattern. Keeping comments after the operator preserves token order; an indented continuation keeps a line-comment-separated pattern visually associated with its binding.
+- **Review:** Focused regressions cover single-line and multiline block comments, line comments, mixed block/line comment runs, constructor subpatterns, comments trailing the nested pattern, match-arm and nested-expression patterns, `let` bindings, and fixed-point output. Hostile review found no actionable issues; it confirmed the `AT` owner registration matches the renderer and probed stable output for match-arm, constructor, and let patterns, including mixed comment runs and a nested-pattern trailing comment.
+- **Human review:** **Review required:** Confirm that comments after `@` stay between the binding and nested pattern, with line comments placing that pattern on an indented continuation.
+- **Remaining scope:** Comments attached to other pattern-interior tokens and other unsupported comment-bearing syntax.
