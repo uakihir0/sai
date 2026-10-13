@@ -3,6 +3,7 @@
 pub mod module_target;
 pub mod package_scopes;
 pub mod use_binding;
+pub mod use_item_binding;
 pub mod use_path;
 pub mod use_target;
 

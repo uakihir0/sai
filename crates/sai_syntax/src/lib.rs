@@ -4025,8 +4025,15 @@ fn keyword_class(name: &str) -> Option<KeywordClass> {
     })
 }
 
-fn case_kind(name: &str) -> SyntaxKind {
-    name.chars()
+/// Returns the identifier case class used by the lexer.
+///
+/// An optional raw-identifier prefix and any leading or embedded underscores
+/// are ignored. Unicode uppercase and titlecase letters classify as `UIDENT`;
+/// all other spellings classify as `LIDENT`.
+pub fn identifier_case_kind(name: &str) -> SyntaxKind {
+    name.strip_prefix("r#")
+        .unwrap_or(name)
+        .chars()
         .find(|ch| *ch != '_')
         .filter(|ch| {
             matches!(
@@ -4035,6 +4042,10 @@ fn case_kind(name: &str) -> SyntaxKind {
             )
         })
         .map_or(SyntaxKind::LIDENT, |_| SyntaxKind::UIDENT)
+}
+
+fn case_kind(name: &str) -> SyntaxKind {
+    identifier_case_kind(name)
 }
 
 fn is_ident_start(ch: char) -> bool {
@@ -4996,6 +5007,20 @@ mod tests {
         );
         assert!(output.tokens[3].flags.contains(TokenFlags::RAW));
         assert_eq!(output.errors[0].code, Code::InvalidRawIdent);
+    }
+
+    #[test]
+    fn public_identifier_case_classifier_accepts_raw_spellings() {
+        for (spelling, expected) in [
+            ("Widget", SyntaxKind::UIDENT),
+            ("r#Widget", SyntaxKind::UIDENT),
+            ("r#__Widget", SyntaxKind::UIDENT),
+            ("r#type", SyntaxKind::LIDENT),
+            ("r#__name", SyntaxKind::LIDENT),
+        ] {
+            assert_eq!(identifier_case_kind(spelling), expected, "{spelling}");
+            assert_eq!(lex_text(spelling).tokens[0].kind, expected, "{spelling}");
+        }
     }
 
     #[test]
