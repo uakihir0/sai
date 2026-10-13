@@ -8241,6 +8241,66 @@ mod tests {
     }
 
     #[test]
+    fn check_reports_root_and_nested_interface_module_file_conflicts() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(package.join("src/lib.sai"), b"interface codec {}\n")
+            .expect("write root interface");
+        fs::write(package.join("src/codec.sai"), b"fn root_child() {}\n")
+            .expect("write root module file");
+        fs::create_dir_all(package.join("src/parent")).expect("create nested module directory");
+        fs::write(package.join("src/parent.sai"), b"interface child {}\n")
+            .expect("write nested interface");
+        fs::write(
+            package.join("src/parent/child.sai"),
+            b"fn nested_child() {}\n",
+        )
+        .expect("write nested module file");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let conflicts = stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"MODULE_INTERFACE_CONFLICT\""))
+            .collect::<Vec<_>>();
+        assert_eq!(conflicts.len(), 2, "{stdout}");
+        assert!(
+            conflicts
+                .iter()
+                .any(|line| line.contains("\"path\":\"src/lib.sai\""))
+        );
+        assert!(
+            conflicts
+                .iter()
+                .any(|line| line.contains("\"path\":\"src/parent.sai\""))
+        );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_allows_an_interface_matching_only_a_namespace_directory() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(package.join("src/lib.sai"), b"interface codec {}\n").expect("write interface");
+        fs::create_dir_all(package.join("src/codec")).expect("create namespace directory");
+        fs::write(package.join("src/codec/nested.sai"), b"fn nested() {}\n")
+            .expect("write nested module");
+
+        let (exit_code, stdout, stderr) =
+            invoke(&["--format=json", "--directory", package_path, "check"]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(!stdout.contains("\"code\":\"MODULE_INTERFACE_CONFLICT\""));
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+    }
+
+    #[test]
     fn check_reports_phase1_reserved_types_and_test_name_errors() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);

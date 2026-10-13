@@ -6,6 +6,7 @@
 //! target attributes here because they are represented as children of an
 //! extern block in the item tree.
 
+use super::{ChildEntry, ModuleData};
 use sai_diagnostics::{Code, Diagnostic, Location, Related, Severity, SourceRef};
 use sai_hir::attrs::TargetCfg;
 use sai_hir::item_tree::{ItemTreeKind, TargetFilterResult};
@@ -310,6 +311,21 @@ pub fn collect_phase1(
                         symbols,
                         def_paths,
                     )?;
+                    if entry.kind == ItemTreeKind::Interface
+                        && interface_conflicts_with_module_file(module, entry.name, symbols)?
+                    {
+                        let name = symbols.resolve(entry.name)?;
+                        let (_, location) = declaration_name_location(entry, input)?;
+                        diagnostics.push(declaration_diagnostic(
+                            Code::ModuleInterfaceConflict,
+                            format!(
+                                "interface `{name}` conflicts with a module file at the same path"
+                            ),
+                            "conflicting interface",
+                            location,
+                            &package_identity,
+                        ));
+                    }
                     bind_declaration(
                         entry,
                         kind,
@@ -357,6 +373,21 @@ pub fn collect_phase1(
         modules: scopes,
         diagnostics,
     })
+}
+
+fn interface_conflicts_with_module_file(
+    module: &ModuleData,
+    interface_name: Symbol,
+    symbols: &Interner,
+) -> Result<bool, PackageScopesError> {
+    if interface_name.is_error() {
+        return Ok(false);
+    }
+    let name = symbols.resolve(interface_name)?;
+    Ok(matches!(
+        module.children.get(name.as_ref()),
+        Some(ChildEntry::Module(_) | ChildEntry::Both(_, _))
+    ))
 }
 
 fn validate_module_input(
@@ -885,6 +916,50 @@ mod tests {
         let id = paths.intern(expected.clone()).unwrap();
         assert_eq!(paths.len().unwrap(), length);
         assert_eq!(paths.resolve(id).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn interface_name_conflicts_only_with_an_exact_module_file_child() {
+        let symbols = Interner::new();
+        let codec = symbols.intern("codec").unwrap();
+        let parent = symbols.intern("parent").unwrap();
+        let nested_module = ModuleData {
+            path: vec![parent],
+            file: FileId::new(42),
+            parent_dir: Some(super::super::ModuleId::ROOT),
+            children: BTreeMap::from([(
+                "codec".to_owned(),
+                ChildEntry::Module(super::super::ModuleId::from_raw(2)),
+            )]),
+        };
+        assert!(interface_conflicts_with_module_file(&nested_module, codec, &symbols).unwrap());
+
+        let module_and_namespace = ModuleData {
+            children: BTreeMap::from([(
+                "codec".to_owned(),
+                ChildEntry::Both(
+                    super::super::ModuleId::from_raw(2),
+                    super::super::NamespaceId::from_raw(0),
+                ),
+            )]),
+            ..nested_module.clone()
+        };
+        assert!(
+            interface_conflicts_with_module_file(&module_and_namespace, codec, &symbols).unwrap()
+        );
+
+        let namespace_only = ModuleData {
+            children: BTreeMap::from([(
+                "codec".to_owned(),
+                ChildEntry::Namespace(super::super::NamespaceId::from_raw(0)),
+            )]),
+            ..nested_module.clone()
+        };
+        assert!(!interface_conflicts_with_module_file(&namespace_only, codec, &symbols).unwrap());
+        assert!(!interface_conflicts_with_module_file(&nested_module, parent, &symbols).unwrap());
+        assert!(
+            !interface_conflicts_with_module_file(&nested_module, Symbol::ERROR, &symbols).unwrap()
+        );
     }
 
     #[test]
