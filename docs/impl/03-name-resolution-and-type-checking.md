@@ -218,6 +218,8 @@ Member namespaces of items (variants, associated functions, fields, trait items)
 
 Phase 2 resolves every `use` declaration of every module and computes the member namespaces `X(M)` with the memoized `lookup(M, x)` of spec/04 §4.5.4. The implementation:
 
+`sai_resolve::use_path::parse_use_path` parses the `UseEntry.pkg_path` text into its exact versionless package identity and interned path segments. Since HIR does not retain the lexer's `PKG_PATH` error bit, this boundary checks the same package-identity and path-segment spelling rules as the lexer. It accepts implicit-use identities such as `sai:core` and preserves hyphens and underscores without normalization.
+
 The module-only path step is implemented by `sai_resolve::module_target::resolve_module_target`. Given path symbols after the package identity, it performs exact spelling lookup through modules and namespace directories, maps an empty path to the package root, and rejects the current module. Unknown paths carry the longest matched prefix and byte-ordered direct module candidates; malformed child IDs fail as an invalid module tree. Package selection, interfaces, dependencies, WIT, import bindings, diagnostics, and invocation from this Phase remain to be integrated.
 
 ```rust
