@@ -757,6 +757,12 @@ pub enum Phase1CollectionError {
     Query(QueryError),
     DeclaredRequirements(DeclaredRequirementsError),
     PackageGraphMissingNode(PackageKey),
+    PackageGraphRequirementEdgeMismatch {
+        package: PackageKey,
+        identity: String,
+        expected_active: bool,
+        found_active: bool,
+    },
 }
 
 impl From<ParseQueryError> for Phase1CollectionError {
@@ -920,6 +926,71 @@ fn phase1_package_graph_projection(
     Ok(Some(Phase1PackageGraphProjection::Package {
         outgoing_edges,
     }))
+}
+
+fn validate_phase1_package_graph_requirements(
+    package: &PackageKey,
+    graph: Option<&Phase1PackageGraphProjection>,
+    declared_requirements: Option<&[DeclaredRequirement]>,
+    target_cfg: &TargetCfg,
+    build_context: Phase1BuildContext,
+) -> Result<(), Phase1CollectionError> {
+    let (Some(Phase1PackageGraphProjection::Package { outgoing_edges }), Some(requirements)) =
+        (graph, declared_requirements)
+    else {
+        return Ok(());
+    };
+
+    let active_edges = outgoing_edges
+        .iter()
+        .map(|edge| edge.visible_identity.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_active_edges = requirements
+        .iter()
+        .filter(|requirement| !is_toolchain_package_identity(&requirement.identity))
+        .filter(|requirement| {
+            requirement.only.as_ref().map_or(true, |targets| {
+                targets
+                    .iter()
+                    .any(|target| target == target_cfg.target_name())
+            }) && (!requirement.test
+                || (build_context.analyzes_tests && build_context.is_root_package))
+        })
+        .map(|requirement| requirement.identity.clone())
+        .collect::<BTreeSet<_>>();
+
+    let identities = active_edges
+        .union(&expected_active_edges)
+        .cloned()
+        .collect::<Vec<_>>();
+    for identity in identities {
+        let expected_active = expected_active_edges.contains(&identity);
+        let found_active = active_edges.contains(&identity);
+        if expected_active != found_active {
+            return Err(Phase1CollectionError::PackageGraphRequirementEdgeMismatch {
+                package: package.clone(),
+                identity,
+                expected_active,
+                found_active,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_toolchain_package_identity(identity: &str) -> bool {
+    matches!(
+        identity,
+        "sai:core"
+            | "sai:alloc"
+            | "wasi:cli"
+            | "wasi:clocks"
+            | "wasi:filesystem"
+            | "wasi:http"
+            | "wasi:io"
+            | "wasi:random"
+            | "wasi:sockets"
+    )
 }
 
 fn stable_child_entry(entry: sai_resolve::ChildEntry) -> StableChildEntry {
@@ -1899,6 +1970,13 @@ impl RootDatabase {
         .map_err(PackageScopesError::from)?;
         let graph = self.package_graph.get(&mut self.query_database, 0)?;
         let package_graph = phase1_package_graph_projection(graph.as_ref().as_ref(), &package_key)?;
+        validate_phase1_package_graph_requirements(
+            &package_key,
+            package_graph.as_ref(),
+            declared_requirements.as_deref(),
+            target_cfg,
+            build_context,
+        )?;
         let def_paths = if let Some(def_paths) = self.def_paths.get(&module_tree.package) {
             Arc::clone(def_paths)
         } else {
@@ -3395,6 +3473,261 @@ mod tests {
             !Arc::ptr_eq(&unrelated_change, &target_change),
             "the exact selected version of a direct edge target is part of the projection"
         );
+    }
+
+    #[test]
+    fn package_scopes_classify_foreign_requirements_from_manifest() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"use acme:dep/module as dep\n", b"fn child() {}\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: true,
+            ..Phase1BuildContext::default()
+        };
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires { acme:dep @ ^1 }\n"[..],
+        );
+
+        database
+            .set_package_graph(Some(phase1_graph("1.0.0", false)))
+            .expect("graph with the dependency edge is recorded");
+        let active = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                context,
+                Arc::clone(&manifest),
+                PackageRole::Root,
+            )
+            .expect("active dependency is classified");
+        assert!(
+            active.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::FeatureNotImplemented
+            })
+        );
+        assert!(
+            active
+                .diagnostics
+                .iter()
+                .all(|diagnostic| { diagnostic.code != sai_diagnostics::Code::UnknownPackage })
+        );
+
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("available graph without the dependency edge is recorded");
+        let missing_edge = database.collect_phase1_package_scopes_with_manifest(
+            &module_tree,
+            &snapshot,
+            &target,
+            context,
+            manifest,
+            PackageRole::Root,
+        );
+        assert!(
+            matches!(
+                missing_edge,
+                Err(Phase1CollectionError::PackageGraphRequirementEdgeMismatch {
+                    ref package,
+                    ref identity,
+                    expected_active: true,
+                    found_active: false,
+                }) if package.as_str() == "acme:phase1#1" && identity == "acme:dep"
+            ),
+            "a target-allowed declaration missing from an available graph is a graph/manifest mismatch"
+        );
+    }
+
+    #[test]
+    fn package_scopes_reject_active_edges_without_manifest_requirements() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"use acme:dep/module as dep\n", b"fn child() {}\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: true,
+            ..Phase1BuildContext::default()
+        };
+        let empty_manifest = Arc::<[u8]>::from(&b"package acme:phase1 @ 1.0.0\n"[..]);
+        database
+            .set_package_graph(Some(phase1_graph("1.0.0", false)))
+            .expect("graph with an undeclared dependency edge is recorded");
+
+        let result = database.collect_phase1_package_scopes_with_manifest(
+            &module_tree,
+            &snapshot,
+            &target,
+            context,
+            empty_manifest,
+            PackageRole::Root,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Phase1CollectionError::PackageGraphRequirementEdgeMismatch {
+                    ref identity,
+                    expected_active: false,
+                    found_active: true,
+                    ..
+                }) if identity == "acme:dep"
+            ),
+            "a graph edge absent from the valid manifest is a graph/manifest mismatch"
+        );
+    }
+
+    #[test]
+    fn package_scopes_allow_target_excluded_requirements_without_active_edges() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"use acme:dep/module as dep\n", b"fn child() {}\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: true,
+            ..Phase1BuildContext::default()
+        };
+        let inactive_manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires { acme:dep @ ^1 only { wasm64-core } }\n"[..],
+        );
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("graph without a target-excluded edge is recorded");
+
+        let scopes = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                context,
+                inactive_manifest,
+                PackageRole::Root,
+            )
+            .expect("an excluded requirement has no active graph edge");
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InactiveDependency)
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != sai_diagnostics::Code::UnknownPackage
+                && diagnostic.code != sai_diagnostics::Code::FeatureNotImplemented
+        }));
+    }
+
+    #[test]
+    fn package_scopes_reject_stale_edges_for_target_excluded_requirements() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"use acme:dep/module as dep\n", b"fn child() {}\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: true,
+            ..Phase1BuildContext::default()
+        };
+        let inactive_manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires { acme:dep @ ^1 only { wasm64-core } }\n"[..],
+        );
+        database
+            .set_package_graph(Some(phase1_graph("1.0.0", false)))
+            .expect("graph with a stale target-excluded edge is recorded");
+
+        let result = database.collect_phase1_package_scopes_with_manifest(
+            &module_tree,
+            &snapshot,
+            &target,
+            context,
+            inactive_manifest,
+            PackageRole::Root,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Phase1CollectionError::PackageGraphRequirementEdgeMismatch {
+                    ref identity,
+                    expected_active: false,
+                    found_active: true,
+                    ..
+                }) if identity == "acme:dep"
+            ),
+            "a stale edge must be rejected before import diagnostics are collected"
+        );
+    }
+
+    #[test]
+    fn package_scopes_validate_root_test_edges_against_test_analysis() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"use acme:dep/module as dep\n", b"fn child() {}\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let test_manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:dep @ ^1 }\n"[..],
+        );
+        let without_tests = Phase1BuildContext {
+            is_root_package: true,
+            ..Phase1BuildContext::default()
+        };
+
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("test edge is absent from a non-test active graph");
+        let ordinary_build = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                without_tests,
+                Arc::clone(&test_manifest),
+                PackageRole::Root,
+            )
+            .expect("inactive test requirements need no active edge");
+        assert!(ordinary_build.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != sai_diagnostics::Code::UnknownPackage
+                && diagnostic.code != sai_diagnostics::Code::FeatureNotImplemented
+        }));
+
+        database
+            .set_package_graph(Some(phase1_graph("1.0.0", false)))
+            .expect("test graph activates the root test edge");
+        let with_tests = Phase1BuildContext {
+            is_root_package: true,
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let test_build = database
+            .collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                with_tests,
+                Arc::clone(&test_manifest),
+                PackageRole::Root,
+            )
+            .expect("the active test edge agrees with the manifest");
+        assert!(
+            test_build
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::FeatureNotImplemented)
+        );
+
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("test graph without its active test edge is recorded");
+        assert!(matches!(
+            database.collect_phase1_package_scopes_with_manifest(
+                &module_tree,
+                &snapshot,
+                &target,
+                with_tests,
+                test_manifest,
+                PackageRole::Root,
+            ),
+            Err(Phase1CollectionError::PackageGraphRequirementEdgeMismatch {
+                expected_active: true,
+                found_active: false,
+                ..
+            })
+        ));
     }
 
     #[test]

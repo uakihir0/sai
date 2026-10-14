@@ -620,7 +620,9 @@ pub fn collect_phase1(
 /// Local module and interface targets have member lookup; module `pub use`
 /// declarations can re-export members from either target. Foreign item tables
 /// are retained as deferred import records. The target-diagnostic pass owns
-/// unknown/current-module errors.
+/// unknown/current-module errors. Foreign package classification is owned by
+/// the declared requirements and target configuration; the driver validates
+/// that its active graph agrees with those inputs before calling this pass.
 pub fn collect_local_module_alias_bindings(
     module_tree: &ModuleTree,
     module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
@@ -747,12 +749,12 @@ pub fn collect_local_module_alias_bindings(
             );
             let foreign_classification = if !is_current_package && !is_known_toolchain_package {
                 requirements.map(|_| match requirement {
+                    None => (PendingItemTarget::UnknownPackage, None),
                     Some(_) if inactive_targets.is_some() => (
                         PendingItemTarget::Inactive,
                         inactive_targets.map(|targets| targets.as_ref()),
                     ),
                     Some(_) => (PendingItemTarget::StageGated, None),
-                    None => (PendingItemTarget::UnknownPackage, None),
                 })
             } else {
                 None
@@ -3910,7 +3912,7 @@ mod tests {
     }
 
     #[test]
-    fn active_foreign_dependencies_are_stage_gated_and_retain_only_conflict_bindings() {
+    fn declared_foreign_dependencies_are_stage_gated_and_retain_only_conflict_bindings() {
         let source = concat!(
             "use acme:declared/module as panic\n",
             "use acme:declared/module.{missing as helper}\n",
