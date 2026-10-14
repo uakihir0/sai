@@ -28,6 +28,10 @@ use sha2::{Digest, Sha256};
 use unicode_width::UnicodeWidthChar;
 
 static NEXT_FMT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
+const MAX_CHECK_WORKSPACE_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CHECK_WORKSPACE_SOURCE_FILES: u64 = 100_000;
+const MAX_CHECK_WORKSPACE_TREE_ENTRIES: u64 = 250_000;
+const MAX_CHECK_WORKSPACE_TREE_PATH_BYTES: u64 = 64 * 1024 * 1024;
 
 struct CliDiagnostic {
     code: &'static str,
@@ -589,6 +593,7 @@ fn run_check(
         }
     }
     let mut package_graph = None;
+    let mut locked_source_dependencies = Vec::new();
     if check_locked_mode(command)
         && let Some(manifest) = parsed_manifest.as_ref()
     {
@@ -611,12 +616,14 @@ fn run_check(
         ) {
             CheckLockPreflight::Continue {
                 graph,
+                source_dependencies,
                 diagnostics: lock_diagnostics,
                 warnings,
             } => {
                 diagnostics.extend(lock_diagnostics);
                 total_warnings = total_warnings.saturating_add(warnings);
                 package_graph = Some(graph);
+                locked_source_dependencies = source_dependencies;
             }
             CheckLockPreflight::Stop {
                 diagnostics: lock_diagnostics,
@@ -680,6 +687,33 @@ fn run_check(
             }
         }
     }
+    let dependency_target_cfg = parsed_manifest.as_ref().and_then(|manifest| {
+        let target = check_target_override(command)
+            .or_else(|| manifest_target_names(manifest).first().cloned())?;
+        sai_driver::target_cfg_for_check(&target).ok()
+    });
+    let mut check_source_budget = CheckWorkspaceSourceBudget::default();
+    let mut dependency_workspace_inputs = Vec::new();
+    let mut dependency_source_files = Vec::new();
+    if !locked_source_dependencies.is_empty() {
+        match check_locked_dependency_source_inputs(
+            &locked_source_dependencies,
+            cancellation,
+            &mut check_source_budget,
+        ) {
+            Ok(inputs) => {
+                total_errors = total_errors.saturating_add(inputs.errors);
+                diagnostics.extend(inputs.diagnostics);
+                dependency_workspace_inputs = inputs.packages;
+                dependency_source_files = inputs.source_files;
+            }
+            Err(()) => return report_interrupted(parsed, stdout, stderr),
+        }
+    }
+    let mut dependency_workspace_integrated = false;
+    let mut dependency_sources_parsed = false;
+    let mut missing_root_module_tree_input = None;
+
     if let Some(manifest) = parsed_manifest {
         let declared_source = manifest.file().declarations.iter().find_map(|declaration| {
             if let sai_package::manifest::PackageDeclaration::Source(source) = &declaration.value {
@@ -699,6 +733,28 @@ fn run_check(
                                 root_identity.as_deref(),
                             ));
                             total_errors = total_errors.saturating_add(1);
+                            missing_root_module_tree_input = Some(
+                                missing_source_module_tree_input(MissingSourceModuleTreeInput {
+                                    package_key: root_package_key
+                                        .as_deref()
+                                        .expect("a syntax-valid package has a stable package key"),
+                                    source_directory: relative_source.as_str(),
+                                    package_header_span: package_header_span
+                                        .as_ref()
+                                        .expect("syntax-valid root package has a header"),
+                                    manifest_path: &manifest_display_path,
+                                    manifest_source: manifest_source
+                                        .as_ref()
+                                        .expect("syntax-valid manifest has a header source"),
+                                    package_identity: root_identity
+                                        .as_deref()
+                                        .expect("a syntax-valid package has an identity"),
+                                    inspection_incomplete: true,
+                                    analyzes_tests: command_tail(command)
+                                        .iter()
+                                        .any(|(argument, _)| argument == "--tests"),
+                                }),
+                            );
                         }
                         Ok(false) => {
                             match std::fs::canonicalize(&source_path) {
@@ -711,17 +767,19 @@ fn run_check(
                                     // diagnostics. The module-tree walker opens
                                     // every component without following links.
                                     let source_directory = source_path.clone();
-                                    let selection = crate::fmt_paths::select_fmt_module_paths(
-                                        std::slice::from_ref(&source_directory),
-                                        &cwd,
-                                        cancellation,
-                                    );
+                                    let selection =
+                                        crate::fmt_paths::select_fmt_module_paths_with_limits(
+                                            std::slice::from_ref(&source_directory),
+                                            &cwd,
+                                            cancellation,
+                                            check_source_budget.snapshot_limits(),
+                                        );
                                     if selection.interrupted || cancellation.is_cancelled() {
                                         return report_interrupted(parsed, stdout, stderr);
                                     }
                                     let root_module_path = source_directory.join("lib.sai");
                                     let root_is_symlink = selection.module_tree_root_symlink;
-                                    let root_inspection_incomplete = root_is_symlink
+                                    let mut root_inspection_incomplete = root_is_symlink
                                         || selection.errors.iter().any(|error| {
                                             error.path == source_directory
                                                 || error.path == root_module_path
@@ -738,7 +796,33 @@ fn run_check(
                                         );
                                         total_errors = total_errors.saturating_add(1);
                                     }
-                                    let module_tree_entries = selection.module_tree_entries;
+                                    let mut module_tree_entries = selection.module_tree_entries;
+                                    let root_tree_metrics = (
+                                        selection.module_tree_inspected_entry_count,
+                                        selection.module_tree_inspected_path_bytes,
+                                    );
+                                    let root_tree_budget_ok = !selection.module_tree_limit_exceeded
+                                        && check_source_budget
+                                            .consume_tree_inventory(root_tree_metrics)
+                                        && check_source_budget.consume_source_file_slots(
+                                            selection.module_tree_source_file_count,
+                                        );
+                                    if !root_tree_budget_ok {
+                                        if !check_source_budget.exhausted {
+                                            diagnostics.push(check_dependency_source_error(
+                                                "IMPLEMENTATION_LIMIT_EXCEEDED",
+                                                "root and active dependency source trees exceed the supported workspace inventory or file-count limits",
+                                                root_identity
+                                                    .as_deref()
+                                                    .expect(
+                                                        "a syntax-valid package has an identity",
+                                                    ),
+                                            ));
+                                            total_errors = total_errors.saturating_add(1);
+                                        }
+                                        root_inspection_incomplete = true;
+                                        module_tree_entries.clear();
+                                    }
                                     for error in selection.errors {
                                         let path = fmt_path_reference(
                                             &error.path,
@@ -779,7 +863,11 @@ fn run_check(
 
                                     let mut source_inputs = Vec::new();
                                     let mut module_tree_sources = Vec::new();
+                                    let mut root_source_budget_exceeded = !root_tree_budget_ok;
                                     for selected in selection.files {
+                                        if root_source_budget_exceeded {
+                                            break;
+                                        }
                                         if selected.is_package_manifest
                                             || selected
                                                 .path
@@ -800,24 +888,118 @@ fn run_check(
                                             &cwd,
                                             Some(&package_root),
                                         );
-                                        let source_key_path = package_source_file_key_path(
+                                        let Some(source_key_path) = package_source_file_key_path(
                                             &selected.path,
                                             &source_directory,
                                             relative_source.as_str(),
+                                        ) else {
+                                            continue;
+                                        };
+                                        if sai_vfs::PackageRelativePath::new(
+                                            source_key_path.clone(),
                                         )
-                                        .unwrap_or_else(|| source_display_path.clone());
+                                        .is_err()
+                                        {
+                                            continue;
+                                        }
+                                        if check_source_budget.total_sai_file_bytes == 0 {
+                                            diagnostics.push(check_dependency_source_error(
+                                                "IMPLEMENTATION_LIMIT_EXCEEDED",
+                                                "root and active dependency source bytes exceed the supported workspace limit",
+                                                root_identity
+                                                    .as_deref()
+                                                    .expect("a syntax-valid package has an identity"),
+                                            ));
+                                            total_errors = total_errors.saturating_add(1);
+                                            root_source_budget_exceeded = true;
+                                            break;
+                                        }
                                         let mut file = selected_check_file(
                                             selected,
                                             source_display_path.clone(),
                                         );
+                                        let source_byte_limit = check_source_budget
+                                            .total_sai_file_bytes
+                                            .min(sai_vfs::MAX_SOURCE_BYTES as u64)
+                                            as usize;
                                         match open_selected_fmt_file(&mut file) {
                                             Ok(source_file) => {
-                                                match read_file_limited(
+                                                let mut source_bytes_read = 0;
+                                                match read_file_limited_with_progress(
                                                     source_file,
-                                                    sai_vfs::MAX_SOURCE_BYTES,
+                                                    source_byte_limit,
                                                     cancellation,
+                                                    &mut source_bytes_read,
                                                 ) {
+                                                    Ok(source)
+                                                        if source.len() > source_byte_limit =>
+                                                    {
+                                                        let workspace_limit_exceeded =
+                                                            !check_source_budget
+                                                                .consume_source_file_bytes(
+                                                                    u64::try_from(source.len())
+                                                                        .unwrap_or(u64::MAX),
+                                                                );
+                                                        if workspace_limit_exceeded {
+                                                            check_source_budget
+                                                                .total_sai_file_bytes = 0;
+                                                        }
+                                                        let diagnostic = if workspace_limit_exceeded
+                                                        {
+                                                            check_dependency_source_error(
+                                                                "IMPLEMENTATION_LIMIT_EXCEEDED",
+                                                                "root and active dependency source bytes exceed the supported workspace limit",
+                                                                root_identity
+                                                                    .as_deref()
+                                                                    .expect(
+                                                                        "a syntax-valid package has an identity",
+                                                                    ),
+                                                            )
+                                                        } else {
+                                                            check_cli_diagnostic(
+                                                                source_limit_diagnostic(
+                                                                    source.len(),
+                                                                    &source_display_path,
+                                                                ),
+                                                            )
+                                                        };
+                                                        diagnostics.push(
+                                                            check_diagnostic_with_package(
+                                                                diagnostic,
+                                                                root_identity.as_deref(),
+                                                            ),
+                                                        );
+                                                        total_errors =
+                                                            total_errors.saturating_add(1);
+                                                        root_source_budget_exceeded |=
+                                                            workspace_limit_exceeded;
+                                                        if workspace_limit_exceeded {
+                                                            break;
+                                                        }
+                                                    }
                                                     Ok(source) => {
+                                                        if !check_source_budget
+                                                            .consume_source_file_bytes(
+                                                                u64::try_from(source.len())
+                                                                    .unwrap_or(u64::MAX),
+                                                            )
+                                                        {
+                                                            diagnostics.push(
+                                                                check_dependency_source_error(
+                                                                    "IMPLEMENTATION_LIMIT_EXCEEDED",
+                                                                    "root and active dependency source bytes exceed the supported workspace limit",
+                                                                    root_identity
+                                                                        .as_deref()
+                                                                        .expect(
+                                                                            "a syntax-valid package has an identity",
+                                                                        ),
+                                                                ),
+                                                            );
+                                                            total_errors =
+                                                                total_errors.saturating_add(1);
+                                                            root_source_budget_exceeded = true;
+                                                            break;
+                                                        }
                                                         let source: Arc<[u8]> = source.into();
                                                         source_inputs.push((
                                                             source_display_path.clone(),
@@ -835,6 +1017,15 @@ fn run_check(
                                                         );
                                                     }
                                                     Err(StdinReadError::Io(error)) => {
+                                                        let workspace_limit_exceeded =
+                                                            !check_source_budget
+                                                                .consume_source_file_bytes(
+                                                                    source_bytes_read,
+                                                                );
+                                                        if workspace_limit_exceeded {
+                                                            check_source_budget
+                                                                .total_sai_file_bytes = 0;
+                                                        }
                                                         diagnostics.push(check_diagnostic_with_package(
                                                     check_cli_diagnostic(fmt_io_diagnostic(
                                                         "SOURCE_READ_FAILED",
@@ -846,6 +1037,21 @@ fn run_check(
                                                 ));
                                                         total_errors =
                                                             total_errors.saturating_add(1);
+                                                        if workspace_limit_exceeded {
+                                                            diagnostics.push(check_diagnostic_with_package(
+                                                                check_dependency_source_error(
+                                                                    "IMPLEMENTATION_LIMIT_EXCEEDED",
+                                                                    "root and active dependency source bytes exceed the supported workspace limit",
+                                                                    root_identity
+                                                                        .as_deref()
+                                                                        .expect("a syntax-valid package has an identity"),
+                                                                ),
+                                                                root_identity.as_deref(),
+                                                            ));
+                                                            total_errors =
+                                                                total_errors.saturating_add(1);
+                                                            root_source_budget_exceeded = true;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -862,6 +1068,11 @@ fn run_check(
                                                 total_errors = total_errors.saturating_add(1);
                                             }
                                         }
+                                    }
+                                    if root_source_budget_exceeded {
+                                        source_inputs.clear();
+                                        module_tree_sources.clear();
+                                        root_inspection_incomplete = true;
                                     }
                                     let declared_targets = manifest_target_names(&manifest);
                                     let target_override = check_target_override(command);
@@ -881,31 +1092,67 @@ fn run_check(
                                         selected_target.as_deref().and_then(|target| {
                                             sai_driver::target_cfg_for_check(target).ok()
                                         });
-                                    let tree_result = module_tree_check_diagnostics(
-                                        root_package_key.as_deref().expect(
-                                            "a syntax-valid package has a stable package key",
-                                        ),
-                                        relative_source.as_str(),
-                                        true,
-                                        module_tree_entries,
-                                        package_header_span
-                                            .as_ref()
-                                            .expect("syntax-valid root package has a header"),
-                                        &manifest_display_path,
-                                        manifest_source
-                                            .as_ref()
-                                            .expect("syntax-valid manifest has a header source"),
-                                        &module_tree_sources,
-                                        root_identity
+                                    let root_package_identity = root_identity
+                                        .as_deref()
+                                        .expect("a syntax-valid package has an identity")
+                                        .to_owned();
+                                    let root_input = CheckModuleTreePackageInput {
+                                        package_key: root_package_key
                                             .as_deref()
-                                            .expect("a syntax-valid package has an identity"),
-                                        include_source_lines,
-                                        root_inspection_incomplete,
-                                        target_cfg.as_ref(),
-                                        package_graph.take(),
-                                        command_tail(command)
+                                            .expect(
+                                                "a syntax-valid package has a stable package key",
+                                            )
+                                            .to_owned(),
+                                        source_directory: relative_source.as_str().to_owned(),
+                                        source_directory_exists: true,
+                                        entries: module_tree_entries,
+                                        inspected_tree_entry_count: if root_tree_budget_ok {
+                                            root_tree_metrics.0
+                                        } else {
+                                            0
+                                        },
+                                        inspected_tree_path_bytes: if root_tree_budget_ok {
+                                            root_tree_metrics.1
+                                        } else {
+                                            0
+                                        },
+                                        package_header_span: package_header_span
+                                            .as_ref()
+                                            .expect("syntax-valid root package has a header")
+                                            .clone(),
+                                        manifest_path: manifest_display_path.clone(),
+                                        manifest_source: Arc::clone(
+                                            manifest_source.as_ref().expect(
+                                                "syntax-valid manifest has a header source",
+                                            ),
+                                        ),
+                                        source_inputs: module_tree_sources,
+                                        package_identity: root_package_identity.clone(),
+                                        inspection_incomplete: root_inspection_incomplete,
+                                        is_root_package: true,
+                                        analyzes_tests: command_tail(command)
                                             .iter()
                                             .any(|(argument, _)| argument == "--tests"),
+                                    };
+                                    let mut workspace_inputs = vec![root_input];
+                                    let mut all_source_files = source_inputs
+                                        .into_iter()
+                                        .map(|(path, source)| {
+                                            (path, source, root_package_identity.clone())
+                                        })
+                                        .collect::<Vec<_>>();
+                                    all_source_files.extend(dependency_source_files.iter().map(
+                                        |(path, source, identity)| {
+                                            (path.clone(), Arc::clone(source), identity.clone())
+                                        },
+                                    ));
+                                    workspace_inputs.append(&mut dependency_workspace_inputs);
+                                    dependency_workspace_integrated = true;
+                                    let tree_result = module_tree_workspace_check_diagnostics(
+                                        &workspace_inputs,
+                                        include_source_lines,
+                                        target_cfg.as_ref(),
+                                        package_graph.take(),
                                     );
                                     push_module_tree_check_result(
                                         &mut diagnostics,
@@ -913,9 +1160,12 @@ fn run_check(
                                         &mut total_warnings,
                                         &mut total_infos,
                                         tree_result,
-                                        root_identity.as_deref(),
+                                        Some(&root_package_identity),
                                     );
-                                    for (source_display_path, source) in source_inputs {
+                                    dependency_sources_parsed = true;
+                                    for (source_display_path, source, source_package_identity) in
+                                        all_source_files
+                                    {
                                         if cancellation.is_cancelled() {
                                             return report_interrupted(parsed, stdout, stderr);
                                         }
@@ -927,7 +1177,7 @@ fn run_check(
                                                         &source_display_path,
                                                         parsed_source.diagnostics(),
                                                         include_source_lines,
-                                                        root_identity.as_deref(),
+                                                        Some(&source_package_identity),
                                                     );
                                                 diagnostics.extend(source_diagnostics);
                                                 total_errors = total_errors.saturating_add(errors);
@@ -953,7 +1203,7 @@ fn run_check(
                                                         .map(|diagnostic| {
                                                             check_diagnostic_with_package(
                                                                 diagnostic,
-                                                                root_identity.as_deref(),
+                                                                Some(&source_package_identity),
                                                             )
                                                         }),
                                                 );
@@ -964,7 +1214,7 @@ fn run_check(
                                                         "source parser failed internally",
                                                         None,
                                                     ),
-                                                    root_identity.as_deref(),
+                                                    Some(&source_package_identity),
                                                 ));
                                                 total_errors = total_errors.saturating_add(1);
                                             }
@@ -989,59 +1239,79 @@ fn run_check(
                                     } else {
                                         match std::fs::metadata(&source_directory) {
                                             Ok(metadata) if !metadata.is_dir() => {
-                                                let tree_result = missing_source_root_module_tree(
-                                            root_package_key.as_deref().expect(
-                                                "a syntax-valid package has a stable package key",
-                                            ),
-                                            relative_source.as_str(),
-                                            package_header_span
-                                                .as_ref()
-                                                .expect("syntax-valid root package has a header"),
-                                            &manifest_display_path,
-                                            manifest_source.as_ref().expect(
-                                                "syntax-valid manifest has a header source",
-                                            ),
-                                            root_identity
-                                                .as_deref()
-                                                .expect("a syntax-valid package has an identity"),
-                                            include_source_lines,
-                                        );
-                                                push_module_tree_check_result(
-                                                    &mut diagnostics,
-                                                    &mut total_errors,
-                                                    &mut total_warnings,
-                                                    &mut total_infos,
-                                                    tree_result,
-                                                    root_identity.as_deref(),
+                                                missing_root_module_tree_input = Some(
+                                                    missing_source_module_tree_input(
+                                                        MissingSourceModuleTreeInput {
+                                                            package_key: root_package_key
+                                                                .as_deref()
+                                                                .expect(
+                                                                    "a syntax-valid package has a stable package key",
+                                                                ),
+                                                            source_directory: relative_source
+                                                                .as_str(),
+                                                            package_header_span: package_header_span
+                                                                .as_ref()
+                                                                .expect(
+                                                                    "syntax-valid root package has a header",
+                                                                ),
+                                                            manifest_path: &manifest_display_path,
+                                                            manifest_source: manifest_source
+                                                                .as_ref()
+                                                                .expect(
+                                                                    "syntax-valid manifest has a header source",
+                                                                ),
+                                                            package_identity: root_identity
+                                                                .as_deref()
+                                                                .expect(
+                                                                    "a syntax-valid package has an identity",
+                                                                ),
+                                                            inspection_incomplete: false,
+                                                            analyzes_tests: command_tail(command)
+                                                                .iter()
+                                                                .any(|(argument, _)| {
+                                                                    argument == "--tests"
+                                                                }),
+                                                        },
+                                                    ),
                                                 );
                                             }
                                             Err(error)
                                                 if error.kind() == io::ErrorKind::NotFound =>
                                             {
-                                                let tree_result = missing_source_root_module_tree(
-                                            root_package_key.as_deref().expect(
-                                                "a syntax-valid package has a stable package key",
-                                            ),
-                                            relative_source.as_str(),
-                                            package_header_span
-                                                .as_ref()
-                                                .expect("syntax-valid root package has a header"),
-                                            &manifest_display_path,
-                                            manifest_source.as_ref().expect(
-                                                "syntax-valid manifest has a header source",
-                                            ),
-                                            root_identity
-                                                .as_deref()
-                                                .expect("a syntax-valid package has an identity"),
-                                            include_source_lines,
-                                        );
-                                                push_module_tree_check_result(
-                                                    &mut diagnostics,
-                                                    &mut total_errors,
-                                                    &mut total_warnings,
-                                                    &mut total_infos,
-                                                    tree_result,
-                                                    root_identity.as_deref(),
+                                                missing_root_module_tree_input = Some(
+                                                    missing_source_module_tree_input(
+                                                        MissingSourceModuleTreeInput {
+                                                            package_key: root_package_key
+                                                                .as_deref()
+                                                                .expect(
+                                                                    "a syntax-valid package has a stable package key",
+                                                                ),
+                                                            source_directory: relative_source
+                                                                .as_str(),
+                                                            package_header_span: package_header_span
+                                                                .as_ref()
+                                                                .expect(
+                                                                    "syntax-valid root package has a header",
+                                                                ),
+                                                            manifest_path: &manifest_display_path,
+                                                            manifest_source: manifest_source
+                                                                .as_ref()
+                                                                .expect(
+                                                                    "syntax-valid manifest has a header source",
+                                                                ),
+                                                            package_identity: root_identity
+                                                                .as_deref()
+                                                                .expect(
+                                                                    "a syntax-valid package has an identity",
+                                                                ),
+                                                            inspection_incomplete: false,
+                                                            analyzes_tests: command_tail(command)
+                                                                .iter()
+                                                                .any(|(argument, _)| {
+                                                                    argument == "--tests"
+                                                                }),
+                                                        },
+                                                    ),
                                                 );
                                             }
                                             Ok(_) => {
@@ -1087,31 +1357,37 @@ fn run_check(
                                         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
                                     ) =>
                                 {
-                                    let tree_result = missing_source_root_module_tree(
-                                        root_package_key.as_deref().expect(
-                                            "a syntax-valid package has a stable package key",
-                                        ),
-                                        relative_source.as_str(),
-                                        package_header_span
-                                            .as_ref()
-                                            .expect("syntax-valid root package has a header"),
-                                        &manifest_display_path,
-                                        manifest_source
-                                            .as_ref()
-                                            .expect("syntax-valid manifest has a header source"),
-                                        root_identity
-                                            .as_deref()
-                                            .expect("a syntax-valid package has an identity"),
-                                        include_source_lines,
-                                    );
-                                    push_module_tree_check_result(
-                                        &mut diagnostics,
-                                        &mut total_errors,
-                                        &mut total_warnings,
-                                        &mut total_infos,
-                                        tree_result,
-                                        root_identity.as_deref(),
-                                    );
+                                    missing_root_module_tree_input =
+                                        Some(missing_source_module_tree_input(
+                                            MissingSourceModuleTreeInput {
+                                                package_key: root_package_key
+                                                    .as_deref()
+                                                    .expect(
+                                                        "a syntax-valid package has a stable package key",
+                                                    ),
+                                                source_directory: relative_source.as_str(),
+                                                package_header_span: package_header_span
+                                                    .as_ref()
+                                                    .expect(
+                                                        "syntax-valid root package has a header",
+                                                    ),
+                                                manifest_path: &manifest_display_path,
+                                                manifest_source: manifest_source
+                                                    .as_ref()
+                                                    .expect(
+                                                        "syntax-valid manifest has a header source",
+                                                    ),
+                                                package_identity: root_identity
+                                                    .as_deref()
+                                                    .expect(
+                                                        "a syntax-valid package has an identity",
+                                                    ),
+                                                inspection_incomplete: false,
+                                                analyzes_tests: command_tail(command)
+                                                    .iter()
+                                                    .any(|(argument, _)| argument == "--tests"),
+                                            },
+                                        ));
                                 }
                                 Err(error) => {
                                     diagnostics.push(check_diagnostic_with_package(
@@ -1157,6 +1433,93 @@ fn run_check(
                             ),
                         )),
                         root_identity.as_deref(),
+                    ));
+                    total_errors = total_errors.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    if let Some(root_input) = missing_root_module_tree_input {
+        let mut workspace_inputs = vec![root_input];
+        workspace_inputs.append(&mut dependency_workspace_inputs);
+        let tree_result = module_tree_workspace_check_diagnostics(
+            &workspace_inputs,
+            include_source_lines,
+            dependency_target_cfg.as_ref(),
+            package_graph.take(),
+        );
+        push_module_tree_check_result(
+            &mut diagnostics,
+            &mut total_errors,
+            &mut total_warnings,
+            &mut total_infos,
+            tree_result,
+            root_identity.as_deref(),
+        );
+        dependency_workspace_integrated = true;
+    }
+    if !dependency_workspace_integrated && !dependency_workspace_inputs.is_empty() {
+        let tree_result = module_tree_workspace_check_diagnostics(
+            &dependency_workspace_inputs,
+            include_source_lines,
+            dependency_target_cfg.as_ref(),
+            package_graph.take(),
+        );
+        push_module_tree_check_result(
+            &mut diagnostics,
+            &mut total_errors,
+            &mut total_warnings,
+            &mut total_infos,
+            tree_result,
+            None,
+        );
+    }
+    if !dependency_sources_parsed {
+        for (source_display_path, source, source_package_identity) in dependency_source_files {
+            if cancellation.is_cancelled() {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+            match sai_fmt::parse_source(&source) {
+                Ok(parsed_source) => {
+                    let (source_diagnostics, errors, warnings, infos) = check_source_diagnostics(
+                        &source,
+                        &source_display_path,
+                        parsed_source.diagnostics(),
+                        include_source_lines,
+                        Some(&source_package_identity),
+                    );
+                    diagnostics.extend(source_diagnostics);
+                    total_errors = total_errors.saturating_add(errors);
+                    total_warnings = total_warnings.saturating_add(warnings);
+                    total_infos = total_infos.saturating_add(infos);
+                }
+                Err(sai_fmt::SourceInputError::Refused(refusal)) => {
+                    let batch = source_format_diagnostics(
+                        &source,
+                        &source_display_path,
+                        sai_fmt::SourceFormatError::Refused(refusal),
+                        parsed.globals.max_errors,
+                        include_source_lines,
+                    );
+                    total_errors = total_errors.saturating_add(batch.total_error_count);
+                    diagnostics.extend(
+                        batch
+                            .diagnostics
+                            .into_iter()
+                            .map(check_cli_diagnostic)
+                            .map(|diagnostic| {
+                                check_diagnostic_with_package(
+                                    diagnostic,
+                                    Some(&source_package_identity),
+                                )
+                            }),
+                    );
+                }
+                Err(sai_fmt::SourceInputError::InternalError) => {
+                    diagnostics.push(check_diagnostic_with_package(
+                        check_internal_diagnostic("source parser failed internally", None),
+                        Some(&source_package_identity),
                     ));
                     total_errors = total_errors.saturating_add(1);
                 }
@@ -1348,6 +1711,7 @@ enum CheckLockPresence {
 enum CheckLockPreflight {
     Continue {
         graph: sai_driver::package_graph::PackageGraph,
+        source_dependencies: Vec<CheckLockedDependencySource>,
         diagnostics: Vec<CheckDiagnostic>,
         warnings: usize,
     },
@@ -1357,6 +1721,12 @@ enum CheckLockPreflight {
         warnings: usize,
     },
     Interrupted,
+}
+
+struct CheckLockedDependencySource {
+    package_key: PackageKey,
+    package_identity: String,
+    directory: sai_package::local_source::LocalPackageDirectory,
 }
 
 enum CheckLockLocalPreflight {
@@ -2394,6 +2764,7 @@ fn check_locked_preflight(
         })
         .collect::<std::collections::BTreeSet<_>>();
     let mut dependency_metadata = std::collections::BTreeMap::new();
+    let mut active_source_directories = Vec::new();
     let mut package_cache = None;
     for plan in &source_plans {
         let pinned = !plan.path_pins.is_empty();
@@ -2851,6 +3222,10 @@ fn check_locked_preflight(
                     };
                 }
             };
+            if metadata.form == sai_driver::package_graph::PackageForm::Source {
+                active_source_directories
+                    .push((plan.package_version.clone(), dependency_directory.clone()));
+            }
             dependency_metadata.insert(plan.package_version.clone(), metadata);
         }
     }
@@ -2879,8 +3254,31 @@ fn check_locked_preflight(
             };
         }
     };
+    let source_dependencies = active_source_directories
+        .into_iter()
+        .map(|(package_version, directory)| {
+            let node = graph
+                .nodes()
+                .iter()
+                .find(|node| {
+                    node.identity() == package_version.package()
+                        && node.version() == package_version.version()
+                })
+                .expect("every active source dependency has a graph node");
+            CheckLockedDependencySource {
+                package_key: node.key().clone(),
+                package_identity: format!(
+                    "{}@{}",
+                    package_version.package(),
+                    package_version.version()
+                ),
+                directory,
+            }
+        })
+        .collect();
     CheckLockPreflight::Continue {
         graph,
+        source_dependencies,
         diagnostics,
         warnings,
     }
@@ -3050,9 +3448,8 @@ fn check_locked_package_metadata(
 
     let form = if !has_source {
         PackageForm::Artifact
-    } else if !has_artifacts {
-        PackageForm::Source
-    } else if profile == "tiny"
+    } else if !has_artifacts
+        || profile == "tiny"
         || is_core_target
         || !has_target_artifact
         || is_root_allocator
@@ -3253,51 +3650,449 @@ fn check_package_validation_fields(
     (code, format!("invalid root package contract: {kind:?}"))
 }
 
-fn module_tree_check_diagnostics(
-    package_key: &str,
-    source_directory: &str,
+struct CheckLockedDependencySourceInputs {
+    packages: Vec<CheckModuleTreePackageInput>,
+    source_files: Vec<(String, Arc<[u8]>, String)>,
+    diagnostics: Vec<CheckDiagnostic>,
+    errors: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CheckWorkspaceSourceBudget {
+    entry_count: u64,
+    path_bytes: u64,
+    sai_file_count: u64,
+    total_sai_file_bytes: u64,
+    exhausted: bool,
+}
+
+impl Default for CheckWorkspaceSourceBudget {
+    fn default() -> Self {
+        Self {
+            entry_count: MAX_CHECK_WORKSPACE_TREE_ENTRIES,
+            path_bytes: MAX_CHECK_WORKSPACE_TREE_PATH_BYTES,
+            sai_file_count: MAX_CHECK_WORKSPACE_SOURCE_FILES,
+            total_sai_file_bytes: MAX_CHECK_WORKSPACE_SOURCE_BYTES,
+            exhausted: false,
+        }
+    }
+}
+
+impl CheckWorkspaceSourceBudget {
+    fn snapshot_limits(self) -> sai_package::local_source::LocalPackageSourceSnapshotLimits {
+        sai_package::local_source::LocalPackageSourceSnapshotLimits {
+            entry_count: self.entry_count,
+            path_bytes: self.path_bytes,
+            sai_file_count: self.sai_file_count,
+            total_sai_file_bytes: self.total_sai_file_bytes,
+        }
+    }
+
+    fn consume_tree_inventory(&mut self, (entry_count, path_bytes): (u64, u64)) -> bool {
+        if entry_count > self.entry_count || path_bytes > self.path_bytes {
+            return false;
+        }
+        self.entry_count -= entry_count;
+        self.path_bytes -= path_bytes;
+        true
+    }
+
+    fn consume_source_file_slots(&mut self, file_count: u64) -> bool {
+        if file_count > self.sai_file_count {
+            return false;
+        }
+        self.sai_file_count -= file_count;
+        true
+    }
+
+    fn consume_source_file_bytes(&mut self, byte_count: u64) -> bool {
+        if byte_count > self.total_sai_file_bytes {
+            return false;
+        }
+        self.total_sai_file_bytes -= byte_count;
+        true
+    }
+
+    fn exhaust(&mut self) {
+        self.entry_count = 0;
+        self.path_bytes = 0;
+        self.sai_file_count = 0;
+        self.total_sai_file_bytes = 0;
+        self.exhausted = true;
+    }
+
+    fn consume_snapshot_progress(
+        &mut self,
+        progress: sai_package::local_source::LocalPackageSourceSnapshotProgress,
+    ) {
+        self.entry_count = self
+            .entry_count
+            .saturating_sub(progress.inspected_entry_count);
+        self.path_bytes = self
+            .path_bytes
+            .saturating_sub(progress.inspected_path_bytes);
+        self.sai_file_count = self.sai_file_count.saturating_sub(progress.sai_file_count);
+        self.total_sai_file_bytes = self
+            .total_sai_file_bytes
+            .saturating_sub(progress.sai_file_bytes_read);
+    }
+}
+
+fn check_locked_dependency_source_inputs(
+    dependencies: &[CheckLockedDependencySource],
+    cancellation: &CancellationToken,
+    source_budget: &mut CheckWorkspaceSourceBudget,
+) -> Result<CheckLockedDependencySourceInputs, ()> {
+    let mut result = CheckLockedDependencySourceInputs {
+        packages: Vec::with_capacity(dependencies.len()),
+        source_files: Vec::new(),
+        diagnostics: Vec::new(),
+        errors: 0,
+    };
+
+    for dependency in dependencies {
+        if cancellation.is_cancelled() {
+            return Err(());
+        }
+        let manifest_source = dependency.directory.manifest_bytes();
+        let manifest = dependency
+            .directory
+            .parse_manifest(sai_package::manifest::PackageRole::Dependency);
+        let Some(header) = manifest.file().header.as_ref() else {
+            result.diagnostics.push(check_dependency_source_error(
+                "LOCK_OUT_OF_DATE",
+                "active source dependency lost its validated package header",
+                &dependency.package_identity,
+            ));
+            result.errors = result.errors.saturating_add(1);
+            continue;
+        };
+        let Some(source_directory) = manifest.file().declarations.iter().find_map(|declaration| {
+            if let sai_package::manifest::PackageDeclaration::Source(source) = &declaration.value {
+                Some(source.as_ref())
+            } else {
+                None
+            }
+        }) else {
+            result.diagnostics.push(check_dependency_source_error(
+                "LOCK_OUT_OF_DATE",
+                "active source dependency has no declared source directory",
+                &dependency.package_identity,
+            ));
+            result.errors = result.errors.saturating_add(1);
+            continue;
+        };
+        let source_directory =
+            match sai_package::package_path::ContentPackagePath::parse(source_directory) {
+                Ok(path) => path,
+                Err(_) => {
+                    result.diagnostics.push(check_dependency_source_error(
+                        "LOCK_OUT_OF_DATE",
+                        "active source dependency has an invalid source directory",
+                        &dependency.package_identity,
+                    ));
+                    result.errors = result.errors.saturating_add(1);
+                    continue;
+                }
+            };
+        let mut snapshot_progress =
+            sai_package::local_source::LocalPackageSourceSnapshotProgress::default();
+        let snapshot_result = dependency
+            .directory
+            .read_source_snapshot_with_limits_progress_and_cancel(
+                &source_directory,
+                source_budget.snapshot_limits(),
+                &mut snapshot_progress,
+                || cancellation.is_cancelled(),
+            );
+        source_budget.consume_snapshot_progress(snapshot_progress);
+        let snapshot = match snapshot_result {
+            Ok(snapshot) => snapshot,
+            Err(sai_package::local_source::LocalPackageSourceSnapshotError::Interrupted) => {
+                return Err(());
+            }
+            Err(sai_package::local_source::LocalPackageSourceSnapshotError::LimitExceeded(
+                limit,
+            )) => {
+                if !matches!(
+                    limit,
+                    sai_package::local_source::LocalPackageSourceLimit::SaiFileBytes
+                ) {
+                    source_budget.exhaust();
+                }
+                result.diagnostics.push(check_dependency_source_error(
+                    "IMPLEMENTATION_LIMIT_EXCEEDED",
+                    "active dependency source tree exceeds the supported snapshot limits",
+                    &dependency.package_identity,
+                ));
+                result.errors = result.errors.saturating_add(1);
+                break;
+            }
+            Err(
+                sai_package::local_source::LocalPackageSourceSnapshotError::PlatformNotSupported,
+            ) => {
+                result.diagnostics.push(check_dependency_source_error(
+                    "SOURCE_READ_FAILED",
+                    "the active dependency source tree cannot be inspected safely on this platform",
+                    &dependency.package_identity,
+                ));
+                result.errors = result.errors.saturating_add(1);
+                continue;
+            }
+            Err(
+                sai_package::local_source::LocalPackageSourceSnapshotError::Directory(_)
+                | sai_package::local_source::LocalPackageSourceSnapshotError::InvalidSourceEntryPath,
+            ) => {
+                result.diagnostics.push(check_dependency_source_error(
+                    "SOURCE_READ_FAILED",
+                    "could not safely inspect the active dependency source tree",
+                    &dependency.package_identity,
+                ));
+                result.errors = result.errors.saturating_add(1);
+                continue;
+            }
+        };
+
+        let mut entries = Vec::with_capacity(snapshot.entries().len());
+        for entry in snapshot.entries() {
+            let kind = match entry.kind() {
+                sai_package::local_source::LocalPackageSourceEntryKind::File => {
+                    sai_vfs::PackageFileKind::File
+                }
+                sai_package::local_source::LocalPackageSourceEntryKind::Directory => {
+                    sai_vfs::PackageFileKind::Directory
+                }
+                sai_package::local_source::LocalPackageSourceEntryKind::Symlink => {
+                    sai_vfs::PackageFileKind::Symlink
+                }
+            };
+            match PackageFileEntry::new(entry.path(), kind) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => {
+                    result.diagnostics.push(check_dependency_source_error(
+                        "SOURCE_READ_FAILED",
+                        "active dependency source tree contains an invalid entry path",
+                        &dependency.package_identity,
+                    ));
+                    result.errors = result.errors.saturating_add(1);
+                    entries.clear();
+                    break;
+                }
+            }
+        }
+
+        let inspection_incomplete =
+            if let sai_package::local_source::LocalPackageSourceRootStatus::Symlink { component } =
+                snapshot.source_root()
+            {
+                result
+                    .diagnostics
+                    .push(module_tree_source_root_symlink_diagnostic(
+                        component,
+                        Some(&dependency.package_identity),
+                    ));
+                result.errors = result.errors.saturating_add(1);
+                true
+            } else {
+                false
+            };
+        let source_directory_exists = matches!(
+            snapshot.source_root(),
+            sai_package::local_source::LocalPackageSourceRootStatus::Present
+        );
+        let package_relative_source_path = |path: &str| {
+            if source_directory.as_str() == "." {
+                path.to_owned()
+            } else {
+                format!("{}/{path}", source_directory.as_str())
+            }
+        };
+        let manifest_path = format!("dep:{}/sai.package", dependency.package_identity);
+        let mut source_inputs = Vec::with_capacity(snapshot.sai_files().len());
+        for source_file in snapshot.sai_files() {
+            let key_path = package_relative_source_path(source_file.path());
+            let display_path = format!("dep:{}/{key_path}", dependency.package_identity);
+            let source = source_file.bytes_arc();
+            source_inputs.push((key_path, display_path.clone(), Arc::clone(&source)));
+            result
+                .source_files
+                .push((display_path, source, dependency.package_identity.clone()));
+        }
+
+        result.packages.push(CheckModuleTreePackageInput {
+            package_key: dependency.package_key.as_str().to_owned(),
+            source_directory: source_directory.as_str().to_owned(),
+            source_directory_exists,
+            entries,
+            inspected_tree_entry_count: snapshot.inspected_entry_count(),
+            inspected_tree_path_bytes: snapshot.inspected_path_bytes(),
+            package_header_span: header.span.clone(),
+            manifest_path,
+            manifest_source,
+            source_inputs,
+            package_identity: dependency.package_identity.clone(),
+            inspection_incomplete,
+            is_root_package: false,
+            analyzes_tests: false,
+        });
+    }
+    Ok(result)
+}
+
+fn check_dependency_source_error(
+    code: &'static str,
+    message: &str,
+    package_identity: &str,
+) -> CheckDiagnostic {
+    check_diagnostic_with_package(
+        check_cli_diagnostic(CliDiagnostic {
+            code,
+            message: message.to_owned(),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        }),
+        Some(package_identity),
+    )
+}
+
+struct CheckModuleTreePackageInput {
+    package_key: String,
+    source_directory: String,
     source_directory_exists: bool,
     entries: Vec<PackageFileEntry>,
-    package_header_span: &std::ops::Range<usize>,
-    manifest_path: &str,
-    manifest_source: &Arc<[u8]>,
-    source_inputs: &[(String, String, Arc<[u8]>)],
-    package_identity: &str,
+    inspected_tree_entry_count: u64,
+    inspected_tree_path_bytes: u64,
+    package_header_span: std::ops::Range<usize>,
+    manifest_path: String,
+    manifest_source: Arc<[u8]>,
+    source_inputs: Vec<(String, String, Arc<[u8]>)>,
+    package_identity: String,
+    inspection_incomplete: bool,
+    is_root_package: bool,
+    analyzes_tests: bool,
+}
+
+struct MissingSourceModuleTreeInput<'a> {
+    package_key: &'a str,
+    source_directory: &'a str,
+    package_header_span: &'a std::ops::Range<usize>,
+    manifest_path: &'a str,
+    manifest_source: &'a Arc<[u8]>,
+    package_identity: &'a str,
+    inspection_incomplete: bool,
+    analyzes_tests: bool,
+}
+
+fn missing_source_module_tree_input(
+    input: MissingSourceModuleTreeInput<'_>,
+) -> CheckModuleTreePackageInput {
+    CheckModuleTreePackageInput {
+        package_key: input.package_key.to_owned(),
+        source_directory: input.source_directory.to_owned(),
+        source_directory_exists: false,
+        entries: Vec::new(),
+        inspected_tree_entry_count: 0,
+        inspected_tree_path_bytes: 0,
+        package_header_span: input.package_header_span.clone(),
+        manifest_path: input.manifest_path.to_owned(),
+        manifest_source: Arc::clone(input.manifest_source),
+        source_inputs: Vec::new(),
+        package_identity: input.package_identity.to_owned(),
+        inspection_incomplete: input.inspection_incomplete,
+        is_root_package: true,
+        analyzes_tests: input.analyzes_tests,
+    }
+}
+
+fn check_module_tree_workspace_exceeds_limits(
+    inputs: &[CheckModuleTreePackageInput],
+    limits: sai_package::local_source::LocalPackageSourceSnapshotLimits,
+) -> bool {
+    let mut source_bytes = 0u64;
+    let mut source_file_count = 0u64;
+    let mut tree_entry_count = 0u64;
+    let mut tree_path_bytes = 0u64;
+    for input in inputs {
+        tree_entry_count = tree_entry_count.saturating_add(input.inspected_tree_entry_count);
+        tree_path_bytes = tree_path_bytes.saturating_add(input.inspected_tree_path_bytes);
+        for (_, _, source) in &input.source_inputs {
+            source_file_count = source_file_count.saturating_add(1);
+            source_bytes =
+                source_bytes.saturating_add(u64::try_from(source.len()).unwrap_or(u64::MAX));
+        }
+    }
+    source_bytes > limits.total_sai_file_bytes
+        || source_file_count > limits.sai_file_count
+        || tree_entry_count > limits.entry_count
+        || tree_path_bytes > limits.path_bytes
+}
+
+fn module_tree_workspace_check_diagnostics(
+    inputs: &[CheckModuleTreePackageInput],
     include_source_lines: bool,
-    root_inspection_incomplete: bool,
     target_cfg: Option<&TargetCfg>,
     package_graph: Option<sai_driver::package_graph::PackageGraph>,
-    analyzes_tests: bool,
 ) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
-    let package_key_value =
-        PackageKey::new(package_key).map_err(|error| format!("invalid package key: {error:?}"))?;
-    let source_directory_value = PackageSourceDirectory::new(source_directory.to_owned())
-        .map_err(|error| format!("invalid source directory: {error:?}"))?;
-    let package_files = PackageFilesSnapshot::new(source_directory_exists, entries)
-        .map_err(|error| format!("invalid package source inventory: {error:?}"))?;
-
+    let workspace_limits = CheckWorkspaceSourceBudget::default().snapshot_limits();
+    if check_module_tree_workspace_exceeds_limits(inputs, workspace_limits)
+        && let Some(input) = inputs.first()
+    {
+        return Ok((
+            vec![check_dependency_source_error(
+                "IMPLEMENTATION_LIMIT_EXCEEDED",
+                "combined root and active dependency sources exceed the supported workspace snapshot limits",
+                &input.package_identity,
+            )],
+            1,
+            0,
+            0,
+        ));
+    }
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
-    let package_id = database
-        .intern_package(package_key_value.as_str())
-        .map_err(|error| format!("could not intern package key: {error:?}"))?;
-    let vfs_files = source_inputs
-        .iter()
-        .filter_map(|(key_path, _, source)| {
-            FileKey::new(package_key_value.as_str(), key_path.clone())
-                .ok()
-                .map(|key| {
-                    (
-                        key,
-                        FileContents::Bytes(Arc::clone(source)),
-                        Durability::Low,
-                    )
-                })
-        })
-        .collect::<Vec<_>>();
+    let mut vfs_files = Vec::new();
+    let mut package_file_inputs = Vec::with_capacity(inputs.len());
+    let mut package_ids = Vec::with_capacity(inputs.len());
+    let mut package_keys = HashSet::with_capacity(inputs.len());
+
+    for input in inputs {
+        let package_key = PackageKey::new(input.package_key.clone())
+            .map_err(|error| format!("invalid package key: {error:?}"))?;
+        if !package_keys.insert(package_key.clone()) {
+            return Err(format!(
+                "duplicate package key in source workspace: {}",
+                package_key.as_str()
+            ));
+        }
+        let source_directory = PackageSourceDirectory::new(input.source_directory.clone())
+            .map_err(|error| format!("invalid source directory: {error:?}"))?;
+        let package_files =
+            PackageFilesSnapshot::new(input.source_directory_exists, input.entries.clone())
+                .map_err(|error| format!("invalid package source inventory: {error:?}"))?;
+        let package_id = database
+            .intern_package(package_key.as_str())
+            .map_err(|error| format!("could not intern package key: {error:?}"))?;
+
+        for (key_path, _, source) in &input.source_inputs {
+            let key = FileKey::new(package_key.as_str(), key_path.clone())
+                .map_err(|error| format!("invalid package source path: {error:?}"))?;
+            vfs_files.push((
+                key,
+                FileContents::Bytes(Arc::clone(source)),
+                Durability::Low,
+            ));
+        }
+        package_file_inputs.push((package_key, package_files, Durability::Low));
+        package_ids.push((package_id, source_directory));
+    }
+
     let input_snapshot = VfsInputSnapshot::new(vfs_files)
         .map_err(|error| format!("invalid package source inputs: {error:?}"))?
-        .with_package_files([(package_key_value.clone(), package_files, Durability::Low)])
+        .with_package_files(package_file_inputs)
         .map_err(|error| format!("invalid package source inventory inputs: {error:?}"))?;
     database
         .replace_vfs_snapshot(None, &input_snapshot)
@@ -3308,163 +4103,210 @@ fn module_tree_check_diagnostics(
             .map_err(|error| format!("could not set the locked package graph: {error:?}"))?;
     }
 
-    let manifest_file_id = database
-        .intern_package_file(
-            package_id,
-            PackageRelativePath::new("sai.package")
-                .map_err(|error| format!("invalid package manifest path: {error:?}"))?,
-        )
-        .map_err(|error| format!("could not intern package manifest: {error:?}"))?;
-    let start = u32::try_from(package_header_span.start)
-        .map_err(|_| "package header span start exceeds the source limit".to_owned())?;
-    let end = u32::try_from(package_header_span.end)
-        .map_err(|_| "package header span end exceeds the source limit".to_owned())?;
-    let range = sai_diagnostics::TextRange::new(
-        sai_diagnostics::TextSize::new(start),
-        sai_diagnostics::TextSize::new(end),
-    )
-    .ok_or_else(|| "package header span is reversed".to_owned())?;
-    let package_field = sai_diagnostics::Location {
-        file: SourceRef {
-            path: manifest_path.to_owned(),
-            package: Some(package_identity.to_owned()),
-            snapshot: None,
-        },
-        span: sai_diagnostics::Span::new(manifest_file_id, range),
-    };
-    let module_tree = database
-        .module_tree(package_id, source_directory_value, Some(package_field))
-        .map_err(|error| format!("module-tree query failed: {error:?}"))?;
-
-    let mut source_by_key = HashMap::new();
-    source_by_key.insert(
-        manifest_path.to_owned(),
-        (manifest_path.to_owned(), Arc::clone(manifest_source)),
-    );
-    for (key_path, display_path, source) in source_inputs {
-        source_by_key.insert(key_path.clone(), (display_path.clone(), Arc::clone(source)));
-    }
-
-    let mut diagnostics = Vec::with_capacity(module_tree.diagnostics.len());
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
-    let mut infos = 0usize;
-    for diagnostic in module_tree.diagnostics.iter() {
-        if root_inspection_incomplete && diagnostic.code.as_str() == "MISSING_ROOT_MODULE" {
-            continue;
-        }
-        let mut data = diagnostic.data.clone();
-        if diagnostic.code.as_str() == "MISSING_ROOT_MODULE"
-            && let Some(Value::String(path)) = data.get_mut("path")
-        {
-            *path = if source_directory == "." {
-                path.clone()
-            } else {
-                format!("{source_directory}/{path}")
-            };
-        }
-        let help = diagnostic
-            .children()
-            .iter()
-            .find(|child| child.kind == sai_diagnostics::ChildKind::Help)
-            .map(|child| child.message.clone());
-        let mut cli_diagnostic = if let Some(primary) = diagnostic.primary() {
-            let (display_path, source) = source_by_key
-                .get(&primary.file.path)
-                .cloned()
-                .unwrap_or_else(|| (primary.file.path.clone(), Arc::from([])));
-            let mut source_index = CliSourceIndex::new(source);
-            cli_source_diagnostic(
-                &mut source_index,
-                FmtDiagnosticSource {
-                    path: &display_path,
-                    include_source_line: include_source_lines,
-                },
-                diagnostic.code.as_str(),
-                diagnostic.message.clone(),
-                primary.span.range.start().to_usize()..primary.span.range.end().to_usize(),
-                (!data.is_empty()).then(|| source_value_object_json(&data)),
-                help,
+    let mut package_trees = Vec::with_capacity(inputs.len());
+    for (index, input) in inputs.iter().enumerate() {
+        let (package_id, source_directory) = &package_ids[index];
+        let manifest_file_id = database
+            .intern_package_file(
+                *package_id,
+                PackageRelativePath::new("sai.package")
+                    .map_err(|error| format!("invalid package manifest path: {error:?}"))?,
             )
-        } else {
-            CliDiagnostic {
-                code: diagnostic.code.as_str(),
-                message: diagnostic.message.clone(),
-                primary: None,
-                primary_label: String::new(),
-                argument_index: None,
-                argument: String::new(),
-                help,
-                data: (!data.is_empty()).then(|| source_value_object_json(&data)),
+            .map_err(|error| format!("could not intern package manifest: {error:?}"))?;
+        let start = u32::try_from(input.package_header_span.start)
+            .map_err(|_| "package header span start exceeds the source limit".to_owned())?;
+        let end = u32::try_from(input.package_header_span.end)
+            .map_err(|_| "package header span end exceeds the source limit".to_owned())?;
+        let range = sai_diagnostics::TextRange::new(
+            sai_diagnostics::TextSize::new(start),
+            sai_diagnostics::TextSize::new(end),
+        )
+        .ok_or_else(|| "package header span is reversed".to_owned())?;
+        let package_field = sai_diagnostics::Location {
+            file: SourceRef {
+                path: input.manifest_path.clone(),
+                package: Some(input.package_identity.clone()),
+                snapshot: None,
+            },
+            span: sai_diagnostics::Span::new(manifest_file_id, range),
+        };
+        let module_tree = database
+            .module_tree(*package_id, source_directory.clone(), Some(package_field))
+            .map_err(|error| format!("module-tree query failed: {error:?}"))?;
+
+        let mut source_by_key = HashMap::new();
+        source_by_key.insert(
+            input.manifest_path.clone(),
+            (
+                input.manifest_path.clone(),
+                Arc::clone(&input.manifest_source),
+            ),
+        );
+        source_by_key.insert(
+            "sai.package".to_owned(),
+            (
+                input.manifest_path.clone(),
+                Arc::clone(&input.manifest_source),
+            ),
+        );
+        for (key_path, display_path, source) in &input.source_inputs {
+            source_by_key.insert(key_path.clone(), (display_path.clone(), Arc::clone(source)));
+            if !input.is_root_package {
+                source_by_key.insert(
+                    format!("dep:{}/{key_path}", input.package_identity),
+                    (display_path.clone(), Arc::clone(source)),
+                );
             }
-        };
-        cli_diagnostic.primary_label = if diagnostic.code.as_str() == "MISSING_ROOT_MODULE" {
-            "package".to_owned()
-        } else {
-            diagnostic.primary_label.clone()
-        };
-        match diagnostic.severity {
-            sai_diagnostics::Severity::Error => errors = errors.saturating_add(1),
-            sai_diagnostics::Severity::Warning => warnings = warnings.saturating_add(1),
-            sai_diagnostics::Severity::Info => infos = infos.saturating_add(1),
         }
-        diagnostics.push(CheckDiagnostic {
-            diagnostic: cli_diagnostic,
-            severity: diagnostic.severity,
-            package: Some(package_identity.to_owned()),
-            related: Vec::new(),
-            children: check_additional_children(diagnostic, &source_by_key, include_source_lines),
-        });
+        package_trees.push((index, *package_id, module_tree, source_by_key));
     }
 
-    if let Some(target_cfg) = target_cfg
-        && !module_tree.modules.is_empty()
-    {
-        let mut snapshot_files = Vec::with_capacity(module_tree.modules.len());
-        let mut complete_snapshot = true;
+    let mut workspace_files = Vec::new();
+    let mut complete_packages = vec![true; inputs.len()];
+    for (index, _, module_tree, source_by_key) in &package_trees {
+        let input = &inputs[*index];
         for module in &module_tree.modules {
             let file_key = database
                 .file_key(module.file)
                 .ok_or_else(|| format!("module-tree file {} is not interned", module.file.raw()))?;
             let Some((_, source)) = source_by_key.get(file_key.path()) else {
-                complete_snapshot = false;
-                break;
+                complete_packages[*index] = false;
+                continue;
             };
             let source = SourceFile::decode(module.file, source)
                 .map_err(|error| format!("could not decode {}: {error:?}", file_key.path()))?;
-            snapshot_files.push(SnapshotFile::new(
+            let snapshot_path = if input.is_root_package {
+                file_key.path().to_owned()
+            } else {
+                format!("dep:{}/{}", input.package_identity, file_key.path())
+            };
+            workspace_files.push(SnapshotFile::new(
                 Arc::new(source),
-                file_key.path().to_owned(),
-                Some(package_identity.to_owned()),
+                snapshot_path,
+                Some(input.package_identity.clone()),
                 None,
             ));
         }
-        if complete_snapshot {
-            let workspace_snapshot = WorkspaceSnapshot::new(snapshot_files)
-                .map_err(|error| format!("could not create source snapshot: {error:?}"))?;
+    }
+    let workspace_snapshot = if workspace_files.is_empty() {
+        None
+    } else {
+        Some(
+            WorkspaceSnapshot::new(workspace_files)
+                .map_err(|error| format!("could not create source snapshot: {error:?}"))?,
+        )
+    };
+
+    let mut diagnostics = Vec::new();
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut infos = 0usize;
+    for (index, _, module_tree, source_by_key) in &package_trees {
+        let input = &inputs[*index];
+        for diagnostic in module_tree.diagnostics.iter() {
+            if input.inspection_incomplete && diagnostic.code.as_str() == "MISSING_ROOT_MODULE" {
+                continue;
+            }
+            let mut data = diagnostic.data.clone();
+            if diagnostic.code.as_str() == "MISSING_ROOT_MODULE"
+                && let Some(Value::String(path)) = data.get_mut("path")
+            {
+                *path = if input.source_directory == "." {
+                    path.clone()
+                } else {
+                    format!("{}/{path}", input.source_directory)
+                };
+            }
+            let help = diagnostic
+                .children()
+                .iter()
+                .find(|child| child.kind == sai_diagnostics::ChildKind::Help)
+                .map(|child| child.message.clone());
+            let mut cli_diagnostic = if let Some(primary) = diagnostic.primary() {
+                let (display_path, source) = source_by_key
+                    .get(&primary.file.path)
+                    .cloned()
+                    .unwrap_or_else(|| (primary.file.path.clone(), Arc::from([])));
+                let mut source_index = CliSourceIndex::new(source);
+                cli_source_diagnostic(
+                    &mut source_index,
+                    FmtDiagnosticSource {
+                        path: &display_path,
+                        include_source_line: include_source_lines,
+                    },
+                    diagnostic.code.as_str(),
+                    diagnostic.message.clone(),
+                    primary.span.range.start().to_usize()..primary.span.range.end().to_usize(),
+                    (!data.is_empty()).then(|| source_value_object_json(&data)),
+                    help,
+                )
+            } else {
+                CliDiagnostic {
+                    code: diagnostic.code.as_str(),
+                    message: diagnostic.message.clone(),
+                    primary: None,
+                    primary_label: String::new(),
+                    argument_index: None,
+                    argument: String::new(),
+                    help,
+                    data: (!data.is_empty()).then(|| source_value_object_json(&data)),
+                }
+            };
+            cli_diagnostic.primary_label = if diagnostic.code.as_str() == "MISSING_ROOT_MODULE" {
+                "package".to_owned()
+            } else {
+                diagnostic.primary_label.clone()
+            };
+            match diagnostic.severity {
+                sai_diagnostics::Severity::Error => errors = errors.saturating_add(1),
+                sai_diagnostics::Severity::Warning => warnings = warnings.saturating_add(1),
+                sai_diagnostics::Severity::Info => infos = infos.saturating_add(1),
+            }
+            diagnostics.push(CheckDiagnostic {
+                diagnostic: cli_diagnostic,
+                severity: diagnostic.severity,
+                package: Some(input.package_identity.clone()),
+                related: Vec::new(),
+                children: check_additional_children(
+                    diagnostic,
+                    source_by_key,
+                    include_source_lines,
+                ),
+            });
+        }
+    }
+
+    if let (Some(target_cfg), Some(workspace_snapshot)) = (target_cfg, workspace_snapshot) {
+        for (index, _, module_tree, source_by_key) in &package_trees {
+            let input = &inputs[*index];
+            if module_tree.modules.is_empty() || !complete_packages[*index] {
+                continue;
+            }
             let phase1 = database
                 .collect_phase1_package_scopes_with_manifest(
-                    &module_tree,
+                    module_tree,
                     &workspace_snapshot,
                     target_cfg,
                     sai_driver::Phase1BuildContext {
-                        is_root_package: true,
-                        is_root_core_module_build: matches!(
-                            target_cfg.target_name(),
-                            "wasm32-core" | "wasm64-core"
-                        ),
+                        is_root_package: input.is_root_package,
+                        is_root_core_module_build: input.is_root_package
+                            && matches!(target_cfg.target_name(), "wasm32-core" | "wasm64-core"),
                         is_test_build: false,
-                        analyzes_tests,
+                        analyzes_tests: input.is_root_package && input.analyzes_tests,
                     },
-                    Arc::clone(manifest_source),
-                    sai_package::manifest::PackageRole::Root,
+                    Arc::clone(&input.manifest_source),
+                    if input.is_root_package {
+                        sai_package::manifest::PackageRole::Root
+                    } else {
+                        sai_package::manifest::PackageRole::Dependency
+                    },
                 )
                 .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
                     &phase1.diagnostics,
-                    &source_by_key,
-                    package_identity,
+                    source_by_key,
+                    &input.package_identity,
                     include_source_lines,
                 );
             diagnostics.extend(phase1_diagnostics);
@@ -3596,33 +4438,6 @@ fn check_additional_children(
             }
         })
         .collect()
-}
-
-fn missing_source_root_module_tree(
-    package_key: &str,
-    source_directory: &str,
-    package_header_span: &std::ops::Range<usize>,
-    manifest_path: &str,
-    manifest_source: &Arc<[u8]>,
-    package_identity: &str,
-    include_source_lines: bool,
-) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
-    module_tree_check_diagnostics(
-        package_key,
-        source_directory,
-        false,
-        Vec::new(),
-        package_header_span,
-        manifest_path,
-        manifest_source,
-        &[],
-        package_identity,
-        include_source_lines,
-        false,
-        None,
-        None,
-        false,
-    )
 }
 
 fn push_module_tree_check_result(
@@ -3915,7 +4730,7 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
         argument_index: None,
         argument: String::new(),
         help: Some(format!(
-            "root-package syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented; {} remain unavailable",
+            "root and active source-dependency syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and root core export-name checks are implemented; {} remain unavailable",
             unsupported.join(", ")
         )),
         data: Some(format!(
@@ -6225,10 +7040,21 @@ fn fmt_io_diagnostic(
 }
 
 fn read_file_limited(
-    mut file: impl Read,
+    file: impl Read,
     limit: usize,
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, StdinReadError> {
+    let mut bytes_read = 0;
+    read_file_limited_with_progress(file, limit, cancellation, &mut bytes_read)
+}
+
+fn read_file_limited_with_progress(
+    mut file: impl Read,
+    limit: usize,
+    cancellation: &CancellationToken,
+    bytes_read: &mut u64,
+) -> Result<Vec<u8>, StdinReadError> {
+    *bytes_read = 0;
     let max_bytes = limit.saturating_add(1);
     let mut source = Vec::with_capacity(max_bytes.min(8192));
     let mut buffer = [0_u8; 8192];
@@ -6243,7 +7069,10 @@ fn read_file_limited(
         let read_len = remaining.min(buffer.len());
         match file.read(&mut buffer[..read_len]) {
             Ok(0) => return Ok(source),
-            Ok(bytes_read) => source.extend_from_slice(&buffer[..bytes_read]),
+            Ok(read_count) => {
+                source.extend_from_slice(&buffer[..read_count]);
+                *bytes_read = u64::try_from(source.len()).unwrap_or(u64::MAX);
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(StdinReadError::Io(error)),
         }
@@ -9832,10 +10661,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        CancellationAwareStdin, CheckDiagnostic, CliDiagnostic, CliLocation, CliPosition,
-        CliSourceIndex, EXPLAIN_CODE_SUMMARIES, RenderedSourceLine, StdinBroker, StdinReadError,
-        cli_position, compare_check_diagnostics, fmt_path_selection_signature, human_file_path,
-        internal_fmt_diagnostic, parse_args, relative_path, report_fmt_diagnostics, run,
+        CancellationAwareStdin, CheckDiagnostic, CheckLockedDependencySource,
+        CheckModuleTreePackageInput, CheckWorkspaceSourceBudget, CliDiagnostic, CliLocation,
+        CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES, RenderedSourceLine, StdinBroker,
+        StdinReadError, check_locked_dependency_source_inputs,
+        check_module_tree_workspace_exceeds_limits, cli_position, compare_check_diagnostics,
+        fmt_path_selection_signature, human_file_path, internal_fmt_diagnostic, parse_args,
+        read_file_limited_with_progress, relative_path, report_fmt_diagnostics, run,
         run_new_with_creator, run_with_cancellation, run_with_cancellation_and_input,
         write_file_atomically_in_directory, write_human_diagnostics,
     };
@@ -9845,6 +10677,218 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn check_workspace_limits_sum_source_bytes_and_tree_costs_across_packages() {
+        let package = |identity: &str| CheckModuleTreePackageInput {
+            package_key: format!("acme:{identity}"),
+            source_directory: "src".to_owned(),
+            source_directory_exists: true,
+            entries: Vec::new(),
+            inspected_tree_entry_count: 1,
+            inspected_tree_path_bytes: 5,
+            package_header_span: 0..1,
+            manifest_path: format!("dep:{identity}/sai.package"),
+            manifest_source: Arc::from(&b"m"[..]),
+            source_inputs: vec![(
+                "src/lib.sai".to_owned(),
+                format!("dep:{identity}/src/lib.sai"),
+                Arc::from(&b"abc"[..]),
+            )],
+            package_identity: identity.to_owned(),
+            inspection_incomplete: false,
+            is_root_package: false,
+            analyzes_tests: false,
+        };
+        let limits = sai_package::local_source::LocalPackageSourceSnapshotLimits {
+            entry_count: 1,
+            path_bytes: 5,
+            sai_file_count: 1,
+            total_sai_file_bytes: 3,
+        };
+        let first = package("first@1.0.0");
+        let second = package("second@1.0.0");
+
+        assert!(!check_module_tree_workspace_exceeds_limits(
+            std::slice::from_ref(&first),
+            limits,
+        ));
+        assert!(check_module_tree_workspace_exceeds_limits(
+            &[first, second],
+            limits,
+        ));
+    }
+
+    #[test]
+    fn dependency_snapshot_limit_stops_before_scanning_later_packages() {
+        let temporary = TestDirectory::new();
+        let first_path = temporary.child("first");
+        let second_path = temporary.child("second");
+        fs::create_dir_all(first_path.join("src")).expect("create first source directory");
+        fs::create_dir(&second_path).expect("create second package directory");
+        let first_manifest = concat!(
+            "package acme:first @ 1.0.0\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n"
+        );
+        let second_manifest = concat!(
+            "package acme:second @ 1.0.0\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n"
+        );
+        fs::write(first_path.join("sai.package"), first_manifest).expect("write first manifest");
+        fs::write(second_path.join("sai.package"), second_manifest).expect("write second manifest");
+        fs::write(first_path.join("src/lib.sai"), b"source exceeds budget")
+            .expect("write oversized source");
+        let first = sai_package::local_source::LocalPackageDirectory::open(
+            fs::canonicalize(&first_path).expect("canonical first package directory"),
+        )
+        .expect("open first package");
+        let second = sai_package::local_source::LocalPackageDirectory::open(
+            fs::canonicalize(&second_path).expect("canonical second package directory"),
+        )
+        .expect("open second package");
+        let dependencies = [
+            CheckLockedDependencySource {
+                package_key: sai_vfs::PackageKey::new("acme:first#1").expect("first key is valid"),
+                package_identity: "acme:first@1.0.0".to_owned(),
+                directory: first,
+            },
+            CheckLockedDependencySource {
+                package_key: sai_vfs::PackageKey::new("acme:second#1")
+                    .expect("second key is valid"),
+                package_identity: "acme:second@1.0.0".to_owned(),
+                directory: second,
+            },
+        ];
+        let mut budget = CheckWorkspaceSourceBudget {
+            total_sai_file_bytes: 2,
+            ..CheckWorkspaceSourceBudget::default()
+        };
+
+        let result = check_locked_dependency_source_inputs(
+            &dependencies,
+            &CancellationToken::default(),
+            &mut budget,
+        )
+        .expect("dependency scanning was not cancelled");
+
+        assert!(result.packages.is_empty());
+        assert_eq!(result.errors, 1);
+        assert_eq!(
+            result.diagnostics[0].diagnostic.code,
+            "IMPLEMENTATION_LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            result.diagnostics[0].package.as_deref(),
+            Some("acme:first@1.0.0")
+        );
+        assert!(budget.exhausted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_dependency_snapshot_charges_read_bytes_to_workspace_budget() {
+        let temporary = TestDirectory::new();
+        let first_path = temporary.child("first");
+        let second_path = temporary.child("second");
+        fs::create_dir_all(first_path.join("src")).expect("create first source directory");
+        fs::create_dir_all(second_path.join("src")).expect("create second source directory");
+        let manifest = concat!(
+            "package acme:source @ 1.0.0\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n"
+        );
+        fs::write(first_path.join("sai.package"), manifest).expect("write first manifest");
+        fs::write(second_path.join("sai.package"), manifest).expect("write second manifest");
+        fs::write(first_path.join("src/a.sai"), vec![b'a'; 40]).expect("write first source");
+        fs::write(
+            first_path.join("src/bad\\name"),
+            b"unrepresentable source entry",
+        )
+        .expect("write unrepresentable source entry");
+        fs::write(second_path.join("src/b.sai"), vec![b'b'; 61]).expect("write second source");
+        let open_package = |path: &Path| {
+            sai_package::local_source::LocalPackageDirectory::open(
+                fs::canonicalize(path).expect("canonical package directory"),
+            )
+            .expect("open package directory")
+        };
+        let dependencies = [
+            CheckLockedDependencySource {
+                package_key: sai_vfs::PackageKey::new("acme:first#1").expect("first key is valid"),
+                package_identity: "acme:first@1.0.0".to_owned(),
+                directory: open_package(&first_path),
+            },
+            CheckLockedDependencySource {
+                package_key: sai_vfs::PackageKey::new("acme:second#1")
+                    .expect("second key is valid"),
+                package_identity: "acme:second@1.0.0".to_owned(),
+                directory: open_package(&second_path),
+            },
+        ];
+        let mut budget = CheckWorkspaceSourceBudget {
+            total_sai_file_bytes: 100,
+            ..CheckWorkspaceSourceBudget::default()
+        };
+
+        let result = check_locked_dependency_source_inputs(
+            &dependencies,
+            &CancellationToken::default(),
+            &mut budget,
+        )
+        .expect("dependency scanning was not cancelled");
+
+        assert!(result.packages.is_empty());
+        assert_eq!(result.errors, 2);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["SOURCE_READ_FAILED", "IMPLEMENTATION_LIMIT_EXCEEDED"]
+        );
+        assert!(budget.exhausted);
+    }
+
+    struct PartiallyFailingReader {
+        returned_prefix: bool,
+    }
+
+    impl Read for PartiallyFailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.returned_prefix {
+                return Err(io::Error::other("injected read failure"));
+            }
+            self.returned_prefix = true;
+            buffer[..4].copy_from_slice(b"part");
+            Ok(4)
+        }
+    }
+
+    #[test]
+    fn root_source_read_progress_survives_an_io_error() {
+        let mut bytes_read = 0;
+        let error = read_file_limited_with_progress(
+            PartiallyFailingReader {
+                returned_prefix: false,
+            },
+            64,
+            &CancellationToken::default(),
+            &mut bytes_read,
+        )
+        .expect_err("the injected second read should fail");
+        assert!(matches!(error, StdinReadError::Io(_)));
+        assert_eq!(bytes_read, 4);
+
+        let mut budget = CheckWorkspaceSourceBudget {
+            total_sai_file_bytes: 100,
+            ..CheckWorkspaceSourceBudget::default()
+        };
+        assert!(budget.consume_source_file_bytes(bytes_read));
+        assert_eq!(budget.total_sai_file_bytes, 96);
+    }
 
     struct CancellingReader {
         cancellation: CancellationToken,
@@ -10360,7 +11404,7 @@ mod tests {
         assert!(stdout.contains("\"stage\":0,\"feature\":\"sai check\""));
         assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
         assert!(stdout.contains(
-            "syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented"
+            "root and active source-dependency syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and root core export-name checks are implemented"
         ));
         assert!(stdout.contains("module-tree validation"));
         assert!(stdout.contains("test-only analysis"));
@@ -11245,7 +12289,7 @@ mod tests {
         assert!(stdout.contains("\"line\":1"));
         assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
         assert!(stdout.contains(
-            "syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented"
+            "root and active source-dependency syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and root core export-name checks are implemented"
         ));
         assert!(stdout.contains("\"exit_code\":1"));
 
@@ -11265,7 +12309,7 @@ mod tests {
         assert!(incomplete_diagnostic.contains("\"primary\":null"));
         assert!(
             incomplete_diagnostic.contains(
-                "syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and core export-name checks are implemented"
+                "root and active source-dependency syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and root core export-name checks are implemented"
             )
         );
         assert!(incomplete_diagnostic.contains("\"symbol\":null,\"package\":null}"));
@@ -12364,7 +13408,7 @@ mod tests {
         let (exit_code, stdout, stderr) =
             invoke(&["--format=json", "--directory", package_path, "check"]);
 
-        assert_eq!(exit_code, 1);
+        assert_eq!(exit_code, 1, "{stdout}");
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"SOURCE_READ_FAILED\""));
         assert!(stdout.contains("canonical package-relative path"));

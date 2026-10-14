@@ -23,6 +23,14 @@ pub(crate) struct FmtPathSelection {
     pub errors: Vec<FmtPathSelectionError>,
     /// Visible package-relative entries recorded during a module-tree walk.
     pub module_tree_entries: Vec<PackageFileEntry>,
+    /// Entries inspected during the module-tree walk, including hidden names.
+    pub module_tree_inspected_entry_count: u64,
+    /// Encoded package-relative path bytes inspected during the module-tree walk.
+    pub module_tree_inspected_path_bytes: u64,
+    /// Visible `.sai` files encountered during the module-tree walk.
+    pub module_tree_source_file_count: u64,
+    /// The module-tree walk stopped at a configured traversal limit.
+    pub module_tree_limit_exceeded: bool,
     /// The selected module-tree root was a symlink and was not followed.
     pub module_tree_root_symlink: bool,
     /// Traversal stopped because cancellation was requested.
@@ -78,6 +86,7 @@ struct DirectoryWalker<'a> {
     source_root: PathBuf,
     retain_capabilities: bool,
     traversal_mode: FmtTraversalMode,
+    module_tree_limits: Option<sai_package::local_source::LocalPackageSourceSnapshotLimits>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -105,6 +114,7 @@ pub(crate) fn select_fmt_paths(
         cancellation,
         true,
         FmtTraversalMode::ExplicitPaths,
+        None,
     )
 }
 
@@ -119,6 +129,7 @@ pub(crate) fn select_fmt_paths_for_comparison(
         cancellation,
         false,
         FmtTraversalMode::ExplicitPaths,
+        None,
     )
 }
 
@@ -137,6 +148,7 @@ pub(crate) fn select_fmt_workspace_paths(
         cancellation,
         true,
         FmtTraversalMode::WorkspaceSource,
+        None,
     )
 }
 
@@ -151,6 +163,7 @@ pub(crate) fn select_fmt_workspace_paths_for_comparison(
         cancellation,
         false,
         FmtTraversalMode::WorkspaceSource,
+        None,
     )
 }
 
@@ -158,10 +171,25 @@ pub(crate) fn select_fmt_workspace_paths_for_comparison(
 ///
 /// The declared root itself is traversed even when its basename starts with a
 /// dot. Dot-prefixed entries below it, including their contents, are skipped.
+#[cfg(test)]
 pub(crate) fn select_fmt_module_paths(
     paths: &[PathBuf],
     current_directory: &Path,
     cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_module_paths_with_limits(
+        paths,
+        current_directory,
+        cancellation,
+        sai_package::local_source::LocalPackageSourceSnapshotLimits::default(),
+    )
+}
+
+pub(crate) fn select_fmt_module_paths_with_limits(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+    limits: sai_package::local_source::LocalPackageSourceSnapshotLimits,
 ) -> FmtPathSelection {
     select_fmt_paths_inner(
         paths,
@@ -169,6 +197,7 @@ pub(crate) fn select_fmt_module_paths(
         cancellation,
         true,
         FmtTraversalMode::ModuleTree,
+        Some(limits),
     )
 }
 
@@ -178,6 +207,7 @@ fn select_fmt_paths_inner(
     cancellation: &CancellationToken,
     retain_capabilities: bool,
     mode: FmtTraversalMode,
+    module_tree_limits: Option<sai_package::local_source::LocalPackageSourceSnapshotLimits>,
 ) -> FmtPathSelection {
     let mut selection = FmtPathSelection::default();
     let mut selected_files = HashSet::new();
@@ -296,9 +326,10 @@ fn select_fmt_paths_inner(
                 source_root: root.clone(),
                 retain_capabilities,
                 traversal_mode: mode,
+                module_tree_limits,
             }
             .walk(root_directory, root);
-            if selection.interrupted {
+            if selection.interrupted || selection.module_tree_limit_exceeded {
                 break;
             }
         } else {
@@ -312,6 +343,12 @@ fn select_fmt_paths_inner(
         }
     }
 
+    if selection.module_tree_limit_exceeded {
+        selection.files.clear();
+        selection.missing.clear();
+        selection.errors.clear();
+        selection.module_tree_entries.clear();
+    }
     selection.files.sort_by(|left, right| {
         left.path
             .as_os_str()
@@ -335,6 +372,49 @@ fn select_fmt_paths_inner(
 }
 
 impl DirectoryWalker<'_> {
+    fn record_module_tree_entry(&mut self, path: &Path) -> bool {
+        let Some(limits) = self.module_tree_limits else {
+            return true;
+        };
+        let next_entry_count = self
+            .selection
+            .module_tree_inspected_entry_count
+            .saturating_add(1);
+        let path_bytes = path
+            .strip_prefix(&self.source_root)
+            .unwrap_or(path)
+            .as_os_str()
+            .as_encoded_bytes()
+            .len();
+        let next_path_bytes = self
+            .selection
+            .module_tree_inspected_path_bytes
+            .saturating_add(u64::try_from(path_bytes).unwrap_or(u64::MAX));
+        if next_entry_count > limits.entry_count || next_path_bytes > limits.path_bytes {
+            self.selection.module_tree_limit_exceeded = true;
+            return false;
+        }
+        self.selection.module_tree_inspected_entry_count = next_entry_count;
+        self.selection.module_tree_inspected_path_bytes = next_path_bytes;
+        true
+    }
+
+    fn record_module_tree_source_file(&mut self) -> bool {
+        let Some(limits) = self.module_tree_limits else {
+            return true;
+        };
+        let next_file_count = self
+            .selection
+            .module_tree_source_file_count
+            .saturating_add(1);
+        if next_file_count > limits.sai_file_count {
+            self.selection.module_tree_limit_exceeded = true;
+            return false;
+        }
+        self.selection.module_tree_source_file_count = next_file_count;
+        true
+    }
+
     fn walk(&mut self, root_directory: Dir, root: PathBuf) {
         let mut pending = vec![PendingDirectory::Opened(Arc::new(root_directory), root)];
         while let Some(pending_directory) = pending.pop() {
@@ -384,7 +464,19 @@ impl DirectoryWalker<'_> {
             let mut ordered_entries = Vec::new();
             for entry in entries {
                 match entry {
-                    Ok(entry) => ordered_entries.push(entry),
+                    Ok(entry) => {
+                        let name = entry.file_name();
+                        let path = directory_path.join(&name);
+                        if self.traversal_mode == FmtTraversalMode::ModuleTree {
+                            if !self.record_module_tree_entry(&path) {
+                                return;
+                            }
+                            if is_hidden_entry_name(&name) {
+                                continue;
+                            }
+                        }
+                        ordered_entries.push(entry);
+                    }
                     Err(source) => self.selection.errors.push(FmtPathSelectionError {
                         path: directory_path.clone(),
                         source,
@@ -468,6 +560,11 @@ impl DirectoryWalker<'_> {
                     );
                 }
                 if file_type.is_file() && selected_file {
+                    if self.traversal_mode == FmtTraversalMode::ModuleTree
+                        && !self.record_module_tree_source_file()
+                    {
+                        return;
+                    }
                     let is_package_manifest = name == "sai.package";
                     push_selected_file(
                         path,
@@ -783,7 +880,9 @@ mod tests {
 
     use sai_driver::CancellationToken;
 
-    use super::select_fmt_paths as select_fmt_paths_with_cancellation;
+    use super::{
+        select_fmt_module_paths_with_limits, select_fmt_paths as select_fmt_paths_with_cancellation,
+    };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -815,6 +914,75 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn module_tree_scan_stops_at_entry_and_path_budgets() {
+        let directory = TestDirectory::new();
+        let source_root = directory.0.join("src");
+        fs::create_dir(&source_root).unwrap();
+        let source_root = fs::canonicalize(source_root).unwrap();
+        fs::write(source_root.join("a.sai"), b"").unwrap();
+        fs::write(source_root.join("b.sai"), b"").unwrap();
+        let limits =
+            |entry_count, path_bytes| sai_package::local_source::LocalPackageSourceSnapshotLimits {
+                entry_count,
+                path_bytes,
+                sai_file_count: u64::MAX,
+                total_sai_file_bytes: u64::MAX,
+            };
+
+        let entry_limited = select_fmt_module_paths_with_limits(
+            std::slice::from_ref(&source_root),
+            &directory.0,
+            &CancellationToken::default(),
+            limits(1, u64::MAX),
+        );
+        assert!(
+            entry_limited.module_tree_limit_exceeded,
+            "{entry_limited:#?}"
+        );
+        assert_eq!(entry_limited.module_tree_inspected_entry_count, 1);
+        assert!(entry_limited.module_tree_entries.is_empty());
+        assert!(entry_limited.files.is_empty());
+
+        let path_limited = select_fmt_module_paths_with_limits(
+            std::slice::from_ref(&source_root),
+            &directory.0,
+            &CancellationToken::default(),
+            limits(u64::MAX, 4),
+        );
+        assert!(path_limited.module_tree_limit_exceeded);
+        assert_eq!(path_limited.module_tree_inspected_entry_count, 0);
+        assert_eq!(path_limited.module_tree_inspected_path_bytes, 0);
+        assert!(path_limited.files.is_empty());
+    }
+
+    #[test]
+    fn module_tree_scan_stops_before_retaining_too_many_source_files() {
+        let directory = TestDirectory::new();
+        let source_root = directory.0.join("src");
+        fs::create_dir(&source_root).unwrap();
+        let source_root = fs::canonicalize(source_root).unwrap();
+        fs::write(source_root.join("a.sai"), b"").unwrap();
+        fs::write(source_root.join("b.sai"), b"").unwrap();
+
+        let selection = select_fmt_module_paths_with_limits(
+            std::slice::from_ref(&source_root),
+            &directory.0,
+            &CancellationToken::default(),
+            sai_package::local_source::LocalPackageSourceSnapshotLimits {
+                entry_count: 10,
+                path_bytes: u64::MAX,
+                sai_file_count: 1,
+                total_sai_file_bytes: u64::MAX,
+            },
+        );
+
+        assert!(selection.module_tree_limit_exceeded, "{selection:#?}");
+        assert_eq!(selection.module_tree_inspected_entry_count, 2);
+        assert_eq!(selection.module_tree_source_file_count, 1);
+        assert!(selection.files.is_empty());
     }
 
     #[test]
