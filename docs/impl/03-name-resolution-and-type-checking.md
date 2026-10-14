@@ -646,6 +646,23 @@ Labels form one namespace per function, closure or `async` body (spec/04 §4.4.5
 
 The result is `labels: Break/Continue HirId → Loop HirId`. `INVALID_BREAK_VALUE` needs the loop's `LoopSource` and is reported by the type checker (§3.7.10).
 
+**Current implementation slice (IR-497).** `sai_resolve::owner::resolve_loop_labels`
+now performs the loop-label portion as an iterative walk over an owner body. It
+returns break/continue target mappings, duplicate-label, undeclared-label, and
+outside-loop diagnostics, and unused-label candidates. It resets the visible
+label stack at closure and async-block boundaries, suppresses an unused-label
+candidate when an error node occurs in that loop body, and converts decoded HIR
+spans through the supplied source snapshot before constructing diagnostics.
+Unused-label candidates retain their HIR spans: lint-level application and the
+machine-applicable removal fix remain deferred until the snapshot-aware syntax
+fix planner is connected. This helper is not yet the tracked `resolve_owner`
+query and does not handle owner-kind-specific contract/return errors; those
+still require the owner context described above. Undeclared-label suggestions
+use Damerau–Levenshtein distance over Unicode scalar values and return at most
+three visible labels within distance two. Its tests cover labeled and unlabeled
+jumps, shadowing, closure/async boundaries, error recovery, source offset
+conversion, and bounded label suggestions.
+
 ### 3.4.6 Visibility
 
 `visible(e, M)` (spec/04 §4.6.1) is evaluated for every path segment that names an item or a member, at the point where the segment is resolved: by the resolver for module members and `use` items, and by the type checker for type-relative members (variants never fail, since they have the enum's visibility; inherent associated functions and methods, spec/05 §5.13.5) and for fields (`PRIVATE_FIELD`, spec/04 §4.6.3, §4.6.4). The visibility of an entity is read from its `ItemTree` entry or from the dependency's metadata, never from HIR, so the check does not depend on the target's body.
