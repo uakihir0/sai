@@ -4336,7 +4336,8 @@ fn module_tree_workspace_check_diagnostics(
                     &direct_foreign_scopes,
                 )
                 .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
-            let phase1 = &collection.scopes;
+            let input_fingerprint = collection.input_fingerprint();
+            let phase1 = collection.scopes();
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
                     &phase1.diagnostics,
@@ -4358,8 +4359,8 @@ fn module_tree_workspace_check_diagnostics(
                         visible_identity: node.identity().to_owned(),
                         package_key,
                         module_tree: Arc::clone(module_tree),
-                        scopes: Arc::new(collection.scopes),
-                        input_fingerprint: collection.input_fingerprint,
+                        scopes: Arc::new(collection.into_scopes()),
+                        input_fingerprint,
                     },
                 );
             }

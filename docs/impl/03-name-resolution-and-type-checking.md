@@ -691,6 +691,19 @@ three visible labels within distance two. Its tests cover labeled and unlabeled
 jumps, shadowing, closure/async boundaries, error recovery, source offset
 conversion, and bounded label suggestions.
 
+**Driver integration (IR-511).** `RootDatabase` can collect Phase 1 package
+scopes together with private snapshot, target, and module-tree provenance, then
+resolve loop labels for the collected direct top-level function descriptors.
+The adapter checks that provenance, rebinds current target-filtered inputs by
+file, and lowers each function in a temporary owner-local HIR arena. Results
+retain snapshot and target provenance and contain a per-owner success or
+lowering error, so a failed owner does not stop the rest of the package. This
+result carries the collection input fingerprint along with its snapshot and
+target, and exposes a check for reuse with the matching package collection.
+This integrates `Body::value` loop labels only; contract predicates,
+return/contract diagnostics, local and path resolution, other owner kinds,
+tracked `hir_owner`, and full `resolve_owner` remain deferred.
+
 ### 3.4.6 Visibility
 
 `visible(e, M)` (spec/04 §4.6.1) is evaluated for every path segment that names an item or a member, at the point where the segment is resolved: by the resolver for module members and `use` items, and by the type checker for type-relative members (variants never fail, since they have the enum's visibility; inherent associated functions and methods, spec/05 §5.13.5) and for fields (`PRIVATE_FIELD`, spec/04 §4.6.3, §4.6.4). The visibility of an entity is read from its `ItemTree` entry or from the dependency's metadata, never from HIR, so the check does not depend on the target's body.

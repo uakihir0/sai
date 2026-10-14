@@ -7,8 +7,11 @@ use sai_diagnostics::{
     CauseKey, Child, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related, SourceRef,
     source_text_status_diagnostic,
 };
+use sai_hir::OwnerId;
+use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
-use sai_hir::item_tree::{ItemTree, TargetFilterError, TargetFilterResult};
+use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
+use sai_hir::lower::{HirLoweringContext, HirLoweringError, lower_function_owner};
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -24,6 +27,7 @@ use sai_package::mvs_diagnostics::{
 };
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
+use sai_resolve::owner::{LabelResolution, LabelResolutionError, resolve_loop_labels};
 use sai_resolve::package_scopes::{
     FilteredModule, ForeignPackageScope, PackageScopesError, PackageUseRequirement,
     collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
@@ -43,9 +47,10 @@ use sai_vfs::{
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
     PackageSourcePath, SnapshotFile, SourceDecodeError, SourceFile, SourceText, VfsInputSnapshot,
     VfsInputUpdate, VfsInputs, WitFilesSnapshot, WorkspaceSnapshot, WorkspaceSnapshotError,
+    WorkspaceSnapshotId,
 };
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Owns the query runtime and the session state for the implemented frontend.
@@ -806,11 +811,117 @@ pub struct Phase1ForeignPackageScopes {
     pub input_fingerprint: Fingerprint,
 }
 
-/// The finalized package scopes and their tracked input fingerprint.
+/// The finalized package scopes and the request provenance needed to bind
+/// their owner descriptors to the same source snapshot and target settings.
 #[derive(Clone, Debug)]
 pub struct Phase1PackageScopesCollection {
-    pub scopes: Phase1PackageScopes,
-    pub input_fingerprint: Fingerprint,
+    scopes: Phase1PackageScopes,
+    input_fingerprint: Fingerprint,
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    module_tree: ModuleTree,
+}
+
+impl Phase1PackageScopesCollection {
+    pub const fn input_fingerprint(&self) -> Fingerprint {
+        self.input_fingerprint
+    }
+
+    pub fn scopes(&self) -> &Phase1PackageScopes {
+        &self.scopes
+    }
+
+    pub fn into_scopes(self) -> Phase1PackageScopes {
+        self.scopes
+    }
+}
+
+/// Owned loop-label results for one top-level function owner.
+///
+/// The temporary HIR arena and snapshot-bound source map used to produce this
+/// value are discarded before it is returned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionOwnerLabelResolution {
+    owner: OwnerId,
+    resolution: Result<LabelResolution, FunctionOwnerLabelResolutionError>,
+    /// Diagnostics produced while lowering the owner, kept separate from the
+    /// label resolver's diagnostics so the caller can preserve phase order.
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl FunctionOwnerLabelResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn resolution(&self) -> Result<&LabelResolution, &FunctionOwnerLabelResolutionError> {
+        self.resolution.as_ref()
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Per-owner label results tagged with the request provenance they belong to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionOwnerLabelResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<FunctionOwnerLabelResolution>,
+}
+
+impl FunctionOwnerLabelResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    /// Checks whether these results were produced for the given package
+    /// collection, including its non-snapshot package inputs.
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[FunctionOwnerLabelResolution] {
+        &self.owners
+    }
+}
+
+/// Failure while lowering a current-snapshot function owner for label
+/// resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FunctionOwnerLabelResolutionError {
+    SnapshotMismatch,
+    ModuleTreeMismatch,
+    MissingSnapshotFile(FileId),
+    Parse(ParseQueryError),
+    ItemTree(ItemTreeQueryError),
+    TargetFilter(TargetFilterError),
+    DefPathInterner(DefPathInternerError),
+    MissingDefPath(OwnerId),
+    DescriptorNotInCurrentTarget { owner: OwnerId, file: FileId },
+    Lowering(HirLoweringError),
+    Labels(LabelResolutionError),
+}
+
+struct CurrentFunctionOwnerInputs {
+    source: Arc<SourceFile>,
+    parsed: Parse,
+    ast_ids: ast::AstIdMap,
+    filtered_item_tree: ItemTree,
+    retained_function_ids: HashSet<ast::ErasedAstId>,
+    source_ref: SourceRef,
 }
 
 impl From<ParseQueryError> for Phase1CollectionError {
@@ -1979,6 +2090,26 @@ impl RootDatabase {
         target_cfg: &TargetCfg,
         build_context: Phase1BuildContext,
     ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
+        self.collect_phase1_package_scopes_collection(
+            module_tree,
+            snapshot,
+            target_cfg,
+            build_context,
+        )
+        .map(|collection| collection.scopes)
+    }
+
+    /// Collects Phase 1 scopes with request-local source and target provenance.
+    ///
+    /// The collection can be passed to snapshot-bound owner adapters. Unlike
+    /// the memoized scope value, its provenance is not retained in a query.
+    pub fn collect_phase1_package_scopes_collection(
+        &mut self,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+        build_context: Phase1BuildContext,
+    ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
         self.collect_phase1_package_scopes_with_requirements(
             module_tree,
             snapshot,
@@ -1987,7 +2118,6 @@ impl RootDatabase {
             None,
             &[],
         )
-        .map(|collection| collection.scopes)
     }
 
     /// Sets the package's exact manifest input, reads its tracked requirement
@@ -2207,6 +2337,175 @@ impl RootDatabase {
         Ok(Phase1PackageScopesCollection {
             scopes,
             input_fingerprint: output.input_fingerprint,
+            snapshot_id: snapshot.id(),
+            target_cfg: target_cfg.clone(),
+            module_tree: module_tree.clone(),
+        })
+    }
+
+    fn current_function_owner_inputs(
+        &mut self,
+        snapshot: &WorkspaceSnapshot,
+        file: FileId,
+        target_cfg: &TargetCfg,
+    ) -> Result<CurrentFunctionOwnerInputs, FunctionOwnerLabelResolutionError> {
+        let snapshot_file = snapshot
+            .file(file)
+            .ok_or(FunctionOwnerLabelResolutionError::MissingSnapshotFile(file))?;
+        let source = Arc::clone(snapshot_file.source());
+        let parsed = self
+            .parse_file(snapshot, file)
+            .map_err(FunctionOwnerLabelResolutionError::Parse)?;
+        let ast_ids = self
+            .ast_id_map(snapshot, file)
+            .map_err(FunctionOwnerLabelResolutionError::Parse)?;
+        let item_tree = self
+            .def_collector(snapshot, file)
+            .map_err(FunctionOwnerLabelResolutionError::ItemTree)?;
+        let filtered_item_tree = item_tree
+            .filter_for_target(
+                source.text(),
+                &parsed.root,
+                &ast_ids,
+                &self.symbols,
+                snapshot,
+                target_cfg,
+            )
+            .map_err(FunctionOwnerLabelResolutionError::TargetFilter)?
+            .item_tree;
+        let retained_function_ids = filtered_item_tree
+            .items
+            .iter()
+            .filter(|entry| entry.kind == ItemTreeKind::Function)
+            .map(|entry| entry.ast_id)
+            .collect();
+        let source_ref = SourceRef {
+            path: snapshot_file.path().to_owned(),
+            package: snapshot_file.package().map(str::to_owned),
+            snapshot: snapshot_file.document_version(),
+        };
+        Ok(CurrentFunctionOwnerInputs {
+            source,
+            parsed,
+            ast_ids,
+            filtered_item_tree,
+            retained_function_ids,
+            source_ref,
+        })
+    }
+
+    /// Lowers each Phase 1 function descriptor from the collection's exact
+    /// module tree and snapshot, then resolves its loop labels.
+    ///
+    /// This is an uncached bridge: HIR and source maps remain local to each
+    /// iteration, and only owned label results and diagnostics are returned.
+    /// The descriptor order is preserved so nested definition paths are
+    /// interned deterministically.
+    pub fn resolve_function_owner_labels(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<FunctionOwnerLabelResolutions, FunctionOwnerLabelResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(FunctionOwnerLabelResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(FunctionOwnerLabelResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = &collection.scopes.function_owners;
+        let mut owners = Vec::with_capacity(descriptors.len());
+        let mut group_start = 0;
+        while group_start < descriptors.len() {
+            let file = descriptors[group_start].file;
+            let mut group_end = group_start + 1;
+            while group_end < descriptors.len() && descriptors[group_end].file == file {
+                group_end += 1;
+            }
+            let inputs =
+                match self.current_function_owner_inputs(snapshot, file, &collection.target_cfg) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        owners.extend(descriptors[group_start..group_end].iter().map(
+                            |descriptor| FunctionOwnerLabelResolution {
+                                owner: descriptor.owner,
+                                resolution: Err(error.clone()),
+                                lowering_diagnostics: Vec::new(),
+                            },
+                        ));
+                        group_start = group_end;
+                        continue;
+                    }
+                };
+
+            for descriptor in &descriptors[group_start..group_end] {
+                let mut lowering_diagnostics = Vec::new();
+                let resolution = (|| {
+                    if !inputs.retained_function_ids.contains(&descriptor.item_id) {
+                        return Err(
+                            FunctionOwnerLabelResolutionError::DescriptorNotInCurrentTarget {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+
+                    let def_paths = self
+                        .def_paths
+                        .get(&descriptor.owner.def_id.package())
+                        .ok_or(FunctionOwnerLabelResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+                    let expected_path = def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .map_err(FunctionOwnerLabelResolutionError::DefPathInterner)?
+                        .ok_or(FunctionOwnerLabelResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+
+                    let arena = HirArena::new();
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.parsed.root,
+                        &arena,
+                        &self.symbols,
+                        def_paths,
+                    );
+                    let (hir_owner, _source_map) = lower_function_owner(
+                        descriptor.owner,
+                        &expected_path,
+                        &inputs.filtered_item_tree,
+                        descriptor.item_id,
+                        &context,
+                    )
+                    .map_err(FunctionOwnerLabelResolutionError::Lowering)?;
+                    lowering_diagnostics = hir_owner.diagnostics.clone();
+                    match hir_owner.body {
+                        Some(body) => resolve_loop_labels(
+                            &body.value,
+                            &inputs.source_ref,
+                            inputs.source.as_ref(),
+                            &self.symbols,
+                        )
+                        .map_err(FunctionOwnerLabelResolutionError::Labels),
+                        None => Ok(LabelResolution::default()),
+                    }
+                })();
+                owners.push(FunctionOwnerLabelResolution {
+                    owner: descriptor.owner,
+                    resolution,
+                    lowering_diagnostics,
+                });
+            }
+            group_start = group_end;
+        }
+        Ok(FunctionOwnerLabelResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
         })
     }
 
@@ -2637,6 +2936,217 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    #[test]
+    fn function_owner_label_adapter_lowers_current_target_descriptors_in_source_order() {
+        let root = concat!(
+            "fn choose() {\n",
+            "    'outer: loop {\n",
+            "        loop { break 'outer; }\n",
+            "    }\n",
+            "}\n",
+            "@target(\"wasm64-core\")\n",
+            "fn excluded() { break; }\n",
+            "fn choose() {}\n",
+        );
+        let child = "pub fn child() {}\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+
+        assert_eq!(collection.scopes.function_owners.len(), 3);
+        let resolved = database
+            .resolve_function_owner_labels(&collection, &module_tree, &snapshot)
+            .expect("current target function owners lower and resolve");
+        assert!(resolved.matches_snapshot(&snapshot));
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.target_cfg(), &target_cfg);
+        assert_eq!(resolved.owners().len(), 3);
+        assert_eq!(
+            resolved
+                .owners()
+                .iter()
+                .map(FunctionOwnerLabelResolution::owner)
+                .collect::<Vec<_>>(),
+            collection
+                .scopes
+                .function_owners
+                .iter()
+                .map(|descriptor| descriptor.owner)
+                .collect::<Vec<_>>(),
+            "the driver preserves Phase 1's module and source order"
+        );
+        assert_eq!(
+            resolved.owners()[0]
+                .resolution()
+                .expect("first function resolves")
+                .labels
+                .len(),
+            1
+        );
+        assert!(
+            resolved.owners()[0]
+                .resolution()
+                .expect("first function resolves")
+                .labels
+                .values()
+                .all(|target| matches!(target, Ok(loop_id) if loop_id.owner == resolved.owners()[0].owner()))
+        );
+        assert!(resolved.owners().iter().all(|owner| {
+            owner
+                .resolution()
+                .is_ok_and(|labels| labels.diagnostics.is_empty())
+                && owner.lowering_diagnostics().is_empty()
+        }));
+        let root_tree = database
+            .def_collector(&snapshot, module_tree.modules[0].file)
+            .expect("root item tree is available");
+        assert_eq!(
+            root_tree
+                .items
+                .iter()
+                .filter(|entry| entry.kind == ItemTreeKind::Function)
+                .count(),
+            3,
+            "the unfiltered root tree contains the target-excluded function"
+        );
+        assert_eq!(
+            collection
+                .scopes
+                .function_owners
+                .iter()
+                .filter(|descriptor| descriptor.file == module_tree.modules[0].file)
+                .count(),
+            2,
+            "target filtering excludes its function from the owner descriptors"
+        );
+        let mut changed_module_tree = module_tree.clone();
+        changed_module_tree.modules[1].parent_dir = None;
+        let changed_collection = database
+            .collect_phase1_package_scopes_collection(
+                &changed_module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("same-snapshot collection with changed package topology succeeds");
+        assert_ne!(
+            collection.input_fingerprint(),
+            changed_collection.input_fingerprint(),
+            "package topology contributes to collection identity independently of the source snapshot"
+        );
+        assert!(!resolved.matches_collection(&changed_collection));
+        let mut stale_module_tree = module_tree.clone();
+        stale_module_tree.modules[0].parent_dir = Some(ModuleId::ROOT);
+        assert!(matches!(
+            database.resolve_function_owner_labels(&collection, &stale_module_tree, &snapshot),
+            Err(FunctionOwnerLabelResolutionError::ModuleTreeMismatch)
+        ));
+    }
+
+    #[test]
+    fn function_owner_label_adapter_rejects_a_collection_from_another_snapshot() {
+        let root = b"fn duplicate() { 0 }\nfn duplicate() { 1 }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root, b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let old_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("old snapshot collection succeeds");
+
+        let root_file = module_tree.modules[0].file;
+        let edited_root = b"fn duplicate() { 2 }\nfn duplicate() { 0 }\nfn duplicate() { 1 }\n";
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai").expect("root key is valid"),
+                Arc::from(edited_root.as_slice()),
+                Durability::Low,
+            )
+            .expect("edited source is recorded");
+        let new_snapshot = WorkspaceSnapshot::new(snapshot.iter().map(|file| {
+            let source = if file.source().id() == root_file {
+                Arc::new(SourceFile::decode(root_file, edited_root).expect("edited source decodes"))
+            } else {
+                Arc::clone(file.source())
+            };
+            SnapshotFile::new(
+                source,
+                file.path().to_owned(),
+                file.package().map(str::to_owned),
+                Some(18),
+            )
+        }))
+        .expect("edited workspace snapshot is valid");
+
+        assert!(matches!(
+            database.resolve_function_owner_labels(&old_collection, &module_tree, &new_snapshot),
+            Err(FunctionOwnerLabelResolutionError::SnapshotMismatch)
+        ));
+
+        let new_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &new_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("new snapshot collection succeeds");
+        let resolved = database
+            .resolve_function_owner_labels(&new_collection, &module_tree, &new_snapshot)
+            .expect("new descriptors lower against the new snapshot");
+        assert_eq!(resolved.owners().len(), 3);
+    }
+
+    #[test]
+    fn function_owner_label_adapter_keeps_processing_after_one_lowering_failure() {
+        let root = "fn first() {}\nfn later() { break; }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let mut collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection succeeds");
+        // Simulate an internal descriptor-corruption failure: the public
+        // collection keeps this owner index immutable to callers.
+        let later_owner = collection.scopes.function_owners[1].owner;
+        collection.scopes.function_owners[0].owner = later_owner;
+
+        let resolved = database
+            .resolve_function_owner_labels(&collection, &module_tree, &snapshot)
+            .expect("per-owner lower failures do not abort the package");
+        assert_eq!(resolved.owners().len(), 2);
+        assert!(matches!(
+            resolved.owners()[0].resolution(),
+            Err(FunctionOwnerLabelResolutionError::Lowering(
+                HirLoweringError::ItemTreeEntryMismatch
+            ))
+        ));
+        let later = resolved.owners()[1]
+            .resolution()
+            .expect("later function still resolves");
+        assert!(
+            later
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::BreakOutsideLoop })
+        );
     }
 
     fn graph_edge(target: &str, visible_identity: &str) -> PackageGraphEdge {
