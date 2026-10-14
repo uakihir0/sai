@@ -244,6 +244,7 @@ mod tests {
             interfaces,
             exports: Default::default(),
             function_owners: Vec::new(),
+            invariant_owners: Vec::new(),
             diagnostics: Vec::new(),
         }
     }

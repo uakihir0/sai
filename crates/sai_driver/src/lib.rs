@@ -11,7 +11,9 @@ use sai_hir::OwnerId;
 use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
-use sai_hir::lower::{HirLoweringContext, HirLoweringError, lower_function_owner};
+use sai_hir::lower::{
+    HirLoweringContext, HirLoweringError, lower_function_owner, lower_invariant_owner,
+};
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -27,7 +29,7 @@ use sai_package::mvs_diagnostics::{
 };
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
-use sai_resolve::owner::{LabelResolution, LabelResolutionError, resolve_function_control_flow};
+use sai_resolve::owner::{LabelResolution, LabelResolutionError, resolve_owner_control_flow};
 use sai_resolve::package_scopes::{
     FilteredModule, ForeignPackageScope, PackageScopesError, PackageUseRequirement,
     collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
@@ -50,7 +52,7 @@ use sai_vfs::{
     WorkspaceSnapshotId,
 };
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 /// Owns the query runtime and the session state for the implemented frontend.
@@ -898,10 +900,73 @@ impl FunctionOwnerLabelResolutions {
     }
 }
 
-/// Failure while lowering a current-snapshot function owner for label
-/// resolution.
+/// Per-owner predicate diagnostics produced for one top-level invariant.
+///
+/// The temporary HIR arena and source map used to produce these diagnostics
+/// are discarded before the value is returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FunctionOwnerLabelResolutionError {
+pub struct InvariantOwnerPredicateResolution {
+    owner: OwnerId,
+    resolution: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    /// Diagnostics produced while lowering the owner, kept separate from the
+    /// predicate resolver's diagnostics so the caller can preserve phase
+    /// order.
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl InvariantOwnerPredicateResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn resolution(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.resolution.as_deref()
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Per-owner invariant predicate results tagged with request provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvariantOwnerPredicateResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<InvariantOwnerPredicateResolution>,
+}
+
+impl InvariantOwnerPredicateResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    /// Checks whether these results were produced for the given package
+    /// collection, including its non-snapshot package inputs.
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[InvariantOwnerPredicateResolution] {
+        &self.owners
+    }
+}
+
+/// Failure while lowering a current-snapshot owner for control-flow or
+/// predicate diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnerControlFlowResolutionError {
     SnapshotMismatch,
     ModuleTreeMismatch,
     MissingSnapshotFile(FileId),
@@ -915,12 +980,15 @@ pub enum FunctionOwnerLabelResolutionError {
     Labels(LabelResolutionError),
 }
 
-struct CurrentFunctionOwnerInputs {
+/// Compatibility name for the original function label adapter error.
+pub type FunctionOwnerLabelResolutionError = OwnerControlFlowResolutionError;
+
+struct CurrentOwnerInputs {
     source: Arc<SourceFile>,
     parsed: Parse,
     ast_ids: ast::AstIdMap,
     filtered_item_tree: ItemTree,
-    retained_function_ids: HashSet<ast::ErasedAstId>,
+    retained_item_kinds: HashMap<ast::ErasedAstId, ItemTreeKind>,
     source_ref: SourceRef,
 }
 
@@ -2343,25 +2411,25 @@ impl RootDatabase {
         })
     }
 
-    fn current_function_owner_inputs(
+    fn current_owner_inputs(
         &mut self,
         snapshot: &WorkspaceSnapshot,
         file: FileId,
         target_cfg: &TargetCfg,
-    ) -> Result<CurrentFunctionOwnerInputs, FunctionOwnerLabelResolutionError> {
+    ) -> Result<CurrentOwnerInputs, OwnerControlFlowResolutionError> {
         let snapshot_file = snapshot
             .file(file)
-            .ok_or(FunctionOwnerLabelResolutionError::MissingSnapshotFile(file))?;
+            .ok_or(OwnerControlFlowResolutionError::MissingSnapshotFile(file))?;
         let source = Arc::clone(snapshot_file.source());
         let parsed = self
             .parse_file(snapshot, file)
-            .map_err(FunctionOwnerLabelResolutionError::Parse)?;
+            .map_err(OwnerControlFlowResolutionError::Parse)?;
         let ast_ids = self
             .ast_id_map(snapshot, file)
-            .map_err(FunctionOwnerLabelResolutionError::Parse)?;
+            .map_err(OwnerControlFlowResolutionError::Parse)?;
         let item_tree = self
             .def_collector(snapshot, file)
-            .map_err(FunctionOwnerLabelResolutionError::ItemTree)?;
+            .map_err(OwnerControlFlowResolutionError::ItemTree)?;
         let filtered_item_tree = item_tree
             .filter_for_target(
                 source.text(),
@@ -2371,25 +2439,24 @@ impl RootDatabase {
                 snapshot,
                 target_cfg,
             )
-            .map_err(FunctionOwnerLabelResolutionError::TargetFilter)?
+            .map_err(OwnerControlFlowResolutionError::TargetFilter)?
             .item_tree;
-        let retained_function_ids = filtered_item_tree
+        let retained_item_kinds = filtered_item_tree
             .items
             .iter()
-            .filter(|entry| entry.kind == ItemTreeKind::Function)
-            .map(|entry| entry.ast_id)
+            .map(|entry| (entry.ast_id, entry.kind))
             .collect();
         let source_ref = SourceRef {
             path: snapshot_file.path().to_owned(),
             package: snapshot_file.package().map(str::to_owned),
             snapshot: snapshot_file.document_version(),
         };
-        Ok(CurrentFunctionOwnerInputs {
+        Ok(CurrentOwnerInputs {
             source,
             parsed,
             ast_ids,
             filtered_item_tree,
-            retained_function_ids,
+            retained_item_kinds,
             source_ref,
         })
     }
@@ -2424,7 +2491,7 @@ impl RootDatabase {
                 group_end += 1;
             }
             let inputs =
-                match self.current_function_owner_inputs(snapshot, file, &collection.target_cfg) {
+                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
                     Ok(inputs) => inputs,
                     Err(error) => {
                         owners.extend(descriptors[group_start..group_end].iter().map(
@@ -2442,7 +2509,9 @@ impl RootDatabase {
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let resolution = (|| {
-                    if !inputs.retained_function_ids.contains(&descriptor.item_id) {
+                    if inputs.retained_item_kinds.get(&descriptor.item_id)
+                        != Some(&ItemTreeKind::Function)
+                    {
                         return Err(
                             FunctionOwnerLabelResolutionError::DescriptorNotInCurrentTarget {
                                 owner: descriptor.owner,
@@ -2483,7 +2552,7 @@ impl RootDatabase {
                     .map_err(FunctionOwnerLabelResolutionError::Lowering)?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     match hir_owner.body {
-                        Some(body) => resolve_function_control_flow(
+                        Some(body) => resolve_owner_control_flow(
                             body,
                             &inputs.source_ref,
                             inputs.source.as_ref(),
@@ -2502,6 +2571,124 @@ impl RootDatabase {
             group_start = group_end;
         }
         Ok(FunctionOwnerLabelResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Lowers each Phase 1 invariant descriptor from the collection's exact
+    /// module tree and snapshot, then diagnoses forbidden predicate syntax.
+    ///
+    /// This is an uncached bridge: HIR and source maps remain local to each
+    /// iteration, and only owned diagnostics and errors are returned. The
+    /// descriptor order is preserved so nested definition paths are interned
+    /// deterministically.
+    pub fn resolve_invariant_owner_predicates(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<InvariantOwnerPredicateResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = &collection.scopes.invariant_owners;
+        let mut owners = Vec::with_capacity(descriptors.len());
+        let mut group_start = 0;
+        while group_start < descriptors.len() {
+            let file = descriptors[group_start].file;
+            let mut group_end = group_start + 1;
+            while group_end < descriptors.len() && descriptors[group_end].file == file {
+                group_end += 1;
+            }
+            let inputs =
+                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        owners.extend(descriptors[group_start..group_end].iter().map(
+                            |descriptor| InvariantOwnerPredicateResolution {
+                                owner: descriptor.owner,
+                                resolution: Err(error.clone()),
+                                lowering_diagnostics: Vec::new(),
+                            },
+                        ));
+                        group_start = group_end;
+                        continue;
+                    }
+                };
+
+            for descriptor in &descriptors[group_start..group_end] {
+                let mut lowering_diagnostics = Vec::new();
+                let resolution = (|| {
+                    if inputs.retained_item_kinds.get(&descriptor.item_id)
+                        != Some(&ItemTreeKind::Invariant)
+                    {
+                        return Err(
+                            OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+
+                    let def_paths = self
+                        .def_paths
+                        .get(&descriptor.owner.def_id.package())
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+                    let expected_path = def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+
+                    let arena = HirArena::new();
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.parsed.root,
+                        &arena,
+                        &self.symbols,
+                        def_paths,
+                    );
+                    let (hir_owner, _source_map) = lower_invariant_owner(
+                        descriptor.owner,
+                        &expected_path,
+                        &inputs.filtered_item_tree,
+                        descriptor.item_id,
+                        &context,
+                    )
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                    lowering_diagnostics = hir_owner.diagnostics.clone();
+                    match hir_owner.body {
+                        Some(body) => resolve_owner_control_flow(
+                            body,
+                            &inputs.source_ref,
+                            inputs.source.as_ref(),
+                            &self.symbols,
+                        )
+                        .map(|result| result.diagnostics)
+                        .map_err(OwnerControlFlowResolutionError::Labels),
+                        None => Ok(Vec::new()),
+                    }
+                })();
+                owners.push(InvariantOwnerPredicateResolution {
+                    owner: descriptor.owner,
+                    resolution,
+                    lowering_diagnostics,
+                });
+            }
+            group_start = group_end;
+        }
+        Ok(InvariantOwnerPredicateResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -3133,6 +3320,44 @@ mod tests {
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
             [sai_diagnostics::Code::InvalidContractExpression; 8]
+        );
+    }
+
+    #[test]
+    fn invariant_owner_adapter_reports_forbidden_predicate_syntax() {
+        let root = b"invariant Account { true?, true }\ninvariant Safe { true }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root, b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("invariant declarations collect");
+        assert_eq!(collection.scopes().invariant_owners.len(), 2);
+
+        let resolved = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("invariant owner predicates resolve");
+
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 2);
+        assert_eq!(
+            resolved.owners()[0]
+                .resolution()
+                .expect("first invariant lowers")
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::InvalidContractExpression]
+        );
+        assert!(
+            resolved.owners()[1]
+                .resolution()
+                .expect("second invariant lowers")
+                .is_empty()
         );
     }
 

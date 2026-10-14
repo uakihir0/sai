@@ -69,14 +69,13 @@ enum ContractWork<'hir> {
     Stmt(&'hir Stmt<'hir>),
 }
 
-/// Resolve labels in a function body and report forbidden source constructs
-/// inside its `requires` and `ensures` predicates.
+/// Resolve labels and predicate restrictions for one HIR owner body.
 ///
 /// Contract violations are diagnosed as `INVALID_CONTRACT_EXPRESSION`.
 /// Contract jumps are deliberately excluded from the loop-label map and
 /// ordinary outside-loop diagnostics. Closure and async-block bodies are
 /// separate owner bodies and are left to their own resolver pass.
-pub fn resolve_function_control_flow(
+pub fn resolve_owner_control_flow(
     body: &Body<'_>,
     source_ref: &SourceRef,
     source: &SourceFile,
@@ -84,7 +83,10 @@ pub fn resolve_function_control_flow(
 ) -> Result<LabelResolution, LabelResolutionError> {
     let mut result = resolve_loop_labels(body.value, source_ref, source, symbols)?;
     for contract in body.contracts {
-        resolve_contract_control_flow(contract.expr, source_ref, source, &mut result.diagnostics)?;
+        resolve_predicate_restrictions(contract.expr, source_ref, source, &mut result.diagnostics)?;
+    }
+    for predicate in body.invariant_preds {
+        resolve_predicate_restrictions(predicate, source_ref, source, &mut result.diagnostics)?;
     }
     result.diagnostics.sort_by_key(|diagnostic| {
         diagnostic
@@ -95,7 +97,7 @@ pub fn resolve_function_control_flow(
     Ok(result)
 }
 
-fn resolve_contract_control_flow(
+fn resolve_predicate_restrictions(
     root: &Expr<'_>,
     source_ref: &SourceRef,
     source: &SourceFile,
@@ -110,7 +112,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`break`",
-                            "control transfer in contract",
+                            "control transfer in predicate",
                             source_ref,
                             source,
                         )?);
@@ -124,7 +126,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`continue`",
-                            "control transfer in contract",
+                            "control transfer in predicate",
                             source_ref,
                             source,
                         )?);
@@ -135,7 +137,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`return`",
-                            "control transfer in contract",
+                            "control transfer in predicate",
                             source_ref,
                             source,
                         )?);
@@ -155,7 +157,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "closure",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -170,7 +172,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`?`",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -182,7 +184,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`.await`",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -220,7 +222,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`unsafe` block",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -232,7 +234,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`region` block",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -291,7 +293,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             pat.span,
                             "`var` statement",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -306,7 +308,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             stmt.span,
                             "assignment",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -319,7 +321,7 @@ fn resolve_contract_control_flow(
                         diagnostics.push(invalid_contract_expression(
                             stmt.span,
                             "compound assignment",
-                            "forbidden construct in contract",
+                            "forbidden construct in predicate",
                             source_ref,
                             source,
                         )?);
@@ -351,7 +353,7 @@ fn invalid_contract_expression(
     let mut diagnostic = Diagnostic::new(
         Code::InvalidContractExpression,
         Severity::Error,
-        format!("{construct} is not allowed in a contract expression"),
+        format!("{construct} is not allowed in a predicate expression"),
         Some(primary),
     );
     diagnostic.primary_label = primary_label.to_owned();
@@ -362,11 +364,10 @@ fn invalid_contract_expression(
 ///
 /// `source_ref` identifies the source file for diagnostics; HIR spans use
 /// decoded-text offsets and are converted to original-file offsets here.
-/// Function contracts are supplied separately by
-/// `resolve_function_control_flow` because their forbidden control-flow and
+/// Predicate expressions are supplied separately by
+/// `resolve_owner_control_flow` because their forbidden control-flow and
 /// syntax constructs are `INVALID_CONTRACT_EXPRESSION`, not loop-target
-/// errors. Refinement and invariant predicates still require their own
-/// owner-kind adapters.
+/// errors.
 pub fn resolve_loop_labels(
     root: &Expr<'_>,
     source_ref: &SourceRef,
@@ -1188,7 +1189,7 @@ mod tests {
         };
         let (source_ref, source) = source();
 
-        let result = resolve_function_control_flow(&body, &source_ref, &source, &symbols)
+        let result = resolve_owner_control_flow(&body, &source_ref, &source, &symbols)
             .expect("function control flow resolves");
 
         assert_eq!(
@@ -1386,7 +1387,7 @@ mod tests {
         };
         let (source_ref, source) = source();
 
-        let result = resolve_function_control_flow(&body, &source_ref, &source, &symbols)
+        let result = resolve_owner_control_flow(&body, &source_ref, &source, &symbols)
             .expect("function contract restrictions resolve");
 
         assert_eq!(
@@ -1415,6 +1416,44 @@ mod tests {
         );
         assert!(result.labels.is_empty());
         assert!(result.unused_labels.is_empty());
+
+        let invariant_return = expr(&arena, owner, 25, 120, 126, ExprKind::Return(None));
+        let invariant_predicates = [predicate, invariant_return];
+        let invariant_body = Body {
+            owner,
+            params: &[],
+            value: body_value,
+            contracts: &[],
+            invariant_preds: &invariant_predicates,
+        };
+        let invariant_result =
+            resolve_owner_control_flow(&invariant_body, &source_ref, &source, &symbols)
+                .expect("invariant predicate restrictions resolve");
+        assert_eq!(
+            invariant_result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidContractExpression; 8]
+        );
+        assert_eq!(
+            invariant_result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("diagnostic has a primary location")
+                        .span
+                        .range
+                        .start()
+                        .raw()
+                })
+                .collect::<Vec<_>>(),
+            [10, 20, 40, 60, 80, 90, 100, 120]
+        );
+        assert!(invariant_result.labels.is_empty());
     }
 
     fn expr<'hir>(
