@@ -474,6 +474,8 @@ Phase 1 declarations and successfully inserted local aliases or item imports are
 
 When a deferred foreign/interface candidate precedes a known local re-export candidate with the same name, this temporary bridge uses the successful local result; the final package resolver must replace this recovery rule with ordered dependency-aware lookup. Type checking, lints, fixes, and successful `check` result records remain unavailable and are represented by `FEATURE_NOT_IMPLEMENTED`.
 
+For `--locked` and `--frozen`, `sai check` holds the shared workspace lock while it reads the lockfile. Before returning `LOCK_MISSING`, it reads and parses the bounded root manifest only to preserve a package identity from an available header; manifest diagnostics are suppressed so missing-lock precedence is preserved, and malformed manifests without a valid header keep `root` and `package` null. No source analysis runs. A present lock receives syntax, local-validity, and graph validation; when the manifest parses, the CLI also validates and compares the root contract for the selected target and `--tests`. Only a root-only lock with no requirements or path overrides is adapted to the driver's `PackageGraph`. A lock with package entries, root requirements, or path overrides stops with `FEATURE_NOT_IMPLEMENTED` before source analysis because dependency source selection, pins, and current dependency contracts are not yet verified. If the root manifest itself is syntactically invalid, the CLI still validates the present lock locally, but cannot compare the root contract. This slice does not claim full Mode A validation and never emits a successful `check` result.
+
 ### 13.6.3 `sai build`
 
 ```text
