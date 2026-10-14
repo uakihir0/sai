@@ -404,6 +404,51 @@ fn run_check(
         }
     };
 
+    let mut waiting_reported = false;
+    let _workspace_lock = loop {
+        if cancellation.is_cancelled() {
+            return report_interrupted(parsed, stdout, stderr);
+        }
+        match WorkspaceLockGuard::try_acquire(&package_root, WorkspaceLockMode::Shared) {
+            Ok(Some(guard)) => break guard,
+            Ok(None) => {
+                if !waiting_reported
+                    && parsed.globals.format == OutputFormat::Human
+                    && !parsed.globals.quiet
+                {
+                    if let Err(error) = stderr.write_all(b"waiting for .sai/lock\n") {
+                        return report_stderr_failure(error);
+                    }
+                    waiting_reported = true;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                let manifest_path = fmt_path_reference(
+                    &package_root.join("sai.package"),
+                    &cwd,
+                    Some(&package_root),
+                );
+                let diagnostic = check_cli_diagnostic(fmt_io_diagnostic(
+                    "WORKSPACE_LOCK_FAILED",
+                    &manifest_path,
+                    "could not acquire the package workspace lock",
+                    &io::Error::other(error),
+                ));
+                return report_check_diagnostics(
+                    parsed,
+                    vec![diagnostic],
+                    1,
+                    0,
+                    0,
+                    None,
+                    stdout,
+                    stderr,
+                );
+            }
+        }
+    };
+
     let mut diagnostics = Vec::new();
     let mut total_errors = 0usize;
     let mut total_warnings = 0usize;
@@ -517,6 +562,121 @@ fn run_check(
 
     if cancellation.is_cancelled() {
         return report_interrupted(parsed, stdout, stderr);
+    }
+    if check_locked_mode(command) {
+        match check_locked_lock_presence(
+            &package_root,
+            &cwd,
+            root_identity.as_deref(),
+            cancellation,
+        ) {
+            CheckLockPresence::Present => {}
+            CheckLockPresence::Missing(diagnostic) | CheckLockPresence::Failed(diagnostic) => {
+                return report_check_diagnostics(
+                    parsed,
+                    vec![diagnostic],
+                    1,
+                    0,
+                    0,
+                    root_identity.as_deref(),
+                    stdout,
+                    stderr,
+                );
+            }
+            CheckLockPresence::Interrupted => {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+        }
+    }
+    let mut package_graph = None;
+    if check_locked_mode(command)
+        && let Some(manifest) = parsed_manifest.as_ref()
+    {
+        match check_locked_preflight(
+            manifest,
+            &package_root,
+            &cwd,
+            manifest_source
+                .as_deref()
+                .expect("a syntax-valid package has a retained manifest snapshot"),
+            check_target_override(command),
+            command_tail(command)
+                .iter()
+                .any(|(argument, _)| argument == "--tests"),
+            root_identity.as_deref(),
+            include_source_lines,
+            cancellation,
+        ) {
+            CheckLockPreflight::Continue {
+                graph,
+                diagnostics: lock_diagnostics,
+                warnings,
+            } => {
+                diagnostics.extend(lock_diagnostics);
+                total_warnings = total_warnings.saturating_add(warnings);
+                package_graph = Some(graph);
+            }
+            CheckLockPreflight::Stop {
+                diagnostics: lock_diagnostics,
+                errors,
+                warnings,
+            } => {
+                diagnostics.extend(lock_diagnostics);
+                total_errors = total_errors.saturating_add(errors);
+                total_warnings = total_warnings.saturating_add(warnings);
+                return report_check_diagnostics(
+                    parsed,
+                    diagnostics,
+                    total_errors,
+                    total_warnings,
+                    total_infos,
+                    root_identity.as_deref(),
+                    stdout,
+                    stderr,
+                );
+            }
+            CheckLockPreflight::Interrupted => {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+        }
+    } else if check_locked_mode(command) {
+        match check_locked_lock_file_only(
+            &package_root,
+            &cwd,
+            root_identity.as_deref(),
+            include_source_lines,
+            cancellation,
+        ) {
+            CheckLockLocalPreflight::Continue {
+                diagnostics: lock_diagnostics,
+                warnings,
+            } => {
+                diagnostics.extend(lock_diagnostics);
+                total_warnings = total_warnings.saturating_add(warnings);
+            }
+            CheckLockLocalPreflight::Stop {
+                diagnostics: lock_diagnostics,
+                errors,
+                warnings,
+            } => {
+                diagnostics.extend(lock_diagnostics);
+                total_errors = total_errors.saturating_add(errors);
+                total_warnings = total_warnings.saturating_add(warnings);
+                return report_check_diagnostics(
+                    parsed,
+                    diagnostics,
+                    total_errors,
+                    total_warnings,
+                    total_infos,
+                    root_identity.as_deref(),
+                    stdout,
+                    stderr,
+                );
+            }
+            CheckLockLocalPreflight::Interrupted => {
+                return report_interrupted(parsed, stdout, stderr);
+            }
+        }
     }
     if let Some(manifest) = parsed_manifest {
         let declared_source = manifest.file().declarations.iter().find_map(|declaration| {
@@ -740,6 +900,7 @@ fn run_check(
                                         include_source_lines,
                                         root_inspection_incomplete,
                                         target_cfg.as_ref(),
+                                        package_graph.take(),
                                         command_tail(command)
                                             .iter()
                                             .any(|(argument, _)| argument == "--tests"),
@@ -1144,6 +1305,1064 @@ fn check_target_not_declared_diagnostic(target: &str) -> CheckDiagnostic {
     })
 }
 
+enum CheckLockPresence {
+    Present,
+    Missing(CheckDiagnostic),
+    Failed(CheckDiagnostic),
+    Interrupted,
+}
+
+enum CheckLockPreflight {
+    Continue {
+        graph: sai_driver::package_graph::PackageGraph,
+        diagnostics: Vec<CheckDiagnostic>,
+        warnings: usize,
+    },
+    Stop {
+        diagnostics: Vec<CheckDiagnostic>,
+        errors: usize,
+        warnings: usize,
+    },
+    Interrupted,
+}
+
+enum CheckLockLocalPreflight {
+    Continue {
+        diagnostics: Vec<CheckDiagnostic>,
+        warnings: usize,
+    },
+    Stop {
+        diagnostics: Vec<CheckDiagnostic>,
+        errors: usize,
+        warnings: usize,
+    },
+    Interrupted,
+}
+
+fn check_locked_mode(command: &crate::args::ParsedCommand) -> bool {
+    command_tail(command)
+        .iter()
+        .any(|(argument, _)| matches!(argument.to_str(), Some("--locked" | "--frozen")))
+}
+
+fn check_locked_lock_presence(
+    package_root: &Path,
+    cwd: &Path,
+    package_identity: Option<&str>,
+    cancellation: &CancellationToken,
+) -> CheckLockPresence {
+    let lock_path = package_root.join("sai.lock");
+    let display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
+    let selection =
+        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    if selection.interrupted || cancellation.is_cancelled() {
+        return CheckLockPresence::Interrupted;
+    }
+    if let Some(error) = selection.errors.into_iter().next() {
+        let diagnostic = check_diagnostic_with_package(
+            check_cli_diagnostic(fmt_io_diagnostic(
+                "SOURCE_READ_FAILED",
+                &display_path,
+                "could not inspect the package lock file",
+                &error.source,
+            )),
+            package_identity,
+        );
+        return CheckLockPresence::Failed(diagnostic);
+    }
+    if let Some((_, missing_path)) = selection.missing.into_iter().next() {
+        let missing_display = fmt_path_reference(&missing_path, cwd, Some(package_root));
+        return CheckLockPresence::Missing(check_missing_lock_diagnostic(
+            &missing_display,
+            package_identity,
+        ));
+    }
+    if selection.files.is_empty() {
+        return CheckLockPresence::Missing(check_missing_lock_diagnostic(
+            &display_path,
+            package_identity,
+        ));
+    }
+    CheckLockPresence::Present
+}
+
+fn check_missing_lock_diagnostic(path: &str, package_identity: Option<&str>) -> CheckDiagnostic {
+    let mut diagnostic = check_cli_diagnostic(CliDiagnostic {
+        code: "LOCK_MISSING",
+        message: "`--locked` or `--frozen` requires a `sai.lock` file".to_owned(),
+        primary: None,
+        primary_label: String::new(),
+        argument_index: None,
+        argument: path.to_owned(),
+        help: Some("run `sai lock` to create the lock file".to_owned()),
+        data: Some(format!("{{\"path\":\"{}\"}}", escape_json(path))),
+    });
+    diagnostic.package = package_identity.map(str::to_owned);
+    diagnostic
+}
+
+fn check_locked_lock_file_only(
+    package_root: &Path,
+    cwd: &Path,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+    cancellation: &CancellationToken,
+) -> CheckLockLocalPreflight {
+    use sai_package::lock::LockParseErrorKind;
+
+    let lock_path = package_root.join("sai.lock");
+    let lock_display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
+    let selection =
+        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    if selection.interrupted || cancellation.is_cancelled() {
+        return CheckLockLocalPreflight::Interrupted;
+    }
+    if let Some(error) = selection.errors.into_iter().next() {
+        return CheckLockLocalPreflight::Stop {
+            diagnostics: vec![check_diagnostic_with_package(
+                check_cli_diagnostic(fmt_io_diagnostic(
+                    "SOURCE_READ_FAILED",
+                    &lock_display_path,
+                    "could not inspect the package lock file",
+                    &error.source,
+                )),
+                package_identity,
+            )],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    if let Some((_, missing_path)) = selection.missing.into_iter().next() {
+        let display_path = fmt_path_reference(&missing_path, cwd, Some(package_root));
+        return CheckLockLocalPreflight::Stop {
+            diagnostics: vec![check_missing_lock_diagnostic(
+                &display_path,
+                package_identity,
+            )],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    let Some(selected) = selection.files.into_iter().next() else {
+        return CheckLockLocalPreflight::Stop {
+            diagnostics: vec![check_missing_lock_diagnostic(
+                &lock_display_path,
+                package_identity,
+            )],
+            errors: 1,
+            warnings: 0,
+        };
+    };
+    let mut file = selected_check_file(selected, lock_display_path.clone());
+    let source = match open_selected_fmt_file(&mut file) {
+        Ok(source_file) => match read_file_limited(
+            source_file,
+            sai_package::git_tree::MAX_PACKAGE_FILE_BYTES as usize,
+            cancellation,
+        ) {
+            Ok(source)
+                if source.len() <= sai_package::git_tree::MAX_PACKAGE_FILE_BYTES as usize =>
+            {
+                Arc::<[u8]>::from(source)
+            }
+            Ok(source) => {
+                let mut data = ValueObject::new();
+                data.insert(
+                    "limit".to_owned(),
+                    Value::Integer(u128::from(sai_package::git_tree::MAX_PACKAGE_FILE_BYTES)),
+                );
+                data.insert("value".to_owned(), Value::Integer(source.len() as u128));
+                return CheckLockLocalPreflight::Stop {
+                    diagnostics: vec![check_lock_source_diagnostic(
+                        &[],
+                        &lock_display_path,
+                        "IMPLEMENTATION_LIMIT_EXCEEDED",
+                        "package lock file exceeds the supported size limit".to_owned(),
+                        0..0,
+                        Some(source_value_object_json(&data)),
+                        None,
+                        package_identity,
+                        include_source_lines,
+                    )],
+                    errors: 1,
+                    warnings: 0,
+                };
+            }
+            Err(StdinReadError::Interrupted) => return CheckLockLocalPreflight::Interrupted,
+            Err(StdinReadError::Io(error)) => {
+                return CheckLockLocalPreflight::Stop {
+                    diagnostics: vec![check_diagnostic_with_package(
+                        check_cli_diagnostic(fmt_io_diagnostic(
+                            "SOURCE_READ_FAILED",
+                            &lock_display_path,
+                            "could not read the package lock file",
+                            &error,
+                        )),
+                        package_identity,
+                    )],
+                    errors: 1,
+                    warnings: 0,
+                };
+            }
+        },
+        Err(error) => {
+            return CheckLockLocalPreflight::Stop {
+                diagnostics: vec![check_diagnostic_with_package(
+                    check_cli_diagnostic(fmt_io_diagnostic(
+                        "SOURCE_READ_FAILED",
+                        &lock_display_path,
+                        "could not open the package lock file",
+                        &error,
+                    )),
+                    package_identity,
+                )],
+                errors: 1,
+                warnings: 0,
+            };
+        }
+    };
+    if cancellation.is_cancelled() {
+        return CheckLockLocalPreflight::Interrupted;
+    }
+    let parsed = sai_package::lock::parse(&source);
+    if parsed
+        .errors()
+        .iter()
+        .any(|error| matches!(error.kind, LockParseErrorKind::LockMergeConflict))
+        && let Some(diagnostic) = lock_parse_diagnostic(
+            &parsed,
+            &source,
+            &lock_display_path,
+            package_identity,
+            include_source_lines,
+        )
+    {
+        return CheckLockLocalPreflight::Stop {
+            diagnostics: vec![diagnostic],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    if let Some(diagnostic) = lock_local_validation_diagnostic(
+        &parsed,
+        &source,
+        &lock_display_path,
+        package_identity,
+        include_source_lines,
+    )
+    .or_else(|| {
+        lock_parse_diagnostic(
+            &parsed,
+            &source,
+            &lock_display_path,
+            package_identity,
+            include_source_lines,
+        )
+    }) {
+        return CheckLockLocalPreflight::Stop {
+            diagnostics: vec![diagnostic],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+
+    let canonical = sai_package::lock_serialization::is_canonical(&source)
+        .expect("a locally valid lock parses and serializes");
+    let warnings = usize::from(!canonical);
+    let mut diagnostics = Vec::new();
+    if !canonical {
+        diagnostics.push(check_lock_source_diagnostic(
+            &source,
+            &lock_display_path,
+            "LOCK_NOT_CANONICAL",
+            "package lock file is valid but not in canonical form".to_owned(),
+            0..0,
+            None,
+            Some(sai_diagnostics::Severity::Warning),
+            package_identity,
+            include_source_lines,
+        ));
+    }
+    match sai_package::lock_graph_validation::validate(&parsed) {
+        Ok(graph) if !graph.is_consistent() => {
+            for error in graph.errors {
+                diagnostics.push(check_lock_source_diagnostic(
+                    &source,
+                    &lock_display_path,
+                    "LOCK_OUT_OF_DATE",
+                    format!("locked dependency graph is inconsistent: {:?}", error.kind),
+                    error.span,
+                    None,
+                    None,
+                    package_identity,
+                    include_source_lines,
+                ));
+            }
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == sai_diagnostics::Severity::Error)
+                .count();
+            CheckLockLocalPreflight::Stop {
+                diagnostics,
+                errors,
+                warnings,
+            }
+        }
+        Ok(_) => CheckLockLocalPreflight::Continue {
+            diagnostics,
+            warnings,
+        },
+        Err(error) => {
+            diagnostics.push(lock_graph_input_diagnostic(
+                error,
+                &source,
+                &lock_display_path,
+                package_identity,
+                include_source_lines,
+            ));
+            CheckLockLocalPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            }
+        }
+    }
+}
+
+fn check_locked_preflight(
+    manifest: &sai_package::manifest::PackageParseOutput,
+    package_root: &Path,
+    cwd: &Path,
+    manifest_source: &[u8],
+    target_override: Option<String>,
+    analyzes_tests: bool,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+    cancellation: &CancellationToken,
+) -> CheckLockPreflight {
+    use sai_package::lock::LockParseErrorKind;
+    use sai_package::lock_root_contract::LockRootContractMismatchKind;
+
+    let lock_path = package_root.join("sai.lock");
+    let lock_display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
+    let selection =
+        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    if selection.interrupted || cancellation.is_cancelled() {
+        return CheckLockPreflight::Interrupted;
+    }
+    if let Some(error) = selection.errors.into_iter().next() {
+        return CheckLockPreflight::Stop {
+            diagnostics: vec![check_diagnostic_with_package(
+                check_cli_diagnostic(fmt_io_diagnostic(
+                    "SOURCE_READ_FAILED",
+                    &lock_display_path,
+                    "could not inspect the package lock file",
+                    &error.source,
+                )),
+                package_identity,
+            )],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    if let Some((_, missing_path)) = selection.missing.into_iter().next() {
+        let display_path = fmt_path_reference(&missing_path, cwd, Some(package_root));
+        return CheckLockPreflight::Stop {
+            diagnostics: vec![check_missing_lock_diagnostic(
+                &display_path,
+                package_identity,
+            )],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    let Some(selected) = selection.files.into_iter().next() else {
+        return CheckLockPreflight::Stop {
+            diagnostics: vec![check_missing_lock_diagnostic(
+                &lock_display_path,
+                package_identity,
+            )],
+            errors: 1,
+            warnings: 0,
+        };
+    };
+
+    let mut file = selected_check_file(selected, lock_display_path.clone());
+    let lock_source = match open_selected_fmt_file(&mut file) {
+        Ok(source_file) => match read_file_limited(
+            source_file,
+            sai_package::git_tree::MAX_PACKAGE_FILE_BYTES as usize,
+            cancellation,
+        ) {
+            Ok(source)
+                if source.len() <= sai_package::git_tree::MAX_PACKAGE_FILE_BYTES as usize =>
+            {
+                Arc::<[u8]>::from(source)
+            }
+            Ok(source) => {
+                let mut data = ValueObject::new();
+                data.insert(
+                    "limit".to_owned(),
+                    Value::Integer(u128::from(sai_package::git_tree::MAX_PACKAGE_FILE_BYTES)),
+                );
+                data.insert("value".to_owned(), Value::Integer(source.len() as u128));
+                return CheckLockPreflight::Stop {
+                    diagnostics: vec![check_lock_source_diagnostic(
+                        &[],
+                        &lock_display_path,
+                        "IMPLEMENTATION_LIMIT_EXCEEDED",
+                        "package lock file exceeds the supported size limit".to_owned(),
+                        0..0,
+                        Some(source_value_object_json(&data)),
+                        None,
+                        package_identity,
+                        include_source_lines,
+                    )],
+                    errors: 1,
+                    warnings: 0,
+                };
+            }
+            Err(StdinReadError::Interrupted) => return CheckLockPreflight::Interrupted,
+            Err(StdinReadError::Io(error)) => {
+                return CheckLockPreflight::Stop {
+                    diagnostics: vec![check_diagnostic_with_package(
+                        check_cli_diagnostic(fmt_io_diagnostic(
+                            "SOURCE_READ_FAILED",
+                            &lock_display_path,
+                            "could not read the package lock file",
+                            &error,
+                        )),
+                        package_identity,
+                    )],
+                    errors: 1,
+                    warnings: 0,
+                };
+            }
+        },
+        Err(error) => {
+            return CheckLockPreflight::Stop {
+                diagnostics: vec![check_diagnostic_with_package(
+                    check_cli_diagnostic(fmt_io_diagnostic(
+                        "SOURCE_READ_FAILED",
+                        &lock_display_path,
+                        "could not open the package lock file",
+                        &error,
+                    )),
+                    package_identity,
+                )],
+                errors: 1,
+                warnings: 0,
+            };
+        }
+    };
+    if cancellation.is_cancelled() {
+        return CheckLockPreflight::Interrupted;
+    }
+
+    let parsed_lock = sai_package::lock::parse(&lock_source);
+    if parsed_lock
+        .errors()
+        .iter()
+        .any(|error| matches!(error.kind, LockParseErrorKind::LockMergeConflict))
+        && let Some(diagnostic) = lock_parse_diagnostic(
+            &parsed_lock,
+            &lock_source,
+            &lock_display_path,
+            package_identity,
+            include_source_lines,
+        )
+    {
+        return CheckLockPreflight::Stop {
+            diagnostics: vec![diagnostic],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    if let Some(diagnostic) = lock_local_validation_diagnostic(
+        &parsed_lock,
+        &lock_source,
+        &lock_display_path,
+        package_identity,
+        include_source_lines,
+    ) {
+        return CheckLockPreflight::Stop {
+            diagnostics: vec![diagnostic],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    if let Some(diagnostic) = lock_parse_diagnostic(
+        &parsed_lock,
+        &lock_source,
+        &lock_display_path,
+        package_identity,
+        include_source_lines,
+    ) {
+        return CheckLockPreflight::Stop {
+            diagnostics: vec![diagnostic],
+            errors: 1,
+            warnings: 0,
+        };
+    }
+    let canonical = sai_package::lock_serialization::is_canonical(&lock_source)
+        .expect("a locally valid lock parses and serializes");
+    let mut diagnostics = Vec::new();
+    let warnings = usize::from(!canonical);
+    if !canonical {
+        diagnostics.push(check_lock_source_diagnostic(
+            &lock_source,
+            &lock_display_path,
+            "LOCK_NOT_CANONICAL",
+            "package lock file is valid but not in canonical form".to_owned(),
+            0..0,
+            None,
+            Some(sai_diagnostics::Severity::Warning),
+            package_identity,
+            include_source_lines,
+        ));
+    }
+    match sai_package::lock_graph_validation::validate(&parsed_lock) {
+        Ok(graph) if !graph.is_consistent() => {
+            for error in graph.errors {
+                diagnostics.push(check_lock_source_diagnostic(
+                    &lock_source,
+                    &lock_display_path,
+                    "LOCK_OUT_OF_DATE",
+                    format!("locked dependency graph is inconsistent: {:?}", error.kind),
+                    error.span,
+                    None,
+                    None,
+                    package_identity,
+                    include_source_lines,
+                ));
+            }
+            return CheckLockPreflight::Stop {
+                errors: diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.severity == sai_diagnostics::Severity::Error)
+                    .count(),
+                diagnostics,
+                warnings,
+            };
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let diagnostic = lock_graph_input_diagnostic(
+                error,
+                &lock_source,
+                &lock_display_path,
+                package_identity,
+                include_source_lines,
+            );
+            diagnostics.push(diagnostic);
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    }
+
+    let toolchain_version = sai_package::version::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("the CLI package version is a valid language version");
+    let validation_context = sai_package::validation::PackageValidationContext {
+        compiler_version: Some(&toolchain_version),
+    };
+    let package_validation = sai_package::validation::validate(manifest, validation_context);
+    if !package_validation.is_valid() {
+        let semantic_diagnostics = package_validation
+            .errors
+            .iter()
+            .map(|error| {
+                let (code, message) = check_package_validation_fields(&error.kind);
+                check_lock_source_diagnostic(
+                    manifest_source,
+                    "sai.package",
+                    code,
+                    message,
+                    error.span.clone(),
+                    None,
+                    None,
+                    package_identity,
+                    include_source_lines,
+                )
+            })
+            .collect::<Vec<_>>();
+        let errors = semantic_diagnostics.len();
+        diagnostics.extend(semantic_diagnostics);
+        return CheckLockPreflight::Stop {
+            diagnostics,
+            errors,
+            warnings,
+        };
+    }
+
+    match sai_package::lock_root_contract::compare(manifest, &parsed_lock) {
+        Ok(comparison) if !comparison.matches_contract() => {
+            for mismatch in comparison.mismatches {
+                let (message, package_span, lock_span) = match mismatch.kind {
+                    LockRootContractMismatchKind::Identity { package, lock } => (
+                        format!("root package identity `{package}` does not match locked `{lock}`"),
+                        mismatch.package_span,
+                        mismatch.lock_span,
+                    ),
+                    LockRootContractMismatchKind::Version { package, lock } => (
+                        format!("root package version `{package}` does not match locked `{lock}`"),
+                        mismatch.package_span,
+                        mismatch.lock_span,
+                    ),
+                    LockRootContractMismatchKind::Targets { package, lock } => (
+                        format!(
+                            "root target set {:?} does not match locked target set {:?}",
+                            package, lock
+                        ),
+                        mismatch.package_span,
+                        mismatch.lock_span,
+                    ),
+                    LockRootContractMismatchKind::Requirements {
+                        missing_from_lock,
+                        unexpected_in_lock,
+                    } => (
+                        format!(
+                            "root requirements do not match the lock (missing: {}; unexpected: {})",
+                            missing_from_lock.len(),
+                            unexpected_in_lock.len()
+                        ),
+                        mismatch.package_span,
+                        mismatch.lock_span,
+                    ),
+                };
+                let mut package_index = CliSourceIndex::new(Arc::from(manifest_source));
+                let mut diagnostic = check_lock_source_diagnostic(
+                    &lock_source,
+                    &lock_display_path,
+                    "LOCK_OUT_OF_DATE",
+                    message,
+                    lock_span,
+                    None,
+                    None,
+                    package_identity,
+                    include_source_lines,
+                );
+                diagnostic.related.push(CheckRelated {
+                    location: package_index.location(
+                        "sai.package",
+                        package_span,
+                        include_source_lines,
+                    ),
+                    what: "current root package contract".to_owned(),
+                });
+                diagnostics.push(diagnostic);
+            }
+            return CheckLockPreflight::Stop {
+                errors: diagnostics.len(),
+                diagnostics,
+                warnings,
+            };
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let message = format!("could not compare the root package to the lock: {error:?}");
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_CORRUPT",
+                message,
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    }
+
+    let declared_targets = manifest_target_names(manifest);
+    let selected_target = target_override
+        .or_else(|| declared_targets.first().cloned())
+        .expect("validated root package has at least one target");
+    if !declared_targets
+        .iter()
+        .any(|target| target == &selected_target)
+    {
+        let mut diagnostic = check_target_not_declared_diagnostic(&selected_target);
+        diagnostic.package = package_identity.map(str::to_owned);
+        diagnostics.push(diagnostic);
+        return CheckLockPreflight::Stop {
+            diagnostics,
+            errors: 1,
+            warnings,
+        };
+    }
+
+    let has_requirements = manifest.file().declarations.iter().any(|declaration| {
+        matches!(
+            &declaration.value,
+            sai_package::manifest::PackageDeclaration::Requires { entries, .. } if !entries.is_empty()
+        )
+    });
+    let has_overrides = manifest.file().declarations.iter().any(|declaration| {
+        matches!(
+            &declaration.value,
+            sai_package::manifest::PackageDeclaration::Overrides(items) if !items.is_empty()
+        )
+    });
+    if !parsed_lock.file().packages.is_empty() || has_requirements || has_overrides {
+        diagnostics.push(check_incomplete_lock_analysis_diagnostic());
+        return CheckLockPreflight::Stop {
+            diagnostics,
+            errors: 1,
+            warnings,
+        };
+    }
+
+    let empty_path_packages = std::collections::BTreeMap::new();
+    let empty_path_overrides = std::collections::BTreeMap::new();
+    let context = match sai_package::resolver_contract::ResolverContractContext::from_root_manifest(
+        manifest,
+        &empty_path_packages,
+        &empty_path_overrides,
+        validation_context,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                format!("root lock graph could not be constructed: {error:?}"),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    let root_contract = match sai_package::resolver_contract::build_resolver_contract(
+        manifest,
+        &context,
+        validation_context,
+    ) {
+        Ok(contract) => contract,
+        Err(error) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                format!("root lock graph could not be constructed: {error:?}"),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    let active_graph = match sai_package::lock_active_graph::build_lock_active_graph(
+        &root_contract,
+        &parsed_lock,
+        &selected_target,
+        analyzes_tests,
+    ) {
+        Ok(graph) => graph,
+        Err(error) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                format!("could not activate the locked root graph: {error:?}"),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    let graph = match sai_driver::package_graph::PackageGraph::from_lock_active_graph(
+        &active_graph,
+        &std::collections::BTreeMap::new(),
+        toolchain_version,
+    ) {
+        Ok(graph) => graph,
+        Err(error) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                format!("could not adapt the locked root graph: {error:?}"),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    CheckLockPreflight::Continue {
+        graph,
+        diagnostics,
+        warnings,
+    }
+}
+
+fn check_lock_source_diagnostic(
+    source: &[u8],
+    path: &str,
+    code: &'static str,
+    message: String,
+    span: std::ops::Range<usize>,
+    data: Option<String>,
+    severity: Option<sai_diagnostics::Severity>,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+) -> CheckDiagnostic {
+    let mut source_index = CliSourceIndex::new(Arc::from(source));
+    CheckDiagnostic {
+        diagnostic: cli_source_diagnostic(
+            &mut source_index,
+            FmtDiagnosticSource {
+                path,
+                include_source_line: include_source_lines,
+            },
+            code,
+            message,
+            span,
+            data,
+            None,
+        ),
+        severity: severity.unwrap_or(sai_diagnostics::Severity::Error),
+        package: package_identity.map(str::to_owned),
+        related: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
+fn lock_parse_diagnostic(
+    parsed: &sai_package::lock::LockParseOutput,
+    source: &[u8],
+    path: &str,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+) -> Option<CheckDiagnostic> {
+    use sai_package::lock::LockParseErrorKind;
+    let Some(error) = parsed
+        .errors()
+        .first()
+        .map(|error| (error.span.clone(), &error.kind))
+    else {
+        if let Some(error) = parsed.lexical_errors().first() {
+            return Some(check_lock_source_diagnostic(
+                source,
+                path,
+                "LOCK_CORRUPT",
+                format!("malformed `sai.lock`: {:?}", error.kind),
+                error.span.clone(),
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+        }
+        return None;
+    };
+    let (span, kind) = error;
+    let (code, message) = match kind {
+        LockParseErrorKind::LockMergeConflict => (
+            "LOCK_MERGE_CONFLICT",
+            "lock file contains merge conflict markers".to_owned(),
+        ),
+        LockParseErrorKind::InvalidFormatVersion => (
+            "LOCK_CORRUPT",
+            "lock file has an invalid format version".to_owned(),
+        ),
+        _ => ("LOCK_CORRUPT", format!("malformed `sai.lock`: {kind:?}")),
+    };
+    Some(check_lock_source_diagnostic(
+        source,
+        path,
+        code,
+        message,
+        span,
+        None,
+        None,
+        package_identity,
+        include_source_lines,
+    ))
+}
+
+fn lock_local_validation_diagnostic(
+    parsed: &sai_package::lock::LockParseOutput,
+    source: &[u8],
+    path: &str,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+) -> Option<CheckDiagnostic> {
+    let validation = sai_package::lock_validation::validate(parsed);
+    let error = validation.errors.first()?;
+    let (code, message) = match &error.kind {
+        sai_package::lock_validation::LockValidationErrorKind::UnsupportedFormatVersion(
+            version,
+        ) => (
+            "UNSUPPORTED_LOCK_VERSION",
+            format!("lock format version {version} is not supported by this toolchain"),
+        ),
+        sai_package::lock_validation::LockValidationErrorKind::Corrupt(kind) => (
+            "LOCK_CORRUPT",
+            format!("lock file violates the lock format: {kind:?}"),
+        ),
+    };
+    Some(check_lock_source_diagnostic(
+        source,
+        path,
+        code,
+        message,
+        error.span.clone(),
+        None,
+        None,
+        package_identity,
+        include_source_lines,
+    ))
+}
+
+fn lock_graph_input_diagnostic(
+    error: sai_package::lock_graph_validation::LockGraphValidationInputError,
+    source: &[u8],
+    path: &str,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+) -> CheckDiagnostic {
+    match error {
+        sai_package::lock_graph_validation::LockGraphValidationInputError::InvalidSyntax => {
+            check_lock_source_diagnostic(
+                source,
+                path,
+                "LOCK_CORRUPT",
+                "lock file syntax is invalid".to_owned(),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            )
+        }
+        sai_package::lock_graph_validation::LockGraphValidationInputError::InvalidLock(
+            validation,
+        ) => {
+            let error = validation.errors.first();
+            let (code, message, span) = error.map_or(
+                (
+                    "LOCK_CORRUPT",
+                    "lock file is locally invalid".to_owned(),
+                    0..0,
+                ),
+                |error| match &error.kind {
+                    sai_package::lock_validation::LockValidationErrorKind::UnsupportedFormatVersion(version) => (
+                        "UNSUPPORTED_LOCK_VERSION",
+                        format!("lock format version {version} is not supported by this toolchain"),
+                        error.span.clone(),
+                    ),
+                    sai_package::lock_validation::LockValidationErrorKind::Corrupt(kind) => (
+                        "LOCK_CORRUPT",
+                        format!("lock file violates the lock format: {kind:?}"),
+                        error.span.clone(),
+                    ),
+                },
+            );
+            check_lock_source_diagnostic(
+                source,
+                path,
+                code,
+                message,
+                span,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            )
+        }
+    }
+}
+
+fn check_package_validation_fields(
+    kind: &sai_package::validation::PackageValidationErrorKind,
+) -> (&'static str, String) {
+    use sai_package::validation::PackageValidationErrorKind as Kind;
+    let code = match kind {
+        Kind::MissingTargets => "MISSING_TARGETS",
+        Kind::PackageHasNoContent => "PACKAGE_HAS_NO_CONTENT",
+        Kind::UnknownTarget(_) => "UNKNOWN_TARGET",
+        Kind::OnlyTargetNotDeclared(_) => "ONLY_TARGET_NOT_DECLARED",
+        Kind::ArtifactTargetNotDeclared(_) => "ARTIFACT_TARGET_NOT_DECLARED",
+        Kind::ArtifactOnCoreTarget(_) => "ARTIFACT_ON_CORE_TARGET",
+        Kind::MissingArtifactForTarget(_) => "MISSING_ARTIFACT_FOR_TARGET",
+        Kind::WitRequired => "WIT_REQUIRED",
+        Kind::MissingExportWorld => "MISSING_EXPORT_WORLD",
+        Kind::InvalidWorldName(_) => "INVALID_WORLD_NAME",
+        Kind::MissingSource(_) => "MISSING_SOURCE",
+        Kind::InvalidPackageName(_) => "INVALID_PACKAGE_NAME",
+        Kind::InvalidDescription => "INVALID_DESCRIPTION",
+        Kind::ImplicitPackageRequired(_) => "IMPLICIT_PACKAGE_REQUIRED",
+        Kind::PackageRequiresItself(_) => "PACKAGE_REQUIRES_ITSELF",
+        Kind::DuplicateRequirement(_) => "DUPLICATE_REQUIREMENT",
+        Kind::InvalidCapabilityName(_) => "INVALID_CAPABILITY_NAME",
+        Kind::CapabilityAllowDenyConflict(_) => "CAPABILITY_ALLOW_DENY_CONFLICT",
+        Kind::UnknownPolicyItem(_) => "UNKNOWN_POLICY_ITEM",
+        Kind::PolicyItemIsCapability(_) => "POLICY_ITEM_IS_CAPABILITY",
+        Kind::UnknownLint(_) => "UNKNOWN_LINT",
+        Kind::NotALint(_) => "NOT_A_LINT",
+        Kind::UnknownProfile(_) => "UNKNOWN_PROFILE",
+        Kind::ProfileAllowExceedsPackage(_) => "PROFILE_ALLOW_EXCEEDS_PACKAGE",
+        Kind::UnknownBudgetMetric(_) => "UNKNOWN_BUDGET_METRIC",
+        Kind::InvalidSize => "INVALID_SIZE",
+        Kind::AllocatorNotRequired(_) => "ALLOCATOR_NOT_REQUIRED",
+        Kind::DuplicateOverride { .. } => "DUPLICATE_OVERRIDE",
+        Kind::CompilerVersionMismatch { .. } => "COMPILER_VERSION_MISMATCH",
+    };
+    (code, format!("invalid root package contract: {kind:?}"))
+}
+
+fn check_incomplete_lock_analysis_diagnostic() -> CheckDiagnostic {
+    check_cli_diagnostic(CliDiagnostic {
+        code: "FEATURE_NOT_IMPLEMENTED",
+        message: "stage 0 feature `sai check` cannot yet verify dependency package contracts and sources".to_owned(),
+        primary: None,
+        primary_label: String::new(),
+        argument_index: None,
+        argument: String::new(),
+        help: Some(
+            "dependency-bearing locked graphs are rejected before source analysis until every dependency contract and selected source can be verified".to_owned(),
+        ),
+        data: Some("{\"stage\":0,\"feature\":\"sai check\"}".to_owned()),
+    })
+}
+
 fn module_tree_check_diagnostics(
     package_key: &str,
     source_directory: &str,
@@ -1157,6 +2376,7 @@ fn module_tree_check_diagnostics(
     include_source_lines: bool,
     root_inspection_incomplete: bool,
     target_cfg: Option<&TargetCfg>,
+    package_graph: Option<sai_driver::package_graph::PackageGraph>,
     analyzes_tests: bool,
 ) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
     let package_key_value =
@@ -1192,6 +2412,11 @@ fn module_tree_check_diagnostics(
     database
         .replace_vfs_snapshot(None, &input_snapshot)
         .map_err(|error| format!("could not set package source inputs: {error:?}"))?;
+    if let Some(package_graph) = package_graph {
+        database
+            .set_package_graph(Some(package_graph))
+            .map_err(|error| format!("could not set the locked package graph: {error:?}"))?;
+    }
 
     let manifest_file_id = database
         .intern_package_file(
@@ -1504,6 +2729,7 @@ fn missing_source_root_module_tree(
         package_identity,
         include_source_lines,
         false,
+        None,
         None,
         false,
     )
@@ -7827,6 +9053,14 @@ mod tests {
         directory
     }
 
+    fn write_root_only_check_lock(package: &Path, version: &str) {
+        fs::write(
+            package.join("sai.lock"),
+            format!("lock 1\n\nroot acme:check @ {version}\n    targets {{ wasm32-wasi }}\n"),
+        )
+        .expect("write root-only lock fixture");
+    }
+
     fn check_diagnostic_lines<'a>(stdout: &'a str, code: &str) -> Vec<&'a str> {
         let marker = format!("\"code\":\"{code}\"");
         stdout
@@ -8229,7 +9463,10 @@ mod tests {
 
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
-        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unexpected check output: {stdout}"
+        );
         assert!(stdout.contains("\"stage\":0,\"feature\":\"sai check\""));
         assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
         assert!(stdout.contains(
@@ -8245,6 +9482,240 @@ mod tests {
             fs::read(&source_path).expect("source remains unchanged"),
             original_source
         );
+    }
+
+    #[test]
+    fn check_locked_missing_lock_precedes_source_analysis() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let _ = fs::remove_file(package.join("sai.lock"));
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--locked",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_MISSING\""));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(!stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
+        let missing_lock = check_diagnostic_lines(&stdout, "LOCK_MISSING");
+        assert_eq!(missing_lock.len(), 1);
+        assert!(missing_lock[0].contains("\"package\":\"acme:check@0.1.0\""));
+    }
+
+    #[test]
+    fn check_locked_missing_lock_precedes_manifest_analysis() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let _ = fs::remove_file(package.join("sai.lock"));
+        fs::write(package.join("sai.package"), b"package {\n")
+            .expect("write malformed package manifest");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--locked",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_MISSING\""));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(stdout.contains("\"root\":null"));
+        let missing_lock = check_diagnostic_lines(&stdout, "LOCK_MISSING");
+        assert_eq!(missing_lock.len(), 1);
+        assert!(missing_lock[0].contains("\"package\":null"));
+    }
+
+    #[test]
+    fn check_locked_validates_a_present_lock_when_manifest_syntax_is_invalid() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        fs::write(package.join("sai.package"), b"package {\n")
+            .expect("write malformed package manifest");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 1\n\nroot acme:check @ 0.1.0\n",
+        )
+        .expect("write locally invalid lock");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--locked",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_CORRUPT\""));
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(!stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        let syntax_diagnostics = check_diagnostic_lines(&stdout, "EXPECTED_TOKEN");
+        assert!(!syntax_diagnostics.is_empty());
+        assert!(
+            syntax_diagnostics
+                .iter()
+                .all(|line| line.contains("\"path\":\"sai.package\""))
+        );
+        assert!(!stdout.contains("\"path\":\"src/lib.sai\""));
+    }
+
+    #[test]
+    fn check_frozen_also_requires_a_lock_before_source_analysis() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let _ = fs::remove_file(package.join("sai.lock"));
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--frozen",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_MISSING\""));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+    }
+
+    #[test]
+    fn check_locked_stale_root_lock_precedes_source_analysis() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        write_root_only_check_lock(&package, "0.2.0");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--locked",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
+    }
+
+    #[test]
+    fn check_locked_validates_graph_before_reporting_root_contract_mismatch() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{manifest}\nrequires {{ acme:dep @ ^1 from git \"https://example.com/acme/dep\" }}\n"
+            ),
+        )
+        .expect("add dependency requirement");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 1\n\nroot acme:check @ 0.2.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0\n",
+        )
+        .expect("write inconsistent stale lock fixture");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--locked",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""));
+        assert!(stdout.contains("MissingEntry"));
+        assert!(!stdout.contains("root package version"));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+    }
+
+    #[test]
+    fn check_locked_root_only_lock_still_reports_incomplete_without_success_record() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        write_root_only_check_lock(&package, "0.1.0");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--locked",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(stdout.contains("\"root\":\"acme:check@0.1.0\""));
+        assert!(!stdout.contains("\"type\":\"result\""));
+    }
+
+    #[test]
+    fn check_locked_dependency_graph_fails_closed_before_source_analysis() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{manifest}\nrequires {{ acme:dep @ ^1 from git \"https://example.com/acme/dep\" }}\n"
+            ),
+        )
+        .expect("add dependency requirement");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 1\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0\n\npackage acme:dep @ 1.0.0\n    source git \"https://example.com/acme/dep\"\n    commit \"0000000000000000000000000000000000000000\"\n    checksum \"sai1:0000000000000000000000000000000000000000000000000000000000000000\"\n    capabilities { }\n",
+        )
+        .expect("write dependency lock fixture");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--locked",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unexpected locked dependency check output: {stdout}"
+        );
+        assert!(stdout.contains("dependency package contracts and sources"));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(!stdout.contains("\"type\":\"result\""));
     }
 
     #[test]
