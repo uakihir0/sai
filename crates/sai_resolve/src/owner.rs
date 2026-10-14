@@ -88,13 +88,35 @@ pub fn resolve_owner_control_flow(
     for predicate in body.invariant_preds {
         resolve_predicate_restrictions(predicate, source_ref, source, &mut result.diagnostics)?;
     }
-    result.diagnostics.sort_by_key(|diagnostic| {
+    sort_owner_diagnostics(&mut result.diagnostics);
+    Ok(result)
+}
+
+/// Reports prohibited source constructs in one owner predicate expression.
+///
+/// This scans the predicate without treating its jumps as ordinary body
+/// control flow, so `return`, `break`, and `continue` receive
+/// `INVALID_CONTRACT_EXPRESSION` and do not produce label or
+/// outside-function diagnostics. Closure and async-block bodies remain
+/// separate owners.
+pub fn resolve_predicate_expression(
+    predicate: &Expr<'_>,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+) -> Result<Vec<Diagnostic>, LabelResolutionError> {
+    let mut diagnostics = Vec::new();
+    resolve_predicate_restrictions(predicate, source_ref, source, &mut diagnostics)?;
+    sort_owner_diagnostics(&mut diagnostics);
+    Ok(diagnostics)
+}
+
+fn sort_owner_diagnostics(diagnostics: &mut [Diagnostic]) {
+    diagnostics.sort_by_key(|diagnostic| {
         diagnostic
             .primary()
             .map(|primary| primary.span.range.start().raw())
             .unwrap_or(u32::MAX)
     });
-    Ok(result)
 }
 
 fn resolve_predicate_restrictions(
@@ -1454,6 +1476,60 @@ mod tests {
             [10, 20, 40, 60, 80, 90, 100, 120]
         );
         assert!(invariant_result.labels.is_empty());
+    }
+
+    #[test]
+    fn predicate_expression_jumps_do_not_enter_loop_label_resolution() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let missing_label = symbols.intern("missing").expect("symbol interns");
+        let jump = expr(
+            &arena,
+            owner,
+            1,
+            10,
+            20,
+            ExprKind::Break {
+                label: Some(label(missing_label, 15, 22)),
+                value: None,
+            },
+        );
+        let loop_body = block(&arena, owner, 2, Some(jump));
+        let predicate = expr(
+            &arena,
+            owner,
+            0,
+            0,
+            30,
+            ExprKind::Loop {
+                body: loop_body,
+                label: None,
+                source: LoopSource::Loop,
+            },
+        );
+        let (source_ref, source) = source();
+
+        let diagnostics = resolve_predicate_expression(&predicate, &source_ref, &source)
+            .expect("predicate restrictions resolve");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidContractExpression]
+        );
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("diagnostic has a primary location")
+                .span
+                .range
+                .start()
+                .raw(),
+            10
+        );
     }
 
     fn expr<'hir>(

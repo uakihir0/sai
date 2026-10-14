@@ -245,6 +245,7 @@ mod tests {
             exports: Default::default(),
             function_owners: Vec::new(),
             invariant_owners: Vec::new(),
+            refinement_predicate_owners: Vec::new(),
             diagnostics: Vec::new(),
         }
     }

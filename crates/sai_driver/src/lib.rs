@@ -12,7 +12,8 @@ use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
 use sai_hir::lower::{
-    HirLoweringContext, HirLoweringError, lower_function_owner, lower_invariant_owner,
+    HirLoweringContext, HirLoweringError, lower_distinct_owner, lower_function_owner,
+    lower_invariant_owner, lower_refined_owner,
 };
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
@@ -29,11 +30,13 @@ use sai_package::mvs_diagnostics::{
 };
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
-use sai_resolve::owner::{LabelResolution, LabelResolutionError, resolve_owner_control_flow};
+use sai_resolve::owner::{
+    LabelResolution, LabelResolutionError, resolve_owner_control_flow, resolve_predicate_expression,
+};
 use sai_resolve::package_scopes::{
     FilteredModule, ForeignPackageScope, PackageScopesError, PackageUseRequirement,
-    collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
-    suppress_export_name_feature_gate,
+    RefinementPredicateOwnerKind, collect_module_alias_bindings_with_foreign_scopes,
+    collect_phase1, suppress_export_name_feature_gate,
 };
 pub use sai_resolve::package_scopes::{
     Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
@@ -900,12 +903,12 @@ impl FunctionOwnerLabelResolutions {
     }
 }
 
-/// Per-owner predicate diagnostics produced for one top-level invariant.
+/// Predicate diagnostics produced for one top-level owner.
 ///
 /// The temporary HIR arena and source map used to produce these diagnostics
 /// are discarded before the value is returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InvariantOwnerPredicateResolution {
+pub struct PredicateOwnerResolution {
     owner: OwnerId,
     resolution: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     /// Diagnostics produced while lowering the owner, kept separate from the
@@ -914,7 +917,7 @@ pub struct InvariantOwnerPredicateResolution {
     lowering_diagnostics: Vec<Diagnostic>,
 }
 
-impl InvariantOwnerPredicateResolution {
+impl PredicateOwnerResolution {
     pub const fn owner(&self) -> OwnerId {
         self.owner
     }
@@ -928,16 +931,16 @@ impl InvariantOwnerPredicateResolution {
     }
 }
 
-/// Per-owner invariant predicate results tagged with request provenance.
+/// Per-owner predicate results tagged with request provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InvariantOwnerPredicateResolutions {
+pub struct PredicateOwnerResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
-    owners: Vec<InvariantOwnerPredicateResolution>,
+    owners: Vec<PredicateOwnerResolution>,
 }
 
-impl InvariantOwnerPredicateResolutions {
+impl PredicateOwnerResolutions {
     pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
         self.snapshot_id
     }
@@ -958,7 +961,7 @@ impl InvariantOwnerPredicateResolutions {
         &self.target_cfg
     }
 
-    pub fn owners(&self) -> &[InvariantOwnerPredicateResolution] {
+    pub fn owners(&self) -> &[PredicateOwnerResolution] {
         &self.owners
     }
 }
@@ -2590,7 +2593,7 @@ impl RootDatabase {
         collection: &Phase1PackageScopesCollection,
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
-    ) -> Result<InvariantOwnerPredicateResolutions, OwnerControlFlowResolutionError> {
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -2612,7 +2615,7 @@ impl RootDatabase {
                     Ok(inputs) => inputs,
                     Err(error) => {
                         owners.extend(descriptors[group_start..group_end].iter().map(
-                            |descriptor| InvariantOwnerPredicateResolution {
+                            |descriptor| PredicateOwnerResolution {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -2680,7 +2683,7 @@ impl RootDatabase {
                         None => Ok(Vec::new()),
                     }
                 })();
-                owners.push(InvariantOwnerPredicateResolution {
+                owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     lowering_diagnostics,
@@ -2688,7 +2691,133 @@ impl RootDatabase {
             }
             group_start = group_end;
         }
-        Ok(InvariantOwnerPredicateResolutions {
+        Ok(PredicateOwnerResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Lowers Phase 1 refined and refinement-bearing distinct descriptors,
+    /// then diagnoses forbidden syntax in each predicate body value.
+    ///
+    /// A predicate expression is not an executable owner body, so this uses
+    /// the predicate-only resolver and does not resolve its loop labels.
+    /// Distinct declarations without a refinement clause are not indexed.
+    pub fn resolve_refinement_owner_predicates(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = &collection.scopes.refinement_predicate_owners;
+        let mut owners = Vec::with_capacity(descriptors.len());
+        let mut group_start = 0;
+        while group_start < descriptors.len() {
+            let file = descriptors[group_start].file;
+            let mut group_end = group_start + 1;
+            while group_end < descriptors.len() && descriptors[group_end].file == file {
+                group_end += 1;
+            }
+            let inputs =
+                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        owners.extend(descriptors[group_start..group_end].iter().map(
+                            |descriptor| PredicateOwnerResolution {
+                                owner: descriptor.owner,
+                                resolution: Err(error.clone()),
+                                lowering_diagnostics: Vec::new(),
+                            },
+                        ));
+                        group_start = group_end;
+                        continue;
+                    }
+                };
+
+            for descriptor in &descriptors[group_start..group_end] {
+                let mut lowering_diagnostics = Vec::new();
+                let resolution = (|| {
+                    let expected_kind = match descriptor.kind {
+                        RefinementPredicateOwnerKind::Refined => ItemTreeKind::Refined,
+                        RefinementPredicateOwnerKind::Distinct => ItemTreeKind::Distinct,
+                    };
+                    if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&expected_kind) {
+                        return Err(
+                            OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+
+                    let def_paths = self
+                        .def_paths
+                        .get(&descriptor.owner.def_id.package())
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+                    let expected_path = def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+
+                    let arena = HirArena::new();
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.parsed.root,
+                        &arena,
+                        &self.symbols,
+                        def_paths,
+                    );
+                    let (hir_owner, _source_map) = match descriptor.kind {
+                        RefinementPredicateOwnerKind::Refined => lower_refined_owner(
+                            descriptor.owner,
+                            &expected_path,
+                            &inputs.filtered_item_tree,
+                            descriptor.item_id,
+                            &context,
+                        ),
+                        RefinementPredicateOwnerKind::Distinct => lower_distinct_owner(
+                            descriptor.owner,
+                            &expected_path,
+                            &inputs.filtered_item_tree,
+                            descriptor.item_id,
+                            &context,
+                        ),
+                    }
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                    lowering_diagnostics = hir_owner.diagnostics.clone();
+                    match hir_owner.body {
+                        Some(body) => resolve_predicate_expression(
+                            body.value,
+                            &inputs.source_ref,
+                            inputs.source.as_ref(),
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Labels),
+                        None => Ok(Vec::new()),
+                    }
+                })();
+                owners.push(PredicateOwnerResolution {
+                    owner: descriptor.owner,
+                    resolution,
+                    lowering_diagnostics,
+                });
+            }
+            group_start = group_end;
+        }
+        Ok(PredicateOwnerResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -3357,6 +3486,58 @@ mod tests {
             resolved.owners()[1]
                 .resolution()
                 .expect("second invariant lowers")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refinement_owner_adapter_checks_refined_and_distinct_predicate_values() {
+        let root = concat!(
+            "type Positive = I32 where self?\n",
+            "distinct Age = U8 where loop { break 'missing }\n",
+            "distinct Plain = U8\n",
+            "type Safe = I32 where self > 0\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("refinement predicate owners collect");
+        assert_eq!(collection.scopes().refinement_predicate_owners.len(), 3);
+
+        let resolved = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("refinement predicate owners resolve");
+
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 3);
+        assert_eq!(
+            resolved.owners()[0]
+                .resolution()
+                .expect("refined owner lowers")
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::InvalidContractExpression]
+        );
+        assert_eq!(
+            resolved.owners()[1]
+                .resolution()
+                .expect("distinct owner lowers")
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::InvalidContractExpression]
+        );
+        assert!(
+            resolved.owners()[2]
+                .resolution()
+                .expect("valid refined owner lowers")
                 .is_empty()
         );
     }
