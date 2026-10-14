@@ -399,16 +399,29 @@ the declared identity, build target, and test-analysis flag to classify local
 import syntax. The adapter still has no active package graph or foreign
 package scopes, so this is only a manifest-backed prepass.
 
-**Inactive dependencies** ([spec/04](../spec/04-modules-and-names.md) §4.3.2 step 1.3). In step 1, after rules 1.1 and 1.2 found no target, let `K` be the `ns:pkg` part of the `PKG_PATH`. If `package_graph` has no active edge of the current package named `K`, and `declared_requirements(P)` has an entry `r` with `r.identity = K`, `r.test = false` and `r.only = Some(T)` where `T` does not contain the target of `target_cfg(P)` (§3.3.1), the use is `INACTIVE_DEPENDENCY`, at the `PKG_PATH`. The help lists the targets of `T` in contract order and suggests `@target` on the `use` and on the items that need it ([spec/15](../spec/15-attributes-and-lints.md) §15.11). The entry records an error, its bindings get `Res::Err`, and step 4 reports nothing for its items. Otherwise the rule does not apply, and a `K` without an active edge falls through to `UNKNOWN_PACKAGE`. A `use` that `@target` removed was never collected (§3.3.1), so it is never checked. An entry with `r.test = true` is a test-only use and follows the next paragraph instead, so a test dependency with an `only` list that excludes the target is also never `INACTIVE_DEPENDENCY` in a build without test analysis.
+**Inactive dependencies** ([spec/04](../spec/04-modules-and-names.md) §4.3.2 step 1.3). After rules 1.1 and 1.2 found no target, let `K` be the `ns:pkg` part of the `PKG_PATH`. If `declared_requirements(P)` has an ordinary requirement `r` with `r.identity = K` and `r.only = Some(T)` where `T` does not contain the target of `target_cfg(P)` (§3.3.1), the use is `INACTIVE_DEPENDENCY`, at the `PKG_PATH`. The help lists the targets of `T` in contract order and suggests `@target` on the `use` and on the items that need it ([spec/15](../spec/15-attributes-and-lints.md) §15.11). The entry records an error, its bindings get `Res::Err`, and step 4 reports nothing for its items. A `use` that `@target` removed was never collected (§3.3.1), so it is never checked. An entry with `r.test = true` is a test-only use and follows the next paragraph instead, so a test dependency with an `only` list that excludes the target is also never `INACTIVE_DEPENDENCY` in a build without test analysis.
 
-The current Stage 0 adapter has no package graph, so the manifest prepass can
-establish only that a declared ordinary dependency is excluded from the
-requested target. It emits `INACTIVE_DEPENDENCY` on the complete `PKG_PATH`,
-preserves manifest target order in help, and suppresses item lookup. Its alias
-and item bindings retain `Res::Err` for later references while still
-participating in duplicate checks. It cannot confirm an active edge; the
-package-graph query is still needed to distinguish one from an unresolved
-dependency edge.
+After current-package and toolchain-package handling, package identity
+classification follows the manifest ordering in spec/04 §4.3.2: a
+target-allowed declared dependency reaches the Stage 3 gate, and only an
+undeclared dependency identity is `UNKNOWN_PACKAGE`. If a valid active package
+graph is also supplied, the driver checks that its direct edges match the
+requirements active for the current target and test-analysis context. A
+missing edge for a declared active requirement, or an edge without a matching
+active requirement, is a typed graph/manifest input inconsistency before
+Phase 2; it must not be reclassified as `UNKNOWN_PACKAGE` or
+`INACTIVE_DEPENDENCY`. Implicit toolchain packages (`sai:core`,
+`sai:alloc`, and the bundled WASI packages) are excluded because they are not
+ordinary active SAI dependency edges. Lock-backed graph activation is the
+primary owner of this validation when it is integrated.
+
+The current Stage 0 adapter may have no package graph, so the manifest
+prepass classifies a target-allowed declared dependency as
+`FEATURE_NOT_IMPLEMENTED` and a target-excluded ordinary dependency as
+`INACTIVE_DEPENDENCY`. Both diagnostics suppress item lookup while
+syntax-derived alias and item bindings retain `Res::Err` for later references
+and still participate in duplicate checks. An available graph adds a
+consistency check, not a different manifest-to-diagnostic precedence.
 
 **Other foreign package identities (IR-473).** After the current-package,
 toolchain-package, and test-only cases above, a valid manifest permits the
