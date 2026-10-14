@@ -5,7 +5,7 @@
 //! contents, and fetched-content verification require resolver inputs and are
 //! deliberately outside this module.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 use crate::lock::{
@@ -47,6 +47,9 @@ pub enum LockGraphErrorKind {
         package: Box<str>,
         line: CompatibilityLine,
         entry_version: Version,
+    },
+    ExcludedEdgeForRootTargets {
+        package: Box<str>,
     },
     CycleToRoot {
         package: Box<str>,
@@ -117,6 +120,20 @@ pub fn validate(
     let file = &parsed.file;
     let root = file.root.as_ref().expect("valid lock has a root block");
     let root_node = node_for_root(&root.value);
+    let root_targets = root
+        .value
+        .fields
+        .iter()
+        .find_map(|field| match &field.value {
+            LockRootField::Targets(targets) => Some(
+                targets
+                    .iter()
+                    .map(|target| target.value.clone())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            LockRootField::Requires(_) => None,
+        })
+        .expect("a locally valid lock has root targets");
     let entries = file
         .packages
         .iter()
@@ -152,6 +169,7 @@ pub fn validate(
         let mut edges = Vec::new();
         for field in &entry.value.fields {
             if let LockPackageField::Requires(requirement) = &field.value {
+                report_excluded_edge(requirement, field.span.clone(), &root_targets, &mut output);
                 if let Some(edge) = collect_edge(
                     requirement,
                     field.span.clone(),
@@ -185,6 +203,26 @@ pub fn validate(
     }
 
     Ok(output)
+}
+
+fn report_excluded_edge(
+    requirement: &LockRequirement,
+    span: Range<usize>,
+    root_targets: &BTreeSet<Box<str>>,
+    output: &mut LockGraphValidationOutput,
+) {
+    if requirement.only.as_ref().is_some_and(|only| {
+        !only
+            .iter()
+            .any(|target| root_targets.contains(target.value.as_ref()))
+    }) {
+        output.errors.push(LockGraphError {
+            kind: LockGraphErrorKind::ExcludedEdgeForRootTargets {
+                package: requirement.package.clone(),
+            },
+            span,
+        });
+    }
 }
 
 fn collect_edge(
@@ -427,6 +465,27 @@ mod tests {
         );
         let output = validate(&parse(source.as_bytes())).expect("valid lock input");
         assert!(output.is_consistent(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn reports_dependency_edges_excluded_by_root_targets() {
+        let source = lock(
+            &["requires acme:a @ ^1 -> 1.0.0"],
+            &[
+                (
+                    "acme:a",
+                    "1.0.0",
+                    &["requires acme:b @ ^1 -> 1.0.0 only { wasm32-core }"],
+                ),
+                ("acme:b", "1.0.0", &[]),
+            ],
+        );
+        let errors = error_kinds(&source);
+        assert!(
+            errors.contains(&LockGraphErrorKind::ExcludedEdgeForRootTargets {
+                package: "acme:b".into(),
+            })
+        );
     }
 
     #[test]

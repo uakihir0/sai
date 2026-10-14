@@ -22,6 +22,7 @@ use crate::git_tree::{
     GitTreeReader,
 };
 use crate::lock::{LockPackage, LockPackageField, LockSource};
+use crate::lock_source_selection::LockPackageSource;
 use crate::lock_validation::{canonical_git_url, valid_checksum};
 use crate::manifest::{PackageDeclaration, PackageParseOutput, PackageRole};
 use crate::mvs::MvsPackageVersion;
@@ -457,6 +458,52 @@ impl GitPackagePathError {
 }
 
 impl GitPackageSourceIdentity {
+    /// Builds an exact Git package identity from a validated lock source.
+    ///
+    /// Callers must still compare the identity with the current path pin and
+    /// the target package entry before loading content.
+    pub fn from_locked_source(
+        source: &LockPackageSource,
+    ) -> Result<Self, GitRemoteReleaseFetchError> {
+        let LockSource::Git(url) = &source.source else {
+            return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                "Git path source identity",
+            ));
+        };
+        let canonical_url =
+            canonical_git_url(url).map_err(|_| GitRemoteReleaseFetchError::InvalidGitUrl)?;
+        if canonical_url != url.as_ref() {
+            return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                "Git path source identity",
+            ));
+        }
+        let commit_text = source.commit.as_deref().ok_or(
+            GitRemoteReleaseFetchError::InvalidLockedPackageField("commit"),
+        )?;
+        let commit_id = gix::ObjectId::from_hex(commit_text.as_bytes())
+            .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("commit"))?;
+        if commit_id.to_hex() != commit_text {
+            return Err(GitRemoteReleaseFetchError::InvalidLockedPackageField(
+                "commit",
+            ));
+        }
+        let directory = source
+            .directory
+            .as_deref()
+            .map(RepositoryPackageDirectory::parse)
+            .transpose()
+            .map_err(|_| GitRemoteReleaseFetchError::InvalidLockedPackageField("directory"))?
+            .unwrap_or_else(|| {
+                RepositoryPackageDirectory::parse(".")
+                    .expect("the repository root is a valid package directory")
+            });
+        Ok(Self {
+            canonical_url: canonical_url.into(),
+            commit_id,
+            directory,
+        })
+    }
+
     /// The canonical repository URL.
     pub fn canonical_url(&self) -> &str {
         &self.canonical_url
@@ -1985,6 +2032,169 @@ pub fn fetch_locked_package_to_cache(
         source,
         status,
         tag_missing,
+    })
+}
+
+/// Verify a locked Git path package from cache, or fetch its exact commit when
+/// the verified source is absent.
+///
+/// The lock entry must describe the exact repository, commit, and package
+/// directory in `source_identity`. Cache hits are re-hashed and checked against
+/// all lock-recorded checksums. On a miss, the exact commit is fetched and its
+/// checksums are verified before any source or checksum metadata is cached.
+/// When `offline` is true, a cache miss returns before making a network call.
+/// Callers must run full lock syntax and semantic validation first.
+pub fn fetch_locked_git_path_package_to_cache(
+    package: &LockPackage,
+    source_identity: &GitPackageSourceIdentity,
+    cache: &PackageCache,
+    offline: bool,
+) -> Result<CachedLockedPackage, LockedPackageCacheFetchError> {
+    fetch_locked_git_path_package_to_cache_with_fetcher(
+        package,
+        source_identity,
+        cache,
+        offline,
+        |identity| {
+            fetch_git_package_source_tree_at_commit(
+                identity.canonical_url(),
+                identity.commit_id(),
+                identity.directory(),
+            )
+        },
+    )
+}
+
+fn fetch_locked_git_path_package_to_cache_with_fetcher(
+    package: &LockPackage,
+    source_identity: &GitPackageSourceIdentity,
+    cache: &PackageCache,
+    offline: bool,
+    fetch: impl FnOnce(
+        &GitPackageSourceIdentity,
+    ) -> Result<FetchedGitPackage, GitRemoteReleaseFetchError>,
+) -> Result<CachedLockedPackage, LockedPackageCacheFetchError> {
+    let request = locked_git_path_request(package, source_identity)
+        .map_err(LockedPackageCacheFetchError::Fetch)?;
+    let locked_commit = request.commit.to_hex().to_string();
+    let source_checksum_is_the_only_locked_hash =
+        request.checksums.wit_checksum.is_none() && request.checksums.artifact_checksums.is_empty();
+    let directory = request
+        .directory
+        .as_ref()
+        .map(RepositoryPackageDirectory::as_str);
+    let cached_checksums =
+        match cache.cached_package_checksums(&request.url, &locked_commit, directory) {
+            Ok(checksums) => checksums,
+            // A malformed checksum record is a miss and can be rebuilt after a
+            // fresh exact-commit fetch verifies the lock.
+            Err(PackageCacheError::CorruptRecord(_)) => None,
+            Err(error) => return Err(LockedPackageCacheFetchError::Cache(error)),
+        };
+    if let Some(cached_checksums) = &cached_checksums {
+        verify_cached_package_checksums(&request.checksums, cached_checksums)
+            .map_err(|error| with_locked_checksum_context(&request, error))
+            .map_err(LockedPackageCacheFetchError::Fetch)?;
+    }
+    let mut corruption_notice = None;
+
+    match cache
+        .verify_source(&request.checksums.source_checksum)
+        .map_err(LockedPackageCacheFetchError::Cache)?
+    {
+        CachedSourceVerification::Verified(source) if cached_checksums.is_some() => {
+            return Ok(CachedLockedPackage {
+                source,
+                status: LockedPackageCacheStatus::Cached,
+                tag_missing: false,
+            });
+        }
+        CachedSourceVerification::Verified(source)
+            if source_checksum_is_the_only_locked_hash
+                && cached_source_has_no_optional_checksums(&source) =>
+        {
+            return Ok(CachedLockedPackage {
+                source,
+                status: LockedPackageCacheStatus::Cached,
+                tag_missing: false,
+            });
+        }
+        CachedSourceVerification::Corrupt {
+            actual_checksum, ..
+        } => {
+            match cache
+                .remove_corrupt_source(&request.checksums.source_checksum)
+                .map_err(LockedPackageCacheFetchError::Cache)?
+            {
+                SourceCacheRemoval::Removed | SourceCacheRemoval::Missing => {
+                    corruption_notice = Some(CacheCorruptionNotice {
+                        expected_checksum: request.checksums.source_checksum.clone(),
+                        actual_checksum,
+                    });
+                }
+                SourceCacheRemoval::Valid => {
+                    if let Some(source) =
+                        find_verified_source(cache, &request.checksums.source_checksum)?
+                        && (cached_checksums.is_some()
+                            || (source_checksum_is_the_only_locked_hash
+                                && cached_source_has_no_optional_checksums(&source)))
+                    {
+                        return Ok(CachedLockedPackage {
+                            source,
+                            status: LockedPackageCacheStatus::Cached,
+                            tag_missing: false,
+                        });
+                    }
+                }
+            }
+        }
+        CachedSourceVerification::Missing | CachedSourceVerification::Verified(_) => {}
+    }
+
+    if offline {
+        return Err(attach_corruption_notice(
+            LockedPackageCacheFetchError::OfflineFetchRequired {
+                package: format!("{}@{}", package.package, package.version).into(),
+                url: request.url,
+                commit: request.commit.to_hex().to_string().into(),
+            },
+            corruption_notice.as_ref(),
+        ));
+    }
+
+    let fetched = fetch(source_identity)
+        .map_err(|error| with_locked_checksum_context(&request, error))
+        .map_err(LockedPackageCacheFetchError::Fetch)
+        .map_err(|error| attach_corruption_notice(error, corruption_notice.as_ref()))?;
+    verify_locked_git_path_package_checksums(&request, source_identity, &fetched)
+        .map_err(LockedPackageCacheFetchError::Fetch)
+        .map_err(|error| attach_corruption_notice(error, corruption_notice.as_ref()))?;
+
+    let source_tree = fetched.into_source();
+    let source_checksum = request.checksums.source_checksum.clone();
+    cache
+        .record_verified_package_checksums(&request.url, &locked_commit, directory, &source_tree)
+        .map_err(LockedPackageCacheFetchError::Cache)
+        .map_err(|error| attach_corruption_notice(error, corruption_notice.as_ref()))?;
+    let source = cache
+        .materialize_source(source_tree)
+        .map_err(LockedPackageCacheFetchError::Cache)
+        .map_err(|error| attach_corruption_notice(error, corruption_notice.as_ref()))?;
+    cache
+        .record_git_source_checksum(&request.url, &locked_commit, directory, &source_checksum)
+        .map_err(LockedPackageCacheFetchError::Cache)
+        .map_err(|error| attach_corruption_notice(error, corruption_notice.as_ref()))?;
+
+    let status = match &corruption_notice {
+        Some(notice) => LockedPackageCacheStatus::RepairedCorrupt {
+            actual_checksum: notice.actual_checksum.clone(),
+        },
+        None => LockedPackageCacheStatus::Fetched,
+    };
+    Ok(CachedLockedPackage {
+        source,
+        status,
+        tag_missing: false,
     })
 }
 
@@ -3636,6 +3846,54 @@ mod tests {
         )
     }
 
+    fn locked_git_path_fixture() -> (
+        TestRemote,
+        super::GitPackageSourceIdentity,
+        FetchedGitPackage,
+    ) {
+        let remote = TestRemote::new("refs/tags/v1.2.3", false);
+        let commit_id = remote.commit_with_sibling_package();
+        let identity = super::GitPackageSourceIdentity {
+            canonical_url: TEST_CANONICAL_GIT_URL.into(),
+            commit_id,
+            directory: RepositoryPackageDirectory::parse("packages/sibling").unwrap(),
+        };
+        let repository =
+            gix::open_opts(&remote.directory.path, gix::open::Options::isolated()).unwrap();
+        let reader = GitTreeReader::open(
+            repository.git_dir().join("objects"),
+            repository.object_hash(),
+        )
+        .unwrap();
+        let source = reader
+            .read_commit_repository_package_source_tree(identity.commit_id(), identity.directory())
+            .unwrap();
+        let fetched = FetchedGitPackage {
+            source_identity: identity.clone(),
+            source,
+        };
+        (remote, identity, fetched)
+    }
+
+    fn locked_git_path_package(
+        identity: &super::GitPackageSourceIdentity,
+        source_checksum: &str,
+    ) -> LockPackage {
+        LockPackage {
+            package: "acme:sibling".into(),
+            version: crate::version::Version::parse("1.4.0").unwrap(),
+            fields: [
+                LockPackageField::Source(LockSource::Git(identity.canonical_url().into())),
+                LockPackageField::Directory(identity.directory().as_str().into()),
+                LockPackageField::Commit(identity.commit_id().to_hex().to_string().into()),
+                LockPackageField::Checksum(source_checksum.into()),
+            ]
+            .into_iter()
+            .map(|value| Spanned { value, span: 0..0 })
+            .collect(),
+        }
+    }
+
     #[test]
     fn maps_advertisement_limit_failures_to_package_too_large() {
         let error = std::io::Error::new(
@@ -3890,6 +4148,137 @@ mod tests {
                 "Git path source identity"
             ))
         );
+    }
+
+    #[test]
+    fn locked_git_path_cache_offline_miss_does_not_call_fetcher() {
+        let (_remote, identity, fetched) = locked_git_path_fixture();
+        let expected_checksum = format!("sai1:{}", "0".repeat(64));
+        let package = locked_git_path_package(&identity, &expected_checksum);
+        let cache_directory = TestDirectory::new("locked-git-path-offline-cache");
+        let cache = PackageCache::open(cache_directory.0.join("cache")).unwrap();
+        let fetches = std::cell::Cell::new(0);
+        let expected_commit = identity.commit_id().to_hex().to_string();
+
+        let error = super::fetch_locked_git_path_package_to_cache_with_fetcher(
+            &package,
+            &identity,
+            &cache,
+            true,
+            |_| {
+                fetches.set(fetches.get() + 1);
+                Ok(fetched)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fetches.get(), 0);
+        assert!(matches!(
+            error,
+            super::LockedPackageCacheFetchError::OfflineFetchRequired {
+                package,
+                url,
+                commit,
+            } if package.as_ref() == "acme:sibling@1.4.0"
+                && url.as_ref() == TEST_CANONICAL_GIT_URL
+                && commit.as_ref() == expected_commit
+        ));
+    }
+
+    #[test]
+    fn locked_git_path_cache_rejects_bad_checksum_without_caching_tree_or_metadata() {
+        let (_remote, identity, fetched) = locked_git_path_fixture();
+        let expected_checksum = format!("sai1:{}", "0".repeat(64));
+        assert_ne!(
+            expected_checksum.as_str(),
+            fetched.source().source_tree().checksum.as_str()
+        );
+        let package = locked_git_path_package(&identity, &expected_checksum);
+        let cache_directory = TestDirectory::new("locked-git-path-mismatch-cache");
+        let cache = PackageCache::open(cache_directory.0.join("cache")).unwrap();
+        let fetches = std::cell::Cell::new(0);
+        let commit = identity.commit_id().to_hex().to_string();
+        let directory = identity.directory().as_str();
+
+        let error = super::fetch_locked_git_path_package_to_cache_with_fetcher(
+            &package,
+            &identity,
+            &cache,
+            false,
+            |_| {
+                fetches.set(fetches.get() + 1);
+                Ok(fetched)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fetches.get(), 1);
+        assert!(matches!(
+            error,
+            super::LockedPackageCacheFetchError::Fetch(
+                GitRemoteReleaseFetchError::LockedChecksumMismatch {
+                    kind: super::GitPackageChecksumKind::Source,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            cache.verify_source(&expected_checksum).unwrap(),
+            crate::package_cache::CachedSourceVerification::Missing
+        ));
+        assert!(
+            cache
+                .cached_package_checksums(identity.canonical_url(), &commit, Some(directory))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn locked_git_path_cache_verifies_a_hit_and_never_fetches_offline() {
+        let (_remote, identity, fetched) = locked_git_path_fixture();
+        let source_checksum = fetched.source().source_tree().checksum.clone();
+        let package = locked_git_path_package(&identity, &source_checksum);
+        let cache_directory = TestDirectory::new("locked-git-path-cache-hit");
+        let cache = PackageCache::open(cache_directory.0.join("cache")).unwrap();
+
+        let fetched_to_cache = super::fetch_locked_git_path_package_to_cache_with_fetcher(
+            &package,
+            &identity,
+            &cache,
+            false,
+            |_| Ok(fetched),
+        )
+        .unwrap();
+        assert_eq!(
+            fetched_to_cache.status(),
+            &super::LockedPackageCacheStatus::Fetched
+        );
+        assert_eq!(fetched_to_cache.source().checksum(), source_checksum);
+        assert_eq!(
+            cache
+                .cached_package_checksums(
+                    identity.canonical_url(),
+                    &identity.commit_id().to_hex().to_string(),
+                    Some(identity.directory().as_str()),
+                )
+                .unwrap()
+                .unwrap()
+                .source_checksum
+                .as_ref(),
+            source_checksum
+        );
+
+        let cached = super::fetch_locked_git_path_package_to_cache_with_fetcher(
+            &package,
+            &identity,
+            &cache,
+            true,
+            |_| panic!("a verified cache hit must not fetch"),
+        )
+        .unwrap();
+        assert_eq!(cached.status(), &super::LockedPackageCacheStatus::Cached);
+        assert_eq!(cached.source().checksum(), source_checksum);
     }
 
     #[test]

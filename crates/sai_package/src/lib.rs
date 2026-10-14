@@ -11,6 +11,7 @@ pub mod lexer;
 pub mod local_source;
 pub mod lock;
 pub mod lock_active_graph;
+pub mod lock_dependency_contract;
 // The root-only creation entry point is safe to expose before the audited
 // dependency-content assembly path is integrated.
 pub mod lock_build;
@@ -18,6 +19,8 @@ pub mod lock_conflict;
 pub mod lock_graph_validation;
 pub mod lock_root_contract;
 pub mod lock_serialization;
+pub mod lock_source_canonicalizer;
+pub mod lock_source_selection;
 pub mod lock_validation;
 pub mod lock_writer;
 pub mod manifest;
