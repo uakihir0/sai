@@ -7,10 +7,15 @@
 //! nodes; WIT view packages are modeled by the later WIT package-scope layer.
 
 use sai_package::identity::PackageIdentity;
+use sai_package::lock_active_graph::{LockActiveGraph, LockActiveNode};
+use sai_package::mvs::MvsPackageVersion;
 use sai_package::version::Version;
 use sai_stable_hash::{StableHash, StableHasher};
 use sai_vfs::PackageKey;
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 /// Whether an active package is compiled from source or consumed as an artifact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +217,52 @@ pub struct PackageGraph {
     nodes: Vec<PackageGraphNode>,
 }
 
+/// Source/artifact metadata not retained by a lock-backed active graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockActivePackageMetadata {
+    pub form: PackageForm,
+    pub role: PackageGraphRole,
+}
+
+/// Invalid lock-active-graph input while adapting it to the driver's graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LockActiveGraphAdapterError {
+    InvalidPackageIdentity(String),
+    NodeRoleMismatch {
+        node: LockActiveNode,
+        role: PackageGraphRole,
+    },
+    DuplicateActiveNode(MvsPackageVersion),
+    MissingDependencyMetadata(MvsPackageVersion),
+    UnexpectedDependencyMetadata(MvsPackageVersion),
+    EdgeEndpointMissing {
+        endpoint: LockActiveNode,
+    },
+    EdgeEndpointMismatch {
+        endpoint: LockActiveNode,
+        expected: LockActiveNode,
+    },
+    InvalidPackageKey(sai_vfs::PackageKeyError),
+    PackageGraph(PackageGraphError),
+}
+
+impl fmt::Display for LockActiveGraphAdapterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "could not adapt lock active package graph: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for LockActiveGraphAdapterError {}
+
+impl From<PackageGraphError> for LockActiveGraphAdapterError {
+    fn from(error: PackageGraphError) -> Self {
+        Self::PackageGraph(error)
+    }
+}
+
 impl PackageGraph {
     /// Builds the active resolved graph, rejecting duplicate nodes, dangling
     /// or mismatched edges, nodes unreachable from the root, cycles, and
@@ -277,6 +328,186 @@ impl PackageGraph {
         })
     }
 
+    /// Converts a lock-backed active graph into the driver's stable graph.
+    ///
+    /// The lock graph does not retain source/artifact form or package role for
+    /// dependencies, so `dependency_metadata` must describe every active
+    /// dependency and no other package. The root is always a source package
+    /// with the root role. `toolchain_version` is supplied separately because
+    /// implicit toolchain packages are not nodes in either graph.
+    pub fn from_lock_active_graph(
+        lock_graph: &LockActiveGraph,
+        dependency_metadata: &BTreeMap<MvsPackageVersion, LockActivePackageMetadata>,
+        toolchain_version: Version,
+    ) -> Result<Self, LockActiveGraphAdapterError> {
+        let root_version = lock_node_version(&lock_graph.root)?;
+        if !lock_graph.root.root {
+            return Err(LockActiveGraphAdapterError::NodeRoleMismatch {
+                node: lock_graph.root.clone(),
+                role: PackageGraphRole::Root,
+            });
+        }
+
+        let mut dependencies = lock_graph.packages.iter().collect::<Vec<_>>();
+        dependencies.sort();
+
+        let mut expected_metadata = BTreeSet::new();
+        let mut active_nodes = BTreeMap::new();
+        let mut stable_keys = BTreeMap::new();
+        let mut graph_nodes = Vec::with_capacity(dependencies.len() + 1);
+
+        let root_key = lock_node_key(&lock_graph.root)?;
+        active_nodes.insert(root_version.clone(), lock_graph.root.clone());
+        stable_keys.insert(root_version.clone(), root_key.clone());
+        let root_edges = Vec::<PackageGraphEdge>::new();
+        graph_nodes.push((
+            root_version.clone(),
+            lock_graph.root.package.to_string(),
+            lock_graph.root.version.clone(),
+            PackageForm::Source,
+            PackageGraphRole::Root,
+            root_edges,
+        ));
+
+        for dependency in dependencies {
+            let package_version = lock_node_version(dependency)?;
+            if active_nodes
+                .insert(package_version.clone(), dependency.clone())
+                .is_some()
+            {
+                return Err(LockActiveGraphAdapterError::DuplicateActiveNode(
+                    package_version,
+                ));
+            }
+            if dependency.root {
+                let role = dependency_metadata
+                    .get(&package_version)
+                    .map_or(PackageGraphRole::Dependency, |metadata| metadata.role);
+                return Err(LockActiveGraphAdapterError::NodeRoleMismatch {
+                    node: dependency.clone(),
+                    role,
+                });
+            }
+            expected_metadata.insert(package_version.clone());
+            let Some(metadata) = dependency_metadata.get(&package_version) else {
+                return Err(LockActiveGraphAdapterError::MissingDependencyMetadata(
+                    package_version,
+                ));
+            };
+            if metadata.role == PackageGraphRole::Root {
+                return Err(LockActiveGraphAdapterError::NodeRoleMismatch {
+                    node: dependency.clone(),
+                    role: metadata.role,
+                });
+            }
+
+            let key = lock_node_key(dependency)?;
+            stable_keys.insert(package_version.clone(), key);
+            graph_nodes.push((
+                package_version,
+                dependency.package.to_string(),
+                dependency.version.clone(),
+                metadata.form,
+                metadata.role,
+                Vec::new(),
+            ));
+        }
+
+        if let Some(extra) = dependency_metadata
+            .keys()
+            .find(|package| !expected_metadata.contains(*package))
+        {
+            return Err(LockActiveGraphAdapterError::UnexpectedDependencyMetadata(
+                extra.clone(),
+            ));
+        }
+
+        let mut outgoing = BTreeMap::<MvsPackageVersion, Vec<PackageGraphEdge>>::new();
+        let mut outgoing_targets = BTreeMap::<MvsPackageVersion, BTreeSet<PackageKey>>::new();
+        for package_version in active_nodes.keys() {
+            outgoing.insert(package_version.clone(), Vec::new());
+            outgoing_targets.insert(package_version.clone(), BTreeSet::new());
+        }
+
+        let mut edges = lock_graph.edges.iter().collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            left.from
+                .cmp(&right.from)
+                .then_with(|| left.to.cmp(&right.to))
+                .then_with(|| {
+                    left.requirement
+                        .to_string()
+                        .cmp(&right.requirement.to_string())
+                })
+                .then_with(|| left.test.cmp(&right.test))
+                .then_with(|| left.only.cmp(&right.only))
+        });
+
+        for edge in edges {
+            let source_version = lock_node_version(&edge.from)?;
+            let Some(expected_source) = active_nodes.get(&source_version) else {
+                return Err(LockActiveGraphAdapterError::EdgeEndpointMissing {
+                    endpoint: edge.from.clone(),
+                });
+            };
+            if expected_source != &edge.from {
+                return Err(LockActiveGraphAdapterError::EdgeEndpointMismatch {
+                    endpoint: edge.from.clone(),
+                    expected: expected_source.clone(),
+                });
+            }
+
+            let target_version = lock_node_version(&edge.to)?;
+            let Some(expected_target) = active_nodes.get(&target_version) else {
+                return Err(LockActiveGraphAdapterError::EdgeEndpointMissing {
+                    endpoint: edge.to.clone(),
+                });
+            };
+            if expected_target != &edge.to {
+                return Err(LockActiveGraphAdapterError::EdgeEndpointMismatch {
+                    endpoint: edge.to.clone(),
+                    expected: expected_target.clone(),
+                });
+            }
+
+            let target_key = stable_keys
+                .get(&target_version)
+                .expect("every validated active node has a stable key");
+            let package_edge =
+                PackageGraphEdge::new(target_key.clone(), edge.to.package.to_string())?;
+            // A malformed or externally constructed active graph can repeat
+            // an edge to one package node. The driver graph models topology,
+            // not lock requirement multiplicity, so retain it only once.
+            if !outgoing_targets
+                .get_mut(&source_version)
+                .expect("every validated active node has an outgoing-edge entry")
+                .insert(target_key.clone())
+            {
+                continue;
+            }
+            outgoing
+                .get_mut(&source_version)
+                .expect("every validated active node has an outgoing-edge entry")
+                .push(package_edge);
+        }
+
+        let nodes = graph_nodes
+            .into_iter()
+            .map(|(package_version, identity, version, form, role, _)| {
+                let key = stable_keys
+                    .get(&package_version)
+                    .expect("every graph node has a stable key")
+                    .clone();
+                let edges = outgoing
+                    .remove(&package_version)
+                    .expect("every graph node has an outgoing-edge entry");
+                PackageGraphNode::new(key, identity, version, form, role, edges)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self::new(toolchain_version, nodes)?)
+    }
+
     pub fn root_key(&self) -> &PackageKey {
         &self.root
     }
@@ -304,6 +535,22 @@ impl PackageGraph {
             .ok()
             .map(|index| &self.nodes[index])
     }
+}
+
+fn lock_node_version(
+    node: &LockActiveNode,
+) -> Result<MvsPackageVersion, LockActiveGraphAdapterError> {
+    MvsPackageVersion::new(node.package.clone(), node.version.clone())
+        .map_err(|_| LockActiveGraphAdapterError::InvalidPackageIdentity(node.package.to_string()))
+}
+
+fn lock_node_key(node: &LockActiveNode) -> Result<PackageKey, LockActiveGraphAdapterError> {
+    PackageKey::new(format!(
+        "{}#{}",
+        node.package,
+        node.version.compatibility_line()
+    ))
+    .map_err(LockActiveGraphAdapterError::InvalidPackageKey)
 }
 
 impl StableHash for PackageGraph {
@@ -550,12 +797,16 @@ fn validate_reachable(nodes: &[PackageGraphNode]) -> Result<(), PackageGraphErro
 #[cfg(test)]
 mod tests {
     use super::{
-        PackageForm, PackageGraph, PackageGraphEdge, PackageGraphError, PackageGraphNode,
-        PackageGraphRole,
+        LockActiveGraphAdapterError, LockActivePackageMetadata, PackageForm, PackageGraph,
+        PackageGraphEdge, PackageGraphError, PackageGraphNode, PackageGraphRole,
     };
+    use sai_package::lock_active_graph::{LockActiveEdge, LockActiveGraph, LockActiveNode};
+    use sai_package::mvs::MvsPackageVersion;
     use sai_package::version::Version;
+    use sai_package::version_req::VersionReq;
     use sai_stable_hash::fingerprint;
     use sai_vfs::PackageKey;
+    use std::collections::BTreeMap;
 
     const TOOLCHAIN_VERSION: &str = "1.8.2";
 
@@ -593,6 +844,265 @@ mod tests {
         nodes: impl IntoIterator<Item = PackageGraphNode>,
     ) -> Result<PackageGraph, PackageGraphError> {
         PackageGraph::new(version(TOOLCHAIN_VERSION), nodes)
+    }
+
+    fn mvs_package_version(package: &str, version_text: &str) -> MvsPackageVersion {
+        MvsPackageVersion::new(package, version(version_text))
+            .expect("test package version is valid")
+    }
+
+    fn lock_node(package: &str, version_text: &str, root: bool) -> LockActiveNode {
+        LockActiveNode {
+            package: package.into(),
+            version: version(version_text),
+            root,
+        }
+    }
+
+    fn lock_edge(from: LockActiveNode, to: LockActiveNode, requirement: &str) -> LockActiveEdge {
+        LockActiveEdge {
+            from,
+            to,
+            requirement: VersionReq::parse(requirement).expect("test requirement is valid"),
+            test: false,
+            only: None,
+            span: 0..1,
+        }
+    }
+
+    fn lock_active_graph() -> LockActiveGraph {
+        let root = lock_node("acme:app", "1.0.0", true);
+        let dependency = lock_node("acme:dep", "1.4.2", false);
+        let leaf = lock_node("acme:leaf", "0.4.5", false);
+        LockActiveGraph {
+            root: root.clone(),
+            // Deliberately noncanonical input order: the adapter must not
+            // depend on the order in which lock packages or edges arrive.
+            packages: vec![leaf.clone(), dependency.clone()],
+            edges: vec![
+                lock_edge(dependency.clone(), leaf, "^0.4"),
+                lock_edge(root, dependency, "^1"),
+            ],
+        }
+    }
+
+    fn lock_active_metadata() -> BTreeMap<MvsPackageVersion, LockActivePackageMetadata> {
+        BTreeMap::from([
+            (
+                mvs_package_version("acme:dep", "1.4.2"),
+                LockActivePackageMetadata {
+                    form: PackageForm::Artifact,
+                    role: PackageGraphRole::Dependency,
+                },
+            ),
+            (
+                mvs_package_version("acme:leaf", "0.4.5"),
+                LockActivePackageMetadata {
+                    form: PackageForm::Source,
+                    role: PackageGraphRole::Dependency,
+                },
+            ),
+        ])
+    }
+
+    #[test]
+    fn adapts_lock_active_graph_with_required_package_metadata() {
+        let graph = PackageGraph::from_lock_active_graph(
+            &lock_active_graph(),
+            &lock_active_metadata(),
+            version(TOOLCHAIN_VERSION),
+        )
+        .expect("complete lock graph metadata adapts");
+
+        assert_eq!(graph.root().key().as_str(), "acme:app#1");
+        assert_eq!(graph.root().form(), PackageForm::Source);
+        assert_eq!(graph.root().role(), PackageGraphRole::Root);
+        assert_eq!(graph.root().active_edges().len(), 1);
+
+        let dependency = graph
+            .node(&key("acme:dep#1"))
+            .expect("dependency is present");
+        assert_eq!(dependency.version().to_string(), "1.4.2");
+        assert_eq!(dependency.form(), PackageForm::Artifact);
+        assert_eq!(dependency.role(), PackageGraphRole::Dependency);
+        assert_eq!(dependency.active_edges().len(), 1);
+        assert_eq!(dependency.active_edges()[0].visible_identity(), "acme:leaf");
+
+        let leaf = graph.node(&key("acme:leaf#0.4")).expect("leaf is present");
+        assert_eq!(leaf.version().to_string(), "0.4.5");
+        assert_eq!(leaf.form(), PackageForm::Source);
+        assert_eq!(graph.toolchain_version().to_string(), TOOLCHAIN_VERSION);
+    }
+
+    #[test]
+    fn lock_adapter_collapses_repeated_edges_to_the_same_target_key() {
+        let mut lock_graph = lock_active_graph();
+        let repeated_edge = lock_graph
+            .edges
+            .iter()
+            .find(|edge| edge.from.root)
+            .expect("root has an active edge")
+            .clone();
+        // The validated lock builder rejects repeated requirement identities;
+        // this exercises the adapter's defensive topology projection.
+        lock_graph.edges.push(repeated_edge);
+
+        let graph = PackageGraph::from_lock_active_graph(
+            &lock_graph,
+            &lock_active_metadata(),
+            version(TOOLCHAIN_VERSION),
+        )
+        .expect("multiple active requirements for one identity share one graph edge");
+
+        assert_eq!(graph.root().active_edges().len(), 1);
+        assert_eq!(
+            graph.root().active_edges()[0].visible_identity(),
+            "acme:dep"
+        );
+    }
+
+    #[test]
+    fn lock_adapter_output_is_independent_of_package_and_edge_order() {
+        let first_input = lock_active_graph();
+        let mut second_input = first_input.clone();
+        second_input.packages.reverse();
+        second_input.edges.reverse();
+
+        let first = PackageGraph::from_lock_active_graph(
+            &first_input,
+            &lock_active_metadata(),
+            version(TOOLCHAIN_VERSION),
+        )
+        .expect("first input adapts");
+        let second = PackageGraph::from_lock_active_graph(
+            &second_input,
+            &lock_active_metadata(),
+            version(TOOLCHAIN_VERSION),
+        )
+        .expect("reordered input adapts");
+
+        assert_eq!(first, second);
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[test]
+    fn lock_adapter_rejects_missing_and_extra_dependency_metadata() {
+        let active = lock_active_graph();
+        let complete = lock_active_metadata();
+        let missing = BTreeMap::from([(
+            mvs_package_version("acme:dep", "1.4.2"),
+            complete[&mvs_package_version("acme:dep", "1.4.2")],
+        )]);
+        assert_eq!(
+            PackageGraph::from_lock_active_graph(&active, &missing, version(TOOLCHAIN_VERSION))
+                .unwrap_err(),
+            LockActiveGraphAdapterError::MissingDependencyMetadata(mvs_package_version(
+                "acme:leaf",
+                "0.4.5"
+            ))
+        );
+
+        let mut extra = complete;
+        extra.insert(
+            mvs_package_version("acme:unused", "2.0.0"),
+            LockActivePackageMetadata {
+                form: PackageForm::Source,
+                role: PackageGraphRole::Dependency,
+            },
+        );
+        assert_eq!(
+            PackageGraph::from_lock_active_graph(&active, &extra, version(TOOLCHAIN_VERSION))
+                .unwrap_err(),
+            LockActiveGraphAdapterError::UnexpectedDependencyMetadata(mvs_package_version(
+                "acme:unused",
+                "2.0.0"
+            ))
+        );
+    }
+
+    #[test]
+    fn lock_adapter_rejects_root_flag_and_metadata_role_mismatches() {
+        let mut root_mismatch = lock_active_graph();
+        root_mismatch.root.root = false;
+        assert!(matches!(
+            PackageGraph::from_lock_active_graph(
+                &root_mismatch,
+                &lock_active_metadata(),
+                version(TOOLCHAIN_VERSION)
+            ),
+            Err(LockActiveGraphAdapterError::NodeRoleMismatch {
+                role: PackageGraphRole::Root,
+                ..
+            })
+        ));
+
+        let mut dependency_mismatch = lock_active_graph();
+        dependency_mismatch.packages[1].root = true;
+        assert!(matches!(
+            PackageGraph::from_lock_active_graph(
+                &dependency_mismatch,
+                &lock_active_metadata(),
+                version(TOOLCHAIN_VERSION)
+            ),
+            Err(LockActiveGraphAdapterError::NodeRoleMismatch {
+                role: PackageGraphRole::Dependency,
+                ..
+            })
+        ));
+
+        let mut metadata = lock_active_metadata();
+        metadata.insert(
+            mvs_package_version("acme:dep", "1.4.2"),
+            LockActivePackageMetadata {
+                form: PackageForm::Source,
+                role: PackageGraphRole::Root,
+            },
+        );
+        assert!(matches!(
+            PackageGraph::from_lock_active_graph(
+                &lock_active_graph(),
+                &metadata,
+                version(TOOLCHAIN_VERSION)
+            ),
+            Err(LockActiveGraphAdapterError::NodeRoleMismatch {
+                role: PackageGraphRole::Root,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lock_adapter_rejects_edges_with_missing_or_mismatched_endpoints() {
+        let mut missing_endpoint = lock_active_graph();
+        missing_endpoint.edges.push(lock_edge(
+            missing_endpoint.root.clone(),
+            lock_node("acme:missing", "1.0.0", false),
+            "^1",
+        ));
+        assert!(matches!(
+            PackageGraph::from_lock_active_graph(
+                &missing_endpoint,
+                &lock_active_metadata(),
+                version(TOOLCHAIN_VERSION)
+            ),
+            Err(LockActiveGraphAdapterError::EdgeEndpointMissing { endpoint })
+                if endpoint.package.as_ref() == "acme:missing"
+        ));
+
+        let mut mismatched_root_flag = lock_active_graph();
+        let edge = &mut mismatched_root_flag.edges[0];
+        edge.to.root = true;
+        assert!(matches!(
+            PackageGraph::from_lock_active_graph(
+                &mismatched_root_flag,
+                &lock_active_metadata(),
+                version(TOOLCHAIN_VERSION)
+            ),
+            Err(LockActiveGraphAdapterError::EdgeEndpointMismatch {
+                endpoint,
+                expected,
+            }) if endpoint.root && !expected.root
+        ));
     }
 
     #[test]
