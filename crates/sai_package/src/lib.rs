@@ -10,6 +10,7 @@ pub mod identity;
 pub mod lexer;
 pub mod local_source;
 pub mod lock;
+pub mod lock_active_graph;
 // The root-only creation entry point is safe to expose before the audited
 // dependency-content assembly path is integrated.
 pub mod lock_build;
