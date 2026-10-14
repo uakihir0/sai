@@ -599,6 +599,17 @@ HIR keeps `a.b.C` as nested `Field` expressions over `Path(a)` ([impl/02](02-fro
 
 Type paths and pattern paths have explicit segments in HIR (`TyKind::Path`, `PatKind::Ctor`) and are resolved by the same procedure without the field-chain step.
 
+**Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
+implements the segment-consumption step after a caller has resolved the first
+name. It follows module/interface members, stops before a suffix whose current
+resolution is no longer module-like, and distinguishes a missing member, an
+inaccessible member, and a module target whose package scope was not supplied.
+The returned segment count is relative to the supplied suffix. Generic
+arguments remain attached to the input segments and are not resolved by this
+walker. `PathRoot` handling, unqualified-name/rib lookup, expression `Field`
+chain recognition, type-relative lookup, and diagnostic construction remain
+outside this helper.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
