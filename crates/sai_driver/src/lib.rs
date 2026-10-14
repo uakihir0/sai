@@ -27,7 +27,7 @@ use sai_package::mvs_diagnostics::{
 };
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
-use sai_resolve::owner::{LabelResolution, LabelResolutionError, resolve_loop_labels};
+use sai_resolve::owner::{LabelResolution, LabelResolutionError, resolve_function_control_flow};
 use sai_resolve::package_scopes::{
     FilteredModule, ForeignPackageScope, PackageScopesError, PackageUseRequirement,
     collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
@@ -2483,8 +2483,8 @@ impl RootDatabase {
                     .map_err(FunctionOwnerLabelResolutionError::Lowering)?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     match hir_owner.body {
-                        Some(body) => resolve_loop_labels(
-                            &body.value,
+                        Some(body) => resolve_function_control_flow(
+                            body,
                             &inputs.source_ref,
                             inputs.source.as_ref(),
                             &self.symbols,
@@ -3051,6 +3051,45 @@ mod tests {
             database.resolve_function_owner_labels(&collection, &stale_module_tree, &snapshot),
             Err(FunctionOwnerLabelResolutionError::ModuleTreeMismatch)
         ));
+    }
+
+    #[test]
+    fn function_owner_control_flow_reports_contract_jumps_without_label_cascades() {
+        let root = concat!(
+            "fn contracted() -> Bool ",
+            "requires { break 'missing; } ",
+            "ensures { return true; } ",
+            "{ true }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("function contracts collect");
+
+        let resolved = database
+            .resolve_function_owner_labels(&collection, &module_tree, &snapshot)
+            .expect("function owner control flow resolves");
+
+        let owner = resolved.owners().first().expect("function owner resolves");
+        let labels = owner.resolution().expect("function lowering succeeds");
+        assert!(labels.labels.is_empty());
+        assert_eq!(
+            labels
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::InvalidContractExpression,
+                sai_diagnostics::Code::InvalidContractExpression,
+            ]
+        );
     }
 
     #[test]

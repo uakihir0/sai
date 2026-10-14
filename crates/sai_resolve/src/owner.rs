@@ -7,10 +7,11 @@ use sai_diagnostics::{
     Child, ChildKind, Code, Diagnostic, Location, Related, Severity, SourceRef,
     Span as DiagnosticSpan,
 };
+use sai_hir::body::Body;
 use sai_hir::expressions::{Arg, Block, Expr, ExprKind, FmtPiece, Label, Stmt, StmtKind};
 use sai_hir::patterns::{Pat, PatKind, PatRangeEnd};
 use sai_hir::types::{GenericArg, GenericArgs, Ty, TyKind};
-use sai_hir::{HirId, Span as HirSpan};
+use sai_hir::{HirId, Span as HirSpan, SpanCtxt};
 use sai_intern::Interner;
 use sai_vfs::SourceFile;
 use std::collections::{HashMap, HashSet};
@@ -60,6 +61,207 @@ enum Work<'hir> {
     Ty(&'hir Ty<'hir>),
     ExitLoop(HirId),
     ExitBoundary(Vec<LoopFrame>),
+}
+
+enum ContractWork<'hir> {
+    Expr(&'hir Expr<'hir>),
+    Block(&'hir Block<'hir>),
+    Stmt(&'hir Stmt<'hir>),
+}
+
+/// Resolve labels in a function body and report source-written control
+/// transfers inside its `requires` and `ensures` predicates.
+///
+/// Contract jumps are diagnosed as `INVALID_CONTRACT_EXPRESSION`; they are
+/// deliberately excluded from the loop-label map and ordinary outside-loop
+/// diagnostics. Closure and async-block bodies are separate owner bodies and
+/// are left to their own resolver pass.
+pub fn resolve_function_control_flow(
+    body: &Body<'_>,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+    symbols: &Interner,
+) -> Result<LabelResolution, LabelResolutionError> {
+    let mut result = resolve_loop_labels(body.value, source_ref, source, symbols)?;
+    for contract in body.contracts {
+        resolve_contract_control_flow(contract.expr, source_ref, source, &mut result.diagnostics)?;
+    }
+    result.diagnostics.sort_by_key(|diagnostic| {
+        diagnostic
+            .primary()
+            .map(|primary| primary.span.range.start().raw())
+            .unwrap_or(u32::MAX)
+    });
+    Ok(result)
+}
+
+fn resolve_contract_control_flow(
+    root: &Expr<'_>,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), LabelResolutionError> {
+    let mut work = vec![ContractWork::Expr(root)];
+    while let Some(task) = work.pop() {
+        match task {
+            ContractWork::Expr(expr) => match expr.kind {
+                ExprKind::Break { value, .. } => {
+                    if expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_control_flow(
+                            expr.span, "`break`", source_ref, source,
+                        )?);
+                    }
+                    if let Some(value) = value {
+                        work.push(ContractWork::Expr(value));
+                    }
+                }
+                ExprKind::Continue { .. } => {
+                    if expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_control_flow(
+                            expr.span,
+                            "`continue`",
+                            source_ref,
+                            source,
+                        )?);
+                    }
+                }
+                ExprKind::Return(value) => {
+                    if expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_control_flow(
+                            expr.span, "`return`", source_ref, source,
+                        )?);
+                    }
+                    if let Some(value) = value {
+                        work.push(ContractWork::Expr(value));
+                    }
+                }
+                ExprKind::Lit(_)
+                | ExprKind::Path(_)
+                | ExprKind::ImplicitMember(_)
+                | ExprKind::ContractResult
+                | ExprKind::Closure(_)
+                | ExprKind::AsyncBlock { .. }
+                | ExprKind::Err => {}
+                ExprKind::Field { base, .. }
+                | ExprKind::TupleField { base, .. }
+                | ExprKind::Unary(_, base)
+                | ExprKind::Borrow(_, base)
+                | ExprKind::Try(base)
+                | ExprKind::Await(base) => work.push(ContractWork::Expr(base)),
+                ExprKind::Call { callee, args, base } => {
+                    if let Some(base) = base {
+                        work.push(ContractWork::Expr(base));
+                    }
+                    for arg in args.iter().rev() {
+                        work.push(ContractWork::Expr(arg.expr));
+                    }
+                    work.push(ContractWork::Expr(callee));
+                }
+                ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+                    work.push(ContractWork::Expr(right));
+                    work.push(ContractWork::Expr(left));
+                }
+                ExprKind::Range { start, end, .. } => {
+                    if let Some(end) = end {
+                        work.push(ContractWork::Expr(end));
+                    }
+                    if let Some(start) = start {
+                        work.push(ContractWork::Expr(start));
+                    }
+                }
+                ExprKind::Tuple(items) | ExprKind::Array(items) => {
+                    for item in items.iter().rev() {
+                        work.push(ContractWork::Expr(item));
+                    }
+                }
+                ExprKind::Block(block) | ExprKind::Region { block, .. } => {
+                    work.push(ContractWork::Block(block));
+                }
+                ExprKind::If { cond, then, els } => {
+                    if let Some(els) = els {
+                        work.push(ContractWork::Expr(els));
+                    }
+                    work.push(ContractWork::Block(then));
+                    work.push(ContractWork::Expr(cond));
+                }
+                ExprKind::Match {
+                    scrutinee, arms, ..
+                } => {
+                    for arm in arms.iter().rev() {
+                        work.push(ContractWork::Expr(arm.body));
+                        if let Some(guard) = arm.guard {
+                            work.push(ContractWork::Expr(guard));
+                        }
+                    }
+                    work.push(ContractWork::Expr(scrutinee));
+                }
+                ExprKind::Loop { body, .. } => work.push(ContractWork::Block(body)),
+                ExprKind::FormatString(pieces) => {
+                    for piece in pieces.iter().rev() {
+                        if let FmtPiece::Arg { expr, .. } = piece {
+                            work.push(ContractWork::Expr(expr));
+                        }
+                    }
+                }
+                ExprKind::ContractOld { args, base } => {
+                    if let Some(base) = base {
+                        work.push(ContractWork::Expr(base));
+                    }
+                    for arg in args.iter().rev() {
+                        work.push(ContractWork::Expr(arg.expr));
+                    }
+                }
+                ExprKind::AsCast { operand, .. } => {
+                    work.push(ContractWork::Expr(operand));
+                }
+            },
+            ContractWork::Block(block) => {
+                if let Some(tail) = block.tail {
+                    work.push(ContractWork::Expr(tail));
+                }
+                for stmt in block.stmts.iter().rev() {
+                    work.push(ContractWork::Stmt(stmt));
+                }
+            }
+            ContractWork::Stmt(stmt) => match stmt.kind {
+                StmtKind::Let { init, els, .. } => {
+                    if let Some(els) = els {
+                        work.push(ContractWork::Block(els));
+                    }
+                    work.push(ContractWork::Expr(init));
+                }
+                StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                    work.push(ContractWork::Expr(rhs));
+                    work.push(ContractWork::Expr(lhs));
+                }
+                StmtKind::Assert { cond, msg, .. } => {
+                    if let Some(msg) = msg {
+                        work.push(ContractWork::Expr(msg));
+                    }
+                    work.push(ContractWork::Expr(cond));
+                }
+                StmtKind::Expr(expr) => work.push(ContractWork::Expr(expr)),
+            },
+        }
+    }
+    Ok(())
+}
+
+fn invalid_contract_control_flow(
+    span: HirSpan,
+    construct: &str,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+) -> Result<Diagnostic, LabelResolutionError> {
+    let primary = source_location(span, source_ref, source)?;
+    let mut diagnostic = Diagnostic::new(
+        Code::InvalidContractExpression,
+        Severity::Error,
+        format!("{construct} is not allowed in a contract expression"),
+        Some(primary),
+    );
+    diagnostic.primary_label = "control transfer in contract".to_owned();
+    Ok(diagnostic)
 }
 
 /// Resolve loop and jump labels in one owner body expression.
@@ -694,6 +896,7 @@ fn push_path_args<'hir>(work: &mut Vec<Work<'hir>>, path: sai_hir::types::Path<'
 mod tests {
     use super::*;
     use sai_hir::arena::HirArena;
+    use sai_hir::body::{Contract, ContractKind};
     use sai_hir::expressions::{CaptureBy, Closure, LoopSource};
     use sai_hir::{
         DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId,
@@ -703,6 +906,10 @@ mod tests {
     use sai_vfs::{FileId, SourceFile, TextRange, TextSize};
 
     fn owner_id() -> OwnerId {
+        owner_id_with_local().0
+    }
+
+    fn owner_id_with_local() -> (OwnerId, sai_hir::LocalDefId) {
         let packages = PackageInterner::new();
         let package = packages.intern("acme:app#1.0").expect("package interns");
         let symbols = Interner::new();
@@ -718,9 +925,8 @@ mod tests {
             &symbols,
         )
         .expect("path is valid");
-        OwnerId {
-            def_id: paths.intern(path).expect("owner path interns"),
-        }
+        let local = paths.intern(path).expect("owner path interns");
+        (OwnerId { def_id: local }, local)
     }
 
     fn hir_id(owner: OwnerId, local: u32) -> HirId {
@@ -756,6 +962,173 @@ mod tests {
             },
             SourceFile::new(file, " ".repeat(128), false).expect("source creates"),
         )
+    }
+
+    #[test]
+    fn function_contract_control_transfers_are_not_resolved_as_loop_jumps() {
+        let arena = HirArena::new();
+        let (owner, nested_def_id) = owner_id_with_local();
+        let symbols = Interner::new();
+        let missing_label = symbols.intern("missing").expect("symbol interns");
+        let contract_break = expr(
+            &arena,
+            owner,
+            1,
+            10,
+            22,
+            ExprKind::Break {
+                label: Some(label(missing_label, 16, 24)),
+                value: None,
+            },
+        );
+        let contract_return = expr(&arena, owner, 2, 30, 40, ExprKind::Return(None));
+        let contract_continue = expr(&arena, owner, 3, 50, 60, ExprKind::Continue { label: None });
+        let synthetic_break = arena.alloc_expr(Expr {
+            hir_id: hir_id(owner, 4),
+            kind: ExprKind::Break {
+                label: None,
+                value: None,
+            },
+            span: HirSpan {
+                ctxt: SpanCtxt::Desugared(sai_hir::DesugaringKind::WhileLoop),
+                ..hir_span(70, 76)
+            },
+        });
+        let contract_while = expr(
+            &arena,
+            owner,
+            5,
+            65,
+            80,
+            ExprKind::Loop {
+                body: block(&arena, owner, 6, Some(synthetic_break)),
+                label: None,
+                source: LoopSource::While,
+            },
+        );
+        let closure_return = expr(&arena, owner, 14, 80, 88, ExprKind::Return(None));
+        let closure = arena.alloc_closure(Closure {
+            def_id: nested_def_id,
+            capture: CaptureBy::Infer,
+            params: &[],
+            ret: None,
+            body: block(&arena, owner, 15, Some(closure_return)),
+        });
+        let closure_contract = expr(&arena, owner, 16, 80, 90, ExprKind::Closure(closure));
+        let async_return = expr(&arena, owner, 17, 90, 98, ExprKind::Return(None));
+        let async_contract = expr(
+            &arena,
+            owner,
+            18,
+            90,
+            100,
+            ExprKind::AsyncBlock {
+                def_id: nested_def_id,
+                capture: CaptureBy::Infer,
+                block: block(&arena, owner, 19, Some(async_return)),
+            },
+        );
+        let function_break = expr(
+            &arena,
+            owner,
+            8,
+            100,
+            110,
+            ExprKind::Break {
+                label: None,
+                value: None,
+            },
+        );
+        let function_loop = expr(
+            &arena,
+            owner,
+            7,
+            90,
+            120,
+            ExprKind::Loop {
+                body: block(&arena, owner, 9, Some(function_break)),
+                label: None,
+                source: LoopSource::Loop,
+            },
+        );
+        let contracts = [
+            Contract {
+                hir_id: hir_id(owner, 10),
+                kind: ContractKind::Requires,
+                expr: contract_break,
+            },
+            Contract {
+                hir_id: hir_id(owner, 11),
+                kind: ContractKind::Ensures,
+                expr: contract_return,
+            },
+            Contract {
+                hir_id: hir_id(owner, 12),
+                kind: ContractKind::Requires,
+                expr: contract_continue,
+            },
+            Contract {
+                hir_id: hir_id(owner, 13),
+                kind: ContractKind::Requires,
+                expr: contract_while,
+            },
+            Contract {
+                hir_id: hir_id(owner, 20),
+                kind: ContractKind::Requires,
+                expr: closure_contract,
+            },
+            Contract {
+                hir_id: hir_id(owner, 21),
+                kind: ContractKind::Requires,
+                expr: async_contract,
+            },
+        ];
+        let body = Body {
+            owner,
+            params: &[],
+            value: function_loop,
+            contracts: &contracts,
+            invariant_preds: &[],
+        };
+        let (source_ref, source) = source();
+
+        let result = resolve_function_control_flow(&body, &source_ref, &source, &symbols)
+            .expect("function control flow resolves");
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                Code::InvalidContractExpression,
+                Code::InvalidContractExpression,
+                Code::InvalidContractExpression,
+            ]
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("diagnostic has a primary location")
+                        .span
+                        .range
+                        .start()
+                        .raw()
+                })
+                .collect::<Vec<_>>(),
+            [10, 30, 50]
+        );
+        assert!(!result.labels.contains_key(&contract_break.hir_id));
+        assert!(!result.labels.contains_key(&contract_continue.hir_id));
+        assert_eq!(
+            result.labels.get(&function_break.hir_id),
+            Some(&Ok(function_loop.hir_id))
+        );
     }
 
     fn expr<'hir>(

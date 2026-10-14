@@ -700,9 +700,20 @@ retain snapshot and target provenance and contain a per-owner success or
 lowering error, so a failed owner does not stop the rest of the package. This
 result carries the collection input fingerprint along with its snapshot and
 target, and exposes a check for reuse with the matching package collection.
-This integrates `Body::value` loop labels only; contract predicates,
-return/contract diagnostics, local and path resolution, other owner kinds,
-tracked `hir_owner`, and full `resolve_owner` remain deferred.
+This integrates `Body::value` loop labels only; function contract control-flow
+diagnostics are added in IR-512.
+
+**Function contract control flow (IR-512).** `resolve_function_control_flow`
+combines ordinary label resolution for `Body::value` with an owner-aware scan
+of function `requires` and `ensures` expressions. Source-written `return`,
+`break`, and `continue` in those predicates receive
+`INVALID_CONTRACT_EXPRESSION`; they are excluded from the label map and do not
+also receive `RETURN_OUTSIDE_FUNCTION`, `BREAK_OUTSIDE_LOOP`,
+`CONTINUE_OUTSIDE_LOOP`, or `UNDECLARED_LABEL`. The scan ignores synthetic
+desugaring breaks and does not enter closure or async-block bodies, which are
+separate owner bodies. Other forbidden predicate forms, local and path
+resolution, other owner kinds, tracked `hir_owner`, and full `resolve_owner`
+remain deferred.
 
 ### 3.4.6 Visibility
 
