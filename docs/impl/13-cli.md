@@ -478,6 +478,8 @@ For `--locked` and `--frozen`, `sai check` holds the shared workspace lock while
 
 For each inspected dependency, syntax, package-header identity/version, and lock-edge contract checks precede compiler compatibility diagnostics. The toolchain version is checked only for active dependencies. An inactive path pin is still checked against the lock contract, but an incompatible compiler requirement on that inactive package does not block `check`.
 
+CLI regression tests also verify active Git contract mismatches, offline cache misses that identify the locked URL and commit, and corrupt-cache removal with both `CACHE_CORRUPT` and `OFFLINE_FETCH_REQUIRED` diagnostics.
+
 ### 13.6.3 `sai build`
 
 ```text

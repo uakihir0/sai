@@ -19,3 +19,6 @@ sai_vfs = { path = "../sai_vfs" }
 sai_windows_fs = { path = "../sai_windows_fs" }
 cap-std = "=4.0.3"
 unicode-width.workspace = true
+
+[dev-dependencies]
+gix.workspace = true
