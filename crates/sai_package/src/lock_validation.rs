@@ -8,11 +8,11 @@ use crate::identity::PackageIdentity;
 use crate::lock::{
     LockPackage, LockPackageField, LockParseOutput, LockRoot, LockRootField, LockSource,
 };
-use crate::manifest::Spanned;
+use crate::manifest::{RequirementSource, Spanned};
 use crate::package_path::{DependencyPackagePath, RepositoryPackageDirectory};
 use crate::version::CompatibilityLine;
 
-pub const SUPPORTED_LOCK_FORMAT_VERSION: u64 = 1;
+pub const SUPPORTED_LOCK_FORMAT_VERSION: u64 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockValidationError {
@@ -69,6 +69,11 @@ pub enum LockCorruptionKind {
     DuplicateRequirement(Box<str>),
     SelfRequirement(Box<str>),
     ArtifactImportTargetsDiffer,
+    RequirementSourceNotAllowedInFormat1,
+    GrantNotAllowedInFormat1,
+    MissingRequirementSourceInFormat2,
+    InvalidRequirementSourcePath,
+    InvalidRequirementGitDirectory,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -90,10 +95,13 @@ impl LockValidationOutput {
 /// Incomplete syntax trees are left to the parser's diagnostics so validation
 /// does not report missing fields based on parser recovery.
 pub fn validate(parsed: &LockParseOutput) -> LockValidationOutput {
-    let mut validator = Validator::default();
     let file = &parsed.file;
     let format_version = file.format_version.unwrap_or(0);
     let format_span = file.format_version_span.clone().unwrap_or(0..0);
+    let mut validator = Validator {
+        format_version,
+        ..Validator::default()
+    };
     if format_version > SUPPORTED_LOCK_FORMAT_VERSION {
         validator.error(
             LockValidationErrorKind::UnsupportedFormatVersion(format_version),
@@ -141,6 +149,7 @@ pub fn validate(parsed: &LockParseOutput) -> LockValidationOutput {
 
 #[derive(Default)]
 struct Validator {
+    format_version: u64,
     errors: Vec<LockValidationError>,
 }
 
@@ -422,6 +431,55 @@ impl Validator {
             }
             self.validate_targets(only);
         }
+        if self.format_version == 1 {
+            if let Some(source) = &requirement.source {
+                self.corrupt(
+                    LockCorruptionKind::RequirementSourceNotAllowedInFormat1,
+                    source.span.clone(),
+                );
+            }
+            if requirement.grant.is_some() {
+                self.corrupt(LockCorruptionKind::GrantNotAllowedInFormat1, span.clone());
+            }
+        } else if self.format_version == 2 && requirement.source.is_none() {
+            self.corrupt(
+                LockCorruptionKind::MissingRequirementSourceInFormat2,
+                span.clone(),
+            );
+        }
+
+        if let Some(source) = &requirement.source {
+            self.validate_requirement_source(&source.value, source.span.clone());
+        }
+        if let Some(grant) = &requirement.grant {
+            self.validate_capabilities(grant);
+        }
+    }
+
+    fn validate_requirement_source(&mut self, source: &RequirementSource, span: Range<usize>) {
+        match source {
+            RequirementSource::Git { url, directory } => {
+                if !valid_lock_string(url) {
+                    self.corrupt(LockCorruptionKind::InvalidString, span.clone());
+                }
+                match canonical_git_url(url) {
+                    Ok(canonical) if canonical == url.as_ref() => {}
+                    Ok(_) => self.corrupt(LockCorruptionKind::NonCanonicalSourceUrl, span.clone()),
+                    Err(()) => self.corrupt(LockCorruptionKind::InvalidSourceUrl, span.clone()),
+                }
+                if directory.as_ref().is_some_and(|directory| {
+                    !valid_lock_string(directory)
+                        || RepositoryPackageDirectory::parse(directory).is_err()
+                }) {
+                    self.corrupt(LockCorruptionKind::InvalidRequirementGitDirectory, span);
+                }
+            }
+            RequirementSource::Path(path) => {
+                if !valid_lock_string(path) || DependencyPackagePath::parse(path).is_err() {
+                    self.corrupt(LockCorruptionKind::InvalidRequirementSourcePath, span);
+                }
+            }
+        }
     }
 
     fn validate_targets(&mut self, items: &[Spanned<Box<str>>]) {
@@ -679,7 +737,7 @@ mod tests {
     fn accepts_a_complete_git_lock_entry() {
         let output = validate(&parse(valid_git_lock().as_bytes()));
         assert!(output.is_valid(), "{:?}", output.errors);
-        assert_eq!(SUPPORTED_LOCK_FORMAT_VERSION, 1);
+        assert_eq!(SUPPORTED_LOCK_FORMAT_VERSION, 2);
     }
 
     #[test]
@@ -692,33 +750,33 @@ mod tests {
         }));
 
         let future = validate(&parse(
-            b"lock 2\nroot acme:app @ 1.0.0\n    future-field value\n",
+            b"lock 3\nroot acme:app @ 1.0.0\n    future-field value\n",
         ));
         assert_eq!(
             future.errors[0].kind,
-            LockValidationErrorKind::UnsupportedFormatVersion(2)
+            LockValidationErrorKind::UnsupportedFormatVersion(3)
         );
         assert_eq!(future.errors[0].span, 5..6);
 
-        let future_with_invalid_utf8 = validate(&parse(b"lock 2\n\xff\n"));
+        let future_with_invalid_utf8 = validate(&parse(b"lock 3\n\xff\n"));
         assert_eq!(
             future_with_invalid_utf8.errors[0].kind,
-            LockValidationErrorKind::UnsupportedFormatVersion(2)
+            LockValidationErrorKind::UnsupportedFormatVersion(3)
         );
 
         let nested_comment_with_invalid_utf8_body = validate(&parse(
-            b"lock /* outer /* inner */ end */ 2 // future\n\xff",
+            b"lock /* outer /* inner */ end */ 3 // future\n\xff",
         ));
         assert_eq!(
             nested_comment_with_invalid_utf8_body.errors[0].kind,
-            LockValidationErrorKind::UnsupportedFormatVersion(2)
+            LockValidationErrorKind::UnsupportedFormatVersion(3)
         );
 
         let leading_comment_with_invalid_utf8_body =
-            validate(&parse(b"/* leading /* nested */ comment */ lock 2\n\xff"));
+            validate(&parse(b"/* leading /* nested */ comment */ lock 3\n\xff"));
         assert_eq!(
             leading_comment_with_invalid_utf8_body.errors[0].kind,
-            LockValidationErrorKind::UnsupportedFormatVersion(2)
+            LockValidationErrorKind::UnsupportedFormatVersion(3)
         );
 
         let oversized_version = parse(b"lock 18446744073709551616\n");
@@ -732,6 +790,63 @@ mod tests {
                     LockValidationErrorKind::UnsupportedFormatVersion(_)
                 ))
         );
+    }
+
+    #[test]
+    fn accepts_v2_requirement_sources_and_optional_grants() {
+        let source = "lock 2\n\
+             root acme:app @ 1.0.0\n\
+                 targets { wasm32-wasi }\n\
+                 requires acme:dep @ ^1 -> 1.2.0 from path \"../dep\" grant { }\n\
+             package acme:dep @ 1.2.0\n\
+                 source path \"../dep\"\n\
+                 requires acme:git-leaf @ ^1 -> 1.3.0 from git \"https://example.test/repo\" dir \"packages/leaf\" grant { wasi:http }\n";
+        let output = validate(&parse(source.as_bytes()));
+        assert!(output.is_valid(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn rejects_v2_only_requirement_fields_in_v1_locks() {
+        let source = "lock 1\n\
+             root acme:app @ 1.0.0\n\
+                 targets { wasm32-wasi }\n\
+                 requires acme:dep @ ^1 -> 1.2.0 from path \"../dep\" grant { }\n";
+        let kinds = corruption_kinds(source);
+        assert!(kinds.contains(&LockCorruptionKind::RequirementSourceNotAllowedInFormat1));
+        assert!(kinds.contains(&LockCorruptionKind::GrantNotAllowedInFormat1));
+    }
+
+    #[test]
+    fn requires_a_source_for_every_v2_requirement() {
+        let source = "lock 2\n\
+             root acme:app @ 1.0.0\n\
+                 targets { wasm32-wasi }\n\
+                 requires acme:dep @ ^1 -> 1.2.0\n\
+             package acme:dep @ 1.2.0\n\
+                 source path \"../dep\"\n\
+                 requires acme:leaf @ ^1 -> 1.3.0\n";
+        let kinds = corruption_kinds(source);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == LockCorruptionKind::MissingRequirementSourceInFormat2)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn validates_v2_requirement_source_paths_urls_and_git_directories() {
+        let source = "lock 2\n\
+             root acme:app @ 1.0.0\n\
+                 targets { wasm32-wasi }\n\
+                 requires acme:bad-path @ ^1 -> 1.0.0 from path \"/absolute\"\n\
+                 requires acme:bad-directory @ ^1 -> 1.0.0 from git \"https://example.test/repo\" dir \"../outside\"\n\
+                 requires acme:bad-url @ ^1 -> 1.0.0 from git \"HTTPS://Example.test/repo\"\n";
+        let kinds = corruption_kinds(source);
+        assert!(kinds.contains(&LockCorruptionKind::InvalidRequirementSourcePath));
+        assert!(kinds.contains(&LockCorruptionKind::InvalidRequirementGitDirectory));
+        assert!(kinds.contains(&LockCorruptionKind::NonCanonicalSourceUrl));
     }
 
     #[test]

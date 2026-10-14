@@ -934,13 +934,13 @@ mod tests {
         ));
 
         let unsupported_and_syntax_invalid =
-            parse(b"lock 2\n\nroot acme:app @ 1.0.0\n    targets {\n");
+            parse(b"lock 3\n\nroot acme:app @ 1.0.0\n    targets {\n");
         assert!(!unsupported_and_syntax_invalid.is_syntax_valid());
         assert!(matches!(
             validate_clean_merge_duplicates(&unsupported_and_syntax_invalid, &BTreeSet::new()),
             Err(LockConflictValidationError::UnsupportedFormatVersion {
                 side: None,
-                version: 2,
+                version: 3,
                 ..
             })
         ));
@@ -960,18 +960,18 @@ mod tests {
             git_package_entry("1.3.0", 'b', 'b', "alloc"),
             git_package_entry("1.4.0", 'c', 'c', "alloc"),
         ])
-        .replacen("lock 1", "lock 2", 1);
+        .replacen("lock 1", "lock 3", 1);
         let parsed = parse(source.as_bytes());
 
         assert!(matches!(
             validate_clean_merge_duplicates(&parsed, &BTreeSet::new()),
-            Err(LockConflictValidationError::UnsupportedFormatVersion { version: 2, .. })
+            Err(LockConflictValidationError::UnsupportedFormatVersion { version: 3, .. })
         ));
     }
 
     #[test]
     fn preserves_the_side_for_unsupported_conflict_lock_formats() {
-        let source = b"lock 2\n\nroot acme:app @ 1.0.0\n    targets {\n<<<<<<< ours\n=======\n>>>>>>> theirs\n";
+        let source = b"lock 3\n\nroot acme:app @ 1.0.0\n    targets {\n<<<<<<< ours\n=======\n>>>>>>> theirs\n";
         let sides = reconstruct_conflict_sides(source)
             .unwrap()
             .expect("conflict markers present");
@@ -980,12 +980,12 @@ mod tests {
             validate_conflict_sides(&sides, &BTreeSet::new()),
             Err(LockConflictValidationError::UnsupportedFormatVersion {
                 side: Some(LockConflictSide::Ours),
-                version: 2,
+                version: 3,
                 ..
             })
         ));
 
-        let source = b"<<<<<<< ours\nlock 1\n\nroot acme:app @ 1.0.0\n    targets {\n=======\nlock 2\n\nroot acme:app @ 1.0.0\n    targets { wasm32-wasi }\n>>>>>>> theirs\n";
+        let source = b"<<<<<<< ours\nlock 1\n\nroot acme:app @ 1.0.0\n    targets {\n=======\nlock 3\n\nroot acme:app @ 1.0.0\n    targets { wasm32-wasi }\n>>>>>>> theirs\n";
         let sides = reconstruct_conflict_sides(source)
             .unwrap()
             .expect("conflict markers present");
@@ -994,7 +994,7 @@ mod tests {
             validate_conflict_sides(&sides, &BTreeSet::new()),
             Err(LockConflictValidationError::UnsupportedFormatVersion {
                 side: Some(LockConflictSide::Theirs),
-                version: 2,
+                version: 3,
                 ..
             })
         ));

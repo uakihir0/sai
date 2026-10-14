@@ -20,7 +20,7 @@ resolve(root contract, lock file or none, mode, fetched contents) -> resolved gr
 
 1. The **root package** is the package whose `sai.package` the command operates on. Exactly one package is the root of a resolution. How a command selects the root (the current directory, a path argument, or a workspace member) is defined by [impl/13](../impl/13-cli.md); every selected root is resolved independently with this chapter's algorithm.
 2. A **node** is a pair (package identity, compatibility line), written `acme:json#1` for line 1 or `acme:json#0.4` for line 0.4. Two versions of the same package in different lines are different nodes (D-PKG-02).
-3. An **edge** is a requirement from a package version to a node, carrying the version requirement, the source clause, the `only` set, and the `grant` set of the requirement ([01 §1.10](01-package-contract.md)).
+3. An **edge** is a requirement from a package version to a node, carrying the version requirement, the requiring contract's original source clause, the `only` set, and the optional `grant` set of the requirement ([01 §1.10](01-package-contract.md)). The original source clause and grant are retained unchanged; a root override changes only the effective source used by resolution (§2.7.3).
 4. The **resolved graph** assigns to every node reachable from the root a selected version and a source, together with the edges of the selected versions. It is the content of `sai.lock` ([03-lock-file.md](03-lock-file.md)).
 5. The **mode** is one of: *build* (any command that needs a resolved graph: `sai check`, `sai build`, `sai test`, `sai run`, and similar), *lock* (resolve and write the lock without building, §2.10.4), *update* (§2.10.5), and *add* (§2.11). Flags such as `--locked`, `--offline`, and `--frozen` restrict what a mode may do ([03-lock-file.md](03-lock-file.md) §3.8).
 
@@ -277,7 +277,7 @@ procedure Check(root, sel, read, P):
 
 1. The edges of the **root** are its `requires` entries followed by its `requires test` entries ([01 §1.10.6](01-package-contract.md)). Test edges are part of every resolution, so that one lock file serves `sai build`, `sai test`, and `sai check --tests` alike; they are marked as test edges in the lock (N-G-23).
 2. The edges of a **dependency** version are its `requires` entries only. Its `requires test` entries are never read for resolution (N-G-11, N-G-16).
-3. An edge carries: the required identity, the version requirement, the source clause (after root overrides, §2.7.3, §2.8), the `only` set, the `grant` set, and whether it is a test edge.
+3. An edge carries the required identity, the version requirement, the original source clause from the requiring contract before root overrides, the `only` set, the optional `grant` set, and whether it is a test edge. The original clause and grant remain part of the edge metadata; root overrides determine the effective source separately (§2.7.3, §2.8).
 4. The order of `requires` entries in a file has no meaning. `Edges` sorts them by identity bytes; an identity appears at most once per package ([01 §1.10.4](01-package-contract.md)).
 
 ### 2.5.2 Target filtering
@@ -354,6 +354,8 @@ A package fetched from Git may use `from path` to refer to another package in th
 3. The node is pinned as in §2.7.1 with the source `git(url, normalized dir)` **at commit `c`**. It is not fetched through a release tag: the requiring package was published together with this exact sibling. The lock records the commit and the checksum like for any Git entry.
 4. The edge's requirement and `pv` are checked as in §2.7.1 rule 3.
 
+When validating a path edge from a lock, use the requiring package's source as the base, not the edge's path string. For a root edge, the base is the selected root package directory. For a local path package, resolve its entry's root-relative `source path` from the selected root and canonicalize the requiring directory and joined target through the host's symbolic links. For a Git package, use that entry's exact locked repository URL, commit, and package directory, then lexically normalize the joined path and reject any path that leaves the repository. Never use the process working directory or fall back to the root directory for a non-root requirer. These rules apply before activation pruning as well as during selection.
+
 ### 2.7.3 Root overrides
 
 Overrides are root-only ([01 §1.16](01-package-contract.md)). Their effect on resolution:
@@ -374,7 +376,8 @@ The source of a resolved node `n` with selected version `v` is chosen by the fir
 
 1. A root override of `n.id` (`use path` for the line of `n`, or `use git`).
 2. The pin of `n` (§2.7).
-3. The source clause of an edge that **named** `v` for `n` (`named[(n.id, v)]` in §2.4.2). If several edges named `v`, the edge whose requirer is least by identity bytes, then by version precedence, is used. The root's identity takes part in this order like any other identity; a root that wants its own source to win uses an override. Source clauses are compared after URL canonicalization ([04 §4.2.2](04-distribution-and-security.md)).
+3. The effective source clause of an edge that **named** `v` for `n` (`named[(n.id, v)]` in §2.4.2), after applying any current root override to its identity. If several edges named `v`, the edge whose requirer is least by identity bytes, then by version precedence, is used. The root's identity takes part in this order like any other identity; a root that wants its own source to win uses an override. The source clause retained on each edge is the original one from its requiring contract; source clauses are compared after URL canonicalization ([04 §4.2.2](04-distribution-and-security.md)).
+   Only an individual edge that named this exact selected version is a candidate. If no edge named it, there is no requirement-source candidate; use rule 4. Do not synthesize a candidate from another incoming edge.
 4. The source recorded in the lock entry for `(n.id, v)`, if `v` was named only as a floor.
 
 Every selected version is named by an edge, a floor, or a pin, so one of the rules applies. In Mode A (§2.10.2), `named` contains only the edges of `G`, and rule 4 covers versions that were originally named by a version that is not selected.
@@ -407,8 +410,8 @@ During selection, the contract of `(id, v)` is read from the source given by the
 
 The format is defined in [03-lock-file.md](03-lock-file.md). The resolver uses:
 
-1. the root block: the root identity and version, the root's targets, and the root's edges (identity, requirement, test flag, `only` set, and the version each resolved to);
-2. one entry per resolved node: identity, version, source (URL and `dir`, or path), commit, checksums, footprint, `compiler` requirement, and the entry's edges (identity, requirement, `only` set, and resolved version).
+1. the root block: the root identity and version, the root's targets, and the root's edges (identity, requirement, original source clause, test flag, `only` set, optional `grant`, and the version each resolved to);
+2. one entry per resolved node: identity, version, source (URL and `dir`, or path), commit, checksums, footprint, `compiler` requirement, and the entry's edges (identity, requirement, original source clause, `only` set, optional `grant`, and resolved version).
 
 Only the root's lock file is used. A `sai.lock` inside a dependency's directory is part of that dependency's content (it is hashed like any other file) but is never read.
 
@@ -416,19 +419,19 @@ Only the root's lock file is used. A `sai.lock` inside a dependency's directory 
 
 A resolution uses the lock unchanged (**Mode A**, N-G-29) when all of the following hold:
 
-1. The lock parses, its format version is supported, and it contains no merge conflict ([03 §3.9](03-lock-file.md)).
+1. The lock parses, its format version is supported, and it contains no merge conflict ([03 §3.9](03-lock-file.md)). A format-1 lock is usable in Mode A only when it is root-only: it has no root edges and no package entries. A dependency-bearing format-1 lock cannot satisfy conditions 5 and 6 because it does not record complete edge metadata.
 2. The root identity, version, and `targets` equal those of the root contract.
-3. The root block's edges equal the included edges of the root contract (§2.5): the same identities, the same requirements in canonical form, the same test flags, and the same `only` sets.
+3. The root block's edges equal the included edges of the root contract (§2.5): the same identities, requirements in canonical form, original source clauses, test flags, `only` sets, and optional grants. An omitted grant differs from an explicit empty grant.
 4. For every edge in the lock (root edges, and the edges recorded in entries), the lock has an entry for `Node(e)` whose version satisfies the edge's requirement and equals the version recorded on the edge.
-5. For every pinned node (root `use path` overrides and `from path` edges), the entry's version equals the currently declared version of the path package, and the recorded edges of the entry equal the included edges of its current contract.
-6. For every entry, its recorded source equals the source chosen by §2.8.1, computed over the edges recorded in the lock and the root's current overrides.
+5. For every pinned node (root `use path` overrides and `from path` edges), the entry's version equals the currently declared version of the path package, and its recorded edges equal the included edges of its current contract for every declared field: identity, canonical requirement, original source clause, `only` set, and optional `grant`. Each edge's recorded resolved version must equal the corresponding lock entry version and satisfy its requirement (condition 4). An omitted grant differs from an explicit empty grant.
+6. For every entry, its recorded source equals the source chosen by §2.8.1, computed over the complete format-2 lock graph, including edges that are inactive for the requested target or test mode, and the root's current overrides. This check happens before activation prunes the graph.
 7. Every entry is reachable from the root block through recorded edges, and the recorded edges have no cycle.
 
-If all conditions hold, the resolved graph is the lock's graph; no selection runs and no tag is fetched. The contents of the nodes that a command needs (active nodes, §2.5.3) are fetched by commit when they are not in the cache, and verified against the lock ([03 §3.7.3](03-lock-file.md)). When the contract of a fetched entry is read, its included edges MUST equal the edges recorded in the entry; otherwise the lock is `LOCK_CORRUPT`, because the checksum matched but the recorded edges do not describe the content.
+If all conditions hold, the resolved graph is the lock's graph; no selection runs and no tag is fetched. Only after validating the complete graph is the active subgraph derived for the requested target and test mode (§2.5.3). Active contents are fetched by commit when they are not in the cache, and verified against the lock ([03 §3.7.3](03-lock-file.md)). Condition 5 also requires the current contracts of every path-pinned node, including inactive nodes; a Git-backed path pin is read from its exact locked commit when needed, without listing tags or fetching an inactive requiring package solely to authenticate the edge. If that pinned package's verified content is not cached, it must be fetched by the locked commit (or fail with `OFFLINE_FETCH_REQUIRED` under `--offline`). When the contract of a fetched entry is read, its included edges, including the original source clauses and optional grants, MUST equal the edges recorded in the entry; otherwise the lock is `LOCK_CORRUPT`, because the checksum matched but the recorded edges do not describe the content.
 
 ### 2.10.3 Mode B: selection with lock floors
 
-If any of conditions 2 to 7 fails, the resolver runs selection (**Mode B**):
+If any of conditions 1 to 7 fails for an otherwise valid lock, the resolver runs selection (**Mode B**):
 
 1. Floors are taken from the lock: for every entry that is not a path entry, `F[(id, line(v))] := v`. Without a lock, `F` is empty.
 2. `Select` and `Check` run with these floors (§2.4). A floor applies only when its node is reached (N-G-24), so entries for requirements that were removed disappear.

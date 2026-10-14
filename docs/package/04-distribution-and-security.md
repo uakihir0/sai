@@ -404,7 +404,7 @@ The flags are defined in [03 §3.8](03-lock-file.md): `--offline` forbids networ
 2. **Meaning of offline.** Under `--offline` the toolchain opens no network connection of any kind: no DNS lookup, no TCP or UDP connection, and no connection to a proxy. A Git URL with a host name is not resolved.
 3. **What is available offline:** the cache's `src/` entries, the tag records, and the bundled standard packages with their bundled index (§4.4.1, §4.4.3).
 4. **What works offline:**
-   - building, checking, and testing with a lock whose active nodes ([02 §2.5.3](02-resolver.md)) are all cached;
+   - building, checking, and testing with a lock whose active nodes ([02 §2.5.3](02-resolver.md)) are all cached, along with any inactive Git-backed path-pinned nodes whose current contracts Mode A condition 5 requires;
    - `sai lock` and resolution in Mode B, if the release tag of every named version is known from a tag record or the bundled index and its content is cached ([03 §3.8.2](03-lock-file.md) rule 3);
    - `sai remove`, with the same condition for the resolution that follows;
    - `sai update <id>@<w>`, if everything needed is cached ([02 §2.10.5](02-resolver.md) rule 7);

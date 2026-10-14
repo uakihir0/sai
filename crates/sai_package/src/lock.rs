@@ -7,7 +7,7 @@ use crate::lexer::{
     is_forbidden_non_ascii_whitespace, lex_lock,
 };
 use crate::lock_conflict::first_conflict_marker;
-use crate::manifest::Spanned;
+use crate::manifest::{RequirementSource, Spanned};
 use crate::version::{Version, VersionParseError};
 use crate::version_req::{VersionReq, VersionReqParseError};
 
@@ -103,7 +103,9 @@ pub struct LockRequirement {
     pub package: Box<str>,
     pub requirement: VersionReq,
     pub selected: Version,
+    pub source: Option<Spanned<RequirementSource>>,
     pub only: Option<Vec<Spanned<Box<str>>>>,
+    pub grant: Option<Vec<Spanned<Box<str>>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,7 +153,7 @@ pub fn parse(source: &[u8]) -> LockParseOutput {
         header.format_version = Some(version);
         header.format_version_span = Some(span);
     }
-    let lexed = lex_lock(source);
+    let lexed = lex_lock(source, header.format_version.unwrap_or(1));
     if !lexed.errors.is_empty() {
         return LockParseOutput {
             file: LockFile {
@@ -227,10 +229,7 @@ fn detect_format_version(source: &[u8]) -> Option<(u64, Range<usize>)> {
         .ok()?
         .parse()
         .ok()?;
-    skip_header_trivia(source, &mut position, end)?;
-    if position != end {
-        return None;
-    }
+    skip_header_trailing_trivia(source, &mut position)?;
     Some((version, digits_start..digits_end))
 }
 
@@ -265,6 +264,46 @@ fn skip_header_trivia(source: &[u8], position: &mut usize, end: usize) -> Option
         }
         if depth != 0 {
             return None;
+        }
+    }
+}
+
+fn skip_header_trailing_trivia(source: &[u8], position: &mut usize) -> Option<()> {
+    loop {
+        while matches!(source.get(*position), Some(b' ' | b'\t')) {
+            *position += 1;
+        }
+        match source.get(*position..) {
+            None | Some([]) | Some([b'\n', ..]) => return Some(()),
+            Some([b'\r', b'\n', ..]) => return Some(()),
+            Some([b'\r', ..]) => return None,
+            Some([b'/', b'/', ..]) => return Some(()),
+            Some([b'/', b'*', ..]) => {
+                let comment_start = *position;
+                *position += 2;
+                let mut depth = 1usize;
+                while *position < source.len() {
+                    if source[*position..].starts_with(b"/*") {
+                        depth += 1;
+                        *position += 2;
+                    } else if source[*position..].starts_with(b"*/") {
+                        depth -= 1;
+                        *position += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        *position += 1;
+                    }
+                }
+                if depth != 0 {
+                    return None;
+                }
+                if source[comment_start..*position].contains(&b'\n') {
+                    return Some(());
+                }
+            }
+            Some(_) => return None,
         }
     }
 }
@@ -534,9 +573,20 @@ impl<'a> Parser<'a> {
         let requirement = self.parse_requirement_text(true)?;
         self.expect_punctuator(PackagePunctuator::Arrow, "`->`")?;
         let selected = self.parse_version("selected package version")?;
+        let source = if self.at_word("from") {
+            Some(self.parse_requirement_source()?)
+        } else {
+            None
+        };
         let only = if self.at_word("only") {
             self.bump();
             Some(self.parse_list(&[PackageTokenKind::Word])?)
+        } else {
+            None
+        };
+        let grant = if self.at_word("grant") {
+            self.bump();
+            Some(self.parse_list(&[PackageTokenKind::Word, PackageTokenKind::PackagePath])?)
         } else {
             None
         };
@@ -545,8 +595,36 @@ impl<'a> Parser<'a> {
             package: self.token_text(package).into(),
             requirement,
             selected,
+            source,
             only,
+            grant,
         }))
+    }
+
+    fn parse_requirement_source(&mut self) -> Option<Spanned<RequirementSource>> {
+        let start = self.position;
+        self.expect_word("`from`")?;
+        let source = if self.at_word("git") {
+            self.bump();
+            let url = self.parse_string("Git source URL")?;
+            let directory = if self.at_word("dir") {
+                self.bump();
+                Some(self.parse_string("Git package directory")?)
+            } else {
+                None
+            };
+            RequirementSource::Git { url, directory }
+        } else if self.at_word("path") {
+            self.bump();
+            RequirementSource::Path(self.parse_string("path source")?)
+        } else {
+            self.error_here(LockParseErrorKind::ExpectedToken("`git` or `path`".into()));
+            return None;
+        };
+        Some(Spanned {
+            value: source,
+            span: self.span_from(start),
+        })
     }
 
     fn parse_requirement_text(&mut self, stop_at_arrow: bool) -> Option<VersionReq> {
@@ -790,6 +868,7 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::manifest::RequirementSource;
     use crate::version::Version;
     use crate::version_req::VersionReq;
 
@@ -911,6 +990,153 @@ mod tests {
             requirement.requirement,
             VersionReq::parse(">=1.2, <2.0").unwrap()
         );
+    }
+
+    #[test]
+    fn parses_v2_requirement_source_then_only_and_grant() {
+        let source = "lock 2\n\
+             root acme:app @ 1.0.0\n\
+                 targets { wasm32-wasi }\n\
+                 requires acme:git-dep @ ^1 -> 1.2.0 from git \"https://example.test/repo\" dir \"packages/dep\" only { wasm32-wasi } grant { wasi:http, alloc }\n\
+                 requires acme:path-dep @ ^1 -> 1.3.0 from path \"../path-dep\" grant { }\n";
+        let output = parse(source.as_bytes());
+        assert!(output.is_syntax_valid(), "{:?}", output.errors);
+        let root = &output.file.root.as_ref().unwrap().value;
+        let LockRootField::Requires(git_requirement) = &root.fields[1].value else {
+            panic!("expected Git requirement");
+        };
+        assert_eq!(
+            git_requirement.source.as_ref().unwrap().value,
+            RequirementSource::Git {
+                url: "https://example.test/repo".into(),
+                directory: Some("packages/dep".into()),
+            }
+        );
+        assert!(
+            source[git_requirement.source.as_ref().unwrap().span.clone()].starts_with("from git ")
+        );
+        assert_eq!(git_requirement.only.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            git_requirement
+                .grant
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|capability| capability.value.as_ref())
+                .collect::<Vec<_>>(),
+            ["wasi:http", "alloc"]
+        );
+
+        let LockRootField::Requires(path_requirement) = &root.fields[2].value else {
+            panic!("expected path requirement");
+        };
+        assert_eq!(
+            path_requirement.source.as_ref().unwrap().value,
+            RequirementSource::Path("../path-dep".into())
+        );
+        assert_eq!(path_requirement.grant.as_ref().unwrap().len(), 0);
+        assert!(path_requirement.only.is_none());
+    }
+
+    #[test]
+    fn parses_format_two_requirement_clauses_on_continuation_lines() {
+        let source = r#"lock 2
+root acme:app @ 1.0.0
+    targets { wasm32-wasi }
+    requires acme:dep @ ^1 -> 1.2.0
+        from git "https://example.test/repo"
+        dir "packages/dep"
+        only { wasm32-wasi }
+        grant { wasi:http, alloc }
+"#;
+        let output = parse(source.as_bytes());
+        assert!(output.is_syntax_valid(), "{:?}", output.errors);
+
+        let LockRootField::Requires(requirement) =
+            &output.file.root.as_ref().unwrap().value.fields[1].value
+        else {
+            panic!("expected requirement");
+        };
+        assert_eq!(
+            requirement.source.as_ref().unwrap().value,
+            RequirementSource::Git {
+                url: "https://example.test/repo".into(),
+                directory: Some("packages/dep".into()),
+            }
+        );
+        assert_eq!(requirement.only.as_ref().unwrap().len(), 1);
+        assert_eq!(requirement.grant.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn format_one_does_not_accept_format_two_requirement_continuations() {
+        let source = "lock 1\n\
+             root acme:app @ 1.0.0\n\
+                 targets { wasm32-wasi }\n\
+                 requires acme:dep @ ^1 -> 1.2.0\n\
+                     from git \"https://example.test/repo\"\n";
+        let output = parse(source.as_bytes());
+        assert!(!output.is_syntax_valid());
+        assert!(!output.errors.is_empty());
+        assert!(output.lexical_errors.is_empty());
+    }
+
+    #[test]
+    fn header_version_survives_a_multiline_trailing_comment() {
+        let source = r#"lock 2 /* trailing comment
+ */
+root acme:app @ 1.0.0
+    targets { wasm32-wasi }
+    requires acme:dep @ ^1 -> 1.2.0
+        from git "https://example.test/repo"
+"#;
+        let output = parse(source.as_bytes());
+        assert!(output.is_syntax_valid(), "{:?}", output.errors);
+        assert_eq!(output.file.format_version, Some(2));
+    }
+
+    #[test]
+    fn same_indent_dir_after_git_edge_starts_an_entry_field() {
+        let source = r#"lock 2
+root acme:root @ 1.0.0
+    targets { wasm32-wasi }
+    requires acme:parent @ ^1 -> 1.0.0 from git "https://example.test/mono"
+package acme:parent @ 1.0.0
+    source git "https://example.test/mono"
+    commit "0123456789012345678901234567890123456789"
+    checksum "sai1:0123456789012345678901234567890123456789012345678901234567890123"
+    capabilities { }
+    requires acme:child @ ^1 -> 1.0.0 from git "https://example.test/child"
+    dir "packages/parent"
+package acme:child @ 1.0.0
+    source git "https://example.test/child"
+    dir "packages/child"
+    commit "0123456789012345678901234567890123456789"
+    checksum "sai1:1123456789012345678901234567890123456789012345678901234567890123"
+    capabilities { }
+"#;
+        let output = parse(source.as_bytes());
+        assert!(output.is_syntax_valid(), "{:?}", output.errors);
+
+        let parent = &output.file.packages[0].value;
+        let requirement = parent
+            .fields
+            .iter()
+            .find_map(|field| match &field.value {
+                LockPackageField::Requires(requirement) => Some(requirement),
+                _ => None,
+            })
+            .expect("parent edge");
+        assert_eq!(
+            requirement.source.as_ref().unwrap().value,
+            RequirementSource::Git {
+                url: "https://example.test/child".into(),
+                directory: None,
+            }
+        );
+        assert!(parent.fields.iter().any(|field| {
+            matches!(&field.value, LockPackageField::Directory(directory) if directory.as_ref() == "packages/parent")
+        }));
     }
 
     #[test]

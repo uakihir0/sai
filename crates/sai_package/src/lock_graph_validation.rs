@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_input_before_graph_analysis() {
-        let future_format = parse(b"lock 2\n");
+        let future_format = parse(b"lock 3\n");
         assert!(matches!(
             validate(&future_format),
             Err(LockGraphValidationInputError::InvalidLock(_))

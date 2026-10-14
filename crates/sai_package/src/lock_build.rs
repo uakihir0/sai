@@ -22,12 +22,13 @@ use crate::lock_graph_validation::{
     LockGraphValidationInputError, LockGraphValidationOutput, validate as validate_lock_graph,
 };
 use crate::lock_validation::{
-    LockValidationError, SUPPORTED_LOCK_FORMAT_VERSION, validate as validate_lock,
+    LockValidationError, SUPPORTED_LOCK_FORMAT_VERSION, canonical_git_url,
+    validate as validate_lock,
 };
 use crate::lock_writer::{
     LockWriteOutcome, WorkspaceLockWriteError, create_workspace_lock_atomically,
 };
-use crate::manifest::{MAX_PACKAGE_MANIFEST_BYTES, PackageRole, Spanned};
+use crate::manifest::{MAX_PACKAGE_MANIFEST_BYTES, PackageRole, RequirementSource, Spanned};
 use crate::mvs::{MvsInputError, MvsPackageVersion, MvsRequirer, select};
 use crate::mvs_graph_validation::{
     MvsDependencyCycle, MvsSelectedGraph, MvsSelectedGraphInputError, MvsVersionConflict,
@@ -76,6 +77,16 @@ pub enum LockBuildError {
     RootContextMismatch(MvsPackageVersion),
     RequirementEdgeMismatch {
         requirer: MvsRequirer,
+        span: Range<usize>,
+    },
+    MissingRequirementSource {
+        requirer: MvsRequirer,
+        package: Box<str>,
+        span: Range<usize>,
+    },
+    InvalidRequirementSourceUrl {
+        requirer: MvsRequirer,
+        package: Box<str>,
         span: Range<usize>,
     },
     UnexpectedGraphEdge {
@@ -522,12 +533,48 @@ fn append_contract_requirements<F: LockRequirementField>(
                     });
                 }
                 consumed_edges[*index] = true;
+                let source = requirement.source.clone().ok_or_else(|| {
+                    LockBuildError::MissingRequirementSource {
+                        requirer: requirer.clone(),
+                        package: requirement.package.clone(),
+                        span: requirement.span.clone(),
+                    }
+                })?;
+                let source_value = match source.value {
+                    RequirementSource::Git { url, directory } => {
+                        let Ok(url) = canonical_git_url(&url) else {
+                            return Err(LockBuildError::InvalidRequirementSourceUrl {
+                                requirer: requirer.clone(),
+                                package: requirement.package.clone(),
+                                span: requirement.span.clone(),
+                            });
+                        };
+                        RequirementSource::Git {
+                            url: url.into(),
+                            directory: directory.filter(|directory| directory.as_ref() != "."),
+                        }
+                    }
+                    RequirementSource::Path(path) => RequirementSource::Path(path),
+                };
+                let source = Some(Spanned {
+                    value: source_value,
+                    span: 0..0,
+                });
                 let only = requirement.only.as_ref().map(|targets| {
                     targets
                         .iter()
                         .map(|target| Spanned {
                             value: target.clone(),
-                            span: requirement.span.clone(),
+                            span: 0..0,
+                        })
+                        .collect()
+                });
+                let grant = requirement.grant.as_ref().map(|capabilities| {
+                    capabilities
+                        .iter()
+                        .map(|capability| Spanned {
+                            value: capability.clone(),
+                            span: 0..0,
                         })
                         .collect()
                 });
@@ -537,7 +584,9 @@ fn append_contract_requirements<F: LockRequirementField>(
                         package: requirement.package.clone(),
                         requirement: requirement.version.clone(),
                         selected: edge.target.version().clone(),
+                        source,
                         only,
+                        grant,
                     }),
                     span: requirement.span.clone(),
                 });
@@ -574,7 +623,7 @@ mod tests {
         LockBuildError, LockPackageMetadata, RootOnlyLockCreationError, build_resolved_lock,
         create_root_only_lock_if_missing,
     };
-    use crate::lock::{LockPackageField, LockSource};
+    use crate::lock::{LockPackageField, LockRootField, LockSource};
     use crate::lock_graph_validation::validate as validate_lock_graph;
     use crate::lock_serialization::serialize_canonical;
     use crate::lock_writer::{LockWriteOutcome, WorkspaceLockWriteError};
@@ -651,7 +700,7 @@ mod tests {
 source "src"
 targets { wasm32-core }
 requires {
-    acme:dep @ ^1 from path "../dep" only { wasm32-core }
+    acme:dep @ ^1 from path "../dep" only { wasm32-core } grant { }
 }
 requires test {
     acme:testdep @ ^1 from path "../testdep" only { wasm32-core }
@@ -774,11 +823,11 @@ requires {
         assert_eq!(
             canonical,
             concat!(
-                "lock 1\n\n",
+                "lock 2\n\n",
                 "root acme:root @ 1.0.0\n",
                 "    targets { wasm32-core }\n",
-                "    requires acme:dep @ ^1 -> 1.2.0 only { wasm32-core }\n",
-                "    requires test acme:testdep @ ^1 -> 1.1.0 only { wasm32-core }\n",
+                "    requires acme:dep @ ^1 -> 1.2.0 from path \"../dep\" only { wasm32-core } grant { }\n",
+                "    requires test acme:testdep @ ^1 -> 1.1.0 from path \"../testdep\" only { wasm32-core }\n",
                 "\n",
                 "package acme:dep @ 1.2.0\n",
                 "    source path \"../dep\"\n",
@@ -794,6 +843,130 @@ requires {
     }
 
     #[test]
+    fn fails_closed_when_an_included_requirement_has_no_source_clause() {
+        let mut fixture = fixture();
+        fixture.root.requirements_mut_for_test()[0].source = None;
+
+        assert!(matches!(
+            build_resolved_lock(
+                &fixture.root,
+                &fixture.graph,
+                &fixture.contracts,
+                &fixture.metadata,
+            ),
+            Err(LockBuildError::MissingRequirementSource {
+                package,
+                ..
+            }) if package.as_ref() == "acme:dep"
+        ));
+    }
+
+    #[test]
+    fn rejects_an_invalid_git_url_in_a_forged_resolver_contract() {
+        let mut fixture = fixture();
+        fixture.root.requirements_mut_for_test()[0].source = Some(crate::manifest::Spanned {
+            value: crate::manifest::RequirementSource::Git {
+                url: "file:///tmp/dep".into(),
+                directory: None,
+            },
+            span: 0..0,
+        });
+
+        assert!(matches!(
+            build_resolved_lock(
+                &fixture.root,
+                &fixture.graph,
+                &fixture.contracts,
+                &fixture.metadata,
+            ),
+            Err(LockBuildError::InvalidRequirementSourceUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn persists_the_original_requirement_source_before_a_root_override() {
+        let root_manifest = parse(
+            br#"package acme:root @ 1.0.0
+source "src"
+targets { wasm32-core }
+requires { acme:dep @ ^1 from git "HTTPS://Example.test:443/original/" }
+overrides { acme:dep use path "../dep" }
+"#,
+        );
+        let dep_version = package_version("acme:dep", "1.2.0");
+        let root_path_overrides = BTreeMap::from([("acme:dep".into(), dep_version.clone())]);
+        let path_packages = BTreeMap::new();
+        let context = ResolverContractContext::from_root_manifest(
+            &root_manifest,
+            &path_packages,
+            &root_path_overrides,
+            PackageValidationContext::default(),
+        )
+        .expect("root override contract is valid");
+        let root = build_resolver_contract(
+            &root_manifest,
+            &context,
+            PackageValidationContext::default(),
+        )
+        .expect("root contract is valid");
+        let dep_manifest = parse_for_role(
+            b"package acme:dep @ 1.2.0\n\
+              source \"src\"\n\
+              targets { wasm32-core }\n",
+            PackageRole::Dependency,
+        );
+        let dep =
+            build_resolver_contract(&dep_manifest, &context, PackageValidationContext::default())
+                .expect("dependency contract is valid");
+        let graph = check_selected_graph(
+            &root.mvs,
+            &select(
+                &root.mvs,
+                &HashMap::from([(dep_version.clone(), dep.mvs.clone())]),
+                &HashMap::new(),
+                &context.root_override_pins(),
+            )
+            .expect("root override selection is valid"),
+        )
+        .expect("selected graph is valid");
+        let contracts = BTreeMap::from([(dep_version.clone(), dep)]);
+        let metadata = BTreeMap::from([(
+            dep_version,
+            LockPackageMetadata {
+                fields: vec![LockPackageField::Source(LockSource::Path("../dep".into()))],
+            },
+        )]);
+
+        let lock = build_resolved_lock(&root, &graph, &contracts, &metadata)
+            .expect("lock preserves the original requirement source");
+        let requirement = lock
+            .file()
+            .root
+            .as_ref()
+            .unwrap()
+            .value
+            .fields
+            .iter()
+            .find_map(|field| match &field.value {
+                LockRootField::Requires(requirement) => Some(requirement),
+                LockRootField::Targets(_) => None,
+            })
+            .unwrap();
+        assert_eq!(
+            requirement.source.as_ref().unwrap().value,
+            crate::manifest::RequirementSource::Git {
+                url: "https://example.test/original".into(),
+                directory: None,
+            }
+        );
+        assert!(
+            serialize_canonical(&lock)
+                .unwrap()
+                .contains("from git \"https://example.test/original\"")
+        );
+    }
+
+    #[test]
     fn creates_a_canonical_lock_for_a_root_without_active_requirements() {
         let directory = TestDirectory::new();
         fs::write(directory.0.join("sai.package"), ROOT_MANIFEST_BYTES).unwrap();
@@ -802,7 +975,7 @@ requires {
 
         let outcome = create_root_only_lock_if_missing(&guard, &root_only_contract())
             .expect("root-only lock is created");
-        let expected = b"lock 1\n\nroot acme:root @ 1.0.0\n    targets { wasm32-core }\n";
+        let expected = b"lock 2\n\nroot acme:root @ 1.0.0\n    targets { wasm32-core }\n";
         assert_eq!(
             outcome,
             LockWriteOutcome::Written {
@@ -949,7 +1122,9 @@ requires {
                     requirement: crate::version_req::VersionReq::parse("^1")
                         .expect("test requirement is valid"),
                     selected: Version::parse("1.0.0").expect("test version is valid"),
+                    source: None,
                     only: None,
+                    grant: None,
                 },
             )));
 

@@ -6,7 +6,7 @@ use crate::lock::{
     LockRootField, LockSource,
 };
 use crate::lock_validation::{LockValidationError, validate};
-use crate::manifest::Spanned;
+use crate::manifest::{RequirementSource, Spanned};
 use crate::validation::capability_covers;
 
 /// Why a parsed lock could not be serialized.
@@ -265,9 +265,31 @@ fn write_requirement(output: &mut String, requirement: &LockRequirement) {
     output.push_str(&requirement.requirement.to_string());
     output.push_str(" -> ");
     output.push_str(&requirement.selected.to_string());
+    if let Some(source) = &requirement.source {
+        output.push_str(" from ");
+        match &source.value {
+            RequirementSource::Git { url, directory } => {
+                output.push_str("git ");
+                write_quoted(output, url);
+                if let Some(directory) = directory.as_deref().filter(|directory| *directory != ".")
+                {
+                    output.push_str(" dir ");
+                    write_quoted(output, directory);
+                }
+            }
+            RequirementSource::Path(path) => {
+                output.push_str("path ");
+                write_quoted(output, path);
+            }
+        }
+    }
     if let Some(only) = &requirement.only {
         output.push_str(" only ");
         write_name_list(output, only);
+    }
+    if let Some(grant) = &requirement.grant {
+        output.push_str(" grant ");
+        write_name_list(output, grant);
     }
 }
 
@@ -373,6 +395,44 @@ package acme:dep @ 1.2.0
     }
 
     #[test]
+    fn serializes_v2_requirement_source_only_and_grant_in_canonical_order() {
+        let source = "lock 2\n\
+             root acme:app @ 1.0.0\n\
+                 targets { wasm32-wasi }\n\
+                 requires acme:z @ ^1 -> 1.3.0 from git \"https://example.test/repo\" dir \".\" only { wasm32-wasi, wasm32-wasi } grant { wasi:http, alloc, alloc }\n\
+                 requires acme:a @ ^1 -> 1.2.0 from path \"../a\" grant { }\n";
+
+        let serialized = serialize_canonical(&parse(source.as_bytes())).unwrap();
+        assert_eq!(
+            serialized,
+            r#"lock 2
+
+root acme:app @ 1.0.0
+    targets { wasm32-wasi }
+    requires acme:a @ ^1 -> 1.2.0 from path "../a" grant { }
+    requires acme:z @ ^1 -> 1.3.0 from git "https://example.test/repo" only { wasm32-wasi } grant { alloc, wasi:http }
+"#
+        );
+        assert!(is_canonical(serialized.as_bytes()).unwrap());
+
+        let reparsed = parse(serialized.as_bytes());
+        let root = &reparsed.file().root.as_ref().unwrap().value;
+        let empty_grant = root
+            .fields
+            .iter()
+            .find_map(|field| match &field.value {
+                crate::lock::LockRootField::Requires(requirement)
+                    if requirement.package.as_ref() == "acme:a" =>
+                {
+                    Some(requirement.grant.as_ref().unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(empty_grant.is_empty());
+    }
+
+    #[test]
     fn sorts_entries_and_artifact_fields_by_their_canonical_keys() {
         let source = "lock 1\n\
              root acme:app @ 1.0.0\n\
@@ -471,13 +531,13 @@ package acme:dep @ 1.2.0
             LockSerializationError::InvalidSyntax { .. }
         ));
 
-        let unsupported_format = serialize_canonical(&parse(b"lock 2\n")).unwrap_err();
+        let unsupported_format = serialize_canonical(&parse(b"lock 3\n")).unwrap_err();
         assert!(matches!(
             unsupported_format,
             LockSerializationError::InvalidSemantics(errors)
                 if errors.iter().any(|error| matches!(
                     error.kind,
-                    crate::lock_validation::LockValidationErrorKind::UnsupportedFormatVersion(2)
+                    crate::lock_validation::LockValidationErrorKind::UnsupportedFormatVersion(3)
                 ))
         ));
 

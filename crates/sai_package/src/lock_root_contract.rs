@@ -7,17 +7,25 @@ use crate::lexer::PackageLexError;
 use crate::lock::{LockParseError, LockParseOutput, LockRootField};
 use crate::lock_validation::{LockValidationOutput, validate as validate_lock};
 use crate::manifest::{
-    PackageDeclaration, PackageParseError, PackageParseOutput, PackageRole, Requirement, Spanned,
+    PackageDeclaration, PackageParseError, PackageParseOutput, PackageRole, Requirement,
+    RequirementSource, Spanned,
 };
 use crate::validation::{
     PackageValidationContext, PackageValidationOutput, validate as validate_package,
 };
 use crate::version::Version;
 
+/// A canonical source clause recorded for one root edge.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RootContractSource {
+    Git {
+        url: Box<str>,
+        directory: Option<Box<str>>,
+    },
+    Path(Box<str>),
+}
+
 /// The comparable portion of one included root edge.
-///
-/// Source clauses and capability grants are intentionally absent: the lock
-/// root block does not store them.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RootContractRequirement {
     pub package: Box<str>,
@@ -26,6 +34,12 @@ pub struct RootContractRequirement {
     pub test: bool,
     /// A sorted, duplicate-free set; `None` remains distinct from `Some`.
     pub only: Option<Vec<Box<str>>>,
+    /// The original source clause, before root overrides. Format 1 omitted
+    /// this field; format 2 records it so source selection can be checked
+    /// against the complete graph.
+    pub source: Option<RootContractSource>,
+    /// A sorted, duplicate-free set; `None` remains distinct from `Some`.
+    pub grant: Option<Vec<Box<str>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +99,9 @@ pub enum LockRootContractInputError {
         syntax_errors: Vec<PackageParseError>,
     },
     InvalidPackageSemantics(PackageValidationOutput),
+    InvalidPackageGitSourceUrl {
+        span: Range<usize>,
+    },
     InvalidLockSemantics(LockValidationOutput),
     InvalidLockSyntax {
         lexical_errors: Vec<PackageLexError>,
@@ -176,7 +193,8 @@ pub fn compare(
         .iter()
         .map(|target| target.value.clone())
         .collect::<BTreeSet<_>>();
-    let package_edges = root_contract_edges(package, &package_targets);
+    let compare_source_and_grant = lock.file.format_version.unwrap_or(0) >= 2;
+    let package_edges = root_contract_edges(package, &package_targets, compare_source_and_grant)?;
     let lock_edges = lock_root_edges(&lock_root.value);
 
     let mut output = LockRootContractOutput::default();
@@ -244,7 +262,8 @@ pub fn compare(
 fn root_contract_edges(
     package: &PackageParseOutput,
     root_targets: &BTreeSet<Box<str>>,
-) -> BTreeMap<RootContractRequirement, Range<usize>> {
+    compare_source_and_grant: bool,
+) -> Result<BTreeMap<RootContractRequirement, Range<usize>>, LockRootContractInputError> {
     let mut edges = BTreeMap::new();
     for declaration in &package.file.declarations {
         let PackageDeclaration::Requires { test, entries } = &declaration.value else {
@@ -254,11 +273,16 @@ fn root_contract_edges(
             if !is_included(&entry.value, root_targets) {
                 continue;
             }
-            let requirement = requirement_key(&entry.value, *test, entry.span.clone());
+            let requirement = requirement_key(
+                &entry.value,
+                *test,
+                entry.span.clone(),
+                compare_source_and_grant,
+            )?;
             edges.insert(requirement.0, requirement.1);
         }
     }
-    edges
+    Ok(edges)
 }
 
 fn lock_root_edges(
@@ -274,6 +298,11 @@ fn lock_root_edges(
             requirement: requirement.requirement.to_string().into(),
             test: requirement.test,
             only: requirement.only.as_ref().map(|targets| sorted_set(targets)),
+            source: requirement.source.as_ref().map(|source| {
+                root_contract_source(&source.value, source.span.clone())
+                    .expect("validated lock source URLs are canonical")
+            }),
+            grant: requirement.grant.as_ref().map(|grant| sorted_set(grant)),
         };
         edges.insert(key, field.span.clone());
     }
@@ -284,8 +313,9 @@ fn requirement_key(
     requirement: &Requirement,
     test: bool,
     span: Range<usize>,
-) -> (RootContractRequirement, Range<usize>) {
-    (
+    compare_source_and_grant: bool,
+) -> Result<(RootContractRequirement, Range<usize>), LockRootContractInputError> {
+    Ok((
         RootContractRequirement {
             package: requirement.package.clone(),
             requirement: requirement.version.to_string().into(),
@@ -294,9 +324,36 @@ fn requirement_key(
                 .only
                 .as_ref()
                 .map(|targets| sorted_set(&targets.value)),
+            source: compare_source_and_grant
+                .then(|| requirement.source.as_ref())
+                .flatten()
+                .map(|source| root_contract_source(&source.value, source.span.clone()))
+                .transpose()?,
+            grant: compare_source_and_grant
+                .then(|| requirement.grant.as_ref())
+                .flatten()
+                .map(|grant| sorted_set(&grant.value)),
         },
         span,
-    )
+    ))
+}
+
+fn root_contract_source(
+    source: &RequirementSource,
+    span: Range<usize>,
+) -> Result<RootContractSource, LockRootContractInputError> {
+    match source {
+        RequirementSource::Git { url, directory } => Ok(RootContractSource::Git {
+            url: crate::lock_validation::canonical_git_url(url)
+                .map_err(|_| LockRootContractInputError::InvalidPackageGitSourceUrl { span })?
+                .into(),
+            directory: directory
+                .as_deref()
+                .filter(|directory| *directory != ".")
+                .map(Into::into),
+        }),
+        RequirementSource::Path(path) => Ok(RootContractSource::Path(path.clone())),
+    }
 }
 
 fn sorted_set(values: &[Spanned<Box<str>>]) -> Vec<Box<str>> {
@@ -346,6 +403,18 @@ mod tests {
         )
     }
 
+    fn lock_v2(root: &str) -> lock::LockParseOutput {
+        lock::parse(
+            format!(
+                "lock 2\n\
+                 root acme:app @ 1.0.0\n\
+                     targets {{ wasm32-wasi, wasm32-core }}\n\
+                     {root}"
+            )
+            .as_bytes(),
+        )
+    }
+
     #[test]
     fn matches_canonical_root_metadata_and_edges() {
         let package = package(
@@ -375,6 +444,64 @@ mod tests {
             lock("requires acme:a @ ^1 -> 1.1.0 only { wasm32-core, wasm32-wasi, wasm32-core }\n");
         let output = compare(&package, &lock).expect("valid inputs");
         assert!(output.matches_contract(), "{:?}", output.mismatches);
+    }
+
+    #[test]
+    fn format_two_compares_original_root_sources_and_grants() {
+        let package = package(
+            "requires { acme:a @ ^1 from git \"https://github.com/acme/a\" grant { alloc } }\n",
+            "wasm32-wasi, wasm32-core",
+        );
+        let matching = lock_v2(
+            "requires acme:a @ ^1 -> 1.1.0 from git \"https://github.com/acme/a\" grant { alloc }\n",
+        );
+        assert!(
+            compare(&package, &matching)
+                .expect("valid v2 inputs")
+                .matches_contract()
+        );
+
+        let changed_source = lock_v2(
+            "requires acme:a @ ^1 -> 1.1.0 from git \"https://github.com/acme/fork\" grant { alloc }\n",
+        );
+        assert!(
+            !compare(&package, &changed_source)
+                .expect("valid v2 inputs")
+                .matches_contract()
+        );
+
+        let changed_grant = lock_v2(
+            "requires acme:a @ ^1 -> 1.1.0 from git \"https://github.com/acme/a\" grant { wasi:filesystem }\n",
+        );
+        assert!(
+            !compare(&package, &changed_grant)
+                .expect("valid v2 inputs")
+                .matches_contract()
+        );
+    }
+
+    #[test]
+    fn format_two_preserves_omitted_versus_empty_grant() {
+        let package = package(
+            "requires { acme:a @ ^1 from path \"../a\" grant {} }\n",
+            "wasm32-wasi, wasm32-core",
+        );
+        let without_grant = lock_v2("requires acme:a @ ^1 -> 1.0.0 from path \"../a\"\n");
+        let output = compare(&package, &without_grant).expect("valid v2 inputs");
+        assert!(!output.matches_contract());
+    }
+
+    #[test]
+    fn rejects_an_invalid_root_git_source_without_panicking() {
+        let package = package(
+            "requires { acme:dep @ ^1 from git \"file://example.invalid/dep\" }\n",
+            "wasm32-wasi, wasm32-core",
+        );
+        let lock = lock_v2("");
+        assert!(matches!(
+            compare(&package, &lock),
+            Err(LockRootContractInputError::InvalidPackageGitSourceUrl { .. })
+        ));
     }
 
     #[test]
@@ -466,7 +593,7 @@ mod tests {
         ));
 
         let valid_package = package("", "wasm32-wasi, wasm32-core");
-        let invalid_lock = lock::parse(b"lock 2\n");
+        let invalid_lock = lock::parse(b"lock 3\n");
         assert!(matches!(
             compare(&valid_package, &invalid_lock),
             Err(LockRootContractInputError::InvalidLockSemantics(_))

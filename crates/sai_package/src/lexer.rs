@@ -125,9 +125,9 @@ pub fn lex_tokens_with_error_limit(source: &[u8], max_errors: usize) -> PackageL
     lex_with_mode(source, LexMode::Package, false, max_errors)
 }
 
-/// Lexes a lock file using its field-aware newline continuation set.
-pub(crate) fn lex_lock(source: &[u8]) -> PackageLexOutput {
-    lex_with_mode(source, LexMode::Lock, true, usize::MAX)
+/// Lexes a lock file using the continuation set for its format version.
+pub(crate) fn lex_lock(source: &[u8], format_version: u64) -> PackageLexOutput {
+    lex_with_mode(source, LexMode::Lock { format_version }, true, usize::MAX)
 }
 
 fn lex_with_mode(
@@ -171,7 +171,7 @@ fn lex_with_mode(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LexMode {
     Package,
-    Lock,
+    Lock { format_version: u64 },
 }
 
 struct Lexer<'a> {
@@ -415,12 +415,59 @@ impl<'a> Lexer<'a> {
         let Some(end) = scan_word(self.text, self.pos) else {
             return false;
         };
+        let word = &self.text[self.pos..end];
+        let requirement_start = self.current_logical_line_requirement_start();
         match self.mode {
             LexMode::Package => {
-                matches!(&self.text[self.pos..end], "from" | "dir" | "only" | "grant")
+                matches!(word, "from" | "dir" | "only" | "grant")
             }
-            LexMode::Lock => &self.text[self.pos..end] == "only",
+            LexMode::Lock { format_version: 1 } => word == "only" && requirement_start.is_some(),
+            LexMode::Lock { format_version: 2 } => {
+                requirement_start.is_some()
+                    && match word {
+                        "from" => self.previous == Some(PackageTokenKind::Version),
+                        "dir" => {
+                            self.previous_tokens_end_git_source()
+                                && requirement_start.is_some_and(|start| {
+                                    self.indentation_at(self.pos) > self.indentation_at(start)
+                                })
+                        }
+                        "only" | "grant" => true,
+                        _ => false,
+                    }
+            }
+            LexMode::Lock { .. } => false,
         }
+    }
+
+    fn current_logical_line_requirement_start(&self) -> Option<usize> {
+        let start = self
+            .tokens
+            .iter()
+            .rposition(|token| token.kind == PackageTokenKind::Newline)
+            .map_or(0, |index| index + 1);
+        self.tokens.get(start).and_then(|token| {
+            (token.kind == PackageTokenKind::Word && &self.text[token.span.clone()] == "requires")
+                .then_some(token.span.start)
+        })
+    }
+
+    fn indentation_at(&self, offset: usize) -> usize {
+        let line_start = self.text[..offset].rfind('\n').map_or(0, |index| index + 1);
+        self.text.as_bytes()[line_start..offset]
+            .iter()
+            .take_while(|byte| matches!(**byte, b' ' | b'\t'))
+            .count()
+    }
+
+    fn previous_tokens_end_git_source(&self) -> bool {
+        let count = self.tokens.len();
+        count >= 3
+            && self.tokens[count - 3].kind == PackageTokenKind::Word
+            && &self.text[self.tokens[count - 3].span.clone()] == "from"
+            && self.tokens[count - 2].kind == PackageTokenKind::Word
+            && &self.text[self.tokens[count - 2].span.clone()] == "git"
+            && self.tokens[count - 1].kind == PackageTokenKind::String
     }
 
     fn lex_token(&mut self) -> PackageToken {
@@ -1104,7 +1151,7 @@ mod tests {
                      dir \"packages/lib\"\n\
                      requires acme:dep @ ^1 -> 1.2.0\n\
                      only { wasm32-wasi }\n";
-        let output = lex_lock(source.as_bytes());
+        let output = lex_lock(source.as_bytes(), 1);
         assert!(output.errors.is_empty(), "{:?}", output.errors);
         let tokens = &output.tokens;
         let dir = tokens
@@ -1124,6 +1171,28 @@ mod tests {
             .position(|token| token.kind == Kind::Word && &source[token.span.clone()] == "dir")
             .unwrap();
         assert_ne!(package_tokens[package_dir - 1].kind, Kind::Newline);
+
+        let format_two_source = "lock 2\n\
+                                package acme:dep @ 1.0.0\n\
+                                    capabilities { }\n\
+                                    dir \"packages/dep\"\n";
+        let format_two_output = lex_lock(format_two_source.as_bytes(), 2);
+        assert!(
+            format_two_output.errors.is_empty(),
+            "{:?}",
+            format_two_output.errors
+        );
+        let format_two_dir = format_two_output
+            .tokens
+            .iter()
+            .position(|token| {
+                token.kind == Kind::Word && &format_two_source[token.span.clone()] == "dir"
+            })
+            .unwrap();
+        assert_eq!(
+            format_two_output.tokens[format_two_dir - 1].kind,
+            Kind::Newline
+        );
     }
 
     #[test]

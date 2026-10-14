@@ -31,9 +31,9 @@ This chapter defines `sai.lock` byte for byte: its lexical form, its grammar, it
 
 ### 3.2.1 Lexical rules
 
-1. The lock is UTF-8 text tokenized with the same token kinds and string, comment, and line-ending rules as `sai.package` ([01 §1.2](01-package-contract.md)). Its NEWLINE continuation set is `{ only }`: `only` may continue a requirement field, while `dir` starts a separate lock field and therefore always follows a NEWLINE. The other package-contract continuation words (`from`, `dir`, and `grant`) do not continue a lock line. The diagnostics of spec/02 apply (`INVALID_UTF8`, `INVALID_LINE_ENDING`, `FORBIDDEN_CHARACTER`, ...).
+1. The lock is UTF-8 text tokenized with the same token kinds and string, comment, and line-ending rules as `sai.package` ([01 §1.2](01-package-contract.md)). In format 1, the edge continuation set is `{ only }`, preserving its original grammar. In format 2, an edge may continue with `from`, `dir`, `only`, or `grant`. A continuation `dir` line is indented by more horizontal-whitespace characters than its `requires` line; at the same or lesser indentation, `dir` starts an entry field. This disambiguates an edge's optional Git directory from the standalone entry `dir`, while the reader still accepts fields in any order. A trailing block comment after the header version may span physical lines; the version is selected before that comment. The diagnostics of spec/02 apply (`INVALID_UTF8`, `INVALID_LINE_ENDING`, `FORBIDDEN_CHARACTER`, ...).
 2. The punctuator `->` occurs only in the lock (§3.3).
-3. The contextual keywords of the lock are: `artifact`, `capabilities`, `checksum`, `commit`, `compiler`, `dir`, `git`, `imports`, `lock`, `only`, `package`, `path`, `requires`, `root`, `source`, `targets`, `test`, `wit`.
+3. The contextual keywords of the lock are: `artifact`, `capabilities`, `checksum`, `commit`, `compiler`, `dir`, `from`, `git`, `grant`, `imports`, `lock`, `only`, `package`, `path`, `requires`, `root`, `source`, `targets`, `test`, `wit`.
 4. Comments are lexically valid in a lock, but the toolchain never writes them, and a lock that contains them is not canonical (§3.2.3).
 5. Before tokenizing, the reader checks for merge conflict markers (§3.9.1).
 
@@ -42,11 +42,11 @@ This chapter defines `sai.lock` byte for byte: its lexical form, its grammar, it
 A lock consists of a **header line**, a **root block**, and zero or more **entry blocks**:
 
 ```sai-lock
-lock 1
+lock 2
 
 root acme:app @ 0.3.0
     targets { wasm32-wasi }
-    requires acme:json @ ^1.6 -> 1.8.0
+    requires acme:json @ ^1.6 -> 1.8.0 from git "https://github.com/acme/json" grant { alloc }
 
 package acme:json @ 1.8.0
     source git "https://github.com/acme/json"
@@ -59,20 +59,21 @@ package acme:json @ 1.8.0
 1. The header is `lock` followed by the format version, an `INT` (§3.10).
 2. The root block describes the root package and its edges. It is not an entry: the root is not locked content.
 3. Each entry block describes one resolved node ([02 §2.1.1](02-resolver.md)). Its first line is `package <id> @ <version>`; the following lines are its fields.
-4. Blocks are recognized by their first keyword (`root`, `package`). Indentation and blank lines are not significant to the parser; they are part of the canonical layout only.
+4. Blocks are recognized by their first keyword (`root`, `package`). Except for the format-2 edge-`dir` continuation rule in §3.2.1, indentation and blank lines are not significant to the parser; they are part of the canonical layout only.
 
 ### 3.2.3 Canonical layout
 
 The toolchain writes exactly the following bytes (N-G-36):
 
 1. Lines end with LF (U+000A). There is no CR, no trailing whitespace on any line, and no byte order mark.
-2. Line 1 is `lock 1`. Line 2 is empty. Then follows the root block, then each entry block in the order of §3.3.4. Blocks are separated by exactly one empty line.
+2. Line 1 is `lock 2` for every new or rewritten lock. A root-only format-1 lock retains its original canonical form (§3.10) when read without being rewritten. Line 2 is empty. Then follows the root block, then each entry block in the order of §3.3.4. Blocks are separated by exactly one empty line.
 3. The first line of a block starts in column 1. Every field line is indented by exactly four spaces (U+0020).
 4. Within a line, tokens are separated by exactly one space, except that no space precedes `,` and no space follows a comparison operator (`^`, `~`, `=`, `>=`, `<`, `<=`). Thus `@` and `->` have one space on each side, a list is written `{ a, b, c }`, and an empty list is `{ }`. A list is always written on one line.
 5. A version requirement is written with its comparators in source order, each as the operator immediately followed by the version in canonical form (§3.3.6), joined by `, ` (`>=1.2, <2.0`). Partial versions stay partial; they are not completed, because completion changes the meaning of `~` ([02 §2.3.1](02-resolver.md)).
-6. Strings are written between `"` with `\"` for `"` and `\\` for `\`. All other characters are written literally. Strings in a lock never contain control characters (§3.3.6).
-7. The file ends with the LF of its last line. There is no empty line at the end.
-8. Nothing else is written: no comments, no timestamps, no toolchain version, and no host-dependent data.
+6. In format 2, an edge writes its original `from` source clause first, then `only` when present, then `grant` when present. The source is the requiring contract's clause before root overrides, not the effective source of the resolved node.
+7. Strings are written between `"` with `\"` for `"` and `\\` for `\`. All other characters are written literally. Strings in a lock never contain control characters (§3.3.6).
+8. The file ends with the LF of its last line. There is no empty line at the end.
+9. Nothing else is written: no comments, no timestamps, no toolchain version, and no host-dependent data.
 
 A lock that parses and validates (§3.3) but whose bytes differ from the canonical serialization of its content is **not canonical**. Reading it is the warning `LOCK_NOT_CANONICAL`; its content is used as is (§3.7.2).
 
@@ -82,18 +83,21 @@ A lock that parses and validates (§3.3) but whose bytes differ from the canonic
 
 ### 3.3.1 Grammar
 
-The notation is that of [01 §1.3](01-package-contract.md). `VersionReq`, `OnlyClause`, and `CapName` are the productions of 01.
+The notation is that of [01 §1.3](01-package-contract.md). `VersionReq`, `OnlyClause`, and `CapName` are the productions of 01. Format 1 uses the V1 edge productions below, preserving its original grammar. Format 2 uses the V2 edge productions; productions are selected by the header and cannot be mixed.
 
 ```ebnf
 LockFile      ::= Header NL RootBlock ( NL EntryBlock )* nl EOF
 Header        ::= "lock" INT
 RootBlock     ::= "root" PKG_PATH '@' VERSION ( NL RootField )*
-RootField     ::= TargetsField | RootEdge
+RootField     ::= TargetsField | RootEdgeV1 | RootEdgeV2
 TargetsField  ::= "targets" '{' nl List<WORD, Sep> nl '}'
-RootEdge      ::= "requires" "test"? PKG_PATH '@' VersionReq '->' VERSION OnlyClause?
+RootEdgeV1    ::= "requires" "test"? PKG_PATH '@' VersionReq '->' VERSION OnlyClause?
+RootEdgeV2    ::= "requires" "test"? PKG_PATH '@' VersionReq '->' VERSION
+                  SourceClause OnlyClause? GrantClause?
 EntryBlock    ::= "package" PKG_PATH '@' VERSION ( NL EntryField )*
 EntryField    ::= SourceField | DirField | CommitField | ChecksumField | WitField
-                | ArtifactField | CompilerField | CapsField | ImportsField | EntryEdge
+                | ArtifactField | CompilerField | CapsField | ImportsField
+                | EntryEdgeV1 | EntryEdgeV2
 SourceField   ::= "source" ( "git" STRING | "path" STRING )
 DirField      ::= "dir" STRING
 CommitField   ::= "commit" STRING
@@ -103,10 +107,16 @@ ArtifactField ::= "artifact" WORD STRING
 CompilerField ::= "compiler" VersionReq
 CapsField     ::= "capabilities" '{' nl List<CapName, Sep>? nl '}'
 ImportsField  ::= "imports" WORD '{' nl List<CapName, Sep>? nl '}'
-EntryEdge     ::= "requires" PKG_PATH '@' VersionReq '->' VERSION OnlyClause?
+EntryEdgeV1   ::= "requires" PKG_PATH '@' VersionReq '->' VERSION OnlyClause?
+EntryEdgeV2   ::= "requires" PKG_PATH '@' VersionReq '->' VERSION
+                  SourceClause OnlyClause? GrantClause?
+SourceClause  ::= "from" "git" STRING ("dir" STRING)? | "from" "path" STRING
+GrantClause   ::= "grant" '{' nl List<CapName, Sep>? nl '}'
 ```
 
-The reader accepts any layout that this grammar and the lexical rules allow (for example lists split over lines); the writer produces only the canonical layout of §3.2.3.
+The header selects exactly one edge grammar. Format 1 retains its original productions: its edges have no source or grant metadata. In format 2, every root and dependency edge has the requiring contract's original declared source clause, before root overrides, and its optional grant. The clause is serialized with the canonical URL and path rules in §3.3.6; it never stores the effective source selected after overrides. `grant` is optional; omission and `grant { }` are distinct. The reader accepts any layout that the selected grammar and lexical rules allow (for example lists split over lines); the writer produces only the canonical layout of §3.2.3.
+
+In an entry block, the standalone `dir` field belongs to the entry's own Git source. An optional `dir` following `from git` belongs to that edge's source clause and stays on the edge line or on a more-indented format-2 continuation line.
 
 ### 3.3.2 The root block
 
@@ -114,9 +124,10 @@ The reader accepts any layout that this grammar and the lexical rules allow (for
 |---|---|---|
 | `root <id> @ <version>` | once | identity and version of the root package |
 | `targets { .. }` | once | the root's `targets`, sorted by bytes |
-| `requires [test] <id> @ <req> -> <v> [only { .. }]` | once per root edge | an included edge of the root ([02 §2.5](02-resolver.md)): the required identity, the requirement in canonical form, the selected version of its node, and its `only` set sorted by bytes; `test` marks a `requires test` edge |
+| Format 1: `requires [test] <id> @ <req> -> <v> [only { .. }]` | once per root edge | The original format-1 edge record; it does not include source or grant metadata. |
+| Format 2: `requires [test] <id> @ <req> -> <v> from <source> [only { .. }] [grant { .. }]` | once per root edge | An included root edge ([02 §2.5](02-resolver.md)): identity, canonical requirement, selected version, original source clause, `only` set, optional grant set, and test flag when present. |
 
-Root edges are recorded so that the resolver can decide, without fetching anything, whether the lock still matches the root contract ([02 §2.10.2](02-resolver.md) rule 3). Source clauses and `grant` sets are not recorded: they are read from `sai.package` (N-G-44).
+Format-2 root edges let the resolver compare complete root-edge metadata with the current root contract before fetching or activating dependencies ([02 §2.10.2](02-resolver.md) condition 3). A root override does not rewrite the recorded original source clause; it is applied separately when checking source selection.
 
 ### 3.3.3 Entry fields
 
@@ -132,7 +143,8 @@ Root edges are recorded so that the resolver can decide, without fetching anythi
 | `compiler <req>` | if declared | if declared | the package's `compiler` requirement ([01 §1.5](01-package-contract.md)) |
 | `capabilities { .. }` | source and hybrid packages | absent | capability footprint of the source ([spec/08 §8.12.8](../spec/08-effects-and-capabilities.md)), normalized as in item 1 and sorted by bytes |
 | `imports <target> { .. }` | one per declared artifact | absent | the capabilities imported by the artifact for that target, sorted by bytes |
-| `requires <id> @ <req> -> <v> [only { .. }]` | once per edge | once per edge | an included edge of the package ([02 §2.5](02-resolver.md)) |
+| Format 1: `requires <id> @ <req> -> <v> [only { .. }]` | once per edge | once per edge | The original format-1 edge record; it does not include source or grant metadata. |
+| Format 2: `requires <id> @ <req> -> <v> from <source> [only { .. }] [grant { .. }]` | once per edge | once per edge | An included dependency edge ([02 §2.5](02-resolver.md)): identity, canonical requirement, selected version, original pre-override source clause, `only` set, and optional grant set. |
 
 1. The **resolved capabilities** of D-PKG-03 are the `capabilities` and `imports` fields. They are the footprint of spec/08 §8.12.8, not the result of the build-time reachability check, which depends on the root's code, the target, and the profile. The `capabilities` field is the union of the source footprints for the targets that the package declares ([01 §1.8](01-package-contract.md)), without any capability that another capability of the set covers (the *covers* relation of [spec/08 §8.12.1](../spec/08-effects-and-capabilities.md); `wasi:http/types` is omitted when `wasi:http` is present). This normalization ([impl/08](../impl/08-effect-and-capability-analysis.md) §8.7.10 items 1 and 2) does not change which capabilities the field covers, so the escalation rule of [02 §2.12.3](02-resolver.md) is unaffected.
 2. Path entries carry no commit, checksums, or footprint (N-G-44): a local path package is the user's working copy, read anew at every build ([02 §2.7.1](02-resolver.md) rule 6), and it is not subject to capability review. A path package inside a Git package ([02 §2.7.2](02-resolver.md)) is a Git entry.
@@ -151,11 +163,11 @@ A lock that violates any of the following rules is `LOCK_CORRUPT`. The diagnosti
 
 1. The header is the first line, and its version is supported (otherwise `UNSUPPORTED_LOCK_VERSION`, §3.10).
 2. There is exactly one root block, directly after the header.
-3. Every field allowed once occurs at most once; required fields are present; fields marked absent in §3.3.3 are absent. Unknown keywords are errors: format 1 has no extension fields (§3.10).
+3. Every field allowed once occurs at most once; required fields are present; fields marked absent in §3.3.3 are absent. The header selects the edge productions: format 1 accepts only its original edge grammar, and format 2 requires a source clause on every root and entry edge. Unknown keywords are errors; neither format has extension fields (§3.10).
 4. Identities, versions, requirements, and capability names are valid per [01](01-package-contract.md). Versions carry no build metadata.
 5. No two entries have the same identity and the same compatibility line ([02 §2.2.3](02-resolver.md)).
 6. A commit is 40 or 64 lowercase hexadecimal digits. A checksum is the string `sai1:` followed by exactly 64 lowercase hexadecimal digits.
-7. URLs are canonical ([04 §4.2.2](04-distribution-and-security.md)); paths in `source path` and `dir` are normalized ([01 §1.6.1](01-package-contract.md)).
+7. URLs in entry sources and edge source clauses are canonical ([04 §4.2.2](04-distribution-and-security.md)); paths in `source path`, `from path`, and `dir` are normalized under [01 §1.6.1](01-package-contract.md). A `from path` clause is resolved from its requiring package's source as defined in [02 §2.7](02-resolver.md), never from the lock file's location.
 8. Targets are known target names; `artifact` and `imports` fields occur for the same set of targets.
 
 Consistency between entries (for example an edge whose recorded version has no entry) is not corruption: it makes the lock out of date, and the resolver handles it by Mode B ([02 §2.10.3](02-resolver.md)).
@@ -165,8 +177,8 @@ Consistency between entries (for example an edge whose recorded version has no e
 1. **Versions** are written in the canonical form of [02 §2.2.1](02-resolver.md): numeric identifiers without leading zeros, pre-release identifiers as in the source, no build metadata. Within a requirement, a partial version keeps its number of components (`^1.6` stays `^1.6`), but each present component is written without leading zeros.
 2. **Requirements** are written as the package author wrote them, normalized by rule 1 and by the spacing of §3.2.3. Two requirements with the same comparators in the same order are the same requirement; the resolver compares requirements in this canonical form ([02 §2.10.2](02-resolver.md) rule 3).
 3. **Strings.** No string in a lock contains a control character (U+0000–U+001F, U+007F–U+009F) or a bidirectional control character (U+202A–U+202E, U+2066–U+2069). URLs are ASCII ([04 §4.2](04-distribution-and-security.md)); paths satisfy [01 §1.6.1](01-package-contract.md); digests and commits are lowercase hexadecimal. A lock string that violates this is `LOCK_CORRUPT`.
-4. **Names** in lists (targets, `only` sets, capabilities, and each `imports` capability set) are written as `WORD` or `PKG_PATH` tokens exactly as in `sai.package`, sorted by their bytes, without duplicates. These lists have set semantics: a reader treats a repeated member as one value, and canonical serialization removes repetitions. Repeated `artifact` or `imports` fields for the same target remain corrupt because each target has at most one field of each kind.
-5. **Repository directory.** `dir "."` is accepted as a noncanonical spelling of the repository root ([02 §2.6.1](02-resolver.md)); canonical serialization omits the `dir` field for that entry. The resolver treats the value as an empty directory for tag lookup and tree hashing.
+4. **Names** in lists (targets, `only` sets, grants, capabilities, and each `imports` capability set) are written as `WORD` or `PKG_PATH` tokens exactly as in `sai.package`, sorted by their bytes, without duplicates. These lists have set semantics: a reader treats a repeated member as one value, and canonical serialization removes repetitions. Repeated `artifact` or `imports` fields for the same target remain corrupt because each target has at most one field of each kind.
+5. **Repository directory.** `dir "."` is accepted as a noncanonical spelling of the repository root ([02 §2.6.1](02-resolver.md)); canonical serialization omits the `dir` field for that entry or edge source clause. The resolver treats the value as an empty directory for tag lookup and tree hashing.
 
 ---
 
@@ -224,7 +236,7 @@ The selected files are sorted by their path bytes (UTF-8), compared as unsigned 
    - one LF (0x0A).
 2. The content of a file is the exact bytes of its Git blob (after decompression), without any conversion.
 3. The **stream** is the concatenation of the lines. Paths contain no LF (§3.4.3 rule 3), so the stream is unambiguous.
-4. The **digest** is SHA-256 of the stream. It is written as `sai1:` followed by 64 lowercase hexadecimal digits (N-G-38). Uppercase digits, other lengths, and other prefixes are invalid in format 1 (§3.3.5 rule 6).
+4. The **digest** is SHA-256 of the stream. It is written as `sai1:` followed by 64 lowercase hexadecimal digits (N-G-38). Uppercase digits, other lengths, and other prefixes are invalid in formats 1 and 2 (§3.3.5 rule 6).
 5. An empty selection has the empty stream. This cannot happen for a source checksum, because the package directory contains `sai.package`.
 
 Informative: on a host with GNU coreutils and findutils, the stream equals the output of `sha256sum` applied to the selected files in sorted order, run from the input directory, provided no path needs `sha256sum`'s escaping (§3.4.3 excludes `\` and LF):
@@ -291,7 +303,7 @@ sai1:9b4c1b8a5126574063c4c23803fe7eaa86a3d012b8d61b398f0980cc8abe8672
 
 ### 3.7.2 Writing
 
-1. The content to be written is the resolution result of [02 §2.10.4](02-resolver.md), serialized canonically (§3.2.3, §3.3.4).
+1. The content to be written is the resolution result of [02 §2.10.4](02-resolver.md), serialized canonically as format 2 (§3.2.3, §3.3.4). `sai lock` migrates a dependency-bearing format-1 lock by resolving in Mode B with its entries as floors and writing the complete format-2 graph. A root-only format-1 lock remains usable in Mode A; any command that writes it upgrades it to format 2.
 2. The file is written only if the serialized bytes differ from its current bytes. Content is compared **semantically**: two locks are equal when their canonical serializations are byte-identical (N-G-40). Thus a lock that is valid but not canonical (`LOCK_NOT_CANONICAL`) is equal to its canonical form; it is rewritten in canonical form by any writing command, and it is left untouched under `--locked` and `--frozen`.
 3. The write is **atomic**:
    1. write the new bytes to a new file in the same directory, with a name that starts with `.sai.lock.` and ends with a random suffix;
@@ -325,6 +337,7 @@ The flags are accepted by every command that resolves. Their spelling and their 
 ### 3.8.1 `--locked`
 
 1. The lock MUST exist (`LOCK_MISSING`) and MUST be usable in Mode A ([02 §2.10.2](02-resolver.md)). If a condition of Mode A fails, the command fails with `LOCK_OUT_OF_DATE` without running selection and without listing or fetching any tag. The message names the failed condition and the entries concerned (for example "root requirement `acme:json @ ^1.7` differs from the locked `^1.6`").
+   A dependency-bearing format-1 lock fails because it lacks the source and grant data required by Mode A conditions 5 and 6; the diagnostic directs the user to run `sai lock` to migrate it. A root-only format-1 lock remains usable in Mode A.
 2. This is equivalent to "the lock would change": if any Mode A condition fails, a Mode B resolution changes at least one block of the lock ([02 §2.10.3](02-resolver.md)).
 3. The network is still used to fetch locked commits that are not in the cache. Their content is verified as usual (§3.7.3).
 4. `sai lock`, `sai update`, `sai add`, and `sai remove` exist to change the lock; under `--locked` they fail with `LOCK_OUT_OF_DATE` as soon as a change would be written. `sai lock --locked` therefore checks that the lock is up to date and writes nothing ([impl/13 §13.4.3](../impl/13-cli.md)).
@@ -334,7 +347,7 @@ The flags are accepted by every command that resolves. Their spelling and their 
 ### 3.8.2 `--offline`
 
 1. No network access is made. Content and tag information come only from the cache, including the toolchain's bundled packages ([04 §4.4.3](04-distribution-and-security.md)).
-2. In Mode A, every active node ([02 §2.5.3](02-resolver.md)) MUST be in the cache. A node that is not is `OFFLINE_FETCH_REQUIRED`, naming the node, its URL, and its commit.
+2. In Mode A, every active node ([02 §2.5.3](02-resolver.md)) MUST be in the cache. Any Git-backed path-pinned node whose current contract is needed by Mode A condition 5 MUST also be in the cache, even when inactive. A required node that is not cached is `OFFLINE_FETCH_REQUIRED`, naming the node, its URL, and its commit. Validating source clauses on inactive edges does not fetch their requiring packages: format 2 carries that metadata in the lock.
 3. In Mode B, selection needs the commit of the release tag of every named version. It is taken from the cache's record of previously fetched tags ([04 §4.4.1](04-distribution-and-security.md)) or from the bundled index. If a needed tag or its content is not available, the command fails with `OFFLINE_FETCH_REQUIRED`. It never selects a different version because of what happens to be cached (P8): offline resolution either produces the same result as an online one or fails.
 4. Listing tags is impossible offline, so `sai update` and `sai add` fail with `OFFLINE_FETCH_REQUIRED`, except `sai update id@w` when everything needed is cached ([02 §2.10.5](02-resolver.md) rule 7).
 5. `--offline` does not prevent writing the lock.
@@ -348,6 +361,8 @@ The flags are accepted by every command that resolves. Their spelling and their 
 | Situation | No flag | `--locked` | `--offline` | `--frozen` |
 |---|---|---|---|---|
 | no `sai.lock` | resolve, create | `LOCK_MISSING` | resolve from cache, create | `LOCK_MISSING` |
+| root-only format-1 lock | use the lock; a writing command upgrades it | use the lock | use the lock | use the lock |
+| dependency-bearing format-1 lock | Mode B from available content, write format 2 | `LOCK_OUT_OF_DATE`; run `sai lock` to migrate | Mode B from cache when all needed tags and content are cached; write format 2 or `OFFLINE_FETCH_REQUIRED` | `LOCK_OUT_OF_DATE`; run `sai lock` to migrate |
 | Mode A holds | use the lock | use the lock | use the lock | use the lock |
 | Mode A fails | Mode B, write | `LOCK_OUT_OF_DATE` | Mode B from cache, write | `LOCK_OUT_OF_DATE` |
 | lock not canonical | rewrite | warning only | rewrite | warning only |
@@ -390,18 +405,18 @@ A clean textual merge can leave two entries for one node, for example when both 
 
 ## 3.10 Format versioning
 
-1. The header `lock <n>` names the format version. `<n>` is an `INT` from [01 §1.2.3](01-package-contract.md) and must fit in an unsigned 64-bit integer; an out-of-range value is lexically invalid. This document defines **format 1**.
+1. The header `lock <n>` names the format version. `<n>` is an `INT` from [01 §1.2.3](01-package-contract.md) and must fit in an unsigned 64-bit integer; an out-of-range value is lexically invalid. This document defines **formats 1 and 2**.
 2. A lock whose format is greater than the highest format the toolchain supports is the error `UNSUPPORTED_LOCK_VERSION`; the help suggests upgrading the toolchain. A format of 0 is `LOCK_CORRUPT`.
 3. Within a format, the set of fields, the canonical layout, and the checksum algorithms are fixed. There is no rule that unknown fields are ignored: an unknown field could carry security-relevant data, such as a new checksum, which an older toolchain would silently drop when it rewrites the file. Any additional field therefore requires a new format.
-4. The checksum prefix names the algorithm. Format 1 defines only `sai1:`. A new algorithm gets a new prefix (for example `sai2:`), introduced by a new format.
-5. A toolchain that supports several formats keeps the format of an existing lock, and writes new locks in the highest format it supports. It never lowers the format of an existing lock. Raising it is a write (§3.7.2) and does not happen under `--locked` or `--frozen`.
+4. The checksum prefix names the algorithm. Formats 1 and 2 define only `sai1:`. A new algorithm gets a new prefix (for example `sai2:`), introduced by a new format.
+5. A toolchain that supports these formats reads format 1 with its unchanged grammar and reads format 2 with its edge source and grant metadata. It writes every new or rewritten lock as format 2 and never lowers an existing format. A dependency-bearing format-1 lock remains readable, but cannot satisfy Mode A conditions 5 and 6; `--locked` and `--frozen` return `LOCK_OUT_OF_DATE` with guidance to run `sai lock`. Mode B can use its entries as floors and reconstruct the complete graph from current contracts. A root-only format-1 lock remains usable in Mode A because it has no dependency edges or entries; writing it upgrades it to format 2 (§3.7.2). Format migration is a write and does not happen under `--locked` or `--frozen`.
 6. The format version is independent of the toolchain version and of the `compiler` requirements of the packages (N-G-43).
 
 ---
 
 ## 3.11 The draft example, corrected
 
-Draft §33 names the file with two embedded U+200B characters; the name is `sai.lock` (R-11). It gives no concrete syntax, only a conceptual list of contents. Each item maps to a field of format 1:
+Draft §33 names the file with two embedded U+200B characters; the name is `sai.lock` (R-11). It gives no concrete syntax, only a conceptual list of contents. Each item maps to a field in the current format; format 2 adds the original source clause and optional grant to each edge:
 
 | Draft §33 item | Field | Notes |
 |---|---|---|
@@ -414,22 +429,22 @@ Draft §33 names the file with two embedded U+200B characters; the name is `sai.
 | WIT/interface checksum | `wit` | tree hash of the WIT directory (§3.5) |
 | resolved capabilities | `capabilities`, `imports <target>` | footprints ([spec/08 §8.12.8](../spec/08-effects-and-capabilities.md)) |
 | compiler compatibility | `compiler` | the package's `compiler` requirement |
-| (not listed) | root block, `requires .. -> <version>` | the edges, which draft §33's goal of reproducing the same dependency graph from the lock requires |
+| (not listed) | root block, `requires .. -> <version> from <source>` in format 2 | the edges and original source clauses, which let the resolver validate the complete graph without reading inactive dependency manifests, except for the contract check on path-pinned nodes |
 
 The following lock belongs to the complete example of [01 §1.19](01-package-contract.md), `acme:photo-service`, after a first `sai lock`:
 
 ```sai-lock
-lock 1
+lock 2
 
 root acme:photo-service @ 1.3.0
     targets { wasm32-core, wasm32-wasi }
-    requires acme:exif @ >=0.7.1, <0.8 -> 0.7.1
-    requires test acme:fixtures @ ^0.2 -> 0.2.0
-    requires acme:image @ ^1.2 -> 1.2.0
-    requires acme:photo-model @ ^1.0 -> 1.0.2
-    requires sai:collections @ ^0.3 -> 0.3.1
-    requires sai:http @ ^1.4 -> 1.4.0
-    requires sai:wasi @ ^0.2 -> 0.2.1 only { wasm32-wasi }
+    requires acme:exif @ >=0.7.1, <0.8 -> 0.7.1 from git "https://github.com/acme/exif" grant { }
+    requires test acme:fixtures @ ^0.2 -> 0.2.0 from git "https://github.com/acme/fixtures"
+    requires acme:image @ ^1.2 -> 1.2.0 from git "https://github.com/acme/media" dir "image"
+    requires acme:photo-model @ ^1.0 -> 1.0.2 from path "../photo-model"
+    requires sai:collections @ ^0.3 -> 0.3.1 from git "https://github.com/sai-lang/collections"
+    requires sai:http @ ^1.4 -> 1.4.0 from git "https://github.com/sai-lang/http"
+    requires sai:wasi @ ^0.2 -> 0.2.1 from git "https://github.com/sai-lang/wasi" only { wasm32-wasi }
 
 package acme:exif @ 0.7.1
     source git "https://github.com/acme/exif"
@@ -459,7 +474,7 @@ package acme:image @ 1.2.0
 package acme:photo-model @ 1.0.2
     source path "../photo-model"
     compiler ^0.1
-    requires sai:collections @ ^0.3 -> 0.3.1
+    requires sai:collections @ ^0.3 -> 0.3.1 from git "https://github.com/sai-lang/collections"
 
 package sai:collections @ 0.3.1
     source git "https://github.com/sai-lang/collections"
@@ -474,8 +489,8 @@ package sai:http @ 1.4.0
     checksum "sai1:cef5219b5c1c24bf99cce8fd65e0fbfdaaed681348a4e5696a67a320a7e5820a"
     compiler ^0.1
     capabilities { alloc, wasi:http }
-    requires sai:collections @ ^0.3.1 -> 0.3.1
-    requires sai:wasi @ ^0.2.1 -> 0.2.1 only { wasm32-wasi }
+    requires sai:collections @ ^0.3.1 -> 0.3.1 from git "https://github.com/sai-lang/collections"
+    requires sai:wasi @ ^0.2.1 -> 0.2.1 from git "https://github.com/sai-lang/wasi" only { wasm32-wasi }
 
 package sai:wasi @ 0.2.1
     source git "https://github.com/sai-lang/wasi"
@@ -489,12 +504,13 @@ Notes:
 
 - The root requires `sai:collections @ ^0.3`, whose minimum is `0.3.0`, but `sai:http` requires `^0.3.1`. MVS selects the maximum of the minimums, `0.3.1`, and every edge to the node records `-> 0.3.1` ([02 §2.4](02-resolver.md)). `sai:wasi` is raised to `0.2.1` the same way.
 - `sai:http` comes from the fork named by the root's override ([02 §2.8.1](02-resolver.md) rule 1). The fork must carry the release tag `v1.4.0`.
+- The root edge for `sai:http` retains its original `sai-lang/http` source clause in format 2; the entry records the effective fork selected by the root override.
 - `acme:image` lives in the monorepo `acme/media`; its release tag is `image/v1.2.0` ([02 §2.6.1](02-resolver.md)). It is a hybrid package: the entry records its source footprint and, for its single artifact, the artifact's imports. The root's `acme:image use artifact` override does not appear in the lock; it selects the form per build ([04 §4.5.1](04-distribution-and-security.md)).
 - `acme:photo-model` is a local path package: no commit, checksum, or footprint (§3.3.3 rule 2). Its version `1.0.2` is the one declared in `../photo-model/sai.package`.
 - `acme:exif` has an empty footprint, which the root's `grant {}` covers ([01 §1.10.8](01-package-contract.md)).
 - The footprint of `sai:wasi` contains `wasi:filesystem`, which the root denies. This is a review item, not an error: only build time rejects a program, and only if code that needs `wasi:filesystem` is reachable ([spec/08 §8.12.8](../spec/08-effects-and-capabilities.md), [02 §2.12](02-resolver.md)).
 - `sai:wasi` is resolved and locked although the `wasm32-core` build never activates it: resolution covers all of the root's targets, and `only` restricts activation ([02 §2.5.2](02-resolver.md), [02 §2.5.3](02-resolver.md)).
-- The commits and digests are illustrative.
+- The dependency contracts for third-party entries are not shown in 01 §1.19, so their edge source clauses here illustrate format 2. The commits and digests are illustrative as well.
 
 ---
 
@@ -504,15 +520,15 @@ These decisions are provisional, pending their entry in [decisions.md](../design
 
 | ID | Rule | Rationale |
 |---|---|---|
-| N-G-36 | `sai.lock` has exactly one canonical byte form: LF only, `lock 1` header, sorted blocks separated by one empty line, four-space field indentation, single spaces, one-line lists, `\"` and `\\` as the only escapes, no comments, timestamps, or toolchain version (§3.2.3). | P8: identical resolutions give identical bytes on every host; P9: diffs show only real changes. |
+| N-G-36 | Each lock format has exactly one canonical byte form: format 1 retains its original `lock 1` form and format 2 uses `lock 2`; both use LF only, sorted blocks separated by one empty line, four-space field indentation, single spaces, one-line lists, `\"` and `\\` as the only escapes, no comments, timestamps, or toolchain version (§3.2.3). New and rewritten locks use format 2. | P8: identical resolutions give identical bytes on every host; P9: diffs show only real changes. |
 | N-G-37 | The `sai1:` tree hash is computed from the Git tree of the locked commit; it selects regular files only (both file modes hashed alike), skips symbolic links, submodules, `.git` components, and top-level `.sai` and `out`, applies no Git attributes or LFS, validates every path, rejects case- and normalization-insensitive collisions, and sorts by path bytes (§3.4). | P4: the same digest and the same materialized tree on every host; P8: host checkout settings cannot change the result; P9: one fully specified algorithm with a test vector. |
 | N-G-38 | Digests are written as `sai1:` followed by 64 lowercase hexadecimal digits; no other encoding is valid (§3.4.6). D-PKG-03 fixes the prefix and the hash but not the encoding. | P8: one spelling per digest; P9: matches the output of common tools. |
 | N-G-39 | An artifact checksum is SHA-256 of the artifact file's bytes with the same `sai1:` encoding; the WIT checksum is the tree hash of the WIT directory (§3.5, §3.6). | P3: interface and artifact changes are visible separately from implementation changes; P9: one hash function throughout. |
 | N-G-40 | Locks are compared semantically, through their canonical serialization. A valid but non-canonical lock is a warning, is used as is, and is rewritten only by a writing command outside `--locked` (§3.7.2). | P8: formatting accidents never change a build or fail CI; P9: no special repair command is needed. |
 | N-G-41 | `--locked` requires Mode A and fails without fetching tags; `--offline` uses only the cache and the bundled index and never selects differently because of what is cached; `--frozen` is both (§3.8). | P2, P8: CI detects stale locks deterministically; offline results equal online results or fail. |
 | N-G-42 | After a merge, `sai lock` reconstructs both sides of a conflicted lock, takes per-node maximum floors, rejects differing content for one version, uses the union of approvals, and resolves the merged `sai.package` in Mode B. The procedure is symmetric (§3.9). | P8: merge results do not depend on merge direction; P5: content conflicts are never resolved silently. |
-| N-G-43 | Format 1 has a fixed field set with no ignorable extensions; new fields or checksum algorithms need a new format; existing locks keep their format and are never downgraded (§3.10). | P5: an older toolchain cannot drop security-relevant data on rewrite; P8. |
-| N-G-44 | The lock records the root block with the root's edges, and every entry's edges with their resolved versions. Footprints are the resolved capabilities. Path entries carry no commit, checksum, or footprint. No line, form, or toolchain field is stored (§3.3). | P1, P8: the graph can be reproduced and checked against `sai.package` without network access; P7: nothing derivable is stored. |
+| N-G-43 | Formats 1 and 2 have fixed field sets with no ignorable extensions; format 1's grammar stays unchanged, and new fields or checksum algorithms need a new format. Readers accept format 1 and 2; new and rewritten locks use format 2. Dependency-bearing format-1 locks cannot satisfy Mode A conditions 5 and 6 and require Mode B migration; root-only format-1 locks remain usable (§3.10). | P5: an older toolchain cannot drop security-relevant data on rewrite; P8. |
+| N-G-44 | The lock records the root block with its edges and every entry's edges with resolved versions. Every format-2 edge also records the requiring contract's original pre-override source clause and optional grant; an omitted grant differs from an explicit empty grant. Footprints are the resolved capabilities. Path entries carry no commit, checksum, or footprint. No line, form, or toolchain field is stored (§3.3). | P1, P8: source selection can use the complete lock graph without reading inactive manifests; path-pinned contracts remain subject to their explicit Mode A check. P7: nothing derivable is stored. |
 | N-G-45 | Content is verified when it is fetched, before it enters the cache; builds trust the read-only, checksum-named cache; a mismatch is never resolved by updating the lock (§3.7.3). | P5: unverified content never reaches a build; P8: no per-build cost; draft §73. |
 | N-G-46 | Every package, application or library, SHOULD commit its lock; a lock is created even without dependencies; `sai.package` is written before `sai.lock`, each atomically, and concurrent writers are serialized (§3.1.1, §3.7). | P8: reproducible CI for libraries too; P9: a crash never leaves a partial or inconsistent pair that cannot be repaired. |
 
