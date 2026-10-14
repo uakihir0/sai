@@ -11,7 +11,7 @@ use sai_hir::body::Body;
 use sai_hir::expressions::{Arg, Block, Expr, ExprKind, FmtPiece, Label, Stmt, StmtKind};
 use sai_hir::patterns::{Pat, PatKind, PatRangeEnd};
 use sai_hir::types::{GenericArg, GenericArgs, Ty, TyKind};
-use sai_hir::{HirId, Span as HirSpan, SpanCtxt};
+use sai_hir::{DesugaringKind, HirId, Safety, Span as HirSpan, SpanCtxt};
 use sai_intern::Interner;
 use sai_vfs::SourceFile;
 use std::collections::{HashMap, HashSet};
@@ -69,13 +69,13 @@ enum ContractWork<'hir> {
     Stmt(&'hir Stmt<'hir>),
 }
 
-/// Resolve labels in a function body and report source-written control
-/// transfers inside its `requires` and `ensures` predicates.
+/// Resolve labels in a function body and report forbidden source constructs
+/// inside its `requires` and `ensures` predicates.
 ///
-/// Contract jumps are diagnosed as `INVALID_CONTRACT_EXPRESSION`; they are
-/// deliberately excluded from the loop-label map and ordinary outside-loop
-/// diagnostics. Closure and async-block bodies are separate owner bodies and
-/// are left to their own resolver pass.
+/// Contract violations are diagnosed as `INVALID_CONTRACT_EXPRESSION`.
+/// Contract jumps are deliberately excluded from the loop-label map and
+/// ordinary outside-loop diagnostics. Closure and async-block bodies are
+/// separate owner bodies and are left to their own resolver pass.
 pub fn resolve_function_control_flow(
     body: &Body<'_>,
     source_ref: &SourceRef,
@@ -107,8 +107,12 @@ fn resolve_contract_control_flow(
             ContractWork::Expr(expr) => match expr.kind {
                 ExprKind::Break { value, .. } => {
                     if expr.span.ctxt == SpanCtxt::Root {
-                        diagnostics.push(invalid_contract_control_flow(
-                            expr.span, "`break`", source_ref, source,
+                        diagnostics.push(invalid_contract_expression(
+                            expr.span,
+                            "`break`",
+                            "control transfer in contract",
+                            source_ref,
+                            source,
                         )?);
                     }
                     if let Some(value) = value {
@@ -117,9 +121,10 @@ fn resolve_contract_control_flow(
                 }
                 ExprKind::Continue { .. } => {
                     if expr.span.ctxt == SpanCtxt::Root {
-                        diagnostics.push(invalid_contract_control_flow(
+                        diagnostics.push(invalid_contract_expression(
                             expr.span,
                             "`continue`",
+                            "control transfer in contract",
                             source_ref,
                             source,
                         )?);
@@ -127,8 +132,12 @@ fn resolve_contract_control_flow(
                 }
                 ExprKind::Return(value) => {
                     if expr.span.ctxt == SpanCtxt::Root {
-                        diagnostics.push(invalid_contract_control_flow(
-                            expr.span, "`return`", source_ref, source,
+                        diagnostics.push(invalid_contract_expression(
+                            expr.span,
+                            "`return`",
+                            "control transfer in contract",
+                            source_ref,
+                            source,
                         )?);
                     }
                     if let Some(value) = value {
@@ -139,15 +148,47 @@ fn resolve_contract_control_flow(
                 | ExprKind::Path(_)
                 | ExprKind::ImplicitMember(_)
                 | ExprKind::ContractResult
-                | ExprKind::Closure(_)
                 | ExprKind::AsyncBlock { .. }
                 | ExprKind::Err => {}
+                ExprKind::Closure(_) => {
+                    if expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_expression(
+                            expr.span,
+                            "closure",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
+                }
                 ExprKind::Field { base, .. }
                 | ExprKind::TupleField { base, .. }
                 | ExprKind::Unary(_, base)
-                | ExprKind::Borrow(_, base)
-                | ExprKind::Try(base)
-                | ExprKind::Await(base) => work.push(ContractWork::Expr(base)),
+                | ExprKind::Borrow(_, base) => work.push(ContractWork::Expr(base)),
+                ExprKind::Try(base) => {
+                    if expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_expression(
+                            expr.span,
+                            "`?`",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
+                    work.push(ContractWork::Expr(base));
+                }
+                ExprKind::Await(base) => {
+                    if expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_expression(
+                            expr.span,
+                            "`.await`",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
+                    work.push(ContractWork::Expr(base));
+                }
                 ExprKind::Call { callee, args, base } => {
                     if let Some(base) = base {
                         work.push(ContractWork::Expr(base));
@@ -174,7 +215,28 @@ fn resolve_contract_control_flow(
                         work.push(ContractWork::Expr(item));
                     }
                 }
-                ExprKind::Block(block) | ExprKind::Region { block, .. } => {
+                ExprKind::Block(block) => {
+                    if block.safety == Safety::Unsafe && expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_expression(
+                            expr.span,
+                            "`unsafe` block",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
+                    work.push(ContractWork::Block(block));
+                }
+                ExprKind::Region { block, .. } => {
+                    if expr.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_expression(
+                            expr.span,
+                            "`region` block",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
                     work.push(ContractWork::Block(block));
                 }
                 ExprKind::If { cond, then, els } => {
@@ -224,13 +286,44 @@ fn resolve_contract_control_flow(
                 }
             }
             ContractWork::Stmt(stmt) => match stmt.kind {
-                StmtKind::Let { init, els, .. } => {
+                StmtKind::Let { pat, init, els, .. } => {
+                    if pat.span.ctxt == SpanCtxt::Desugared(DesugaringKind::VarStmt) {
+                        diagnostics.push(invalid_contract_expression(
+                            pat.span,
+                            "`var` statement",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
                     if let Some(els) = els {
                         work.push(ContractWork::Block(els));
                     }
                     work.push(ContractWork::Expr(init));
                 }
-                StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                StmtKind::Assign { lhs, rhs } => {
+                    if stmt.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_expression(
+                            stmt.span,
+                            "assignment",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
+                    work.push(ContractWork::Expr(rhs));
+                    work.push(ContractWork::Expr(lhs));
+                }
+                StmtKind::AssignOp { lhs, rhs, .. } => {
+                    if stmt.span.ctxt == SpanCtxt::Root {
+                        diagnostics.push(invalid_contract_expression(
+                            stmt.span,
+                            "compound assignment",
+                            "forbidden construct in contract",
+                            source_ref,
+                            source,
+                        )?);
+                    }
                     work.push(ContractWork::Expr(rhs));
                     work.push(ContractWork::Expr(lhs));
                 }
@@ -247,9 +340,10 @@ fn resolve_contract_control_flow(
     Ok(())
 }
 
-fn invalid_contract_control_flow(
+fn invalid_contract_expression(
     span: HirSpan,
     construct: &str,
+    primary_label: &str,
     source_ref: &SourceRef,
     source: &SourceFile,
 ) -> Result<Diagnostic, LabelResolutionError> {
@@ -260,7 +354,7 @@ fn invalid_contract_control_flow(
         format!("{construct} is not allowed in a contract expression"),
         Some(primary),
     );
-    diagnostic.primary_label = "control transfer in contract".to_owned();
+    diagnostic.primary_label = primary_label.to_owned();
     Ok(diagnostic)
 }
 
@@ -268,9 +362,11 @@ fn invalid_contract_control_flow(
 ///
 /// `source_ref` identifies the source file for diagnostics; HIR spans use
 /// decoded-text offsets and are converted to original-file offsets here.
-/// Contracts and invariant predicates are deliberately supplied by a future
-/// owner-kind-aware adapter because their control-flow errors are
-/// `INVALID_CONTRACT_EXPRESSION`, not loop-target errors.
+/// Function contracts are supplied separately by
+/// `resolve_function_control_flow` because their forbidden control-flow and
+/// syntax constructs are `INVALID_CONTRACT_EXPRESSION`, not loop-target
+/// errors. Refinement and invariant predicates still require their own
+/// owner-kind adapters.
 pub fn resolve_loop_labels(
     root: &Expr<'_>,
     source_ref: &SourceRef,
@@ -965,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn function_contract_control_transfers_are_not_resolved_as_loop_jumps() {
+    fn function_contract_forbidden_expressions_are_not_resolved_as_loop_jumps() {
         let arena = HirArena::new();
         let (owner, nested_def_id) = owner_id_with_local();
         let symbols = Interner::new();
@@ -1105,6 +1201,7 @@ mod tests {
                 Code::InvalidContractExpression,
                 Code::InvalidContractExpression,
                 Code::InvalidContractExpression,
+                Code::InvalidContractExpression,
             ]
         );
         assert_eq!(
@@ -1121,7 +1218,7 @@ mod tests {
                         .raw()
                 })
                 .collect::<Vec<_>>(),
-            [10, 30, 50]
+            [10, 30, 50, 80]
         );
         assert!(!result.labels.contains_key(&contract_break.hir_id));
         assert!(!result.labels.contains_key(&contract_continue.hir_id));
@@ -1129,6 +1226,195 @@ mod tests {
             result.labels.get(&function_break.hir_id),
             Some(&Ok(function_loop.hir_id))
         );
+    }
+
+    #[test]
+    fn function_contract_rejects_remaining_forbidden_constructs() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let operand = expr(&arena, owner, 1, 11, 12, ExprKind::ContractResult);
+        let try_expr = expr(&arena, owner, 2, 10, 13, ExprKind::Try(operand));
+        let await_expr = expr(&arena, owner, 3, 20, 30, ExprKind::Await(operand));
+        let unsafe_block = arena.alloc_block(Block {
+            hir_id: hir_id(owner, 4),
+            stmts: &[],
+            tail: None,
+            safety: Safety::Unsafe,
+            span: hir_span(40, 50),
+        });
+        let unsafe_expr = expr(&arena, owner, 5, 40, 50, ExprKind::Block(unsafe_block));
+        let region_block = block(&arena, owner, 6, None);
+        let region_expr = expr(
+            &arena,
+            owner,
+            7,
+            60,
+            70,
+            ExprKind::Region {
+                name: sai_hir::types::Name {
+                    sym: symbols.intern("r").expect("symbol interns"),
+                    span: hir_span(67, 68),
+                },
+                binding: sai_hir::BindingId::default(),
+                block: region_block,
+            },
+        );
+        let lhs = expr(&arena, owner, 8, 81, 82, ExprKind::ContractResult);
+        let rhs = expr(&arena, owner, 9, 83, 84, ExprKind::ContractResult);
+        let assignment = Stmt {
+            hir_id: hir_id(owner, 10),
+            kind: StmtKind::Assign { lhs, rhs },
+            span: hir_span(80, 85),
+        };
+        let compound_assignment = Stmt {
+            hir_id: hir_id(owner, 11),
+            kind: StmtKind::AssignOp {
+                op: sai_hir::expressions::BinOp::Add,
+                lhs,
+                rhs,
+            },
+            span: hir_span(90, 96),
+        };
+        let generated_assignment = Stmt {
+            hir_id: hir_id(owner, 24),
+            kind: StmtKind::Assign { lhs, rhs },
+            span: HirSpan {
+                ctxt: SpanCtxt::Desugared(DesugaringKind::ForLoop),
+                ..hir_span(96, 100)
+            },
+        };
+        let var_pat = arena.alloc_pat(sai_hir::patterns::Pat {
+            hir_id: hir_id(owner, 12),
+            kind: PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Var,
+                name: sai_hir::types::Name {
+                    sym: symbols.intern("mutable").expect("symbol interns"),
+                    span: HirSpan {
+                        ctxt: SpanCtxt::Desugared(DesugaringKind::VarStmt),
+                        ..hir_span(100, 110)
+                    },
+                },
+                binding: sai_hir::BindingId::default(),
+                sub: None,
+            },
+            span: HirSpan {
+                ctxt: SpanCtxt::Desugared(DesugaringKind::VarStmt),
+                ..hir_span(100, 110)
+            },
+        });
+        let var_statement = Stmt {
+            hir_id: hir_id(owner, 13),
+            kind: StmtKind::Let {
+                pat: var_pat,
+                ty: None,
+                init: operand,
+                els: None,
+            },
+            span: hir_span(100, 110),
+        };
+        let let_pat = arena.alloc_pat(sai_hir::patterns::Pat {
+            hir_id: hir_id(owner, 14),
+            kind: PatKind::Binding {
+                mode: sai_hir::patterns::BindingMode::Var,
+                name: sai_hir::types::Name {
+                    sym: symbols.intern("mutable").expect("symbol interns"),
+                    span: hir_span(110, 120),
+                },
+                binding: sai_hir::BindingId::default(),
+                sub: None,
+            },
+            span: hir_span(110, 120),
+        });
+        let let_statement = Stmt {
+            hir_id: hir_id(owner, 15),
+            kind: StmtKind::Let {
+                pat: let_pat,
+                ty: None,
+                init: operand,
+                els: None,
+            },
+            span: hir_span(110, 120),
+        };
+        let statements = arena.alloc_stmts(&[
+            Stmt {
+                hir_id: hir_id(owner, 16),
+                kind: StmtKind::Expr(try_expr),
+                span: hir_span(10, 13),
+            },
+            Stmt {
+                hir_id: hir_id(owner, 17),
+                kind: StmtKind::Expr(await_expr),
+                span: hir_span(20, 30),
+            },
+            Stmt {
+                hir_id: hir_id(owner, 18),
+                kind: StmtKind::Expr(unsafe_expr),
+                span: hir_span(40, 50),
+            },
+            Stmt {
+                hir_id: hir_id(owner, 19),
+                kind: StmtKind::Expr(region_expr),
+                span: hir_span(60, 70),
+            },
+            assignment,
+            compound_assignment,
+            generated_assignment,
+            var_statement,
+            let_statement,
+        ]);
+        let predicate_block = arena.alloc_block(Block {
+            hir_id: hir_id(owner, 20),
+            stmts: statements,
+            tail: None,
+            safety: Safety::Safe,
+            span: hir_span(0, 128),
+        });
+        let predicate = expr(&arena, owner, 21, 0, 128, ExprKind::Block(predicate_block));
+        let contracts = [Contract {
+            hir_id: hir_id(owner, 22),
+            kind: ContractKind::Requires,
+            expr: predicate,
+        }];
+        let body_value = expr(&arena, owner, 23, 0, 1, ExprKind::Err);
+        let body = Body {
+            owner,
+            params: &[],
+            value: body_value,
+            contracts: &contracts,
+            invariant_preds: &[],
+        };
+        let (source_ref, source) = source();
+
+        let result = resolve_function_control_flow(&body, &source_ref, &source, &symbols)
+            .expect("function contract restrictions resolve");
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::InvalidContractExpression; 7]
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("diagnostic has a primary location")
+                        .span
+                        .range
+                        .start()
+                        .raw()
+                })
+                .collect::<Vec<_>>(),
+            [10, 20, 40, 60, 80, 90, 100]
+        );
+        assert!(result.labels.is_empty());
+        assert!(result.unused_labels.is_empty());
     }
 
     fn expr<'hir>(

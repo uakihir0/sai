@@ -711,9 +711,19 @@ of function `requires` and `ensures` expressions. Source-written `return`,
 also receive `RETURN_OUTSIDE_FUNCTION`, `BREAK_OUTSIDE_LOOP`,
 `CONTINUE_OUTSIDE_LOOP`, or `UNDECLARED_LABEL`. The scan ignores synthetic
 desugaring breaks and does not enter closure or async-block bodies, which are
-separate owner bodies. Other forbidden predicate forms, local and path
-resolution, other owner kinds, tracked `hir_owner`, and full `resolve_owner`
-remain deferred.
+separate owner bodies.
+
+**Remaining function contract restrictions (IR-513).** The same bridge also
+reports `INVALID_CONTRACT_EXPRESSION` for source-written `?`, `.await`,
+assignments, compound assignments, `var` statements, `unsafe` blocks, `region`
+blocks, and closure expressions. It identifies `var` statements by their HIR
+`VarStmt` desugaring context, leaving ordinary `let` statements allowed even
+when a pattern binds a mutable local. It reports a closure expression without
+walking its body. Async-block expressions are not in the prohibition list, and
+their bodies remain separate owners. These checks currently cover only
+top-level function contracts; refinement predicates, invariant elements,
+associated and other owner kinds, local and path resolution, tracked
+`hir_owner`, and full `resolve_owner` remain deferred.
 
 ### 3.4.6 Visibility
 
@@ -1204,7 +1214,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 ### 3.7.14 Contracts and predicates
 
-Predicates (spec/09 §9.1.2) are checked against `Bool` with `RetCtx { kind: Predicate }` pushed, so that `return`, `break`, `continue`, `?`, `.await`, assignments, `var`, `unsafe` and `region` blocks and closures are `INVALID_CONTRACT_EXPRESSION` (the resolver reports the jump forms, §3.4.5; this chapter the others). Each predicate is checked in the scope of its declaration (N-C-43): `requires` and `ensures` clauses in their function's owner, after the body, in declaration order; refinement predicates and invariants in their own owners (§3.7.1).
+Predicates (spec/09 §9.1.2) are checked against `Bool` with `RetCtx { kind: Predicate }` pushed, so that `return`, `break`, `continue`, `?`, `.await`, assignments, `var`, `unsafe` and `region` blocks and closures are `INVALID_CONTRACT_EXPRESSION`. In the eventual tracked pipeline, the resolver reports jump forms (§3.4.5) and this chapter reports the others. The temporary top-level-function bridge (IR-511–IR-513) currently reports all listed syntax restrictions during owner processing; type-checker integration must coordinate with that bridge to avoid duplicate diagnostics. Each predicate is checked in the scope of its declaration (N-C-43): `requires` and `ensures` clauses in their function's owner, after the body, in declaration order; refinement predicates and invariants in their own owners (§3.7.1).
 
 - **`requires`** sees the parameters at their declared types. **`ensures`** sees the parameters and `ContractResult`, whose type is the declared return type (for an `async fn` the declared output, spec/09 §9.3.2). A function with an `ensures` clause and a parameter named `result` is `RESULT_NAME_CONFLICT`, on the parameter. `RESULT_OUTSIDE_ENSURES` and `OLD_OUTSIDE_ENSURES` were reported by the resolver.
 - **`ContractOld { args, base }`**: validate that there is exactly one unnamed positional argument and no `base`, as required by spec/09 §9.3.2; preserving malformed call shapes in HIR lets this stage diagnose them without resolving `old` as a user function. For the valid shape, a nested `ContractOld` is `NESTED_OLD`; an operand that mentions `ContractResult` is `OLD_REFERS_TO_RESULT`; the operand type must be `Copy` (`Goal::Copy(T, CopyOrigin::Old)`, failure `OLD_REQUIRES_COPY` with the fix "copy the needed scalar"). The free locals of the operand must be parameters; the resolver's `ContractScope` rib already restricts them.

@@ -3093,6 +3093,50 @@ mod tests {
     }
 
     #[test]
+    fn function_owner_control_flow_reports_remaining_contract_restrictions() {
+        let root = concat!(
+            "fn contracted(value: Bool) -> Bool ",
+            "requires { ",
+            "let okay = value; ",
+            "value?; ",
+            "value.await; ",
+            "value = true; ",
+            "value += true; ",
+            "var changed = true; ",
+            "unsafe { true }; ",
+            "region r { true }; ",
+            "fn() { return true; }; ",
+            "} ",
+            "{ true }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("function contracts collect");
+
+        let resolved = database
+            .resolve_function_owner_labels(&collection, &module_tree, &snapshot)
+            .expect("function owner control flow resolves");
+
+        let owner = resolved.owners().first().expect("function owner resolves");
+        let labels = owner.resolution().expect("function lowering succeeds");
+        assert_eq!(
+            labels
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::InvalidContractExpression; 8]
+        );
+    }
+
+    #[test]
     fn function_owner_label_adapter_rejects_a_collection_from_another_snapshot() {
         let root = b"fn duplicate() { 0 }\nfn duplicate() { 1 }\n";
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root, b"");
