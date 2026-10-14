@@ -243,6 +243,7 @@ mod tests {
             modules,
             interfaces,
             exports: Default::default(),
+            function_owners: Vec::new(),
             diagnostics: Vec::new(),
         }
     }

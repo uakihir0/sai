@@ -221,6 +221,7 @@ mod tests {
             modules,
             interfaces,
             exports: BTreeMap::new(),
+            function_owners: Vec::new(),
             diagnostics: Vec::new(),
         }
     }

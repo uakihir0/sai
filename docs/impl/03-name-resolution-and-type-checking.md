@@ -327,6 +327,23 @@ names keep the first binding and diagnose the later name. Missing members of
 local interfaces are `UNRESOLVED_IMPORT`; foreign interface member tables
 remain deferred.
 
+**Top-level function owner descriptors (IR-510).** `Phase1PackageScopes`
+retains an ordered `function_owners` list alongside its module scopes. Each
+descriptor pairs the canonical `OwnerId` from the Phase 1 definition-path
+walk with its containing module file and the entry's erased AST ID. Collection
+happens before duplicate-binding recovery, so duplicate functions and
+`Symbol::ERROR` recovery entries retain distinct owner identities even when
+they are omitted from the module scope. The list contains only direct function
+entries that survived target filtering. An erased AST ID is file-local and
+must be resolved against the current snapshot's `AstIdMap` before lowering;
+descriptors carry no spans, syntax pointers, or arena-borrowed HIR.
+
+This is only a source index for top-level functions, not a `hir_owner` or
+`resolve_owner` query. Associated and impl members, fields, variants, generic
+parameters, closures, and async blocks are not indexed here. The owner HIR
+lowering and source-map APIs exist separately, but the driver does not yet
+connect this index to them or cache resolved owner results.
+
 **Tracked local query adapter (IR-470).** The driver now tracks this local
 Phase 1 and Phase 3 slice through an interim `package_scopes` derived query,
 keyed by canonical `PackageKey`. Its input identity covers the package's
