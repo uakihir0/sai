@@ -2,6 +2,7 @@
 
 pub mod package_graph;
 
+use crate::package_graph::{PackageForm, PackageGraph, PackageGraphRole};
 use sai_diagnostics::{
     CauseKey, Child, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related, SourceRef,
     source_text_status_diagnostic,
@@ -21,6 +22,7 @@ use sai_package::mvs_diagnostics::{
     mixed_source_identity_failure_diagnostics, mixed_source_reload_failure_diagnostics,
     root_dependency_cycle_diagnostics, version_conflict_diagnostics,
 };
+use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_resolve::package_scopes::{
     FilteredModule, PackageScopesError, PackageUseRequirement, collect_local_module_alias_bindings,
@@ -69,6 +71,7 @@ pub struct RootDatabase {
     def_paths: HashMap<PackageId, Arc<DefPathInterner>>,
     package_scopes: Phase1PackageScopesQueries,
     declared_requirements: DeclaredRequirementsQueries,
+    package_graph: InputQuery<u8, Option<PackageGraph>>,
 }
 
 /// A semantically usable direct requirement retained from `sai.package`.
@@ -299,6 +302,26 @@ struct Phase1PackageScopesIdentity {
     target_capabilities: BTreeSet<String>,
     build_context: Phase1BuildContext,
     declared_requirements: Option<Vec<DeclaredRequirement>>,
+    package_graph: Option<Phase1PackageGraphProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Phase1PackageGraphProjection {
+    Package {
+        outgoing_edges: Vec<StableActivePackageEdge>,
+    },
+    ImplicitToolchain {
+        version: Version,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableActivePackageEdge {
+    visible_identity: String,
+    target: PackageKey,
+    target_version: Version,
+    target_form: PackageForm,
+    target_role: PackageGraphRole,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -487,6 +510,33 @@ impl StableHash for Phase1PackageScopesIdentity {
         self.build_context.is_test_build.stable_hash(hasher);
         self.build_context.analyzes_tests.stable_hash(hasher);
         self.declared_requirements.stable_hash(hasher);
+        self.package_graph.stable_hash(hasher);
+    }
+}
+
+impl StableHash for Phase1PackageGraphProjection {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        match self {
+            Self::Package { outgoing_edges } => {
+                hasher.write_tag(0xD8);
+                outgoing_edges.stable_hash(hasher);
+            }
+            Self::ImplicitToolchain { version } => {
+                hasher.write_tag(0xD9);
+                version.to_string().stable_hash(hasher);
+            }
+        }
+    }
+}
+
+impl StableHash for StableActivePackageEdge {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xDA);
+        self.visible_identity.stable_hash(hasher);
+        self.target.stable_hash(hasher);
+        self.target_version.to_string().stable_hash(hasher);
+        self.target_form.stable_hash(hasher);
+        self.target_role.stable_hash(hasher);
     }
 }
 
@@ -706,6 +756,7 @@ pub enum Phase1CollectionError {
     SnapshotBoundDiagnosticHasFixes,
     Query(QueryError),
     DeclaredRequirements(DeclaredRequirementsError),
+    PackageGraphMissingNode(PackageKey),
 }
 
 impl From<ParseQueryError> for Phase1CollectionError {
@@ -763,6 +814,7 @@ fn phase1_package_scopes_identity(
     target_cfg: &TargetCfg,
     build_context: Phase1BuildContext,
     declared_requirements: Option<&[DeclaredRequirement]>,
+    package_graph: Option<Phase1PackageGraphProjection>,
     symbols: &Interner,
 ) -> Result<Phase1PackageScopesIdentity, Phase1CollectionError> {
     let modules = module_tree
@@ -828,7 +880,46 @@ fn phase1_package_scopes_identity(
         target_capabilities: target_cfg.capabilities().clone(),
         build_context,
         declared_requirements: declared_requirements.map(|requirements| requirements.to_vec()),
+        package_graph,
     })
+}
+
+fn phase1_package_graph_projection(
+    graph: Option<&PackageGraph>,
+    package: &PackageKey,
+) -> Result<Option<Phase1PackageGraphProjection>, Phase1CollectionError> {
+    let Some(graph) = graph else {
+        return Ok(None);
+    };
+    if matches!(package.as_str(), "sai:core" | "sai:alloc") {
+        return Ok(Some(Phase1PackageGraphProjection::ImplicitToolchain {
+            version: graph.toolchain_version().clone(),
+        }));
+    }
+
+    let node = graph
+        .node(package)
+        .ok_or_else(|| Phase1CollectionError::PackageGraphMissingNode(package.clone()))?;
+    let outgoing_edges = node
+        .active_edges()
+        .iter()
+        .map(|edge| {
+            let target = graph.node(edge.target()).ok_or_else(|| {
+                Phase1CollectionError::PackageGraphMissingNode(edge.target().clone())
+            })?;
+            Ok(StableActivePackageEdge {
+                visible_identity: edge.visible_identity().to_owned(),
+                target: target.key().clone(),
+                target_version: target.version().clone(),
+                target_form: target.form(),
+                target_role: target.role(),
+            })
+        })
+        .collect::<Result<Vec<_>, Phase1CollectionError>>()?;
+
+    Ok(Some(Phase1PackageGraphProjection::Package {
+        outgoing_edges,
+    }))
 }
 
 fn stable_child_entry(entry: sai_resolve::ChildEntry) -> StableChildEntry {
@@ -1248,6 +1339,7 @@ fn mixed_source_diagnostic_snapshot(
 impl RootDatabase {
     /// Creates a fresh compiler session with empty VFS inputs.
     pub fn new() -> Result<Self, QueryError> {
+        let mut query_database = QueryDatabase::new();
         let vfs = VfsInputs::new()?;
         let syntax = SyntaxQueries::new(vfs.clone())?;
         let hir = ItemTreeQueries::new(syntax.clone())?;
@@ -1257,8 +1349,11 @@ impl RootDatabase {
         let package_scopes =
             Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
+        let package_graph =
+            InputQuery::<u8, Option<PackageGraph>>::new("package_graph", Durability::Medium)?;
+        package_graph.set(&mut query_database, 0, None)?;
         Ok(Self {
-            query_database: QueryDatabase::new(),
+            query_database,
             vfs,
             syntax,
             hir,
@@ -1269,7 +1364,19 @@ impl RootDatabase {
             def_paths: HashMap::new(),
             package_scopes,
             declared_requirements,
+            package_graph,
         })
+    }
+
+    /// Sets the resolved active SAI package graph for this build.
+    ///
+    /// `None` means resolution is unavailable. `Some(graph)` is an available
+    /// graph, including when the selected package has no active outgoing
+    /// edges. The graph input follows Medium durability as specified for
+    /// resolver output.
+    pub fn set_package_graph(&mut self, graph: Option<PackageGraph>) -> Result<bool, QueryError> {
+        self.package_graph
+            .set_at_durability(&mut self.query_database, 0, graph, Durability::Medium)
     }
 
     /// Interns a stable package key for this session.
@@ -1790,6 +1897,8 @@ impl RootDatabase {
                 .as_ref(),
         )
         .map_err(PackageScopesError::from)?;
+        let graph = self.package_graph.get(&mut self.query_database, 0)?;
+        let package_graph = phase1_package_graph_projection(graph.as_ref().as_ref(), &package_key)?;
         let def_paths = if let Some(def_paths) = self.def_paths.get(&module_tree.package) {
             Arc::clone(def_paths)
         } else {
@@ -1809,6 +1918,7 @@ impl RootDatabase {
             target_cfg,
             build_context,
             declared_requirements.as_deref(),
+            package_graph,
             &self.symbols,
         )?);
         let prepared = Arc::new(PreparedPhase1PackageScopes {
@@ -2133,6 +2243,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::package_graph::{PackageGraphEdge, PackageGraphNode};
     use sai_package::local_source::LocalPackageDirectory;
     use sai_package::mixed_source::resolve_mixed_source_packages;
     use sai_package::mvs::{MvsContract, MvsEdge, MvsPackageVersion, select};
@@ -2278,6 +2389,88 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    fn graph_edge(target: &str, visible_identity: &str) -> PackageGraphEdge {
+        PackageGraphEdge::new(
+            PackageKey::new(target).expect("graph target key is valid"),
+            visible_identity,
+        )
+        .expect("graph edge is valid")
+    }
+
+    fn graph_node(
+        key: &str,
+        identity: &str,
+        version: &str,
+        role: PackageGraphRole,
+        edges: Vec<PackageGraphEdge>,
+    ) -> PackageGraphNode {
+        PackageGraphNode::new(
+            PackageKey::new(key).expect("graph package key is valid"),
+            identity,
+            Version::parse(version).expect("graph package version is valid"),
+            PackageForm::Source,
+            role,
+            edges,
+        )
+        .expect("graph package node is valid")
+    }
+
+    fn phase1_graph(dependency_version: &str, dependency_has_leaf: bool) -> PackageGraph {
+        let dependency_edges = if dependency_has_leaf {
+            vec![graph_edge("acme:leaf#1", "acme:leaf")]
+        } else {
+            Vec::new()
+        };
+        let mut nodes = vec![
+            graph_node(
+                "acme:phase1#1",
+                "acme:phase1",
+                "1.0.0",
+                PackageGraphRole::Root,
+                vec![graph_edge("acme:dep#1", "acme:dep")],
+            ),
+            graph_node(
+                "acme:dep#1",
+                "acme:dep",
+                dependency_version,
+                PackageGraphRole::Dependency,
+                dependency_edges,
+            ),
+        ];
+        if dependency_has_leaf {
+            nodes.push(graph_node(
+                "acme:leaf#1",
+                "acme:leaf",
+                "1.0.0",
+                PackageGraphRole::Dependency,
+                Vec::new(),
+            ));
+        }
+        PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            nodes,
+        )
+        .expect("active graph is valid")
+    }
+
+    fn phase1_root_only_graph() -> PackageGraph {
+        phase1_root_only_graph_with_toolchain("1.8.2")
+    }
+
+    fn phase1_root_only_graph_with_toolchain(toolchain_version: &str) -> PackageGraph {
+        PackageGraph::new(
+            Version::parse(toolchain_version).expect("toolchain version is valid"),
+            [graph_node(
+                "acme:phase1#1",
+                "acme:phase1",
+                "1.0.0",
+                PackageGraphRole::Root,
+                Vec::new(),
+            )],
+        )
+        .expect("root-only graph is valid")
     }
 
     #[test]
@@ -3088,6 +3281,183 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "the derived query should reuse the same memo for identical inputs"
+        );
+    }
+
+    #[test]
+    fn package_scopes_graph_identity_distinguishes_unavailable_and_empty_edges() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(b"fn stable() {}\n", b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext::default();
+        let package_key = PackageKey::new("acme:phase1#1").expect("package key is valid");
+
+        database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &target, context)
+            .expect("scopes collect while resolution is unavailable");
+        let unavailable = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("unavailable graph still has a package-scope memo");
+        assert_eq!(unavailable.identity.package_graph, None);
+
+        let graph = phase1_root_only_graph();
+        assert!(
+            database
+                .set_package_graph(Some(graph.clone()))
+                .expect("available graph input is recorded")
+        );
+        database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &target, context)
+            .expect("scopes collect with an available root-only graph");
+        let available = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("available graph has a package-scope memo");
+        assert_eq!(
+            available.identity.package_graph,
+            Some(Phase1PackageGraphProjection::Package {
+                outgoing_edges: Vec::new()
+            })
+        );
+        assert!(
+            !Arc::ptr_eq(&unavailable, &available),
+            "an available package with no edges differs from unavailable resolution"
+        );
+
+        assert!(
+            !database
+                .set_package_graph(Some(graph))
+                .expect("identical graph input is accepted")
+        );
+        database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &target, context)
+            .expect("repeated available-graph collection succeeds");
+        let repeated = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("repeated collection has a package-scope memo");
+        assert!(
+            Arc::ptr_eq(&available, &repeated),
+            "identical graph projections reuse the package-scope memo"
+        );
+    }
+
+    #[test]
+    fn package_scopes_graph_identity_tracks_only_outgoing_edges_and_target_selection() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(b"fn stable() {}\n", b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext::default();
+        let package_key = PackageKey::new("acme:phase1#1").expect("package key is valid");
+
+        database
+            .set_package_graph(Some(phase1_graph("1.0.0", false)))
+            .expect("initial graph is recorded");
+        database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &target, context)
+            .expect("initial scopes collect");
+        let initial = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("initial package-scope memo exists");
+
+        database
+            .set_package_graph(Some(phase1_graph("1.0.0", true)))
+            .expect("unrelated dependency edge is recorded");
+        database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &target, context)
+            .expect("scopes collect after an unrelated dependency edge changes");
+        let unrelated_change = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("package-scope memo remains available");
+        assert!(
+            Arc::ptr_eq(&initial, &unrelated_change),
+            "changes below the root's direct outgoing edges do not invalidate its local scopes"
+        );
+
+        database
+            .set_package_graph(Some(phase1_graph("1.1.0", false)))
+            .expect("selected dependency version change is recorded");
+        database
+            .collect_phase1_package_scopes(&module_tree, &snapshot, &target, context)
+            .expect("scopes collect after an active target version changes");
+        let target_change = database
+            .package_scopes
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("updated package-scope memo exists");
+        assert!(
+            !Arc::ptr_eq(&unrelated_change, &target_change),
+            "the exact selected version of a direct edge target is part of the projection"
+        );
+    }
+
+    #[test]
+    fn implicit_toolchain_scope_projection_tracks_toolchain_version() {
+        let first_graph = phase1_root_only_graph_with_toolchain("1.8.2");
+        let next_graph = phase1_root_only_graph_with_toolchain("1.8.3");
+        for package in ["sai:core", "sai:alloc"] {
+            let package = PackageKey::new(package).expect("implicit package key is valid");
+            let unavailable = phase1_package_graph_projection(None, &package)
+                .expect("unavailable graph projection succeeds");
+            let first = phase1_package_graph_projection(Some(&first_graph), &package)
+                .expect("first toolchain projection succeeds");
+            let next = phase1_package_graph_projection(Some(&next_graph), &package)
+                .expect("next toolchain projection succeeds");
+
+            assert_eq!(unavailable, None);
+            assert_eq!(
+                first,
+                Some(Phase1PackageGraphProjection::ImplicitToolchain {
+                    version: Version::parse("1.8.2").expect("toolchain version is valid"),
+                })
+            );
+            assert_ne!(
+                first,
+                next,
+                "implicit {} scopes must track the exact toolchain version",
+                package.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn package_scopes_rejects_a_package_missing_from_an_available_graph() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(b"fn stable() {}\n", b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [graph_node(
+                "other:root#1",
+                "other:root",
+                "1.0.0",
+                PackageGraphRole::Root,
+                Vec::new(),
+            )],
+        )
+        .expect("other root graph is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("available graph is recorded");
+
+        let error = database
+            .collect_phase1_package_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect_err("a missing selected package must not be treated as an empty graph node");
+        assert_eq!(
+            error,
+            Phase1CollectionError::PackageGraphMissingNode(
+                PackageKey::new("acme:phase1#1").expect("package key is valid")
+            )
         );
     }
 
