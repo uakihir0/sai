@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod module_member_lookup;
 pub mod module_target;
 pub mod owner;
 pub mod package_scopes;

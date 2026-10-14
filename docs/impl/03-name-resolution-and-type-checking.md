@@ -667,6 +667,17 @@ conversion, and bounded label suggestions.
 
 `visible(e, M)` (spec/04 §4.6.1) is evaluated for every path segment that names an item or a member, at the point where the segment is resolved: by the resolver for module members and `use` items, and by the type checker for type-relative members (variants never fail, since they have the enum's visibility; inherent associated functions and methods, spec/05 §5.13.5) and for fields (`PRIVATE_FIELD`, spec/04 §4.6.3, §4.6.4). The visibility of an entity is read from its `ItemTree` entry or from the dependency's metadata, never from HIR, so the check does not depend on the target's body.
 
+**Current module-member lookup slice (IR-498).** `sai_resolve::module_member_lookup::ModuleMemberIndex`
+indexes supplied package scopes by canonical module or interface `DefId`, then
+looks up qualified members through the `members` maps while preserving each
+binding's original `Res`. Same-package lookups may see private members;
+cross-package lookups require effective `Visibility::Pub` or
+`Visibility::Export`. The caller must supply every active source package that
+can own a qualified target, including transitive packages reached through
+re-exports. This index does not yet parse or resolve path text, apply
+owner-level test-only rules, or emit path diagnostics; those remain part of the
+tracked owner resolver.
+
 Distinct types (spec/04 §4.6.4): the constructor `D(b)`, the pattern `D(b)` and `.value` are visible outside the defining package only if the declaration is `pub distinct D = pub B`. The check is done by the type checker where it resolves the constructor call, the pattern and the field (§3.13.3). `PUB_REPR_ON_PRIVATE_DISTINCT` is reported by `wf_check_item` on the `pub` marker of the base.
 
 ### 3.4.7 Deprecation
