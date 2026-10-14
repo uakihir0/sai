@@ -351,7 +351,7 @@ struct ImportResolver<'a> {
 }
 ```
 
-1. **Use targets.** `resolve_pkg_path(M, path)` implements spec/04 §4.3.2 for each `UseEntry` in source order, and records the result (a module `DefId`, an interface `DefId`, or an error) on the entry. For a WIT package, the result is the view interface of a WIT unit, and an interface of another source package is replaced by its generated view ([16](16-interfaces-and-wit.md) §16.4.7, §16.4.8). Diagnostics: `UNKNOWN_PACKAGE`, `UNKNOWN_MODULE`, `USE_OF_CURRENT_MODULE`, `INVALID_USE_TARGET`, `UNKNOWN_WIT_ITEM`, `PRIVATE_ITEM`, `INACTIVE_DEPENDENCY` (below); before Stage 3, a declared dependency is `FEATURE_NOT_IMPLEMENTED`. `MODULE_INTERFACE_CONFLICT` is reported in Phase 1 of the defining package, on the interface declaration. Package and member-name suggestions follow the edit-distance rule of [impl/11](11-diagnostics.md) (N-H-5) where spec/04 calls for those suggestions. `UNKNOWN_MODULE` is an exception: spec/04 §4.3.2 step 2.3 requires every direct child module below the longest matched prefix.
+1. **Use targets.** `resolve_pkg_path(M, path)` implements spec/04 §4.3.2 for each `UseEntry` in source order, and records the result (a module `DefId`, an interface `DefId`, or an error) on the entry. For a WIT package, the result is the view interface of a WIT unit, and an interface of another source package is replaced by its generated view ([16](16-interfaces-and-wit.md) §16.4.7, §16.4.8). Diagnostics: `UNKNOWN_PACKAGE`, `UNKNOWN_MODULE`, `USE_OF_CURRENT_MODULE`, `INVALID_USE_TARGET`, `UNKNOWN_WIT_ITEM`, `PRIVATE_ITEM`, `INACTIVE_DEPENDENCY` (below); before Stage 3, a declared dependency is `FEATURE_NOT_IMPLEMENTED`. `MODULE_INTERFACE_CONFLICT` is reported in Phase 1 of the defining package, on the interface declaration. Package and member-name suggestions follow the edit-distance rule of [impl/11](11-diagnostics.md) (N-H-5) where spec/04 calls for those suggestions, except `UNKNOWN_PACKAGE`, whose fixed distance-2 cutoff is in spec/04 §4.3.2 step 1.4. `UNKNOWN_MODULE` is another exception: spec/04 §4.3.2 step 2.3 requires every direct child module below the longest matched prefix.
 2. **Foreign targets.** For a target in another package, `X(T)` is the `members` table of that package's `package_scopes`, which is final (spec/04 §4.5.4 Phase 2).
 3. **Local targets.** For a target in the current package, `lookup(T, y)` is evaluated with the memo. `InProgress` on entry means a cycle: every `pub use` binding on `stack` from the first occurrence of `(T, y)` to the top forms the cycle. If none of them was reported, `REEXPORT_CYCLE` is reported once, on the binding of the cycle that comes first in source order (file path order, then offset), with every other binding of the cycle as a related location. Every binding on the cycle gets `Res::Err`.
 4. **Item lists.** For each `UseItem` `x as y`: a missing member is `UNRESOLVED_IMPORT` (with the help of N-A-20 when `x` names a variant, field, method or associated item of a type in `X(T)`), an invisible member is `PRIVATE_ITEM`, a `pub use` of a non-`pub` entity is `PRIVATE_REEXPORT`, and a case mismatch between `x` and `y` is `ALIAS_CASE_MISMATCH`.
@@ -380,9 +380,10 @@ keeps the first source-order occurrence of a repeated identity, preserves
 `only` targets in manifest order, and retains `requires test` entries for
 dependency manifests. Each normalized entry carries the ordinal of its first
 requirement occurrence so equal-ranked package suggestions can follow manifest
-declaration order without changing the query's identity-sorted result. It parses with a zero retained-diagnostic limit, rejects
-recovered entries from syntactically invalid manifests, and verifies that a
-valid manifest header matches the package identity and compatibility line.
+declaration order without changing the query's identity-sorted result. It
+parses with a zero retained-diagnostic limit, rejects recovered entries from
+syntactically invalid manifests, and verifies that a valid manifest header
+matches the package identity and compatibility line.
 Requirement identities and target names stay as strings in the cached value
 so it does not retain session-local symbols; the resolver can intern target
 names when it consumes this value. Manifest diagnostics remain owned by the
@@ -405,9 +406,40 @@ establish only that a declared ordinary dependency is excluded from the
 requested target. It emits `INACTIVE_DEPENDENCY` on the complete `PKG_PATH`,
 preserves manifest target order in help, and suppresses item lookup. Its alias
 and item bindings retain `Res::Err` for later references while still
-participating in duplicate checks. Confirming an active edge before this
-diagnostic, then falling through to `UNKNOWN_PACKAGE` when appropriate,
-requires the future package-graph query.
+participating in duplicate checks. It cannot confirm an active edge; the
+package-graph query is still needed to distinguish one from an unresolved
+dependency edge.
+
+**Other foreign package identities (IR-473).** After the current-package,
+toolchain-package, and test-only cases above, a valid manifest permits the
+temporary adapter to classify an external `PKG_PATH` by its identity. A
+target-allowed declared dependency is `FEATURE_NOT_IMPLEMENTED` at the package
+identity span, with `data.stage = 3` and `data.feature = "dependencies"`.
+Before this diagnostic, a declared ordinary requirement whose `only` list
+excludes the target remains `INACTIVE_DEPENDENCY` on the complete path. If no
+requirement declares the identity, it is `UNKNOWN_PACKAGE` at the identity
+span. The seven toolchain WASI identities (`wasi:cli`, `wasi:clocks`,
+`wasi:filesystem`, `wasi:http`, `wasi:io`, `wasi:random`, and `wasi:sockets`)
+remain known Stage 4 WIT packages, along with `sai:core` and `sai:alloc`;
+their scopes are still deferred.
+
+`UNKNOWN_PACKAGE` stores the written identity as `data.name` and its candidate
+identities as `data.candidates`, including when that list is empty. Candidates
+are declared requirements (including `requires test`) within
+Damerau–Levenshtein distance 2, ordered by distance and then first declaration
+order, with byte spelling as a deterministic final tie-breaker and at most 10
+entries. This fixed distance cutoff from spec/04 §4.3.2 step 1.4 takes
+precedence over impl/11 §11.4.5's general small-candidate-set rule: a distant
+identity is not listed just because the manifest has few requirements. A
+nonempty list is also shown in a help child.
+
+The adapter suppresses suffix, module, and member lookup after either
+classification error. It retains the syntax-derived alias and item names as
+`Res::Err` bindings for `DUPLICATE_BINDING`, without treating them as
+`REDUNDANT_IMPORT` or `SHADOWS_PRELUDE`. An absent or invalid manifest remains
+distinct from a valid empty requirement list: with no valid list, foreign
+identities stay deferred; with a valid empty list, an undeclared identity is
+`UNKNOWN_PACKAGE`.
 
 **Test-only uses** ([spec/14](../spec/14-testing.md) §14.2.5, N-E-65). A `UseEntry` is **test-only** when the `ns:pkg` part of its `PKG_PATH` is the identity of an entry with `test = true` in `declared_requirements(P)`. This is read in every build, also for a dependency, whose test edges are never in the graph. Test analysis is **active for `P`** when `build_config` has test code active ([impl/01](01-architecture.md) §1.1.1) and `P` is one of the packages selected for test analysis (the `tests` list of [impl/08](08-effect-and-capability-analysis.md) §8.7.1). Before step 1, Phase 2 classifies every test-only entry in source order:
 
@@ -417,7 +449,10 @@ requires the future package-graph query.
 4. Otherwise the entry is not resolved: no package lookup is made and no diagnostic of steps 1 to 4 is reported for it. Each of its bindings (spec/04 §4.3.3, §4.3.4, which depend only on the syntax) is an import binding with `Res::TestOnly(import)`, a resolution that is never equal to any other entity, so Phase 3 reports `DUPLICATE_BINDING` against it but never `REDUNDANT_IMPORT`.
 
 The current adapter implements classification for the root manifest, the
-no-test-analysis sentinel in item 4, and the non-root diagnostic in item 3.
+no-test-analysis sentinel in item 4, the non-root diagnostic in item 3, and
+foreign identity classification for a valid requirement list. For root test
+analysis, a target-allowed declared test dependency reaches the Stage 3
+dependency gate; an excluded test edge remains `INACTIVE_DEPENDENCY`.
 `Phase1BuildContext::is_root_package` records whether package graph edges are
 available to this package; it is separate from manifest `PackageRole` and the
 artifact flags, and is part of the tracked package-scope query identity. The
@@ -428,8 +463,9 @@ before target-restriction checks, while its syntax-derived names retain unique
 `Phase1BuildContext::analyzes_tests` input controls test-edge target
 restrictions independently of `is_test_build`; `sai check --tests` enables
 test analysis but does not mark a test-build artifact. For root test analysis,
-foreign package resolution still cannot complete because active test edges and
-foreign scopes are not wired. A test-only `pub use` is diagnosed at its
+the adapter classifies a target-allowed declared test dependency at the Stage 3
+gate, but does not verify its edge or resolve its module/member tables. A
+test-only `pub use` is diagnosed at its
 `PKG_PATH` and excluded from local re-export lookup in either mode. Every
 binding introduced by a test-only entry has `ImportBinding::test_only = true`.
 Checking ordinary references to these bindings at their use site, including

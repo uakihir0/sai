@@ -236,6 +236,8 @@ Candidate lists in `data` (and in help messages) are ordered by increasing edit 
 
 `name` is the exact spelling the user wrote. `candidates` contains at most 10 registered lint codes within Damerau–Levenshtein distance 2, ordered by distance and then by their declaration order in spec/15 §15.17.2. A case-only correction is represented by the diagnostic's machine-applicable fix, not by adding a case variant to `candidates`.
 
+`UNKNOWN_PACKAGE` uses the same `name` and `candidates` data shape, including an empty candidate array. Its candidates are declared package identities within Damerau–Levenshtein distance 2, as fixed by spec/04 §4.3.2 step 1.4. This exact cutoff takes precedence over the general relative threshold and small-set rule above; candidates are ordered by distance and first manifest declaration order, then capped at 10.
+
 ### 11.4.6 Internal compiler errors
 
 When a component of the toolchain detects a violated internal invariant or panics, the toolchain reports the hard error `INTERNAL_COMPILER_ERROR` (defined in [01-introduction.md](../spec/01-introduction.md) §1.10; this section defines only how it is reported) and stops the command with exit code 101 ([13-cli.md](13-cli.md) §13.3.4). Its message is `internal compiler error: <description>`. Its `data` object has the fields `component` (string, the crate name), `panic_message` (string), `query_stack` (array of strings, innermost first), and `compiler_version` (string). It has a `primary` location if the failing query concerned a source range, and `null` otherwise. Diagnostics produced before the failure are still emitted, in the order of §11.11.1, before the `INTERNAL_COMPILER_ERROR` record.
