@@ -600,9 +600,11 @@ fn run_check(
                 .as_deref()
                 .expect("a syntax-valid package has a retained manifest snapshot"),
             check_target_override(command),
+            check_profile_override(command),
             command_tail(command)
                 .iter()
                 .any(|(argument, _)| argument == "--tests"),
+            check_offline_mode(command),
             root_identity.as_deref(),
             include_source_lines,
             cancellation,
@@ -1290,6 +1292,37 @@ fn check_target_override(command: &crate::args::ParsedCommand) -> Option<String>
     None
 }
 
+fn check_profile_override(command: &crate::args::ParsedCommand) -> Option<String> {
+    let tail = command_tail(command);
+    let mut index = 0;
+    while index < tail.len() {
+        let argument = tail[index].0.to_str()?;
+        if argument == "--" {
+            break;
+        }
+        if let Some(profile) = argument.strip_prefix("--profile=") {
+            return Some(profile.to_owned());
+        }
+        if argument == "--profile" {
+            return tail.get(index + 1)?.0.to_str().map(str::to_owned);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn check_offline_mode(command: &crate::args::ParsedCommand) -> bool {
+    for (argument, _) in command_tail(command) {
+        if argument == "--" {
+            break;
+        }
+        if matches!(argument.to_str(), Some("--offline" | "--frozen")) {
+            return true;
+        }
+    }
+    false
+}
+
 fn check_target_not_declared_diagnostic(target: &str) -> CheckDiagnostic {
     let mut data = ValueObject::new();
     data.insert("target".to_owned(), Value::String(target.to_owned()));
@@ -1635,7 +1668,9 @@ fn check_locked_preflight(
     cwd: &Path,
     manifest_source: &[u8],
     target_override: Option<String>,
+    profile_override: Option<String>,
     analyzes_tests: bool,
+    offline: bool,
     package_identity: Option<&str>,
     include_source_lines: bool,
     cancellation: &CancellationToken,
@@ -1807,7 +1842,7 @@ fn check_locked_preflight(
     let canonical = sai_package::lock_serialization::is_canonical(&lock_source)
         .expect("a locally valid lock parses and serializes");
     let mut diagnostics = Vec::new();
-    let warnings = usize::from(!canonical);
+    let mut warnings = usize::from(!canonical);
     if !canonical {
         diagnostics.push(check_lock_source_diagnostic(
             &lock_source,
@@ -2000,20 +2035,26 @@ fn check_locked_preflight(
         };
     }
 
-    let has_requirements = manifest.file().declarations.iter().any(|declaration| {
-        matches!(
-            &declaration.value,
-            sai_package::manifest::PackageDeclaration::Requires { entries, .. } if !entries.is_empty()
-        )
+    let has_root_edges = parsed_lock.file().root.as_ref().is_some_and(|root| {
+        root.value
+            .fields
+            .iter()
+            .any(|field| matches!(field.value, sai_package::lock::LockRootField::Requires(_)))
     });
-    let has_overrides = manifest.file().declarations.iter().any(|declaration| {
-        matches!(
-            &declaration.value,
-            sai_package::manifest::PackageDeclaration::Overrides(items) if !items.is_empty()
-        )
-    });
-    if !parsed_lock.file().packages.is_empty() || has_requirements || has_overrides {
-        diagnostics.push(check_incomplete_lock_analysis_diagnostic());
+    if parsed_lock.file().format_version.unwrap_or(1) == 1
+        && (!parsed_lock.file().packages.is_empty() || has_root_edges)
+    {
+        diagnostics.push(check_lock_source_diagnostic(
+            &lock_source,
+            &lock_display_path,
+            "LOCK_OUT_OF_DATE",
+            "dependency-bearing format-1 locks lack the source and grant metadata required for locked validation; run `sai lock` to migrate the lock".to_owned(),
+            0..0,
+            None,
+            None,
+            package_identity,
+            include_source_lines,
+        ));
         return CheckLockPreflight::Stop {
             diagnostics,
             errors: 1,
@@ -2021,15 +2062,122 @@ fn check_locked_preflight(
         };
     }
 
-    let empty_path_packages = std::collections::BTreeMap::new();
-    let empty_path_overrides = std::collections::BTreeMap::new();
+    let root_directory = match sai_package::local_source::LocalPackageDirectory::open(package_root)
+    {
+        Ok(directory) if directory.manifest_bytes().as_ref() == manifest_source => directory,
+        Ok(_) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "SOURCE_READ_FAILED",
+                "root package manifest changed while the locked graph was being validated"
+                    .to_owned(),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+        Err(_) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "SOURCE_READ_FAILED",
+                "could not capture the root package directory for locked path resolution"
+                    .to_owned(),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    let mut root_directories = sai_package::local_source::LocalPackageDirectoryIndex::default();
+    let root_package_version = match root_directories.index_root_directory(&root_directory) {
+        Ok(version) => version,
+        Err(_) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                "the captured root package manifest could not be indexed for path resolution"
+                    .to_owned(),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    let root_path_overrides = match root_directories.index_root_path_overrides(&root_directory) {
+        Ok(overrides) => overrides,
+        Err(_) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                "a current root path override could not be resolved".to_owned(),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    let root_path_packages = match root_directories
+        .index_root_path_requirements(&root_directory, &root_path_overrides)
+    {
+        Ok(packages) => packages,
+        Err(_) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                "a current root path requirement could not be resolved".to_owned(),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
     let context = match sai_package::resolver_contract::ResolverContractContext::from_root_manifest(
         manifest,
-        &empty_path_packages,
-        &empty_path_overrides,
+        &root_path_packages,
+        &root_path_overrides,
         validation_context,
     ) {
-        Ok(context) => context,
+        Ok(context) => context.into_owned(),
         Err(error) => {
             diagnostics.push(check_lock_source_diagnostic(
                 &lock_source,
@@ -2074,6 +2222,139 @@ fn check_locked_preflight(
             };
         }
     };
+
+    let source_plans = match sai_package::lock_source_selection::plan_lock_source_selection(
+        &parsed_lock,
+        &context,
+    ) {
+        Ok(plans) => plans,
+        Err(sai_package::lock_source_selection::LockSourceSelectionInputError::FormatOneCannotSelectDependencySources) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                "dependency-bearing format-1 locks cannot prove the selected sources; run `sai lock` to migrate the lock".to_owned(),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+        Err(error) => {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                format!("complete locked source selection could not be planned: {error:?}"),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    };
+    let mut source_canonicalizer =
+        match sai_package::lock_source_canonicalizer::LockSourceIdentityCanonicalizer::new(
+            root_directory,
+            root_package_version,
+            &parsed_lock,
+        ) {
+            Ok(canonicalizer) => canonicalizer,
+            Err(error) => {
+                diagnostics.push(check_lock_source_diagnostic(
+                    &lock_source,
+                    &lock_display_path,
+                    "LOCK_OUT_OF_DATE",
+                    format!("locked source records could not be checked: {error:?}"),
+                    0..0,
+                    None,
+                    None,
+                    package_identity,
+                    include_source_lines,
+                ));
+                return CheckLockPreflight::Stop {
+                    diagnostics,
+                    errors: 1,
+                    warnings,
+                };
+            }
+        };
+    for plan in &source_plans {
+        if let Err(error) = sai_package::lock_source_selection::validate_lock_source_plan(
+            plan,
+            &mut source_canonicalizer,
+        ) {
+            let (message, span) = match &error {
+                sai_package::lock_source_selection::LockSourceSelectionCheckError::PinCanonicalization {
+                    pin, ..
+                } => (
+                    format!(
+                        "a current path pin for {} could not be resolved",
+                        locked_package_version_label(&plan.package_version)
+                    ),
+                    pin.span.clone(),
+                ),
+                sai_package::lock_source_selection::LockSourceSelectionCheckError::EntryCanonicalization {
+                    ..
+                } => (
+                    format!(
+                        "the selected lock source for {} could not be resolved",
+                        locked_package_version_label(&plan.package_version)
+                    ),
+                    0..0,
+                ),
+                sai_package::lock_source_selection::LockSourceSelectionCheckError::ConflictingPathPins {
+                    first,
+                    conflicting,
+                } => (
+                    format!(
+                        "current path pins for {} select different sources",
+                        locked_package_version_label(&plan.package_version)
+                    ),
+                    first.span.start.min(conflicting.span.start)
+                        ..first.span.end.max(conflicting.span.end),
+                ),
+                sai_package::lock_source_selection::LockSourceSelectionCheckError::SourceMismatch {
+                    ..
+                } => (
+                    format!(
+                        "locked source for {} differs from the source selected by the current root contract",
+                        locked_package_version_label(&plan.package_version)
+                    ),
+                    0..0,
+                ),
+            };
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_OUT_OF_DATE",
+                message,
+                span,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+    }
+
     let active_graph = match sai_package::lock_active_graph::build_lock_active_graph(
         &root_contract,
         &parsed_lock,
@@ -2100,9 +2381,482 @@ fn check_locked_preflight(
             };
         }
     };
+    let root_targets = declared_targets
+        .iter()
+        .map(|target| target.as_str().into())
+        .collect::<std::collections::BTreeSet<_>>();
+    let active_versions = active_graph
+        .packages
+        .iter()
+        .map(|node| {
+            sai_package::mvs::MvsPackageVersion::new(node.package.clone(), node.version.clone())
+                .expect("the validated active graph contains valid package identities")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut dependency_metadata = std::collections::BTreeMap::new();
+    let mut package_cache = None;
+    for plan in &source_plans {
+        let pinned = !plan.path_pins.is_empty();
+        let active = active_versions.contains(&plan.package_version);
+        let package_label = locked_package_version_label(&plan.package_version);
+        if !pinned && !active {
+            continue;
+        }
+        let Some(lock_entry) = parsed_lock.file().packages.iter().find(|entry| {
+            entry.value.package.as_ref() == plan.package_version.package()
+                && entry.value.version == *plan.package_version.version()
+        }) else {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                "LOCK_CORRUPT",
+                format!("locked package entry for {} is missing", package_label),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        };
+        let dependency_directory = match &plan.actual.source {
+            sai_package::lock::LockSource::Path(_) => {
+                use sai_package::lock_source_selection::LockSourceCanonicalizer as _;
+                let directory = source_canonicalizer
+                    .canonicalize_entry(&plan.actual)
+                    .ok()
+                    .and_then(|_| source_canonicalizer.local_directory(&plan.package_version))
+                    .cloned();
+                let Some(directory) = directory else {
+                    diagnostics.push(check_lock_source_diagnostic(
+                        &lock_source,
+                        &lock_display_path,
+                        "LOCK_OUT_OF_DATE",
+                        format!(
+                            "current local source for {} could not be opened",
+                            package_label
+                        ),
+                        0..0,
+                        None,
+                        None,
+                        package_identity,
+                        include_source_lines,
+                    ));
+                    return CheckLockPreflight::Stop {
+                        diagnostics,
+                        errors: 1,
+                        warnings,
+                    };
+                };
+                directory
+            }
+            sai_package::lock::LockSource::Git(_) => {
+                if package_cache.is_none() {
+                    let cache = sai_package::package_cache::cache_directory_from_environment()
+                        .and_then(sai_package::package_cache::PackageCache::open);
+                    match cache {
+                        Ok(cache) => package_cache = Some(cache),
+                        Err(_) => {
+                            diagnostics.push(check_lock_source_diagnostic(
+                                &lock_source,
+                                &lock_display_path,
+                                "SOURCE_READ_FAILED",
+                                "could not open the verified package cache".to_owned(),
+                                0..0,
+                                None,
+                                None,
+                                package_identity,
+                                include_source_lines,
+                            ));
+                            return CheckLockPreflight::Stop {
+                                diagnostics,
+                                errors: 1,
+                                warnings,
+                            };
+                        }
+                    }
+                }
+                let cache = package_cache.as_ref().expect("initialized package cache");
+                let loaded = if pinned {
+                    let identity =
+                        sai_package::git_remote::GitPackageSourceIdentity::from_locked_source(
+                            &plan.actual,
+                        );
+                    match identity {
+                        Ok(identity) => {
+                            sai_package::git_remote::fetch_locked_git_path_package_to_cache(
+                                &lock_entry.value,
+                                &identity,
+                                cache,
+                                offline,
+                            )
+                        }
+                        Err(error) => {
+                            Err(sai_package::git_remote::LockedPackageCacheFetchError::Fetch(error))
+                        }
+                    }
+                } else {
+                    sai_package::git_remote::fetch_locked_package_to_cache(
+                        &lock_entry.value,
+                        cache,
+                        offline,
+                    )
+                };
+                match loaded {
+                    Ok(loaded) => {
+                        if let sai_package::git_remote::LockedPackageCacheStatus::RepairedCorrupt {
+                            actual_checksum,
+                        } = loaded.status()
+                        {
+                            diagnostics.push(check_cache_corrupt_warning(
+                                &plan.package_version,
+                                actual_checksum.as_deref(),
+                                package_identity,
+                            ));
+                            warnings = warnings.saturating_add(1);
+                        }
+                        match sai_package::local_source::LocalPackageDirectory::open(
+                            loaded.source().path(),
+                        ) {
+                            Ok(directory) => directory,
+                            Err(_) => {
+                                diagnostics.push(check_lock_source_diagnostic(
+                                    &lock_source,
+                                    &lock_display_path,
+                                    "LOCK_CORRUPT",
+                                    format!(
+                                        "verified cached source for {} has no readable package manifest",
+                                        package_label
+                                    ),
+                                    0..0,
+                                    None,
+                                    None,
+                                    package_identity,
+                                    include_source_lines,
+                                ));
+                                return CheckLockPreflight::Stop {
+                                    diagnostics,
+                                    errors: 1,
+                                    warnings,
+                                };
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if error.cache_corruption_notice().is_some() {
+                            diagnostics.push(check_cache_corrupt_warning(
+                                &plan.package_version,
+                                error
+                                    .cache_corruption_notice()
+                                    .and_then(|notice| notice.actual_checksum()),
+                                package_identity,
+                            ));
+                            warnings = warnings.saturating_add(1);
+                        }
+                        let code = error
+                            .diagnostic_code()
+                            .map_or("FETCH_FAILED", sai_diagnostics::Code::as_str);
+                        let message = match &error {
+                            sai_package::git_remote::LockedPackageCacheFetchError::OfflineFetchRequired {
+                                package,
+                                url,
+                                commit,
+                            } => format!(
+                                "locked package {package} from {url} at commit {commit} is not available in the verified cache"
+                            ),
+                            _ => format!(
+                                "could not verify locked source for {} ({})",
+                                package_label, code
+                            ),
+                        };
+                        diagnostics.push(check_lock_source_diagnostic(
+                            &lock_source,
+                            &lock_display_path,
+                            code,
+                            message,
+                            0..0,
+                            None,
+                            None,
+                            package_identity,
+                            include_source_lines,
+                        ));
+                        return CheckLockPreflight::Stop {
+                            diagnostics,
+                            errors: 1,
+                            warnings,
+                        };
+                    }
+                }
+            }
+        };
+        let dependency_manifest =
+            dependency_directory.parse_manifest(sai_package::manifest::PackageRole::Dependency);
+        let contract_mismatch_code = check_locked_contract_mismatch_code(&plan.actual.source);
+        if !dependency_manifest.is_syntax_valid() {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                contract_mismatch_code,
+                format!(
+                    "current package contract for {} is not syntactically valid",
+                    package_label
+                ),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+        let validation = sai_package::validation::validate(
+            &dependency_manifest,
+            sai_package::validation::PackageValidationContext::default(),
+        );
+        if !validation.is_valid() {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                contract_mismatch_code,
+                format!(
+                    "current package contract for {} is semantically invalid",
+                    package_label
+                ),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+        let Some(header) = dependency_manifest.file().header.as_ref() else {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                contract_mismatch_code,
+                format!(
+                    "current package contract for {} has no package header",
+                    package_label
+                ),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        };
+        let found_version = sai_package::mvs::MvsPackageVersion::new(
+            header.value.identity.to_string(),
+            header.value.version.clone(),
+        )
+        .expect("the validated package header has a valid identity");
+        if found_version != plan.package_version {
+            diagnostics.push(check_lock_source_diagnostic(
+                &lock_source,
+                &lock_display_path,
+                contract_mismatch_code,
+                format!(
+                    "current source for {} contains package {}",
+                    package_label,
+                    locked_package_version_label(&found_version)
+                ),
+                0..0,
+                None,
+                None,
+                package_identity,
+                include_source_lines,
+            ));
+            return CheckLockPreflight::Stop {
+                diagnostics,
+                errors: 1,
+                warnings,
+            };
+        }
+        if pinned || active {
+            let compared = sai_package::lock_dependency_contract::compare(
+                &dependency_manifest,
+                lock_entry,
+                &root_targets,
+            );
+            match compared {
+                Ok(comparison) if !comparison.matches_contract() => {
+                    let description = if pinned {
+                        "current path-pinned package contract"
+                    } else {
+                        "current active package contract"
+                    };
+                    let message =
+                        format!("{description} for {package_label} differs from the lock");
+                    diagnostics.push(check_lock_source_diagnostic(
+                        &lock_source,
+                        &lock_display_path,
+                        contract_mismatch_code,
+                        message,
+                        0..0,
+                        None,
+                        None,
+                        package_identity,
+                        include_source_lines,
+                    ));
+                    return CheckLockPreflight::Stop {
+                        diagnostics,
+                        errors: 1,
+                        warnings,
+                    };
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    diagnostics.push(check_lock_source_diagnostic(
+                        &lock_source,
+                        &lock_display_path,
+                        contract_mismatch_code,
+                        format!(
+                            "current package contract for {} could not be compared with the lock",
+                            package_label
+                        ),
+                        0..0,
+                        None,
+                        None,
+                        package_identity,
+                        include_source_lines,
+                    ));
+                    return CheckLockPreflight::Stop {
+                        diagnostics,
+                        errors: 1,
+                        warnings,
+                    };
+                }
+            }
+        }
+        if active {
+            let active_validation = sai_package::validation::validate(
+                &dependency_manifest,
+                sai_package::validation::PackageValidationContext {
+                    compiler_version: Some(&toolchain_version),
+                },
+            );
+            if let Some(error) =
+                active_validation.errors.iter().find(|error| {
+                    matches!(
+                    error.kind,
+                    sai_package::validation::PackageValidationErrorKind::CompilerVersionMismatch {
+                        ..
+                    }
+                )
+                })
+            {
+                let sai_package::validation::PackageValidationErrorKind::CompilerVersionMismatch {
+                    requirement,
+                    found,
+                } = &error.kind
+                else {
+                    unreachable!("selected compiler validation error");
+                };
+                let dependency_package = format!(
+                    "{}@{}",
+                    plan.package_version.package(),
+                    plan.package_version.version()
+                );
+                let dependency_manifest_path = format!("dep:{dependency_package}/sai.package");
+                let dependency_manifest_source = dependency_directory.manifest_bytes();
+                diagnostics.push(check_lock_source_diagnostic(
+                    &dependency_manifest_source,
+                    &dependency_manifest_path,
+                    "COMPILER_VERSION_MISMATCH",
+                    format!(
+                        "package {package_label} requires compiler {requirement}, but this toolchain is {found}"
+                    ),
+                    error.span.clone(),
+                    None,
+                    None,
+                    Some(&dependency_package),
+                    include_source_lines,
+                ));
+                return CheckLockPreflight::Stop {
+                    diagnostics,
+                    errors: 1,
+                    warnings,
+                };
+            }
+        }
+        if active {
+            if !manifest_target_names(&dependency_manifest)
+                .iter()
+                .any(|target| target == &selected_target)
+            {
+                diagnostics.push(check_lock_source_diagnostic(
+                    &lock_source,
+                    &lock_display_path,
+                    "TARGET_NOT_SUPPORTED_BY_DEPENDENCY",
+                    format!(
+                        "active dependency {} does not declare target `{selected_target}`",
+                        package_label
+                    ),
+                    0..0,
+                    None,
+                    None,
+                    package_identity,
+                    include_source_lines,
+                ));
+                return CheckLockPreflight::Stop {
+                    diagnostics,
+                    errors: 1,
+                    warnings,
+                };
+            }
+            let metadata = match check_locked_package_metadata(
+                manifest,
+                &dependency_manifest,
+                &selected_target,
+                profile_override.as_deref().unwrap_or("dev"),
+            ) {
+                Ok(metadata) => metadata,
+                Err(form_errors) => {
+                    let errors = form_errors.len();
+                    diagnostics.extend(form_errors.into_iter().map(|error| {
+                        check_lock_source_diagnostic(
+                            manifest_source,
+                            "sai.package",
+                            error.code,
+                            error.message,
+                            error.span,
+                            None,
+                            None,
+                            package_identity,
+                            include_source_lines,
+                        )
+                    }));
+                    return CheckLockPreflight::Stop {
+                        diagnostics,
+                        errors,
+                        warnings,
+                    };
+                }
+            };
+            dependency_metadata.insert(plan.package_version.clone(), metadata);
+        }
+    }
     let graph = match sai_driver::package_graph::PackageGraph::from_lock_active_graph(
         &active_graph,
-        &std::collections::BTreeMap::new(),
+        &dependency_metadata,
         toolchain_version,
     ) {
         Ok(graph) => graph,
@@ -2162,6 +2916,157 @@ fn check_lock_source_diagnostic(
         related: Vec::new(),
         children: Vec::new(),
     }
+}
+
+fn check_cache_corrupt_warning(
+    package: &sai_package::mvs::MvsPackageVersion,
+    actual_checksum: Option<&str>,
+    root_package_identity: Option<&str>,
+) -> CheckDiagnostic {
+    let checksum = actual_checksum
+        .map(|checksum| format!(" (observed checksum {checksum})"))
+        .unwrap_or_default();
+    CheckDiagnostic {
+        diagnostic: CliDiagnostic {
+            code: "CACHE_CORRUPT",
+            message: format!(
+                "cached source for {} was corrupt and has been removed{checksum}",
+                locked_package_version_label(package)
+            ),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        },
+        severity: sai_diagnostics::Severity::Warning,
+        package: root_package_identity.map(str::to_owned),
+        related: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
+fn locked_package_version_label(package: &sai_package::mvs::MvsPackageVersion) -> String {
+    format!("{} @ {}", package.package(), package.version())
+}
+
+fn check_locked_contract_mismatch_code(source: &sai_package::lock::LockSource) -> &'static str {
+    match source {
+        sai_package::lock::LockSource::Git(_) => "LOCK_CORRUPT",
+        sai_package::lock::LockSource::Path(_) => "LOCK_OUT_OF_DATE",
+    }
+}
+
+#[derive(Debug)]
+struct CheckLockedPackageFormError {
+    code: &'static str,
+    message: String,
+    span: std::ops::Range<usize>,
+}
+
+fn check_locked_package_metadata(
+    root_manifest: &sai_package::manifest::PackageParseOutput,
+    dependency_manifest: &sai_package::manifest::PackageParseOutput,
+    target: &str,
+    profile: &str,
+) -> Result<sai_driver::package_graph::LockActivePackageMetadata, Vec<CheckLockedPackageFormError>>
+{
+    use sai_driver::package_graph::{LockActivePackageMetadata, PackageForm, PackageGraphRole};
+    use sai_package::manifest::{OverrideSource, PackageDeclaration};
+
+    let has_source = dependency_manifest
+        .file()
+        .declarations
+        .iter()
+        .any(|declaration| matches!(declaration.value, PackageDeclaration::Source(_)));
+    let artifacts = dependency_manifest
+        .file()
+        .declarations
+        .iter()
+        .flat_map(|declaration| match &declaration.value {
+            PackageDeclaration::ArtifactComponents(entries) => entries.iter().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let has_artifacts = !artifacts.is_empty();
+    let package_identity = dependency_manifest
+        .file()
+        .header
+        .as_ref()
+        .map(|header| header.value.identity.to_string())
+        .unwrap_or_default();
+    let artifact_override_span = root_manifest
+        .file()
+        .declarations
+        .iter()
+        .filter_map(|declaration| match &declaration.value {
+            PackageDeclaration::Overrides(overrides) => Some(overrides.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|override_| {
+            (override_.value.package.as_ref() == package_identity
+                && matches!(override_.value.source, OverrideSource::Artifact))
+            .then(|| override_.span.clone())
+        });
+    let allocator_span = root_manifest
+        .file()
+        .declarations
+        .iter()
+        .find_map(|declaration| match &declaration.value {
+            PackageDeclaration::Allocator(identity) if identity.as_ref() == package_identity => {
+                Some(declaration.span.clone())
+            }
+            _ => None,
+        });
+    let root_uses_artifact = artifact_override_span.is_some();
+    let is_root_allocator = allocator_span.is_some();
+    let mut form_errors = Vec::new();
+    if root_uses_artifact && !(has_source && has_artifacts) {
+        form_errors.push(CheckLockedPackageFormError {
+            code: "INVALID_OVERRIDE",
+            message: format!(
+                "`use artifact` override for `{package_identity}` requires a hybrid package"
+            ),
+            span: artifact_override_span.expect("checked artifact override"),
+        });
+    }
+    if is_root_allocator && !has_source {
+        form_errors.push(CheckLockedPackageFormError {
+            code: "ALLOCATOR_INTERFACE_MISMATCH",
+            message: format!("allocator package `{package_identity}` must provide source code"),
+            span: allocator_span.expect("checked allocator declaration"),
+        });
+    }
+    if !form_errors.is_empty() {
+        form_errors.sort_by_key(|error| error.span.start);
+        return Err(form_errors);
+    }
+    let has_target_artifact = artifacts
+        .iter()
+        .any(|artifact| artifact.value.target.as_ref() == target);
+    let is_core_target = target.ends_with("-core");
+
+    let form = if !has_source {
+        PackageForm::Artifact
+    } else if !has_artifacts {
+        PackageForm::Source
+    } else if profile == "tiny"
+        || is_core_target
+        || !has_target_artifact
+        || is_root_allocator
+        || !root_uses_artifact
+    {
+        PackageForm::Source
+    } else {
+        PackageForm::Artifact
+    };
+
+    Ok(LockActivePackageMetadata {
+        form,
+        role: PackageGraphRole::Dependency,
+    })
 }
 
 fn lock_parse_diagnostic(
@@ -2346,21 +3251,6 @@ fn check_package_validation_fields(
         Kind::CompilerVersionMismatch { .. } => "COMPILER_VERSION_MISMATCH",
     };
     (code, format!("invalid root package contract: {kind:?}"))
-}
-
-fn check_incomplete_lock_analysis_diagnostic() -> CheckDiagnostic {
-    check_cli_diagnostic(CliDiagnostic {
-        code: "FEATURE_NOT_IMPLEMENTED",
-        message: "stage 0 feature `sai check` cannot yet verify dependency package contracts and sources".to_owned(),
-        primary: None,
-        primary_label: String::new(),
-        argument_index: None,
-        argument: String::new(),
-        help: Some(
-            "dependency-bearing locked graphs are rejected before source analysis until every dependency contract and selected source can be verified".to_owned(),
-        ),
-        data: Some("{\"stage\":0,\"feature\":\"sai check\"}".to_owned()),
-    })
 }
 
 fn module_tree_check_diagnostics(
@@ -9679,7 +10569,7 @@ mod tests {
     }
 
     #[test]
-    fn check_locked_dependency_graph_fails_closed_before_source_analysis() {
+    fn check_locked_dependency_lock_v1_requires_migration() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
         let package_path = package.to_str().expect("package path is UTF-8");
@@ -9710,12 +10600,613 @@ mod tests {
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
         assert!(
-            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""),
             "unexpected locked dependency check output: {stdout}"
         );
-        assert!(stdout.contains("dependency package contracts and sources"));
+        assert!(stdout.contains("run `sai lock` to migrate the lock"));
         assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
         assert!(!stdout.contains("\"type\":\"result\""));
+    }
+
+    #[test]
+    fn check_locked_validates_active_local_path_dependency_offline() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!("{manifest}\nrequires {{ acme:dep @ ^1 from path \"dep\" }}\n"),
+        )
+        .expect("add local path requirement");
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write dependency contract");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n\npackage acme:dep @ 1.0.0\n    source path \"dep\"\n",
+        )
+        .expect("write format-2 path lock");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed root source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""), "{stdout}");
+        assert!(!stdout.contains("dependency package contracts and sources"));
+        assert!(!stdout.contains("\"code\":\"OFFLINE_FETCH_REQUIRED\""));
+        assert!(!stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""));
+    }
+
+    #[test]
+    fn check_locked_reports_compiler_mismatch_for_an_active_dependency() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!("{manifest}\nrequires {{ acme:dep @ ^1 from path \"dep\" }}\n"),
+        )
+        .expect("add local path dependency");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.0.0\ncompiler ^0.2\nsource \"src\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write a dependency requiring a newer toolchain");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n\npackage acme:dep @ 1.0.0\n    source path \"dep\"\n",
+        )
+        .expect("write format-2 path lock");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed root source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("\"code\":\"COMPILER_VERSION_MISMATCH\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("\"package\":\"acme:dep@1.0.0\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("dep:acme:dep@1.0.0/sai.package"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"LOCK_CORRUPT\""));
+        assert!(!stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+    }
+
+    #[test]
+    fn check_locked_reports_contract_mismatch_before_active_dependency_compiler_mismatch() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!("{manifest}\nrequires {{ acme:dep @ ^1 from path \"dep\" }}\n"),
+        )
+        .expect("add local path dependency");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.0.0\ncompiler ^0.2\nsource \"src\"\ntargets { wasm32-wasi }\nrequires { acme:other @ ^1 from path \"../other\" grant { alloc } }\n",
+        )
+        .expect("write an incompatible dependency with changed contract edges");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        let other = package.join("other");
+        fs::create_dir_all(other.join("src")).expect("create child dependency directory");
+        fs::write(
+            other.join("sai.package"),
+            "package acme:other @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write child dependency contract");
+        fs::write(other.join("src/lib.sai"), "pub fn other() {}\n")
+            .expect("write child dependency source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n\npackage acme:dep @ 1.0.0\n    source path \"dep\"\n    requires acme:other @ ^1 -> 1.0.0 from path \"../other\" grant { }\n\npackage acme:other @ 1.0.0\n    source path \"other\"\n",
+        )
+        .expect("write a lock with mismatched dependency grant metadata");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed root source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""), "{stdout}");
+        assert!(
+            stdout.contains(
+                "current path-pinned package contract for acme:dep @ 1.0.0 differs from the lock"
+            ),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"COMPILER_VERSION_MISMATCH\""));
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(!stdout.contains("\"code\":\"OFFLINE_FETCH_REQUIRED\""));
+    }
+
+    #[test]
+    fn check_locked_does_not_gate_inactive_dependency_compiler_compatibility() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        set_check_targets(&package, "wasm32-core, wasm32-wasi");
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{manifest}\nrequires {{ acme:dep @ ^1 from path \"dep\" only {{ wasm32-core }} }}\n"
+            ),
+        )
+        .expect("add a core-only local path dependency");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.0.0\ncompiler ^0.2\nsource \"src\"\ntargets { wasm32-core }\n",
+        )
+        .expect("write inactive dependency requiring a newer toolchain");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-core, wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\" only { wasm32-core }\n\npackage acme:dep @ 1.0.0\n    source path \"dep\"\n",
+        )
+        .expect("write format-2 path lock");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed root source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"EXPECTED_TOKEN\""), "{stdout}");
+        assert!(!stdout.contains("\"code\":\"COMPILER_VERSION_MISMATCH\""));
+        assert!(!stdout.contains("\"code\":\"LOCK_CORRUPT\""));
+        assert!(!stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""));
+    }
+
+    #[test]
+    fn check_locked_compares_inactive_path_pinned_dependency_contracts() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        set_check_targets(&package, "wasm32-core, wasm32-wasi");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{manifest}\nrequires {{ acme:dep @ ^1 from path \"dep\" only {{ wasm32-core }} }}\n"
+            ),
+        )
+        .expect("add inactive local path requirement");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-core, wasm32-wasi }\nrequires { acme:other @ ^1 from path \"../other\" grant { alloc } }\n",
+        )
+        .expect("write dependency contract");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        let other = package.join("other");
+        fs::create_dir_all(other.join("src")).expect("create sibling source directory");
+        fs::write(
+            other.join("sai.package"),
+            "package acme:other @ 1.0.0\nsource \"src\"\ntargets { wasm32-core, wasm32-wasi }\n",
+        )
+        .expect("write sibling contract");
+        fs::write(other.join("src/lib.sai"), "pub fn other() {}\n").expect("write sibling source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-core, wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\" only { wasm32-core }\n\npackage acme:dep @ 1.0.0\n    source path \"dep\"\n    requires acme:other @ ^1 -> 1.0.0 from path \"../other\" grant { }\n\npackage acme:other @ 1.0.0\n    source path \"other\"\n",
+        )
+        .expect("write lock with a mismatched pinned dependency edge");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed root source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""), "{stdout}");
+        assert!(
+            stdout.contains(
+                "current path-pinned package contract for acme:dep @ 1.0.0 differs from the lock"
+            ),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(!stdout.contains("\"code\":\"OFFLINE_FETCH_REQUIRED\""));
+    }
+
+    #[test]
+    fn check_locked_rejects_recorded_edges_excluded_from_every_root_target() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!("{manifest}\nrequires {{ acme:dep @ ^1 from path \"dep\" }}\n"),
+        )
+        .expect("add local path requirement");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-core, wasm32-wasi }\nrequires { acme:stale @ ^1 from git \"https://example.com/acme/stale\" only { wasm32-core } }\n",
+        )
+        .expect("write dependency contract");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n\npackage acme:dep @ 1.0.0\n    source path \"dep\"\n    requires acme:stale @ ^1 -> 1.0.0 from git \"https://example.com/acme/stale\" only { wasm32-core }\n\npackage acme:stale @ 1.0.0\n    source git \"https://example.com/acme/stale\"\n    commit \"0000000000000000000000000000000000000000\"\n    checksum \"sai1:0000000000000000000000000000000000000000000000000000000000000000\"\n    capabilities { }\n",
+        )
+        .expect("write lock retaining an excluded dependency edge");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed root source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""), "{stdout}");
+        assert!(stdout.contains("ExcludedEdgeForRootTargets"), "{stdout}");
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(!stdout.contains("\"code\":\"OFFLINE_FETCH_REQUIRED\""));
+    }
+
+    #[test]
+    fn check_locked_classifies_a_changed_local_lock_floor_as_out_of_date() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{manifest}\nrequires {{ acme:dep @ ^1 from git \"https://example.com/acme/dep\" }}\n"
+            ),
+        )
+        .expect("add named Git requirement whose selected source comes from the lock floor");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.1.0\nsource \"src\"\n",
+        )
+        .expect("write semantically invalid local lock-floor contract");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.1.0 from git \"https://example.com/acme/dep\"\n\npackage acme:dep @ 1.1.0\n    source path \"dep\"\n",
+        )
+        .expect("write lock retaining a local path floor");
+        fs::write(package.join("src/lib.sai"), b"fn {\n").expect("write malformed root source");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"LOCK_OUT_OF_DATE\""), "{stdout}");
+        assert!(
+            stdout
+                .contains("current package contract for acme:dep @ 1.1.0 is semantically invalid"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("\"code\":\"EXPECTED_TOKEN\""));
+        assert!(!stdout.contains("\"code\":\"OFFLINE_FETCH_REQUIRED\""));
+    }
+
+    #[test]
+    fn check_locked_rejects_an_artifact_only_allocator_package() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{manifest}\nrequires {{ acme:allocator @ ^1 from path \"dep\" }}\nallocator acme:allocator\n"
+            ),
+        )
+        .expect("add artifact-only allocator dependency");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("wit")).expect("create dependency WIT directory");
+        fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:allocator @ 1.0.0\nwit \"wit\"\nexport world allocator\ntargets { wasm32-wasi }\nartifact component { wasm32-wasi \"dist/allocator.wasm\" }\n",
+        )
+        .expect("write artifact-only allocator contract");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:allocator @ ^1 -> 1.0.0 from path \"dep\"\n\npackage acme:allocator @ 1.0.0\n    source path \"dep\"\n",
+        )
+        .expect("write artifact-only allocator lock");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("\"code\":\"ALLOCATOR_INTERFACE_MISMATCH\""),
+            "{stdout}"
+        );
+        assert!(stdout.contains("\"path\":\"sai.package\""), "{stdout}");
+    }
+
+    #[test]
+    fn check_locked_rejects_use_artifact_on_a_source_only_package() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let manifest = fs::read_to_string(&manifest_path).expect("read root manifest fixture");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{manifest}\nrequires {{ acme:dep @ ^1 from path \"dep\" }}\noverrides {{ acme:dep use artifact }}\n"
+            ),
+        )
+        .expect("add an invalid artifact override");
+
+        let dependency = package.join("dep");
+        fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+        fs::write(
+            dependency.join("sai.package"),
+            "package acme:dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write source-only dependency contract");
+        fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n")
+            .expect("write dependency source");
+        fs::write(
+            package.join("sai.lock"),
+            "lock 2\n\nroot acme:check @ 0.1.0\n    targets { wasm32-wasi }\n    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n\npackage acme:dep @ 1.0.0\n    source path \"dep\"\n",
+        )
+        .expect("write source-only dependency lock");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("\"code\":\"INVALID_OVERRIDE\""), "{stdout}");
+        assert!(stdout.contains("\"path\":\"sai.package\""), "{stdout}");
+    }
+
+    #[test]
+    fn locked_contract_mismatch_classification_tracks_source_kind() {
+        assert_eq!(
+            super::check_locked_contract_mismatch_code(&sai_package::lock::LockSource::Git(
+                "https://example.com/acme/dep".into()
+            )),
+            "LOCK_CORRUPT"
+        );
+        assert_eq!(
+            super::check_locked_contract_mismatch_code(&sai_package::lock::LockSource::Path(
+                "dep".into()
+            )),
+            "LOCK_OUT_OF_DATE"
+        );
+    }
+
+    #[test]
+    fn locked_package_form_selection_applies_profile_target_override_and_allocator_rules() {
+        let root = sai_package::manifest::parse_for_role(
+            b"package acme:root @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi, wasm32-core }\n",
+            sai_package::manifest::PackageRole::Root,
+        );
+        let artifact_override_root = sai_package::manifest::parse_for_role(
+            b"package acme:root @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi, wasm32-core }\nrequires { acme:dep @ ^1 }\noverrides { acme:dep use artifact }\n",
+            sai_package::manifest::PackageRole::Root,
+        );
+        let allocator_override_root = sai_package::manifest::parse_for_role(
+            b"package acme:root @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi, wasm32-core }\nrequires { acme:dep @ ^1 }\nallocator acme:dep\noverrides { acme:dep use artifact }\n",
+            sai_package::manifest::PackageRole::Root,
+        );
+        let hybrid = sai_package::manifest::parse_for_role(
+            b"package acme:dep @ 1.0.0\nsource \"src\"\nwit \"wit\"\nexport world dep\ntargets { wasm32-wasi, wasm32-core }\nartifact component { wasm32-wasi \"dist/dep.wasm\" }\n",
+            sai_package::manifest::PackageRole::Dependency,
+        );
+        let artifact_only = sai_package::manifest::parse_for_role(
+            b"package acme:artifact @ 1.0.0\nwit \"wit\"\nexport world artifact\ntargets { wasm32-wasi }\nartifact component { wasm32-wasi \"dist/artifact.wasm\" }\n",
+            sai_package::manifest::PackageRole::Dependency,
+        );
+        assert!(root.is_syntax_valid());
+        assert!(artifact_override_root.is_syntax_valid());
+        assert!(allocator_override_root.is_syntax_valid());
+        assert!(hybrid.is_syntax_valid());
+        assert!(artifact_only.is_syntax_valid());
+
+        use sai_driver::package_graph::PackageForm;
+        let form = |root, target, profile| {
+            super::check_locked_package_metadata(root, &hybrid, target, profile)
+                .expect("valid package form")
+                .form
+        };
+        assert_eq!(form(&root, "wasm32-wasi", "dev"), PackageForm::Source);
+        assert_eq!(
+            form(&artifact_override_root, "wasm32-wasi", "dev"),
+            PackageForm::Artifact
+        );
+        assert_eq!(
+            form(&artifact_override_root, "wasm32-wasi", "tiny"),
+            PackageForm::Source
+        );
+        assert_eq!(
+            form(&artifact_override_root, "wasm32-core", "release"),
+            PackageForm::Source
+        );
+        assert_eq!(
+            form(&allocator_override_root, "wasm32-wasi", "release"),
+            PackageForm::Source
+        );
+        assert_eq!(
+            super::check_locked_package_metadata(&root, &artifact_only, "wasm32-wasi", "tiny")
+                .expect("valid artifact-only package form")
+                .form,
+            PackageForm::Artifact
+        );
+    }
+
+    #[test]
+    fn locked_package_form_selection_rejects_invalid_allocator_and_artifact_override() {
+        let allocator_root = sai_package::manifest::parse_for_role(
+            b"package acme:root @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\nrequires { acme:artifact @ ^1 }\nallocator acme:artifact\n",
+            sai_package::manifest::PackageRole::Root,
+        );
+        let artifact_only = sai_package::manifest::parse_for_role(
+            b"package acme:artifact @ 1.0.0\nwit \"wit\"\nexport world artifact\ntargets { wasm32-wasi }\nartifact component { wasm32-wasi \"dist/artifact.wasm\" }\n",
+            sai_package::manifest::PackageRole::Dependency,
+        );
+        let override_root = sai_package::manifest::parse_for_role(
+            b"package acme:root @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\nrequires { acme:dep @ ^1 }\noverrides { acme:dep use artifact }\n",
+            sai_package::manifest::PackageRole::Root,
+        );
+        let source_only = sai_package::manifest::parse_for_role(
+            b"package acme:dep @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
+            sai_package::manifest::PackageRole::Dependency,
+        );
+        assert!(allocator_root.is_syntax_valid());
+        assert!(artifact_only.is_syntax_valid());
+        assert!(override_root.is_syntax_valid());
+        assert!(source_only.is_syntax_valid());
+
+        let allocator_errors = super::check_locked_package_metadata(
+            &allocator_root,
+            &artifact_only,
+            "wasm32-wasi",
+            "dev",
+        )
+        .expect_err("artifact-only package cannot be a root allocator");
+        assert_eq!(allocator_errors.len(), 1);
+        assert_eq!(allocator_errors[0].code, "ALLOCATOR_INTERFACE_MISMATCH");
+
+        let override_errors = super::check_locked_package_metadata(
+            &override_root,
+            &source_only,
+            "wasm32-wasi",
+            "dev",
+        )
+        .expect_err("use artifact requires a hybrid dependency");
+        assert_eq!(override_errors.len(), 1);
+        assert_eq!(override_errors[0].code, "INVALID_OVERRIDE");
     }
 
     #[test]
