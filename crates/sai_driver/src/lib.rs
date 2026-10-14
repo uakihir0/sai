@@ -25,8 +25,9 @@ use sai_package::mvs_diagnostics::{
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_resolve::package_scopes::{
-    FilteredModule, PackageScopesError, PackageUseRequirement, collect_local_module_alias_bindings,
-    collect_phase1, suppress_export_name_feature_gate,
+    FilteredModule, ForeignPackageScope, PackageScopesError, PackageUseRequirement,
+    collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
+    suppress_export_name_feature_gate,
 };
 pub use sai_resolve::package_scopes::{
     Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
@@ -303,6 +304,14 @@ struct Phase1PackageScopesIdentity {
     build_context: Phase1BuildContext,
     declared_requirements: Option<Vec<DeclaredRequirement>>,
     package_graph: Option<Phase1PackageGraphProjection>,
+    foreign_packages: Vec<Phase1ForeignPackageIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Phase1ForeignPackageIdentity {
+    visible_identity: String,
+    package_key: PackageKey,
+    input_fingerprint: Fingerprint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,6 +369,7 @@ struct PreparedPhase1PackageScopes {
     target_cfg: TargetCfg,
     build_context: Phase1BuildContext,
     declared_requirements: Option<Arc<[DeclaredRequirement]>>,
+    foreign_packages: Vec<Phase1ForeignPackageScopes>,
     modules: Vec<OwnedPhase1ModuleInput>,
     def_paths: Arc<DefPathInterner>,
 }
@@ -511,6 +521,16 @@ impl StableHash for Phase1PackageScopesIdentity {
         self.build_context.analyzes_tests.stable_hash(hasher);
         self.declared_requirements.stable_hash(hasher);
         self.package_graph.stable_hash(hasher);
+        self.foreign_packages.stable_hash(hasher);
+    }
+}
+
+impl StableHash for Phase1ForeignPackageIdentity {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xDB);
+        self.visible_identity.stable_hash(hasher);
+        self.package_key.stable_hash(hasher);
+        self.input_fingerprint.stable_hash(hasher);
     }
 }
 
@@ -756,6 +776,7 @@ pub enum Phase1CollectionError {
     SnapshotBoundDiagnosticHasFixes,
     Query(QueryError),
     DeclaredRequirements(DeclaredRequirementsError),
+    Package(PackageIdError),
     PackageGraphMissingNode(PackageKey),
     PackageGraphRequirementEdgeMismatch {
         package: PackageKey,
@@ -763,6 +784,33 @@ pub enum Phase1CollectionError {
         expected_active: bool,
         found_active: bool,
     },
+    ForeignPackageScopeMismatch {
+        package: PackageKey,
+        visible_identity: String,
+        target: PackageKey,
+    },
+}
+
+/// A finalized, direct source dependency scope available to one package's
+/// Phase 2–3 import resolution.
+///
+/// `visible_identity` and `package_key` come from the requiring package's
+/// exact active graph edge. The selected key is retained so query identity and
+/// graph validation never resolve a dependency by identity alone.
+#[derive(Clone, Debug)]
+pub struct Phase1ForeignPackageScopes {
+    pub visible_identity: String,
+    pub package_key: PackageKey,
+    pub module_tree: Arc<ModuleTree>,
+    pub scopes: Arc<Phase1PackageScopes>,
+    pub input_fingerprint: Fingerprint,
+}
+
+/// The finalized package scopes and their tracked input fingerprint.
+#[derive(Clone, Debug)]
+pub struct Phase1PackageScopesCollection {
+    pub scopes: Phase1PackageScopes,
+    pub input_fingerprint: Fingerprint,
 }
 
 impl From<ParseQueryError> for Phase1CollectionError {
@@ -813,6 +861,12 @@ impl From<DeclaredRequirementsError> for Phase1CollectionError {
     }
 }
 
+impl From<PackageIdError> for Phase1CollectionError {
+    fn from(error: PackageIdError) -> Self {
+        Self::Package(error)
+    }
+}
+
 fn phase1_package_scopes_identity(
     package: PackageKey,
     module_tree: &ModuleTree,
@@ -821,6 +875,7 @@ fn phase1_package_scopes_identity(
     build_context: Phase1BuildContext,
     declared_requirements: Option<&[DeclaredRequirement]>,
     package_graph: Option<Phase1PackageGraphProjection>,
+    foreign_packages: &[Phase1ForeignPackageScopes],
     symbols: &Interner,
 ) -> Result<Phase1PackageScopesIdentity, Phase1CollectionError> {
     let modules = module_tree
@@ -878,6 +933,21 @@ fn phase1_package_scopes_identity(
         })
         .collect::<Result<Vec<_>, Phase1CollectionError>>()?;
 
+    let mut foreign_packages = foreign_packages
+        .iter()
+        .map(|foreign| Phase1ForeignPackageIdentity {
+            visible_identity: foreign.visible_identity.clone(),
+            package_key: foreign.package_key.clone(),
+            input_fingerprint: foreign.input_fingerprint,
+        })
+        .collect::<Vec<_>>();
+    foreign_packages.sort_by(|left, right| {
+        left.visible_identity
+            .as_bytes()
+            .cmp(right.visible_identity.as_bytes())
+            .then_with(|| left.package_key.cmp(&right.package_key))
+    });
+
     Ok(Phase1PackageScopesIdentity {
         package,
         modules,
@@ -887,6 +957,7 @@ fn phase1_package_scopes_identity(
         build_context,
         declared_requirements: declared_requirements.map(|requirements| requirements.to_vec()),
         package_graph,
+        foreign_packages,
     })
 }
 
@@ -972,6 +1043,37 @@ fn validate_phase1_package_graph_requirements(
                 identity,
                 expected_active,
                 found_active,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_phase1_foreign_package_scopes(
+    package: &PackageKey,
+    graph: Option<&Phase1PackageGraphProjection>,
+    foreign_scopes: &[Phase1ForeignPackageScopes],
+) -> Result<(), Phase1CollectionError> {
+    let mut identities = BTreeSet::new();
+    for foreign in foreign_scopes {
+        let valid_edge = match graph {
+            Some(Phase1PackageGraphProjection::Package { outgoing_edges }) => {
+                outgoing_edges.iter().any(|edge| {
+                    edge.visible_identity == foreign.visible_identity
+                        && edge.target == foreign.package_key
+                        && edge.target_form == PackageForm::Source
+                })
+            }
+            Some(Phase1PackageGraphProjection::ImplicitToolchain { .. }) | None => false,
+        };
+        if !valid_edge
+            || !identities.insert(foreign.visible_identity.as_str())
+            || foreign.module_tree.modules.len() != foreign.scopes.modules.len()
+        {
+            return Err(Phase1CollectionError::ForeignPackageScopeMismatch {
+                package: package.clone(),
+                visible_identity: foreign.visible_identity.clone(),
+                target: foreign.package_key.clone(),
             });
         }
     }
@@ -1103,7 +1205,16 @@ fn collect_prepared_phase1_package_scopes(
                 })
                 .collect::<Vec<_>>()
         });
-    let module_alias_diagnostics = collect_local_module_alias_bindings(
+    let foreign_scopes = prepared
+        .foreign_packages
+        .iter()
+        .map(|foreign| ForeignPackageScope {
+            visible_identity: &foreign.visible_identity,
+            module_tree: &foreign.module_tree,
+            scopes: &foreign.scopes,
+        })
+        .collect::<Vec<_>>();
+    let module_alias_diagnostics = collect_module_alias_bindings_with_foreign_scopes(
         &prepared.module_tree,
         &module_inputs,
         &mut scopes,
@@ -1114,6 +1225,7 @@ fn collect_prepared_phase1_package_scopes(
         &prepared.target_cfg,
         prepared.build_context.analyzes_tests,
         prepared.build_context.is_root_package,
+        &foreign_scopes,
     )?;
     scopes.diagnostics.extend(module_alias_diagnostics);
     sort_phase1_diagnostics(&mut scopes.diagnostics);
@@ -1855,9 +1967,8 @@ impl RootDatabase {
     ///
     /// Target filtering prepares this query's source-bound input. Phase 1
     /// declarations, local use-target diagnostics, and local module/interface
-    /// bindings run in the tracked `package_scopes` query. This remains a
-    /// local-only boundary: it does not load a foreign package graph, inspect
-    /// declared requirements or WIT, or enable Stage 4 behavior.
+    /// bindings run in the tracked `package_scopes` query. Foreign dependency
+    /// scopes are available through the explicit graph-aware overload.
     ///
     /// The database retains one append-only definition-path interner per
     /// package so returned `DefId`s remain resolvable for its lifetime.
@@ -1874,7 +1985,9 @@ impl RootDatabase {
             target_cfg,
             build_context,
             None,
+            &[],
         )
+        .map(|collection| collection.scopes)
     }
 
     /// Sets the package's exact manifest input, reads its tracked requirement
@@ -1893,6 +2006,32 @@ impl RootDatabase {
         manifest_bytes: Arc<[u8]>,
         manifest_role: PackageRole,
     ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
+        self.collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+            module_tree,
+            snapshot,
+            target_cfg,
+            build_context,
+            manifest_bytes,
+            manifest_role,
+            &[],
+        )
+        .map(|collection| collection.scopes)
+    }
+
+    /// Collects package scopes using finalized scopes for exact active direct
+    /// source dependencies. Each foreign input is validated against this
+    /// package's graph edge and its fingerprint becomes part of the tracked
+    /// query identity.
+    pub fn collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+        &mut self,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+        build_context: Phase1BuildContext,
+        manifest_bytes: Arc<[u8]>,
+        manifest_role: PackageRole,
+        foreign_scopes: &[Phase1ForeignPackageScopes],
+    ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
         self.set_package_manifest(
             module_tree.package,
             manifest_bytes,
@@ -1914,6 +2053,7 @@ impl RootDatabase {
             target_cfg,
             build_context,
             requirements,
+            foreign_scopes,
         )
     }
 
@@ -1924,7 +2064,8 @@ impl RootDatabase {
         target_cfg: &TargetCfg,
         build_context: Phase1BuildContext,
         declared_requirements: Option<Arc<[DeclaredRequirement]>>,
-    ) -> Result<Phase1PackageScopes, Phase1CollectionError> {
+        foreign_scopes: &[Phase1ForeignPackageScopes],
+    ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
         if module_tree.modules.len() > u32::MAX as usize {
             return Err(Phase1CollectionError::TooManyModules);
         }
@@ -1970,12 +2111,36 @@ impl RootDatabase {
         .map_err(PackageScopesError::from)?;
         let graph = self.package_graph.get(&mut self.query_database, 0)?;
         let package_graph = phase1_package_graph_projection(graph.as_ref().as_ref(), &package_key)?;
+        for foreign in foreign_scopes {
+            let expected_package = self
+                .packages
+                .intern(foreign.package_key.as_str())
+                .map_err(Phase1CollectionError::Package)?;
+            let contains_foreign_definition = foreign.scopes.modules.iter().all(|module| {
+                module.module_def_id.package() == expected_package
+                    && self
+                        .resolve_def_path(module.module_def_id.to_def_id())
+                        .is_ok_and(|path| path.is_some())
+            });
+            if foreign.module_tree.package != expected_package || !contains_foreign_definition {
+                return Err(Phase1CollectionError::ForeignPackageScopeMismatch {
+                    package: package_key.clone(),
+                    visible_identity: foreign.visible_identity.clone(),
+                    target: foreign.package_key.clone(),
+                });
+            }
+        }
         validate_phase1_package_graph_requirements(
             &package_key,
             package_graph.as_ref(),
             declared_requirements.as_deref(),
             target_cfg,
             build_context,
+        )?;
+        validate_phase1_foreign_package_scopes(
+            &package_key,
+            package_graph.as_ref(),
+            foreign_scopes,
         )?;
         let def_paths = if let Some(def_paths) = self.def_paths.get(&module_tree.package) {
             Arc::clone(def_paths)
@@ -1997,6 +2162,7 @@ impl RootDatabase {
             build_context,
             declared_requirements.as_deref(),
             package_graph,
+            foreign_scopes,
             &self.symbols,
         )?);
         let prepared = Arc::new(PreparedPhase1PackageScopes {
@@ -2005,6 +2171,7 @@ impl RootDatabase {
             target_cfg: target_cfg.clone(),
             build_context,
             declared_requirements,
+            foreign_packages: foreign_scopes.to_vec(),
             modules: owned_inputs,
             def_paths,
         });
@@ -2018,11 +2185,11 @@ impl RootDatabase {
             package_key.clone(),
             identity.as_ref().clone(),
         )?;
-        let memo = self
+        let output = self
             .package_scopes
             .query
             .get(&mut self.query_database, package_key)?;
-        let memo = memo.result.as_ref().map_err(Clone::clone)?;
+        let memo = output.result.as_ref().map_err(Clone::clone)?;
         let mut scopes = memo.scopes.clone();
         for input in &prepared.modules {
             scopes
@@ -2037,7 +2204,10 @@ impl RootDatabase {
             );
         }
         sort_phase1_diagnostics(&mut scopes.diagnostics);
-        Ok(scopes)
+        Ok(Phase1PackageScopesCollection {
+            scopes,
+            input_fingerprint: output.input_fingerprint,
+        })
     }
 
     /// Resolves a definition ID created in this database's Phase 1 results.
@@ -3359,6 +3529,34 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "the derived query should reuse the same memo for identical inputs"
+        );
+    }
+
+    #[test]
+    fn package_scope_query_identity_tracks_foreign_scope_fingerprints() {
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let foreign_identity = |input_fingerprint| Phase1PackageScopesIdentity {
+            package: PackageKey::new("acme:phase1#1").expect("package key is valid"),
+            modules: Vec::new(),
+            namespaces: Vec::new(),
+            target_name: target.target_name().to_owned(),
+            target_capabilities: target.capabilities().clone(),
+            build_context: Phase1BuildContext::default(),
+            declared_requirements: None,
+            package_graph: None,
+            foreign_packages: vec![Phase1ForeignPackageIdentity {
+                visible_identity: "acme:dep".to_owned(),
+                package_key: PackageKey::new("acme:dep#1").expect("package key is valid"),
+                input_fingerprint,
+            }],
+        };
+        let before = foreign_identity(Fingerprint::new(1));
+        let after = foreign_identity(Fingerprint::new(2));
+
+        assert_ne!(
+            fingerprint(&before),
+            fingerprint(&after),
+            "a dependency scope change must invalidate its consumer's tracked query"
         );
     }
 

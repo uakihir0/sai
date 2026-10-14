@@ -216,7 +216,7 @@ fn current_module_diagnostic(
     diagnostic
 }
 
-fn unknown_module_diagnostic(
+pub(crate) fn unknown_module_diagnostic(
     entry: &UseEntry,
     path: &ParsedUsePath,
     matched_prefix: Vec<String>,

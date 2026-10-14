@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -4054,6 +4054,7 @@ fn module_tree_workspace_check_diagnostics(
     }
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
+    let package_graph_for_scopes = package_graph.clone();
     let mut vfs_files = Vec::new();
     let mut package_file_inputs = Vec::with_capacity(inputs.len());
     let mut package_ids = Vec::with_capacity(inputs.len());
@@ -4277,13 +4278,45 @@ fn module_tree_workspace_check_diagnostics(
     }
 
     if let (Some(target_cfg), Some(workspace_snapshot)) = (target_cfg, workspace_snapshot) {
-        for (index, _, module_tree, source_by_key) in &package_trees {
-            let input = &inputs[*index];
-            if module_tree.modules.is_empty() || !complete_packages[*index] {
+        let collection_order =
+            phase1_package_collection_order(inputs, package_graph_for_scopes.as_ref())?;
+        let mut finalized_foreign_scopes =
+            BTreeMap::<PackageKey, sai_driver::Phase1ForeignPackageScopes>::new();
+        for index in collection_order {
+            let (_, _, module_tree, source_by_key) = &package_trees[index];
+            let input = &inputs[index];
+            if !complete_packages[index] {
                 continue;
             }
-            let phase1 = database
-                .collect_phase1_package_scopes_with_manifest(
+            let package_key = PackageKey::new(input.package_key.clone())
+                .map_err(|error| format!("invalid package key: {error:?}"))?;
+            let direct_foreign_scopes = package_graph_for_scopes
+                .as_ref()
+                .and_then(|graph| {
+                    let node = graph.node(&package_key)?;
+                    Some(
+                        node.active_edges()
+                            .iter()
+                            .filter_map(|edge| {
+                                let target = graph.node(edge.target())?;
+                                if target.form() != sai_driver::package_graph::PackageForm::Source {
+                                    return None;
+                                }
+                                let scope = finalized_foreign_scopes.get(edge.target())?;
+                                Some(sai_driver::Phase1ForeignPackageScopes {
+                                    visible_identity: edge.visible_identity().to_owned(),
+                                    package_key: edge.target().clone(),
+                                    module_tree: Arc::clone(&scope.module_tree),
+                                    scopes: Arc::clone(&scope.scopes),
+                                    input_fingerprint: scope.input_fingerprint,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap_or_default();
+            let collection = database
+                .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
                     module_tree,
                     &workspace_snapshot,
                     target_cfg,
@@ -4300,8 +4333,10 @@ fn module_tree_workspace_check_diagnostics(
                     } else {
                         sai_package::manifest::PackageRole::Dependency
                     },
+                    &direct_foreign_scopes,
                 )
                 .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
+            let phase1 = &collection.scopes;
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
                     &phase1.diagnostics,
@@ -4313,9 +4348,91 @@ fn module_tree_workspace_check_diagnostics(
             errors = errors.saturating_add(phase1_errors);
             warnings = warnings.saturating_add(phase1_warnings);
             infos = infos.saturating_add(phase1_infos);
+
+            if let Some(graph) = package_graph_for_scopes.as_ref()
+                && let Some(node) = graph.node(&package_key)
+            {
+                finalized_foreign_scopes.insert(
+                    package_key.clone(),
+                    sai_driver::Phase1ForeignPackageScopes {
+                        visible_identity: node.identity().to_owned(),
+                        package_key,
+                        module_tree: Arc::clone(module_tree),
+                        scopes: Arc::new(collection.scopes),
+                        input_fingerprint: collection.input_fingerprint,
+                    },
+                );
+            }
         }
     }
     Ok((diagnostics, errors, warnings, infos))
+}
+
+fn phase1_package_collection_order(
+    inputs: &[CheckModuleTreePackageInput],
+    package_graph: Option<&sai_driver::package_graph::PackageGraph>,
+) -> Result<Vec<usize>, String> {
+    let mut input_indices = BTreeMap::new();
+    for (index, input) in inputs.iter().enumerate() {
+        let key = PackageKey::new(input.package_key.clone())
+            .map_err(|error| format!("invalid package key: {error:?}"))?;
+        if input_indices.insert(key.clone(), index).is_some() {
+            return Err(format!(
+                "duplicate package key in Phase 1 collection order: {}",
+                key.as_str()
+            ));
+        }
+    }
+
+    let Some(package_graph) = package_graph else {
+        return Ok((0..inputs.len()).collect());
+    };
+
+    let mut order = Vec::with_capacity(inputs.len());
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for node in package_graph.nodes() {
+        let key = node.key();
+        if !input_indices.contains_key(key) || visited.contains(key) {
+            continue;
+        }
+        let mut stack = vec![(key.clone(), false)];
+        while let Some((key, exiting)) = stack.pop() {
+            if exiting {
+                visiting.remove(&key);
+                visited.insert(key.clone());
+                if let Some(index) = input_indices.get(&key) {
+                    order.push(*index);
+                }
+                continue;
+            }
+            if visited.contains(&key) || !input_indices.contains_key(&key) {
+                continue;
+            }
+            if !visiting.insert(key.clone()) {
+                return Err(format!(
+                    "active package graph cycle while ordering Phase 1 scopes at {}",
+                    key.as_str()
+                ));
+            }
+            let node = package_graph.node(&key).ok_or_else(|| {
+                format!(
+                    "active package graph has no node while ordering Phase 1 scopes for {}",
+                    key.as_str()
+                )
+            })?;
+            stack.push((key, true));
+            for edge in node.active_edges().iter().rev() {
+                stack.push((edge.target().clone(), false));
+            }
+        }
+    }
+    for (key, index) in &input_indices {
+        if visited.insert(key.clone()) {
+            order.push(*index);
+        }
+    }
+    Ok(order)
 }
 
 fn phase1_check_diagnostics(
@@ -10663,20 +10780,94 @@ mod tests {
     use super::{
         CancellationAwareStdin, CheckDiagnostic, CheckLockedDependencySource,
         CheckModuleTreePackageInput, CheckWorkspaceSourceBudget, CliDiagnostic, CliLocation,
-        CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES, RenderedSourceLine, StdinBroker,
-        StdinReadError, check_locked_dependency_source_inputs,
+        CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES, PackageKey, RenderedSourceLine,
+        StdinBroker, StdinReadError, check_locked_dependency_source_inputs,
         check_module_tree_workspace_exceeds_limits, cli_position, compare_check_diagnostics,
         fmt_path_selection_signature, human_file_path, internal_fmt_diagnostic, parse_args,
-        read_file_limited_with_progress, relative_path, report_fmt_diagnostics, run,
-        run_new_with_creator, run_with_cancellation, run_with_cancellation_and_input,
-        write_file_atomically_in_directory, write_human_diagnostics,
+        phase1_package_collection_order, read_file_limited_with_progress, relative_path,
+        report_fmt_diagnostics, run, run_new_with_creator, run_with_cancellation,
+        run_with_cancellation_and_input, write_file_atomically_in_directory,
+        write_human_diagnostics,
     };
     use sai_diagnostics::{Value, ValueObject};
     use sai_driver::CancellationToken;
+    use sai_driver::package_graph::{
+        PackageForm, PackageGraph, PackageGraphEdge, PackageGraphNode, PackageGraphRole,
+    };
+    use sai_package::version::Version;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn phase1_package_collection_orders_active_dependencies_before_consumers() {
+        let root_key = PackageKey::new("acme:root#1").unwrap();
+        let middle_key = PackageKey::new("acme:middle#1").unwrap();
+        let leaf_key = PackageKey::new("acme:leaf#1").unwrap();
+        let version = |raw: &str| Version::parse(raw).unwrap();
+        let node = |key: PackageKey, identity: &str, role, edges: Vec<PackageGraphEdge>| {
+            PackageGraphNode::new(
+                key,
+                identity,
+                version("1.0.0"),
+                PackageForm::Source,
+                role,
+                edges,
+            )
+            .unwrap()
+        };
+        let graph = PackageGraph::new(
+            version("1.0.0"),
+            [
+                node(
+                    root_key.clone(),
+                    "acme:root",
+                    PackageGraphRole::Root,
+                    vec![PackageGraphEdge::new(middle_key.clone(), "acme:middle").unwrap()],
+                ),
+                node(
+                    middle_key.clone(),
+                    "acme:middle",
+                    PackageGraphRole::Dependency,
+                    vec![PackageGraphEdge::new(leaf_key.clone(), "acme:leaf").unwrap()],
+                ),
+                node(
+                    leaf_key.clone(),
+                    "acme:leaf",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .unwrap();
+        let package = |key: PackageKey| CheckModuleTreePackageInput {
+            package_key: key.as_str().to_owned(),
+            source_directory: "src".to_owned(),
+            source_directory_exists: true,
+            entries: Vec::new(),
+            inspected_tree_entry_count: 0,
+            inspected_tree_path_bytes: 0,
+            package_header_span: 0..1,
+            manifest_path: format!("{}@1.0.0/sai.package", key.as_str()),
+            manifest_source: Arc::from(&b"manifest"[..]),
+            source_inputs: Vec::new(),
+            package_identity: key.as_str().to_owned(),
+            inspection_incomplete: false,
+            is_root_package: key == root_key,
+            analyzes_tests: false,
+        };
+        let inputs = vec![
+            package(root_key.clone()),
+            package(middle_key.clone()),
+            package(leaf_key.clone()),
+        ];
+
+        assert_eq!(
+            phase1_package_collection_order(&inputs, Some(&graph)).unwrap(),
+            vec![2, 1, 0]
+        );
+    }
 
     #[test]
     fn check_workspace_limits_sum_source_bytes_and_tree_costs_across_packages() {

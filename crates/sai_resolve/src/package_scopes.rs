@@ -4,14 +4,16 @@
 //! [`collect_phase1`] builds direct declaration scopes. The
 //! [`collect_local_module_alias_bindings`] pass then inserts local module
 //! aliases, resolves item imports from local modules and interfaces, and
-//! computes local `pub use` members. Dependency targets, test-only imports,
-//! and the canonical prelude table remain deferred.
+//! computes local `pub use` members. The foreign-scope entry point also
+//! resolves selected active source dependency modules and their finalized
+//! member namespaces. Test-only imports without test analysis and the
+//! canonical prelude table remain deferred.
 //! Extern-function children are checked against their validated target
 //! attributes here because they are represented as children of an extern block
 //! in the item tree.
 
 use super::{ChildEntry, ModuleData, ModuleId, ModuleTree};
-use crate::module_target::ModuleTargetError;
+use crate::module_target::{ModuleTargetError, resolve_foreign_module_target};
 use crate::use_binding::{UseBindingNameError, derive_use_binding_name};
 use crate::use_item_binding::{UseItemBindingError, derive_use_item_binding};
 use crate::use_path::{ParsedUsePath, UsePathError, parse_use_path};
@@ -37,7 +39,7 @@ use sai_syntax::{
 };
 use sai_vfs::{FileId, PackageKey, SourceFile, Span, TextRange, TextSize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// The entity kind stored by a declaration binding.
@@ -128,6 +130,10 @@ struct PendingLocalUseItem {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingItemTarget {
     LocalModule(ModuleId),
+    ForeignModule {
+        package_scope_index: usize,
+        module: ModuleId,
+    },
     LocalInterface(DefId),
     Deferred,
     Inactive,
@@ -193,6 +199,21 @@ pub struct Phase1PackageScopes {
     /// source-relative file path and byte offset. Module-tree diagnostics
     /// remain owned by `module_tree`.
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A finalized source-package scope that may be imported by a consumer.
+///
+/// The caller selects these scopes from the active direct package graph.
+/// Artifact and WIT package scopes must not be represented by this type.
+pub struct ForeignPackageScope<'a> {
+    /// Versionless package identity used by `PKG_PATH`, such as
+    /// `acme:collections`.
+    pub visible_identity: &'a str,
+    /// The source package's exact module topology.
+    pub module_tree: &'a ModuleTree,
+    /// The source package's finalized module members and canonical
+    /// definition identities.
+    pub scopes: &'a Phase1PackageScopes,
 }
 
 /// Build context needed for Phase 1 checks whose rules depend on the artifact.
@@ -266,6 +287,7 @@ pub enum PackageScopesError {
     InvalidModuleTree,
     InvalidCurrentModule,
     UnsupportedPackageKey,
+    ForeignPackageScopeMismatch,
     DefPath(DefPathInternerError),
     TooManyDefinitions,
 }
@@ -615,6 +637,31 @@ pub fn collect_phase1(
     })
 }
 
+fn validate_foreign_package_scopes(
+    foreign_scopes: &[ForeignPackageScope<'_>],
+    packages: &PackageInterner,
+) -> Result<(), PackageScopesError> {
+    let mut identities = HashSet::with_capacity(foreign_scopes.len());
+    for foreign in foreign_scopes {
+        if foreign.module_tree.modules.len() != foreign.scopes.modules.len() {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+        let spelling = packages.resolve(foreign.module_tree.package)?;
+        let key = PackageKey::new(spelling.to_string()).map_err(PackageScopesError::PackageKey)?;
+        let identity = key
+            .as_str()
+            .split_once('#')
+            .map_or(key.as_str(), |(identity, _)| identity);
+        if identity.starts_with("wit:")
+            || identity != foreign.visible_identity
+            || !identities.insert(foreign.visible_identity)
+        {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+    }
+    Ok(())
+}
+
 /// Resolves package-local use aliases and item imports.
 ///
 /// Local module and interface targets have member lookup; module `pub use`
@@ -635,11 +682,47 @@ pub fn collect_local_module_alias_bindings(
     analyzes_tests: bool,
     is_root_package: bool,
 ) -> Result<Vec<Diagnostic>, PackageScopesError> {
+    collect_module_alias_bindings_with_foreign_scopes(
+        module_tree,
+        module_inputs,
+        scopes,
+        packages,
+        symbols,
+        def_paths,
+        requirements,
+        target_cfg,
+        analyzes_tests,
+        is_root_package,
+        &[],
+    )
+}
+
+/// Resolves local imports and imports from selected active source dependencies.
+///
+/// `foreign_scopes` must contain only source-package scopes for exact active
+/// direct dependency edges of this package. Dependencies must have completed
+/// Phase 2 before this function is called, so their `members` maps are final.
+/// The caller remains responsible for validating that the scopes agree with
+/// the package graph and manifest requirements.
+pub fn collect_module_alias_bindings_with_foreign_scopes(
+    module_tree: &ModuleTree,
+    module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
+    scopes: &mut Phase1PackageScopes,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    def_paths: &DefPathInterner,
+    requirements: Option<&[PackageUseRequirement]>,
+    target_cfg: &TargetCfg,
+    analyzes_tests: bool,
+    is_root_package: bool,
+    foreign_scopes: &[ForeignPackageScope<'_>],
+) -> Result<Vec<Diagnostic>, PackageScopesError> {
     if module_tree.modules.len() != scopes.modules.len()
         || def_paths.package() != module_tree.package
     {
         return Err(PackageScopesError::PackageMismatch);
     }
+    validate_foreign_package_scopes(foreign_scopes, packages)?;
     if module_tree.modules.is_empty() {
         return Ok(Vec::new());
     }
@@ -652,6 +735,12 @@ pub fn collect_local_module_alias_bindings(
         .as_str()
         .split_once('#')
         .map_or(package_key.as_str(), |(identity, _)| identity);
+    if foreign_scopes
+        .iter()
+        .any(|foreign| foreign.visible_identity == current_package_identity)
+    {
+        return Err(PackageScopesError::ForeignPackageScopeMismatch);
+    }
     let module_def_ids = scopes
         .modules
         .iter()
@@ -796,6 +885,7 @@ pub fn collect_local_module_alias_bindings(
                 ));
                 (None, PendingItemTarget::Inactive)
             } else if let Some((foreign_target, allowed_targets)) = foreign_classification {
+                let mut resolved_foreign_target = None;
                 match foreign_target {
                     PendingItemTarget::Inactive => {
                         let targets =
@@ -809,13 +899,103 @@ pub fn collect_local_module_alias_bindings(
                         ));
                     }
                     PendingItemTarget::StageGated => {
-                        let identity_range =
-                            use_package_identity_range(path_range, &parsed.package_identity)?;
-                        diagnostics.push(dependency_feature_not_implemented_diagnostic(
-                            source_location(input, identity_range)?,
-                            &parsed.package_identity,
-                            &package_identity,
-                        ));
+                        if let Some((package_scope_index, foreign)) =
+                            foreign_scopes.iter().enumerate().find(|(_, foreign)| {
+                                foreign.visible_identity == parsed.package_identity
+                            })
+                        {
+                            match resolve_foreign_module_target(
+                                foreign.module_tree,
+                                &parsed.segments,
+                                symbols,
+                            ) {
+                                Ok(target_module) => {
+                                    let target_scope = foreign
+                                        .scopes
+                                        .modules
+                                        .get(target_module.raw() as usize)
+                                        .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+                                    resolved_foreign_target = Some((
+                                        Some(Res::Def(
+                                            DefKind::Module,
+                                            target_scope.module_def_id.to_def_id(),
+                                        )),
+                                        PendingItemTarget::ForeignModule {
+                                            package_scope_index,
+                                            module: target_module,
+                                        },
+                                    ));
+                                }
+                                Err(ModuleTargetError::UnknownModule {
+                                    matched_prefix,
+                                    module_candidates,
+                                }) => {
+                                    if let Some(interface_visibility) =
+                                        foreign_interface_visibility(foreign, &parsed)
+                                    {
+                                        if interface_visibility == Visibility::Private {
+                                            diagnostics.push(use_binding_diagnostic(
+                                                Code::PrivateItem,
+                                                Severity::Error,
+                                                format!(
+                                                    "interface target in `{}` is not visible from this package",
+                                                    parsed.package_identity
+                                                ),
+                                                "private interface",
+                                                source_location(input, path_range)?,
+                                                &package_identity,
+                                            ));
+                                        } else {
+                                            diagnostics.push(
+                                                stage_feature_not_implemented_diagnostic(
+                                                    4,
+                                                    "interfaces",
+                                                    &parsed.package_identity,
+                                                    source_location(input, path_range)?,
+                                                    &package_identity,
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        diagnostics.push(
+                                            crate::use_target_diagnostics::unknown_module_diagnostic(
+                                                entry,
+                                                &parsed,
+                                                matched_prefix,
+                                                module_candidates,
+                                                source_location(input, path_range)?,
+                                                &package_identity,
+                                                symbols,
+                                            )?,
+                                        );
+                                    }
+                                    resolved_foreign_target =
+                                        Some((None, PendingItemTarget::Unavailable));
+                                }
+                                Err(ModuleTargetError::MissingRootModule) => {
+                                    resolved_foreign_target =
+                                        Some((None, PendingItemTarget::Unavailable));
+                                }
+                                Err(ModuleTargetError::Symbol(error)) => {
+                                    return Err(PackageScopesError::Symbol(error));
+                                }
+                                Err(ModuleTargetError::InvalidModuleTree) => {
+                                    return Err(PackageScopesError::InvalidModuleTree);
+                                }
+                                Err(
+                                    ModuleTargetError::InvalidCurrentModule
+                                    | ModuleTargetError::UseOfCurrentModule(_),
+                                ) => return Err(PackageScopesError::InvalidModuleTree),
+                            }
+                        } else {
+                            let identity_range =
+                                use_package_identity_range(path_range, &parsed.package_identity)?;
+                            diagnostics.push(dependency_feature_not_implemented_diagnostic(
+                                source_location(input, identity_range)?,
+                                &parsed.package_identity,
+                                &package_identity,
+                            ));
+                        }
                     }
                     PendingItemTarget::UnknownPackage => {
                         let identity_range =
@@ -834,7 +1014,7 @@ pub fn collect_local_module_alias_bindings(
                     }
                     _ => return Err(PackageScopesError::InvalidModuleTree),
                 }
-                (None, foreign_target)
+                resolved_foreign_target.unwrap_or((None, foreign_target))
             } else {
                 match resolve_parsed_use_target(
                     &parsed,
@@ -1062,6 +1242,7 @@ pub fn collect_local_module_alias_bindings(
         module_inputs,
         scopes,
         pending_items,
+        foreign_scopes,
         symbols,
         &package_identity,
         &mut diagnostics,
@@ -1124,6 +1305,7 @@ fn resolve_local_use_items(
     module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
     scopes: &mut Phase1PackageScopes,
     pending: Vec<PendingLocalUseItem>,
+    foreign_scopes: &[ForeignPackageScope<'_>],
     symbols: &Interner,
     package_identity: &str,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1157,6 +1339,7 @@ fn resolve_local_use_items(
         module_inputs,
         scopes,
         pending: &pending,
+        foreign_scopes,
         pub_use_candidates,
         memo: HashMap::new(),
         stack: Vec::new(),
@@ -1420,6 +1603,7 @@ struct LocalModuleMemberResolver<'a> {
     module_inputs: &'a BTreeMap<ModuleId, FilteredModule<'a>>,
     scopes: &'a mut Phase1PackageScopes,
     pending: &'a [PendingLocalUseItem],
+    foreign_scopes: &'a [ForeignPackageScope<'a>],
     pub_use_candidates: HashMap<(ModuleId, Symbol), Vec<usize>>,
     memo: HashMap<(ModuleId, Symbol), LocalMemberMemo>,
     stack: Vec<LocalMemberFrame>,
@@ -1468,11 +1652,17 @@ impl LocalModuleMemberResolver<'_> {
 
         let result = match item.target {
             PendingItemTarget::LocalModule(module) => self.lookup(module, item.source_name)?,
+            PendingItemTarget::ForeignModule {
+                package_scope_index,
+                module,
+            } => {
+                self.lookup_foreign_module_member(package_scope_index, module, item.source_name)?
+            }
             PendingItemTarget::LocalInterface(interface) => {
                 self.lookup_interface_member(interface, item.source_name)?
             }
             PendingItemTarget::Deferred => {
-                // Foreign package member tables are not available in this slice.
+                // The dependency is not an active source package scope.
                 return Ok(());
             }
             PendingItemTarget::Inactive
@@ -1507,6 +1697,13 @@ impl LocalModuleMemberResolver<'_> {
             }
             LocalMemberLookup::Deferred => return Ok(()),
         };
+
+        let is_foreign_target = matches!(item.target, PendingItemTarget::ForeignModule { .. });
+        if is_foreign_target && !item.is_pub && target_binding.visibility == Visibility::Private {
+            self.report_private_item(item)?;
+            self.set_import_res(item.module, item.import, Res::Err)?;
+            return Ok(());
+        }
 
         if item.is_pub && target_binding.visibility != Visibility::Pub {
             self.report_private_reexport(item)?;
@@ -1571,6 +1768,29 @@ impl LocalModuleMemberResolver<'_> {
             .unwrap_or(LocalMemberLookup::Missing))
     }
 
+    fn lookup_foreign_module_member(
+        &self,
+        package_scope_index: usize,
+        module: ModuleId,
+        name: Symbol,
+    ) -> Result<LocalMemberLookup, PackageScopesError> {
+        let foreign = self
+            .foreign_scopes
+            .get(package_scope_index)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        let module_scope = foreign
+            .scopes
+            .modules
+            .get(module.raw() as usize)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        Ok(module_scope
+            .members
+            .get(&name)
+            .cloned()
+            .map(LocalMemberLookup::Found)
+            .unwrap_or(LocalMemberLookup::Missing))
+    }
+
     fn lookup(
         &mut self,
         module: ModuleId,
@@ -1618,6 +1838,14 @@ impl LocalModuleMemberResolver<'_> {
                     self.stack.pop();
                     target
                 }
+                PendingItemTarget::ForeignModule {
+                    package_scope_index,
+                    module,
+                } => self.lookup_foreign_module_member(
+                    package_scope_index,
+                    module,
+                    edge.source_name,
+                )?,
                 PendingItemTarget::LocalInterface(interface) => {
                     self.lookup_interface_member(interface, edge.source_name)?
                 }
@@ -1765,6 +1993,10 @@ impl LocalModuleMemberResolver<'_> {
         let name = self.symbols.resolve(item.source_name)?;
         let candidates = match item.target {
             PendingItemTarget::LocalModule(module) => self.suggested_member_names(module, &name)?,
+            PendingItemTarget::ForeignModule {
+                package_scope_index,
+                module,
+            } => self.suggested_foreign_member_names(package_scope_index, module, &name)?,
             PendingItemTarget::LocalInterface(interface) => {
                 self.suggested_interface_member_names(interface, &name)?
             }
@@ -1875,6 +2107,52 @@ impl LocalModuleMemberResolver<'_> {
             .collect())
     }
 
+    fn suggested_foreign_member_names(
+        &self,
+        package_scope_index: usize,
+        module: ModuleId,
+        name: &str,
+    ) -> Result<Vec<String>, PackageScopesError> {
+        let foreign = self
+            .foreign_scopes
+            .get(package_scope_index)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        let module_scope = foreign
+            .scopes
+            .modules
+            .get(module.raw() as usize)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        let mut candidates = module_scope
+            .members
+            .keys()
+            .copied()
+            .map(|symbol| {
+                self.symbols
+                    .resolve(symbol)
+                    .map(|spelling| (spelling.to_string(), symbol))
+                    .map_err(PackageScopesError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        candidates.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        candidates.dedup_by_key(|(_, symbol)| *symbol);
+        let mut ranked = candidates
+            .into_iter()
+            .filter(|(spelling, _)| !is_reserved_type_name(spelling))
+            .map(|(spelling, _)| (damerau_levenshtein(name, &spelling), spelling))
+            .filter(|(distance, _)| *distance <= 2)
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(3)
+            .map(|(_, spelling)| spelling)
+            .collect())
+    }
+
     fn suggested_interface_member_names(
         &self,
         interface: DefId,
@@ -1940,7 +2218,23 @@ impl LocalModuleMemberResolver<'_> {
         self.diagnostics.push(use_binding_diagnostic(
             Code::PrivateReexport,
             Severity::Error,
-            format!("cannot re-export package-private item `{name}`"),
+            format!("cannot re-export non-public item `{name}`"),
+            "private item",
+            self.location(item.module, item.source_span)?,
+            self.package_identity,
+        ));
+        Ok(())
+    }
+
+    fn report_private_item(
+        &mut self,
+        item: &PendingLocalUseItem,
+    ) -> Result<(), PackageScopesError> {
+        let name = self.symbols.resolve(item.source_name)?;
+        self.diagnostics.push(use_binding_diagnostic(
+            Code::PrivateItem,
+            Severity::Error,
+            format!("cannot import non-public item `{name}` from another package"),
             "private item",
             self.location(item.module, item.source_span)?,
             self.package_identity,
@@ -2041,6 +2335,26 @@ fn local_interface_target(
         Res::Def(DefKind::Interface, def_id) => Some(def_id),
         Res::Def(_, _) | Res::Err | Res::TestOnly(_) => None,
     }
+}
+
+fn foreign_interface_visibility(
+    foreign: &ForeignPackageScope<'_>,
+    path: &ParsedUsePath,
+) -> Option<Visibility> {
+    let interface_name = path.segments.last().copied()?;
+    let parent_path = &path.segments[..path.segments.len() - 1];
+    let module_index = foreign
+        .module_tree
+        .modules
+        .iter()
+        .position(|module| module.path.as_slice() == parent_path)?;
+    let binding = foreign
+        .scopes
+        .modules
+        .get(module_index)?
+        .declared
+        .get(&interface_name)?;
+    matches!(binding.res, Res::Def(DefKind::Interface, _)).then_some(binding.visibility)
 }
 
 /// Names that can be shadowed by a module-level declaration or module alias.
@@ -2448,6 +2762,30 @@ fn dependency_feature_not_implemented_diagnostic(
         "feature".to_owned(),
         Value::String("dependencies".to_owned()),
     );
+    diagnostic
+}
+
+fn stage_feature_not_implemented_diagnostic(
+    stage: u32,
+    feature: &str,
+    identity: &str,
+    location: Location,
+    package_identity: &str,
+) -> Diagnostic {
+    let mut diagnostic = use_binding_diagnostic(
+        Code::FeatureNotImplemented,
+        Severity::Error,
+        format!("stage {stage} feature `{feature}` is not implemented for `{identity}`"),
+        "feature not implemented",
+        location,
+        package_identity,
+    );
+    diagnostic
+        .data
+        .insert("stage".to_owned(), Value::Integer(u128::from(stage)));
+    diagnostic
+        .data
+        .insert("feature".to_owned(), Value::String(feature.to_owned()));
     diagnostic
 }
 
@@ -3354,6 +3692,253 @@ mod tests {
         target_cfg: TargetCfg,
     }
 
+    struct ForeignScopeFixture {
+        visible_identity: String,
+        tree: ModuleTree,
+        scopes: Phase1PackageScopes,
+        _def_paths: DefPathInterner,
+    }
+
+    impl ForeignScopeFixture {
+        fn new(consumer: &Fixture) -> Self {
+            let package = consumer
+                .packages
+                .intern("acme:foreign#1")
+                .expect("foreign package key interns");
+            let def_paths = DefPathInterner::new(package, &consumer.packages, &consumer.symbols)
+                .expect("foreign definition path interner");
+            let api = consumer.symbols.intern("api").expect("module name interns");
+            let alpha = consumer
+                .symbols
+                .intern("alpha")
+                .expect("module name interns");
+            let zebra = consumer
+                .symbols
+                .intern("zebra")
+                .expect("module name interns");
+            let root_id = intern_module_def_path(
+                package,
+                &[],
+                &consumer.packages,
+                &consumer.symbols,
+                &def_paths,
+            )
+            .expect("foreign root definition path");
+            let api_id = intern_module_def_path(
+                package,
+                &[api],
+                &consumer.packages,
+                &consumer.symbols,
+                &def_paths,
+            )
+            .expect("foreign module definition path");
+            let alpha_id = intern_module_def_path(
+                package,
+                &[api, alpha],
+                &consumer.packages,
+                &consumer.symbols,
+                &def_paths,
+            )
+            .expect("foreign module definition path");
+            let zebra_id = intern_module_def_path(
+                package,
+                &[api, zebra],
+                &consumer.packages,
+                &consumer.symbols,
+                &def_paths,
+            )
+            .expect("foreign module definition path");
+            let api_path = [DisambiguatedDefPathData {
+                data: DefPathData::Module(api),
+                disambiguator: 0,
+            }];
+            let public_name = consumer
+                .symbols
+                .intern("Public")
+                .expect("member name interns");
+            let private_name = consumer
+                .symbols
+                .intern("Hidden")
+                .expect("member name interns");
+            let exported_name = consumer
+                .symbols
+                .intern("exported")
+                .expect("member name interns");
+            let forwarded_name = consumer
+                .symbols
+                .intern("Forwarded")
+                .expect("member name interns");
+            let codec_name = consumer
+                .symbols
+                .intern("codec")
+                .expect("interface name interns");
+            let public_res = Res::Def(
+                DefKind::Struct,
+                intern_path(
+                    package,
+                    &api_path,
+                    DefPathData::TypeNs(public_name),
+                    0,
+                    &consumer.packages,
+                    &consumer.symbols,
+                    &def_paths,
+                )
+                .expect("foreign public item path")
+                .to_def_id(),
+            );
+            let private_res = Res::Def(
+                DefKind::Struct,
+                intern_path(
+                    package,
+                    &api_path,
+                    DefPathData::TypeNs(private_name),
+                    0,
+                    &consumer.packages,
+                    &consumer.symbols,
+                    &def_paths,
+                )
+                .expect("foreign private item path")
+                .to_def_id(),
+            );
+            let exported_res = Res::Def(
+                DefKind::Fn,
+                intern_path(
+                    package,
+                    &api_path,
+                    DefPathData::ValueNs(exported_name),
+                    0,
+                    &consumer.packages,
+                    &consumer.symbols,
+                    &def_paths,
+                )
+                .expect("foreign exported item path")
+                .to_def_id(),
+            );
+            let interface_res = Res::Def(
+                DefKind::Interface,
+                intern_path(
+                    package,
+                    &api_path,
+                    DefPathData::TypeNs(codec_name),
+                    0,
+                    &consumer.packages,
+                    &consumer.symbols,
+                    &def_paths,
+                )
+                .expect("foreign interface path")
+                .to_def_id(),
+            );
+            let dummy_span = Span::new(FileId::new(901), TextRange::empty(TextSize::new(0)));
+            let binding = |res, visibility, origin| Binding {
+                res,
+                name_span: dummy_span,
+                origin,
+                visibility,
+            };
+
+            let root_module = ModuleData {
+                path: Vec::new(),
+                file: FileId::new(901),
+                parent_dir: None,
+                children: BTreeMap::from([(
+                    "api".to_owned(),
+                    ChildEntry::Module(ModuleId::from_raw(1)),
+                )]),
+            };
+            let api_module = ModuleData {
+                path: vec![api],
+                file: FileId::new(902),
+                parent_dir: Some(ModuleId::ROOT),
+                children: BTreeMap::from([
+                    (
+                        "alpha".to_owned(),
+                        ChildEntry::Module(ModuleId::from_raw(2)),
+                    ),
+                    (
+                        "zebra".to_owned(),
+                        ChildEntry::Module(ModuleId::from_raw(3)),
+                    ),
+                ]),
+            };
+            let alpha_module = ModuleData {
+                path: vec![api, alpha],
+                file: FileId::new(903),
+                parent_dir: Some(ModuleId::from_raw(1)),
+                children: BTreeMap::new(),
+            };
+            let zebra_module = ModuleData {
+                path: vec![api, zebra],
+                file: FileId::new(904),
+                parent_dir: Some(ModuleId::from_raw(1)),
+                children: BTreeMap::new(),
+            };
+            let tree = ModuleTree {
+                package,
+                modules: vec![root_module, api_module, alpha_module, zebra_module],
+                namespaces: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            let mut module_scopes = [root_id, api_id, alpha_id, zebra_id]
+                .into_iter()
+                .map(|module_def_id| Phase1ModuleScopes {
+                    module_def_id,
+                    declared: HashMap::new(),
+                    members: HashMap::new(),
+                    scope: HashMap::new(),
+                    imports: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let api_scope = &mut module_scopes[1];
+            api_scope.declared.insert(
+                public_name,
+                binding(public_res, Visibility::Pub, BindingOrigin::Decl),
+            );
+            api_scope.declared.insert(
+                private_name,
+                binding(private_res, Visibility::Private, BindingOrigin::Decl),
+            );
+            api_scope.declared.insert(
+                exported_name,
+                binding(exported_res, Visibility::Export, BindingOrigin::Decl),
+            );
+            api_scope.declared.insert(
+                codec_name,
+                binding(interface_res, Visibility::Pub, BindingOrigin::Decl),
+            );
+            api_scope.members = api_scope.declared.clone();
+            api_scope.members.insert(
+                forwarded_name,
+                binding(
+                    public_res,
+                    Visibility::Pub,
+                    BindingOrigin::PubUse {
+                        import: ImportIndex(0),
+                    },
+                ),
+            );
+            let scopes = Phase1PackageScopes {
+                modules: module_scopes,
+                interfaces: HashMap::new(),
+                exports: BTreeMap::new(),
+                diagnostics: Vec::new(),
+            };
+            Self {
+                visible_identity: "acme:foreign".to_owned(),
+                tree,
+                scopes,
+                _def_paths: def_paths,
+            }
+        }
+
+        fn scope(&self) -> ForeignPackageScope<'_> {
+            ForeignPackageScope {
+                visible_identity: &self.visible_identity,
+                module_tree: &self.tree,
+                scopes: &self.scopes,
+            }
+        }
+    }
+
     impl Fixture {
         fn new(text: &str, target: &str) -> Self {
             Self::new_with_identity(text, target, "acme:phase1#0.1")
@@ -3508,6 +4093,23 @@ mod tests {
             analyzes_tests: bool,
             is_root_package: bool,
         ) -> (Phase1PackageScopes, DefPathInterner) {
+            self.collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_scopes(
+                module_sources,
+                requirements,
+                analyzes_tests,
+                is_root_package,
+                &[],
+            )
+        }
+
+        fn collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_scopes(
+            &self,
+            module_sources: &[(&str, &str)],
+            requirements: Option<&[PackageUseRequirement]>,
+            analyzes_tests: bool,
+            is_root_package: bool,
+            foreign_scopes: &[ForeignPackageScope<'_>],
+        ) -> (Phase1PackageScopes, DefPathInterner) {
             struct ExtraInput {
                 module_name: Symbol,
                 file: FileId,
@@ -3652,7 +4254,7 @@ mod tests {
                 )
                 .expect("local use targets collect"),
             );
-            let local_import_diagnostics = collect_local_module_alias_bindings(
+            let local_import_diagnostics = collect_module_alias_bindings_with_foreign_scopes(
                 &tree,
                 &inputs,
                 &mut scopes,
@@ -3663,8 +4265,9 @@ mod tests {
                 &self.target_cfg,
                 analyzes_tests,
                 is_root_package,
+                foreign_scopes,
             )
-            .expect("local use items collect");
+            .expect("local and foreign use items collect");
             scopes.diagnostics.extend(local_import_diagnostics);
             (scopes, paths)
         }
@@ -3672,6 +4275,167 @@ mod tests {
 
     fn text<'a>(symbols: &'a Interner, symbol: Symbol) -> String {
         symbols.resolve(symbol).unwrap().to_string()
+    }
+
+    #[test]
+    fn foreign_module_and_item_imports_keep_canonical_identity_and_visibility() {
+        let source = concat!(
+            "use acme:foreign/api as api_alias\n",
+            "use acme:foreign/api.{Public as Imported, exported, Forwarded as Relay}\n",
+            "pub use acme:foreign/api.{Public as Reexported, Hidden as Leaked}\n",
+            "use acme:foreign/api.{Hidden as Inaccessible}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let api_alias = fixture.symbols.intern("api_alias").unwrap();
+        let imported = fixture.symbols.intern("Imported").unwrap();
+        let exported = fixture.symbols.intern("exported").unwrap();
+        let relay = fixture.symbols.intern("Relay").unwrap();
+        let reexported = fixture.symbols.intern("Reexported").unwrap();
+        let leaked = fixture.symbols.intern("Leaked").unwrap();
+        let inaccessible = fixture.symbols.intern("Inaccessible").unwrap();
+        let public_name = fixture.symbols.intern("Public").unwrap();
+        let api_module = &foreign.scopes.modules[1];
+        let public_res = api_module.members[&public_name].res;
+
+        assert_eq!(
+            root.scope[&api_alias].res,
+            Res::Def(DefKind::Module, api_module.module_def_id.to_def_id(),),
+            "foreign module aliases retain the dependency module's canonical DefId"
+        );
+        assert_eq!(root.scope[&imported].res, public_res);
+        assert_eq!(
+            root.scope[&exported].res, api_module.members[&exported].res,
+            "exported functions remain visible to ordinary external imports"
+        );
+        assert_eq!(
+            root.scope[&relay].res,
+            api_module.members[&fixture.symbols.intern("Forwarded").unwrap()].res,
+            "imports follow already-finalized dependency re-exports"
+        );
+        assert_eq!(root.members[&reexported].res, public_res);
+        assert_eq!(root.members[&reexported].visibility, Visibility::Pub);
+        assert!(!root.members.contains_key(&api_alias));
+        assert!(!root.members.contains_key(&imported));
+        assert!(!root.members.contains_key(&leaked));
+        assert!(!root.scope.contains_key(&inaccessible));
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::PrivateReexport)
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::PrivateItem)
+        );
+        assert!(
+            !scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+        );
+    }
+
+    #[test]
+    fn unknown_foreign_module_reports_matched_prefix_and_sorted_children() {
+        let fixture = Fixture::new("use acme:foreign/api/missing as absent\n", "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+            );
+
+        let diagnostic = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownModule)
+            .expect("an unknown suffix in an active foreign source package is diagnosed");
+        assert_eq!(
+            diagnostic.data.get("matched_prefix"),
+            Some(&Value::Array(vec![Value::String("api".to_owned())]))
+        );
+        assert_eq!(
+            diagnostic.data.get("module_candidates"),
+            Some(&Value::Array(vec![
+                Value::String("alpha".to_owned()),
+                Value::String("zebra".to_owned()),
+            ]))
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::FeatureNotImplemented)
+        );
+    }
+
+    #[test]
+    fn foreign_interface_targets_are_stage_gated_not_unknown_modules() {
+        let fixture = Fixture::new("use acme:foreign/api/codec as codec\n", "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+            );
+
+        let diagnostic = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+            .expect("foreign interface targets are recognized as Stage 4");
+        assert_eq!(diagnostic.data.get("stage"), Some(&Value::Integer(4)));
+        assert_eq!(
+            diagnostic.data.get("feature"),
+            Some(&Value::String("interfaces".to_owned()))
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::UnknownModule)
+        );
     }
 
     #[test]
