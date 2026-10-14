@@ -364,12 +364,13 @@ struct ImportResolver<'a> {
 ```rust
 pub struct DeclaredRequirement {
     pub identity: SmolStr,                 // `ns:pkg`
+    pub declaration_order: u32,            // first source occurrence among requirements
     pub only: Option<Arc<[Symbol]>>,       // the target names of `only { .. }`, in contract order
     pub test: bool,                        // an entry of `requires test`
 }
 ```
 
-The entries are sorted by identity bytes. An entry that the contract queries reject (for example `DUPLICATE_REQUIREMENT`, package/01 §1.10.4) keeps its first occurrence only; the contract diagnostics are reported by package/01, never here. A change of `sai.package` that does not change this list leaves `package_scopes` green.
+The entries are sorted by identity bytes, while `declaration_order` preserves the first source occurrence among requirement entries. An entry that the contract queries reject (for example `DUPLICATE_REQUIREMENT`, package/01 §1.10.4) keeps its first occurrence only; the contract diagnostics are reported by package/01, never here. A change of `sai.package` that does not change this list leaves `package_scopes` green.
 
 **Tracked requirement query (IR-471).** `RootDatabase` now exposes
 `declared_requirements(PackageId)` over the exact manifest bytes and
@@ -377,7 +378,9 @@ The entries are sorted by identity bytes. An entry that the contract queries rej
 `PackageKey` and tracks both values as inputs. It sorts by identity bytes,
 keeps the first source-order occurrence of a repeated identity, preserves
 `only` targets in manifest order, and retains `requires test` entries for
-dependency manifests. It parses with a zero retained-diagnostic limit, rejects
+dependency manifests. Each normalized entry carries the ordinal of its first
+requirement occurrence so equal-ranked package suggestions can follow manifest
+declaration order without changing the query's identity-sorted result. It parses with a zero retained-diagnostic limit, rejects
 recovered entries from syntactically invalid manifests, and verifies that a
 valid manifest header matches the package identity and compatibility line.
 Requirement identities and target names stay as strings in the cached value

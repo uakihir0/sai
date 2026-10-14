@@ -73,9 +73,12 @@ pub struct RootDatabase {
 ///
 /// Target spellings stay as strings so query results remain independent of
 /// session-local symbol IDs. The order of `only` targets is manifest order.
+/// `declaration_order` is the source ordinal of the first declaration for
+/// this identity, even though query results are sorted by identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeclaredRequirement {
     pub identity: String,
+    pub declaration_order: u32,
     pub only: Option<Arc<[String]>>,
     pub test: bool,
 }
@@ -84,6 +87,7 @@ impl StableHash for DeclaredRequirement {
     fn stable_hash(&self, hasher: &mut StableHasher) {
         hasher.write_tag(0xD4);
         self.identity.stable_hash(hasher);
+        self.declaration_order.stable_hash(hasher);
         self.only.stable_hash(hasher);
         self.test.stable_hash(hasher);
     }
@@ -227,6 +231,7 @@ impl DeclaredRequirementsQueries {
                     });
                 }
                 let mut by_identity = BTreeMap::<String, DeclaredRequirement>::new();
+                let mut declaration_ordinal = 0_u32;
                 for declaration in &parsed.file().declarations {
                     let sai_package::manifest::PackageDeclaration::Requires { test, entries } =
                         &declaration.value
@@ -234,6 +239,8 @@ impl DeclaredRequirementsQueries {
                         continue;
                     };
                     for entry in entries {
+                        let source_ordinal = declaration_ordinal;
+                        declaration_ordinal = declaration_ordinal.saturating_add(1);
                         let requirement = &entry.value;
                         let only = requirement.only.as_ref().map(|targets| {
                             targets
@@ -247,6 +254,7 @@ impl DeclaredRequirementsQueries {
                             .entry(requirement.package.to_string())
                             .or_insert(DeclaredRequirement {
                                 identity: requirement.package.to_string(),
+                                declaration_order: source_ordinal,
                                 only,
                                 test: *test,
                             });
@@ -2486,11 +2494,13 @@ mod tests {
             [
                 DeclaredRequirement {
                     identity: "acme:test".to_owned(),
+                    declaration_order: 2,
                     only: None,
                     test: true,
                 },
                 DeclaredRequirement {
                     identity: "zed:dep".to_owned(),
+                    declaration_order: 0,
                     only: Some(Arc::from([
                         "wasm64-core".to_owned(),
                         "wasm32-core".to_owned(),
@@ -2498,6 +2508,76 @@ mod tests {
                     test: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn declared_requirements_track_reordering_while_remaining_identity_sorted() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:reordered#1")
+            .expect("package key interns");
+        let first_source: Arc<[u8]> = Arc::from(
+            &b"package acme:reordered @ 1.0.0\n\
+              requires {\n\
+                  zed:dep @ ^1\n\
+                  acme:dep @ ^1\n\
+              }\n"[..],
+        );
+        database
+            .set_package_manifest(package, first_source, PackageRole::Root, Durability::Low)
+            .expect("initial manifest input is set");
+        let first = database
+            .declared_requirements(package)
+            .expect("initial requirements query succeeds");
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|requirement| {
+                    (
+                        requirement.identity.as_str(),
+                        requirement.declaration_order,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [("acme:dep", 1), ("zed:dep", 0)]
+        );
+
+        let reordered_source: Arc<[u8]> = Arc::from(
+            &b"package acme:reordered @ 1.0.0\n\
+              requires {\n\
+                  acme:dep @ ^1\n\
+                  zed:dep @ ^1\n\
+              }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                package,
+                reordered_source,
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("reordered manifest input is set");
+        let reordered = database
+            .declared_requirements(package)
+            .expect("reordered requirements query succeeds");
+
+        assert!(
+            !Arc::ptr_eq(&first, &reordered),
+            "reordering first declarations changes the tracked requirement value"
+        );
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|requirement| {
+                    (
+                        requirement.identity.as_str(),
+                        requirement.declaration_order,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [("acme:dep", 0), ("zed:dep", 1)]
         );
     }
 
@@ -2523,6 +2603,7 @@ mod tests {
             requirements.as_ref(),
             [DeclaredRequirement {
                 identity: "acme:test-support".to_owned(),
+                declaration_order: 0,
                 only: Some(Arc::from(["wasm32-core".to_owned()])),
                 test: true,
             }]
