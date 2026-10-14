@@ -105,6 +105,9 @@ pub struct ImportBinding {
     pub test_only: bool,
     /// Retained so inactive uses still participate in module-scope conflicts.
     pub inactive: bool,
+    /// Retained so package-classification failures still participate in
+    /// module-scope conflicts without entering member lookup.
+    pub retain_for_conflicts: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +132,8 @@ enum PendingItemTarget {
     Deferred,
     Inactive,
     Unavailable,
+    UnknownPackage,
+    StageGated,
     TestOnly,
 }
 
@@ -139,6 +144,7 @@ enum PendingItemTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageUseRequirement {
     pub identity: String,
+    pub declaration_order: u32,
     pub only: Option<Arc<[String]>>,
     pub test: bool,
 }
@@ -622,7 +628,7 @@ pub fn collect_local_module_alias_bindings(
     packages: &PackageInterner,
     symbols: &Interner,
     def_paths: &DefPathInterner,
-    requirements: &[PackageUseRequirement],
+    requirements: Option<&[PackageUseRequirement]>,
     target_cfg: &TargetCfg,
     analyzes_tests: bool,
     is_root_package: bool,
@@ -726,6 +732,31 @@ pub fn collect_local_module_alias_bindings(
                         .any(|target| target == target_cfg.target_name())
                 });
             let test_dependency_unavailable = test_only && analyzes_tests && !is_root_package;
+            let is_current_package = parsed.package_identity == current_package_identity;
+            let is_known_toolchain_package = matches!(
+                parsed.package_identity.as_str(),
+                "sai:core"
+                    | "sai:alloc"
+                    | "wasi:cli"
+                    | "wasi:clocks"
+                    | "wasi:filesystem"
+                    | "wasi:http"
+                    | "wasi:io"
+                    | "wasi:random"
+                    | "wasi:sockets"
+            );
+            let foreign_classification = if !is_current_package && !is_known_toolchain_package {
+                requirements.map(|_| match requirement {
+                    Some(_) if inactive_targets.is_some() => (
+                        PendingItemTarget::Inactive,
+                        inactive_targets.map(|targets| targets.as_ref()),
+                    ),
+                    Some(_) => (PendingItemTarget::StageGated, None),
+                    None => (PendingItemTarget::UnknownPackage, None),
+                })
+            } else {
+                None
+            };
             let binding_name = match derive_use_binding_name(entry, symbols) {
                 Ok(binding_name) => binding_name,
                 Err(UseBindingNameError::Intern(error)) => {
@@ -753,7 +784,7 @@ pub fn collect_local_module_alias_bindings(
                     &package_identity,
                 ));
                 (None, PendingItemTarget::Unavailable)
-            } else if let Some(targets) = inactive_targets {
+            } else if test_only && let Some(targets) = inactive_targets {
                 diagnostics.push(inactive_dependency_diagnostic(
                     source_location(input, path_range)?,
                     &parsed.package_identity,
@@ -762,6 +793,46 @@ pub fn collect_local_module_alias_bindings(
                     &package_identity,
                 ));
                 (None, PendingItemTarget::Inactive)
+            } else if let Some((foreign_target, allowed_targets)) = foreign_classification {
+                match foreign_target {
+                    PendingItemTarget::Inactive => {
+                        let targets =
+                            allowed_targets.ok_or(PackageScopesError::InvalidModuleTree)?;
+                        diagnostics.push(inactive_dependency_diagnostic(
+                            source_location(input, path_range)?,
+                            &parsed.package_identity,
+                            target_cfg.target_name(),
+                            targets,
+                            &package_identity,
+                        ));
+                    }
+                    PendingItemTarget::StageGated => {
+                        let identity_range =
+                            use_package_identity_range(path_range, &parsed.package_identity)?;
+                        diagnostics.push(dependency_feature_not_implemented_diagnostic(
+                            source_location(input, identity_range)?,
+                            &parsed.package_identity,
+                            &package_identity,
+                        ));
+                    }
+                    PendingItemTarget::UnknownPackage => {
+                        let identity_range =
+                            use_package_identity_range(path_range, &parsed.package_identity)?;
+                        let candidates = requirements
+                            .map(|requirements| {
+                                package_identity_candidates(requirements, &parsed.package_identity)
+                            })
+                            .unwrap_or_default();
+                        diagnostics.push(unknown_package_diagnostic(
+                            source_location(input, identity_range)?,
+                            &parsed.package_identity,
+                            &candidates,
+                            &package_identity,
+                        ));
+                    }
+                    _ => return Err(PackageScopesError::InvalidModuleTree),
+                }
+                (None, foreign_target)
             } else {
                 match resolve_parsed_use_target(
                     &parsed,
@@ -857,6 +928,7 @@ pub fn collect_local_module_alias_bindings(
                         false,
                         false,
                         false,
+                        false,
                     )?;
                     valid_binding = false;
                 } else if is_reserved_type_name(&name_spelling) {
@@ -882,12 +954,19 @@ pub fn collect_local_module_alias_bindings(
                         false,
                         false,
                         false,
+                        false,
                     )?;
                     valid_binding = false;
                 }
 
                 if valid_binding
-                    && (target_res.is_some() || test_only || target == PendingItemTarget::Inactive)
+                    && (target_res.is_some()
+                        || test_only
+                        || target == PendingItemTarget::Inactive
+                        || matches!(
+                            target,
+                            PendingItemTarget::UnknownPackage | PendingItemTarget::StageGated
+                        ))
                 {
                     let module_scopes = scopes
                         .modules
@@ -901,8 +980,16 @@ pub fn collect_local_module_alias_bindings(
                         name_span,
                         target_res.unwrap_or(Res::Err),
                         test_only,
-                        test_only && target != PendingItemTarget::Inactive,
+                        test_only
+                            && matches!(
+                                target,
+                                PendingItemTarget::TestOnly | PendingItemTarget::Unavailable
+                            ),
                         target == PendingItemTarget::Inactive,
+                        matches!(
+                            target,
+                            PendingItemTarget::UnknownPackage | PendingItemTarget::StageGated
+                        ),
                     )?;
                 }
             }
@@ -941,8 +1028,16 @@ pub fn collect_local_module_alias_bindings(
                     binding_span,
                     Res::Err,
                     test_only,
-                    test_only && target != PendingItemTarget::Inactive,
+                    test_only
+                        && matches!(
+                            target,
+                            PendingItemTarget::TestOnly | PendingItemTarget::Unavailable
+                        ),
                     target == PendingItemTarget::Inactive,
+                    matches!(
+                        target,
+                        PendingItemTarget::UnknownPackage | PendingItemTarget::StageGated
+                    ),
                 )?;
                 pending_items.push(PendingLocalUseItem {
                     module: module_id,
@@ -1005,6 +1100,24 @@ fn use_item_binding_name_range(
         .ok_or(PackageScopesError::MissingName)
 }
 
+fn use_package_identity_range(
+    package_path_range: TextRange,
+    identity: &str,
+) -> Result<TextRange, PackageScopesError> {
+    let start = package_path_range.start().raw();
+    let end = start
+        .checked_add(
+            u32::try_from(identity.len()).map_err(|_| PackageScopesError::InvalidSourceRange)?,
+        )
+        .ok_or(PackageScopesError::InvalidSourceRange)?;
+    let range = TextRange::new(TextSize::new(start), TextSize::new(end))
+        .ok_or(PackageScopesError::InvalidSourceRange)?;
+    if range.end() > package_path_range.end() {
+        return Err(PackageScopesError::InvalidSourceRange);
+    }
+    Ok(range)
+}
+
 fn resolve_local_use_items(
     module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
     scopes: &mut Phase1PackageScopes,
@@ -1021,6 +1134,8 @@ fn resolve_local_use_items(
                 item.target,
                 PendingItemTarget::Unavailable
                     | PendingItemTarget::Inactive
+                    | PendingItemTarget::UnknownPackage
+                    | PendingItemTarget::StageGated
                     | PendingItemTarget::TestOnly
             )
         {
@@ -1093,7 +1208,7 @@ fn insert_resolved_imports_into_scopes(
             })
             .collect::<Result<Vec<_>, PackageScopesError>>()?;
         for (raw_import_index, import) in module_scope.imports.iter().enumerate() {
-            if import.res == Res::Err && !import.inactive {
+            if import.res == Res::Err && !import.inactive && !import.retain_for_conflicts {
                 continue;
             }
             let import_index = ImportIndex(
@@ -1162,7 +1277,9 @@ fn insert_resolved_imports_into_scopes(
                         import_index.and_then(|index| module_scope.imports.get(index.0 as usize));
                     let is_module_alias = import.is_some_and(|import| import.item_index.is_none());
                     let is_item_import = import.is_some_and(|import| import.item_index.is_some());
+                    let is_err_binding = binding.res == Res::Err;
                     let is_prelude_reimport = is_item_import
+                        && !is_err_binding
                         && is_shadowable_prelude_name(&spelling)
                         && is_same_prelude_entity(
                             &spelling,
@@ -1183,7 +1300,7 @@ fn insert_resolved_imports_into_scopes(
                     } else {
                         module_scope.scope.insert(name, binding);
                     }
-                    if is_module_alias && is_shadowable_prelude_name(&spelling) {
+                    if is_module_alias && !is_err_binding && is_shadowable_prelude_name(&spelling) {
                         diagnostics.push(use_binding_diagnostic(
                             Code::ShadowsPrelude,
                             Severity::Warning,
@@ -1193,6 +1310,7 @@ fn insert_resolved_imports_into_scopes(
                             package_identity,
                         ));
                     } else if is_item_import
+                        && !is_err_binding
                         && is_shadowable_prelude_name(&spelling)
                         && !is_prelude_reimport
                     {
@@ -1208,6 +1326,7 @@ fn insert_resolved_imports_into_scopes(
                 }
                 Some(previous)
                     if previous.res == binding.res
+                        && binding.res != Res::Err
                         && !current_is_inactive
                         && !previous_is_inactive =>
                 {
@@ -1356,6 +1475,8 @@ impl LocalModuleMemberResolver<'_> {
             }
             PendingItemTarget::Inactive
             | PendingItemTarget::Unavailable
+            | PendingItemTarget::UnknownPackage
+            | PendingItemTarget::StageGated
             | PendingItemTarget::TestOnly => {
                 // The use-target pass owns missing, current-module, and
                 // malformed-target diagnostics. Inactive and test-only
@@ -1504,6 +1625,8 @@ impl LocalModuleMemberResolver<'_> {
                 }
                 PendingItemTarget::Inactive
                 | PendingItemTarget::Unavailable
+                | PendingItemTarget::UnknownPackage
+                | PendingItemTarget::StageGated
                 | PendingItemTarget::TestOnly => continue,
             };
             match target {
@@ -1646,6 +1769,8 @@ impl LocalModuleMemberResolver<'_> {
             PendingItemTarget::Deferred
             | PendingItemTarget::Inactive
             | PendingItemTarget::Unavailable
+            | PendingItemTarget::UnknownPackage
+            | PendingItemTarget::StageGated
             | PendingItemTarget::TestOnly => Vec::new(),
         };
         let mut diagnostic = use_binding_diagnostic(
@@ -2198,6 +2323,7 @@ fn push_import_binding(
     test_only: bool,
     keep_test_only_resolution: bool,
     inactive: bool,
+    retain_for_conflicts: bool,
 ) -> Result<ImportIndex, PackageScopesError> {
     let import = ImportIndex(
         u32::try_from(module_scopes.imports.len())
@@ -2216,21 +2342,111 @@ fn push_import_binding(
         is_pub: entry.is_pub,
         test_only,
         inactive,
+        retain_for_conflicts,
     });
     Ok(import)
 }
 
 fn find_package_use_requirement<'a>(
-    requirements: &'a [PackageUseRequirement],
+    requirements: Option<&'a [PackageUseRequirement]>,
     identity: &str,
     current_package_identity: &str,
 ) -> Option<&'a PackageUseRequirement> {
     if identity == current_package_identity || matches!(identity, "sai:core" | "sai:alloc") {
         return None;
     }
-    requirements
+    requirements?
         .iter()
         .find(|requirement| requirement.identity == identity)
+}
+
+fn package_identity_candidates(
+    requirements: &[PackageUseRequirement],
+    identity: &str,
+) -> Vec<String> {
+    let mut candidates = requirements
+        .iter()
+        .filter_map(|requirement| {
+            let distance = damerau_levenshtein(identity, &requirement.identity);
+            (distance <= 2).then_some((
+                distance,
+                requirement.declaration_order,
+                requirement.identity.as_str(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.as_bytes().cmp(right.2.as_bytes()))
+    });
+    candidates
+        .into_iter()
+        .take(10)
+        .map(|(_, _, identity)| identity.to_owned())
+        .collect()
+}
+
+fn unknown_package_diagnostic(
+    location: Location,
+    identity: &str,
+    candidates: &[String],
+    package_identity: &str,
+) -> Diagnostic {
+    let mut diagnostic = use_binding_diagnostic(
+        Code::UnknownPackage,
+        Severity::Error,
+        format!("unknown package `{identity}`"),
+        "unknown package",
+        location,
+        package_identity,
+    );
+    diagnostic
+        .data
+        .insert("name".to_owned(), Value::String(identity.to_owned()));
+    diagnostic.data.insert(
+        "candidates".to_owned(),
+        Value::Array(candidates.iter().cloned().map(Value::String).collect()),
+    );
+    if !candidates.is_empty() {
+        let rendered = candidates
+            .iter()
+            .map(|candidate| format!("`{candidate}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!("similar packages: {rendered}"),
+                location: None,
+            })
+            .expect("a diagnostic without a workspace snapshot accepts help children");
+    }
+    diagnostic
+}
+
+fn dependency_feature_not_implemented_diagnostic(
+    location: Location,
+    identity: &str,
+    package_identity: &str,
+) -> Diagnostic {
+    let mut diagnostic = use_binding_diagnostic(
+        Code::FeatureNotImplemented,
+        Severity::Error,
+        format!("stage 3 feature `dependencies` is not implemented for `{identity}`"),
+        "dependency feature",
+        location,
+        package_identity,
+    );
+    diagnostic
+        .data
+        .insert("stage".to_owned(), Value::Integer(3));
+    diagnostic.data.insert(
+        "feature".to_owned(),
+        Value::String("dependencies".to_owned()),
+    );
+    diagnostic
 }
 
 fn inactive_dependency_diagnostic(
@@ -3275,6 +3491,21 @@ mod tests {
             analyzes_tests: bool,
             is_root_package: bool,
         ) -> (Phase1PackageScopes, DefPathInterner) {
+            self.collect_with_local_modules_and_paths_and_optional_requirements_for_package(
+                module_sources,
+                Some(requirements),
+                analyzes_tests,
+                is_root_package,
+            )
+        }
+
+        fn collect_with_local_modules_and_paths_and_optional_requirements_for_package(
+            &self,
+            module_sources: &[(&str, &str)],
+            requirements: Option<&[PackageUseRequirement]>,
+            analyzes_tests: bool,
+            is_root_package: bool,
+        ) -> (Phase1PackageScopes, DefPathInterner) {
             struct ExtraInput {
                 module_name: Symbol,
                 file: FileId,
@@ -3554,6 +3785,7 @@ mod tests {
         let fixture = Fixture::new(source, "wasm32-core");
         let requirements = [PackageUseRequirement {
             identity: "acme:test-support".to_owned(),
+            declaration_order: 0,
             only: Some(Arc::from([
                 "wasm64-core".to_owned(),
                 "wasm32-wasi".to_owned(),
@@ -3618,6 +3850,7 @@ mod tests {
         let fixture = Fixture::new(source, "wasm32-core");
         let requirements = [PackageUseRequirement {
             identity: "acme:targeted".to_owned(),
+            declaration_order: 0,
             only: Some(Arc::from([
                 "wasm64-core".to_owned(),
                 "wasm32-wasi".to_owned(),
@@ -3677,11 +3910,197 @@ mod tests {
     }
 
     #[test]
+    fn active_foreign_dependencies_are_stage_gated_and_retain_only_conflict_bindings() {
+        let source = concat!(
+            "use acme:declared/module as panic\n",
+            "use acme:declared/module.{missing as helper}\n",
+            "fn panic() {}\n",
+            "fn helper() {}\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let requirements = [PackageUseRequirement {
+            identity: "acme:declared".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[],
+            &requirements,
+            false,
+        );
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let feature_diagnostics = scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+            .collect::<Vec<_>>();
+
+        assert_eq!(feature_diagnostics.len(), 2);
+        for diagnostic in feature_diagnostics {
+            let primary = diagnostic.primary().expect("feature diagnostic span");
+            let spelling = &source[primary.span.range.start().raw() as usize
+                ..primary.span.range.end().raw() as usize];
+            assert_eq!(spelling, "acme:declared");
+            assert_eq!(diagnostic.data.get("stage"), Some(&Value::Integer(3)));
+            assert_eq!(
+                diagnostic.data.get("feature"),
+                Some(&Value::String("dependencies".to_owned()))
+            );
+        }
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.code,
+                Code::UnknownPackage | Code::UnknownModule | Code::UnresolvedImport
+            )
+        }));
+        assert_eq!(root.imports.len(), 2);
+        assert!(root.imports.iter().all(|import| {
+            import.res == Res::Err && import.retain_for_conflicts && !import.inactive
+        }));
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            2,
+            "both syntax-derived bindings still conflict with declarations"
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Code::RedundantImport && diagnostic.code != Code::ShadowsPrelude
+        }));
+    }
+
+    #[test]
+    fn unknown_foreign_packages_report_bounded_ordered_candidates_without_cascades() {
+        let source = "use acme:foa/module.{Missing as selected}\n";
+        let fixture = Fixture::new(source, "wasm32-core");
+        let mut requirements = ('b'..='z')
+            .rev()
+            .take(12)
+            .enumerate()
+            .map(|(order, suffix)| PackageUseRequirement {
+                identity: format!("acme:fo{suffix}"),
+                declaration_order: order as u32,
+                only: None,
+                test: false,
+            })
+            .collect::<Vec<_>>();
+        requirements.push(PackageUseRequirement {
+            identity: "acme:xyz".to_owned(),
+            declaration_order: 12,
+            only: None,
+            test: false,
+        });
+        let (scopes, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[],
+            &requirements,
+            false,
+        );
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let unknown = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownPackage)
+            .expect("undeclared identity is diagnosed");
+        let primary = unknown.primary().expect("unknown package span");
+        let spelling = &source
+            [primary.span.range.start().raw() as usize..primary.span.range.end().raw() as usize];
+        assert_eq!(spelling, "acme:foa");
+        let candidates = (('b'..='z').rev())
+            .take(10)
+            .map(|suffix| Value::String(format!("acme:fo{suffix}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unknown.data.get("name"),
+            Some(&Value::String("acme:foa".to_owned()))
+        );
+        assert_eq!(
+            unknown.data.get("candidates"),
+            Some(&Value::Array(candidates))
+        );
+        assert!(unknown.children().iter().any(|child| {
+            child.kind == ChildKind::Help && child.message.contains("similar packages:")
+        }));
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.code,
+                Code::FeatureNotImplemented | Code::UnknownModule | Code::UnresolvedImport
+            )
+        }));
+        assert_eq!(root.imports.len(), 1);
+        assert_eq!(root.imports[0].res, Res::Err);
+        assert!(root.imports[0].retain_for_conflicts);
+        let selected = fixture.symbols.intern("selected").expect("alias interns");
+        assert_eq!(
+            root.scope.get(&selected).map(|binding| binding.res),
+            Some(Res::Err),
+            "a failed foreign import poisons later references without a cascade"
+        );
+    }
+
+    #[test]
+    fn foreign_classification_requires_a_valid_manifest_and_preserves_toolchain_packages() {
+        let source = concat!(
+            "use other:package/module as external\n",
+            "use sai:core/fmt as fmt\n",
+            "use sai:alloc/string as strings\n",
+            "use wasi:io/error as io_error\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (without_manifest, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package(
+                &[],
+                None,
+                false,
+                true,
+            );
+        assert!(without_manifest.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != Code::UnknownPackage
+                && diagnostic.code != Code::FeatureNotImplemented
+        }));
+
+        let (with_valid_empty_manifest, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package(
+                &[],
+                Some(&[]),
+                false,
+                true,
+            );
+        assert_eq!(
+            with_valid_empty_manifest
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::UnknownPackage)
+                .count(),
+            1,
+            "a valid empty requirement list classifies the undeclared foreign package"
+        );
+        assert!(
+            with_valid_empty_manifest
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Code::FeatureNotImplemented),
+        );
+        let unknown = with_valid_empty_manifest
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownPackage)
+            .expect("the only unknown is the undeclared foreign identity");
+        assert_eq!(
+            unknown.data.get("name"),
+            Some(&Value::String("other:package".to_owned()))
+        );
+    }
+
+    #[test]
     fn test_analysis_does_not_reexport_test_only_deferred_items() {
         let source = "pub use acme:phase1/bridge.{helper}\n";
         let fixture = Fixture::new(source, "wasm32-core");
         let requirements = [PackageUseRequirement {
             identity: "acme:test-support".to_owned(),
+            declaration_order: 0,
             only: None,
             test: true,
         }];
@@ -3719,6 +4138,7 @@ mod tests {
         let fixture = Fixture::new(source, "wasm32-core");
         let requirements = [PackageUseRequirement {
             identity: "acme:test-support".to_owned(),
+            declaration_order: 0,
             only: Some(Arc::from(["wasm32-wasi".to_owned()])),
             test: true,
         }];
@@ -3770,6 +4190,7 @@ mod tests {
         let fixture = Fixture::new(source, "wasm32-core");
         let requirements = [PackageUseRequirement {
             identity: "acme:test-support".to_owned(),
+            declaration_order: 0,
             only: Some(Arc::from(["wasm32-wasi".to_owned()])),
             test: true,
         }];
@@ -3832,6 +4253,7 @@ mod tests {
         let fixture = Fixture::new(source, "wasm32-core");
         let requirements = [PackageUseRequirement {
             identity: "acme:test-support".to_owned(),
+            declaration_order: 0,
             only: None,
             test: true,
         }];

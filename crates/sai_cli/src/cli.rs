@@ -8456,9 +8456,14 @@ mod tests {
             1,
             "{stdout}"
         );
+        let unknown_package = check_diagnostic_lines(&stdout, "UNKNOWN_PACKAGE");
+        assert_eq!(unknown_package.len(), 1, "{stdout}");
+        let unknown_start = source
+            .find("other:package")
+            .expect("undeclared package identity");
         assert!(
-            check_diagnostic_lines(&stdout, "UNKNOWN_PACKAGE").is_empty(),
-            "{stdout}"
+            unknown_package[0].contains(&format!("\"start\":{{\"byte\":{unknown_start},")),
+            "{unknown_package:?}"
         );
         assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
     }
@@ -8925,10 +8930,62 @@ mod tests {
             unknown[0].contains(&format!("\"start\":{{\"byte\":{expected_start},")),
             "{unknown:?}"
         );
+        let unknown_package = check_diagnostic_lines(&stdout, "UNKNOWN_PACKAGE");
+        assert_eq!(unknown_package.len(), 1, "{stdout}");
+        let package_identity_start = client_source
+            .find("other:package")
+            .expect("undeclared foreign identity");
         assert!(
-            check_diagnostic_lines(&stdout, "UNKNOWN_PACKAGE").is_empty(),
-            "{stdout}"
+            unknown_package[0].contains(&format!("\"start\":{{\"byte\":{package_identity_start},")),
+            "{unknown_package:?}"
         );
+        assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
+    }
+
+    #[test]
+    fn check_reports_declared_active_dependency_as_stage_three_feature() {
+        let temporary = TestDirectory::new();
+        let package = create_check_package(&temporary);
+        let package_path = package.to_str().expect("package path is UTF-8");
+        let manifest_path = package.join("sai.package");
+        let mut manifest = fs::read_to_string(&manifest_path).expect("read package manifest");
+        manifest.push_str("\nrequires { acme:declared @ ^1 }\n");
+        fs::write(manifest_path, manifest).expect("declare active dependency");
+        let source = "use acme:declared/module.{Missing as selected}\n";
+        fs::write(package.join("src/lib.sai"), source).expect("write dependency use");
+
+        let (exit_code, stdout, stderr) = invoke(&[
+            "--format=json",
+            "--directory",
+            package_path,
+            "check",
+            "--target=wasm32-core",
+        ]);
+
+        assert_eq!(exit_code, 1);
+        assert!(stderr.is_empty());
+        let diagnostics = check_diagnostic_lines(&stdout, "FEATURE_NOT_IMPLEMENTED");
+        let dependency = diagnostics
+            .iter()
+            .find(|line| line.contains("\"feature\":\"dependencies\""))
+            .expect("declared dependency has a stage-gate diagnostic");
+        let identity_start = source.find("acme:declared").expect("dependency identity");
+        let identity_end = identity_start + "acme:declared".len();
+        assert!(
+            dependency.contains("\"stage\":3")
+                && dependency.contains(&format!("\"start\":{{\"byte\":{identity_start},")),
+            "{dependency}"
+        );
+        assert!(
+            dependency.contains(&format!("\"end\":{{\"byte\":{identity_end},")),
+            "{dependency}"
+        );
+        for code in ["UNKNOWN_PACKAGE", "UNKNOWN_MODULE", "UNRESOLVED_IMPORT"] {
+            assert!(
+                check_diagnostic_lines(&stdout, code).is_empty(),
+                "{code}: {stdout}"
+            );
+        }
         assert!(!stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""));
     }
 

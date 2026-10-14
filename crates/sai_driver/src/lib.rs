@@ -925,6 +925,20 @@ fn collect_prepared_phase1_package_scopes(
         symbols,
     )?;
     scopes.diagnostics.extend(use_target_diagnostics);
+    let requirements = prepared
+        .declared_requirements
+        .as_deref()
+        .map(|requirements| {
+            requirements
+                .iter()
+                .map(|requirement| PackageUseRequirement {
+                    identity: requirement.identity.clone(),
+                    declaration_order: requirement.declaration_order,
+                    only: requirement.only.clone(),
+                    test: requirement.test,
+                })
+                .collect::<Vec<_>>()
+        });
     let module_alias_diagnostics = collect_local_module_alias_bindings(
         &prepared.module_tree,
         &module_inputs,
@@ -932,17 +946,7 @@ fn collect_prepared_phase1_package_scopes(
         packages,
         symbols,
         &prepared.def_paths,
-        &prepared
-            .declared_requirements
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|requirement| PackageUseRequirement {
-                identity: requirement.identity.clone(),
-                only: requirement.only.clone(),
-                test: requirement.test,
-            })
-            .collect::<Vec<_>>(),
+        requirements.as_deref(),
         &prepared.target_cfg,
         prepared.build_context.analyzes_tests,
         prepared.build_context.is_root_package,
@@ -2535,10 +2539,7 @@ mod tests {
             first
                 .iter()
                 .map(|requirement| {
-                    (
-                        requirement.identity.as_str(),
-                        requirement.declaration_order,
-                    )
+                    (requirement.identity.as_str(), requirement.declaration_order)
                 })
                 .collect::<Vec<_>>(),
             [("acme:dep", 1), ("zed:dep", 0)]
@@ -2571,10 +2572,7 @@ mod tests {
             reordered
                 .iter()
                 .map(|requirement| {
-                    (
-                        requirement.identity.as_str(),
-                        requirement.declaration_order,
-                    )
+                    (requirement.identity.as_str(), requirement.declaration_order)
                 })
                 .collect::<Vec<_>>(),
             [("acme:dep", 0), ("zed:dep", 1)]
