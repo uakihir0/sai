@@ -27,13 +27,13 @@ pub struct RequirementComparator {
 }
 
 /// An inclusive or exclusive upper endpoint of a version interval.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct UpperBound {
     endpoint: UpperBoundEndpoint,
     inclusive: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum UpperBoundEndpoint {
     Version(Version),
     ReleaseCore {
@@ -44,7 +44,7 @@ pub enum UpperBoundEndpoint {
 }
 
 /// A validated intersection of package version comparator intervals.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VersionReq {
     comparators: Vec<RequirementComparator>,
     minimum: Version,

@@ -342,6 +342,7 @@ pub struct ResolverContract {
     pub mvs: MvsContract,
     manifest_package_version: MvsPackageVersion,
     role: PackageRole,
+    package_targets: BTreeSet<Box<str>>,
     root_targets: BTreeSet<Box<str>>,
     /// Retained for exact workspace-snapshot provenance checks. Excluded
     /// from resolver-contract equality; semantic fields below define Eq.
@@ -359,6 +360,7 @@ impl PartialEq for ResolverContract {
         self.mvs == other.mvs
             && self.manifest_package_version == other.manifest_package_version
             && self.role == other.role
+            && self.package_targets == other.package_targets
             && self.root_targets == other.root_targets
             && self.requirements == other.requirements
             && self.parse_warnings == other.parse_warnings
@@ -372,6 +374,12 @@ impl Eq for ResolverContract {}
 impl ResolverContract {
     pub const fn role(&self) -> PackageRole {
         self.role
+    }
+
+    /// Targets declared by this package, distinct from the root targets used
+    /// to filter dependency requirements during resolution.
+    pub fn package_targets(&self) -> &BTreeSet<Box<str>> {
+        &self.package_targets
     }
 
     /// Package identity and version declared by the validated manifest.
@@ -1204,6 +1212,20 @@ pub fn build_resolver_contract(
         header.value.version.clone(),
     )
     .map_err(ResolverContractBuildError::MvsInput)?;
+    let package_targets = parsed
+        .file()
+        .declarations
+        .iter()
+        .find_map(|declaration| match &declaration.value {
+            PackageDeclaration::Targets(targets) => Some(
+                targets
+                    .iter()
+                    .map(|target| target.value.clone())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            _ => None,
+        })
+        .expect("validated package manifests declare targets");
     if parsed.role() == PackageRole::Root && parsed != &context.root_manifest {
         return Err(ResolverContractBuildError::RootManifestMismatch);
     }
@@ -1267,6 +1289,7 @@ pub fn build_resolver_contract(
         mvs,
         manifest_package_version: package_version,
         role: parsed.role(),
+        package_targets,
         root_targets: context.root_targets.clone(),
         manifest_digest: *parsed
             .manifest_digest()

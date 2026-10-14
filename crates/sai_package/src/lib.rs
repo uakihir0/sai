@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod active_graph;
 pub mod git_path_requirements;
 pub mod git_remote;
 pub mod git_source_index;

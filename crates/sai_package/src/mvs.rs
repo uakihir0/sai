@@ -306,7 +306,7 @@ impl MvsInputError {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MvsRequirer {
     Root(MvsPackageVersion),
     Package(MvsPackageVersion),
