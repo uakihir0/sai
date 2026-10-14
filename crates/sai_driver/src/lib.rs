@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod package_graph;
+
 use sai_diagnostics::{
     CauseKey, Child, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related, SourceRef,
     source_text_status_diagnostic,
