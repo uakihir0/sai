@@ -49,10 +49,33 @@ pub fn resolve_module_target(
     segments: &[Symbol],
     symbols: &Interner,
 ) -> Result<ModuleId, ModuleTargetError> {
+    resolve_module_target_in_package(tree, Some(current_module), segments, symbols)
+}
+
+/// Resolves a path below a foreign SAI package identity to an exact module.
+///
+/// Unlike [`resolve_module_target`], this does not apply
+/// `USE_OF_CURRENT_MODULE`: `current_module` belongs to the importing
+/// package, while every `ModuleId` in `tree` belongs to the target package.
+/// A zero-segment path names the foreign package root.
+pub fn resolve_foreign_module_target(
+    tree: &ModuleTree,
+    segments: &[Symbol],
+    symbols: &Interner,
+) -> Result<ModuleId, ModuleTargetError> {
+    resolve_module_target_in_package(tree, None, segments, symbols)
+}
+
+fn resolve_module_target_in_package(
+    tree: &ModuleTree,
+    current_module: Option<ModuleId>,
+    segments: &[Symbol],
+    symbols: &Interner,
+) -> Result<ModuleId, ModuleTargetError> {
     if tree.module(ModuleId::ROOT).is_none() {
         return Err(ModuleTargetError::MissingRootModule);
     }
-    if tree.module(current_module).is_none() {
+    if current_module.is_some_and(|module| tree.module(module).is_none()) {
         return Err(ModuleTargetError::InvalidCurrentModule);
     }
 
@@ -139,9 +162,9 @@ pub fn resolve_module_target(
 
 fn finish_target(
     target: ModuleId,
-    current_module: ModuleId,
+    current_module: Option<ModuleId>,
 ) -> Result<ModuleId, ModuleTargetError> {
-    if target == current_module {
+    if current_module == Some(target) {
         Err(ModuleTargetError::UseOfCurrentModule(target))
     } else {
         Ok(target)
@@ -246,6 +269,49 @@ mod tests {
         assert_eq!(
             resolve_module_target(&tree, ModuleId::from_raw(1), &[], &symbols),
             Ok(ModuleId::ROOT)
+        );
+    }
+
+    #[test]
+    fn foreign_empty_path_resolves_to_the_package_root() {
+        let symbols = Interner::new();
+        let tree = tree(
+            &symbols,
+            vec![
+                (
+                    vec![],
+                    children(&[("nested", ChildEntry::Module(ModuleId::from_raw(1)))]),
+                ),
+                (vec!["nested"], BTreeMap::new()),
+            ],
+            vec![],
+        );
+
+        assert_eq!(
+            resolve_foreign_module_target(&tree, &[], &symbols),
+            Ok(ModuleId::ROOT)
+        );
+    }
+
+    #[test]
+    fn foreign_exact_path_does_not_apply_the_importing_modules_self_check() {
+        let symbols = Interner::new();
+        let tree = tree(
+            &symbols,
+            vec![
+                (
+                    vec![],
+                    children(&[("nested", ChildEntry::Module(ModuleId::from_raw(1)))]),
+                ),
+                (vec!["nested"], BTreeMap::new()),
+            ],
+            vec![],
+        );
+        let path = [symbol(&symbols, "nested")];
+
+        assert_eq!(
+            resolve_foreign_module_target(&tree, &path, &symbols),
+            Ok(ModuleId::from_raw(1))
         );
     }
 
