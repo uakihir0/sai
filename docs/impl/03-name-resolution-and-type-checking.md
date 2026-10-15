@@ -708,7 +708,20 @@ defining declaration as a related location, including when that declaration
 is in a foreign source file. Missing members remain typed errors until the
 complete `UNRESOLVED_NAME` candidate and unique-import-fix contract is
 implemented. Missing target scopes remain closure errors rather than source
-diagnostics. This adapter does not yet integrate with command-level `check`.
+diagnostics.
+
+**Tracked owner path query and `sai check` integration (IR-544).** Each
+top-level type owner is resolved through a tracked query keyed by requester
+package and owner index. Its identity includes the requester collection, the
+validated active-source closure, and the concrete lookup maps used by module
+and interface traversal. The query owns its staged paths and returns only
+owned path results and errors; snapshot-bound `Diagnostic` values are rebuilt
+at the caller boundary. `sai check` retains finalized dependency collections,
+builds the active-source closure for each package, and emits the resulting
+`PRIVATE_ITEM` diagnostics with workspace-wide source lookup for both primary
+and foreign declaration locations. The command still reports
+`FEATURE_NOT_IMPLEMENTED` and does not claim complete analysis or produce a
+success result record.
 
 ### 3.4.3 Ribs
 
