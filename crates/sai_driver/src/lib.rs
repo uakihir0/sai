@@ -1322,9 +1322,10 @@ impl FunctionOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
-    /// Returns first-segment resolution for type paths in the function
-    /// signature and body. Qualified suffixes remain available to later
-    /// member-scope resolution.
+    /// Returns type-path results for the function signature and body.
+    /// Qualified local module/interface prefixes are consumed through the
+    /// first non-module member; its type-relative suffix remains for later
+    /// resolution.
     pub fn type_path_resolution(
         &self,
     ) -> Result<Option<&TypeOwnerPathResolution>, &FunctionOwnerResolutionError> {
@@ -6322,9 +6323,11 @@ impl RootDatabase {
         self.resolve_function_owner_analyses(collection, module_tree, snapshot)
     }
 
-    /// Resolves loop labels, lexical locals, and one-segment module paths for
-    /// each current top-level function owner. Module scopes and aliases are
-    /// taken from the exact scope associated with each descriptor's file.
+    /// Resolves loop labels, lexical locals, module paths, and local
+    /// qualified type prefixes for each current top-level function owner.
+    /// Unqualified module scopes are taken from the exact scope associated
+    /// with each descriptor's file; qualified source traversal is limited
+    /// to the current package.
     ///
     /// This is an uncached bridge: HIR and source maps remain local to each
     /// iteration, and only owned results and diagnostics are returned.
@@ -6341,6 +6344,8 @@ impl RootDatabase {
             return Err(FunctionOwnerLabelResolutionError::ModuleTreeMismatch);
         }
 
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
@@ -6466,9 +6471,9 @@ impl RootDatabase {
                                     primitive_prelude,
                                     &rejected_type_paths,
                                     module_scope,
-                                    None,
+                                    Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    None,
+                                    Some(&source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -11320,12 +11325,20 @@ mod tests {
             "use acme:phase1/child as child_alias\n",
             "type Array<T> = T\n",
             "fn typed<T, const Count: U32>(value: T, optional: Option<T>, ",
-            "qualified: child_alias.Widget) -> U32 { let local: U32 = 0; child_alias }\n",
+            "qualified: child_alias.Widget, ",
+            "interface_member: child_alias.api.Request.Associated, ",
+            "missing_member: child_alias.MissingType) -> U32 { let local: U32 = 0; child_alias }\n",
             "fn const_type_shadow<const U32: Bool>(value: U32) {}\n",
             "fn module_type_shadow(value: Array<U32>) {}\n",
             "fn bodyless<T>(value: T) -> U32\n",
         );
-        let child = "pub fn child_fn() {}\n";
+        let child = concat!(
+            "pub type Widget = U32\n",
+            "pub interface api {\n",
+            "  type Request = U32\n",
+            "}\n",
+            "pub fn child_fn() {}\n",
+        );
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(root.as_bytes(), child.as_bytes());
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -11358,6 +11371,39 @@ mod tests {
             .get(&symbol("child_alias"))
             .expect("child alias has a binding")
             .res;
+        let child_module_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let widget_binding = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget alias is declared");
+        let api_name = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let request_name = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let request_binding = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (child_module_scope
+                    .members
+                    .get(&api_name)
+                    .is_some_and(|binding| binding.res == Res::Def(DefKind::Interface, *def_id)))
+                .then(|| interface.members.get(&request_name))
+                .flatten()
+            })
+            .expect("interface api declares Request");
 
         let resolved = database
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
@@ -11399,9 +11445,67 @@ mod tests {
         );
         assert!(
             type_paths.paths().values().any(|path| {
-                path.base == child_alias && path.resolved_segments == 1 && path.segment_count == 2
+                path.base == widget_binding.res
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2
             }),
-            "qualified type paths resolve only their module head"
+            "qualified local module prefixes resolve through their first type member"
+        );
+        assert!(
+            type_paths.paths().values().any(|path| {
+                path.base == request_binding.res
+                    && path.resolved_segments == 3
+                    && path.segment_count == 4
+            }),
+            "interface members resolve after a local module prefix and leave type-relative suffixes"
+        );
+        assert_eq!(
+            type_paths.module_path_errors().len(),
+            1,
+            "only the missing local member produces a qualified-path error"
+        );
+        let missing_offset = root
+            .find("child_alias.MissingType")
+            .expect("missing type member path exists");
+        let missing_error = type_paths
+            .module_path_errors()
+            .iter()
+            .find_map(|path_error| match path_error.error() {
+                ModulePathError::MissingMember {
+                    name,
+                    segment_index,
+                    span,
+                    ..
+                } if database
+                    .resolve_symbol(name)
+                    .is_ok_and(|name| name.as_ref() == "MissingType") =>
+                {
+                    Some((*path_error, segment_index, span))
+                }
+                _ => None,
+            })
+            .expect("unknown local member is retained as a typed path error");
+        assert_eq!(missing_error.1, 0);
+        let missing_start = missing_offset + "child_alias.".len();
+        assert_eq!(missing_error.2.file, module_tree.modules[0].file);
+        assert_eq!(
+            missing_error.2.range.start().to_usize(),
+            missing_start,
+            "the missing-member error starts at the exact suffix segment"
+        );
+        assert_eq!(
+            missing_error.2.range.end().to_usize(),
+            missing_start + "MissingType".len(),
+            "the missing-member error covers only the exact suffix segment"
+        );
+        assert_eq!(
+            type_paths.paths().get(&missing_error.0.hir_id()),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            }),
+            "the missing member path resolves to an error sentinel through that segment"
         );
         assert!(
             type_paths.deferred_paths().iter().any(|path| {
@@ -11842,15 +11946,20 @@ mod tests {
             3,
             "qualified type and effect paths resolve only their diagnosed module heads"
         );
+        let signature_type_paths = signature
+            .type_path_resolution()
+            .expect("ordinary type path lookup succeeds")
+            .expect("function has an ordinary type path result");
         assert!(
-            signature
-                .type_path_resolution()
-                .expect("ordinary type path lookup succeeds")
-                .expect("function has an ordinary type path result")
+            signature_type_paths
                 .paths()
                 .values()
                 .any(|path| path.base == Res::Err),
             "rejected test-only type heads remain error paths and do not fall through to the Prelude"
+        );
+        assert!(
+            signature_type_paths.module_path_errors().is_empty(),
+            "a rejected test-only head suppresses qualified member lookup"
         );
         assert!(
             signature
