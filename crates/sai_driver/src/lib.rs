@@ -1370,14 +1370,16 @@ impl OwnerTestOnlyPathResolution {
     }
 }
 
-/// Test-only path results for one direct trait or impl header.
+/// Partial type-head and test-only path results for one direct trait or impl
+/// header.
 ///
-/// This pass checks only declaration-header references; it does not resolve
-/// ordinary module paths or associated members.
+/// This pass checks only declaration-header references; qualified member
+/// suffixes and associated members remain for later resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraitImplHeaderResolution {
     owner: OwnerId,
     kind: TopLevelOwnerKind,
+    type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -1390,6 +1392,12 @@ impl TraitImplHeaderResolution {
 
     pub const fn kind(&self) -> TopLevelOwnerKind {
         self.kind
+    }
+
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
+        self.type_path_resolution.as_ref()
     }
 
     pub fn test_only_path_resolution(
@@ -1441,7 +1449,7 @@ impl TraitImplHeaderResolutions {
 }
 
 /// Partial type-head and qualified-member results shared by type, function,
-/// and const owners.
+/// const, predicate, extern-function, and trait/impl-header owners.
 ///
 /// A type head is resolved without requiring member scopes. When those scopes
 /// are available, the same result also retains typed qualified-member errors.
@@ -4449,6 +4457,8 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
             | ItemKind::Struct { generics, .. }
             | ItemKind::Alias { generics, .. }
             | ItemKind::Enum { generics, .. }
+            | ItemKind::Trait { generics, .. }
+            | ItemKind::Impl { generics, .. }
             | ItemKind::Distinct { generics, .. } => generics,
             ItemKind::Resource { .. } => return HashMap::new(),
             _ => return HashMap::new(),
@@ -9051,12 +9061,12 @@ impl RootDatabase {
         })
     }
 
-    /// Diagnoses test-only path references in direct trait and impl headers.
+    /// Resolves partial type heads and diagnoses test-only references in
+    /// direct trait and impl headers.
     ///
     /// The pass checks declaration generics, bounds, where clauses,
     /// supertraits, impl self types, and impl trait/interface targets. It does
-    /// not perform ordinary type or module lookup and does not process
-    /// associated members.
+    /// not resolve qualified member suffixes or process associated members.
     pub fn resolve_trait_impl_header_test_only_paths(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -9097,6 +9107,7 @@ impl RootDatabase {
                     owners.push(TraitImplHeaderResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
+                        type_path_resolution: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
                         lowering_diagnostics,
@@ -9106,7 +9117,11 @@ impl RootDatabase {
             };
 
             let analysis: Result<
-                (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                (
+                    Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+                    Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+                    Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+                ),
                 OwnerControlFlowResolutionError,
             > = (|| {
                 let owner_descriptor = find_top_level_owner_descriptor(
@@ -9171,6 +9186,32 @@ impl RootDatabase {
                 let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
                 let candidates = owner_test_only_path_candidates(&hir_owner);
                 let generic_parameters = owner_generic_parameters(&hir_owner);
+                let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                let rejected_type_paths = rejected_test_only_type_path_ids(
+                    descriptor.owner,
+                    &candidates,
+                    &generic_parameters,
+                    &module_scope,
+                );
+                let type_path_resolution = match (&self.primitive_prelude, rejected_type_paths) {
+                    (Ok(primitive_prelude), Ok(rejected_type_paths)) => {
+                        Ok(resolve_type_owner_module_paths(
+                            descriptor.owner,
+                            &candidates,
+                            &generic_resolutions,
+                            primitive_prelude,
+                            &rejected_type_paths,
+                            &module_scope,
+                            None,
+                            descriptor.owner.def_id.package(),
+                            None,
+                        ))
+                    }
+                    (Err(error), _) => Err(OwnerControlFlowResolutionError::PrimitivePrelude(
+                        error.clone(),
+                    )),
+                    (_, Err(error)) => Err(error),
+                };
                 let mut path_resolution = OwnerTestOnlyPathResolution {
                     owner: descriptor.owner,
                     paths: HashMap::new(),
@@ -9184,18 +9225,25 @@ impl RootDatabase {
                     &self.symbols,
                     &inputs,
                     snapshot,
-                )?;
-                sort_phase1_diagnostics(&mut diagnostics);
-                Ok((path_resolution, diagnostics))
+                );
+                if let Ok(diagnostics) = &mut diagnostics {
+                    sort_phase1_diagnostics(diagnostics);
+                }
+                let path_resolution = match &diagnostics {
+                    Ok(_) => Ok(path_resolution),
+                    Err(error) => Err(error.clone()),
+                };
+                Ok((type_path_resolution, path_resolution, diagnostics))
             })();
 
             match analysis {
-                Ok((path_resolution, diagnostics)) => {
+                Ok((type_path_resolution, path_resolution, diagnostics)) => {
                     owners.push(TraitImplHeaderResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
-                        test_only_path_resolution: Ok(path_resolution),
-                        test_only_diagnostics: Ok(diagnostics),
+                        type_path_resolution,
+                        test_only_path_resolution: path_resolution,
+                        test_only_diagnostics: diagnostics,
                         lowering_diagnostics,
                     });
                 }
@@ -9203,6 +9251,7 @@ impl RootDatabase {
                     owners.push(TraitImplHeaderResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
+                        type_path_resolution: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
                         lowering_diagnostics,
@@ -15571,6 +15620,23 @@ mod tests {
                 .all(|path| path.base == Res::Err),
             "resolved test-only trait paths are rewritten to the error sentinel"
         );
+        let resolved_trait_types = resolved_imports.owners()[0]
+            .type_path_resolution()
+            .expect("resolved trait type heads remain available");
+        assert!(
+            resolved_trait_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "ordinary type lookup rejects test-only imported heads even when their imports have resolutions"
+        );
+        assert!(
+            resolved_trait_types
+                .paths()
+                .values()
+                .all(|path| path.base != Res::Def(DefKind::Fn, function_def)),
+            "trait type lookup never captures a test-only import resolution"
+        );
         assert_eq!(
             resolved_imports.owners()[2]
                 .test_only_diagnostics()
@@ -15602,6 +15668,15 @@ mod tests {
                     .values()
                     .all(|path| path.base == Res::Err),
                 "resolved test-only header paths are rewritten to the error sentinel"
+            );
+            assert!(
+                owner
+                    .type_path_resolution()
+                    .expect("resolved header type paths succeed")
+                    .paths()
+                    .values()
+                    .all(|path| path.base != Res::Def(DefKind::Fn, function_def)),
+                "ordinary header type lookup never captures test-only import resolutions"
             );
         }
 
@@ -15663,6 +15738,389 @@ mod tests {
                 .skip(1)
                 .all(|owner| owner.test_only_diagnostics().is_ok()),
             "subsequent trait and impl headers continue resolving"
+        );
+    }
+
+    #[test]
+    fn trait_impl_header_resolves_type_heads_separately() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "type Array<T> = T\n",
+            "type Shared<T> = T\n",
+            "type RootOnly<T> = T\n",
+            "trait Api<T: Bound, const N: U32>: Super<T> ",
+            "where T: (Fn(CallbackArg) -> CallbackOutput effects { fs.read }) ",
+            "+ (FnMut(MutArg) -> MutOutput effects { fs.write }) + WhereBound, N: U32 {}\n",
+            "trait RootScope: Shared<U32> + child_alias.Widget {}\n",
+            "impl<T: ImplBound, const N: U32> Api<T> for Array<N> ",
+            "where T: ImplWhere, N: ImplType {}\n",
+        );
+        let child = concat!(
+            "type Shared<T> = T\n",
+            "trait ChildScope: Shared<U32> + RootOnly<U32> {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("trait and impl headers collect");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let api_descriptor = *collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Trait)
+            .expect("Api trait descriptor is indexed");
+        let api_inputs = database
+            .current_owner_inputs(&snapshot, api_descriptor.file, &collection.target_cfg)
+            .expect("trait source inputs are available");
+        let api_def_paths = database
+            .def_paths
+            .get(&api_descriptor.owner.def_id.package())
+            .expect("package definition paths are available");
+        let api_item_path = api_def_paths
+            .resolve_def_id(api_descriptor.owner.def_id.to_def_id())
+            .expect("trait definition path resolves")
+            .expect("trait definition path exists");
+        let api_arena = HirArena::new();
+        let api_context = HirLoweringContext::new(
+            &api_inputs.ast_ids,
+            &snapshot,
+            &api_inputs.parsed.root,
+            &api_arena,
+            &database.symbols,
+            api_def_paths,
+        );
+        let (api_hir, _) = lower_top_level_owner(
+            api_descriptor,
+            &api_item_path,
+            &api_inputs.filtered_item_tree,
+            &api_inputs.retained_item_kinds,
+            &api_context,
+        )
+        .expect("trait HIR lowering succeeds");
+        let api_candidates = owner_test_only_path_candidates(&api_hir);
+        let symbol = |name: &str| {
+            root_scope
+                .scope
+                .keys()
+                .copied()
+                .find(|symbol| {
+                    database
+                        .resolve_symbol(*symbol)
+                        .is_ok_and(|resolved| resolved.as_ref() == name)
+                })
+                .unwrap_or_else(|| panic!("root module contains `{name}`"))
+        };
+        let alias_array = root_scope
+            .scope
+            .get(&symbol("Array"))
+            .expect("root Array alias exists")
+            .res;
+        let root_shared = root_scope
+            .scope
+            .get(&symbol("Shared"))
+            .expect("root Shared alias exists")
+            .res;
+        let root_only = root_scope
+            .scope
+            .get(&symbol("RootOnly"))
+            .expect("root RootOnly alias exists")
+            .res;
+        let child_module = root_scope
+            .scope
+            .get(&symbol("child_alias"))
+            .expect("child module alias exists")
+            .res;
+        let shared_symbol = symbol("Shared");
+        let child_shared = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists")
+            .scope
+            .get(&shared_symbol)
+            .expect("child Shared alias exists")
+            .res;
+
+        let resolved = database
+            .resolve_trait_impl_header_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("trait and impl type heads resolve");
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 4);
+        let api = &resolved.owners()[0];
+        let api_types = api
+            .type_path_resolution()
+            .expect("trait header type lookup succeeds");
+        let candidate_named = |candidate: &OwnerPathHead<'_>, name: &str| {
+            database
+                .resolve_symbol(candidate.name)
+                .is_ok_and(|resolved| resolved.as_ref() == name)
+        };
+        for expected_type_name in ["CallbackArg", "CallbackOutput", "MutArg", "MutOutput"] {
+            assert!(
+                api_candidates.iter().any(|candidate| {
+                    candidate.kind == OwnerPathKind::Type
+                        && candidate_named(candidate, expected_type_name)
+                }),
+                "function-bound type head `{expected_type_name}` remains a type candidate; candidates: {:?}",
+                api_candidates
+                    .iter()
+                    .map(|candidate| {
+                        (
+                            database
+                                .resolve_symbol(candidate.name)
+                                .expect("candidate name is interned")
+                                .to_string(),
+                            candidate.kind,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        for function_sugar_name in ["Fn", "FnMut", "fs"] {
+            assert!(
+                !api_candidates.iter().any(|candidate| {
+                    candidate.kind == OwnerPathKind::Type
+                        && candidate_named(candidate, function_sugar_name)
+                }),
+                "function sugar/effect head `{function_sugar_name}` is not a type candidate"
+            );
+        }
+        assert!(
+            api_candidates.iter().any(|candidate| {
+                candidate.kind == OwnerPathKind::Effect && candidate_named(candidate, "fs")
+            }),
+            "function-bound effect paths retain their separate effect classification"
+        );
+        let expected_type_path_ids = api_candidates
+            .iter()
+            .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+            .map(|candidate| candidate.hir_id)
+            .collect::<HashSet<_>>();
+        let actual_type_path_ids = api_types
+            .paths()
+            .keys()
+            .copied()
+            .chain(api_types.deferred_paths().iter().map(|path| path.hir_id))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            actual_type_path_ids, expected_type_path_ids,
+            "partial type lookup contains every type candidate and excludes function sugar/effect heads"
+        );
+        let api_t = database
+            .symbols
+            .intern("T")
+            .expect("type generic name is interned");
+        let api_n = database
+            .symbols
+            .intern("N")
+            .expect("const generic name is interned");
+        let api_generics = database
+            .def_paths
+            .get(&api.owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(api.owner().def_id, &[(api_t, false, 0), (api_n, true, 0)])
+            .expect("trait generic definitions are stable");
+        assert!(
+            api_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, api_generics[0].to_def_id())
+            }),
+            "trait type generics retain their exact identity in bounds and supertraits"
+        );
+        assert!(
+            api_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::ConstParam, api_generics[1].to_def_id())
+            }),
+            "trait const generics retain their exact identity in type positions"
+        );
+        assert!(
+            api_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "primitive heads in trait generics resolve"
+        );
+        for deferred in ["Bound", "Super", "WhereBound"] {
+            assert!(
+                api_types.deferred_paths().iter().any(|path| {
+                    database
+                        .resolve_symbol(path.name)
+                        .is_ok_and(|name| name.as_ref() == deferred)
+                }),
+                "unresolved trait bound `{deferred}` remains deferred"
+            );
+        }
+
+        let root_scope_header = &resolved.owners()[1];
+        let root_scope_types = root_scope_header
+            .type_path_resolution()
+            .expect("root trait type lookup succeeds");
+        assert!(
+            root_scope_types
+                .paths()
+                .values()
+                .any(|path| path.base == root_shared),
+            "root trait headers use the root file's Shared alias"
+        );
+        assert!(
+            root_scope_types.paths().values().any(|path| {
+                path.base == child_module && path.resolved_segments == 1 && path.segment_count == 2
+            }),
+            "qualified trait heads resolve their module prefix and preserve the suffix"
+        );
+        assert!(
+            root_scope_types.module_path_errors().is_empty(),
+            "qualified header suffixes remain deferred without a member index"
+        );
+
+        let implementation = &resolved.owners()[2];
+        let implementation_types = implementation
+            .type_path_resolution()
+            .expect("impl header type lookup succeeds");
+        let impl_t = database
+            .symbols
+            .intern("T")
+            .expect("impl type generic name is interned");
+        let impl_n = database
+            .symbols
+            .intern("N")
+            .expect("impl const generic name is interned");
+        let impl_generics = database
+            .def_paths
+            .get(&implementation.owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                implementation.owner().def_id,
+                &[(impl_t, false, 0), (impl_n, true, 0)],
+            )
+            .expect("impl generic definitions are stable");
+        assert!(
+            implementation_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, impl_generics[0].to_def_id())
+            }),
+            "impl type generics retain their exact identity"
+        );
+        assert!(
+            implementation_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::ConstParam, impl_generics[1].to_def_id())
+            }),
+            "impl const generics retain their exact identity in type positions"
+        );
+        assert!(
+            implementation_types
+                .paths()
+                .values()
+                .any(|path| path.base == alias_array),
+            "the module Array alias takes precedence over the primitive Prelude binding"
+        );
+        assert!(
+            implementation_types.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "ImplBound")
+            }),
+            "unresolved impl bounds remain deferred"
+        );
+
+        let child_scope_owner = &resolved.owners()[3];
+        let child_scope_types = child_scope_owner
+            .type_path_resolution()
+            .expect("child trait type lookup succeeds");
+        assert!(
+            child_scope_types
+                .paths()
+                .values()
+                .any(|path| path.base == child_shared)
+                && child_shared != root_shared,
+            "same-named trait aliases resolve to their own file definitions"
+        );
+        assert!(
+            child_scope_types.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "RootOnly")
+            }),
+            "root-only types remain deferred in child trait headers"
+        );
+        assert!(
+            !child_scope_types
+                .paths()
+                .values()
+                .any(|path| path.base == root_only),
+            "child trait headers do not capture the root-only alias"
+        );
+    }
+
+    #[test]
+    fn trait_impl_header_type_heads_survive_early_test_only_diagnostic_failure() {
+        let root = concat!(
+            "use acme:test-support/fixtures as broken_type\n",
+            "use acme:test-support/fixtures as later_type\n",
+            "trait Header: broken_type.First + later_type.Second {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("trait header test-only imports collect");
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let broken_import_index = module_scope
+            .imports
+            .iter()
+            .position(|import| {
+                database
+                    .resolve_symbol(import.name)
+                    .is_ok_and(|name| name.as_ref() == "broken_type")
+            })
+            .expect("broken_type import exists");
+        module_scope.imports[broken_import_index].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+
+        let resolved = database
+            .resolve_trait_impl_header_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("header diagnostic failure stays owner-local");
+        let owner = &resolved.owners()[0];
+        assert!(matches!(
+            owner.test_only_diagnostics(),
+            Err(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                import,
+                ..
+            }) if import.0 as usize == broken_import_index
+        ));
+        let type_paths = owner
+            .type_path_resolution()
+            .expect("header type path lookup remains independent");
+        assert_eq!(type_paths.paths().len(), 2);
+        assert!(
+            type_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "later header type heads remain rejected after test-only diagnostic collection fails"
         );
     }
 
