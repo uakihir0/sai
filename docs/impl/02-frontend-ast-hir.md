@@ -1279,6 +1279,19 @@ remain in the existing child descriptor table. The driver must still rebind
 each file and AST ID against the current snapshot before dispatching a lowerer;
 this index is not the `hir_owner` query.
 
+**Current driver dispatch (IR-520).** `sai_driver` now has an exhaustive
+`TopLevelOwnerKind` to `ItemTreeKind` mapping and a shared dispatch to the
+corresponding top-level `lower_*_owner` API. Existing function, invariant,
+refinement, and extern-contract adapters reconcile their specialized
+descriptors with this common index and use the shared dispatch for lowering.
+Each adapter builds one temporary `OwnerId` lookup index for validation while
+traversing the original descriptor vectors in module/source order; duplicate
+owner IDs are treated as ambiguous. Before dispatch, the driver checks the
+descriptor kind against the current target-filtered item tree. The arena-owned
+HIR and source map remain local to that lowering call. The common dispatch is
+not yet a package-wide lowering or resolution query, and the remaining direct
+owner kinds still need integration into that bridge.
+
 ### 2.8.5 Data structures
 
 HIR nodes are allocated in a typed arena owned by the query session. `HirOwner` is a logical owner whose node and body fields borrow from that arena; it does not contain the arena that stores those values. The session arena outlives its memoized HIR owners and reclaims its allocations together. This avoids making `HirOwner` self-referential. `'hir` is the arena-borrow lifetime.

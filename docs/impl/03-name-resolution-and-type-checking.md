@@ -355,10 +355,13 @@ parent extern-block identity.
 
 Consumers must rebind each file and AST ID against the current snapshot before
 lowering. The table is a source index, not a `hir_owner` or `resolve_owner`
-query, and the driver does not yet dispatch it to all owner lowerers or cache
-owner results. Associated, world, interface, and extern child owners, fields,
-variants, generic parameters, closures, async blocks, and synthetic derived
-owners are not in this direct top-level index.
+query. The driver has an exhaustive direct-owner kind-to-lowerer dispatcher;
+the function, invariant, refinement, and extern-block adapters now validate
+their specialized descriptors against this common index before dispatching.
+The current bridges do not yet lower every indexed owner through one
+package-wide adapter or cache owner results. Associated, world, interface, and
+extern child owners, fields, variants, generic parameters, closures, async
+blocks, and synthetic derived owners are not in this direct top-level index.
 
 **Tracked local query adapter (IR-470).** The driver now tracks this local
 Phase 1 and Phase 3 slice through an interim `package_scopes` derived query,
