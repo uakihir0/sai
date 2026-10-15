@@ -330,10 +330,13 @@ bodies and contracts, and direct interface declarations including resource
 method signatures and recovery-only interface body/contract syntax. IR-538
 adds top-level structs, aliases, enums, and resources, including generic
 bounds, `where` clauses, alias targets, fields, and enum payloads. IR-539 adds
-test-only diagnostics for effect `covers` declarations. World/WIT references
-remain pending. The grammar exposes no additional extern-child form beyond
-function heads, which IR-532 already covers; the property-parameter exception
-is preserved during test analysis.
+test-only diagnostics for effect `covers` declarations, and IR-540 adds them
+for direct world import/export/include module paths and world-function
+signatures, including parser-recovered syntax. Package-qualified `WorldRef`
+resolution remains with the WIT resolver; spec/14 does not yet define how a
+direct `requires test` package path is diagnosed. The grammar exposes no
+additional extern-child form beyond function heads, which IR-532 already
+covers; the property-parameter exception is preserved during test analysis.
 The complete canonical prelude and general tracked `package_scopes(PackageId)`
 query also remain deferred.
 
@@ -942,8 +945,9 @@ test-only diagnostics without manufacturing HIR path results. AST-only
 predicate and recovered function scans include constructor and range-pattern
 heads, and nested refined declarations use their ItemTree generic parameters
 for shadowing. Parent, child, and resource-method failures stay isolated. This
-remains a diagnostic pass; ordinary type/effect/member lookup, world/WIT
-references, and command-level `check` integration remain pending.
+remains a diagnostic pass; ordinary type/effect/member lookup, full world/WIT
+resolution (including package-qualified references), and command-level `check`
+integration remain pending.
 
 **Top-level type test-only references (IR-538).** The driver diagnoses
 references to test-only imports in direct top-level structs, aliases, enums,
@@ -956,10 +960,12 @@ independently of `Res`, emits exact first-segment spans with the original
 result channel. Target filtering and per-owner failure isolation remain in
 force. Top-level resource field types are included at this stage because
 resources already lower as ordinary top-level type owners; resources add no
-generic parameter scope. IR-539 below covers effect `covers` references.
-Ordinary type, member, and Prelude resolution, world/WIT references, and
-command-level `check` integration remain pending. The grammar exposes no
-further extern-child form beyond function heads, which IR-532 covers.
+generic parameter scope. IR-539 covers effect `covers` references, and IR-540
+covers test-only module-binding heads in direct world items and boundary
+signatures. Ordinary type, member, and Prelude resolution, package-qualified
+world/WIT resolution, and command-level `check` integration remain pending.
+The grammar exposes no further extern-child form beyond function heads, which
+IR-532 covers.
 
 **Effect `covers` test-only references (IR-539).** The driver diagnoses
 test-only imports used as the first segment of a top-level effect's `covers`
@@ -968,8 +974,32 @@ paths, using that effect's exact file scope and the originating import's
 Well-formed HIR paths retain `Res::Err` results with one resolved head and the
 full segment count. When a malformed covers set is lowered as empty, a
 recovery-only AST scan diagnoses valid references without creating HIR path
-results. Ordinary effect lookup, complete covers-graph validation, world/WIT
-references, and command-level `check` integration remain pending.
+results. IR-540 covers test-only module-binding heads in local world items and
+world-function boundary signatures. Ordinary effect lookup, complete
+covers-graph validation, package-qualified world/WIT resolution, and
+command-level `check` integration remain pending.
+
+**World item test-only references (IR-540).** The driver checks first-segment
+module-scope bindings used by direct world `import`, `export`, and `include`
+items, plus nested parameter/result types and effects in world-function
+signatures. It uses each child's exact file scope, classifies by import origin
+and `test_only` rather than `Res`, emits a diagnostic at the reference with a
+note at the originating `PKG_PATH`, and stores retained HIR heads as
+`Res::Err`. Target-filtered imports are already absent from the scope.
+Parser-recovered world-function generics, `where`, borrow/effect/contracts,
+and bodies receive diagnostic-only AST coverage; generic and const-parameter
+shadowing is retained, and a failed recovered-body walk does not suppress
+signature diagnostics. Direct package-qualified `WorldRef` values remain with
+world/package resolution: spec/14 §14.2.5 defines the restriction around
+bindings introduced by `use` and the note at that use, not direct package
+paths.
+
+**Review required:** Confirm whether direct `WorldRef::Pkg` references whose
+identity appears in `requires test` should be rejected outside tests, and if
+so, which source span and related note the diagnostic should use. They do not
+have a test-only `use` binding to point back to. Until spec/14 defines this
+case, IR-540 leaves it outside the binding-based test-only pass. Ordinary
+world/WIT name resolution and package availability validation remain pending.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
@@ -999,8 +1029,10 @@ and reports `SHADOWS_MODULE` using aliases from the owner's exact file scope.
 Implicit `self` remains owner-scoped and is not treated as a lexical local.
 Const initializers and tests/properties are outside this predicate adapter.
 IR-523 and IR-525 add their local/module path passes under the required
-test-analysis or constant-owner context; constant-expression legality and
-test-only diagnostics remain deferred.
+test-analysis or constant-owner context. At the time of IR-521,
+constant-expression legality and test-only diagnostics remained deferred;
+later entries document test-only path coverage added by IR-526 through IR-540.
+Constant-expression legality remains pending.
 
 **Function module-scope fallback (IR-522).** The top-level function adapter
 passes local misses through generic-parameter lookup and then resolves
@@ -1058,8 +1090,10 @@ const declaration-type heads; IR-529, IR-531, and IR-532 add invariant,
 refined/distinct, and extern owners, while IR-534 covers direct trait/impl
 headers, IR-535–IR-536 cover associated declaration signatures, method bodies,
 and contracts, IR-537 covers interfaces, and IR-538 covers top-level
-struct/alias/enum/resource declarations. Effects, worlds, and remaining
-extern-child owners remain for later integration.
+struct/alias/enum/resource declarations. IR-539 and IR-540 add test-only
+reference diagnostics for effects and world owners. Ordinary effect and full
+world/WIT resolution, plus remaining extern-child owners, remain for later
+integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
 the declared type before its body-dependent local-resolution branch and also
