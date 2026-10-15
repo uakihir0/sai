@@ -296,26 +296,46 @@ collide in this alias form.
 When compiling the exact `sai:core` or `sai:alloc` package, local definition
 paths are compared with the canonical prelude item path: an exact reimport
 produces `REDUNDANT_IMPORT` and leaves the implicit prelude binding in place.
-Re-export chains retain that identity through their original `DefId`. Foreign
-imports remain deferred until external item and prelude identities are
-available.
+Re-export chains retain that identity through their original `DefId`.
+Foreign-interface targets and members remain deferred, as do canonical
+prelude identities through non-local re-export chains; source-package module
+and item imports are resolved by the current `sai check` path below.
 
-Foreign package and interface member tables remain deferred, as do active-edge
-identity checks for imports from foreign targets, test-only reference checks
-for owner kinds not yet covered by the incremental owner adapters, and the
-final `package_scopes(PackageId)` query. The adapters below cover top-level
-functions, extern functions, consts, invariants, refined types, and
-refinement-bearing distinct types; this is not the complete tracked owner
-resolver.
-The resolver does not yet build the complete canonical prelude
-`BTreeMap<Symbol, Res>` described in §3.3.7; the current bridge compares local
-definition paths for the supported item-import cases.
-When a foreign/interface re-export candidate precedes a known local candidate
+**Foreign source-package scopes in `sai check`.** The CLI collects Phase 1
+scopes for active source packages in dependency-first order and supplies each
+package with finalized scopes for its active direct source dependencies.
+Foreign module aliases, item imports, and public item re-exports resolve
+through those scopes, preserve canonical `DefId`s, and apply visibility
+checks. The locked-source integration test covers a root-to-middle-to-leaf
+re-export chain. This is a `check`-specific assembly path, not a general
+tracked `package_scopes(PackageId)` query.
+
+When a valid manifest is available, Phase 1 collection compares its target-
+and test-filtered requirements with the set of active outgoing dependency
+identities. A supplied foreign scope is checked against an active direct edge
+by visible identity, selected `PackageKey`, and source form; duplicate
+identities and mismatched module/scope counts are rejected. The graph
+projection tracks the selected target version in its query identity. These
+checks validate graph inputs and supplied scopes; they do not assemble
+missing scopes.
+
+Source `Phase1PackageScopes` already stores direct interface member maps, but
+foreign interface targets and their member imports/re-exports are not wired
+into the import resolver: public interface targets are Stage-4-gated, while
+private targets receive a visibility diagnostic. The current incremental
+owner adapters cover top-level functions, extern functions, consts,
+invariants, refined types, refinement-bearing distinct types, and direct
+trait/impl headers. Test-only checks for associated members, interface owners,
+and other remaining owner kinds are pending; the property-parameter exception
+is preserved during test analysis. The complete canonical prelude and general
+tracked `package_scopes(PackageId)` query also remain deferred.
+
+When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
-retaining the foreign/interface item as deferred; a complete package resolver
-must replace this temporary recovery rule with the final ordered package
-lookup. Type checking, lints, fixes, and successful `check` result records
-remain unavailable and are represented by `FEATURE_NOT_IMPLEMENTED`.
+retaining the foreign-interface item as deferred; a complete package resolver
+must replace this temporary recovery rule with final ordered lookup. Type
+checking, lints, fixes, and successful `check` result records remain
+unavailable and are represented by `FEATURE_NOT_IMPLEMENTED`.
 
 **Local interface member tables (IR-469).** The temporary Phase 1 bridge
 collects each local interface's direct type declarations, enums, resources,
@@ -399,9 +419,9 @@ The module-only path step is implemented by `sai_resolve::module_target::resolve
 
 The temporary CLI bridge is `sai_resolve::use_target_diagnostics::collect_local_use_target_diagnostics`, called after Phase 1 by the driver. It uses each filtered use's AST ID to recover the whole `PKG_PATH` token range, then converts only local current-module and unknown-module errors to diagnostics. It suppresses malformed-token duplicates, the module-tree-owned missing-root case, foreign package identities and unresolved paths whose final segment names an interface declared by the parent module. The Phase 3 slice also resolves such a local interface alias to its declaring interface `DefId`. Candidate data uses `matched_prefix` and `module_candidates`. For `UNKNOWN_MODULE`, spec/04 §4.3.2 step 2.3 requires the full direct-child module list; this exact list takes precedence over impl/11 N-H-5's edit-distance heuristic for general name suggestions.
 
-The §4.3.3 binding-name step is implemented by `sai_resolve::use_binding::derive_use_binding_name`. Explicit aliases retain their symbol; an unaliased target derives its final path segment or package name and maps hyphens to underscores. An item-only `UseItems` list has no module binding; an empty list is rejected by the parser under spec/03 §3.1.1 and §3.4, and HIR still preserves its presence for error recovery in the stable item-tree shape. Derived strict keywords and reserved words return `RequiresAlias`; the temporary local Phase 3 pass checks the binding name before resolving its target and inserts successful local module or interface aliases. Item-list imports are resolved from local module and interface member tables; IR-472 classifies declared inactive and test-only requirements before local lookup. Foreign member tables remain deferred.
+The §4.3.3 binding-name step is implemented by `sai_resolve::use_binding::derive_use_binding_name`. Explicit aliases retain their symbol; an unaliased target derives its final path segment or package name and maps hyphens to underscores. An item-only `UseItems` list has no module binding; an empty list is rejected by the parser under spec/03 §3.1.1 and §3.4, and HIR still preserves its presence for error recovery in the stable item-tree shape. Derived strict keywords and reserved words return `RequiresAlias`; the temporary Phase 3 pass checks the binding name before resolving its target and inserts successful local module or interface aliases. Item-list imports are resolved from local scopes and supplied foreign source-package scopes; IR-472 classifies declared inactive and test-only requirements before local lookup. Foreign interface targets and member tables remain deferred.
 
-The §4.3.4 item-alias case-class check is implemented by `sai_resolve::use_item_binding::derive_use_item_binding`. It preserves the source and binding symbols and returns whether their lexer-defined case classes differ; Phase 3 owns the `ALIAS_CASE_MISMATCH` diagnostic and binding insertion. The shared `sai_syntax::identifier_case_kind` helper keeps this check aligned with lexing, including Unicode uppercase and titlecase letters. The temporary local Phase 3 bridge resolves item lists against local module and interface member tables, retains canonical entity identity through local re-exports, and defers foreign member lookup and references to test-only bindings.
+The §4.3.4 item-alias case-class check is implemented by `sai_resolve::use_item_binding::derive_use_item_binding`. It preserves the source and binding symbols and returns whether their lexer-defined case classes differ; Phase 3 owns the `ALIAS_CASE_MISMATCH` diagnostic and binding insertion. The shared `sai_syntax::identifier_case_kind` helper keeps this check aligned with lexing, including Unicode uppercase and titlecase letters. The Phase 3 bridge resolves item lists against local module/interface tables and supplied foreign source-package scopes, retaining canonical entity identity through module and item re-exports. Foreign interface targets/member lookup, a general tracked package-scope query, and test-only diagnostics for owner kinds not yet covered remain deferred.
 
 ```rust
 enum LookupState { InProgress, Done(Option<Binding>) }   // None: no member `x`; Some(Binding{res: Res::Err}) = ⊥
@@ -845,6 +865,19 @@ with the source `PKG_PATH` note. Signature and contract diagnostics are merged
 in source order. This remains an incremental extern adapter, not complete
 extern-child or general type/effect resolution.
 
+**Trait and impl header test-only references (IR-534).** The top-level header
+adapter checks trait generic bounds, const-parameter types, `where` clauses,
+and supertraits, plus impl generics, `where` clauses, self types, and trait or
+interface targets. It selects the exact module scope for each current,
+target-filtered owner. Generic parameters shadow same-named imports in
+type-position paths. Function-trait sugar names are not looked up as imports,
+while nested types and effects remain candidates; built-in effect roots retain
+their precedence. The pass follows each binding's import origin even when its
+`Res` is `Def`, reports at exact source spans with the complete `PKG_PATH`
+note, stores rejected header heads as `Res::Err`, and isolates failures per
+owner. Associated members and ordinary type/module resolution remain outside
+this header-only increment.
+
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
 block/child `OwnerId`s, rebinds both AST IDs from current target-filtered
@@ -929,8 +962,9 @@ the path and a note at the originating use's complete `PKG_PATH`; the path
 result becomes `Res::Err` so later phases do not cascade. IR-526 covered const
 initializer expressions only. IR-528 below extends the same diagnostic rule to
 const declaration-type heads; IR-529, IR-531, and IR-532 add invariant,
-refined/distinct, and extern owners. Trait, impl, interface, and other
-non-test owner kinds remain for later integration.
+refined/distinct, and extern owners, while IR-534 covers direct trait/impl
+headers. Associated trait/impl members, interface, and other non-test owner
+kinds remain for later integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
 the declared type before its body-dependent local-resolution branch and also
