@@ -796,9 +796,10 @@ independent from predicate diagnostics, so a local-resolution error does not
 hide control-flow or restriction diagnostics. It resolves only lexical locals
 and reports `SHADOWS_MODULE` using aliases from the owner's exact file scope.
 Implicit `self` remains owner-scoped and is not treated as a lexical local.
-Const initializers, tests, and properties are deliberately outside this
-adapter: constant-expression rules and test-analysis activation need their
-owner/build context before the local pass can be enabled there.
+Const initializers and tests/properties are outside this predicate adapter.
+IR-523 and IR-525 add their local/module path passes under the required
+test-analysis or constant-owner context; constant-expression legality and
+test-only diagnostics remain deferred.
 
 **Function module-scope fallback (IR-522).** The top-level function adapter
 passes local misses through generic-parameter lookup and then resolves
@@ -828,6 +829,17 @@ same file's module scope. Test-only and diagnosed module bindings retain their
 generic parameters, so this bridge supplies an empty generic-name set. Prelude
 lookup, qualified-member tails, type-position paths, test-only diagnostics,
 tracked `hir_owner`/`resolve_owner` queries, and type checking remain deferred.
+
+**Constant-owner path analysis (IR-525).** For every target-filtered top-level
+const descriptor, the driver lowers the current initializer and resolves its
+plain one-segment expression paths through lexical locals and then the
+`Phase1ModuleScopes` selected by the exact source file. Constants have no
+generic parameters or body-local bindings in the accepted const-expression
+grammar, so this bridge passes an empty generic set and leaves misses deferred.
+It preserves `Res::Err` and `Res::TestOnly` for a later owner-aware diagnostic
+pass. It does not validate §6.27 constant-expression legality, resolve
+type-position paths or qualified tails, perform prelude lookup, or emit final
+unresolved-name diagnostics.
 
 ### 3.4.6 Visibility
 
