@@ -1019,7 +1019,7 @@ impl TraitImplHeaderResolutions {
 }
 
 /// The kind of associated trait or impl declaration checked by the
-/// test-only signature pass.
+/// test-only reference pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TraitImplMemberKind {
     TraitAssociatedType,
@@ -1028,7 +1028,7 @@ pub enum TraitImplMemberKind {
     ImplMethod,
 }
 
-/// Test-only references found in one associated declaration signature.
+/// Test-only references found in one associated declaration owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraitImplMemberTestOnlyResolution {
     parent_owner: OwnerId,
@@ -1036,6 +1036,8 @@ pub struct TraitImplMemberTestOnlyResolution {
     kind: TraitImplMemberKind,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+    module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
 }
 
@@ -1060,6 +1062,28 @@ impl TraitImplMemberTestOnlyResolution {
 
     pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
         self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    /// Lexical resolution for a method body and its contracts.
+    ///
+    /// Associated types and methods without a lowered body return `Ok(None)`.
+    pub fn local_resolution(
+        &self,
+    ) -> Result<Option<&LocalResolution>, &OwnerControlFlowResolutionError> {
+        self.local_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Module fallback for deferred method-body and contract paths.
+    ///
+    /// Associated types and methods without a lowered body return `Ok(None)`.
+    pub fn module_resolution(
+        &self,
+    ) -> Result<Option<&ModuleResolution>, &OwnerControlFlowResolutionError> {
+        self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
     }
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
@@ -1105,7 +1129,7 @@ impl TraitImplMemberOwnerResolution {
 }
 
 /// Provenance-tagged test-only diagnostics for associated trait and impl
-/// declaration signatures.
+/// declarations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraitImplMemberTestOnlyResolutions {
     snapshot_id: WorkspaceSnapshotId,
@@ -1794,10 +1818,6 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
     owner_test_only_path_candidates_with_body(owner, true)
 }
 
-fn owner_test_only_signature_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
-    owner_test_only_path_candidates_with_body(owner, false)
-}
-
 fn owner_test_only_path_candidates_with_body(
     owner: &HirOwner<'_>,
     include_body: bool,
@@ -2384,7 +2404,7 @@ fn collect_test_only_reference_diagnostics(
     Ok(diagnostics)
 }
 
-fn collect_test_only_non_expression_reference_diagnostics(
+fn collect_test_only_module_head_diagnostics(
     owner: OwnerId,
     candidates: &[OwnerPathHead],
     generic_parameters: &HashSet<Symbol>,
@@ -4273,7 +4293,7 @@ impl RootDatabase {
                         paths: HashMap::new(),
                     };
                     let signature_diagnostics = match &module_scope {
-                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                        Ok(module_scope) => collect_test_only_module_head_diagnostics(
                             descriptor.owner,
                             &function_paths,
                             &generic_parameters,
@@ -4507,7 +4527,7 @@ impl RootDatabase {
                         paths: HashMap::new(),
                     };
                     let non_expression_diagnostics = match &module_scope {
-                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                        Ok(module_scope) => collect_test_only_module_head_diagnostics(
                             descriptor.owner,
                             &path_candidates,
                             &HashSet::new(),
@@ -4902,7 +4922,7 @@ impl RootDatabase {
                         paths: HashMap::new(),
                     };
                     let non_expression_diagnostics = match &module_scope {
-                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                        Ok(module_scope) => collect_test_only_module_head_diagnostics(
                             descriptor.owner,
                             &path_candidates,
                             &HashSet::new(),
@@ -5178,7 +5198,7 @@ impl RootDatabase {
                         paths: HashMap::new(),
                     };
                     let hir_non_expression_diagnostics = match &module_scope {
-                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                        Ok(module_scope) => collect_test_only_module_head_diagnostics(
                             descriptor.owner,
                             &path_candidates,
                             &generic_parameters,
@@ -5462,7 +5482,7 @@ impl RootDatabase {
                         paths: HashMap::new(),
                     };
                     let signature_diagnostics = match &module_scope {
-                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                        Ok(module_scope) => collect_test_only_module_head_diagnostics(
                             descriptor.owner,
                             &path_candidates,
                             &generic_parameters,
@@ -5700,7 +5720,7 @@ impl RootDatabase {
                     owner: descriptor.owner,
                     paths: HashMap::new(),
                 };
-                let mut diagnostics = collect_test_only_non_expression_reference_diagnostics(
+                let mut diagnostics = collect_test_only_module_head_diagnostics(
                     descriptor.owner,
                     &candidates,
                     &generic_parameters,
@@ -5745,12 +5765,12 @@ impl RootDatabase {
     }
 
     /// Diagnoses test-only references in associated trait and impl
-    /// declaration signatures.
+    /// declarations.
     ///
     /// The pass checks associated type bounds and definition types plus
-    /// method signatures, generic bounds, and where clauses. Method bodies
-    /// and contracts are left for owner resolution after local bindings are
-    /// available.
+    /// method signatures, generic bounds, and where clauses. For methods with
+    /// bodies or contracts, it resolves locals before module fallback and
+    /// diagnoses test-only expression paths after local and generic lookup.
     pub fn resolve_trait_impl_member_test_only_paths(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -5905,6 +5925,7 @@ impl RootDatabase {
                 }
 
                 let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let module_aliases = module_aliases_for_scope(module_scope);
                 let parent_generics = owner_generic_parameters(&parent_hir);
                 let mut members = Vec::with_capacity(member_entries.len());
                 for (entry, member_owner) in member_entries
@@ -5918,7 +5939,13 @@ impl RootDatabase {
                     };
                     let mut lowering_diagnostics = Vec::new();
                     let member_analysis: Result<
-                        (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                        (
+                            OwnerTestOnlyPathResolution,
+                            Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+                            Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                            Vec<Diagnostic>,
+                            Option<OwnerControlFlowResolutionError>,
+                        ),
                         OwnerControlFlowResolutionError,
                     > = (|| {
                         let expected_member_path = def_paths
@@ -5927,7 +5954,7 @@ impl RootDatabase {
                             .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
                                 member_owner,
                             ))?;
-                        let (member_hir, _) = match descriptor.kind {
+                        let (member_hir, source_map) = match descriptor.kind {
                             TopLevelOwnerKind::Trait => lower_trait_item_owner(
                                 member_owner,
                                 &expected_member_path,
@@ -5957,33 +5984,121 @@ impl RootDatabase {
                         }
                         .map_err(OwnerControlFlowResolutionError::Lowering)?;
                         lowering_diagnostics.extend(member_hir.diagnostics.iter().cloned());
-                        let candidates = owner_test_only_signature_path_candidates(&member_hir);
                         let mut generic_parameters = parent_generics.clone();
                         generic_parameters.extend(owner_generic_parameters(&member_hir));
+                        let candidates = owner_test_only_path_candidates(&member_hir);
+                        let module_head_candidates = candidates
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.kind != OwnerPathKind::Expression
+                                    // Qualified expression paths start with a module/interface
+                                    // alias; the local resolver handles one-segment values.
+                                    || candidate.segment_count > 1
+                            })
+                            .copied()
+                            .collect::<Vec<_>>();
                         let mut path_resolution = OwnerTestOnlyPathResolution {
                             owner: member_owner,
                             paths: HashMap::new(),
                         };
-                        let mut diagnostics =
-                            collect_test_only_non_expression_reference_diagnostics(
-                                member_owner,
-                                &candidates,
-                                &generic_parameters,
-                                module_scope,
-                                &mut path_resolution,
-                                &self.symbols,
-                                &inputs,
+                        let mut diagnostics = collect_test_only_module_head_diagnostics(
+                            member_owner,
+                            &module_head_candidates,
+                            &generic_parameters,
+                            module_scope,
+                            &mut path_resolution,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        )?;
+                        let mut local_resolution = Ok(None);
+                        let mut module_resolution = Ok(None);
+                        let mut expression_diagnostic_error = None;
+                        if let Some(body) = member_hir.body {
+                            match resolve_owner_locals(
+                                body,
+                                &source_map,
                                 snapshot,
-                            )?;
+                                &self.symbols,
+                                &module_aliases,
+                            ) {
+                                Ok(locals) => {
+                                    let mut module = resolve_owner_module_paths(
+                                        &locals,
+                                        module_scope,
+                                        &generic_parameters,
+                                    );
+                                    match collect_test_only_reference_diagnostics(
+                                        member_owner,
+                                        &locals.deferred_paths,
+                                        module_scope,
+                                        &mut module,
+                                        &inputs,
+                                        snapshot,
+                                    ) {
+                                        Ok(mut expression_diagnostics) => {
+                                            diagnostics.append(&mut expression_diagnostics);
+                                        }
+                                        Err(error) => {
+                                            expression_diagnostic_error = Some(error);
+                                        }
+                                    }
+                                    local_resolution = Ok(Some(locals));
+                                    module_resolution = Ok(Some(module));
+                                }
+                                Err(error) => {
+                                    let error = OwnerControlFlowResolutionError::Locals(error);
+                                    local_resolution = Err(error.clone());
+                                    module_resolution = Err(error.clone());
+                                }
+                            }
+                        }
                         sort_phase1_diagnostics(&mut diagnostics);
-                        Ok((path_resolution, diagnostics))
+                        Ok((
+                            path_resolution,
+                            local_resolution,
+                            module_resolution,
+                            diagnostics,
+                            expression_diagnostic_error,
+                        ))
                     })();
 
-                    let (test_only_path_resolution, test_only_diagnostics) = match member_analysis {
-                        Ok((path_resolution, diagnostics)) => {
-                            (Ok(path_resolution), Ok(diagnostics))
-                        }
-                        Err(error) => (Err(error.clone()), Err(error)),
+                    let (
+                        test_only_path_resolution,
+                        local_resolution,
+                        module_resolution,
+                        test_only_diagnostics,
+                    ) = match member_analysis {
+                        Ok((
+                            path_resolution,
+                            local_resolution,
+                            module_resolution,
+                            _,
+                            Some(error),
+                        )) => (
+                            Ok(path_resolution),
+                            local_resolution,
+                            module_resolution,
+                            Err(error),
+                        ),
+                        Ok((
+                            path_resolution,
+                            local_resolution,
+                            module_resolution,
+                            diagnostics,
+                            None,
+                        )) => (
+                            Ok(path_resolution),
+                            local_resolution,
+                            module_resolution,
+                            Ok(diagnostics),
+                        ),
+                        Err(error) => (
+                            Err(error.clone()),
+                            Err(error.clone()),
+                            Err(error.clone()),
+                            Err(error),
+                        ),
                     };
                     members.push(TraitImplMemberTestOnlyResolution {
                         parent_owner: descriptor.owner,
@@ -5991,6 +6106,8 @@ impl RootDatabase {
                         kind,
                         test_only_path_resolution,
                         test_only_diagnostics,
+                        local_resolution,
+                        module_resolution,
                         lowering_diagnostics,
                     });
                 }
@@ -10789,7 +10906,7 @@ mod tests {
     }
 
     #[test]
-    fn trait_impl_member_test_only_paths_cover_associated_signatures() {
+    fn trait_impl_member_test_only_paths_cover_signatures_and_method_bodies() {
         let root = concat!(
             "use acme:test-support/fixtures as fixture\n",
             "use acme:test-support/fixtures as fs\n",
@@ -10980,6 +11097,25 @@ mod tests {
             diagnostics_for(&trait_members[2]).is_empty(),
             "the parent Fixture generic and method M generic shadow imported types"
         );
+        assert!(
+            trait_members[0]
+                .local_resolution()
+                .expect("associated type has no local-resolution error")
+                .is_none()
+                && trait_members[0]
+                    .module_resolution()
+                    .expect("associated type has no module-resolution error")
+                    .is_none()
+                && trait_members[1]
+                    .local_resolution()
+                    .expect("bodyless trait method has no local-resolution error")
+                    .is_none()
+                && trait_members[1]
+                    .module_resolution()
+                    .expect("bodyless trait method has no module-resolution error")
+                    .is_none(),
+            "associated types and methods without bodies have no local or module results"
+        );
 
         let impl_members = results.owners()[1].members();
         assert_eq!(
@@ -10995,8 +11131,20 @@ mod tests {
                 span_of("fixture.ImplReturned", 0),
                 span_of("fixture.ImplWhereBound", 0),
                 span_of("fixture.impl_effect", 0),
+                span_of("fixture.impl_body", 0),
             ],
-            "impl method generics and signature paths are checked"
+            "impl method generics, signature paths, and qualified body paths are checked"
+        );
+        assert!(
+            impl_members[1]
+                .local_resolution()
+                .expect("impl method local resolution succeeds")
+                .is_some()
+                && impl_members[1]
+                    .module_resolution()
+                    .expect("impl method module resolution succeeds")
+                    .is_some(),
+            "method bodies expose their local and module fallback results"
         );
 
         let root_scope = &collection.scopes().modules[ModuleId::ROOT.raw() as usize];
@@ -11082,6 +11230,233 @@ mod tests {
                 .flat_map(TraitImplMemberOwnerResolution::members)
                 .all(|member| diagnostics_for(member).is_empty()),
             "ordinary module imports do not receive test-only diagnostics"
+        );
+    }
+
+    #[test]
+    fn trait_impl_member_test_only_paths_cover_method_bodies_and_contracts() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{flag, outside, BodyType, ParentType, broken, N}\n",
+            "trait Api<ParentType> {\n",
+            "  fn shadowed(flag: Bool) { flag }\n",
+            "  fn body(value: Bool) {\n",
+            "    let typed: fixture.BodyType = value\n",
+            "    value as fixture.CastType\n",
+            "    outside\n",
+            "  }\n",
+            "  fn contract_only() requires outside\n",
+            "  fn contracts(value: Bool) requires outside ensures outside { value }\n",
+            "  fn generic_type<BodyType>(value: BodyType) {\n",
+            "    let typed: fixture.Container<BodyType> = value\n",
+            "  }\n",
+            "  fn parent_generic(value: ParentType) { let typed: ParentType = value }\n",
+            "  fn const_generic_shadow<const N: U32>() { N }\n",
+            "  fn broken_path() { broken }\n",
+            "}\n",
+            "type Local = Bool\n",
+            "impl Api for Local {\n",
+            "  fn impl_body(flag: Bool) requires outside {\n",
+            "    let typed: fixture.ImplBodyType = flag\n",
+            "    outside\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed_root = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed_root.errors.is_empty(), "{:?}", parsed_root.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only imports and associated owners collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated method bodies and contracts resolve");
+        assert!(
+            results.owners().iter().all(|owner| owner.error().is_none()),
+            "each trait and impl owner resolves independently"
+        );
+        let trait_members = results.owners()[0].members();
+        let impl_members = results.owners()[1].members();
+        assert_eq!(trait_members.len(), 8);
+        assert_eq!(impl_members.len(), 1);
+
+        let span = |needle: &str, occurrence: usize| {
+            let start = root
+                .match_indices(needle)
+                .nth(occurrence)
+                .unwrap_or_else(|| panic!("expected occurrence {occurrence} of `{needle}`"))
+                .0;
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + needle.len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        let diagnostic_spans = |member: &TraitImplMemberTestOnlyResolution| {
+            member
+                .test_only_diagnostics()
+                .expect("member diagnostics succeed")
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("test-only diagnostic has a primary span")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            diagnostic_spans(&trait_members[0]).is_empty(),
+            "a method parameter shadows a same-named imported value"
+        );
+        assert!(
+            trait_members[0]
+                .local_resolution()
+                .expect("shadowed method local resolution succeeds")
+                .expect("shadowed method has a body")
+                .paths
+                .values()
+                .any(|path| matches!(path.base, Res::Local(_))),
+            "the shadowing parameter resolves as a local"
+        );
+
+        assert_eq!(
+            diagnostic_spans(&trait_members[1]),
+            [span("fixture", 3), span("fixture", 4), span("outside", 1),],
+            "nested body types, casts, and unshadowed expression paths are checked"
+        );
+        let body_module = trait_members[1]
+            .module_resolution()
+            .expect("body module resolution succeeds")
+            .expect("body method has module resolution");
+        assert!(
+            body_module.paths.values().any(|path| path.base == Res::Err),
+            "the test-only expression binding is rejected in module fallback"
+        );
+
+        assert_eq!(
+            diagnostic_spans(&trait_members[2]),
+            [span("outside", 2)],
+            "a contract-only trait method receives a synthetic body scope"
+        );
+        assert!(
+            trait_members[2]
+                .local_resolution()
+                .expect("contract-only local resolution succeeds")
+                .is_some(),
+            "contracts are visited even when the trait method has no executable body"
+        );
+        assert_eq!(
+            diagnostic_spans(&trait_members[3]),
+            [span("outside", 3), span("outside", 4)],
+            "requires and ensures expressions are both checked"
+        );
+        assert!(
+            diagnostic_spans(&trait_members[4]) == [span("fixture", 5)],
+            "the module head is diagnosed while a method generic shadows the nested type argument"
+        );
+        assert!(
+            diagnostic_spans(&trait_members[5]).is_empty(),
+            "a parent generic shadows a same-named import in signature and body types"
+        );
+        assert!(
+            diagnostic_spans(&trait_members[6]).is_empty(),
+            "a const generic shadows a same-named import in an expression"
+        );
+        assert!(
+            trait_members[6]
+                .module_resolution()
+                .expect("const-generic module resolution succeeds")
+                .expect("const-generic method has a body")
+                .deferred_paths
+                .iter()
+                .any(|path| path.name
+                    == collection.scopes().modules[ModuleId::ROOT.raw() as usize]
+                        .scope
+                        .keys()
+                        .copied()
+                        .find(|symbol| {
+                            database
+                                .resolve_symbol(*symbol)
+                                .is_ok_and(|name| name.as_ref() == "N")
+                        })
+                        .expect("N import exists")),
+            "generic expression names remain deferred for the later generic resolver"
+        );
+        assert_eq!(
+            diagnostic_spans(&impl_members[0]),
+            [span("outside", 5), span("fixture", 6), span("outside", 6),],
+            "impl method body annotations and expressions are checked"
+        );
+        assert!(
+            impl_members[0]
+                .local_resolution()
+                .expect("impl method local resolution succeeds")
+                .expect("impl method has a body")
+                .paths
+                .values()
+                .any(|path| matches!(path.base, Res::Local(_))),
+            "impl method parameters resolve before module imports"
+        );
+
+        let root_scope = &collection.scopes().modules[ModuleId::ROOT.raw() as usize];
+        let broken_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "broken")
+            })
+            .expect("broken item import exists");
+        let broken_import = match root_scope
+            .scope
+            .get(&broken_symbol)
+            .expect("broken import binding exists")
+            .origin
+        {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("broken item comes from a use"),
+        };
+        let mut broken_collection = collection.clone();
+        broken_collection.scopes.modules[ModuleId::ROOT.raw() as usize].imports
+            [broken_import.0 as usize]
+            .use_ast_id = ast::ErasedAstId::new(u32::MAX);
+        let isolated = database
+            .resolve_trait_impl_member_test_only_paths(&broken_collection, &module_tree, &snapshot)
+            .expect("a member diagnostic failure does not stop sibling members");
+        assert!(
+            isolated.owners()[0].members()[7]
+                .test_only_diagnostics()
+                .is_err(),
+            "a missing import syntax node is retained on its declaring member"
+        );
+        assert!(
+            isolated.owners()[0].members()[1]
+                .test_only_diagnostics()
+                .is_ok(),
+            "a sibling body keeps its own successful diagnostic result"
         );
     }
 
