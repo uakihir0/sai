@@ -7,9 +7,11 @@ use sai_diagnostics::{
     CauseKey, Child, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related, SourceRef,
     source_text_status_diagnostic,
 };
-use sai_hir::OwnerId;
 use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
+use sai_hir::expressions::{
+    Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
+};
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
 use sai_hir::items::{HirOwner, ItemKind, OwnerNode};
 use sai_hir::lower::{
@@ -19,8 +21,14 @@ use sai_hir::lower::{
     lower_invariant_owner, lower_property_owner, lower_refined_owner, lower_resource_owner,
     lower_struct_owner, lower_test_owner, lower_trait_owner, lower_world_owner,
 };
+use sai_hir::patterns::{Pat as HirPat, PatKind, PatRangeEnd};
 use sai_hir::source_map::HirSourceMap;
+use sai_hir::types::{
+    Bound, BoundKind, EffectRef as HirEffectRef, GenericArg, GenericArgs, GenericParamKind,
+    Path as HirPath, PathRoot, Ty, TyKind,
+};
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
+use sai_hir::{HirId, OwnerId};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
 use sai_package::manifest::PackageRole;
@@ -36,13 +44,13 @@ use sai_package::mvs_diagnostics::{
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_resolve::owner::{
-    LabelResolution, LabelResolutionError, LocalResolution, LocalResolutionError, ModuleResolution,
-    resolve_owner_control_flow, resolve_owner_locals, resolve_owner_module_paths,
+    DeferredPath, LabelResolution, LabelResolutionError, LocalResolution, LocalResolutionError,
+    ModuleResolution, resolve_owner_control_flow, resolve_owner_locals, resolve_owner_module_paths,
     resolve_predicate_expression,
 };
 use sai_resolve::package_scopes::{
     BindingOrigin, DefKind, FilteredModule, ForeignPackageScope, ImportIndex, PackageScopesError,
-    PackageUseRequirement, Phase1ModuleScopes, RefinementPredicateOwnerKind, Res,
+    PackageUseRequirement, PathRes, Phase1ModuleScopes, RefinementPredicateOwnerKind, Res,
     collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
     suppress_export_name_feature_gate,
 };
@@ -856,16 +864,20 @@ impl Phase1PackageScopesCollection {
     }
 }
 
-/// Owned loop-label and local-name results for one top-level function owner.
+/// Owned control-flow, local, module, and test-only results for one top-level
+/// function owner.
 ///
-/// The temporary HIR arena and snapshot-bound source map used to produce this
-/// value are discarded before it is returned.
+/// The temporary HIR arena and snapshot-bound source map used to produce these
+/// values are discarded before they are returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionOwnerResolution {
     owner: OwnerId,
     resolution: Result<LabelResolution, FunctionOwnerResolutionError>,
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
+    test_only_path_resolution:
+        Result<Option<FunctionTestOnlyPathResolution>, FunctionOwnerResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, FunctionOwnerResolutionError>,
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// label resolver's diagnostics so the caller can preserve phase order.
     lowering_diagnostics: Vec<Diagnostic>,
@@ -898,8 +910,40 @@ impl FunctionOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<Option<&FunctionTestOnlyPathResolution>, &FunctionOwnerResolutionError> {
+        self.test_only_path_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &FunctionOwnerResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
         &self.lowering_diagnostics
+    }
+}
+
+/// Non-expression function paths rejected because their module binding is
+/// test-only. This includes types, effects, and path patterns.
+///
+/// Other paths remain for later generic/module/prelude/effect resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionTestOnlyPathResolution {
+    owner: OwnerId,
+    paths: HashMap<HirId, PathRes>,
+}
+
+impl FunctionTestOnlyPathResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn paths(&self) -> &HashMap<HirId, PathRes> {
+        &self.paths
     }
 }
 
@@ -1471,16 +1515,393 @@ fn module_scope_for_file<'a>(
     Ok(module_scope)
 }
 
-fn collect_const_test_only_reference_diagnostics(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FunctionPathKind {
+    Type,
+    Effect,
+    Pattern,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FunctionPathHead {
+    hir_id: HirId,
+    name: Symbol,
+    span: sai_hir::Span,
+    segment_count: u32,
+    kind: FunctionPathKind,
+}
+
+fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathHead> {
+    enum Work<'hir> {
+        Expr(&'hir HirExpr<'hir>),
+        Block(&'hir HirBlock<'hir>),
+        Stmt(&'hir Stmt<'hir>),
+        Pat(&'hir HirPat<'hir>),
+        Ty(&'hir Ty<'hir>),
+        Bound(Bound<'hir>),
+        Path {
+            path: HirPath<'hir>,
+            kind: FunctionPathKind,
+        },
+        Args(GenericArgs<'hir>),
+        Effect(HirEffectRef<'hir>),
+    }
+
+    let OwnerNode::Item(item) = owner.node else {
+        return Vec::new();
+    };
+    let ItemKind::Fn { sig, generics, .. } = item.kind else {
+        return Vec::new();
+    };
+    let mut work = Vec::new();
+    for parameter in sig.params {
+        work.push(Work::Ty(parameter.ty));
+    }
+    if let Some(effects) = sig.effects {
+        work.extend(effects.iter().copied().map(Work::Effect));
+    }
+    if let Some(ret) = sig.ret {
+        work.push(Work::Ty(ret));
+    }
+    for parameter in generics.params {
+        match parameter.kind {
+            GenericParamKind::Type { bounds } => {
+                work.extend(bounds.iter().copied().map(Work::Bound));
+            }
+            GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
+        }
+    }
+    for predicate in generics.where_preds {
+        work.push(Work::Ty(predicate.ty));
+        work.extend(predicate.bounds.iter().copied().map(Work::Bound));
+    }
+    if let Some(body) = owner.body {
+        work.push(Work::Expr(body.value));
+        work.extend(
+            body.contracts
+                .iter()
+                .rev()
+                .map(|contract| Work::Expr(&contract.expr)),
+        );
+        work.extend(
+            body.invariant_preds
+                .iter()
+                .rev()
+                .map(|predicate| Work::Expr(predicate)),
+        );
+    }
+
+    let mut paths = Vec::new();
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Expr(expr) => match expr.kind {
+                ExprKind::Lit(_)
+                | ExprKind::ImplicitMember(_)
+                | ExprKind::ContractResult
+                | ExprKind::Continue { .. }
+                | ExprKind::Err => {}
+                ExprKind::Path(path) => {
+                    for segment in path.segments.iter().rev() {
+                        if let Some(args) = segment.args {
+                            work.push(Work::Args(*args));
+                        }
+                    }
+                }
+                ExprKind::Field { base, args, .. } => {
+                    if let Some(args) = args {
+                        work.push(Work::Args(*args));
+                    }
+                    work.push(Work::Expr(base));
+                }
+                ExprKind::TupleField { base, .. }
+                | ExprKind::Unary(_, base)
+                | ExprKind::Borrow(_, base)
+                | ExprKind::Try(base)
+                | ExprKind::Await(base) => work.push(Work::Expr(base)),
+                ExprKind::Call { callee, args, base } => {
+                    if let Some(base) = base {
+                        work.push(Work::Expr(base));
+                    }
+                    work.extend(args.iter().rev().map(|arg| Work::Expr(&arg.expr)));
+                    work.push(Work::Expr(callee));
+                }
+                ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+                    work.push(Work::Expr(right));
+                    work.push(Work::Expr(left));
+                }
+                ExprKind::Range { start, end, .. } => {
+                    if let Some(end) = end {
+                        work.push(Work::Expr(end));
+                    }
+                    if let Some(start) = start {
+                        work.push(Work::Expr(start));
+                    }
+                }
+                ExprKind::Tuple(items) | ExprKind::Array(items) => {
+                    work.extend(items.iter().rev().map(Work::Expr));
+                }
+                ExprKind::Block(block) => work.push(Work::Block(block)),
+                ExprKind::AsyncBlock { block, .. }
+                | ExprKind::Loop { body: block, .. }
+                | ExprKind::Region { block, .. } => work.push(Work::Block(block)),
+                ExprKind::If { cond, then, els } => {
+                    if let Some(els) = els {
+                        work.push(Work::Expr(els));
+                    }
+                    work.push(Work::Block(then));
+                    work.push(Work::Expr(cond));
+                }
+                ExprKind::Match {
+                    scrutinee, arms, ..
+                } => {
+                    for arm in arms.iter().rev() {
+                        work.push(Work::Expr(&arm.body));
+                        if let Some(guard) = arm.guard {
+                            work.push(Work::Expr(guard));
+                        }
+                        work.push(Work::Pat(arm.pat));
+                    }
+                    work.push(Work::Expr(scrutinee));
+                }
+                ExprKind::Break { value, .. } | ExprKind::Return(value) => {
+                    if let Some(value) = value {
+                        work.push(Work::Expr(value));
+                    }
+                }
+                ExprKind::Closure(closure) => {
+                    work.push(Work::Block(closure.body));
+                    if let Some(ret) = closure.ret {
+                        work.push(Work::Ty(ret));
+                    }
+                    for parameter in closure.params.iter().rev() {
+                        if let Some(ty) = parameter.ty {
+                            work.push(Work::Ty(ty));
+                        }
+                    }
+                }
+                ExprKind::FormatString(pieces) => {
+                    for piece in pieces.iter().rev() {
+                        if let FmtPiece::Arg { expr, .. } = piece {
+                            work.push(Work::Expr(expr));
+                        }
+                    }
+                }
+                ExprKind::ContractOld { args, base } => {
+                    if let Some(base) = base {
+                        work.push(Work::Expr(base));
+                    }
+                    work.extend(args.iter().rev().map(|arg| Work::Expr(&arg.expr)));
+                }
+                ExprKind::AsCast { operand, ty } => {
+                    work.push(Work::Ty(ty));
+                    work.push(Work::Expr(operand));
+                }
+            },
+            Work::Block(block) => {
+                if let Some(tail) = block.tail {
+                    work.push(Work::Expr(tail));
+                }
+                work.extend(block.stmts.iter().rev().map(Work::Stmt));
+            }
+            Work::Stmt(stmt) => match stmt.kind {
+                StmtKind::Let { pat, ty, init, els } => {
+                    if let Some(els) = els {
+                        work.push(Work::Block(els));
+                    }
+                    work.push(Work::Expr(init));
+                    if let Some(ty) = ty {
+                        work.push(Work::Ty(ty));
+                    }
+                    work.push(Work::Pat(pat));
+                }
+                StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                    work.push(Work::Expr(rhs));
+                    work.push(Work::Expr(lhs));
+                }
+                StmtKind::Assert { cond, msg, .. } => {
+                    if let Some(msg) = msg {
+                        work.push(Work::Expr(msg));
+                    }
+                    work.push(Work::Expr(cond));
+                }
+                StmtKind::Expr(expr) => work.push(Work::Expr(expr)),
+            },
+            Work::Pat(pat) => match pat.kind {
+                PatKind::Wild | PatKind::Lit(_) | PatKind::Err => {}
+                PatKind::Binding { sub, .. } => {
+                    if let Some(sub) = sub {
+                        work.push(Work::Pat(sub));
+                    }
+                }
+                PatKind::Range { start, end, .. } => {
+                    if let Some(PatRangeEnd::Path(path)) = end {
+                        work.push(Work::Path {
+                            path,
+                            kind: FunctionPathKind::Pattern,
+                        });
+                    }
+                    if let Some(PatRangeEnd::Path(path)) = start {
+                        work.push(Work::Path {
+                            path,
+                            kind: FunctionPathKind::Pattern,
+                        });
+                    }
+                }
+                PatKind::Tuple(patterns) | PatKind::Or(patterns) => {
+                    work.extend(patterns.iter().rev().map(Work::Pat));
+                }
+                PatKind::Slice {
+                    before,
+                    rest,
+                    after,
+                } => {
+                    work.extend(after.iter().rev().map(Work::Pat));
+                    if let Some(Some(rest)) = rest {
+                        work.push(Work::Pat(rest));
+                    }
+                    work.extend(before.iter().rev().map(Work::Pat));
+                }
+                PatKind::Ctor { path, args, .. } => {
+                    if let Some(args) = args {
+                        work.extend(args.iter().rev().map(|arg| Work::Pat(&arg.pat)));
+                    }
+                    work.push(Work::Path {
+                        path,
+                        kind: FunctionPathKind::Pattern,
+                    });
+                }
+                PatKind::ImplicitMember { args, .. } => {
+                    if let Some(args) = args {
+                        work.extend(args.iter().rev().map(|arg| Work::Pat(&arg.pat)));
+                    }
+                }
+            },
+            Work::Ty(ty) => match ty.kind {
+                TyKind::Path(path) => work.push(Work::Path {
+                    path,
+                    kind: FunctionPathKind::Type,
+                }),
+                TyKind::Borrow(_, inner) => work.push(Work::Ty(inner)),
+                TyKind::Tuple(elements) => {
+                    work.extend(elements.iter().rev().map(Work::Ty));
+                }
+                TyKind::FnPtr {
+                    params,
+                    ret,
+                    effects,
+                    ..
+                } => {
+                    if let Some(effects) = effects {
+                        work.extend(effects.iter().copied().map(Work::Effect));
+                    }
+                    if let Some(ret) = ret {
+                        work.push(Work::Ty(ret));
+                    }
+                    work.extend(params.iter().rev().map(Work::Ty));
+                }
+                TyKind::Infer | TyKind::Err => {}
+            },
+            Work::Bound(bound) => {
+                if let Some(effects) = bound.effects {
+                    work.extend(effects.iter().copied().map(Work::Effect));
+                }
+                match bound.kind {
+                    BoundKind::Trait(path) => work.push(Work::Path {
+                        path,
+                        kind: FunctionPathKind::Type,
+                    }),
+                    BoundKind::FnSugar { params, ret, .. } => {
+                        if let Some(ret) = ret {
+                            work.push(Work::Ty(ret));
+                        }
+                        work.extend(params.iter().rev().map(Work::Ty));
+                    }
+                }
+            }
+            Work::Path { path, kind } => {
+                if path.root == PathRoot::Plain
+                    && let Some(segment) = path.segments.first()
+                    && let Ok(segment_count) = u32::try_from(path.segments.len())
+                {
+                    let name = segment.name.sym;
+                    if !name.is_error() {
+                        paths.push(FunctionPathHead {
+                            hir_id: path.hir_id,
+                            name,
+                            span: segment.name.span,
+                            segment_count,
+                            kind,
+                        });
+                    }
+                }
+                for segment in path.segments.iter().rev() {
+                    if let Some(args) = segment.args {
+                        work.push(Work::Args(*args));
+                    }
+                }
+            }
+            Work::Effect(effect) => {
+                if let Some(segment) = effect.segments.first()
+                    && let Ok(segment_count) = u32::try_from(effect.segments.len())
+                    && !segment.sym.is_error()
+                {
+                    paths.push(FunctionPathHead {
+                        hir_id: effect.hir_id,
+                        name: segment.sym,
+                        span: segment.span,
+                        segment_count,
+                        kind: FunctionPathKind::Effect,
+                    });
+                }
+            }
+            Work::Args(args) => {
+                for arg in args.args.iter().rev() {
+                    match arg {
+                        GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                            work.push(Work::Ty(ty));
+                        }
+                        GenericArg::Const(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    paths.sort_by_key(|path| path.span.range.start());
+    paths
+}
+
+fn is_builtin_effect_root(symbol: Symbol, symbols: &Interner) -> bool {
+    let Ok(name) = symbols.resolve(symbol) else {
+        return false;
+    };
+    matches!(
+        name.as_ref(),
+        "alloc"
+            | "fs"
+            | "net"
+            | "clock"
+            | "random"
+            | "stdio"
+            | "env"
+            | "process"
+            | "thread"
+            | "host"
+            | "ffi"
+    )
+}
+
+fn collect_test_only_reference_diagnostics(
     owner: OwnerId,
-    locals: &LocalResolution,
+    deferred_paths: &[DeferredPath],
     module_scope: &Phase1ModuleScopes,
     module_resolution: &mut ModuleResolution,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
     let mut diagnostics = Vec::new();
-    for candidate in &locals.deferred_paths {
+    let mut candidates = deferred_paths.to_vec();
+    candidates.sort_by_key(|candidate| candidate.span.range.start());
+    for candidate in candidates {
         let Some(binding) = module_scope.scope.get(&candidate.name) else {
             continue;
         };
@@ -1498,79 +1919,155 @@ fn collect_const_test_only_reference_diagnostics(
             continue;
         }
 
-        let path = module_resolution.paths.entry(candidate.hir_id).or_insert(
-            sai_resolve::package_scopes::PathRes {
-                base: binding.res,
-                resolved_segments: 1,
-                segment_count: 1,
-            },
-        );
+        // A deferred expression path may be shadowed by an owner generic.
+        // Only paths the module resolver actually claimed can refer here.
+        let Some(path) = module_resolution.paths.get_mut(&candidate.hir_id) else {
+            continue;
+        };
         path.base = Res::Err;
         module_resolution
             .deferred_paths
             .retain(|deferred| deferred.hir_id != candidate.hir_id);
 
-        let reference = sai_diagnostics::Location::from_decoded_source(
-            inputs.source_ref.clone(),
-            sai_diagnostics::Span::new(candidate.span.file, candidate.span.range),
-            &inputs.source,
-        )
-        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        diagnostics.push(test_only_reference_diagnostic(
             owner,
-        ))?;
-        let syntax = inputs
-            .ast_ids
-            .pointer(import.use_ast_id)
-            .and_then(|pointer| {
-                pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
-            })
+            candidate.span,
+            import_index,
+            import.use_ast_id,
+            inputs,
+            snapshot,
+        )?);
+    }
+    Ok(diagnostics)
+}
+
+fn collect_test_only_non_expression_reference_diagnostics(
+    owner: OwnerId,
+    candidates: &[FunctionPathHead],
+    generic_parameters: &HashSet<Symbol>,
+    module_scope: &Phase1ModuleScopes,
+    path_resolution: &mut FunctionTestOnlyPathResolution,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
+    for candidate in candidates {
+        if matches!(
+            candidate.kind,
+            FunctionPathKind::Type | FunctionPathKind::Pattern
+        ) && generic_parameters.contains(&candidate.name)
+        {
+            continue;
+        }
+        if candidate.kind == FunctionPathKind::Effect
+            && is_builtin_effect_root(candidate.name, symbols)
+        {
+            continue;
+        }
+        let Some(binding) = module_scope.scope.get(&candidate.name) else {
+            continue;
+        };
+        let import_index = match binding.origin {
+            BindingOrigin::Decl => continue,
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+        };
+        let import = module_scope.imports.get(import_index.0 as usize).ok_or(
+            OwnerControlFlowResolutionError::MissingImportBinding {
+                owner,
+                import: import_index,
+            },
+        )?;
+        if !import.test_only {
+            continue;
+        }
+
+        path_resolution.paths.insert(
+            candidate.hir_id,
+            PathRes {
+                base: Res::Err,
+                resolved_segments: 1,
+                segment_count: candidate.segment_count,
+            },
+        );
+        diagnostics.push(test_only_reference_diagnostic(
+            owner,
+            candidate.span,
+            import_index,
+            import.use_ast_id,
+            inputs,
+            snapshot,
+        )?);
+    }
+    Ok(diagnostics)
+}
+
+fn test_only_reference_diagnostic(
+    owner: OwnerId,
+    reference_span: sai_hir::Span,
+    import_index: ImportIndex,
+    use_ast_id: ast::ErasedAstId,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let reference = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(reference_span.file, reference_span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let syntax = inputs
+        .ast_ids
+        .pointer(use_ast_id)
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .ok_or(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+            owner,
+            import: import_index,
+        })?;
+    let use_decl = ast::UseDecl::cast(syntax).ok_or(
+        OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+            owner,
+            import: import_index,
+        },
+    )?;
+    let package_path =
+        use_decl
+            .package()
             .ok_or(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
                 owner,
                 import: import_index,
             })?;
-        let use_decl = ast::UseDecl::cast(syntax).ok_or(
-            OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
-                owner,
-                import: import_index,
-            },
-        )?;
-        let package_path = use_decl.package().ok_or(
-            OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
-                owner,
-                import: import_index,
-            },
-        )?;
-        let use_location = sai_diagnostics::Location::from_decoded_source(
-            inputs.source_ref.clone(),
-            sai_diagnostics::Span::new(
-                inputs.filtered_item_tree.file,
-                package_path.syntax().text_range(),
-            ),
-            &inputs.source,
-        )
-        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
-            owner,
-        ))?;
-        let mut diagnostic = Diagnostic::new(
-            sai_diagnostics::Code::TestDependencyOutsideTest,
-            sai_diagnostics::Severity::Error,
-            "test-only bindings may be referenced only from test or property owners",
-            Some(reference),
-        );
-        diagnostic.primary_label = "test-only reference outside a test or property".to_owned();
-        diagnostic.package = inputs.source_ref.package.clone();
-        diagnostic
-            .push_related(Related::DeclaredHere {
-                location: use_location,
-                what: "test-only use".to_owned(),
-            })
-            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
-        let diagnostic = diagnostic
-            .with_workspace_snapshot(snapshot)
-            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
-        diagnostics.push(diagnostic);
-    }
-    Ok(diagnostics)
+    let use_location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(
+            inputs.filtered_item_tree.file,
+            package_path.syntax().text_range(),
+        ),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        sai_diagnostics::Code::TestDependencyOutsideTest,
+        sai_diagnostics::Severity::Error,
+        "test-only bindings may be referenced only from test or property owners",
+        Some(reference),
+    );
+    diagnostic.primary_label = "test-only reference outside a test or property".to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic
+        .push_related(Related::DeclaredHere {
+            location: use_location,
+            what: "test-only use".to_owned(),
+        })
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    let diagnostic = diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    Ok(diagnostic)
 }
 
 fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol> {
@@ -3150,6 +3647,8 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                test_only_path_resolution: Err(error.clone()),
+                                test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -3167,6 +3666,8 @@ impl RootDatabase {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
                 let mut module_resolution = None;
+                let mut test_only_path_resolution = None;
+                let mut test_only_diagnostics = None;
                 let resolution = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -3206,6 +3707,29 @@ impl RootDatabase {
                         &context,
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
+                    let function_paths = function_test_only_path_candidates(&hir_owner);
+                    let generic_parameters = owner_generic_parameters(&hir_owner);
+                    let mut resolved_function_paths = FunctionTestOnlyPathResolution {
+                        owner: descriptor.owner,
+                        paths: HashMap::new(),
+                    };
+                    let signature_diagnostics = match &module_scope {
+                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                            descriptor.owner,
+                            &function_paths,
+                            &generic_parameters,
+                            module_scope,
+                            &mut resolved_function_paths,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    test_only_path_resolution = Some(match &module_scope {
+                        Ok(_) => Ok(Some(resolved_function_paths)),
+                        Err(error) => Err(error.clone()),
+                    });
                     match hir_owner.body {
                         Some(body) => {
                             let labels = resolve_owner_control_flow(
@@ -3228,19 +3752,44 @@ impl RootDatabase {
                             };
                             match locals {
                                 Ok(locals) => {
-                                    let module_paths = match &module_scope {
+                                    let mut module_paths = match &module_scope {
                                         Ok(module_scope) => Ok(resolve_owner_module_paths(
                                             &locals,
                                             module_scope,
-                                            &owner_generic_parameters(&hir_owner),
+                                            &generic_parameters,
                                         )),
                                         Err(error) => Err(error.clone()),
                                     };
+                                    let test_only_paths = match (&module_scope, &mut module_paths) {
+                                        (Ok(module_scope), Ok(module_paths)) => {
+                                            collect_test_only_reference_diagnostics(
+                                                descriptor.owner,
+                                                &locals.deferred_paths,
+                                                module_scope,
+                                                module_paths,
+                                                &inputs,
+                                                snapshot,
+                                            )
+                                        }
+                                        (Err(error), _) => Err(error.clone()),
+                                        (_, Err(error)) => Err(error.clone()),
+                                    };
                                     module_resolution = Some(module_paths.map(Some));
+                                    let test_only_paths =
+                                        match (signature_diagnostics, test_only_paths) {
+                                            (Ok(mut signature), Ok(body)) => {
+                                                signature.extend(body);
+                                                sort_phase1_diagnostics(&mut signature);
+                                                Ok(signature)
+                                            }
+                                            (Err(error), _) | (_, Err(error)) => Err(error),
+                                        };
+                                    test_only_diagnostics = Some(test_only_paths);
                                     local_resolution = Some(Ok(Some(locals)));
                                 }
                                 Err(error) => {
                                     module_resolution = Some(Err(error.clone()));
+                                    test_only_diagnostics = Some(signature_diagnostics);
                                     local_resolution = Some(Err(error));
                                 }
                             };
@@ -3249,6 +3798,7 @@ impl RootDatabase {
                         None => {
                             local_resolution = Some(Ok(None));
                             module_resolution = Some(Ok(None));
+                            test_only_diagnostics = Some(signature_diagnostics);
                             Ok(LabelResolution::default())
                         }
                     }
@@ -3257,11 +3807,17 @@ impl RootDatabase {
                     local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let module_resolution =
                     module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let test_only_path_resolution =
+                    test_only_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let test_only_diagnostics =
+                    test_only_diagnostics.unwrap_or_else(|| resolution.clone().map(|_| Vec::new()));
                 owners.push(FunctionOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
                     module_resolution,
+                    test_only_path_resolution,
+                    test_only_diagnostics,
                     lowering_diagnostics,
                 });
             }
@@ -3407,9 +3963,9 @@ impl RootDatabase {
                             let test_only_diagnostics = match &module_scope {
                                 Ok(module_scope) => match &mut module_resolution {
                                     Ok(Some(module_resolution)) => {
-                                        collect_const_test_only_reference_diagnostics(
+                                        collect_test_only_reference_diagnostics(
                                             descriptor.owner,
-                                            &locals,
+                                            &locals.deferred_paths,
                                             module_scope,
                                             module_resolution,
                                             &inputs,
@@ -5003,6 +5559,578 @@ mod tests {
     }
 
     #[test]
+    fn function_owner_test_only_diagnostics_follow_module_origins() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures as fs\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{flag}\n",
+            "fn repeated() { fixture && fixture }\n",
+            "fn imported_item() { flag }\n",
+            "fn generic<Fixture>() { Fixture }\n",
+            "fn local() { let fixture = true; fixture }\n",
+            "fn signature<T: Fixture>(fixture: Fixture, nested: Container<Fixture>, callback: fn() effects { fixture.read }) -> fixture.Type where T: Fixture effects { fixture.write } { let typed: Fixture = fixture as Fixture; identity<Fixture>(typed) }\n",
+            "fn generic_type<Fixture>(value: Fixture) { Fixture }\n",
+            "fn builtin_effect_root() effects { fs.read } { true }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only imports are retained for ordinary function analysis");
+        let (
+            fixture_symbol,
+            fixture_import_index,
+            generic_symbol,
+            generic_import_index,
+            item_import_index,
+        ) = {
+            let module_scope = collection
+                .scopes()
+                .module(ModuleId::ROOT)
+                .expect("root module scope exists");
+            let symbol_named = |expected: &str| {
+                module_scope
+                    .scope
+                    .keys()
+                    .copied()
+                    .find(|symbol| {
+                        database
+                            .resolve_symbol(*symbol)
+                            .is_ok_and(|name| name.as_ref() == expected)
+                    })
+                    .unwrap_or_else(|| panic!("module scope contains `{expected}`"))
+            };
+            let import_index_for = |symbol| match module_scope
+                .scope
+                .get(&symbol)
+                .expect("requested module binding exists")
+                .origin
+            {
+                BindingOrigin::Decl => panic!("`{symbol:?}` comes from a use binding"),
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => {
+                    import.0 as usize
+                }
+            };
+            let fixture_symbol = symbol_named("fixture");
+            let builtin_root_symbol = symbol_named("fs");
+            let generic_symbol = symbol_named("Fixture");
+            let item_symbol = symbol_named("flag");
+            let fixture_import_index = import_index_for(fixture_symbol);
+            let builtin_root_import_index = import_index_for(builtin_root_symbol);
+            let generic_import_index = import_index_for(generic_symbol);
+            let item_import_index = import_index_for(item_symbol);
+            assert!(module_scope.imports[fixture_import_index].test_only);
+            assert!(matches!(
+                module_scope.imports[fixture_import_index].res,
+                Res::TestOnly(_)
+            ));
+            assert!(module_scope.imports[builtin_root_import_index].test_only);
+            assert!(module_scope.imports[generic_import_index].test_only);
+            assert!(module_scope.imports[item_import_index].test_only);
+            (
+                fixture_symbol,
+                fixture_import_index,
+                generic_symbol,
+                generic_import_index,
+                item_import_index,
+            )
+        };
+
+        let results = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("top-level function owners resolve");
+        assert_eq!(results.owners().len(), 7);
+        let repeated = &results.owners()[0];
+        assert_eq!(
+            repeated
+                .module_resolution()
+                .expect("module lookup succeeds")
+                .expect("repeated function has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err, Res::Err],
+            "each out-of-test module reference is changed to the error sentinel"
+        );
+        let repeated_diagnostics = repeated
+            .test_only_diagnostics()
+            .expect("reference diagnostics are collected");
+        assert_eq!(repeated_diagnostics.len(), 2);
+        let repeated_start = root
+            .find("fn repeated() { fixture")
+            .expect("repeated function exists") as u32
+            + "fn repeated() { ".len() as u32;
+        let repeated_spans = repeated_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("reference has a primary location")
+                    .span
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repeated_spans,
+            [
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(repeated_start),
+                        sai_diagnostics::TextSize::new(
+                            repeated_start + "fixture".len() as u32,
+                        ),
+                    )
+                    .expect("first reference range is ordered"),
+                ),
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(
+                            repeated_start + "fixture && ".len() as u32,
+                        ),
+                        sai_diagnostics::TextSize::new(
+                            repeated_start + "fixture && fixture".len() as u32,
+                        ),
+                    )
+                    .expect("second reference range is ordered"),
+                ),
+            ]
+        );
+        let first_use_start = root
+            .find("acme:test-support/fixtures")
+            .expect("alias use path exists") as u32;
+        let first_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(first_use_start),
+                sai_diagnostics::TextSize::new(
+                    first_use_start + "acme:test-support/fixtures".len() as u32,
+                ),
+            )
+            .expect("alias package path range is ordered"),
+        );
+        assert!(repeated_diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::TestDependencyOutsideTest
+                && diagnostic.related().iter().any(|related| {
+                    matches!(
+                        related,
+                        Related::DeclaredHere { location, .. }
+                            if location.span == first_use_span
+                    )
+                })
+        }));
+
+        let imported_item = &results.owners()[1];
+        assert_eq!(
+            imported_item
+                .module_resolution()
+                .expect("item module lookup succeeds")
+                .expect("item function has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err]
+        );
+        let item_diagnostics = imported_item
+            .test_only_diagnostics()
+            .expect("item reference diagnostics are collected");
+        assert_eq!(item_diagnostics.len(), 1);
+        assert_eq!(
+            item_diagnostics[0].code,
+            sai_diagnostics::Code::TestDependencyOutsideTest
+        );
+        let second_use_start = root
+            .find("acme:test-support/fixtures.{flag}")
+            .expect("item use path exists") as u32;
+        let second_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(second_use_start),
+                sai_diagnostics::TextSize::new(
+                    second_use_start + "acme:test-support/fixtures".len() as u32,
+                ),
+            )
+            .expect("item package path range is ordered"),
+        );
+        assert!(item_diagnostics[0].related().iter().any(|related| matches!(
+            related,
+            Related::DeclaredHere { location, .. } if location.span == second_use_span
+        )));
+
+        let generic = &results.owners()[2];
+        let generic_module = generic
+            .module_resolution()
+            .expect("generic lookup succeeds")
+            .expect("generic function has a module result");
+        assert!(
+            generic_module.paths.is_empty(),
+            "same-named generic was resolved through module scope: {generic_module:#?}"
+        );
+        assert_eq!(
+            generic_module.deferred_paths.len(),
+            1,
+            "a same-named generic remains deferred for generic resolution"
+        );
+        let deferred_generic_name = database
+            .resolve_symbol(generic_module.deferred_paths[0].name)
+            .expect("deferred generic name is interned");
+        let imported_generic_name = database
+            .resolve_symbol(generic_symbol)
+            .expect("generic module alias name is interned");
+        assert_eq!(
+            deferred_generic_name.as_ref(),
+            imported_generic_name.as_ref(),
+            "the generic and imported module alias have the same name"
+        );
+        assert!(
+            generic
+                .test_only_diagnostics()
+                .expect("generic reference diagnostics are collected")
+                .is_empty(),
+            "the generic must not be mistaken for the test-only module alias"
+        );
+
+        let local = &results.owners()[3];
+        assert!(
+            local
+                .local_resolution()
+                .expect("local lookup succeeds")
+                .expect("local function has a local result")
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_))),
+            "local shadowing wins before the test-only module import"
+        );
+        assert!(
+            local
+                .test_only_diagnostics()
+                .expect("local diagnostics are collected")
+                .is_empty()
+        );
+
+        let signature = &results.owners()[4];
+        let signature_diagnostics = signature
+            .test_only_diagnostics()
+            .expect("signature test-only references are diagnosed");
+        assert_eq!(
+            signature_diagnostics.len(),
+            10,
+            "signature and body type paths, nested effect references, and a qualified head are checked: {:?}",
+            signature_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.primary().map(|primary| primary.span.clone()))
+                .collect::<Vec<_>>()
+        );
+        let signature_text_start = root
+            .find("fn signature")
+            .expect("signature function exists");
+        let signature_text_end = signature_text_start
+            + root[signature_text_start..]
+                .find('\n')
+                .expect("signature line ends with a newline");
+        let signature_text = &root[signature_text_start..signature_text_end];
+        let signature_body_start = signature_text
+            .find("{ let typed:")
+            .expect("function body follows its signature and effects clauses");
+        let signature_types_text = &signature_text[..signature_body_start];
+        let span_for = |start: u32, text: &str| {
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + text.len() as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        let mut expected_signature_spans = signature_types_text
+            .match_indices("Fixture")
+            .map(|(offset, name)| span_for((signature_text_start + offset) as u32, name))
+            .collect::<Vec<_>>();
+        expected_signature_spans.extend(
+            signature_types_text
+                .match_indices("fixture.")
+                .map(|(offset, _)| span_for((signature_text_start + offset) as u32, "fixture")),
+        );
+        expected_signature_spans.extend(
+            signature_text[signature_body_start..]
+                .match_indices("Fixture")
+                .map(|(offset, name)| {
+                    span_for(
+                        (signature_text_start + signature_body_start + offset) as u32,
+                        name,
+                    )
+                }),
+        );
+        expected_signature_spans.sort_by_key(|span| span.range.start());
+        assert_eq!(
+            signature_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic
+                    .primary()
+                    .expect("reference has a primary location")
+                    .span
+                    .clone())
+                .collect::<Vec<_>>(),
+            expected_signature_spans,
+            "signature, body type, and body expression diagnostics use the path-head span in source order"
+        );
+        let fixture_type_use_start =
+            root.find("acme:test-support/fixtures.{Fixture}")
+                .expect("test-only type import path exists") as u32;
+        let fixture_type_use_span = span_for(fixture_type_use_start, "acme:test-support/fixtures");
+        for diagnostic in signature_diagnostics {
+            let primary = diagnostic
+                .primary()
+                .expect("reference has a primary location");
+            let reference = &root[primary.span.range.start().raw() as usize
+                ..primary.span.range.end().raw() as usize];
+            let expected_use_span = if reference == "Fixture" {
+                &fixture_type_use_span
+            } else {
+                &first_use_span
+            };
+            assert!(diagnostic.related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. }
+                    if &location.span == expected_use_span
+            )));
+        }
+
+        let signature_types = signature
+            .test_only_path_resolution()
+            .expect("non-expression path lookup succeeds")
+            .expect("function has test-only non-expression path results");
+        assert_eq!(signature_types.owner(), signature.owner());
+        assert_eq!(signature_types.paths().len(), 10);
+        assert!(
+            signature_types
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err && path.resolved_segments == 1)
+        );
+        assert_eq!(
+            signature_types
+                .paths()
+                .values()
+                .filter(|path| path.segment_count == 2)
+                .count(),
+            3,
+            "qualified type and effect paths resolve only their diagnosed module heads"
+        );
+        assert!(
+            signature
+                .local_resolution()
+                .expect("function body local lookup succeeds")
+                .expect("function has a body")
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_))),
+            "a value parameter with the module alias name wins only in the body, not in type position"
+        );
+
+        let generic_type = &results.owners()[5];
+        assert!(
+            generic_type
+                .test_only_diagnostics()
+                .expect("generic signature diagnostics are collected")
+                .is_empty(),
+            "generic type parameters also shadow same-named test-only type imports"
+        );
+        assert!(
+            generic_type
+                .test_only_path_resolution()
+                .expect("generic path lookup succeeds")
+                .expect("generic function has path results")
+                .paths()
+                .is_empty(),
+            "same-named generic type paths are not rewritten as imported test-only types"
+        );
+
+        let builtin_effect_root = &results.owners()[6];
+        assert!(
+            builtin_effect_root
+                .test_only_diagnostics()
+                .expect("built-in effect lookup succeeds")
+                .is_empty(),
+            "built-in effect roots take precedence over same-named test-only module aliases"
+        );
+        assert!(
+            builtin_effect_root
+                .test_only_path_resolution()
+                .expect("built-in effect path lookup succeeds")
+                .expect("function has an auxiliary path result")
+                .paths()
+                .is_empty(),
+            "built-in effect references are not rewritten as test-only module paths"
+        );
+
+        // Origin, rather than the current Res, is the test-only authority.
+        let resolved_def = Res::Def(
+            DefKind::Fn,
+            collection.scopes.function_owners[0]
+                .owner
+                .def_id
+                .to_def_id(),
+        );
+        {
+            let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            module_scope.imports[fixture_import_index].res = resolved_def;
+            module_scope
+                .scope
+                .get_mut(&fixture_symbol)
+                .expect("alias binding exists")
+                .res = resolved_def;
+            module_scope.imports[generic_import_index].res = resolved_def;
+            module_scope
+                .scope
+                .get_mut(&generic_symbol)
+                .expect("type binding exists")
+                .res = resolved_def;
+        }
+        let resolved_import_results = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("resolved test-only bindings remain diagnosable");
+        assert_eq!(
+            resolved_import_results.owners()[0]
+                .module_resolution()
+                .expect("module lookup succeeds")
+                .expect("repeated function has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err, Res::Err]
+        );
+        assert_eq!(
+            resolved_import_results.owners()[0]
+                .test_only_diagnostics()
+                .expect("origin-based diagnostics succeed")
+                .len(),
+            2
+        );
+        assert_eq!(
+            resolved_import_results.owners()[4]
+                .test_only_diagnostics()
+                .expect("resolved signature imports remain diagnosable")
+                .len(),
+            10,
+            "all non-expression diagnostics follow test-only binding origins even when their Res is Def"
+        );
+
+        {
+            let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            module_scope.imports[fixture_import_index].res = Res::Err;
+            module_scope
+                .scope
+                .get_mut(&fixture_symbol)
+                .expect("alias binding exists")
+                .res = Res::Err;
+            module_scope.imports[generic_import_index].res = Res::Err;
+            module_scope
+                .scope
+                .get_mut(&generic_symbol)
+                .expect("type binding exists")
+                .res = Res::Err;
+        }
+        let diagnosed_import_results = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("diagnosed test-only bindings remain diagnosable");
+        assert_eq!(
+            diagnosed_import_results.owners()[4]
+                .test_only_diagnostics()
+                .expect("diagnosed imports retain origin-based diagnostics")
+                .len(),
+            10,
+            "all non-expression diagnostics follow test-only binding origins even when their Res is Err"
+        );
+
+        // Ordinary failed signature imports keep their existing error without
+        // a test-only diagnostic cascade.
+        {
+            let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            module_scope.imports[generic_import_index].test_only = false;
+            module_scope.imports[generic_import_index].res = Res::Err;
+            module_scope
+                .scope
+                .get_mut(&generic_symbol)
+                .expect("type binding exists")
+                .res = Res::Err;
+        }
+        let ordinary_type_error_results = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("ordinary failed type imports stay in their own diagnostic channel");
+        assert_eq!(
+            ordinary_type_error_results.owners()[4]
+                .test_only_diagnostics()
+                .expect("non-expression diagnostics still succeed")
+                .len(),
+            3,
+            "only the still-test-only qualified type and effect heads are diagnosed"
+        );
+        assert_eq!(
+            ordinary_type_error_results.owners()[4]
+                .test_only_path_resolution()
+                .expect("non-expression path lookup succeeds")
+                .expect("function path results are present")
+                .paths()
+                .values()
+                .count(),
+            3,
+            "ordinary Res::Err type bindings are left to their own diagnostic"
+        );
+
+        // An unrelated failed import remains an error but does not cascade.
+        {
+            let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            let imported_item_name = module_scope.imports[item_import_index].name;
+            module_scope.imports[item_import_index].test_only = false;
+            module_scope.imports[item_import_index].res = Res::Err;
+            module_scope
+                .scope
+                .get_mut(&imported_item_name)
+                .expect("item binding exists")
+                .res = Res::Err;
+        }
+        let ordinary_error_results = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("ordinary import errors stay in their own diagnostic channel");
+        assert!(
+            ordinary_error_results.owners()[1]
+                .test_only_diagnostics()
+                .expect("item diagnostic collection succeeds")
+                .is_empty()
+        );
+        assert_eq!(
+            ordinary_error_results.owners()[1]
+                .module_resolution()
+                .expect("module lookup succeeds")
+                .expect("item function has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err]
+        );
+    }
+
+    #[test]
     fn const_owner_paths_use_target_filtered_exact_file_scopes() {
         let root = concat!(
             "const BASE: Bool = true\n",
@@ -6020,7 +7148,7 @@ mod tests {
             "a test-only module alias remains a module alias before test analysis resolves it"
         );
         assert_eq!(resolved.owners().len(), 2);
-        assert!(matches!(
+        assert_eq!(
             resolved.owners()[1]
                 .module_resolution()
                 .expect("test-only marker resolution succeeds")
@@ -6029,8 +7157,16 @@ mod tests {
                 .values()
                 .next()
                 .map(|path| path.base),
-            Some(Res::TestOnly(_))
-        ));
+            Some(Res::Err),
+            "an out-of-test function reference becomes the error sentinel after diagnosis"
+        );
+        assert_eq!(
+            resolved.owners()[1]
+                .test_only_diagnostics()
+                .expect("function test-only diagnostics succeed")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -6463,6 +7599,10 @@ mod tests {
             resolved.owners()[0].local_resolution(),
             Err(FunctionOwnerResolutionError::TopLevelOwnerDescriptorMismatch { .. })
         ));
+        assert!(matches!(
+            resolved.owners()[0].test_only_diagnostics(),
+            Err(FunctionOwnerResolutionError::TopLevelOwnerDescriptorMismatch { .. })
+        ));
         let later = resolved.owners()[1]
             .resolution()
             .expect("later function still resolves");
@@ -6471,6 +7611,12 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::BreakOutsideLoop })
+        );
+        assert!(
+            resolved.owners()[1]
+                .test_only_diagnostics()
+                .expect("later function diagnostics still resolve")
+                .is_empty()
         );
     }
 
