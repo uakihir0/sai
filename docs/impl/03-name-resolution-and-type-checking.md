@@ -874,9 +874,26 @@ expression path in source order. It follows the exact module binding's
 the binding's `Res`. Local shadowing has already removed that path from the
 deferred set. Each test-only reference gets `TEST_DEPENDENCY_OUTSIDE_TEST` at
 the path and a note at the originating use's complete `PKG_PATH`; the path
-result becomes `Res::Err` so later phases do not cascade. This slice covers
-const initializer expressions only. Const type paths and test-only references
-in other non-test owners remain for the tracked owner resolver.
+result becomes `Res::Err` so later phases do not cascade. IR-526 covered const
+initializer expressions only. IR-528 below extends the same diagnostic rule to
+const declaration-type heads; test-only references in other non-test owners
+remain for the tracked owner resolver.
+
+**Const test-only type diagnostics (IR-528).** The const owner adapter walks
+the declared type before its body-dependent local-resolution branch and also
+walks the initializer HIR for non-expression paths. It checks direct and
+nested generic type paths through the exact file's module scope and stores
+rejected heads in a separate `OwnerTestOnlyPathResolution`, keeping this
+diagnostic-only pass distinct from expression `ModuleResolution`. The
+initializer walk covers local type annotations, casts, closure signatures,
+and constructor/range pattern paths where present. Qualified types diagnose
+the first module alias segment and leave the tail for later member resolution.
+The declared-type walk runs even if the owner has no body. Test-only
+declaration-type, initializer-body, and initializer-expression diagnostics
+are merged in source order, use the binding's import origin regardless of
+`Res`, include the complete original `PKG_PATH`, and mark only the rejected
+path as `Res::Err`. Ordinary type resolution, Prelude fallback, qualified-tail
+lookup, and final unresolved-name diagnostics remain later work.
 
 ### 3.4.6 Visibility
 
