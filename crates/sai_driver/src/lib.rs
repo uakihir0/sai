@@ -1007,6 +1007,10 @@ pub struct PredicateOwnerResolution {
     owner: OwnerId,
     resolution: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+    module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+    test_only_path_resolution:
+        Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// predicate resolver's diagnostics so the caller can preserve phase
     /// order.
@@ -1028,6 +1032,36 @@ impl PredicateOwnerResolution {
         self.local_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns expression paths resolved through the owner's exact module
+    /// scope, when this predicate adapter performs that pass.
+    pub fn module_resolution(
+        &self,
+    ) -> Result<Option<&ModuleResolution>, &OwnerControlFlowResolutionError> {
+        self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns rejected non-expression paths, such as types, effects, and
+    /// constructor paths, when this predicate adapter performs that pass.
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<Option<&OwnerTestOnlyPathResolution>, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns test-only reference diagnostics when this predicate adapter
+    /// performs that pass.
+    pub fn test_only_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
@@ -1592,6 +1626,10 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
             }
         }
         ItemKind::Const { ty } => work.push(Work::Ty(ty)),
+        ItemKind::Invariant { target } => work.push(Work::Path {
+            path: target,
+            kind: OwnerPathKind::Type,
+        }),
         _ => return Vec::new(),
     }
     if let Some(body) = owner.body {
@@ -3765,7 +3803,8 @@ impl RootDatabase {
                                     module_aliases,
                                 )
                                 .map_err(FunctionOwnerLabelResolutionError::Locals),
-                                (Err(error), _) | (_, Err(error)) => Err(error.clone()),
+                                (Err(error), _) => Err(error.clone()),
+                                (_, Err(error)) => Err(error.clone()),
                             };
                             match locals {
                                 Ok(locals) => {
@@ -4284,6 +4323,9 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
+                                module_resolution: Err(error.clone()),
+                                test_only_path_resolution: Err(error.clone()),
+                                test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -4291,12 +4333,27 @@ impl RootDatabase {
                         continue;
                     }
                 };
-            let module_aliases = module_aliases_for_file(collection, module_tree, file);
+            let module_scope = module_scope_for_file(collection, module_tree, file);
+            let module_aliases = module_scope
+                .as_ref()
+                .map(|scope| module_aliases_for_scope(scope))
+                .map_err(Clone::clone);
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
-                let mut local_resolution = None;
-                let resolution = (|| {
+                let analysis: Result<
+                    (
+                        Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+                        Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                        Result<
+                            Option<OwnerTestOnlyPathResolution>,
+                            OwnerControlFlowResolutionError,
+                        >,
+                        Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
+                        Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+                    ),
+                    OwnerControlFlowResolutionError,
+                > = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
                         descriptor.owner,
@@ -4335,42 +4392,133 @@ impl RootDatabase {
                         &context,
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
-                    match hir_owner.body {
-                        Some(body) => {
-                            let locals = match &module_aliases {
-                                Ok(module_aliases) => resolve_owner_locals(
-                                    body,
-                                    &source_map,
-                                    snapshot,
-                                    &self.symbols,
-                                    module_aliases,
-                                )
-                                .map(Some)
-                                .map_err(OwnerControlFlowResolutionError::Locals),
+                    let path_candidates = owner_test_only_path_candidates(&hir_owner);
+                    let mut resolved_paths = OwnerTestOnlyPathResolution {
+                        owner: descriptor.owner,
+                        paths: HashMap::new(),
+                    };
+                    let non_expression_diagnostics = match &module_scope {
+                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                            descriptor.owner,
+                            &path_candidates,
+                            &HashSet::new(),
+                            module_scope,
+                            &mut resolved_paths,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let path_resolution = match &module_scope {
+                        Ok(_) => Ok(Some(resolved_paths)),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let predicate_diagnostics = match hir_owner.body {
+                        Some(body) => resolve_owner_control_flow(
+                            body,
+                            &inputs.source_ref,
+                            inputs.source.as_ref(),
+                            &self.symbols,
+                        )
+                        .map(|result| result.diagnostics)
+                        .map_err(OwnerControlFlowResolutionError::Labels),
+                        None => Ok(Vec::new()),
+                    };
+                    let Some(body) = hir_owner.body else {
+                        return Ok((
+                            Ok(None),
+                            Ok(None),
+                            path_resolution,
+                            non_expression_diagnostics.map(Some),
+                            predicate_diagnostics,
+                        ));
+                    };
+                    let locals = match &module_aliases {
+                        Ok(module_aliases) => resolve_owner_locals(
+                            body,
+                            &source_map,
+                            snapshot,
+                            &self.symbols,
+                            module_aliases,
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Locals),
+                        Err(error) => Err(error.clone()),
+                    };
+                    match locals {
+                        Ok(locals) => {
+                            let mut module_resolution = match &module_scope {
+                                Ok(module_scope) => Ok(Some(resolve_owner_module_paths(
+                                    &locals,
+                                    module_scope,
+                                    &HashSet::new(),
+                                ))),
                                 Err(error) => Err(error.clone()),
                             };
-                            local_resolution = Some(locals);
-                            resolve_owner_control_flow(
-                                body,
-                                &inputs.source_ref,
-                                inputs.source.as_ref(),
-                                &self.symbols,
-                            )
-                            .map(|result| result.diagnostics)
-                            .map_err(OwnerControlFlowResolutionError::Labels)
+                            let expression_diagnostics =
+                                match (&module_scope, &mut module_resolution) {
+                                    (Ok(module_scope), Ok(Some(module_resolution))) => {
+                                        collect_test_only_reference_diagnostics(
+                                            descriptor.owner,
+                                            &locals.deferred_paths,
+                                            module_scope,
+                                            module_resolution,
+                                            &inputs,
+                                            snapshot,
+                                        )
+                                    }
+                                    (Ok(_), Ok(None)) => Ok(Vec::new()),
+                                    (Err(error), _) => Err(error.clone()),
+                                    (_, Err(error)) => Err(error.clone()),
+                                };
+                            let test_only_diagnostics =
+                                match (non_expression_diagnostics, expression_diagnostics) {
+                                    (Ok(mut non_expression), Ok(expression)) => {
+                                        non_expression.extend(expression);
+                                        sort_phase1_diagnostics(&mut non_expression);
+                                        Ok(Some(non_expression))
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => Err(error),
+                                };
+                            Ok((
+                                Ok(Some(locals)),
+                                module_resolution,
+                                path_resolution,
+                                test_only_diagnostics,
+                                predicate_diagnostics,
+                            ))
                         }
-                        None => {
-                            local_resolution = Some(Ok(None));
-                            Ok(Vec::new())
-                        }
+                        Err(error) => Ok((
+                            Err(error.clone()),
+                            Err(error.clone()),
+                            path_resolution,
+                            non_expression_diagnostics.map(Some),
+                            predicate_diagnostics,
+                        )),
                     }
                 })();
-                let local_resolution =
-                    local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let (
+                    local_resolution,
+                    module_resolution,
+                    test_only_path_resolution,
+                    test_only_diagnostics,
+                    resolution,
+                ) = analysis.unwrap_or_else(|error| {
+                    (
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error),
+                    )
+                });
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
+                    module_resolution,
+                    test_only_path_resolution,
+                    test_only_diagnostics,
                     lowering_diagnostics,
                 });
             }
@@ -4422,6 +4570,9 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
+                                module_resolution: Err(error.clone()),
+                                test_only_path_resolution: Err(error.clone()),
+                                test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -4511,6 +4662,9 @@ impl RootDatabase {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
+                    module_resolution: Ok(None),
+                    test_only_path_resolution: Ok(None),
+                    test_only_diagnostics: Ok(None),
                     lowering_diagnostics,
                 });
             }
@@ -4563,6 +4717,9 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
+                                module_resolution: Err(error.clone()),
+                                test_only_path_resolution: Err(error.clone()),
+                                test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -4682,6 +4839,9 @@ impl RootDatabase {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
+                    module_resolution: Ok(None),
+                    test_only_path_resolution: Ok(None),
+                    test_only_diagnostics: Ok(None),
                     lowering_diagnostics,
                 });
             }
@@ -7773,6 +7933,348 @@ mod tests {
             .expect("second invariant owner has a body");
         assert!(safe_locals.bindings.is_empty());
         assert!(safe_locals.paths.is_empty());
+    }
+
+    #[test]
+    fn invariant_owner_test_only_references_are_diagnosed() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{flag}\n",
+            "invariant Fixture { { let value: Fixture = true; flag } }\n",
+            "invariant Local { { let fixture = true; fixture } }\n",
+            "@target(\"wasm64-core\")\n",
+            "invariant Excluded { flag }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only invariant references are retained");
+        assert_eq!(
+            collection.scopes().invariant_owners.len(),
+            2,
+            "the target-excluded invariant is omitted before owner analysis"
+        );
+
+        let (type_symbol, type_import, value_symbol, value_import) = {
+            let scope = collection
+                .scopes()
+                .module(ModuleId::ROOT)
+                .expect("root module scope exists");
+            let symbol_named = |name: &str| {
+                scope
+                    .scope
+                    .keys()
+                    .copied()
+                    .find(|symbol| {
+                        database
+                            .resolve_symbol(*symbol)
+                            .is_ok_and(|spelling| spelling.as_ref() == name)
+                    })
+                    .unwrap_or_else(|| panic!("module scope contains `{name}`"))
+            };
+            let import_for = |symbol| match scope
+                .scope
+                .get(&symbol)
+                .expect("requested binding exists")
+                .origin
+            {
+                BindingOrigin::Decl => panic!("`{symbol:?}` comes from a use binding"),
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            };
+            let fixture_symbol = symbol_named("fixture");
+            let type_symbol = symbol_named("Fixture");
+            let value_symbol = symbol_named("flag");
+            let fixture_import = import_for(fixture_symbol);
+            let type_import = import_for(type_symbol);
+            let value_import = import_for(value_symbol);
+            for index in [fixture_import, type_import, value_import] {
+                assert!(scope.imports[index.0 as usize].test_only);
+                assert!(matches!(
+                    scope.imports[index.0 as usize].res,
+                    Res::TestOnly(_)
+                ));
+            }
+            (type_symbol, type_import, value_symbol, value_import)
+        };
+
+        let resolved = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("invariant owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 2);
+        let fixture_owner = &resolved.owners()[0];
+        let fixture_type_path = fixture_owner
+            .test_only_path_resolution()
+            .expect("invariant type lookup succeeds")
+            .expect("invariant analysis includes non-expression paths");
+        assert_eq!(fixture_type_path.owner(), fixture_owner.owner());
+        assert_eq!(fixture_type_path.paths().len(), 2);
+        assert_eq!(
+            fixture_type_path
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err, Res::Err],
+            "the imported invariant target and its predicate-body type are rejected"
+        );
+        let fixture_module_paths = fixture_owner
+            .module_resolution()
+            .expect("invariant expression lookup succeeds")
+            .expect("invariant analysis includes expression paths");
+        assert_eq!(
+            fixture_module_paths
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "the predicate's test-only value reference is rejected"
+        );
+        let fixture_diagnostics = fixture_owner
+            .test_only_diagnostics()
+            .expect("invariant test-only diagnostics succeed")
+            .expect("invariant adapter runs the test-only pass");
+        assert_eq!(fixture_diagnostics.len(), 3);
+        let target_start = root
+            .find("invariant Fixture")
+            .expect("invariant target exists") as u32
+            + "invariant ".len() as u32;
+        let body_type_start = root
+            .find("let value: Fixture")
+            .expect("predicate type annotation exists") as u32
+            + "let value: ".len() as u32;
+        let predicate_start = root
+            .find("invariant Fixture { { let value: Fixture = true; flag")
+            .expect("invariant predicate reference exists") as u32
+            + "invariant Fixture { { let value: Fixture = true; ".len() as u32;
+        let reference_spans = fixture_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("test-only invariant reference has a primary location")
+                    .span
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reference_spans,
+            [
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(target_start),
+                        sai_diagnostics::TextSize::new(target_start + "Fixture".len() as u32),
+                    )
+                    .expect("target path span is ordered"),
+                ),
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(body_type_start),
+                        sai_diagnostics::TextSize::new(body_type_start + "Fixture".len() as u32),
+                    )
+                    .expect("predicate type path span is ordered"),
+                ),
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(predicate_start),
+                        sai_diagnostics::TextSize::new(predicate_start + "flag".len() as u32,),
+                    )
+                    .expect("predicate path span is ordered"),
+                ),
+            ],
+            "target and predicate diagnostics are source ordered"
+        );
+
+        let type_use_start = root
+            .find("acme:test-support/fixtures.{Fixture}")
+            .expect("type item use exists") as u32;
+        let type_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(type_use_start),
+                sai_diagnostics::TextSize::new(
+                    type_use_start + "acme:test-support/fixtures".len() as u32,
+                ),
+            )
+            .expect("type package path range is ordered"),
+        );
+        let value_use_start = root
+            .find("acme:test-support/fixtures.{flag}")
+            .expect("value item use exists") as u32;
+        let value_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(value_use_start),
+                sai_diagnostics::TextSize::new(
+                    value_use_start + "acme:test-support/fixtures".len() as u32,
+                ),
+            )
+            .expect("value package path range is ordered"),
+        );
+        for (diagnostic, expected_use_span) in
+            fixture_diagnostics
+                .iter()
+                .zip([&type_use_span, &type_use_span, &value_use_span])
+        {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            assert!(diagnostic.related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. } if &location.span == expected_use_span
+            )));
+        }
+        let local_owner = &resolved.owners()[1];
+        assert!(
+            local_owner
+                .test_only_diagnostics()
+                .expect("locally shadowed invariant has no test-only error")
+                .expect("invariant adapter runs the test-only pass")
+                .is_empty(),
+            "a local predicate binding shadows the imported module alias"
+        );
+        assert!(
+            local_owner
+                .local_resolution()
+                .expect("local invariant resolution succeeds")
+                .expect("local invariant has a body")
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
+            "the syntax-known test-only module alias still participates in local-shadow diagnostics"
+        );
+
+        let def_id = collection.scopes.top_level_owners[0]
+            .owner
+            .def_id
+            .to_def_id();
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            for (symbol, import, kind) in [
+                (type_symbol, type_import, DefKind::Struct),
+                (value_symbol, value_import, DefKind::Const),
+            ] {
+                let resolved = Res::Def(kind, def_id);
+                scope.imports[import.0 as usize].res = resolved;
+                scope
+                    .scope
+                    .get_mut(&symbol)
+                    .expect("imported binding exists")
+                    .res = resolved;
+            }
+        }
+        let resolved_def_bindings = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("resolved test-only imports remain diagnosable");
+        assert_eq!(
+            resolved_def_bindings.owners()[0]
+                .test_only_diagnostics()
+                .expect("origin-based invariant diagnostics succeed")
+                .expect("invariant adapter runs the test-only pass")
+                .len(),
+            3,
+            "both type and value references follow test-only import origin when Res is Def"
+        );
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            for (symbol, import) in [(type_symbol, type_import), (value_symbol, value_import)] {
+                scope.imports[import.0 as usize].res = Res::Err;
+                scope
+                    .scope
+                    .get_mut(&symbol)
+                    .expect("imported binding exists")
+                    .res = Res::Err;
+            }
+        }
+        let diagnosed_bindings = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("diagnosed test-only imports remain diagnosable");
+        assert_eq!(
+            diagnosed_bindings.owners()[0]
+                .test_only_diagnostics()
+                .expect("diagnosed invariant imports retain their origin")
+                .expect("invariant adapter runs the test-only pass")
+                .len(),
+            3,
+            "both type and value references follow test-only import origin when Res is Err"
+        );
+
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            scope.imports[type_import.0 as usize].test_only = false;
+        }
+        let ordinary_type = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("ordinary type bindings do not receive test-only diagnostics");
+        assert_eq!(
+            ordinary_type.owners()[0]
+                .test_only_diagnostics()
+                .expect("value reference remains test-only")
+                .expect("invariant adapter runs the test-only pass")
+                .len(),
+            1,
+            "only the remaining test-only predicate value is diagnosed"
+        );
+        assert!(
+            ordinary_type.owners()[0]
+                .test_only_path_resolution()
+                .expect("ordinary type lookup succeeds")
+                .expect("invariant adapter includes a type result")
+                .paths()
+                .is_empty(),
+            "an ordinary Res::Err target does not cascade"
+        );
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            scope.imports[value_import.0 as usize].test_only = false;
+        }
+        let ordinary_bindings = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("ordinary invariant bindings do not receive test-only diagnostics");
+        assert!(
+            ordinary_bindings.owners()[0]
+                .test_only_diagnostics()
+                .expect("ordinary invariant diagnostics succeed")
+                .expect("invariant adapter runs the test-only pass")
+                .is_empty(),
+            "ordinary type and value imports are not classified as test-only"
+        );
+
+        let mut broken_collection = collection.clone();
+        let second_item = broken_collection.scopes.invariant_owners[1].item_id;
+        broken_collection.scopes.invariant_owners[0].item_id = second_item;
+        let isolated_failures = database
+            .resolve_invariant_owner_predicates(&broken_collection, &module_tree, &snapshot)
+            .expect("one malformed invariant descriptor stays owner local");
+        assert!(
+            isolated_failures.owners()[0]
+                .test_only_path_resolution()
+                .is_err()
+        );
+        assert!(
+            isolated_failures.owners()[1]
+                .test_only_path_resolution()
+                .is_ok(),
+            "a following invariant remains analyzable after one descriptor fails"
+        );
     }
 
     #[test]
