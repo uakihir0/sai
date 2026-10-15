@@ -32,8 +32,8 @@ use sai_hir::lower::{
 use sai_hir::patterns::{Pat as HirPat, PatKind, PatRangeEnd};
 use sai_hir::source_map::HirSourceMap;
 use sai_hir::types::{
-    Bound, BoundKind, EffectRef as HirEffectRef, GenericArg, GenericArgs, GenericParamKind,
-    Path as HirPath, PathRoot, Ty, TyKind,
+    Bound, BoundKind, EffectRef as HirEffectRef, GenericArg, GenericArgs, GenericParamKind, Name,
+    Path as HirPath, PathRoot, PathSegment, Ty, TyKind,
 };
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
 use sai_hir::{HirId, OwnerId};
@@ -109,6 +109,7 @@ pub struct RootDatabase {
     /// by Phase 1 remains associated with its original package-local paths.
     def_paths: HashMap<PackageId, Arc<DefPathInterner>>,
     package_scopes: Phase1PackageScopesQueries,
+    type_owner_paths: TypeOwnerPathQueries,
     declared_requirements: DeclaredRequirementsQueries,
     package_graph: InputQuery<u8, Option<PackageGraph>>,
 }
@@ -514,6 +515,250 @@ impl StableHash for Phase1PackageScopesQueryOutput {
 struct Phase1PackageScopesQueries {
     input: InputQuery<PackageKey, Phase1PackageScopesIdentity>,
     query: DerivedQuery<PackageKey, Phase1PackageScopesQueryOutput>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TypeOwnerPathQueryKey {
+    package: PackageKey,
+    owner_index: u32,
+}
+
+impl StableHash for TypeOwnerPathQueryKey {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xDD);
+        self.package.stable_hash(hasher);
+        self.owner_index.stable_hash(hasher);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypeOwnerPathQueryIdentity {
+    collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Fingerprint,
+    scope_lookup_fingerprint: Fingerprint,
+}
+
+impl StableHash for TypeOwnerPathQueryIdentity {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xDE);
+        self.collection_input_fingerprint.stable_hash(hasher);
+        self.member_scope_closure_fingerprint.stable_hash(hasher);
+        self.scope_lookup_fingerprint.stable_hash(hasher);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OwnedTypeOwnerPathSegment {
+    hir_id: HirId,
+    name: Symbol,
+    span: sai_hir::Span,
+}
+
+#[derive(Clone)]
+struct OwnedTypeOwnerPathCandidate {
+    hir_id: HirId,
+    name: Symbol,
+    span: sai_hir::Span,
+    segment_count: u32,
+    kind: OwnerPathKind,
+    segments: Vec<OwnedTypeOwnerPathSegment>,
+}
+
+struct PreparedTypeOwnerPathQuery {
+    owner: OwnerId,
+    candidates: Vec<OwnedTypeOwnerPathCandidate>,
+    generic_resolutions: HashMap<Symbol, Res>,
+    rejected_test_only_paths: HashSet<HirId>,
+    module_scope: Phase1ModuleScopes,
+    package_scopes: Phase1PackageScopes,
+    foreign_package_scopes: Vec<Phase1PackageScopes>,
+    requesting_package: PackageId,
+    source_graph_packages: HashSet<PackageId>,
+}
+
+fn type_owner_scope_lookup_fingerprint(
+    package_scopes: &Phase1PackageScopes,
+    module_scope: &Phase1ModuleScopes,
+    foreign_package_scopes: &[Phase1PackageScopes],
+) -> Fingerprint {
+    fn hash_bindings(
+        bindings: &HashMap<Symbol, sai_resolve::package_scopes::Binding>,
+        hasher: &mut StableHasher,
+    ) {
+        let mut entries = bindings
+            .iter()
+            .map(|(name, binding)| (format!("{name:?}"), format!("{binding:?}")))
+            .collect::<Vec<_>>();
+        entries.sort();
+        hasher.write_len(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+        for (name, binding) in entries {
+            name.stable_hash(hasher);
+            binding.stable_hash(hasher);
+        }
+    }
+
+    fn hash_package_members(scopes: &Phase1PackageScopes, hasher: &mut StableHasher) {
+        hasher.write_len(u64::try_from(scopes.modules.len()).unwrap_or(u64::MAX));
+        for module in &scopes.modules {
+            format!("{:?}", module.module_def_id).stable_hash(hasher);
+            hash_bindings(&module.members, hasher);
+        }
+
+        let mut interfaces = scopes
+            .interfaces
+            .iter()
+            .map(|(def_id, scope)| (format!("{def_id:?}"), scope))
+            .collect::<Vec<_>>();
+        interfaces.sort_by(|left, right| left.0.cmp(&right.0));
+        hasher.write_len(u64::try_from(interfaces.len()).unwrap_or(u64::MAX));
+        for (def_id, interface) in interfaces {
+            def_id.stable_hash(hasher);
+            hash_bindings(&interface.members, hasher);
+        }
+    }
+
+    let mut hasher = StableHasher::new();
+    hasher.write_tag(0xDF);
+    hash_bindings(&module_scope.scope, &mut hasher);
+    hash_package_members(package_scopes, &mut hasher);
+    hasher.write_len(u64::try_from(foreign_package_scopes.len()).unwrap_or(u64::MAX));
+    for scopes in foreign_package_scopes {
+        hash_package_members(scopes, &mut hasher);
+    }
+    hasher.finish()
+}
+
+struct StagedTypeOwnerPathQuery {
+    identity: Arc<TypeOwnerPathQueryIdentity>,
+    prepared: Arc<PreparedTypeOwnerPathQuery>,
+}
+
+thread_local! {
+    static STAGED_TYPE_OWNER_PATH_QUERIES: RefCell<HashMap<TypeOwnerPathQueryKey, StagedTypeOwnerPathQuery>> =
+        RefCell::new(HashMap::new());
+}
+
+struct StagedTypeOwnerPathQueryGuard {
+    key: TypeOwnerPathQueryKey,
+    previous: Option<StagedTypeOwnerPathQuery>,
+}
+
+impl StagedTypeOwnerPathQueryGuard {
+    fn install(
+        key: TypeOwnerPathQueryKey,
+        identity: Arc<TypeOwnerPathQueryIdentity>,
+        prepared: Arc<PreparedTypeOwnerPathQuery>,
+    ) -> Self {
+        let previous = STAGED_TYPE_OWNER_PATH_QUERIES.with(|staged| {
+            staged
+                .borrow_mut()
+                .insert(key.clone(), StagedTypeOwnerPathQuery { identity, prepared })
+        });
+        Self { key, previous }
+    }
+}
+
+impl Drop for StagedTypeOwnerPathQueryGuard {
+    fn drop(&mut self) {
+        STAGED_TYPE_OWNER_PATH_QUERIES.with(|staged| {
+            let mut staged = staged.borrow_mut();
+            staged.remove(&self.key);
+            if let Some(previous) = self.previous.take() {
+                staged.insert(self.key.clone(), previous);
+            }
+        });
+    }
+}
+
+#[derive(Clone)]
+struct TypeOwnerPathQueryOutput {
+    identity: Arc<TypeOwnerPathQueryIdentity>,
+    input_fingerprint: Fingerprint,
+    result: TypeOwnerPathResolution,
+}
+
+impl PartialEq for TypeOwnerPathQueryOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.result == other.result
+    }
+}
+
+impl Eq for TypeOwnerPathQueryOutput {}
+
+impl StableHash for TypeOwnerPathQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        self.input_fingerprint.stable_hash(hasher);
+    }
+}
+
+struct TypeOwnerPathQueries {
+    input: InputQuery<TypeOwnerPathQueryKey, TypeOwnerPathQueryIdentity>,
+    query: DerivedQuery<TypeOwnerPathQueryKey, TypeOwnerPathQueryOutput>,
+}
+
+impl TypeOwnerPathQueries {
+    fn new() -> Result<Self, QueryError> {
+        let input = InputQuery::<TypeOwnerPathQueryKey, TypeOwnerPathQueryIdentity>::new(
+            "type_owner_paths_input",
+            Durability::Low,
+        )?;
+        let query_input = input.clone();
+        let query = DerivedQuery::new(
+            "type_owner_paths",
+            move |database: &mut QueryDatabase, key: &TypeOwnerPathQueryKey| {
+                let identity = query_input.get(database, key.clone())?;
+                let prepared = STAGED_TYPE_OWNER_PATH_QUERIES.with(|staged| {
+                    staged
+                        .borrow()
+                        .get(key)
+                        .filter(|staged| staged.identity.as_ref() == identity.as_ref())
+                        .map(|staged| Arc::clone(&staged.prepared))
+                });
+                let Some(prepared) = prepared else {
+                    return Err(QueryError::MissingInput {
+                        query: "type_owner_paths_prepared_inputs".to_owned(),
+                    });
+                };
+                let result = resolve_prepared_type_owner_paths(&prepared);
+                Ok(TypeOwnerPathQueryOutput {
+                    input_fingerprint: fingerprint(identity.as_ref()),
+                    identity,
+                    result,
+                })
+            },
+        )?;
+        Ok(Self { input, query })
+    }
+
+    fn resolve(
+        &self,
+        database: &mut QueryDatabase,
+        key: TypeOwnerPathQueryKey,
+        identity: TypeOwnerPathQueryIdentity,
+        prepared: PreparedTypeOwnerPathQuery,
+    ) -> Result<Arc<TypeOwnerPathQueryOutput>, QueryError> {
+        let identity = Arc::new(identity);
+        let _staged = StagedTypeOwnerPathQueryGuard::install(
+            key.clone(),
+            Arc::clone(&identity),
+            Arc::new(prepared),
+        );
+        self.input
+            .set(database, key.clone(), identity.as_ref().clone())?;
+        let output = self.query.get(database, key)?;
+        if output.identity != identity {
+            return Err(QueryError::MissingInput {
+                query: "type_owner_paths_identity_mismatch".to_owned(),
+            });
+        }
+        Ok(output)
+    }
+}
+
+impl From<QueryError> for OwnerControlFlowResolutionError {
+    fn from(error: QueryError) -> Self {
+        Self::Query(error)
+    }
 }
 
 impl Phase1PackageScopesQueries {
@@ -2126,6 +2371,7 @@ impl ConstOwnerResolutions {
 /// Failure while lowering or resolving a current-snapshot HIR owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnerControlFlowResolutionError {
+    Query(QueryError),
     SnapshotMismatch,
     ModuleTreeMismatch,
     ModuleMemberScopes(Phase1ModuleMemberScopeError),
@@ -4141,7 +4387,7 @@ fn resolve_type_owner_module_paths(
     owner: OwnerId,
     candidates: &[OwnerPathHead<'_>],
     generic_resolutions: &HashMap<Symbol, Res>,
-    test_only_paths: &OwnerTestOnlyPathResolution,
+    rejected_test_only_paths: &HashSet<HirId>,
     module_scope: &Phase1ModuleScopes,
     members: Option<&ModuleMemberIndex<'_>>,
     requesting_package: PackageId,
@@ -4156,7 +4402,7 @@ fn resolve_type_owner_module_paths(
     {
         let base = if let Some(resolution) = generic_resolutions.get(&candidate.name) {
             *resolution
-        } else if test_only_paths.paths.contains_key(&candidate.hir_id) {
+        } else if rejected_test_only_paths.contains(&candidate.hir_id) {
             Res::Err
         } else if let Some(binding) = module_scope.scope.get(&candidate.name) {
             binding.res
@@ -4223,6 +4469,55 @@ fn resolve_type_owner_module_paths(
         deferred_paths,
         module_path_errors,
     }
+}
+
+fn resolve_prepared_type_owner_paths(
+    prepared: &PreparedTypeOwnerPathQuery,
+) -> TypeOwnerPathResolution {
+    let path_segments = prepared
+        .candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .segments
+                .iter()
+                .map(|segment| PathSegment {
+                    hir_id: segment.hir_id,
+                    name: Name {
+                        sym: segment.name,
+                        span: segment.span,
+                    },
+                    args: None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let candidates = prepared
+        .candidates
+        .iter()
+        .zip(&path_segments)
+        .map(|(candidate, segments)| OwnerPathHead {
+            hir_id: candidate.hir_id,
+            name: candidate.name,
+            span: candidate.span,
+            segment_count: candidate.segment_count,
+            kind: candidate.kind,
+            segments,
+        })
+        .collect::<Vec<_>>();
+    let members = ModuleMemberIndex::new(
+        std::iter::once(&prepared.package_scopes).chain(&prepared.foreign_package_scopes),
+    );
+    resolve_type_owner_module_paths(
+        prepared.owner,
+        &candidates,
+        &prepared.generic_resolutions,
+        &prepared.rejected_test_only_paths,
+        &prepared.module_scope,
+        Some(&members),
+        prepared.requesting_package,
+        Some(&prepared.source_graph_packages),
+    )
 }
 
 fn module_path_error_segment_index(error: ModulePathError) -> usize {
@@ -4978,6 +5273,7 @@ impl RootDatabase {
         let symbols = Arc::new(Interner::new());
         let package_scopes =
             Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
+        let type_owner_paths = TypeOwnerPathQueries::new()?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
         let package_graph =
             InputQuery::<u8, Option<PackageGraph>>::new("package_graph", Durability::Medium)?;
@@ -4993,6 +5289,7 @@ impl RootDatabase {
             symbols,
             def_paths: HashMap::new(),
             package_scopes,
+            type_owner_paths,
             declared_requirements,
             package_graph,
         })
@@ -7776,16 +8073,75 @@ impl RootDatabase {
                     snapshot,
                 )?;
                 sort_phase1_diagnostics(&mut diagnostics);
-                let path_resolution = resolve_type_owner_module_paths(
-                    descriptor.owner,
-                    &candidates,
-                    &generic_resolutions,
-                    &test_only_path_resolution,
-                    &module_scope,
-                    members,
-                    collection.module_tree.package,
-                    member_scopes.map(|scopes| &scopes.source_graph_packages),
-                );
+                let path_resolution =
+                    if let (Some(member_scopes), Some(_members)) = (member_scopes, members) {
+                        let key = TypeOwnerPathQueryKey {
+                            package: collection.package_key.clone(),
+                            owner_index: descriptor.owner.def_id.index().raw(),
+                        };
+                        let prepared = PreparedTypeOwnerPathQuery {
+                            owner: descriptor.owner,
+                            candidates: candidates
+                                .iter()
+                                .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+                                .map(|candidate| OwnedTypeOwnerPathCandidate {
+                                    hir_id: candidate.hir_id,
+                                    name: candidate.name,
+                                    span: candidate.span,
+                                    segment_count: candidate.segment_count,
+                                    kind: candidate.kind,
+                                    segments: candidate
+                                        .segments
+                                        .iter()
+                                        .map(|segment| OwnedTypeOwnerPathSegment {
+                                            hir_id: segment.hir_id,
+                                            name: segment.name.sym,
+                                            span: segment.name.span,
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                            generic_resolutions: generic_resolutions.clone(),
+                            rejected_test_only_paths: test_only_path_resolution
+                                .paths
+                                .keys()
+                                .copied()
+                                .collect(),
+                            module_scope: module_scope.clone(),
+                            package_scopes: collection.scopes.clone(),
+                            foreign_package_scopes: member_scopes
+                                .source_packages
+                                .iter()
+                                .map(|package| package.collection.scopes.clone())
+                                .collect(),
+                            requesting_package: collection.module_tree.package,
+                            source_graph_packages: member_scopes.source_graph_packages.clone(),
+                        };
+                        let identity = TypeOwnerPathQueryIdentity {
+                            collection_input_fingerprint: collection.input_fingerprint,
+                            member_scope_closure_fingerprint: member_scopes.closure_fingerprint,
+                            scope_lookup_fingerprint: type_owner_scope_lookup_fingerprint(
+                                &prepared.package_scopes,
+                                &prepared.module_scope,
+                                &prepared.foreign_package_scopes,
+                            ),
+                        };
+                        self.type_owner_paths
+                            .resolve(&mut self.query_database, key, identity, prepared)?
+                            .result
+                            .clone()
+                    } else {
+                        resolve_type_owner_module_paths(
+                            descriptor.owner,
+                            &candidates,
+                            &generic_resolutions,
+                            &test_only_path_resolution.paths.keys().copied().collect(),
+                            &module_scope,
+                            members,
+                            collection.module_tree.package,
+                            member_scopes.map(|scopes| &scopes.source_graph_packages),
+                        )
+                    };
                 let module_path_diagnostics = self.type_owner_module_path_diagnostics(
                     descriptor.owner,
                     &path_resolution,
@@ -15941,6 +16297,25 @@ mod tests {
         assert_eq!(
             results.member_scope_closure_fingerprint(),
             Some(member_scopes.closure_fingerprint())
+        );
+        let record_owner = results.owners()[2].owner;
+        let cached_path_key = TypeOwnerPathQueryKey {
+            package: root_collection.package_key.clone(),
+            owner_index: record_owner.def_id.index().raw(),
+        };
+        let first_cached_paths = database
+            .type_owner_paths
+            .query
+            .get(&mut database.query_database, cached_path_key.clone())
+            .expect("type-owner paths are tracked");
+        let repeated_cached_paths = database
+            .type_owner_paths
+            .query
+            .get(&mut database.query_database, cached_path_key)
+            .expect("type-owner paths remain available");
+        assert!(
+            Arc::ptr_eq(&first_cached_paths, &repeated_cached_paths),
+            "equal owner and scope inputs reuse the tracked path result"
         );
 
         let path_errors = results.owners()[2]
