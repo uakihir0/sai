@@ -2127,8 +2127,8 @@ pub type FunctionOwnerLabelResolutions = FunctionOwnerResolutions;
 /// The temporary HIR arena and source map used to produce these results are
 /// discarded before the value is returned. Predicate diagnostics and local
 /// name results are independent so a local-resolution failure does not hide
-/// owner-specific predicate diagnostics. Type-head results are currently
-/// available only for invariant owners.
+/// owner-specific predicate diagnostics. Type-head results are available only
+/// for invariant and extern-function owners.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PredicateOwnerResolution {
     owner: OwnerId,
@@ -2172,8 +2172,8 @@ impl PredicateOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
-    /// Returns first-segment resolution for type paths in an invariant target
-    /// and predicate body. Other predicate adapters leave this channel absent.
+    /// Returns first-segment resolution for type paths in invariant and
+    /// extern-function owners. Other predicate adapters leave this channel absent.
     pub fn type_path_resolution(
         &self,
     ) -> Result<Option<&TypeOwnerPathResolution>, &OwnerControlFlowResolutionError> {
@@ -4451,6 +4451,7 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
             ItemKind::Resource { .. } => return HashMap::new(),
             _ => return HashMap::new(),
         },
+        OwnerNode::ExternItem(item) => item.generics,
         _ => return HashMap::new(),
     };
     let mut resolutions = HashMap::with_capacity(generics.params.len());
@@ -7441,8 +7442,8 @@ impl RootDatabase {
     ///
     /// Both the enclosing extern block and its function are lowered in the
     /// same temporary HIR arena because the function owner validates its
-    /// source-ordered slot against the block owner. Only owned diagnostics
-    /// and errors escape this adapter.
+    /// source-ordered slot against the block owner. Only owned paths,
+    /// diagnostics, and errors escape this adapter.
     pub fn resolve_extern_function_predicates(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -7476,7 +7477,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
-                                type_path_resolution: Ok(None),
+                                type_path_resolution: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -7496,6 +7497,7 @@ impl RootDatabase {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
                 let mut module_resolution = None;
+                let mut type_path_resolution = None;
                 let mut test_only_path_resolution = None;
                 let mut test_only_diagnostics = None;
                 let resolution = (|| {
@@ -7592,6 +7594,38 @@ impl RootDatabase {
                         Ok(_) => Ok(Some(resolved_paths)),
                         Err(error) => Err(error.clone()),
                     });
+                    let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                    let rejected_type_paths = match &module_scope {
+                        Ok(module_scope) => rejected_test_only_type_path_ids(
+                            descriptor.owner,
+                            &path_candidates,
+                            &generic_parameters,
+                            module_scope,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    type_path_resolution = Some(
+                        match (&module_scope, &self.primitive_prelude, rejected_type_paths) {
+                            (Ok(module_scope), Ok(primitive_prelude), Ok(rejected_type_paths)) => {
+                                Ok(Some(resolve_type_owner_module_paths(
+                                    descriptor.owner,
+                                    &path_candidates,
+                                    &generic_resolutions,
+                                    primitive_prelude,
+                                    &rejected_type_paths,
+                                    module_scope,
+                                    None,
+                                    descriptor.owner.def_id.package(),
+                                    None,
+                                )))
+                            }
+                            (Err(error), _, _) => Err(error.clone()),
+                            (_, Err(error), _) => Err(
+                                OwnerControlFlowResolutionError::PrimitivePrelude(error.clone()),
+                            ),
+                            (_, _, Err(error)) => Err(error),
+                        },
+                    );
 
                     let predicate_diagnostics = match hir_owner.body {
                         Some(body) => {
@@ -7670,12 +7704,14 @@ impl RootDatabase {
                     test_only_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let test_only_diagnostics =
                     test_only_diagnostics.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let type_path_resolution =
+                    type_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
                     module_resolution,
-                    type_path_resolution: Ok(None),
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -15289,8 +15325,9 @@ mod tests {
         assert!(
             resolved.owners()[0]
                 .type_path_resolution()
-                .expect("extern predicate adapter does not resolve type heads")
-                .is_none()
+                .expect("extern type path lookup succeeds")
+                .is_some(),
+            "extern owners expose type heads independently of their predicate result"
         );
         assert_eq!(
             resolved.owners()[0]
@@ -15335,6 +15372,277 @@ mod tests {
                 .expect("bodyless extern local resolution succeeds")
                 .is_none(),
             "an extern function without a body or contracts has no local scope"
+        );
+    }
+
+    #[test]
+    fn extern_function_adapter_resolves_type_path_heads_separately() {
+        let root = concat!(
+            "type Array<T> = T\n",
+            "type Shared<T> = T\n",
+            "type RootOnly<T> = T\n",
+            "unsafe extern \"wasm\" module \"env\" {\n",
+            "  fn typed<T, const Count: U32>(value: Array<T>, shared: Shared<T>, ",
+            "size: Count, optional: Option<T>) -> U32;\n",
+            "  fn contracted(value: Bool) requires { let typed: U32 = true; typed } ",
+            "ensures { result }\n",
+            "}\n",
+        );
+        let child = concat!(
+            "type Shared<T> = T\n",
+            "unsafe extern \"wasm\" module \"env\" {\n",
+            "  fn child(value: Shared<U32>, root_only: RootOnly<U32>);\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("extern function owners collect");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let symbol = |name: &str| {
+            root_scope
+                .scope
+                .keys()
+                .copied()
+                .find(|symbol| {
+                    database
+                        .resolve_symbol(*symbol)
+                        .is_ok_and(|resolved| resolved.as_ref() == name)
+                })
+                .unwrap_or_else(|| panic!("root module contains `{name}`"))
+        };
+        let array_resolution = root_scope
+            .scope
+            .get(&symbol("Array"))
+            .expect("root module type alias exists")
+            .res;
+        let shared_symbol = symbol("Shared");
+        let root_shared_resolution = root_scope
+            .scope
+            .get(&shared_symbol)
+            .expect("root module Shared alias exists")
+            .res;
+        let child_shared_resolution = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists")
+            .scope
+            .get(&shared_symbol)
+            .expect("child module Shared alias exists")
+            .res;
+
+        let resolved = database
+            .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
+            .expect("extern function type heads resolve independently");
+        assert_eq!(resolved.owners().len(), 3);
+
+        let generic_def_id = |owner: OwnerId, name: &str, is_const: bool| {
+            let name = database
+                .symbols
+                .intern(name)
+                .expect("generic name is interned");
+            database
+                .def_paths
+                .get(&owner.def_id.package())
+                .expect("package definition paths are available")
+                .intern_generic_params(owner.def_id, &[(name, is_const, 0)])
+                .expect("extern generic has a stable definition identity")[0]
+                .to_def_id()
+        };
+        let typed = &resolved.owners()[0];
+        let typed_paths = typed
+            .type_path_resolution()
+            .expect("bodyless extern type lookup succeeds")
+            .expect("bodyless extern signatures have type path results");
+        let type_parameter = generic_def_id(typed.owner(), "T", false);
+        let const_parameter = generic_def_id(typed.owner(), "Count", true);
+        assert!(
+            typed_paths
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Def(DefKind::TyParam, type_parameter)),
+            "extern type parameters resolve to their exact definitions"
+        );
+        assert!(
+            typed_paths
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::Def(DefKind::ConstParam, const_parameter) }),
+            "extern const parameters keep their definition kind in type position"
+        );
+        assert!(
+            typed_paths
+                .paths()
+                .values()
+                .any(|path| path.base == array_resolution),
+            "module type aliases remain visible in extern signatures"
+        );
+        assert!(
+            typed_paths
+                .paths()
+                .values()
+                .any(|path| path.base == root_shared_resolution),
+            "the root extern owner uses its file's Shared alias"
+        );
+        assert_eq!(
+            typed_paths
+                .paths()
+                .values()
+                .filter(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32))
+                .count(),
+            2,
+            "primitive heads resolve in the const parameter and return type"
+        );
+        assert!(
+            typed_paths.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Option")
+            }),
+            "non-primitive Prelude candidates remain deferred"
+        );
+        assert!(
+            typed
+                .module_resolution()
+                .expect("bodyless expression lookup succeeds")
+                .is_none(),
+            "bodyless signature paths do not create an expression result"
+        );
+
+        let contracted = &resolved.owners()[1];
+        let contracted_paths = contracted
+            .type_path_resolution()
+            .expect("contract type lookup succeeds")
+            .expect("extern contract expressions have type path results");
+        assert!(
+            contracted_paths
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "type annotations inside extern contracts resolve"
+        );
+        let expression_paths = contracted
+            .module_resolution()
+            .expect("contract expression lookup succeeds")
+            .expect("contract expressions create a module result");
+        assert!(
+            expression_paths.paths.is_empty(),
+            "type annotations remain separate from contract expression paths"
+        );
+
+        let child_file = module_tree.modules[1].file;
+        let child_owner_id = collection
+            .scopes()
+            .extern_function_owners
+            .iter()
+            .find(|descriptor| descriptor.file == child_file)
+            .expect("child extern function descriptor exists")
+            .owner;
+        let child_owner = resolved
+            .owners()
+            .iter()
+            .find(|owner| owner.owner() == child_owner_id)
+            .expect("child extern function result exists");
+        let child_type_paths = child_owner
+            .type_path_resolution()
+            .expect("child module type lookup succeeds")
+            .expect("child extern function has a type path result");
+        assert!(
+            child_type_paths
+                .paths()
+                .values()
+                .any(|path| path.base == child_shared_resolution)
+                && child_shared_resolution != root_shared_resolution,
+            "the child file resolves its own definition of a same-named module alias"
+        );
+        assert!(
+            child_type_paths.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "RootOnly")
+            }),
+            "a root-only type alias is not leaked into the child file scope"
+        );
+    }
+
+    #[test]
+    fn extern_type_paths_reject_later_test_only_heads_after_diagnostic_failure() {
+        let root = concat!(
+            "use acme:test-support/fixtures as broken_type\n",
+            "use acme:test-support/fixtures as later_type\n",
+            "unsafe extern \"wasm\" module \"env\" {\n",
+            "  fn contracted(value: broken_type.Widget) ",
+            "requires { let typed: later_type.Widget = true; true }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("extern signature and contract imports collect");
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let broken_import_index = module_scope
+            .imports
+            .iter()
+            .position(|import| {
+                database
+                    .resolve_symbol(import.name)
+                    .is_ok_and(|name| name.as_ref() == "broken_type")
+            })
+            .expect("broken_type import exists");
+        module_scope.imports[broken_import_index].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+
+        let resolved = database
+            .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
+            .expect("test-only diagnostic failure remains isolated from type paths");
+        let owner = &resolved.owners()[0];
+        assert!(
+            matches!(
+                owner.test_only_diagnostics(),
+                Err(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                    import,
+                    ..
+                }) if import.0 as usize == broken_import_index
+            ),
+            "the declared test-only type head triggers the expected early diagnostic failure"
+        );
+        let type_paths = owner
+            .type_path_resolution()
+            .expect("type path resolution remains independent")
+            .expect("the extern owner retains its type path result");
+        assert_eq!(type_paths.paths().len(), 2);
+        assert!(
+            type_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "the later test-only contract type head stays rejected after diagnostic failure"
         );
     }
 
@@ -18879,6 +19187,18 @@ mod tests {
                 .is_none(),
             "bodyless extern signatures still receive path diagnostics without a local body"
         );
+        let bodyless_type_paths = bodyless
+            .type_path_resolution()
+            .expect("bodyless type path lookup succeeds")
+            .expect("bodyless extern signatures retain type path results");
+        assert_eq!(bodyless_type_paths.paths().len(), 2);
+        assert!(
+            bodyless_type_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "test-only signature type heads stay rejected in the ordinary type result"
+        );
 
         let generic = &resolved.owners()[1];
         assert!(
@@ -18896,6 +19216,28 @@ mod tests {
                 .expect("generic signature path results exist")
                 .paths()
                 .is_empty()
+        );
+        let generic_type_paths = generic
+            .type_path_resolution()
+            .expect("generic type path lookup succeeds")
+            .expect("generic extern signatures retain type path results");
+        let generic_fixture = database
+            .symbols
+            .intern("Fixture")
+            .expect("generic name is interned");
+        let generic_fixture_def = database
+            .def_paths
+            .get(&generic.owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(generic.owner().def_id, &[(generic_fixture, false, 0)])
+            .expect("extern type generic has a stable definition identity")[0]
+            .to_def_id();
+        assert!(
+            generic_type_paths
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::Def(DefKind::TyParam, generic_fixture_def) }),
+            "the generic type binding wins over the same-spelled test-only import"
         );
 
         let contracted = &resolved.owners()[2];
@@ -18950,6 +19292,16 @@ mod tests {
                 .values()
                 .all(|path| path.base == Res::Err),
             "test-only `flag` paths are rejected after contract-local resolution"
+        );
+        assert!(
+            contracted
+                .type_path_resolution()
+                .expect("contract signature type lookup succeeds")
+                .expect("extern contract owner has a type path result")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::Bool)),
+            "ordinary signature type heads remain available beside contract diagnostics"
         );
 
         // Simulate an incorrectly paired source item on one descriptor. The
@@ -19063,6 +19415,16 @@ mod tests {
                 .values()
                 .all(|path| path.base == Res::Err),
             "resolved test-only signature paths are rewritten to the error sentinel"
+        );
+        assert!(
+            resolved_bodyless
+                .type_path_resolution()
+                .expect("resolved type path lookup succeeds")
+                .expect("bodyless extern type results exist")
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "resolved imports retain test-only rejection in the ordinary type result"
         );
 
         let resolved_contracted = &resolved_imports.owners()[2];
