@@ -1019,12 +1019,13 @@ impl PredicateOwnerResolutions {
     }
 }
 
-/// Owned lexical-local results for one test or property owner.
+/// Owned lexical-local and module-path results for one test or property owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestPropertyOwnerResolution {
     owner: OwnerId,
     kind: TopLevelOwnerKind,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+    module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
 }
 
@@ -1045,12 +1046,22 @@ impl TestPropertyOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
+    /// Returns one-segment module-scope path results for candidates not
+    /// resolved as lexical locals.
+    pub fn module_resolution(
+        &self,
+    ) -> Result<Option<&ModuleResolution>, &OwnerControlFlowResolutionError> {
+        self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
         &self.lowering_diagnostics
     }
 }
 
-/// Per-owner lexical-local results for a test-analysis request.
+/// Per-owner local and module-path results for a test-analysis request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestPropertyOwnerResolutions {
     snapshot_id: WorkspaceSnapshotId,
@@ -3080,13 +3091,14 @@ impl RootDatabase {
         })
     }
 
-    /// Resolves lexical locals in top-level tests and properties when test
-    /// analysis is active for this package collection.
+    /// Resolves lexical locals and one-segment module paths in top-level tests
+    /// and properties when test analysis is active for this package
+    /// collection.
     ///
     /// This uncached bridge uses the exact current lowering and source map for
     /// each target-filtered owner. Ordinary builds are rejected before any
     /// test or property body is lowered.
-    pub fn resolve_test_property_owner_locals(
+    pub fn resolve_test_property_owner_analyses(
         &mut self,
         collection: &Phase1PackageScopesCollection,
         module_tree: &ModuleTree,
@@ -3132,6 +3144,7 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 kind: descriptor.kind,
                                 local_resolution: Err(error.clone()),
+                                module_resolution: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -3139,11 +3152,21 @@ impl RootDatabase {
                         continue;
                     }
                 };
-            let module_aliases = module_aliases_for_file(collection, module_tree, file);
+            let module_scope = module_scope_for_file(collection, module_tree, file);
+            let module_aliases = match &module_scope {
+                Ok(module_scope) => Ok(module_aliases_for_scope(module_scope)),
+                Err(error) => Err(error.clone()),
+            };
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
-                let local_resolution = (|| {
+                let analysis: Result<
+                    (
+                        Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+                        Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                    ),
+                    OwnerControlFlowResolutionError,
+                > = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
                         descriptor.owner,
@@ -3181,26 +3204,42 @@ impl RootDatabase {
                         &context,
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
-                    match hir_owner.body {
-                        Some(body) => match &module_aliases {
-                            Ok(module_aliases) => resolve_owner_locals(
-                                body,
-                                &source_map,
-                                snapshot,
-                                &self.symbols,
-                                module_aliases,
-                            )
-                            .map(Some)
-                            .map_err(OwnerControlFlowResolutionError::Locals),
-                            Err(error) => Err(error.clone()),
-                        },
-                        None => Ok(None),
+                    let Some(body) = hir_owner.body else {
+                        return Ok((Ok(None), Ok(None)));
+                    };
+                    let locals = match &module_aliases {
+                        Ok(module_aliases) => resolve_owner_locals(
+                            body,
+                            &source_map,
+                            snapshot,
+                            &self.symbols,
+                            module_aliases,
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Locals),
+                        Err(error) => Err(error.clone()),
+                    };
+                    match locals {
+                        Ok(locals) => {
+                            let module_resolution = match &module_scope {
+                                Ok(module_scope) => Ok(Some(resolve_owner_module_paths(
+                                    &locals,
+                                    module_scope,
+                                    &HashSet::new(),
+                                ))),
+                                Err(error) => Err(error.clone()),
+                            };
+                            Ok((Ok(Some(locals)), module_resolution))
+                        }
+                        Err(error) => Ok((Err(error.clone()), Err(error))),
                     }
                 })();
+                let (local_resolution, module_resolution) =
+                    analysis.unwrap_or_else(|error| (Err(error.clone()), Err(error)));
                 owners.push(TestPropertyOwnerResolution {
                     owner: descriptor.owner,
                     kind: descriptor.kind,
                     local_resolution,
+                    module_resolution,
                     lowering_diagnostics,
                 });
             }
@@ -4639,7 +4678,7 @@ mod tests {
             "test-name owner descriptors remain available outside test analysis"
         );
         assert_eq!(
-            database.resolve_test_property_owner_locals(&collection, &module_tree, &snapshot),
+            database.resolve_test_property_owner_analyses(&collection, &module_tree, &snapshot),
             Err(OwnerControlFlowResolutionError::TestAnalysisDisabled),
             "ordinary builds cannot accidentally lower test or property bodies"
         );
@@ -4698,7 +4737,7 @@ mod tests {
         );
 
         let results = database
-            .resolve_test_property_owner_locals(&collection, &module_tree, &snapshot)
+            .resolve_test_property_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("active non-root test analysis resolves local owners");
         assert!(results.matches_collection(&collection));
         assert_eq!(
@@ -4729,7 +4768,184 @@ mod tests {
                     .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
                 "a local binding shadows the syntax-known test-only module alias"
             );
+            let module = owner
+                .module_resolution()
+                .expect("module fallback succeeds")
+                .expect("test and property owners have module results");
+            assert!(
+                module.paths.is_empty() && module.deferred_paths.is_empty(),
+                "locally resolved paths are not reconsidered by module lookup"
+            );
         }
+    }
+
+    #[test]
+    fn test_property_module_resolution_uses_exact_file_scopes_and_local_precedence() {
+        let root = concat!(
+            "fn root_value() {}\n",
+            "fn module_value() {}\n",
+            "test \"root\" { root_value }\n",
+            "property \"property\" (root_value: Bool) { [root_value, module_value] }\n",
+        );
+        let child = "test \"child\" { root_value }\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let collection = database
+            .collect_phase1_package_scopes_collection(&module_tree, &snapshot, &target_cfg, context)
+            .expect("test-analysis package scopes collect");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let root_value = root_scope
+            .scope
+            .iter()
+            .find_map(|(symbol, binding)| {
+                (database.resolve_symbol(*symbol).ok()?.as_ref() == "root_value")
+                    .then_some(binding.res)
+            })
+            .expect("root module contains root_value");
+        let root_value_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "root_value")
+            })
+            .expect("root_value has an interned symbol");
+        let module_value = root_scope
+            .scope
+            .iter()
+            .find_map(|(symbol, binding)| {
+                (database.resolve_symbol(*symbol).ok()?.as_ref() == "module_value")
+                    .then_some(binding.res)
+            })
+            .expect("root module contains module_value");
+
+        let results = database
+            .resolve_test_property_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("active test analysis resolves module paths");
+        assert_eq!(results.owners().len(), 3);
+        assert_eq!(results.owners()[0].kind(), TopLevelOwnerKind::Test);
+        let root_test = results.owners()[0]
+            .module_resolution()
+            .expect("root module lookup succeeds")
+            .expect("root test has a module result");
+        assert_eq!(
+            root_test
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [root_value],
+            "a test resolves an unqualified root-module function"
+        );
+
+        let property = &results.owners()[1];
+        assert_eq!(property.kind(), TopLevelOwnerKind::Property);
+        let property_locals = property
+            .local_resolution()
+            .expect("property local lookup succeeds")
+            .expect("property body has a local result");
+        assert_eq!(
+            property_locals.paths.len(),
+            1,
+            "the named property parameter must bind its body reference: {:?}",
+            property_locals
+        );
+        assert!(
+            property_locals
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_))),
+            "property parameters take precedence over a same-named module item"
+        );
+        let property_module = property
+            .module_resolution()
+            .expect("property module lookup succeeds")
+            .expect("property has a module result");
+        assert_eq!(
+            property_module
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [module_value],
+            "an unbound property-body path falls through to the same file's module scope"
+        );
+        assert!(property_module.deferred_paths.is_empty());
+
+        let child_test = results.owners()[2]
+            .module_resolution()
+            .expect("child module lookup succeeds")
+            .expect("child test has a module result");
+        assert!(child_test.paths.is_empty());
+        assert_eq!(child_test.deferred_paths.len(), 1);
+        assert_eq!(
+            child_test.deferred_paths[0].name, root_value_symbol,
+            "a root-module name does not leak into a child file's unqualified scope"
+        );
+    }
+
+    #[test]
+    fn test_owner_module_resolution_preserves_test_only_bindings() {
+        let root = concat!(
+            "use acme:test-support/fixtures as client\n",
+            "test \"test-only\" { client }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: false,
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                context,
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("non-root test analysis collects package scopes");
+        let expected = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .imports[0]
+            .res;
+        assert!(matches!(expected, Res::TestOnly(_)));
+
+        let results = database
+            .resolve_test_property_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("test module paths resolve");
+        let module = results.owners()[0]
+            .module_resolution()
+            .expect("test-only module lookup succeeds")
+            .expect("test owner has a module result");
+        assert_eq!(
+            module
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [expected],
+            "module lookup preserves the test-only import identity"
+        );
     }
 
     #[test]
@@ -4737,6 +4953,7 @@ mod tests {
         let root = concat!(
             "use acme:test-support/fixtures as client\n",
             "test \"local\" { let client = true; client }\n",
+            "test \"unshadowed\" { client }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -4776,8 +4993,9 @@ mod tests {
         );
 
         let results = database
-            .resolve_test_property_owner_locals(&collection, &module_tree, &snapshot)
+            .resolve_test_property_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("test analysis still resolves the retained test body");
+        assert_eq!(results.owners().len(), 2);
         let local = results.owners()[0]
             .local_resolution()
             .expect("local resolution succeeds")
@@ -4794,6 +5012,19 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
             "an inactive test-only module alias remains a syntax-known module name"
+        );
+        let unshadowed_module = results.owners()[1]
+            .module_resolution()
+            .expect("inactive alias module lookup succeeds")
+            .expect("unshadowed owner has a module result");
+        assert_eq!(
+            unshadowed_module
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "inactive test-only references retain their error sentinel"
         );
     }
 
@@ -4816,14 +5047,21 @@ mod tests {
         collection.scopes.top_level_owners[0].item_id = property_item_id;
 
         let results = database
-            .resolve_test_property_owner_locals(&collection, &module_tree, &snapshot)
+            .resolve_test_property_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("one bad descriptor remains an owner-local failure");
         assert_eq!(results.owners().len(), 2);
         assert!(results.owners()[0].local_resolution().is_err());
+        assert!(results.owners()[0].module_resolution().is_err());
         assert!(
             results.owners()[1]
                 .local_resolution()
                 .expect("the following owner still resolves")
+                .is_some()
+        );
+        assert!(
+            results.owners()[1]
+                .module_resolution()
+                .expect("the following module lookup succeeds")
                 .is_some()
         );
     }
