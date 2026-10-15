@@ -813,7 +813,7 @@ remains for a later pass. This slice does not resolve prelude names, qualified
 members, or non-function owner kinds, and does not emit final unresolved-name
 diagnostics.
 
-**Test and property local resolution (IR-523).** The driver retains the
+**Test and property owner resolution (IR-523–524).** The driver retains the
 `Phase1BuildContext` on each package-scope collection and enables this adapter
 only when `analyzes_tests` is true, independently of `is_root_package`.
 Target-filtered test and property descriptors are lowered from current file
@@ -822,9 +822,12 @@ and `HirSourceMap`, using module aliases from that exact file scope. Results
 retain collection provenance and isolate lowering/local-resolution failures
 per owner. Test-only module aliases with no item list remain syntax-known for
 `SHADOWS_MODULE` even when an inactive test-only import has `Res::Err`.
-This slice resolves lexical locals only; it does not resolve generic,
-module-item, prelude, or qualified-member references, nor does it add tracked
-`hir_owner`/`resolve_owner` queries or type checking.
+After local lookup, one-segment plain expression paths resolve through the
+same file's module scope. Test-only and diagnosed module bindings retain their
+`Res` values, while misses remain deferred. Test and property owners have no
+generic parameters, so this bridge supplies an empty generic-name set. Prelude
+lookup, qualified-member tails, type-position paths, test-only diagnostics,
+tracked `hir_owner`/`resolve_owner` queries, and type checking remain deferred.
 
 ### 3.4.6 Visibility
 
