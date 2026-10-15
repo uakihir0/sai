@@ -132,6 +132,7 @@ pub enum LocalResolutionError {
     MismatchedBodySource,
     MissingSourceFile,
     ForeignLocalSymbol,
+    TooManyPathSegments,
 }
 
 #[derive(Clone, Copy)]
@@ -163,12 +164,13 @@ enum LocalWork<'hir> {
     ExitScope,
 }
 
-/// Resolves simple value paths to local bindings in one owner's body.
+/// Resolves local heads of plain value paths in one owner's body.
 ///
 /// The walk covers the executable body, contracts, and invariant predicates.
-/// It resolves only one-segment `PathRoot::Plain` expression paths; all other
-/// path roots and names with no local match remain available to later owner,
-/// module, and prelude resolution.
+/// A local binding may resolve the first segment of a qualified path so later
+/// member lookup can continue from that value. Unbound one-segment paths are
+/// deferred to generic, module, and prelude lookup; qualified module heads
+/// remain available to their corresponding later pass.
 pub fn resolve_owner_locals(
     body: &Body<'_>,
     source_map: &HirSourceMap,
@@ -252,15 +254,17 @@ pub fn resolve_owner_locals(
                     if path.hir_id.owner != body.owner {
                         return Err(LocalResolutionError::MismatchedOwner);
                     }
-                    if path.root == PathRoot::Plain && path.segments.len() == 1 {
+                    if path.root == PathRoot::Plain && !path.segments.is_empty() {
                         let name = path.segments[0].name;
+                        let segment_count = u32::try_from(path.segments.len())
+                            .map_err(|_| LocalResolutionError::TooManyPathSegments)?;
                         if name.sym.is_error() {
                             result.paths.insert(
                                 path.hir_id,
                                 PathRes {
                                     base: Res::Err,
                                     resolved_segments: 1,
-                                    segment_count: 1,
+                                    segment_count,
                                 },
                             );
                         } else {
@@ -271,10 +275,10 @@ pub fn resolve_owner_locals(
                                     PathRes {
                                         base: Res::Local(binding),
                                         resolved_segments: 1,
-                                        segment_count: 1,
+                                        segment_count,
                                     },
                                 );
-                            } else {
+                            } else if path.segments.len() == 1 {
                                 result.deferred_paths.push(DeferredPath {
                                     hir_id: path.hir_id,
                                     name: name.sym,
@@ -1902,6 +1906,34 @@ mod tests {
         expr(arena, owner, local, start, end, ExprKind::Path(path))
     }
 
+    fn local_multi_segment_path_expr<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        local: u32,
+        first: (sai_hir::Symbol, u32, u32),
+        second: (sai_hir::Symbol, u32, u32),
+    ) -> &'hir Expr<'hir> {
+        let segments = [
+            PathSegment {
+                hir_id: hir_id(owner, local + 2),
+                name: local_name(first.0, first.1, first.2),
+                args: None,
+            },
+            PathSegment {
+                hir_id: hir_id(owner, local + 3),
+                name: local_name(second.0, second.1, second.2),
+                args: None,
+            },
+        ];
+        let path = Path {
+            hir_id: hir_id(owner, local + 1),
+            root: PathRoot::Plain,
+            segments: arena.alloc_path_segments(&segments),
+            span: hir_span(first.1, second.2),
+        };
+        expr(arena, owner, local, first.1, second.2, ExprKind::Path(path))
+    }
+
     fn local_binding_pat<'hir>(
         arena: &'hir HirArena<'hir>,
         owner: OwnerId,
@@ -2147,6 +2179,47 @@ mod tests {
             Some(BindingKind::Let)
         );
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn local_binding_resolves_the_head_of_a_multi_segment_plain_path() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let receiver = symbols.intern("receiver").expect("symbol interns");
+        let member = symbols.intern("member").expect("symbol interns");
+        let params = [BodyParam {
+            hir_id: hir_id(owner, 1),
+            binding: BindingId::from_raw(0),
+            name: Some(local_name(receiver, 0, 8)),
+            mutable: false,
+        }];
+        let path_expr =
+            local_multi_segment_path_expr(&arena, owner, 10, (receiver, 20, 28), (member, 29, 35));
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(
+            &arena,
+            owner,
+            source_map.source_id(),
+            &params,
+            path_expr,
+            &[],
+        );
+
+        let result = resolve_owner_locals(body, &source_map, &snapshot, &symbols, &HashSet::new())
+            .expect("local path head resolves");
+        let ExprKind::Path(path) = path_expr.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            result.paths.get(&path.hir_id),
+            Some(&PathRes {
+                base: Res::Local(BindingId::from_raw(0)),
+                resolved_segments: 1,
+                segment_count: 2,
+            })
+        );
+        assert!(result.deferred_paths.is_empty());
     }
 
     #[test]
