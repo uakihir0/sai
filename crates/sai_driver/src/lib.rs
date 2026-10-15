@@ -9293,6 +9293,8 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let descriptors = collection
             .scopes
             .top_level_owners
@@ -9415,9 +9417,9 @@ impl RootDatabase {
                             primitive_prelude,
                             &rejected_type_paths,
                             &module_scope,
-                            None,
+                            Some(&module_members),
                             descriptor.owner.def_id.package(),
-                            None,
+                            Some(&source_graph_packages),
                         ))
                     }
                     (Err(error), _) => Err(OwnerControlFlowResolutionError::PrimitivePrelude(
@@ -16429,11 +16431,16 @@ mod tests {
             "trait Api<T: Bound, const N: U32>: Super<T> ",
             "where T: (Fn(CallbackArg) -> CallbackOutput effects { fs.read }) ",
             "+ (FnMut(MutArg) -> MutOutput effects { fs.write }) + WhereBound, N: U32 {}\n",
-            "trait RootScope: Shared<U32> + child_alias.Widget {}\n",
+            "trait RootScope: Shared<U32> + child_alias.Widget + ",
+            "child_alias.api.Request.Associated + child_alias.MissingType {}\n",
             "impl<T: ImplBound, const N: U32> Api<T> for Array<N> ",
             "where T: ImplWhere, N: ImplType {}\n",
         );
         let child = concat!(
+            "trait Widget {}\n",
+            "interface api {\n",
+            "  type Request = Bool\n",
+            "}\n",
             "type Shared<T> = T\n",
             "trait ChildScope: Shared<U32> + RootOnly<U32> {}\n",
         );
@@ -16514,26 +16521,52 @@ mod tests {
             .get(&symbol("RootOnly"))
             .expect("root RootOnly alias exists")
             .res;
-        let child_module = root_scope
-            .scope
-            .get(&symbol("child_alias"))
-            .expect("child module alias exists")
-            .res;
         let shared_symbol = symbol("Shared");
-        let child_shared = collection
+        let child_module_scope = collection
             .scopes()
             .module(ModuleId::from_raw(1))
-            .expect("child module scope exists")
+            .expect("child module scope exists");
+        let child_shared = child_module_scope
             .scope
             .get(&shared_symbol)
             .expect("child Shared alias exists")
             .res;
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let child_widget = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget trait is declared")
+            .res;
+        let api_name = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let request_name = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let request_binding = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (child_module_scope
+                    .members
+                    .get(&api_name)
+                    .is_some_and(|binding| binding.res == Res::Def(DefKind::Interface, *def_id)))
+                .then(|| interface.members.get(&request_name))
+                .flatten()
+            })
+            .expect("interface api declares Request");
 
         let resolved = database
             .resolve_trait_impl_header_test_only_paths(&collection, &module_tree, &snapshot)
             .expect("trait and impl type heads resolve");
         assert!(resolved.matches_collection(&collection));
-        assert_eq!(resolved.owners().len(), 4);
+        assert_eq!(resolved.owners().len(), 5);
         let api = &resolved.owners()[0];
         let api_types = api
             .type_path_resolution()
@@ -16651,13 +16684,53 @@ mod tests {
         );
         assert!(
             root_scope_types.paths().values().any(|path| {
-                path.base == child_module && path.resolved_segments == 1 && path.segment_count == 2
+                path.base == child_widget && path.resolved_segments == 2 && path.segment_count == 2
             }),
-            "qualified trait heads resolve their module prefix and preserve the suffix"
+            "qualified trait heads resolve through same-package private members"
         );
         assert!(
-            root_scope_types.module_path_errors().is_empty(),
-            "qualified header suffixes remain deferred without a member index"
+            root_scope_types.paths().values().any(|path| {
+                path.base == request_binding.res
+                    && path.resolved_segments == 3
+                    && path.segment_count == 4
+            }),
+            "trait headers stop at interface type members and preserve their suffix"
+        );
+        assert_eq!(root_scope_types.module_path_errors().len(), 1);
+        let missing_offset = root
+            .find("child_alias.MissingType")
+            .expect("missing trait member path exists");
+        let missing_error = &root_scope_types.module_path_errors()[0];
+        let (missing_name, missing_segment, missing_span) = match missing_error.error() {
+            ModulePathError::MissingMember {
+                name,
+                segment_index,
+                span,
+                ..
+            } => (name, segment_index, span),
+            error => panic!("expected a missing-member error, got {error:?}"),
+        };
+        assert!(
+            database
+                .resolve_symbol(missing_name)
+                .is_ok_and(|name| name.as_ref() == "MissingType")
+        );
+        assert_eq!(missing_segment, 0);
+        let missing_start = missing_offset + "child_alias.".len();
+        assert_eq!(missing_span.file, module_tree.modules[0].file);
+        assert_eq!(missing_span.range.start().to_usize(), missing_start);
+        assert_eq!(
+            missing_span.range.end().to_usize(),
+            missing_start + "MissingType".len()
+        );
+        assert_eq!(
+            root_scope_types.paths().get(&missing_error.hir_id()),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            }),
+            "the absent trait member has an exact error-path result"
         );
 
         let implementation = &resolved.owners()[2];
@@ -16709,7 +16782,7 @@ mod tests {
             "unresolved impl bounds remain deferred"
         );
 
-        let child_scope_owner = &resolved.owners()[3];
+        let child_scope_owner = &resolved.owners()[4];
         let child_scope_types = child_scope_owner
             .type_path_resolution()
             .expect("child trait type lookup succeeds");
@@ -16799,6 +16872,10 @@ mod tests {
                 .values()
                 .all(|path| path.base == Res::Err),
             "later header type heads remain rejected after test-only diagnostic collection fails"
+        );
+        assert!(
+            type_paths.module_path_errors().is_empty(),
+            "rejected test-only header heads do not trigger member lookup"
         );
     }
 
