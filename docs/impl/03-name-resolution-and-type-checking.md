@@ -995,9 +995,9 @@ result becomes `Res::Err` so later phases do not cascade. IR-526 covered const
 initializer expressions only. IR-528 below extends the same diagnostic rule to
 const declaration-type heads; IR-529, IR-531, and IR-532 add invariant,
 refined/distinct, and extern owners, while IR-534 covers direct trait/impl
-headers and IR-535 covers associated declaration signatures. Associated
-method bodies and contracts, interface, and other non-test owner kinds remain
-for later integration.
+headers and IR-535–IR-536 cover associated declaration signatures, method
+bodies, and contracts. Interface and other non-test owner kinds remain for
+later integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
 the declared type before its body-dependent local-resolution branch and also
