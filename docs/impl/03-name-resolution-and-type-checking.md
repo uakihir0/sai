@@ -198,7 +198,7 @@ This section implements Phases 1–3 of spec/04 §4.5.4. All three phases run in
 
 ### 3.3.1 `@target` filtering
 
-Before Phase 1, every item, field, variant, trait or impl item and extern item is filtered by its `@target` predicate. The predicate is decoded from the item tree's `RawAttr` by the function that [impl/02](02-frontend-ast-hir.md) §2.10.2 shares with the `attrs` query, and evaluated here against the build's target and its capability set (spec/15, [targets](../targets/targets-and-profiles.md)), which the driver provides as the input `target_cfg(PackageId) -> Arc<TargetCfg>`. An item whose predicate is false is not collected, together with everything nested in it: it gets no `DefId` and no HIR owner (impl/02 §2.10.2), no binding, no impl entry and no body check, and its uses are resolved as if it did not exist.
+Before Phase 1, every module-level item and `use` is filtered by its `@target` predicate. The predicate is decoded from the item tree's `RawAttr` by the function that [impl/02](02-frontend-ast-hir.md) §2.10.2 shares with the `attrs` query, and evaluated here against the build's target and its capability set (spec/15, [targets](../targets/targets-and-profiles.md)), which the driver provides as the input `target_cfg(PackageId) -> Arc<TargetCfg>`. An item whose predicate is false is not collected, together with everything nested in it: it gets no `DefId` and no HIR owner (impl/02 §2.10.2), no binding, no impl entry and no body check, and its uses are resolved as if it did not exist. `@target` on fields, variants, trait or impl members, interface or extern items is invalid under spec/15 §15.11.3.
 
 `@target` filtering is applied before every duplicate check, so two items with the same name are allowed when at most one survives (spec/04 §4.4.3).
 
@@ -324,11 +324,12 @@ foreign interface targets and their member imports/re-exports are not wired
 into the import resolver: public interface targets are Stage-4-gated, while
 private targets receive a visibility diagnostic. The current incremental
 owner adapters cover top-level functions, extern functions, consts,
-invariants, refined types, refinement-bearing distinct types, and direct
-trait/impl headers. Test-only checks for associated members, interface owners,
-and other remaining owner kinds are pending; the property-parameter exception
-is preserved during test analysis. The complete canonical prelude and general
-tracked `package_scopes(PackageId)` query also remain deferred.
+invariants, refined types, refinement-bearing distinct types, direct
+trait/impl headers, and associated trait/impl declarations including method
+bodies and contracts. Interface owners and other remaining owner kinds are
+pending; the property-parameter exception is preserved during test analysis.
+The complete canonical prelude and general tracked `package_scopes(PackageId)`
+query also remain deferred.
 
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
@@ -878,6 +879,37 @@ note, stores rejected header heads as `Res::Err`, and isolates failures per
 owner. Associated members and ordinary type/module resolution remain outside
 this header-only increment.
 
+**Associated trait/impl signature test-only references (IR-535).** For each
+current, target-filtered direct trait or impl, the adapter matches associated
+type and method entries from its filtered ItemTree with the child `OwnerId`s
+in the lowered parent. Each child has its own path results and failure
+channel. Trait associated-type bounds, impl associated-type definition types,
+and method parameter/return types, effects, generic bounds, const-parameter
+types, and `where` clauses are checked against the module scope for the
+parent's exact file. Parent and method generic names both shadow type-position
+imports; built-in effect roots retain their precedence. Test-only status
+follows the originating import even when the visible binding has `Res::Def`;
+diagnostics include the source span and complete `PKG_PATH` note, and rejected
+path heads become `Res::Err`. Spec/15 §15.11.3 makes `@target` on an associated
+member `INVALID_ATTRIBUTE_TARGET`; the filtered parent ItemTree supplies the
+associated declarations present in this build.
+
+**Associated method body and contract test-only references (IR-536).** The
+adapter reuses each method's canonical `OwnerId`, lowered HIR, source map, and
+the exact module scope selected for its parent file. The full owner walk checks
+nested body and contract type, effect, and pattern paths with both parent and
+method generic names and built-in effect precedence. Expression paths resolve
+through lexical locals first, then generic parameters, then module bindings;
+only paths claimed by module fallback are classified by `BindingOrigin` and
+changed to `Res::Err` when their import is test-only. Qualified module-alias
+heads stay on the module diagnostic path because they are not one-segment
+local-value lookups. Methods with contracts but no written body use the HIR
+body produced for those contracts; bodyless methods and associated types have
+no local or module result. Test-only diagnostics retain exact source spans and
+the complete `PKG_PATH` note, with resolution and diagnostic failures isolated
+per member. This remains a diagnostic pass and does not add ordinary
+type/effect/module-member lookup or command-level check integration.
+
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
 block/child `OwnerId`s, rebinds both AST IDs from current target-filtered
@@ -963,8 +995,9 @@ result becomes `Res::Err` so later phases do not cascade. IR-526 covered const
 initializer expressions only. IR-528 below extends the same diagnostic rule to
 const declaration-type heads; IR-529, IR-531, and IR-532 add invariant,
 refined/distinct, and extern owners, while IR-534 covers direct trait/impl
-headers. Associated trait/impl members, interface, and other non-test owner
-kinds remain for later integration.
+headers and IR-535 covers associated declaration signatures. Associated
+method bodies and contracts, interface, and other non-test owner kinds remain
+for later integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
 the declared type before its body-dependent local-resolution branch and also
