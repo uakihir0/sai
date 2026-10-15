@@ -1787,12 +1787,14 @@ pub enum TraitImplMemberKind {
     ImplMethod,
 }
 
-/// Test-only references found in one associated declaration owner.
+/// Partial type-head and test-only path results for one associated
+/// declaration owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraitImplMemberTestOnlyResolution {
     parent_owner: OwnerId,
     owner: OwnerId,
     kind: TraitImplMemberKind,
+    type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
@@ -1811,6 +1813,12 @@ impl TraitImplMemberTestOnlyResolution {
 
     pub const fn kind(&self) -> TraitImplMemberKind {
         self.kind
+    }
+
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
+        self.type_path_resolution.as_ref()
     }
 
     pub fn test_only_path_resolution(
@@ -1887,8 +1895,8 @@ impl TraitImplMemberOwnerResolution {
     }
 }
 
-/// Provenance-tagged test-only diagnostics for associated trait and impl
-/// declarations.
+/// Provenance-tagged type-head results and test-only diagnostics for
+/// associated trait and impl declarations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraitImplMemberTestOnlyResolutions {
     snapshot_id: WorkspaceSnapshotId,
@@ -4464,6 +4472,14 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
             _ => return HashMap::new(),
         },
         OwnerNode::ExternItem(item) => item.generics,
+        OwnerNode::TraitItem(item) => match item.kind {
+            TraitItemKind::Fn { generics, .. } => generics,
+            TraitItemKind::AssocType { .. } => return HashMap::new(),
+        },
+        OwnerNode::ImplItem(item) => match item.kind {
+            ImplItemKind::Fn { generics, .. } => generics,
+            ImplItemKind::AssocType { .. } => return HashMap::new(),
+        },
         _ => return HashMap::new(),
     };
     let mut resolutions = HashMap::with_capacity(generics.params.len());
@@ -9268,11 +9284,13 @@ impl RootDatabase {
         })
     }
 
-    /// Diagnoses test-only references in associated trait and impl
-    /// declarations.
+    /// Resolves partial type heads and diagnoses test-only references in
+    /// associated trait and impl declarations.
     ///
     /// The pass checks associated type bounds and definition types plus
-    /// method signatures, generic bounds, and where clauses. For methods with
+    /// method signatures, generic bounds, and where clauses. Type results are
+    /// kept separate from test-only diagnostics, resolve only path heads, and
+    /// include method-body and contract type positions. For methods with
     /// bodies or contracts, it resolves locals before module fallback and
     /// diagnoses test-only expression paths after local and generic lookup.
     pub fn resolve_trait_impl_member_test_only_paths(
@@ -9442,6 +9460,7 @@ impl RootDatabase {
                         ));
                     };
                     let mut lowering_diagnostics = Vec::new();
+                    let mut type_path_resolution = None;
                     let member_analysis: Result<
                         (
                             OwnerTestOnlyPathResolution,
@@ -9491,6 +9510,37 @@ impl RootDatabase {
                         let mut generic_parameters = parent_generics.clone();
                         generic_parameters.extend(owner_generic_parameters(&member_hir));
                         let candidates = owner_test_only_path_candidates(&member_hir);
+                        let mut generic_resolutions = owner_type_generic_resolutions(&parent_hir);
+                        generic_resolutions.extend(owner_type_generic_resolutions(&member_hir));
+                        let rejected_type_paths = rejected_test_only_type_path_ids(
+                            member_owner,
+                            &candidates,
+                            &generic_parameters,
+                            module_scope,
+                        );
+                        let resolved_type_paths =
+                            match (&self.primitive_prelude, rejected_type_paths) {
+                                (Ok(primitive_prelude), Ok(rejected_type_paths)) => {
+                                    Ok(resolve_type_owner_module_paths(
+                                        member_owner,
+                                        &candidates,
+                                        &generic_resolutions,
+                                        primitive_prelude,
+                                        &rejected_type_paths,
+                                        module_scope,
+                                        None,
+                                        member_owner.def_id.package(),
+                                        None,
+                                    ))
+                                }
+                                (Err(error), _) => {
+                                    Err(OwnerControlFlowResolutionError::PrimitivePrelude(
+                                        error.clone(),
+                                    ))
+                                }
+                                (_, Err(error)) => Err(error),
+                            };
+                        type_path_resolution = Some(resolved_type_paths);
                         let module_head_candidates = candidates
                             .iter()
                             .filter(|candidate| {
@@ -9567,6 +9617,14 @@ impl RootDatabase {
                         ))
                     })();
 
+                    let type_path_resolution =
+                        match (type_path_resolution, member_analysis.as_ref()) {
+                            (Some(resolution), _) => resolution,
+                            (None, Err(error)) => Err(error.clone()),
+                            (None, Ok(_)) => {
+                                unreachable!("successful member analysis resolves its type heads")
+                            }
+                        };
                     let (
                         test_only_path_resolution,
                         local_resolution,
@@ -9608,6 +9666,7 @@ impl RootDatabase {
                         parent_owner: descriptor.owner,
                         owner: member_owner,
                         kind,
+                        type_path_resolution,
                         test_only_path_resolution,
                         test_only_diagnostics,
                         local_resolution,
@@ -16556,18 +16615,23 @@ mod tests {
             "use acme:test-support/fixtures as fs\n",
             "use acme:test-support/fixtures.{Fixture}\n",
             "use acme:test-support/fixtures.{Fixture as M}\n",
+            "use acme:phase1/child as child_alias\n",
+            "type Array<T> = T\n",
             "fn real_definition() {}\n",
-            "trait Api<Fixture> {\n",
+            "trait Api<Fixture, const ParentN: U32> where ParentN: ParentBound {\n",
             "  type Associated: fixture.AssociatedBound\n",
-            "  fn trait_method<M: fixture.MethodBound>(value: M, other: Container<fixture.NestedParam>) -> fixture.Returned where M: fixture.WhereBound effects { fs.read, fixture.method_effect }\n",
-            "  fn shadowed<M>(value: M) -> Fixture\n",
+            "  fn trait_method<M: fixture.MethodBound, const MethodN: U32>(value: M, option: Option<M>, array: Array<U32>, other: Container<fixture.NestedParam>, qualified: child_alias.Widget) -> fixture.Returned where M: fixture.WhereBound, MethodN: MethodWhere effects { fs.read, fixture.method_effect }\n",
+            "  fn shadowed<M>(value: M, parent: ParentN) -> Fixture where ParentN: ParentBound\n",
+            "  fn method_shadows_parent<Fixture>(value: Fixture) -> Fixture\n",
             "}\n",
             "impl<T: fixture.ImplBound> Api<T> for fixture.SelfType {\n",
             "  type ImplAssociated = fixture.ImplAssociated\n",
-            "  fn impl_method<N: fixture.ImplMethodBound>(value: fixture.ImplParam) -> fixture.ImplReturned where N: fixture.ImplWhereBound effects { fixture.impl_effect } { fixture.impl_body }\n",
+            "  fn impl_method<N: fixture.ImplMethodBound>(value: fixture.ImplParam, parent: T) -> fixture.ImplReturned where N: fixture.ImplWhereBound effects { fixture.impl_effect } { fixture.impl_body }\n",
             "}\n",
         );
-        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let child = "type ChildWidget = U32\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
         let parsed_root = database
             .parse_file(&snapshot, module_tree.modules[0].file)
             .expect("test source parses");
@@ -16607,6 +16671,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 TraitImplMemberKind::TraitAssociatedType,
+                TraitImplMemberKind::TraitMethod,
                 TraitImplMemberKind::TraitMethod,
                 TraitImplMemberKind::TraitMethod,
             ],
@@ -16679,6 +16744,175 @@ mod tests {
         let type_package_path = package_path_span(2);
 
         let trait_members = results.owners()[0].members();
+        assert!(
+            trait_members[0]
+                .type_path_resolution()
+                .expect("trait associated type path result succeeds")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "trait associated-type bounds use the ordinary type-head channel"
+        );
+        let parent_owner = results.owners()[0].owner();
+        let parent_fixture = database
+            .symbols
+            .intern("Fixture")
+            .expect("parent type generic name is interned");
+        let parent_n = database
+            .symbols
+            .intern("ParentN")
+            .expect("parent const generic name is interned");
+        let parent_generics = database
+            .def_paths
+            .get(&parent_owner.def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                parent_owner.def_id,
+                &[(parent_fixture, false, 0), (parent_n, true, 0)],
+            )
+            .expect("parent type and const generic definitions are stable");
+        let method_owner = trait_members[1].owner();
+        let method_m = database
+            .symbols
+            .intern("M")
+            .expect("method type generic name is interned");
+        let method_n = database
+            .symbols
+            .intern("MethodN")
+            .expect("method const generic name is interned");
+        let method_generics = database
+            .def_paths
+            .get(&method_owner.def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                method_owner.def_id,
+                &[(method_m, false, 0), (method_n, true, 0)],
+            )
+            .expect("method type and const generic definitions are stable");
+        let member_root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let member_symbol = |name: &str| {
+            member_root_scope
+                .scope
+                .keys()
+                .copied()
+                .find(|symbol| {
+                    database
+                        .resolve_symbol(*symbol)
+                        .is_ok_and(|resolved| resolved.as_ref() == name)
+                })
+                .unwrap_or_else(|| panic!("root module contains `{name}`"))
+        };
+        let alias_array = member_root_scope
+            .scope
+            .get(&member_symbol("Array"))
+            .expect("root Array alias exists")
+            .res;
+        let child_module = member_root_scope
+            .scope
+            .get(&member_symbol("child_alias"))
+            .expect("root child module alias exists")
+            .res;
+        let method_types = trait_members[1]
+            .type_path_resolution()
+            .expect("trait method type path result succeeds");
+        assert!(
+            method_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, method_generics[0].to_def_id())
+            }),
+            "method type generics retain their exact child-owner identity"
+        );
+        assert!(
+            method_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::ConstParam, method_generics[1].to_def_id())
+            }),
+            "method const generics retain their exact child-owner identity in type positions"
+        );
+        assert!(
+            method_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "const generic declarations resolve their primitive types"
+        );
+        assert!(
+            method_types
+                .paths()
+                .values()
+                .any(|path| path.base == alias_array),
+            "a valid module Array alias shadows the primitive Prelude entry"
+        );
+        assert!(
+            method_types.paths().values().any(|path| {
+                path.base == child_module && path.resolved_segments == 1 && path.segment_count == 2
+            }),
+            "qualified member type heads resolve only their module prefix"
+        );
+        assert!(
+            method_types.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Option")
+            }),
+            "non-primitive Prelude names remain deferred"
+        );
+        assert!(
+            method_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "test-only type heads remain rejected in the ordinary type result"
+        );
+        let shadowed_types = trait_members[2]
+            .type_path_resolution()
+            .expect("shadowed trait method type result succeeds");
+        assert!(
+            shadowed_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, parent_generics[0].to_def_id())
+            }),
+            "parent type generics retain their exact definition identity in child methods"
+        );
+        assert!(
+            shadowed_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::ConstParam, parent_generics[1].to_def_id())
+            }),
+            "parent const generics retain their exact identity in member type positions"
+        );
+        assert!(
+            diagnostics_for(&trait_members[3]).is_empty(),
+            "a method generic shadows its same-named parent generic and import"
+        );
+        let shadowing_method = &trait_members[3];
+        let shadowing_fixture = database
+            .symbols
+            .intern("Fixture")
+            .expect("shadowing method generic name is interned");
+        let shadowing_method_generic = database
+            .def_paths
+            .get(&shadowing_method.owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                shadowing_method.owner().def_id,
+                &[(shadowing_fixture, false, 0)],
+            )
+            .expect("shadowing method generic definition is stable");
+        let shadowing_method_types = shadowing_method
+            .type_path_resolution()
+            .expect("method-shadowed type heads resolve");
+        assert!(
+            shadowing_method_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, shadowing_method_generic[0].to_def_id())
+            }),
+            "method generic identities override same-named parent generics"
+        );
+        assert!(
+            !shadowing_method_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, parent_generics[0].to_def_id())
+            }),
+            "method type results do not retain a shadowed parent generic"
+        );
         assert_eq!(
             diagnostic_spans(diagnostics_for(&trait_members[0])),
             [span_of("fixture.AssociatedBound", 0)],
@@ -16762,6 +16996,52 @@ mod tests {
         );
 
         let impl_members = results.owners()[1].members();
+        assert!(
+            impl_members[0]
+                .type_path_resolution()
+                .expect("impl associated type path result succeeds")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "impl associated-type definitions use the ordinary type-head channel"
+        );
+        let impl_parent_owner = results.owners()[1].owner();
+        let impl_t = database
+            .symbols
+            .intern("T")
+            .expect("impl type generic name is interned");
+        let impl_parent_generics = database
+            .def_paths
+            .get(&impl_parent_owner.def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(impl_parent_owner.def_id, &[(impl_t, false, 0)])
+            .expect("impl generic definitions are stable");
+        let impl_method_owner = impl_members[1].owner();
+        let impl_n = database
+            .symbols
+            .intern("N")
+            .expect("impl method generic name is interned");
+        let impl_method_generics = database
+            .def_paths
+            .get(&impl_method_owner.def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(impl_method_owner.def_id, &[(impl_n, false, 0)])
+            .expect("impl method generic definitions are stable");
+        let impl_method_types = impl_members[1]
+            .type_path_resolution()
+            .expect("impl method type path result succeeds");
+        assert!(
+            impl_method_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, impl_parent_generics[0].to_def_id())
+            }),
+            "impl parent type generics retain their exact identity in methods"
+        );
+        assert!(
+            impl_method_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, impl_method_generics[0].to_def_id())
+            }),
+            "impl method generics retain their exact child-owner identity"
+        );
         assert_eq!(
             diagnostic_spans(diagnostics_for(&impl_members[0])),
             [span_of("fixture.ImplAssociated", 0)],
@@ -16889,7 +17169,10 @@ mod tests {
             "    value as fixture.CastType\n",
             "    outside\n",
             "  }\n",
-            "  fn contract_only() requires outside\n",
+            "  fn contract_only() requires {\n",
+            "    let typed: U32 = 1\n",
+            "    outside\n",
+            "  }\n",
             "  fn contracts(value: Bool) requires outside ensures outside { value }\n",
             "  fn generic_type<BodyType>(value: BodyType) {\n",
             "    let typed: fixture.Container<BodyType> = value\n",
@@ -16997,6 +17280,23 @@ mod tests {
             body_module.paths.values().any(|path| path.base == Res::Err),
             "the test-only expression binding is rejected in module fallback"
         );
+        let body_types = trait_members[1]
+            .type_path_resolution()
+            .expect("method-body type path result succeeds");
+        assert!(
+            body_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "test-only type heads in method bodies are rejected in the ordinary type channel"
+        );
+        assert!(
+            body_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::Bool) }),
+            "method signature types remain in the partial type channel"
+        );
 
         assert_eq!(
             diagnostic_spans(&trait_members[2]),
@@ -17010,6 +17310,15 @@ mod tests {
                 .is_some(),
             "contracts are visited even when the trait method has no executable body"
         );
+        assert!(
+            trait_members[2]
+                .type_path_resolution()
+                .expect("contract-only method type paths succeed")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "type heads inside synthesized contract bodies are resolved"
+        );
         assert_eq!(
             diagnostic_spans(&trait_members[3]),
             [span("outside", 3), span("outside", 4)],
@@ -17019,9 +17328,53 @@ mod tests {
             diagnostic_spans(&trait_members[4]) == [span("fixture", 5)],
             "the module head is diagnosed while a method generic shadows the nested type argument"
         );
+        let generic_body_types = trait_members[4]
+            .type_path_resolution()
+            .expect("generic method-body type paths succeed");
+        let body_type_name = database
+            .symbols
+            .intern("BodyType")
+            .expect("method generic name is interned");
+        let body_type_generic = database
+            .def_paths
+            .get(&trait_members[4].owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                trait_members[4].owner().def_id,
+                &[(body_type_name, false, 0)],
+            )
+            .expect("method generic definition is stable");
+        assert!(
+            generic_body_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, body_type_generic[0].to_def_id())
+            }),
+            "nested body types preserve the exact method-generic identity"
+        );
         assert!(
             diagnostic_spans(&trait_members[5]).is_empty(),
             "a parent generic shadows a same-named import in signature and body types"
+        );
+        let parent_body_types = trait_members[5]
+            .type_path_resolution()
+            .expect("parent-generic method-body type paths succeed");
+        let parent_type_name = database
+            .symbols
+            .intern("ParentType")
+            .expect("parent generic name is interned");
+        let parent_type_generic = database
+            .def_paths
+            .get(&results.owners()[0].owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                results.owners()[0].owner().def_id,
+                &[(parent_type_name, false, 0)],
+            )
+            .expect("parent generic definition is stable");
+        assert!(
+            parent_body_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, parent_type_generic[0].to_def_id())
+            }),
+            "body types preserve the exact parent-generic identity"
         );
         assert!(
             diagnostic_spans(&trait_members[6]).is_empty(),
@@ -17108,11 +17461,13 @@ mod tests {
     fn trait_impl_member_test_only_paths_use_each_files_scope_and_isolate_parents() {
         let root = concat!(
             "use acme:test-support/fixtures as fixture\n",
-            "trait RootApi { fn root_method() -> fixture.RootType }\n",
+            "type Shared<T> = T\n",
+            "trait RootApi { fn root_method() -> Shared<fixture.RootType> }\n",
         );
         let child = concat!(
             "use acme:test-support/fixtures as fixture\n",
-            "trait ChildApi { fn child_method() -> fixture.ChildType }\n",
+            "type Shared<T> = T\n",
+            "trait ChildApi { fn child_method() -> Shared<fixture.ChildType> }\n",
         );
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(root.as_bytes(), child.as_bytes());
@@ -17142,6 +17497,36 @@ mod tests {
                 .iter()
                 .all(|owner| owner.error().is_none() && owner.members().len() == 1)
         );
+        let shared_symbol = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "Shared")
+            })
+            .expect("Shared aliases use one interned symbol");
+        let root_shared = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .scope
+            .get(&shared_symbol)
+            .expect("root Shared alias exists")
+            .res;
+        let child_shared = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists")
+            .scope
+            .get(&shared_symbol)
+            .expect("child Shared alias exists")
+            .res;
+        assert_ne!(root_shared, child_shared);
         for (module_index, needle) in ["fixture.RootType", "fixture.ChildType"]
             .into_iter()
             .enumerate()
@@ -17175,6 +17560,33 @@ mod tests {
                     .expect("member diagnostic has a primary span")
                     .span,
                 expected_reference
+            );
+            let type_paths = member
+                .type_path_resolution()
+                .expect("each child gets an independent type result");
+            let own_shared = if module_index == 0 {
+                root_shared
+            } else {
+                child_shared
+            };
+            let sibling_shared = if module_index == 0 {
+                child_shared
+            } else {
+                root_shared
+            };
+            assert!(
+                type_paths
+                    .paths()
+                    .values()
+                    .any(|path| path.base == own_shared),
+                "member type heads use the alias in their exact source file"
+            );
+            assert!(
+                !type_paths
+                    .paths()
+                    .values()
+                    .any(|path| path.base == sibling_shared),
+                "same-named aliases from sibling files never leak into member results"
             );
             let source = if module_index == 0 { root } else { child };
             let use_start = source
@@ -17218,6 +17630,153 @@ mod tests {
                 .expect("child member remains available")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn trait_impl_member_type_heads_survive_early_diagnostic_failure() {
+        let root = concat!(
+            "use acme:test-support/fixtures as broken_type\n",
+            "use acme:test-support/fixtures as later_type\n",
+            "trait Api {\n",
+            "  fn broken() -> broken_type.First {\n",
+            "    let typed: later_type.Second = true\n",
+            "  }\n",
+            "  fn sibling() -> later_type.Third\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("trait method test-only imports collect");
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let broken_import_index = module_scope
+            .imports
+            .iter()
+            .position(|import| {
+                database
+                    .resolve_symbol(import.name)
+                    .is_ok_and(|name| name.as_ref() == "broken_type")
+            })
+            .expect("broken_type import exists");
+        module_scope.imports[broken_import_index].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+
+        let resolved = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("member diagnostic failure remains owner-local");
+        let members = resolved.owners()[0].members();
+        assert_eq!(members.len(), 2);
+        assert!(matches!(
+            members[0].test_only_diagnostics(),
+            Err(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                import,
+                ..
+            }) if import.0 as usize == broken_import_index
+        ));
+        let broken_types = members[0]
+            .type_path_resolution()
+            .expect("broken method keeps its independent type result");
+        assert_eq!(broken_types.paths().len(), 2);
+        assert!(
+            broken_types
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "later test-only type heads remain rejected after diagnostic extraction fails"
+        );
+        assert!(
+            members[1]
+                .type_path_resolution()
+                .expect("sibling type result remains independent")
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "a diagnostic failure in one child does not stop sibling type resolution"
+        );
+    }
+
+    #[test]
+    fn trait_impl_member_type_path_errors_are_child_local() {
+        let root = concat!(
+            "use acme:test-support/fixtures as broken_type\n",
+            "trait Api {\n",
+            "  type Broken: broken_type.Bound\n",
+            "  fn sibling() -> U32\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("trait members collect");
+        let root_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let broken_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "broken_type")
+            })
+            .expect("broken_type alias exists");
+        root_scope
+            .scope
+            .get_mut(&broken_symbol)
+            .expect("broken_type binding exists")
+            .origin = BindingOrigin::Use {
+            import: ImportIndex(u32::MAX),
+        };
+
+        let resolved = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("type path errors stay within their child member");
+        let members = resolved.owners()[0].members();
+        assert_eq!(members.len(), 2);
+        assert!(matches!(
+            members[0].type_path_resolution(),
+            Err(OwnerControlFlowResolutionError::MissingImportBinding {
+                import: ImportIndex(u32::MAX),
+                ..
+            })
+        ));
+        assert!(
+            members[1]
+                .type_path_resolution()
+                .expect("sibling type path result succeeds")
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "a malformed type binding does not prevent sibling member resolution"
         );
     }
 
