@@ -751,18 +751,23 @@ their bodies remain separate owners.
 restrictions to `Body::invariant_preds` for direct top-level invariant owners.
 Its Phase 1 descriptors preserve canonical owner IDs and source order; the
 driver rebinds current target-filtered inputs and returns owned diagnostics
-tagged with snapshot, target, and package-collection provenance. The bridge
-does not yet resolve predicate paths or types. Refinement predicates,
-associated and other owner kinds, local and path resolution, tracked
-`hir_owner`, and full `resolve_owner` remain deferred.
+tagged with snapshot, target, and package-collection provenance. IR-521 also
+runs the local-name pass over those predicate expressions using the same
+lowered `Body` and `HirSourceMap`, so block bindings and their later uses are
+resolved and module-alias shadowing is reported. This remains a partial local
+pass: implicit `self` and other owner-specific lookup are deferred, as are
+generic/module/prelude fallback, associated and other owner kinds, tracked
+`hir_owner`, and full `resolve_owner`.
 
 **Top-level refinement predicates (IR-515).** The bridge now also validates
 `Body::value` for top-level `type R = B where p` and `distinct D = B where p`
 owners. These values are scanned as predicates rather than executable bodies,
 so prohibited jumps receive `INVALID_CONTRACT_EXPRESSION` without label or
 outside-function cascades. Distinct declarations without a refinement clause
-are not indexed. The bridge still does not resolve implicit `self`, predicate
-paths, or types; nested interface type declarations and other owner kinds
+are not indexed. IR-521 also resolves block-local names in each predicate from
+the same lowering result, while leaving implicit `self` for owner-aware
+resolution. Generic, module, interface, prelude, and test-only fallback,
+type resolution, nested interface type declarations, and other owner kinds
 remain deferred.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
@@ -774,11 +779,26 @@ expressions. It includes bodyless extern declarations with contracts and
 returns per-owner results. Per spec/09 §9.3.1, extern `requires` are checked at
 call sites while `ensures` are trusted facts and are never checked at runtime;
 this bridge handles syntax restrictions only and does not implement those
-semantics or name/type resolution. Test results and review findings are recorded
-in [`design/implementation-review.md`](../design/implementation-review.md).
+semantics or complete name/type resolution. IR-521 additionally resolves
+parameter and block-local names in each retained contract from the function's
+same lowered `Body` and `HirSourceMap`; module, generic, prelude, and type
+fallback remain deferred. Test results and review findings are recorded in
+[`design/implementation-review.md`](../design/implementation-review.md).
 Hostile review found no remaining issues after the target-filtered block
 disambiguator correction. Other owner kinds and tracked `hir_owner`/full `resolve_owner`
 remain deferred.
+
+**Predicate-owner local resolution (IR-521).** The invariant, top-level
+refinement/distinct, and extern-function adapters retain the source map from
+their existing lowering and run `resolve_owner_locals` against that exact map
+and body. The new `PredicateOwnerResolution::local_resolution` result is
+independent from predicate diagnostics, so a local-resolution error does not
+hide control-flow or restriction diagnostics. It resolves only lexical locals
+and reports `SHADOWS_MODULE` using aliases from the owner's exact file scope.
+Implicit `self` remains owner-scoped and is not treated as a lexical local.
+Const initializers, tests, and properties are deliberately outside this
+adapter: constant-expression rules and test-analysis activation need their
+owner/build context before the local pass can be enabled there.
 
 ### 3.4.6 Visibility
 
