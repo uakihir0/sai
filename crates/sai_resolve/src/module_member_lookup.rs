@@ -67,6 +67,14 @@ impl<'a> MemberScope<'a> {
             Self::Interface(scope) => scope.members.get(&name),
         }
     }
+
+    fn iter(self) -> impl Iterator<Item = (Symbol, &'a Binding)> + 'a {
+        let members = match self {
+            Self::Module(scope) => &scope.members,
+            Self::Interface(scope) => &scope.members,
+        };
+        members.iter().map(|(name, binding)| (*name, binding))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -151,6 +159,25 @@ impl<'a> ModuleMemberIndex<'a> {
             return ModuleMemberLookup::Inaccessible(binding);
         }
         ModuleMemberLookup::Found(binding)
+    }
+
+    /// Enumerate members visible through a normalized module or interface target.
+    ///
+    /// A missing source scope returns `None`. Package-private members are
+    /// included when the requesting package owns the target; for foreign
+    /// targets, only `Pub` and `Export` bindings are included. The iteration
+    /// order is unspecified because member scopes use hash maps.
+    pub fn visible_members(
+        &self,
+        target: ModuleTarget,
+        requesting_package: PackageId,
+    ) -> Option<impl Iterator<Item = (Symbol, &'a Binding)> + 'a> {
+        let indexed = *self.targets.get(&target.def_id)?;
+        Some(indexed.scope.iter().filter_map(move |(name, binding)| {
+            (indexed.package == requesting_package
+                || matches!(binding.visibility, Visibility::Pub | Visibility::Export))
+            .then_some((name, binding))
+        }))
     }
 }
 
@@ -516,5 +543,135 @@ mod tests {
             }
             result => panic!("expected package-local private member, got {result:?}"),
         }
+    }
+
+    #[test]
+    fn visible_member_enumeration_includes_same_package_private_bindings() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let package = package_id(&packages, "acme:app#1.0");
+        let root = local_def_id(package, &packages, &symbols, Vec::new());
+        let private_name = symbol(&symbols, "private_fn");
+        let private_item = local_def_id(
+            package,
+            &packages,
+            &symbols,
+            vec![DefPathData::ValueNs(private_name)],
+        );
+        let public_name = symbol(&symbols, "public_fn");
+        let public_item = local_def_id(
+            package,
+            &packages,
+            &symbols,
+            vec![DefPathData::ValueNs(public_name)],
+        );
+        let mut root_scope = module_scope(root);
+        root_scope.members.insert(
+            private_name,
+            binding(
+                Res::Def(DefKind::Fn, private_item.to_def_id()),
+                Visibility::Private,
+            ),
+        );
+        root_scope.members.insert(
+            public_name,
+            binding(
+                Res::Def(DefKind::Fn, public_item.to_def_id()),
+                Visibility::Pub,
+            ),
+        );
+        let scopes = package_scopes(vec![root_scope], HashMap::new());
+        let index = ModuleMemberIndex::new([&scopes]);
+
+        let members = index
+            .visible_members(
+                ModuleTarget::from_res(Res::Def(DefKind::Module, root.to_def_id()))
+                    .expect("module normalizes"),
+                package,
+            )
+            .expect("module scope is indexed")
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            members.get(&private_name).map(|binding| binding.res),
+            Some(Res::Def(DefKind::Fn, private_item.to_def_id()))
+        );
+        assert_eq!(
+            members.get(&public_name).map(|binding| binding.res),
+            Some(Res::Def(DefKind::Fn, public_item.to_def_id()))
+        );
+    }
+
+    #[test]
+    fn visible_member_enumeration_excludes_foreign_private_bindings() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let requester = package_id(&packages, "acme:app#1.0");
+        let dependency = package_id(&packages, "acme:dependency#1.0");
+        let root = local_def_id(dependency, &packages, &symbols, Vec::new());
+        let private_name = symbol(&symbols, "private_fn");
+        let private_item = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![DefPathData::ValueNs(private_name)],
+        );
+        let public_name = symbol(&symbols, "public_fn");
+        let public_item = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![DefPathData::ValueNs(public_name)],
+        );
+        let exported_name = symbol(&symbols, "exported_fn");
+        let exported_item = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![DefPathData::ValueNs(exported_name)],
+        );
+        let mut root_scope = module_scope(root);
+        root_scope.members.insert(
+            private_name,
+            binding(
+                Res::Def(DefKind::Fn, private_item.to_def_id()),
+                Visibility::Private,
+            ),
+        );
+        root_scope.members.insert(
+            public_name,
+            binding(
+                Res::Def(DefKind::Fn, public_item.to_def_id()),
+                Visibility::Pub,
+            ),
+        );
+        root_scope.members.insert(
+            exported_name,
+            binding(
+                Res::Def(DefKind::Fn, exported_item.to_def_id()),
+                Visibility::Export,
+            ),
+        );
+        let scopes = package_scopes(vec![root_scope], HashMap::new());
+        let index = ModuleMemberIndex::new([&scopes]);
+
+        let members = index
+            .visible_members(
+                ModuleTarget::from_res(Res::Def(DefKind::Module, root.to_def_id()))
+                    .expect("module normalizes"),
+                requester,
+            )
+            .expect("dependency scope is indexed")
+            .collect::<HashMap<_, _>>();
+
+        assert!(!members.contains_key(&private_name));
+        assert_eq!(
+            members.get(&public_name).map(|binding| binding.res),
+            Some(Res::Def(DefKind::Fn, public_item.to_def_id()))
+        );
+        assert_eq!(
+            members.get(&exported_name).map(|binding| binding.res),
+            Some(Res::Def(DefKind::Fn, exported_item.to_def_id()))
+        );
     }
 }
