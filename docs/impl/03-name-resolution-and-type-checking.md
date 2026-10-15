@@ -800,6 +800,19 @@ Const initializers, tests, and properties are deliberately outside this
 adapter: constant-expression rules and test-analysis activation need their
 owner/build context before the local pass can be enabled there.
 
+**Function module-scope fallback (IR-522).** The top-level function adapter
+passes local misses through generic-parameter lookup and then resolves
+one-segment `PathRoot::Plain` expression paths in the `Phase1ModuleScopes`
+belonging to the descriptor's exact file. Local results remain in their own
+channel; names matching a function generic and module misses remain ordered
+deferred candidates. Module bindings with `Res::Def`, `Res::Err`, or
+`Res::TestOnly` become one-segment `PathRes` entries. The test-only marker is
+retained for a later build-context-aware dependency diagnostic. A module alias
+used as the head of a qualified expression is resolved while its member tail
+remains for a later pass. This slice does not resolve prelude names, qualified
+members, or non-function owner kinds, and does not emit final unresolved-name
+diagnostics.
+
 ### 3.4.6 Visibility
 
 `visible(e, M)` (spec/04 §4.6.1) is evaluated for every path segment that names an item or a member, at the point where the segment is resolved: by the resolver for module members and `use` items, and by the type checker for type-relative members (variants never fail, since they have the enum's visibility; inherent associated functions and methods, spec/05 §5.13.5) and for fields (`PRIVATE_FIELD`, spec/04 §4.6.3, §4.6.4). The visibility of an entity is read from its `ItemTree` entry or from the dependency's metadata, never from HIR, so the check does not depend on the target's body.
