@@ -1525,6 +1525,22 @@ IR-514 adds Phase 1 descriptors and the same uncached lowering bridge for direct
 
 IR-515 adds source-ordered descriptors and predicate-only validation for top-level refined types and distinct types that have a refinement clause. Both lower their predicate into `Body::value`, so the adapter scans that expression directly and does not apply ordinary loop-label or function-return resolution. Distinct declarations without a refinement clause are omitted. Predicate HIR, source maps, implicit `self` resolution, and type checking remain outside the owned result.
 
+**Implemented slice (IR-516; tests pass; hostile reviews complete).** IR-516 extends
+the temporary bridge to contracts on direct top-level extern functions by reusing the Phase 1
+extern-function descriptors, whose canonical block and child `OwnerId`s were
+assigned from the corresponding `DefPath`s.
+The adapter rebinds each descriptor's block and function AST IDs against the
+current target-filtered file inputs, lowers the extern block and item in a
+temporary HIR arena, and scans the retained `requires` and `ensures`
+expressions with the predicate-only restriction pass. It includes bodyless
+extern declarations when they carry contracts and preserves an independent
+result for each owner. This slice checks predicate syntax only; it does not resolve names or types, check
+`requires` at call sites, or interpret trusted `ensures` facts. Verification
+commands and test results are recorded in
+[`design/implementation-review.md`](../design/implementation-review.md).
+Hostile reviews found no remaining issues after the target-filtered block
+disambiguator correction.
+
 `sai_hir::lower::lower_const_owner` resolves a top-level constant from the same snapshot-checked item tree and builds its `ItemKind::Const`, initializer `Body`, and source map. It preflights the declared type and initializer before allocating HIR. The caller supplies the complete expected owner `DefPath`, and lowering verifies that `OwnerId` resolves to it exactly. A missing diagnosed type becomes `TyKind::Err`; a missing diagnosed initializer becomes an `ExprKind::Err` body value so the constant owner remains available to later stages.
 
 `sai_hir::lower::lower_invariant_owner` resolves a top-level invariant through the same snapshot, visibility, and raw-attribute checks and verifies the complete expected owner `DefPath`. Its `ItemKind::Invariant` target is a plain path with the single declared type name. The owner has a synthetic unit body value and stores every parser-retained predicate in source order in `Body::invariant_preds`. It preflights all predicates before allocating HIR and prepares nested closure and async-block paths across the entire declaration, so ordinals continue across predicate boundaries. Target-type validity, defining-module placement, duplicate invariants, and predicate typing remain semantic validation responsibilities.
@@ -1555,7 +1571,7 @@ IR-515 adds source-ordered descriptors and predicate-only validation for top-lev
 
 `sai_hir::lower::lower_world_item_owner` resolves one direct item below an already-lowered world. It validates the parent world's AST, source span, visibility, attributes, DefPath, and source-ordered owner slot, then checks the child's direct syntax membership and complete one-component DefPath. Import/export references lower `PKG_PATH` to `WorldRef::Pkg` and module segments to `WorldRef::Mod`; includes use the same reference lowering. Import/export functions lower their nested `FnDecl` signature without a body or contract IDs. Generic parameters and `where` clauses are omitted because the world-function HIR schema stores only `FnSig` and the grammar diagnoses these declarations. A malformed `WorldRef` with no usable package or module path lowers to an empty module path mapped to the reference node, preserving its owner for later name-resolution diagnostics.
 
-`sai_hir::lower::lower_extern_block_owner` resolves an extern block and validates its complete `ExternBlock { abi, module }` DefPath, including the source-order disambiguator for identical headers. It stores direct function owners in source order and atomically interns their `ValueNs` paths, numbering duplicate function names in that order. The block retains its safe/unsafe marker, decoded module name, and `Wasm`/`C` ABI; an unknown ABI retains its exact DefPath ABI symbol and lowers to `ExternAbi::Err` for the parser diagnostic. An explicit empty list is valid, and the block has no body.
+`sai_hir::lower::lower_extern_block_owner` resolves an extern block and validates its complete `ExternBlock { abi, module }` DefPath, including the source-order disambiguator for identical headers among blocks retained by the current target-filtered ItemTree. It counts those retained blocks in AST source order so a filtered sibling does not shift the path. It stores direct function owners in source order and atomically interns their `ValueNs` paths, numbering duplicate function names in that order. The block retains its safe/unsafe marker, decoded module name, and `Wasm`/`C` ABI; an unknown ABI retains its exact DefPath ABI symbol and lowers to `ExternAbi::Err` for the parser diagnostic. An explicit empty list is valid, and the block has no body.
 
 `sai_hir::lower::lower_extern_item_owner` resolves one function below an already-lowered extern block. It checks the block's current AST and ItemTree declaration, ABI/module/safety metadata, attributes, source span, complete DefPath, and source-order disambiguator, then verifies direct function membership, the parent's owner slot, and the child's complete `ValueNs` DefPath. The function's signature, generics, `where` predicates, and `requires`/`ensures` expressions are lowered with the shared full function lowerer. A bodyless import without contracts has no owner body; contracts retain their expression nodes and parameter bindings in the shared synthetic contract body. Diagnosed function visibility markers do not create visibility on `ExternItem`.
 

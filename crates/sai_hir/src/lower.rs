@@ -1418,7 +1418,7 @@ pub fn lower_extern_block_owner<'hir>(
     validate_current_item_metadata(entry, declaration.attrs(), visibility, context)?;
     let info = extern_block_info(&declaration, context.symbols)?;
     validate_owner_def_path(owner, expected_path, info.path.clone(), context)?;
-    let disambiguator = extern_block_disambiguator(entry, &info.path, context)?;
+    let disambiguator = extern_block_disambiguator(entry, &info.path, item_tree, context)?;
     if !matches!(
         expected_path.data().last(),
         Some(component) if component.disambiguator == disambiguator
@@ -1549,7 +1549,7 @@ pub fn lower_extern_item_owner<'hir>(
         block_path.data().last(),
         Some(component)
             if component.disambiguator
-                == extern_block_disambiguator(block_entry, &block_info.path, context)?
+                == extern_block_disambiguator(block_entry, &block_info.path, item_tree, context)?
     ) {
         return Err(HirLoweringError::ItemTreeEntryMismatch);
     }
@@ -5791,8 +5791,21 @@ fn extern_block_info(
 fn extern_block_disambiguator<'hir>(
     entry: &crate::item_tree::ItemTreeEntry,
     component: &DefPathData,
+    item_tree: &ItemTree,
     context: &HirLoweringContext<'_, 'hir>,
 ) -> Result<u32, HirLoweringError> {
+    // Use the target-filtered ItemTree as the membership set, but walk the
+    // source AST to preserve canonical source-order disambiguators.
+    let retained_extern_blocks = item_tree
+        .items
+        .iter()
+        .filter(|candidate| candidate.kind == ItemTreeKind::ExternBlock)
+        .map(|candidate| candidate.ast_id)
+        .collect::<HashSet<_>>();
+    if !retained_extern_blocks.contains(&entry.ast_id) {
+        return Err(HirLoweringError::ItemTreeEntryMismatch);
+    }
+
     let source_file = ast::SourceFile::cast(context.root.clone())
         .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
     let mut disambiguator = 0u32;
@@ -5805,7 +5818,9 @@ fn extern_block_disambiguator<'hir>(
             .ast_id(&declaration)
             .map(ast::AstId::erase)
             .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
-        if extern_block_info(&declaration, context.symbols)?.path != *component {
+        if !retained_extern_blocks.contains(&ast_id)
+            || extern_block_info(&declaration, context.symbols)?.path != *component
+        {
             continue;
         }
         if ast_id == entry.ast_id {

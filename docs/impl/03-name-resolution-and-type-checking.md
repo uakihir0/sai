@@ -740,6 +740,21 @@ are not indexed. The bridge still does not resolve implicit `self`, predicate
 paths, or types; nested interface type declarations and other owner kinds
 remain deferred.
 
+**Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
+adapter reuses Phase 1's extern-function descriptors and their canonical
+block/child `OwnerId`s, rebinds both AST IDs from current target-filtered
+inputs, lowers the extern block and function item in a temporary arena, and applies the
+predicate-only restriction scan to retained `requires` and `ensures`
+expressions. It includes bodyless extern declarations with contracts and
+returns per-owner results. Per spec/09 §9.3.1, extern `requires` are checked at
+call sites while `ensures` are trusted facts and are never checked at runtime;
+this bridge handles syntax restrictions only and does not implement those
+semantics or name/type resolution. Test results and review findings are recorded
+in [`design/implementation-review.md`](../design/implementation-review.md).
+Hostile review found no remaining issues after the target-filtered block
+disambiguator correction. Other owner kinds and tracked `hir_owner`/full `resolve_owner`
+remain deferred.
+
 ### 3.4.6 Visibility
 
 `visible(e, M)` (spec/04 §4.6.1) is evaluated for every path segment that names an item or a member, at the point where the segment is resolved: by the resolver for module members and `use` items, and by the type checker for type-relative members (variants never fail, since they have the enum's visibility; inherent associated functions and methods, spec/05 §5.13.5) and for fields (`PRIVATE_FIELD`, spec/04 §4.6.3, §4.6.4). The visibility of an entity is read from its `ItemTree` entry or from the dependency's metadata, never from HIR, so the check does not depend on the target's body.

@@ -208,6 +208,9 @@ pub struct Phase1PackageScopes {
     /// module and source order. Distinct declarations without a refinement
     /// clause are not included.
     pub refinement_predicate_owners: Vec<RefinementPredicateOwnerDescriptor>,
+    /// Extern function owners in module, block, and source order. Each
+    /// descriptor retains both the function and its enclosing block identity.
+    pub extern_function_owners: Vec<ExternFunctionOwnerDescriptor>,
     /// Target-attribute and Phase-1 declaration diagnostics, sorted by
     /// source-relative file path and byte offset. Module-tree diagnostics
     /// remain owned by `module_tree`.
@@ -260,6 +263,17 @@ pub struct RefinementPredicateOwnerDescriptor {
     pub file: FileId,
     pub item_id: ErasedAstId,
     pub kind: RefinementPredicateOwnerKind,
+}
+
+/// Source descriptor for one function declared inside a top-level extern
+/// block.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ExternFunctionOwnerDescriptor {
+    pub owner: OwnerId,
+    pub block_owner: OwnerId,
+    pub file: FileId,
+    pub block_item_id: ErasedAstId,
+    pub item_id: ErasedAstId,
 }
 
 /// A finalized source-package scope that may be imported by a consumer.
@@ -424,6 +438,7 @@ pub fn collect_phase1(
     let mut function_owners = Vec::new();
     let mut invariant_owners = Vec::new();
     let mut refinement_predicate_owners = Vec::new();
+    let mut extern_function_owners = Vec::new();
     let mut diagnostics = Vec::new();
     let mut export_candidates = Vec::new();
 
@@ -522,6 +537,13 @@ pub fn collect_phase1(
                             .into_iter()
                             .next()
                             .ok_or(PackageScopesError::MissingAstNode)?;
+                        extern_function_owners.push(ExternFunctionOwnerDescriptor {
+                            owner: OwnerId { def_id: child_id },
+                            block_owner: OwnerId { def_id: block_id },
+                            file: module.file,
+                            block_item_id: entry.ast_id,
+                            item_id: child.ast_id,
+                        });
                         bind_declaration(
                             child,
                             DefKind::ExternFn,
@@ -739,6 +761,7 @@ pub fn collect_phase1(
         function_owners,
         invariant_owners,
         refinement_predicate_owners,
+        extern_function_owners,
         diagnostics,
     })
 }
@@ -4029,6 +4052,7 @@ mod tests {
                 function_owners: Vec::new(),
                 invariant_owners: Vec::new(),
                 refinement_predicate_owners: Vec::new(),
+                extern_function_owners: Vec::new(),
                 diagnostics: Vec::new(),
             };
             Self {
@@ -7154,6 +7178,56 @@ mod tests {
         };
         let path = paths.resolve_def_id(def_id).unwrap().unwrap();
         assert_eq!(path.data().last().unwrap().disambiguator, 0);
+        assert_eq!(scopes.extern_function_owners.len(), 2);
+        let descriptor = scopes.extern_function_owners[0];
+        let block_entry = &fixture.filtered.item_tree.items[0];
+        let child_entry = &block_entry.children[0];
+        assert_eq!(descriptor.file, fixture.file);
+        assert_eq!(descriptor.block_item_id, block_entry.ast_id);
+        assert_eq!(descriptor.item_id, child_entry.ast_id);
+        assert_eq!(
+            scopes
+                .extern_function_owners
+                .iter()
+                .map(|descriptor| descriptor.item_id)
+                .collect::<Vec<_>>(),
+            block_entry
+                .children
+                .iter()
+                .map(|child| child.ast_id)
+                .collect::<Vec<_>>(),
+            "diagnosed extern child attributes preserve recoverable owners"
+        );
+        assert_eq!(
+            paths
+                .resolve_def_id(descriptor.block_owner.def_id.to_def_id())
+                .unwrap()
+                .unwrap()
+                .data()
+                .last()
+                .unwrap()
+                .data,
+            DefPathData::ExternBlock {
+                abi: fixture.symbols.intern("wasm").unwrap(),
+                module: Some(fixture.symbols.intern("env").unwrap()),
+            }
+        );
+        let block_path = paths
+            .resolve_def_id(descriptor.block_owner.def_id.to_def_id())
+            .unwrap()
+            .unwrap();
+        let owner_path = paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &owner_path.data()[..block_path.data().len()],
+            block_path.data()
+        );
+        assert_eq!(
+            owner_path.data().last().unwrap().data,
+            DefPathData::ValueNs(read)
+        );
         assert!(
             scopes
                 .diagnostics
@@ -7515,6 +7589,30 @@ mod tests {
         let (scopes, paths) = fixture.collect();
         assert!(scopes.modules[0].declared.is_empty());
         assert_eq!(paths.len().unwrap(), 4);
+        assert_eq!(scopes.extern_function_owners.len(), 2);
+        assert!(
+            scopes
+                .extern_function_owners
+                .iter()
+                .all(|descriptor| descriptor.file == fixture.file
+                    && descriptor.block_item_id == fixture.filtered.item_tree.items[0].ast_id)
+        );
+        assert_eq!(
+            scopes
+                .extern_function_owners
+                .iter()
+                .map(|descriptor| descriptor.item_id)
+                .collect::<Vec<_>>(),
+            fixture.filtered.item_tree.items[0]
+                .children
+                .iter()
+                .map(|child| child.ast_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scopes.extern_function_owners[0].block_owner,
+            scopes.extern_function_owners[1].block_owner
+        );
 
         let block_data = DefPathData::ExternBlock {
             abi: fixture.symbols.intern("wasm").unwrap(),

@@ -12,8 +12,9 @@ use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
 use sai_hir::lower::{
-    HirLoweringContext, HirLoweringError, lower_distinct_owner, lower_function_owner,
-    lower_invariant_owner, lower_refined_owner,
+    ExternItemIds, HirLoweringContext, HirLoweringError, lower_distinct_owner,
+    lower_extern_block_owner, lower_extern_item_owner, lower_function_owner, lower_invariant_owner,
+    lower_refined_owner,
 };
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
@@ -2447,7 +2448,14 @@ impl RootDatabase {
         let retained_item_kinds = filtered_item_tree
             .items
             .iter()
-            .map(|entry| (entry.ast_id, entry.kind))
+            .flat_map(|entry| {
+                std::iter::once((entry.ast_id, entry.kind)).chain(
+                    entry
+                        .children
+                        .iter()
+                        .map(|child| (child.ast_id, child.kind)),
+                )
+            })
             .collect();
         let source_ref = SourceRef {
             path: snapshot_file.path().to_owned(),
@@ -2805,6 +2813,146 @@ impl RootDatabase {
                             &inputs.source_ref,
                             inputs.source.as_ref(),
                         )
+                        .map_err(OwnerControlFlowResolutionError::Labels),
+                        None => Ok(Vec::new()),
+                    }
+                })();
+                owners.push(PredicateOwnerResolution {
+                    owner: descriptor.owner,
+                    resolution,
+                    lowering_diagnostics,
+                });
+            }
+            group_start = group_end;
+        }
+        Ok(PredicateOwnerResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Lowers top-level extern function owners and diagnoses their contract
+    /// predicates.
+    ///
+    /// Both the enclosing extern block and its function are lowered in the
+    /// same temporary HIR arena because the function owner validates its
+    /// source-ordered slot against the block owner. Only owned diagnostics
+    /// and errors escape this adapter.
+    pub fn resolve_extern_function_predicates(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = &collection.scopes.extern_function_owners;
+        let mut owners = Vec::with_capacity(descriptors.len());
+        let mut group_start = 0;
+        while group_start < descriptors.len() {
+            let file = descriptors[group_start].file;
+            let mut group_end = group_start + 1;
+            while group_end < descriptors.len() && descriptors[group_end].file == file {
+                group_end += 1;
+            }
+            let inputs =
+                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        owners.extend(descriptors[group_start..group_end].iter().map(
+                            |descriptor| PredicateOwnerResolution {
+                                owner: descriptor.owner,
+                                resolution: Err(error.clone()),
+                                lowering_diagnostics: Vec::new(),
+                            },
+                        ));
+                        group_start = group_end;
+                        continue;
+                    }
+                };
+
+            for descriptor in &descriptors[group_start..group_end] {
+                let mut lowering_diagnostics = Vec::new();
+                let resolution = (|| {
+                    if inputs.retained_item_kinds.get(&descriptor.block_item_id)
+                        != Some(&ItemTreeKind::ExternBlock)
+                        || inputs.retained_item_kinds.get(&descriptor.item_id)
+                            != Some(&ItemTreeKind::ExternFn)
+                    {
+                        return Err(
+                            OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+
+                    let def_paths = self
+                        .def_paths
+                        .get(&descriptor.owner.def_id.package())
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+                    let block_path = def_paths
+                        .resolve_def_id(descriptor.block_owner.def_id.to_def_id())
+                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.block_owner,
+                        ))?;
+                    let expected_path = def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+
+                    let arena = HirArena::new();
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.parsed.root,
+                        &arena,
+                        &self.symbols,
+                        def_paths,
+                    );
+                    let (block_hir, _block_source_map) = lower_extern_block_owner(
+                        descriptor.block_owner,
+                        &block_path,
+                        &inputs.filtered_item_tree,
+                        descriptor.block_item_id,
+                        &context,
+                    )
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                    lowering_diagnostics.extend(block_hir.diagnostics.iter().cloned());
+
+                    let (hir_owner, _source_map) = lower_extern_item_owner(
+                        descriptor.owner,
+                        &expected_path,
+                        &block_hir,
+                        ExternItemIds {
+                            block: descriptor.block_item_id,
+                            item: descriptor.item_id,
+                        },
+                        &inputs.filtered_item_tree,
+                        &context,
+                    )
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                    lowering_diagnostics.extend(hir_owner.diagnostics.iter().cloned());
+                    match hir_owner.body {
+                        Some(body) => resolve_owner_control_flow(
+                            body,
+                            &inputs.source_ref,
+                            inputs.source.as_ref(),
+                            &self.symbols,
+                        )
+                        .map(|result| result.diagnostics)
                         .map_err(OwnerControlFlowResolutionError::Labels),
                         None => Ok(Vec::new()),
                     }
@@ -3539,6 +3687,93 @@ mod tests {
                 .resolution()
                 .expect("valid refined owner lowers")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn extern_function_adapter_checks_bodyless_requires_and_ensures_per_owner() {
+        let root = concat!(
+            "unsafe extern \"wasm\" module \"env\" {\n",
+            "  fn contracted(value: Bool) -> Bool ",
+            "requires { break 'missing; } ",
+            "ensures { return true; }\n",
+            "  fn safe(value: Bool) -> Bool ",
+            "requires { value } ",
+            "ensures { result }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("extern function owners collect");
+        assert_eq!(collection.scopes().extern_function_owners.len(), 2);
+
+        let resolved = database
+            .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
+            .expect("extern function predicates resolve");
+
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 2);
+        assert_eq!(
+            resolved.owners()[0]
+                .resolution()
+                .expect("first extern function lowers")
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::InvalidContractExpression,
+                sai_diagnostics::Code::InvalidContractExpression,
+            ]
+        );
+        assert!(
+            resolved.owners()[1]
+                .resolution()
+                .expect("second extern function lowers")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn extern_function_adapter_uses_target_filtered_block_disambiguators() {
+        let root = concat!(
+            "@target(\"wasm64-core\")\n",
+            "extern \"wasm\" module \"env\" { fn filtered() }\n",
+            "extern \"wasm\" module \"env\" {\n",
+            "  fn retained() -> Bool requires { return true; }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("target-filtered extern function owners collect");
+        assert_eq!(collection.scopes().extern_function_owners.len(), 1);
+
+        let resolved = database
+            .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
+            .expect("target-filtered extern function predicate resolves");
+
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 1);
+        assert_eq!(
+            resolved.owners()[0]
+                .resolution()
+                .expect("retained extern function lowers")
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::InvalidContractExpression]
         );
     }
 
