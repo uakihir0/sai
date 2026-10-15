@@ -1025,6 +1025,76 @@ impl TraitImplHeaderResolutions {
     }
 }
 
+/// Test-only references found in one direct top-level type declaration.
+///
+/// Struct and resource fields, alias targets, enum payloads, and declaration
+/// generic bounds are attributed to their enclosing top-level owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeOwnerTestOnlyResolution {
+    owner: OwnerId,
+    kind: TopLevelOwnerKind,
+    test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl TypeOwnerTestOnlyResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn kind(&self) -> TopLevelOwnerKind {
+        self.kind
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution.as_ref()
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Provenance-tagged test-only diagnostics for direct top-level type owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeOwnerTestOnlyResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<TypeOwnerTestOnlyResolution>,
+}
+
+impl TypeOwnerTestOnlyResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[TypeOwnerTestOnlyResolution] {
+        &self.owners
+    }
+}
+
 /// The kind of associated trait or impl declaration checked by the
 /// test-only reference pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2159,6 +2229,35 @@ fn owner_test_only_path_candidates_with_body(
     let signature = match owner.node {
         OwnerNode::Item(item) => match item.kind {
             ItemKind::Fn { sig, generics, .. } => Some((sig, generics)),
+            ItemKind::Struct { generics, fields } => {
+                header_generics.push(generics);
+                work.extend(fields.iter().map(|field| Work::Ty(field.ty)));
+                None
+            }
+            ItemKind::Alias { generics, ty } => {
+                header_generics.push(generics);
+                work.push(Work::Ty(ty));
+                None
+            }
+            ItemKind::Enum { generics, variants } => {
+                header_generics.push(generics);
+                for variant in variants.iter() {
+                    match variant.shape {
+                        VariantShape::Unit => {}
+                        VariantShape::Tuple(types) => {
+                            work.extend(types.iter().rev().map(Work::Ty));
+                        }
+                        VariantShape::Record(fields) => {
+                            work.extend(fields.iter().rev().map(|field| Work::Ty(field.ty)));
+                        }
+                    }
+                }
+                None
+            }
+            ItemKind::Resource { fields } => {
+                work.extend(fields.iter().map(|field| Work::Ty(field.ty)));
+                None
+            }
             ItemKind::Trait { .. } | ItemKind::Impl { .. } => None,
             _ => None,
         },
@@ -2204,6 +2303,10 @@ fn owner_test_only_path_candidates_with_body(
     match owner.node {
         OwnerNode::Item(item) => match item.kind {
             ItemKind::Fn { .. } => {}
+            ItemKind::Struct { .. }
+            | ItemKind::Alias { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::Resource { .. } => {}
             ItemKind::Trait {
                 generics,
                 supertraits,
@@ -3155,6 +3258,9 @@ fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
     let generics = match owner.node {
         OwnerNode::Item(item) => match item.kind {
             ItemKind::Fn { generics, .. }
+            | ItemKind::Struct { generics, .. }
+            | ItemKind::Alias { generics, .. }
+            | ItemKind::Enum { generics, .. }
             | ItemKind::Distinct { generics, .. }
             | ItemKind::Trait { generics, .. }
             | ItemKind::Impl { generics, .. } => generics,
@@ -6111,6 +6217,180 @@ impl RootDatabase {
             group_start = group_end;
         }
         Ok(PredicateOwnerResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Diagnoses test-only references in direct top-level type declarations.
+    ///
+    /// The pass checks struct and resource fields, alias targets, enum
+    /// payloads, declaration generic bounds, and where clauses. Fields and
+    /// variants are attributed to their enclosing top-level owner. Top-level
+    /// resources are included because their field types are declaration
+    /// references even though resources do not declare generic parameters.
+    pub fn resolve_type_owner_test_only_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<TypeOwnerTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.kind,
+                    TopLevelOwnerKind::Struct
+                        | TopLevelOwnerKind::Alias
+                        | TopLevelOwnerKind::Enum
+                        | TopLevelOwnerKind::Resource
+                )
+            })
+            .collect::<Vec<_>>();
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let mut owners = Vec::with_capacity(descriptors.len());
+
+        for descriptor in descriptors {
+            let mut lowering_diagnostics = Vec::new();
+            let inputs = match self.current_owner_inputs(
+                snapshot,
+                descriptor.file,
+                &collection.target_cfg,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    owners.push(TypeOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        test_only_path_resolution: Err(error.clone()),
+                        test_only_diagnostics: Err(error),
+                        lowering_diagnostics,
+                    });
+                    continue;
+                }
+            };
+
+            let analysis: Result<
+                (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                OwnerControlFlowResolutionError,
+            > = (|| {
+                let owner_descriptor = find_top_level_owner_descriptor(
+                    &top_level_owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    descriptor.kind,
+                )?;
+                let expected_item_kind = match descriptor.kind {
+                    TopLevelOwnerKind::Struct => ItemTreeKind::Struct,
+                    TopLevelOwnerKind::Alias => ItemTreeKind::Alias,
+                    TopLevelOwnerKind::Enum => ItemTreeKind::Enum,
+                    TopLevelOwnerKind::Resource => ItemTreeKind::Resource,
+                    _ => {
+                        return Err(
+                            OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+                };
+                if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&expected_item_kind)
+                {
+                    return Err(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                }
+
+                let def_paths = self
+                    .def_paths
+                    .get(&descriptor.owner.def_id.package())
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let expected_path = def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.parsed.root,
+                    &arena,
+                    &self.symbols,
+                    def_paths,
+                );
+                let (hir_owner, _source_map) = lower_top_level_owner(
+                    owner_descriptor,
+                    &expected_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )?;
+                lowering_diagnostics.extend(hir_owner.diagnostics.iter().cloned());
+
+                let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let candidates = owner_test_only_path_candidates(&hir_owner);
+                let generic_parameters = owner_generic_parameters(&hir_owner);
+                let mut path_resolution = OwnerTestOnlyPathResolution {
+                    owner: descriptor.owner,
+                    paths: HashMap::new(),
+                };
+                let mut diagnostics = collect_test_only_module_head_diagnostics(
+                    descriptor.owner,
+                    &candidates,
+                    &generic_parameters,
+                    &module_scope,
+                    &mut path_resolution,
+                    &self.symbols,
+                    &inputs,
+                    snapshot,
+                )?;
+                sort_phase1_diagnostics(&mut diagnostics);
+                Ok((path_resolution, diagnostics))
+            })();
+
+            match analysis {
+                Ok((path_resolution, diagnostics)) => {
+                    owners.push(TypeOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        test_only_path_resolution: Ok(path_resolution),
+                        test_only_diagnostics: Ok(diagnostics),
+                        lowering_diagnostics,
+                    });
+                }
+                Err(error) => {
+                    owners.push(TypeOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        test_only_path_resolution: Err(error.clone()),
+                        test_only_diagnostics: Err(error),
+                        lowering_diagnostics,
+                    });
+                }
+            }
+        }
+
+        Ok(TypeOwnerTestOnlyResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -12455,6 +12735,331 @@ mod tests {
                 .expect("child member remains available")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn type_owner_test_only_paths_cover_direct_top_level_types() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "type Alias<T: fixture.AliasBound, const N: fixture.ConstParamType> = ",
+            "fn() -> Box<fixture.AliasTarget> effects { fixture.alias_effect }\n",
+            "type Record<T: fixture.RecordBound> where T: fixture.RecordWhere {\n",
+            "  direct: Fixture\n",
+            "  nested: Box<fixture.RecordField>\n",
+            "}\n",
+            "enum Choice<T: fixture.EnumBound> where T: fixture.EnumWhere {\n",
+            "  Tuple(T, fixture.TuplePayload)\n",
+            "  Record(value: fixture.RecordPayload)\n",
+            "}\n",
+            "resource Handle {\n",
+            "  value: fixture.ResourceField\n",
+            "}\n",
+            "type Shadow<Fixture: fixture.ShadowBound> = Fixture\n",
+            "@target(\"wasm64-core\")\n",
+            "type Filtered = fixture.Filtered\n",
+        );
+        let child = "type ChildAlias = Fixture\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only type imports collect");
+        let results = database
+            .resolve_type_owner_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("top-level type declarations resolve");
+        assert!(results.matches_snapshot(&snapshot));
+        assert!(results.matches_collection(&collection));
+        assert_eq!(results.target_cfg(), &target_cfg);
+        assert_eq!(
+            results
+                .owners()
+                .iter()
+                .map(TypeOwnerTestOnlyResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Struct,
+                TopLevelOwnerKind::Enum,
+                TopLevelOwnerKind::Resource,
+                TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Alias,
+            ],
+            "aliases, records, enums, resources, and the child alias are checked; the wasm64 item is filtered"
+        );
+
+        let span_for = |needle: &str, head: &str, occurrence: usize| {
+            let start = root
+                .match_indices(needle)
+                .nth(occurrence)
+                .expect("diagnostic source fragment exists")
+                .0
+                + needle
+                    .find(head)
+                    .expect("diagnostic head occurs in source fragment");
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + head.len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        fn diagnostics_for(owner: &TypeOwnerTestOnlyResolution) -> &[Diagnostic] {
+            owner
+                .test_only_diagnostics()
+                .expect("type owner diagnostics succeed")
+        }
+        let diagnostic_spans = |owner: &TypeOwnerTestOnlyResolution| {
+            diagnostics_for(owner)
+                .iter()
+                .map(|diagnostic| {
+                    assert_eq!(
+                        diagnostic.code,
+                        sai_diagnostics::Code::TestDependencyOutsideTest
+                    );
+                    diagnostic
+                        .primary()
+                        .expect("test-only type reference has a primary span")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            diagnostic_spans(&results.owners()[0]),
+            [
+                span_for("fixture.AliasBound", "fixture", 0),
+                span_for("fixture.ConstParamType", "fixture", 0),
+                span_for("fixture.AliasTarget", "fixture", 0),
+                span_for("fixture.alias_effect", "fixture", 0),
+            ],
+            "alias type and const-generic bounds, nested target types, and function-pointer effects are checked"
+        );
+        assert_eq!(
+            diagnostic_spans(&results.owners()[1]),
+            [
+                span_for("fixture.RecordBound", "fixture", 0),
+                span_for("fixture.RecordWhere", "fixture", 0),
+                span_for("direct: Fixture", "Fixture", 0),
+                span_for("fixture.RecordField", "fixture", 0),
+            ],
+            "record generic bounds, where clauses, imported names, and field types are checked"
+        );
+        assert_eq!(
+            diagnostic_spans(&results.owners()[2]),
+            [
+                span_for("fixture.EnumBound", "fixture", 0),
+                span_for("fixture.EnumWhere", "fixture", 0),
+                span_for("fixture.TuplePayload", "fixture", 0),
+                span_for("fixture.RecordPayload", "fixture", 0),
+            ],
+            "enum bounds, where clauses, tuple payloads, and record payloads are checked"
+        );
+        assert_eq!(
+            diagnostic_spans(&results.owners()[3]),
+            [span_for("fixture.ResourceField", "fixture", 0)],
+            "resource field types are attributed to the resource owner"
+        );
+        assert_eq!(
+            diagnostic_spans(&results.owners()[4]),
+            [span_for("fixture.ShadowBound", "fixture", 0)],
+            "generic parameters shadow matching imported type names without hiding bounds"
+        );
+        assert!(
+            diagnostic_spans(&results.owners()[5]).is_empty(),
+            "a test-only type import from the root file is not visible to the child file"
+        );
+
+        let package_path = |occurrence: usize| {
+            let start = root
+                .match_indices("acme:test-support/fixtures")
+                .nth(occurrence)
+                .expect("test-only use path exists")
+                .0;
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (start + "acme:test-support/fixtures".len()) as u32,
+                    ),
+                )
+                .expect("package path range is ordered"),
+            )
+        };
+        let alias_package_path = package_path(0);
+        let type_package_path = package_path(1);
+        for owner in results.owners() {
+            assert!(
+                diagnostics_for(owner).iter().all(|diagnostic| {
+                    let span = &diagnostic
+                        .primary()
+                        .expect("diagnostic has a primary span")
+                        .span;
+                    let reference = root
+                        .get(span.range.start().to_usize()..span.range.end().to_usize())
+                        .expect("diagnostic span lies in the root source");
+                    let expected = if reference == "Fixture" {
+                        &type_package_path
+                    } else {
+                        &alias_package_path
+                    };
+                    diagnostic.related().iter().any(|related| {
+                        matches!(
+                            related,
+                            Related::DeclaredHere { location, .. } if &location.span == expected
+                        )
+                    })
+                }),
+                "diagnostics name the exact import PKG_PATH that introduced their head"
+            );
+            assert_eq!(
+                owner
+                    .test_only_path_resolution()
+                    .expect("non-expression type path results succeed")
+                    .paths()
+                    .len(),
+                diagnostics_for(owner).len(),
+                "one path result is stored for each rejected head"
+            );
+            assert!(
+                owner
+                    .test_only_path_resolution()
+                    .expect("non-expression type path results succeed")
+                    .paths()
+                    .values()
+                    .all(|path| path.base == Res::Err),
+                "rejected top-level type heads become error sentinels"
+            );
+        }
+
+        // Test-only classification follows import provenance even if Phase 1
+        // already resolved the binding to a definition.
+        let fixture_def = collection.scopes().top_level_owners[0]
+            .owner
+            .def_id
+            .to_def_id();
+        let mut resolved_import_collection = collection.clone();
+        let root_scope =
+            &mut resolved_import_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        for binding in root_scope.scope.values_mut() {
+            let import_index = match binding.origin {
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+                BindingOrigin::Decl => continue,
+            };
+            let import = &mut root_scope.imports[import_index.0 as usize];
+            if import.test_only {
+                let resolved = if import.item_index.is_some() {
+                    Res::Def(DefKind::Alias, fixture_def)
+                } else {
+                    Res::Def(DefKind::Module, fixture_def)
+                };
+                import.res = resolved;
+                binding.res = resolved;
+            }
+        }
+        let resolved_import_results = database
+            .resolve_type_owner_test_only_paths(
+                &resolved_import_collection,
+                &module_tree,
+                &snapshot,
+            )
+            .expect("resolved test-only import results are still classified by origin");
+        for (resolved, baseline) in resolved_import_results
+            .owners()
+            .iter()
+            .zip(results.owners())
+        {
+            assert_eq!(
+                diagnostic_spans(resolved),
+                diagnostic_spans(baseline),
+                "test-only import origins remain rejected after their results become definitions"
+            );
+        }
+
+        let mut ordinary_collection = collection.clone();
+        for import in &mut ordinary_collection.scopes.modules[ModuleId::ROOT.raw() as usize].imports
+        {
+            import.test_only = false;
+        }
+        let ordinary_results = database
+            .resolve_type_owner_test_only_paths(&ordinary_collection, &module_tree, &snapshot)
+            .expect("ordinary imports remain valid");
+        assert!(
+            ordinary_results.owners().iter().all(|owner| {
+                matches!(owner.test_only_diagnostics(), Ok(diagnostics) if diagnostics.is_empty())
+            }),
+            "ordinary import origins do not produce test-only diagnostics"
+        );
+
+        // A malformed type descriptor affects only that owner.
+        let mut broken_collection = collection.clone();
+        broken_collection.scopes.top_level_owners[0].item_id = ast::ErasedAstId::new(u32::MAX);
+        let isolated = database
+            .resolve_type_owner_test_only_paths(&broken_collection, &module_tree, &snapshot)
+            .expect("owner descriptor failures remain isolated");
+        assert!(
+            isolated.owners()[0].test_only_diagnostics().is_err(),
+            "the malformed alias descriptor reports its own failure"
+        );
+        assert!(
+            isolated
+                .owners()
+                .iter()
+                .skip(1)
+                .all(|owner| owner.test_only_diagnostics().is_ok()),
+            "remaining type declarations continue resolving"
+        );
+    }
+
+    #[test]
+    fn type_owner_test_only_paths_use_current_target_descriptors() {
+        let root = concat!(
+            "@target(\"wasm64-core\")\n",
+            "type Hidden = Fixture\n",
+            "type Visible = Fixture\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("target-filtered type owners collect");
+        let results = database
+            .resolve_type_owner_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("current target type owners resolve");
+        assert_eq!(results.owners().len(), 1);
+        assert_eq!(results.owners()[0].kind(), TopLevelOwnerKind::Alias);
+        assert!(
+            results.owners()[0]
+                .test_only_diagnostics()
+                .expect("visible alias diagnostics succeed")
+                .is_empty(),
+            "the active alias is checked and no filtered owner leaks into results"
         );
     }
 
