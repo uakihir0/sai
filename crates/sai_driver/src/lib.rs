@@ -1275,8 +1275,8 @@ impl Phase1PackageScopesCollection {
     }
 }
 
-/// Owned control-flow, local, module, and test-only results for one top-level
-/// function owner.
+/// Owned control-flow, local, module, type-path, and test-only results for
+/// one top-level function owner.
 ///
 /// The temporary HIR arena and snapshot-bound source map used to produce these
 /// values are discarded before they are returned.
@@ -1286,6 +1286,7 @@ pub struct FunctionOwnerResolution {
     resolution: Result<LabelResolution, FunctionOwnerResolutionError>,
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
+    type_path_resolution: Result<Option<TypeOwnerPathResolution>, FunctionOwnerResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, FunctionOwnerResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, FunctionOwnerResolutionError>,
@@ -1317,6 +1318,17 @@ impl FunctionOwnerResolution {
         &self,
     ) -> Result<Option<&ModuleResolution>, &FunctionOwnerResolutionError> {
         self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns first-segment resolution for type paths in the function
+    /// signature and body. Qualified suffixes remain available to later
+    /// member-scope resolution.
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<Option<&TypeOwnerPathResolution>, &FunctionOwnerResolutionError> {
+        self.type_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
     }
@@ -1473,9 +1485,11 @@ impl TypeOwnerModulePathError {
     }
 }
 
-/// Partial type-path and test-only resolution for one direct top-level type
-/// declaration. Struct and resource fields, alias targets, enum payloads,
-/// and declaration generic bounds are attributed to their enclosing owner.
+/// Partial type-path resolution for one type or function owner.
+///
+/// For top-level type declarations, fields, targets, payloads, and declaration
+/// generic bounds belong to the enclosing owner. Function results cover
+/// signature types, generic bounds, and body type paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypeOwnerResolution {
     owner: OwnerId,
@@ -4369,7 +4383,8 @@ fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
 fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> {
     let generics = match owner.node {
         OwnerNode::Item(item) => match item.kind {
-            ItemKind::Struct { generics, .. }
+            ItemKind::Fn { generics, .. }
+            | ItemKind::Struct { generics, .. }
             | ItemKind::Alias { generics, .. }
             | ItemKind::Enum { generics, .. } => generics,
             ItemKind::Resource { .. } => return HashMap::new(),
@@ -6120,6 +6135,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                type_path_resolution: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -6139,6 +6155,7 @@ impl RootDatabase {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
                 let mut module_resolution = None;
+                let mut type_path_resolution = None;
                 let mut test_only_path_resolution = None;
                 let mut test_only_diagnostics = None;
                 let resolution = (|| {
@@ -6199,9 +6216,39 @@ impl RootDatabase {
                         ),
                         Err(error) => Err(error.clone()),
                     };
+                    let rejected_type_paths = function_paths
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.kind == OwnerPathKind::Type
+                                && resolved_function_paths
+                                    .paths
+                                    .contains_key(&candidate.hir_id)
+                        })
+                        .map(|candidate| candidate.hir_id)
+                        .collect::<HashSet<_>>();
                     test_only_path_resolution = Some(match &module_scope {
                         Ok(_) => Ok(Some(resolved_function_paths)),
                         Err(error) => Err(error.clone()),
+                    });
+                    let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                    type_path_resolution = Some(match (&module_scope, &self.primitive_prelude) {
+                        (Ok(module_scope), Ok(primitive_prelude)) => {
+                            Ok(Some(resolve_type_owner_module_paths(
+                                descriptor.owner,
+                                &function_paths,
+                                &generic_resolutions,
+                                primitive_prelude,
+                                &rejected_type_paths,
+                                module_scope,
+                                None,
+                                descriptor.owner.def_id.package(),
+                                None,
+                            )))
+                        }
+                        (Err(error), _) => Err(error.clone()),
+                        (_, Err(error)) => Err(OwnerControlFlowResolutionError::PrimitivePrelude(
+                            error.clone(),
+                        )),
                     });
                     match hir_owner.body {
                         Some(body) => {
@@ -6281,6 +6328,8 @@ impl RootDatabase {
                     local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let module_resolution =
                     module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let type_path_resolution =
+                    type_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let test_only_path_resolution =
                     test_only_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let test_only_diagnostics =
@@ -6290,6 +6339,7 @@ impl RootDatabase {
                     resolution,
                     local_resolution,
                     module_resolution,
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -10685,6 +10735,158 @@ mod tests {
     }
 
     #[test]
+    fn function_owner_adapter_resolves_type_path_heads_separately() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "type Array<T> = T\n",
+            "fn typed<T, const Count: U32>(value: T, optional: Option<T>, ",
+            "qualified: child_alias.Widget) -> U32 { let local: U32 = 0; child_alias }\n",
+            "fn const_type_shadow<const U32: Bool>(value: U32) {}\n",
+            "fn module_type_shadow(value: Array<U32>) {}\n",
+            "fn bodyless<T>(value: T) -> U32\n",
+        );
+        let child = "pub fn child_fn() {}\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("function module scopes collect");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let symbol = |name: &str| {
+            root_scope
+                .scope
+                .keys()
+                .copied()
+                .find(|symbol| {
+                    database
+                        .resolve_symbol(*symbol)
+                        .is_ok_and(|resolved| resolved.as_ref() == name)
+                })
+                .unwrap_or_else(|| panic!("root module contains `{name}`"))
+        };
+        let child_alias = root_scope
+            .scope
+            .get(&symbol("child_alias"))
+            .expect("child alias has a binding")
+            .res;
+
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analysis resolves type path heads");
+        let generic_def_id = |owner: OwnerId, name: &str, is_const: bool| {
+            let name = database
+                .symbols
+                .intern(name)
+                .expect("generic name is interned");
+            database
+                .def_paths
+                .get(&owner.def_id.package())
+                .expect("package definition paths are available")
+                .intern_generic_params(owner.def_id, &[(name, is_const, 0)])
+                .expect("function generic has a stable definition identity")[0]
+                .to_def_id()
+        };
+        let typed = &resolved.owners()[0];
+        let type_generic = generic_def_id(typed.owner(), "T", false);
+        let type_paths = typed
+            .type_path_resolution()
+            .expect("type path analysis succeeds")
+            .expect("typed function has a type path result");
+        assert!(
+            type_paths
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Def(DefKind::TyParam, type_generic)),
+            "function type parameters resolve in signature type paths"
+        );
+        assert_eq!(
+            type_paths
+                .paths()
+                .values()
+                .filter(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32))
+                .count(),
+            3,
+            "primitive type heads resolve in the const parameter, return type, and body annotation"
+        );
+        assert!(
+            type_paths.paths().values().any(|path| {
+                path.base == child_alias && path.resolved_segments == 1 && path.segment_count == 2
+            }),
+            "qualified type paths resolve only their module head"
+        );
+        assert!(
+            type_paths.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Option")
+            }),
+            "non-primitive Prelude candidates remain deferred"
+        );
+        let module_paths = typed
+            .module_resolution()
+            .expect("expression module analysis succeeds")
+            .expect("typed function has a module result");
+        assert_eq!(module_paths.paths.len(), 1);
+        assert_eq!(
+            module_paths.paths.values().next().map(|path| path.base),
+            Some(child_alias),
+            "type candidates stay out of expression module resolution"
+        );
+
+        let const_type_shadow = &resolved.owners()[1];
+        let const_generic = generic_def_id(const_type_shadow.owner(), "U32", true);
+        let const_type_paths = const_type_shadow
+            .type_path_resolution()
+            .expect("const generic type analysis succeeds")
+            .expect("const generic function has a type path result");
+        assert!(
+            const_type_paths
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Def(DefKind::ConstParam, const_generic)),
+            "const generic names retain their definition kind in type position"
+        );
+
+        let module_type_shadow = &resolved.owners()[2];
+        let module_type_paths = module_type_shadow
+            .type_path_resolution()
+            .expect("module type shadow analysis succeeds")
+            .expect("module type shadow function has a type path result");
+        assert!(
+            module_type_paths
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "the exact module binding takes precedence over a primitive Prelude entry"
+        );
+
+        let bodyless = &resolved.owners()[3];
+        assert!(
+            bodyless
+                .type_path_resolution()
+                .expect("bodyless function signature type analysis succeeds")
+                .is_some(),
+            "signature type paths resolve even when the function has no body"
+        );
+        assert!(
+            bodyless
+                .local_resolution()
+                .expect("bodyless local result succeeds")
+                .is_none(),
+            "bodyless functions continue to have no local body result"
+        );
+    }
+
+    #[test]
     fn function_owner_test_only_diagnostics_follow_module_origins() {
         let root = concat!(
             "use acme:test-support/fixtures as fixture\n",
@@ -11062,6 +11264,16 @@ mod tests {
         );
         assert!(
             signature
+                .type_path_resolution()
+                .expect("ordinary type path lookup succeeds")
+                .expect("function has an ordinary type path result")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "rejected test-only type heads remain error paths and do not fall through to the Prelude"
+        );
+        assert!(
+            signature
                 .local_resolution()
                 .expect("function body local lookup succeeds")
                 .expect("function has a body")
@@ -11072,6 +11284,20 @@ mod tests {
         );
 
         let generic_type = &results.owners()[5];
+        let generic_type_name = database
+            .symbols
+            .intern("Fixture")
+            .expect("generic type name is interned");
+        let generic_type_def_id = database
+            .def_paths
+            .get(&generic_type.owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                generic_type.owner().def_id,
+                &[(generic_type_name, false, 0)],
+            )
+            .expect("function generic keeps its definition identity")[0]
+            .to_def_id();
         assert!(
             generic_type
                 .test_only_diagnostics()
@@ -11087,6 +11313,16 @@ mod tests {
                 .paths()
                 .is_empty(),
             "same-named generic type paths are not rewritten as imported test-only types"
+        );
+        assert!(
+            generic_type
+                .type_path_resolution()
+                .expect("ordinary generic type path lookup succeeds")
+                .expect("generic function has an ordinary type path result")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Def(DefKind::TyParam, generic_type_def_id)),
+            "function type generic resolution wins before a same-named test-only import"
         );
 
         let builtin_effect_root = &results.owners()[6];
