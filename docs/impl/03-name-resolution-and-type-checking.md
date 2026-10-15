@@ -705,10 +705,9 @@ to their later resolvers. An erroneous head continues to suppress suffix
 lookup. For current top-level type owners, an inaccessible member becomes a
 snapshot-bound `PRIVATE_ITEM` diagnostic at the reference segment with the
 defining declaration as a related location, including when that declaration
-is in a foreign source file. Missing members remain typed errors until the
-complete `UNRESOLVED_NAME` candidate and unique-import-fix contract is
-implemented. Missing target scopes remain closure errors rather than source
-diagnostics.
+is in a foreign source file. IR-545 maps missing source members to
+`UNRESOLVED_NAME`; missing target scopes remain closure errors rather than
+source diagnostics.
 
 **Tracked owner path query and `sai check` integration (IR-544).** Each
 top-level type owner is resolved through a tracked query keyed by requester
@@ -718,10 +717,22 @@ and interface traversal. The query owns its staged paths and returns only
 owned path results and errors; snapshot-bound `Diagnostic` values are rebuilt
 at the caller boundary. `sai check` retains finalized dependency collections,
 builds the active-source closure for each package, and emits the resulting
-`PRIVATE_ITEM` diagnostics with workspace-wide source lookup for both primary
-and foreign declaration locations. The command still reports
+`PRIVATE_ITEM` and `UNRESOLVED_NAME` diagnostics with workspace-wide source
+lookup for primary and foreign declaration locations. The command still reports
 `FEATURE_NOT_IMPLEMENTED` and does not claim complete analysis or produce a
 success result record.
+
+**Qualified missing-member diagnostics (IR-545).** The module path walker
+retains the exact `ModuleTarget` when a member is missing. The driver emits a
+snapshot-bound `UNRESOLVED_NAME` at that segment with the canonical package
+identity and module path, up to three visible member names within bounded
+Damerau–Levenshtein distance two, deterministic ranking, and the same names
+in structured diagnostic data and a help child. Suggestion enumeration uses
+the target package's effective visibility, so foreign private members are
+excluded while same-package private members remain eligible. No `use` fix is
+offered for a missing qualified suffix: importing the suffix into the current
+scope cannot make the original `module.missing` path resolve. Unqualified
+name fixes remain a separate resolver obligation.
 
 ### 3.4.3 Ribs
 
