@@ -326,8 +326,10 @@ private targets receive a visibility diagnostic. The current incremental
 owner adapters cover top-level functions, extern functions, consts,
 invariants, refined types, refinement-bearing distinct types, direct
 trait/impl headers, and associated trait/impl declarations including method
-bodies and contracts. Interface owners and other remaining owner kinds are
-pending; the property-parameter exception is preserved during test analysis.
+bodies and contracts, and direct interface declarations including resource
+method signatures and recovery-only interface body/contract syntax. Other
+remaining owner kinds are pending; the property-parameter exception is
+preserved during test analysis.
 The complete canonical prelude and general tracked `package_scopes(PackageId)`
 query also remain deferred.
 
@@ -695,7 +697,7 @@ enum RibKind {
 6. A generic parameter of a method whose name is a generic parameter of the enclosing `impl` or `trait` is `SHADOWS_GENERIC_PARAM`; two generic parameters of one list are `DUPLICATE_BINDING`.
 7. For `match` arms, the arm rib holds the pattern's bindings and covers the guard and the body. For `if let` and `while let`, which impl/02 lowers to `Match`, the user arm's rib covers its body only, which is the condition scope of spec/04 §4.7.1. For `for`, the user pattern is inside the `Some(..)` arm of the inner match, which gives the fresh-per-iteration loop pattern scope.
 
-**Current owner-local resolution helper (IR-517).** `sai_resolve::owner::resolve_owner_locals` walks a borrowed `Body` without letting arena references escape. It registers parameters, closure parameters, `let`/`var` pattern bindings, match-arm bindings, region bindings, and generated loop-pattern bindings in lexical ribs; it resolves one-segment `PathRoot::Plain` expression paths to `Res::Local` and records `Symbol::ERROR` paths as `Res::Err`. A local receiver such as `x.a.b` records the `Path(x)` node with one resolved segment; the following fields remain for later type/member resolution. Module alias names from the current `S(M)` are an explicit input and matching local declarations receive `SHADOWS_MODULE`. The walk covers the body value, function contracts, and invariant predicates. A local miss is left for generic, module, or prelude lookup, and non-expression type/pattern paths are not resolved here.
+**Current owner-local resolution helper (IR-517).** `sai_resolve::owner::resolve_owner_locals` walks a borrowed `Body` without letting arena references escape. It registers parameters, closure parameters, `let`/`var` pattern bindings, match-arm bindings, region bindings, and generated loop-pattern bindings in lexical ribs; it resolves the local head of a plain value path to `Res::Local`, preserving the full path segment count, and records `Symbol::ERROR` paths as `Res::Err`. A local receiver such as `x.a.b` records the `Path(x)` node with one resolved segment; the following fields remain for later type/member resolution. Module alias names from the current `S(M)` are an explicit input and matching local declarations receive `SHADOWS_MODULE`. The walk covers the body value, function contracts, and invariant predicates. A local miss is left for generic, module, or prelude lookup, and non-expression type/pattern paths are not resolved here.
 
 The helper takes the borrowed `Body`, its `HirSourceMap`, and the current `WorkspaceSnapshot`. It requires the Body and map to share the lowering-time `HirSourceId`, then checks owner identity and the map's file, path, package, document version, and raw bytes against that snapshot. This prevents an older Body from being paired with a new source map and permits an unchanged owner file to retain its source map when an unrelated workspace file changes. The owned `LocalResolution` records the file provenance, body-source identity, and module-alias set used for resolution; its provenance check takes the current map, snapshot, and aliases and rejects changed inputs without invalidating on unrelated workspace changes. This is an uncached local slice, not the `resolve_owner` query or the complete `ResolvedOwner`: signature/generic paths, chain heads, label results, and composed fallback lookup remain deferred. Duplicate binding recovery keeps the first binding in a rib; the later duplicate receives `DUPLICATE_BINDING`.
 
@@ -909,6 +911,35 @@ no local or module result. Test-only diagnostics retain exact source spans and
 the complete `PKG_PATH` note, with resolution and diagnostic failures isolated
 per member. This remains a diagnostic pass and does not add ordinary
 type/effect/module-member lookup or command-level check integration.
+
+**Interface declaration test-only references (IR-537).** For each
+current-target interface, the adapter pairs its filtered ItemTree children
+with canonical child `OwnerId`s from the lowered interface. It checks direct
+struct fields, aliases, refined bases, enum payloads, interface function
+signatures, and resource method signatures against the exact containing
+file's module scope. Generic parameters shadow same-named type paths, and
+built-in effect roots retain precedence in nested function-pointer types.
+Resource methods are lowered through their resource owner and keep a separate
+result channel. Interface functions and resource methods are signature-only
+HIR owners, so they have no retained local or module body-path results. For
+recovered interface function/resource syntax and invalid interface refinement
+predicates, the adapter transiently lowers the body for lexical-local
+resolution, then scans those syntax roots for test-only diagnostic paths.
+Parameter and block-local bindings therefore shadow module aliases, including
+the first segment of a qualified expression path. These recovery-only paths
+never enter the retained HIR resolution results. The standalone refined-owner
+syntax scan uses the owner's body-local resolution to apply the same shadowing
+rule.
+
+Interface refinements are rejected by spec/09 §9.2.1 and spec/13 §13.2.2, but
+the current HIR keeps only the base type and refinement span. The adapter
+scans a retained invalid refinement predicate from its current AST and emits
+test-only diagnostics without manufacturing HIR path results. AST-only
+predicate and recovered function scans include constructor and range-pattern
+heads, and nested refined declarations use their ItemTree generic parameters
+for shadowing. Parent, child, and resource-method failures stay isolated. This
+remains a diagnostic pass; ordinary type/effect/member lookup, world and
+other owner kinds, and command-level `check` integration remain pending.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
