@@ -1528,14 +1528,6 @@ fn lower_top_level_owner<'hir>(
     lowered.map_err(OwnerControlFlowResolutionError::Lowering)
 }
 
-fn module_aliases_for_file(
-    collection: &Phase1PackageScopesCollection,
-    module_tree: &ModuleTree,
-    file: FileId,
-) -> Result<HashSet<Symbol>, OwnerControlFlowResolutionError> {
-    module_scope_for_file(collection, module_tree, file).map(module_aliases_for_scope)
-}
-
 fn module_scope_for_file<'a>(
     collection: &'a Phase1PackageScopesCollection,
     module_tree: &ModuleTree,
@@ -1606,56 +1598,66 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
         Effect(HirEffectRef<'hir>),
     }
 
-    let OwnerNode::Item(item) = owner.node else {
-        return Vec::new();
-    };
     let mut work = Vec::new();
-    match item.kind {
-        ItemKind::Fn { sig, generics, .. } => {
-            for parameter in sig.params {
-                work.push(Work::Ty(parameter.ty));
-            }
-            if let Some(effects) = sig.effects {
-                work.extend(effects.iter().copied().map(Work::Effect));
-            }
-            if let Some(ret) = sig.ret {
-                work.push(Work::Ty(ret));
-            }
-            for parameter in generics.params {
-                match parameter.kind {
-                    GenericParamKind::Type { bounds } => {
-                        work.extend(bounds.iter().copied().map(Work::Bound));
-                    }
-                    GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
-                }
-            }
-            for predicate in generics.where_preds {
-                work.push(Work::Ty(predicate.ty));
-                work.extend(predicate.bounds.iter().copied().map(Work::Bound));
-            }
-        }
-        ItemKind::Const { ty } => work.push(Work::Ty(ty)),
-        ItemKind::Refined { base } => work.push(Work::Ty(base)),
-        ItemKind::Distinct { generics, base, .. } => {
-            work.push(Work::Ty(base));
-            for parameter in generics.params {
-                match parameter.kind {
-                    GenericParamKind::Type { bounds } => {
-                        work.extend(bounds.iter().copied().map(Work::Bound));
-                    }
-                    GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
-                }
-            }
-            for predicate in generics.where_preds {
-                work.push(Work::Ty(predicate.ty));
-                work.extend(predicate.bounds.iter().copied().map(Work::Bound));
-            }
-        }
-        ItemKind::Invariant { target } => work.push(Work::Path {
-            path: target,
-            kind: OwnerPathKind::Type,
-        }),
+    let signature = match owner.node {
+        OwnerNode::Item(item) => match item.kind {
+            ItemKind::Fn { sig, generics, .. } => Some((sig, generics)),
+            _ => None,
+        },
+        OwnerNode::ExternItem(item) => Some((item.sig, item.generics)),
         _ => return Vec::new(),
+    };
+    if let Some((sig, generics)) = signature {
+        for parameter in sig.params {
+            work.push(Work::Ty(parameter.ty));
+        }
+        if let Some(effects) = sig.effects {
+            work.extend(effects.iter().copied().map(Work::Effect));
+        }
+        if let Some(ret) = sig.ret {
+            work.push(Work::Ty(ret));
+        }
+        for parameter in generics.params {
+            match parameter.kind {
+                GenericParamKind::Type { bounds } => {
+                    work.extend(bounds.iter().copied().map(Work::Bound));
+                }
+                GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
+            }
+        }
+        for predicate in generics.where_preds {
+            work.push(Work::Ty(predicate.ty));
+            work.extend(predicate.bounds.iter().copied().map(Work::Bound));
+        }
+    }
+    if let OwnerNode::Item(item) = owner.node {
+        match item.kind {
+            ItemKind::Fn { .. } => {}
+            ItemKind::Const { ty } => work.push(Work::Ty(ty)),
+            ItemKind::Refined { base } => work.push(Work::Ty(base)),
+            ItemKind::Distinct { generics, base, .. } => {
+                work.push(Work::Ty(base));
+                for parameter in generics.params {
+                    match parameter.kind {
+                        GenericParamKind::Type { bounds } => {
+                            work.extend(bounds.iter().copied().map(Work::Bound));
+                        }
+                        GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
+                    }
+                }
+                for predicate in generics.where_preds {
+                    work.push(Work::Ty(predicate.ty));
+                    work.extend(predicate.bounds.iter().copied().map(Work::Bound));
+                }
+            }
+            ItemKind::Invariant { target } => work.push(Work::Path {
+                path: target,
+                kind: OwnerPathKind::Type,
+            }),
+            _ => return Vec::new(),
+        }
+    } else if !matches!(owner.node, OwnerNode::ExternItem(_)) {
+        return Vec::new();
     }
     if let Some(body) = owner.body {
         work.push(Work::Expr(body.value));
@@ -2348,11 +2350,12 @@ fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol
 }
 
 fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
-    let OwnerNode::Item(item) = owner.node else {
-        return HashSet::new();
-    };
-    let generics = match item.kind {
-        ItemKind::Fn { generics, .. } | ItemKind::Distinct { generics, .. } => generics,
+    let generics = match owner.node {
+        OwnerNode::Item(item) => match item.kind {
+            ItemKind::Fn { generics, .. } | ItemKind::Distinct { generics, .. } => generics,
+            _ => return HashSet::new(),
+        },
+        OwnerNode::ExternItem(item) => item.generics,
         _ => return HashSet::new(),
     };
     generics
@@ -5080,11 +5083,18 @@ impl RootDatabase {
                         continue;
                     }
                 };
-            let module_aliases = module_aliases_for_file(collection, module_tree, file);
+            let module_scope = module_scope_for_file(collection, module_tree, file);
+            let module_aliases = module_scope
+                .as_ref()
+                .map(|scope| module_aliases_for_scope(scope))
+                .map_err(Clone::clone);
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
+                let mut module_resolution = None;
+                let mut test_only_path_resolution = None;
+                let mut test_only_diagnostics = None;
                 let resolution = (|| {
                     let block_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -5156,21 +5166,81 @@ impl RootDatabase {
                     )
                     .map_err(OwnerControlFlowResolutionError::Lowering)?;
                     lowering_diagnostics.extend(hir_owner.diagnostics.iter().cloned());
-                    match hir_owner.body {
+                    let path_candidates = owner_test_only_path_candidates(&hir_owner);
+                    let generic_parameters = owner_generic_parameters(&hir_owner);
+                    let mut resolved_paths = OwnerTestOnlyPathResolution {
+                        owner: descriptor.owner,
+                        paths: HashMap::new(),
+                    };
+                    let signature_diagnostics = match &module_scope {
+                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                            descriptor.owner,
+                            &path_candidates,
+                            &generic_parameters,
+                            module_scope,
+                            &mut resolved_paths,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    test_only_path_resolution = Some(match &module_scope {
+                        Ok(_) => Ok(Some(resolved_paths)),
+                        Err(error) => Err(error.clone()),
+                    });
+
+                    let predicate_diagnostics = match hir_owner.body {
                         Some(body) => {
-                            let locals = match &module_aliases {
-                                Ok(module_aliases) => resolve_owner_locals(
+                            let locals = match (&module_scope, &module_aliases) {
+                                (Ok(_), Ok(module_aliases)) => resolve_owner_locals(
                                     body,
                                     &source_map,
                                     snapshot,
                                     &self.symbols,
                                     module_aliases,
                                 )
-                                .map(Some)
                                 .map_err(OwnerControlFlowResolutionError::Locals),
-                                Err(error) => Err(error.clone()),
+                                (Err(error), _) => Err(error.clone()),
+                                (_, Err(error)) => Err(error.clone()),
                             };
-                            local_resolution = Some(locals);
+                            local_resolution = Some(locals.clone().map(Some));
+
+                            let mut module_paths = match (&locals, &module_scope) {
+                                (Ok(locals), Ok(module_scope)) => Ok(resolve_owner_module_paths(
+                                    locals,
+                                    module_scope,
+                                    &generic_parameters,
+                                )),
+                                (Err(error), _) => Err(error.clone()),
+                                (_, Err(error)) => Err(error.clone()),
+                            };
+                            let expression_diagnostics =
+                                match (&module_scope, &locals, &mut module_paths) {
+                                    (Ok(module_scope), Ok(locals), Ok(module_paths)) => {
+                                        collect_test_only_reference_diagnostics(
+                                            descriptor.owner,
+                                            &locals.deferred_paths,
+                                            module_scope,
+                                            module_paths,
+                                            &inputs,
+                                            snapshot,
+                                        )
+                                    }
+                                    (Err(error), _, _) => Err(error.clone()),
+                                    (_, Err(error), _) => Err(error.clone()),
+                                    (_, _, Err(error)) => Err((*error).clone()),
+                                };
+                            module_resolution = Some(module_paths.map(Some));
+                            test_only_diagnostics =
+                                Some(match (signature_diagnostics, expression_diagnostics) {
+                                    (Ok(mut signature), Ok(expression)) => {
+                                        signature.extend(expression);
+                                        sort_phase1_diagnostics(&mut signature);
+                                        Ok(Some(signature))
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => Err(error),
+                                });
                             resolve_owner_control_flow(
                                 body,
                                 &inputs.source_ref,
@@ -5182,19 +5252,28 @@ impl RootDatabase {
                         }
                         None => {
                             local_resolution = Some(Ok(None));
+                            module_resolution = Some(Ok(None));
+                            test_only_diagnostics = Some(signature_diagnostics.map(Some));
                             Ok(Vec::new())
                         }
-                    }
+                    };
+                    predicate_diagnostics
                 })();
                 let local_resolution =
                     local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let module_resolution =
+                    module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let test_only_path_resolution =
+                    test_only_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let test_only_diagnostics =
+                    test_only_diagnostics.unwrap_or_else(|| resolution.clone().map(|_| None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
-                    module_resolution: Ok(None),
-                    test_only_path_resolution: Ok(None),
-                    test_only_diagnostics: Ok(None),
+                    module_resolution,
+                    test_only_path_resolution,
+                    test_only_diagnostics,
                     lowering_diagnostics,
                 });
             }
@@ -9487,6 +9566,270 @@ mod tests {
                 .expect("bodyless extern local resolution succeeds")
                 .is_none(),
             "an extern function without a body or contracts has no local scope"
+        );
+    }
+
+    #[test]
+    fn extern_function_adapter_diagnoses_test_only_signature_and_contract_paths() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{flag}\n",
+            "unsafe extern \"wasm\" module \"env\" {\n",
+            "  fn bodyless(value: Fixture) -> Fixture;\n",
+            "  fn generic<Fixture>(value: Fixture) -> Fixture;\n",
+            "  fn contracted(value: Bool) requires { let fixture = true; fixture && flag } ",
+            "ensures { flag }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only extern imports are retained");
+        assert_eq!(collection.scopes().extern_function_owners.len(), 3);
+
+        let resolved = database
+            .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
+            .expect("extern function references resolve");
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 3);
+
+        let span_for = |start: usize, text: &str| {
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + text.len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        let package_path_span = |occurrence: usize| {
+            let start = root
+                .match_indices("acme:test-support/fixtures")
+                .nth(occurrence)
+                .expect("expected import path exists")
+                .0;
+            span_for(start, "acme:test-support/fixtures")
+        };
+        let diagnostic_spans = |diagnostics: &[Diagnostic]| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("test-only reference has a primary span")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let assert_import_note =
+            |diagnostic: &Diagnostic, expected_span: &sai_diagnostics::Span| {
+                assert!(diagnostic.related().iter().any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. } if &location.span == expected_span
+                )));
+            };
+
+        let bodyless = &resolved.owners()[0];
+        let bodyless_diagnostics = bodyless
+            .test_only_diagnostics()
+            .expect("bodyless signature diagnostics succeed")
+            .expect("extern adapter runs signature diagnostics");
+        assert_eq!(bodyless_diagnostics.len(), 2);
+        let bodyless_start = root
+            .find("fn bodyless")
+            .expect("bodyless declaration exists");
+        let first_type_start = root[bodyless_start..]
+            .find("Fixture")
+            .expect("parameter type exists")
+            + bodyless_start;
+        let second_type_start = root[first_type_start + "Fixture".len()..]
+            .find("Fixture")
+            .expect("return type exists")
+            + first_type_start
+            + "Fixture".len();
+        assert_eq!(
+            diagnostic_spans(bodyless_diagnostics),
+            [
+                span_for(first_type_start, "Fixture"),
+                span_for(second_type_start, "Fixture"),
+            ],
+            "bodyless extern signatures retain exact, source-ordered type-head spans"
+        );
+        let fixture_package_path = package_path_span(1);
+        for diagnostic in bodyless_diagnostics {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            assert_import_note(diagnostic, &fixture_package_path);
+        }
+        let bodyless_paths = bodyless
+            .test_only_path_resolution()
+            .expect("bodyless signature path lookup succeeds")
+            .expect("bodyless adapter runs signature path lookup");
+        assert_eq!(bodyless_paths.owner(), bodyless.owner());
+        assert_eq!(bodyless_paths.paths().len(), 2);
+        assert!(
+            bodyless_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err && path.resolved_segments == 1)
+        );
+        assert!(
+            bodyless
+                .local_resolution()
+                .expect("bodyless local lookup succeeds")
+                .is_none(),
+            "bodyless extern signatures still receive path diagnostics without a local body"
+        );
+
+        let generic = &resolved.owners()[1];
+        assert!(
+            generic
+                .test_only_diagnostics()
+                .expect("generic signature diagnostics succeed")
+                .expect("extern adapter runs the generic signature pass")
+                .is_empty(),
+            "a generic parameter shadows an imported test-only type of the same name"
+        );
+        assert!(
+            generic
+                .test_only_path_resolution()
+                .expect("generic path lookup succeeds")
+                .expect("generic signature path results exist")
+                .paths()
+                .is_empty()
+        );
+
+        let contracted = &resolved.owners()[2];
+        let contract_diagnostics = contracted
+            .test_only_diagnostics()
+            .expect("extern contract diagnostics succeed")
+            .expect("extern adapter runs the test-only contract pass");
+        assert_eq!(contract_diagnostics.len(), 2);
+        let requires_start = root
+            .find("fixture && flag")
+            .expect("requires expression has an imported reference")
+            + "fixture && ".len();
+        let ensures_start = root
+            .find("ensures { flag }")
+            .expect("ensures expression has an imported reference")
+            + "ensures { ".len();
+        assert_eq!(
+            diagnostic_spans(contract_diagnostics),
+            [
+                span_for(requires_start, "flag"),
+                span_for(ensures_start, "flag"),
+            ],
+            "requires and ensures references are both diagnosed in source order"
+        );
+        let flag_package_path = package_path_span(2);
+        for diagnostic in contract_diagnostics {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            assert_import_note(diagnostic, &flag_package_path);
+        }
+        let contracted_locals = contracted
+            .local_resolution()
+            .expect("contract local resolution succeeds")
+            .expect("contract expressions form an extern owner body");
+        assert!(
+            contracted_locals
+                .paths
+                .values()
+                .any(|path| matches!(path.base, Res::Local(_))),
+            "a contract local wins before the same-spelled test-only module alias"
+        );
+        let contract_module_paths = contracted
+            .module_resolution()
+            .expect("contract module lookup succeeds")
+            .expect("contract expressions form an extern owner body");
+        assert_eq!(contract_module_paths.paths.len(), 2);
+        assert!(
+            contract_module_paths
+                .paths
+                .values()
+                .all(|path| path.base == Res::Err),
+            "test-only `flag` paths are rejected after contract-local resolution"
+        );
+
+        // Simulate an incorrectly paired source item on one descriptor. The
+        // failed owner must not suppress independent extern owners in the
+        // same file.
+        let mut broken_collection = collection.clone();
+        let second_item = broken_collection.scopes.extern_function_owners[1].item_id;
+        broken_collection.scopes.extern_function_owners[0].item_id = second_item;
+        let isolated = database
+            .resolve_extern_function_predicates(&broken_collection, &module_tree, &snapshot)
+            .expect("descriptor failures remain isolated to their owner");
+        assert!(
+            isolated.owners()[0].resolution().is_err(),
+            "the corrupted extern owner reports its own failure"
+        );
+        assert!(
+            isolated.owners()[0].test_only_diagnostics().is_err(),
+            "the corrupted owner does not publish partial test-only diagnostics"
+        );
+        assert!(
+            isolated.owners()[1].resolution().is_ok() && isolated.owners()[2].resolution().is_ok(),
+            "later owners continue resolving after one descriptor fails"
+        );
+
+        // Reclassifying an imported name as ordinary keeps it outside the
+        // test-only diagnostic channel while preserving signature diagnostics.
+        let flag_symbol = collection
+            .scopes
+            .module(ModuleId::ROOT)
+            .expect("root scope exists")
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "flag")
+            })
+            .expect("flag module binding exists");
+        let flag_import = match collection
+            .scopes
+            .module(ModuleId::ROOT)
+            .expect("root scope exists")
+            .scope[&flag_symbol]
+            .origin
+        {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("flag comes from an import"),
+        };
+        let root_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        root_scope.imports[flag_import.0 as usize].test_only = false;
+        let ordinary_import = database
+            .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
+            .expect("ordinary import classification remains resolvable");
+        assert!(
+            ordinary_import.owners()[2]
+                .test_only_diagnostics()
+                .expect("ordinary contract imports do not fail lookup")
+                .expect("extern diagnostic pass is present")
+                .is_empty(),
+            "ordinary imports do not receive test-only contract diagnostics"
         );
     }
 
