@@ -304,8 +304,9 @@ Foreign package and interface member tables remain deferred, as do active-edge
 identity checks for imports from foreign targets, test-only reference checks
 for owner kinds not yet covered by the incremental owner adapters, and the
 final `package_scopes(PackageId)` query. The adapters below cover top-level
-functions, consts, invariants, refined types, and refinement-bearing distinct
-types; this is not the complete tracked owner resolver.
+functions, extern functions, consts, invariants, refined types, and
+refinement-bearing distinct types; this is not the complete tracked owner
+resolver.
 The resolver does not yet build the complete canonical prelude
 `BTreeMap<Symbol, Res>` described in §3.3.7; the current bridge compares local
 definition paths for the supported item-import cases.
@@ -592,7 +593,7 @@ Resolution of a canonical path walks the module tree of `sai:core` or `sai:alloc
 
 The prelude is a fixed table `prelude: BTreeMap<Symbol, Res>` built once from the list of spec/16 §16.4, by canonical path as for lang items. The reserved type names map to `Res::PrimTy(..)`: `Int ↦ I64`, `UInt ↦ U64` (D-TYPE-01), `Never ↦ PrimTy::Never`. `Array` maps to the built-in array constructor `Res::PrimTy(PrimTy::Array)`, because `Array<T, N>` is a structural type (spec/05 §5.1.3) even though it has a library module for its associated functions (§3.9.3).
 
-**Canonical prelude provider (IR-530).** `sai_resolve::prelude` now defines all 50 canonical standard-library item paths and the 19 primitive type and constructor names, and builds the complete set of 69 names from a caller-supplied canonical-item resolver. The builder checks each item’s expected kind and standard-package identity. The current API uses `PreludeBinding` to keep primitive type and constructor bindings separate from ordinary `Res`, since `Res` does not yet represent `PrimTy`; it uses a symbol-keyed hash map for lookup plus an entry slice sorted by spelling, since `Symbol` does not implement `Ord`. This provider is defined and tested, but is not yet wired into owner lookup or package-scope construction.
+**Canonical prelude provider (IR-530) and primitive resolutions (IR-533).** `sai_resolve::prelude` defines all 50 canonical standard-library item paths and the 19 primitive type and constructor names, and builds the complete set of 69 names from a caller-supplied canonical-item resolver. The builder checks each item’s expected kind and standard-package identity. `Res::PrimTy(PrimTy)` now represents primitive resolutions, while `PreludeBinding` remains explicit so callers can distinguish built-in bindings from canonical library items. The provider uses a symbol-keyed hash map for lookup plus an entry slice sorted by spelling, since `Symbol` does not implement `Ord`. The provider is defined and tested, but is not yet wired into owner lookup or package-scope construction.
 
 ## 3.4 Resolving paths in owners
 
@@ -797,8 +798,8 @@ rejected path heads to `Res::Err`, and returns separate module-resolution,
 path-resolution, and diagnostic channels. Test-only diagnostics are source
 ordered and preserve per-owner failures; path results are keyed by HIR path in
 a map. The new channels are optional on the shared
-predicate result because the extern predicate adapter has not yet adopted
-this pass; that adapter retains its existing behavior.
+predicate result because the refined/distinct and extern predicate adapters
+adopted these channels in IR-531 and IR-532.
 
 **Top-level refinement predicates (IR-515).** The bridge now also validates
 `Body::value` for top-level `type R = B where p` and `distinct D = B where p`
@@ -827,6 +828,22 @@ expression and non-expression results; test-only diagnostics are merged in
 source order and use import origins with complete `PKG_PATH` notes. This pass
 does not provide general type, effect, interface, Prelude, or final
 unresolved-name resolution.
+
+**Extern-function test-only references (IR-532).** The extern predicate
+adapter checks signature parameter and return types, effect references,
+generic bounds, const-parameter types, and generic where predicates against
+the exact module scope. Generic parameters shadow same-named imports in
+type-position paths; built-in effect roots retain their established
+precedence.
+Contracts on bodyless extern declarations still form a HIR body and receive
+local resolution, module fallback, and test-only expression diagnostics;
+ordinary bodyless signatures have no local or module result but retain
+signature diagnostics. Expression paths resolve after contract locals.
+Test-only references are classified through the originating import even when
+the visible binding carries `Res::Def`, and rejected paths become `Res::Err`
+with the source `PKG_PATH` note. Signature and contract diagnostics are merged
+in source order. This remains an incremental extern adapter, not complete
+extern-child or general type/effect resolution.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
@@ -911,8 +928,8 @@ deferred set. Each test-only reference gets `TEST_DEPENDENCY_OUTSIDE_TEST` at
 the path and a note at the originating use's complete `PKG_PATH`; the path
 result becomes `Res::Err` so later phases do not cascade. IR-526 covered const
 initializer expressions only. IR-528 below extends the same diagnostic rule to
-const declaration-type heads; IR-529 and IR-531 add invariant and
-refined/distinct predicate owners. Extern, trait, impl, interface, and other
+const declaration-type heads; IR-529, IR-531, and IR-532 add invariant,
+refined/distinct, and extern owners. Trait, impl, interface, and other
 non-test owner kinds remain for later integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
