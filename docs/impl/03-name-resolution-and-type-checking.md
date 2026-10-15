@@ -338,11 +338,27 @@ entries that survived target filtering. An erased AST ID is file-local and
 must be resolved against the current snapshot's `AstIdMap` before lowering;
 descriptors carry no spans, syntax pointers, or arena-borrowed HIR.
 
-This is only a source index for top-level functions, not a `hir_owner` or
-`resolve_owner` query. Associated and impl members, fields, variants, generic
-parameters, closures, and async blocks are not indexed here. The owner HIR
-lowering and source-map APIs exist separately, but the driver does not yet
-connect this index to them or cache resolved owner results.
+At IR-510 this was only a source index for top-level functions, not a
+`hir_owner` or `resolve_owner` query.
+
+**Direct top-level owner index (IR-519).** `Phase1PackageScopes` now also
+retains `top_level_owners`, an ordered list for direct top-level functions,
+types, traits, impls, constants, invariants, effects, interfaces, worlds,
+extern blocks, tests, and properties that have a canonical definition path.
+Each entry pairs its `OwnerId`, `FileId`, erased AST ID, and owner kind from
+the same Phase 1 path-interning pass. Descriptors are collected from the
+target-filtered item tree before duplicate-binding recovery, so duplicate and
+recovery-name declarations keep their distinct paths. A test or property with
+no recovered name has no canonical path and receives no descriptor. Extern
+functions remain in their existing child descriptors, which also retain the
+parent extern-block identity.
+
+Consumers must rebind each file and AST ID against the current snapshot before
+lowering. The table is a source index, not a `hir_owner` or `resolve_owner`
+query, and the driver does not yet dispatch it to all owner lowerers or cache
+owner results. Associated, world, interface, and extern child owners, fields,
+variants, generic parameters, closures, async blocks, and synthetic derived
+owners are not in this direct top-level index.
 
 **Tracked local query adapter (IR-470).** The driver now tracks this local
 Phase 1 and Phase 3 slice through an interim `package_scopes` derived query,
