@@ -1303,6 +1303,7 @@ pub enum OwnerControlFlowResolutionError {
         owner: OwnerId,
         import: ImportIndex,
     },
+    MissingRefinedTypeSyntax(OwnerId),
     InvalidSourceLocation(OwnerId),
     Lowering(HirLoweringError),
     Labels(LabelResolutionError),
@@ -1569,6 +1570,7 @@ fn module_scope_for_file<'a>(
 enum OwnerPathKind {
     Type,
     Effect,
+    Expression,
     Pattern,
 }
 
@@ -1578,6 +1580,13 @@ struct OwnerPathHead {
     name: Symbol,
     span: sai_hir::Span,
     segment_count: u32,
+    kind: OwnerPathKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RefinedGenericSyntaxPathHead {
+    name: Symbol,
+    span: sai_diagnostics::Span,
     kind: OwnerPathKind,
 }
 
@@ -1626,6 +1635,22 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
             }
         }
         ItemKind::Const { ty } => work.push(Work::Ty(ty)),
+        ItemKind::Refined { base } => work.push(Work::Ty(base)),
+        ItemKind::Distinct { generics, base, .. } => {
+            work.push(Work::Ty(base));
+            for parameter in generics.params {
+                match parameter.kind {
+                    GenericParamKind::Type { bounds } => {
+                        work.extend(bounds.iter().copied().map(Work::Bound));
+                    }
+                    GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
+                }
+            }
+            for predicate in generics.where_preds {
+                work.push(Work::Ty(predicate.ty));
+                work.extend(predicate.bounds.iter().copied().map(Work::Bound));
+            }
+        }
         ItemKind::Invariant { target } => work.push(Work::Path {
             path: target,
             kind: OwnerPathKind::Type,
@@ -1927,6 +1952,87 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
     paths
 }
 
+fn refined_generic_syntax_path_candidates(
+    type_decl: &ast::TypeDecl,
+    file: FileId,
+    symbols: &Interner,
+) -> Result<Vec<RefinedGenericSyntaxPathHead>, HirLoweringError> {
+    let mut paths = Vec::new();
+    let mut roots = Vec::new();
+    if let Some(generic_params) = type_decl.generic_params() {
+        roots.push(generic_params.syntax().clone());
+    }
+    roots.extend(
+        type_decl
+            .syntax()
+            .descendants()
+            .filter_map(ast::WhereClause::cast)
+            .map(|clause| clause.syntax().clone()),
+    );
+    for root in roots {
+        for node in root.descendants() {
+            if let Some(path) = ast::PathType::cast(node.clone())
+                && let Some(name) = path.segments().next().and_then(|segment| segment.name())
+                && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+            {
+                paths.push(RefinedGenericSyntaxPathHead {
+                    name: symbol,
+                    span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                    kind: OwnerPathKind::Type,
+                });
+            }
+
+            if let Some(path) = ast::PathExpr::cast(node.clone())
+                && let Some(name) = path.name()
+                && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+            {
+                paths.push(RefinedGenericSyntaxPathHead {
+                    name: symbol,
+                    span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                    kind: OwnerPathKind::Expression,
+                });
+            }
+
+            if let Some(effect) = ast::EffectRef::cast(node)
+                && let Some(name) = effect.segments().next()
+                && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+            {
+                paths.push(RefinedGenericSyntaxPathHead {
+                    name: symbol,
+                    span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                    kind: OwnerPathKind::Effect,
+                });
+            }
+        }
+    }
+
+    paths.sort_by_key(|path| (path.span.range.start(), path.span.range.end()));
+    paths.dedup_by_key(|path| path.span);
+    Ok(paths)
+}
+
+fn intern_ast_name_ref(
+    name: &ast::NameRef,
+    symbols: &Interner,
+) -> Result<Option<Symbol>, HirLoweringError> {
+    let Some(token) = name.syntax().first_token() else {
+        return Ok(None);
+    };
+    if token.has_error() {
+        return Ok(None);
+    }
+    let written = token.text();
+    let raw_name = written.strip_prefix("r#");
+    let identifier = raw_name.unwrap_or(written);
+    let invalid_raw = matches!(raw_name, Some("self" | "Self" | "_"));
+    let reserved = raw_name.is_none() && sai_syntax::is_reserved_identifier(identifier);
+    if invalid_raw || reserved {
+        return Ok(None);
+    }
+    let normalized = sai_syntax::normalize_identifier(identifier);
+    Ok(Some(symbols.intern(&normalized)?))
+}
+
 fn is_builtin_effect_root(symbol: Symbol, symbols: &Interner) -> bool {
     let Ok(name) = symbols.resolve(symbol) else {
         return false;
@@ -2057,6 +2163,72 @@ fn collect_test_only_non_expression_reference_diagnostics(
     Ok(diagnostics)
 }
 
+fn collect_refined_generic_syntax_test_only_diagnostics(
+    owner: OwnerId,
+    item_id: ast::ErasedAstId,
+    generic_parameters: &HashSet<Symbol>,
+    module_scope: &Phase1ModuleScopes,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
+    let syntax = inputs
+        .ast_ids
+        .pointer(item_id)
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .ok_or(OwnerControlFlowResolutionError::MissingRefinedTypeSyntax(
+            owner,
+        ))?;
+    let type_decl = ast::TypeDecl::cast(syntax).ok_or(
+        OwnerControlFlowResolutionError::MissingRefinedTypeSyntax(owner),
+    )?;
+    let candidates =
+        refined_generic_syntax_path_candidates(&type_decl, inputs.filtered_item_tree.file, symbols)
+            .map_err(OwnerControlFlowResolutionError::Lowering)?;
+
+    let mut diagnostics = Vec::new();
+    for candidate in candidates {
+        if matches!(
+            candidate.kind,
+            OwnerPathKind::Type | OwnerPathKind::Expression | OwnerPathKind::Pattern
+        ) && generic_parameters.contains(&candidate.name)
+        {
+            continue;
+        }
+        if candidate.kind == OwnerPathKind::Effect
+            && is_builtin_effect_root(candidate.name, symbols)
+        {
+            continue;
+        }
+        let Some(binding) = module_scope.scope.get(&candidate.name) else {
+            continue;
+        };
+        let import_index = match binding.origin {
+            BindingOrigin::Decl => continue,
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+        };
+        let import = module_scope.imports.get(import_index.0 as usize).ok_or(
+            OwnerControlFlowResolutionError::MissingImportBinding {
+                owner,
+                import: import_index,
+            },
+        )?;
+        if !import.test_only {
+            continue;
+        }
+
+        diagnostics.push(test_only_reference_diagnostic_at(
+            owner,
+            candidate.span,
+            import_index,
+            import.use_ast_id,
+            inputs,
+            snapshot,
+        )?);
+    }
+    Ok(diagnostics)
+}
+
 fn test_only_reference_diagnostic(
     owner: OwnerId,
     reference_span: sai_hir::Span,
@@ -2065,9 +2237,27 @@ fn test_only_reference_diagnostic(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    test_only_reference_diagnostic_at(
+        owner,
+        sai_diagnostics::Span::new(reference_span.file, reference_span.range),
+        import_index,
+        use_ast_id,
+        inputs,
+        snapshot,
+    )
+}
+
+fn test_only_reference_diagnostic_at(
+    owner: OwnerId,
+    reference_span: sai_diagnostics::Span,
+    import_index: ImportIndex,
+    use_ast_id: ast::ErasedAstId,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
     let reference = sai_diagnostics::Location::from_decoded_source(
         inputs.source_ref.clone(),
-        sai_diagnostics::Span::new(reference_span.file, reference_span.range),
+        reference_span,
         &inputs.source,
     )
     .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
@@ -2161,13 +2351,35 @@ fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
     let OwnerNode::Item(item) = owner.node else {
         return HashSet::new();
     };
-    let ItemKind::Fn { generics, .. } = item.kind else {
-        return HashSet::new();
+    let generics = match item.kind {
+        ItemKind::Fn { generics, .. } | ItemKind::Distinct { generics, .. } => generics,
+        _ => return HashSet::new(),
     };
     generics
         .params
         .iter()
         .map(|parameter| parameter.name.sym)
+        .filter(|name| !name.is_error())
+        .collect()
+}
+
+fn item_tree_generic_parameters(
+    item_tree: &ItemTree,
+    item_id: ast::ErasedAstId,
+) -> HashSet<Symbol> {
+    item_tree
+        .items
+        .iter()
+        .find(|entry| entry.ast_id == item_id)
+        .into_iter()
+        .flat_map(|entry| entry.children.iter())
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                ItemTreeKind::TypeParam | ItemTreeKind::ConstParam
+            )
+        })
+        .map(|entry| entry.name)
         .filter(|name| !name.is_error())
         .collect()
 }
@@ -4533,11 +4745,13 @@ impl RootDatabase {
     }
 
     /// Lowers Phase 1 refined and refinement-bearing distinct descriptors,
-    /// then diagnoses forbidden syntax in each predicate body value.
+    /// then diagnoses test-only references and forbidden predicate syntax.
     ///
     /// A predicate expression is not an executable owner body, so this uses
     /// the predicate-only resolver and does not resolve its loop labels.
-    /// Distinct declarations without a refinement clause are not indexed.
+    /// Test-only references are checked through the descriptor's exact module
+    /// scope after local lookup. Distinct declarations without a refinement
+    /// clause are not indexed.
     pub fn resolve_refinement_owner_predicates(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -4580,12 +4794,27 @@ impl RootDatabase {
                         continue;
                     }
                 };
-            let module_aliases = module_aliases_for_file(collection, module_tree, file);
+            let module_scope = module_scope_for_file(collection, module_tree, file);
+            let module_aliases = module_scope
+                .as_ref()
+                .map(|scope| module_aliases_for_scope(scope))
+                .map_err(Clone::clone);
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
-                let mut local_resolution = None;
-                let resolution = (|| {
+                let analysis: Result<
+                    (
+                        Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+                        Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                        Result<
+                            Option<OwnerTestOnlyPathResolution>,
+                            OwnerControlFlowResolutionError,
+                        >,
+                        Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
+                        Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+                    ),
+                    OwnerControlFlowResolutionError,
+                > = (|| {
                     let owner_kind = match descriptor.kind {
                         RefinementPredicateOwnerKind::Refined => TopLevelOwnerKind::Refined,
                         RefinementPredicateOwnerKind::Distinct => TopLevelOwnerKind::Distinct,
@@ -4628,43 +4857,167 @@ impl RootDatabase {
                         &context,
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
-                    match hir_owner.body {
-                        Some(body) => {
-                            let locals = match &module_aliases {
-                                Ok(module_aliases) => resolve_owner_locals(
-                                    body,
-                                    &source_map,
-                                    snapshot,
-                                    &self.symbols,
-                                    module_aliases,
-                                )
-                                .map(Some)
-                                .map_err(OwnerControlFlowResolutionError::Locals),
+                    let path_candidates = owner_test_only_path_candidates(&hir_owner);
+                    let mut generic_parameters = owner_generic_parameters(&hir_owner);
+                    if descriptor.kind == RefinementPredicateOwnerKind::Refined {
+                        generic_parameters.extend(item_tree_generic_parameters(
+                            &inputs.filtered_item_tree,
+                            descriptor.item_id,
+                        ));
+                    }
+                    let refined_generic_syntax_diagnostics = match (descriptor.kind, &module_scope)
+                    {
+                        (RefinementPredicateOwnerKind::Refined, Ok(module_scope)) => {
+                            collect_refined_generic_syntax_test_only_diagnostics(
+                                descriptor.owner,
+                                descriptor.item_id,
+                                &generic_parameters,
+                                module_scope,
+                                &self.symbols,
+                                &inputs,
+                                snapshot,
+                            )
+                        }
+                        (_, Ok(_)) => Ok(Vec::new()),
+                        (_, Err(error)) => Err(error.clone()),
+                    };
+                    let mut resolved_paths = OwnerTestOnlyPathResolution {
+                        owner: descriptor.owner,
+                        paths: HashMap::new(),
+                    };
+                    let hir_non_expression_diagnostics = match &module_scope {
+                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                            descriptor.owner,
+                            &path_candidates,
+                            &generic_parameters,
+                            module_scope,
+                            &mut resolved_paths,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let mut non_expression_diagnostics = match (
+                        hir_non_expression_diagnostics,
+                        refined_generic_syntax_diagnostics,
+                    ) {
+                        (Ok(mut hir_diagnostics), Ok(syntax_diagnostics)) => {
+                            hir_diagnostics.extend(syntax_diagnostics);
+                            Ok(hir_diagnostics)
+                        }
+                        (Err(error), _) | (_, Err(error)) => Err(error),
+                    };
+                    if let Ok(diagnostics) = &mut non_expression_diagnostics {
+                        sort_phase1_diagnostics(diagnostics);
+                    }
+                    let path_resolution = match &module_scope {
+                        Ok(_) => Ok(Some(resolved_paths)),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let predicate_diagnostics = match hir_owner.body {
+                        Some(body) => resolve_predicate_expression(
+                            body.value,
+                            &inputs.source_ref,
+                            inputs.source.as_ref(),
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Labels),
+                        None => Ok(Vec::new()),
+                    };
+                    let Some(body) = hir_owner.body else {
+                        return Ok((
+                            Ok(None),
+                            Ok(None),
+                            path_resolution,
+                            non_expression_diagnostics.map(Some),
+                            predicate_diagnostics,
+                        ));
+                    };
+                    let locals = match &module_aliases {
+                        Ok(module_aliases) => resolve_owner_locals(
+                            body,
+                            &source_map,
+                            snapshot,
+                            &self.symbols,
+                            module_aliases,
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Locals),
+                        Err(error) => Err(error.clone()),
+                    };
+                    match locals {
+                        Ok(locals) => {
+                            let mut module_resolution = match &module_scope {
+                                Ok(module_scope) => Ok(Some(resolve_owner_module_paths(
+                                    &locals,
+                                    module_scope,
+                                    &generic_parameters,
+                                ))),
                                 Err(error) => Err(error.clone()),
                             };
-                            local_resolution = Some(locals);
-                            resolve_predicate_expression(
-                                body.value,
-                                &inputs.source_ref,
-                                inputs.source.as_ref(),
-                            )
-                            .map_err(OwnerControlFlowResolutionError::Labels)
+                            let expression_diagnostics =
+                                match (&module_scope, &mut module_resolution) {
+                                    (Ok(module_scope), Ok(Some(module_resolution))) => {
+                                        collect_test_only_reference_diagnostics(
+                                            descriptor.owner,
+                                            &locals.deferred_paths,
+                                            module_scope,
+                                            module_resolution,
+                                            &inputs,
+                                            snapshot,
+                                        )
+                                    }
+                                    (Ok(_), Ok(None)) => Ok(Vec::new()),
+                                    (Err(error), _) => Err(error.clone()),
+                                    (_, Err(error)) => Err(error.clone()),
+                                };
+                            let test_only_diagnostics =
+                                match (non_expression_diagnostics, expression_diagnostics) {
+                                    (Ok(mut non_expression), Ok(expression)) => {
+                                        non_expression.extend(expression);
+                                        sort_phase1_diagnostics(&mut non_expression);
+                                        Ok(Some(non_expression))
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => Err(error),
+                                };
+                            Ok((
+                                Ok(Some(locals)),
+                                module_resolution,
+                                path_resolution,
+                                test_only_diagnostics,
+                                predicate_diagnostics,
+                            ))
                         }
-                        None => {
-                            local_resolution = Some(Ok(None));
-                            Ok(Vec::new())
-                        }
+                        Err(error) => Ok((
+                            Err(error.clone()),
+                            Err(error.clone()),
+                            path_resolution,
+                            non_expression_diagnostics.map(Some),
+                            predicate_diagnostics,
+                        )),
                     }
                 })();
-                let local_resolution =
-                    local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let (
+                    local_resolution,
+                    module_resolution,
+                    test_only_path_resolution,
+                    test_only_diagnostics,
+                    resolution,
+                ) = analysis.unwrap_or_else(|error| {
+                    (
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error),
+                    )
+                });
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
-                    module_resolution: Ok(None),
-                    test_only_path_resolution: Ok(None),
-                    test_only_diagnostics: Ok(None),
+                    module_resolution,
+                    test_only_path_resolution,
+                    test_only_diagnostics,
                     lowering_diagnostics,
                 });
             }
@@ -8350,6 +8703,715 @@ mod tests {
             self_locals.paths.is_empty(),
             "implicit self remains for owner-aware resolution"
         );
+    }
+
+    #[test]
+    fn refinement_owner_test_only_references_are_diagnosed() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{flag}\n",
+            "type Positive = Fixture where { let fixture = true; let typed: Fixture = true; fixture && flag }\n",
+            "distinct Age<Fixture> = fixture.Type<Fixture> where { let typed: Fixture = true; flag }\n",
+            "distinct Plain = U8\n",
+            "@target(\"wasm64-core\")\n",
+            "type Excluded = I32 where { flag }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only refinement references are retained");
+        assert_eq!(
+            collection.scopes().refinement_predicate_owners.len(),
+            2,
+            "the target-excluded refinement and distinct without predicates are omitted"
+        );
+
+        let (fixture_symbol, fixture_import, type_symbol, type_import, value_symbol, value_import) = {
+            let scope = collection
+                .scopes()
+                .module(ModuleId::ROOT)
+                .expect("root module scope exists");
+            let symbol_named = |name: &str| {
+                scope
+                    .scope
+                    .keys()
+                    .copied()
+                    .find(|symbol| {
+                        database
+                            .resolve_symbol(*symbol)
+                            .is_ok_and(|spelling| spelling.as_ref() == name)
+                    })
+                    .unwrap_or_else(|| panic!("module scope contains `{name}`"))
+            };
+            let import_for = |symbol| match scope
+                .scope
+                .get(&symbol)
+                .expect("requested binding exists")
+                .origin
+            {
+                BindingOrigin::Decl => panic!("`{symbol:?}` comes from a use binding"),
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            };
+            let fixture_symbol = symbol_named("fixture");
+            let type_symbol = symbol_named("Fixture");
+            let value_symbol = symbol_named("flag");
+            let fixture_import = import_for(fixture_symbol);
+            let type_import = import_for(type_symbol);
+            let value_import = import_for(value_symbol);
+            for index in [fixture_import, type_import, value_import] {
+                assert!(scope.imports[index.0 as usize].test_only);
+                assert!(matches!(
+                    scope.imports[index.0 as usize].res,
+                    Res::TestOnly(_)
+                ));
+            }
+            (
+                fixture_symbol,
+                fixture_import,
+                type_symbol,
+                type_import,
+                value_symbol,
+                value_import,
+            )
+        };
+
+        let resolved = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("refinement owner analyses succeed");
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 2);
+        let positive = &resolved.owners()[0];
+        let positive_type_paths = positive
+            .test_only_path_resolution()
+            .expect("refinement type lookup succeeds")
+            .expect("refinement analysis includes non-expression paths");
+        assert_eq!(positive_type_paths.paths().len(), 2);
+        assert!(
+            positive_type_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "base and nested predicate type heads are rejected"
+        );
+        let positive_module_paths = positive
+            .module_resolution()
+            .expect("refinement expression lookup succeeds")
+            .expect("refinement analysis includes expression paths");
+        assert_eq!(
+            positive_module_paths
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "the test-only predicate value is rejected"
+        );
+        let positive_locals = positive
+            .local_resolution()
+            .expect("refinement local resolution succeeds")
+            .expect("refinement owner has a body");
+        assert!(
+            positive_locals
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_))),
+            "the local module-alias shadow is resolved before module fallback"
+        );
+        assert!(
+            positive_locals
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
+            "the local shadow still reports SHADOWS_MODULE"
+        );
+
+        let age = &resolved.owners()[1];
+        let age_type_paths = age
+            .test_only_path_resolution()
+            .expect("distinct type lookup succeeds")
+            .expect("distinct analysis includes non-expression paths");
+        assert_eq!(age_type_paths.paths().len(), 1);
+        assert!(
+            age_type_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "the qualified base head is rejected"
+        );
+        let age_module_paths = age
+            .module_resolution()
+            .expect("distinct expression lookup succeeds")
+            .expect("distinct analysis includes expression paths");
+        assert_eq!(
+            age_module_paths
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err]
+        );
+        let diagnostics = positive
+            .test_only_diagnostics()
+            .expect("refinement test-only diagnostics succeed")
+            .expect("refinement adapter runs the test-only pass");
+        let age_diagnostics = age
+            .test_only_diagnostics()
+            .expect("distinct test-only diagnostics succeed")
+            .expect("distinct adapter runs the test-only pass");
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(age_diagnostics.len(), 2);
+        let diagnostic_spans = resolved
+            .owners()
+            .iter()
+            .flat_map(|owner| {
+                owner
+                    .test_only_diagnostics()
+                    .expect("test-only diagnostics succeed")
+                    .expect("refinement adapter runs the test-only pass")
+                    .iter()
+                    .map(|diagnostic| {
+                        diagnostic
+                            .primary()
+                            .expect("test-only reference has a primary location")
+                            .span
+                            .clone()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let span_for = |start: usize, text: &str| {
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + text.len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        let positive_base =
+            root.find("type Positive = Fixture").unwrap() + "type Positive = ".len();
+        let predicate_types = root.match_indices("let typed: Fixture").collect::<Vec<_>>();
+        let positive_predicate_type = predicate_types[0].0 + "let typed: ".len();
+        let positive_value = root.find("fixture && flag").unwrap() + "fixture && ".len();
+        let age_base = root
+            .find("distinct Age<Fixture> = fixture.Type<Fixture>")
+            .unwrap()
+            + "distinct Age<Fixture> = ".len();
+        let age_value = root
+            .find("where { let typed: Fixture = true; flag")
+            .unwrap()
+            + "where { let typed: Fixture = true; ".len();
+        let expected_reference_spans = [
+            span_for(positive_base, "Fixture"),
+            span_for(positive_predicate_type, "Fixture"),
+            span_for(positive_value, "flag"),
+            span_for(age_base, "fixture"),
+            span_for(age_value, "flag"),
+        ];
+        assert_eq!(
+            diagnostic_spans, expected_reference_spans,
+            "base, nested type, and expression diagnostics are source ordered"
+        );
+        let age_generic_base_type = span_for(
+            root.find("fixture.Type<Fixture>").unwrap() + "fixture.Type<".len(),
+            "Fixture",
+        );
+        let age_generic_predicate_type =
+            span_for(predicate_types[1].0 + "let typed: ".len(), "Fixture");
+        assert!(
+            !diagnostic_spans.contains(&age_generic_base_type)
+                && !diagnostic_spans.contains(&age_generic_predicate_type),
+            "the Distinct generic shadows the imported type in both base and predicate type paths"
+        );
+        for (diagnostic, expected_use_index) in resolved
+            .owners()
+            .iter()
+            .flat_map(|owner| {
+                owner
+                    .test_only_diagnostics()
+                    .expect("test-only diagnostics succeed")
+                    .expect("refinement adapter runs the test-only pass")
+                    .iter()
+            })
+            .zip([1usize, 1, 2, 0, 2])
+        {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            let package_path_start = root
+                .match_indices("acme:test-support/fixtures")
+                .nth(expected_use_index)
+                .expect("expected import exists")
+                .0;
+            let expected_package_span = span_for(package_path_start, "acme:test-support/fixtures");
+            assert!(
+                diagnostic.related().iter().any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. }
+                        if location.span == expected_package_span
+                )),
+                "each diagnostic points back to its originating PKG_PATH"
+            );
+        }
+
+        let fixture_def = Res::Def(
+            DefKind::Module,
+            collection.scopes.top_level_owners[0]
+                .owner
+                .def_id
+                .to_def_id(),
+        );
+        let type_def = Res::Def(
+            DefKind::Struct,
+            collection.scopes.top_level_owners[0]
+                .owner
+                .def_id
+                .to_def_id(),
+        );
+        let value_def = Res::Def(
+            DefKind::Const,
+            collection.scopes.top_level_owners[0]
+                .owner
+                .def_id
+                .to_def_id(),
+        );
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            for (symbol, import, resolution) in [
+                (fixture_symbol, fixture_import, fixture_def),
+                (type_symbol, type_import, type_def),
+                (value_symbol, value_import, value_def),
+            ] {
+                scope.imports[import.0 as usize].res = resolution;
+                scope
+                    .scope
+                    .get_mut(&symbol)
+                    .expect("test-only binding exists")
+                    .res = resolution;
+            }
+        }
+        let resolved_def_bindings = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("resolved test-only imports remain diagnosable");
+        assert_eq!(
+            resolved_def_bindings
+                .owners()
+                .iter()
+                .map(|owner| {
+                    owner
+                        .test_only_diagnostics()
+                        .expect("origin-based diagnostics succeed")
+                        .expect("refinement adapter runs the test-only pass")
+                        .len()
+                })
+                .collect::<Vec<_>>(),
+            [3, 2],
+            "remaining expression and non-shadowed type paths use import origin when Res is Def"
+        );
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            for (symbol, import) in [
+                (fixture_symbol, fixture_import),
+                (type_symbol, type_import),
+                (value_symbol, value_import),
+            ] {
+                scope.imports[import.0 as usize].res = Res::Err;
+                scope
+                    .scope
+                    .get_mut(&symbol)
+                    .expect("test-only binding exists")
+                    .res = Res::Err;
+            }
+        }
+        let diagnosed_bindings = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("diagnosed test-only imports remain diagnosable");
+        assert_eq!(
+            diagnosed_bindings
+                .owners()
+                .iter()
+                .map(|owner| {
+                    owner
+                        .test_only_diagnostics()
+                        .expect("diagnosed import diagnostics succeed")
+                        .expect("refinement adapter runs the test-only pass")
+                        .len()
+                })
+                .collect::<Vec<_>>(),
+            [3, 2],
+            "remaining expression and non-shadowed type paths use import origin when Res is Err"
+        );
+
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            for import in [fixture_import, type_import, value_import] {
+                scope.imports[import.0 as usize].test_only = false;
+            }
+        }
+        let ordinary_imports = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("ordinary refinement imports are not test-only");
+        assert!(
+            ordinary_imports.owners().iter().all(|owner| owner
+                .test_only_diagnostics()
+                .expect("ordinary import diagnostics succeed")
+                .expect("refinement adapter runs the test-only pass")
+                .is_empty()),
+            "ordinary imports do not receive test-only diagnostics"
+        );
+
+        let mut broken_collection = collection.clone();
+        let second_item = broken_collection.scopes.refinement_predicate_owners[1].item_id;
+        broken_collection.scopes.refinement_predicate_owners[0].item_id = second_item;
+        let isolated_failures = database
+            .resolve_refinement_owner_predicates(&broken_collection, &module_tree, &snapshot)
+            .expect("one malformed refinement descriptor stays owner local");
+        assert!(
+            isolated_failures.owners()[0]
+                .test_only_path_resolution()
+                .is_err()
+        );
+        assert!(
+            isolated_failures.owners()[1]
+                .test_only_path_resolution()
+                .is_ok(),
+            "a following refinement remains analyzable after one descriptor fails"
+        );
+    }
+
+    #[test]
+    fn refined_generic_parameters_shadow_test_only_names() {
+        let root = concat!(
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{flag}\n",
+            "type Bad<Fixture> = Fixture where { let typed: Fixture = true; Fixture && flag }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("generic refined owner is collected for recovery");
+        assert_eq!(collection.scopes().refinement_predicate_owners.len(), 1);
+
+        let scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        for name in ["Fixture", "flag"] {
+            let binding = scope
+                .scope
+                .iter()
+                .find(|(symbol, _)| {
+                    database
+                        .resolve_symbol(**symbol)
+                        .is_ok_and(|spelling| spelling.as_ref() == name)
+                })
+                .map(|(_, binding)| binding)
+                .unwrap_or_else(|| panic!("test-only `{name}` binding exists"));
+            let (BindingOrigin::Use { import } | BindingOrigin::PubUse { import }) = binding.origin
+            else {
+                panic!("test-only `{name}` comes from a use binding");
+            };
+            assert!(scope.imports[import.0 as usize].test_only);
+            assert!(matches!(binding.res, Res::TestOnly(_)));
+        }
+
+        let resolved = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("generic refined owner resolves");
+        let owner = &resolved.owners()[0];
+        assert!(
+            owner
+                .test_only_path_resolution()
+                .expect("non-expression path analysis succeeds")
+                .expect("refined adapter runs non-expression lookup")
+                .paths()
+                .is_empty(),
+            "the generic Fixture shadows both the base and predicate type paths"
+        );
+        let module = owner
+            .module_resolution()
+            .expect("expression module lookup succeeds")
+            .expect("refined adapter runs expression lookup");
+        assert_eq!(
+            module
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "the unrelated test-only value reference remains diagnosed"
+        );
+        assert_eq!(module.deferred_paths.len(), 1);
+        assert_eq!(
+            database
+                .resolve_symbol(module.deferred_paths[0].name)
+                .expect("deferred generic reference is interned")
+                .as_ref(),
+            "Fixture",
+            "the generic Fixture expression remains deferred before the prelude/type-kind pass"
+        );
+
+        let diagnostics = owner
+            .test_only_diagnostics()
+            .expect("test-only diagnostics succeed")
+            .expect("refined adapter runs the test-only pass");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::TestDependencyOutsideTest
+        );
+        let flag_start = root.find("Fixture && flag").unwrap() + "Fixture && ".len();
+        let expected_reference_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(flag_start as u32),
+                sai_diagnostics::TextSize::new((flag_start + "flag".len()) as u32),
+            )
+            .expect("flag reference span is ordered"),
+        );
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("test-only value reference has a primary location")
+                .span,
+            expected_reference_span
+        );
+        let use_start = root
+            .match_indices("acme:test-support/fixtures")
+            .nth(1)
+            .expect("test-only value import exists")
+            .0;
+        let expected_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(use_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (use_start + "acme:test-support/fixtures".len()) as u32,
+                ),
+            )
+            .expect("value import PKG_PATH span is ordered"),
+        );
+        assert!(diagnostics[0].related().iter().any(|related| matches!(
+            related,
+            Related::DeclaredHere { location, .. } if location.span == expected_use_span
+        )));
+    }
+
+    #[test]
+    fn refined_generic_syntax_test_only_paths_are_diagnosed() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "type Bad<T: fixture.Trait, const N: fixture.Size> = U8 where true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("refined generic syntax is retained for recovery");
+        assert_eq!(collection.scopes().refinement_predicate_owners.len(), 1);
+
+        let resolved = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("refined generic syntax analysis succeeds");
+        let owner = &resolved.owners()[0];
+        assert!(
+            owner
+                .test_only_path_resolution()
+                .expect("non-expression path analysis succeeds")
+                .expect("refined adapter runs non-expression lookup")
+                .paths()
+                .is_empty(),
+            "AST-only generic references do not fabricate HIR path results"
+        );
+
+        let diagnostics = owner
+            .test_only_diagnostics()
+            .expect("generic syntax test-only diagnostics succeed")
+            .expect("refined adapter runs the test-only pass");
+        assert_eq!(diagnostics.len(), 2);
+        let bound_start = root.find("T: fixture.Trait").unwrap() + "T: ".len();
+        let const_type_start = root.find("const N: fixture.Size").unwrap() + "const N: ".len();
+        let expected_reference_spans = [bound_start, const_type_start].map(|start| {
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + "fixture".len()) as u32),
+                )
+                .expect("generic reference range is ordered"),
+            )
+        });
+        let use_start = root.find("acme:test-support/fixtures").unwrap();
+        let expected_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(use_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (use_start + "acme:test-support/fixtures".len()) as u32,
+                ),
+            )
+            .expect("test-only import package path range is ordered"),
+        );
+        for (diagnostic, expected_reference_span) in
+            diagnostics.iter().zip(expected_reference_spans)
+        {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("generic test-only path has a primary location")
+                    .span,
+                expected_reference_span
+            );
+            assert!(diagnostic.related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. } if location.span == expected_use_span
+            )));
+        }
+    }
+
+    #[test]
+    fn refined_fn_sugar_bound_uses_its_lang_item_not_an_imported_name() {
+        let root = concat!(
+            "use acme:test-support/fixtures.{Fixture as Fn}\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "type Bad<T: Fn(Fixture)> = U8 where true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only imported names are retained");
+        assert_eq!(collection.scopes().refinement_predicate_owners.len(), 1);
+        let scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        for name in ["Fn", "Fixture"] {
+            let binding = scope
+                .scope
+                .iter()
+                .find(|(symbol, _)| {
+                    database
+                        .resolve_symbol(**symbol)
+                        .is_ok_and(|spelling| spelling.as_ref() == name)
+                })
+                .map(|(_, binding)| binding)
+                .unwrap_or_else(|| panic!("test-only `{name}` binding exists"));
+            let (BindingOrigin::Use { import } | BindingOrigin::PubUse { import }) = binding.origin
+            else {
+                panic!("test-only `{name}` comes from a use binding");
+            };
+            assert!(scope.imports[import.0 as usize].test_only);
+        }
+
+        let resolved = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("Fn sugar bound owner resolves");
+        let diagnostics = resolved.owners()[0]
+            .test_only_diagnostics()
+            .expect("generic syntax diagnostics succeed")
+            .expect("refined adapter runs the test-only pass");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the Fn sugar name maps to its lang item, while Fixture remains an import reference"
+        );
+        let fixture_start = root.find("Fn(Fixture)").unwrap() + "Fn(".len();
+        let expected_fixture_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(fixture_start as u32),
+                sai_diagnostics::TextSize::new((fixture_start + "Fixture".len()) as u32),
+            )
+            .expect("nested type path range is ordered"),
+        );
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::TestDependencyOutsideTest
+        );
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("nested test-only type path has a primary location")
+                .span,
+            expected_fixture_span
+        );
+        let fixture_use_start = root
+            .match_indices("acme:test-support/fixtures")
+            .nth(1)
+            .expect("direct Fixture import exists")
+            .0;
+        let expected_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(fixture_use_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (fixture_use_start + "acme:test-support/fixtures".len()) as u32,
+                ),
+            )
+            .expect("Fixture import package path range is ordered"),
+        );
+        assert!(diagnostics[0].related().iter().any(|related| matches!(
+            related,
+            Related::DeclaredHere { location, .. } if location.span == expected_use_span
+        )));
     }
 
     #[test]
