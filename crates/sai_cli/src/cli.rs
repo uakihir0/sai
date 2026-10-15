@@ -65,6 +65,7 @@ struct CheckChild {
 
 struct CliLocation {
     path: String,
+    package: Option<String>,
     start: CliPosition,
     end: CliPosition,
     source_line: Option<Arc<RenderedSourceLine>>,
@@ -4162,6 +4163,20 @@ fn module_tree_workspace_check_diagnostics(
         package_trees.push((index, *package_id, module_tree, source_by_key));
     }
 
+    let mut workspace_source_by_key = HashMap::new();
+    for (index, _, _, source_by_key) in &package_trees {
+        let input = &inputs[*index];
+        for (key, source) in source_by_key {
+            if input.is_root_package {
+                if !key.starts_with("dep:") {
+                    workspace_source_by_key.insert(key.clone(), source.clone());
+                }
+            } else if key.starts_with("dep:") {
+                workspace_source_by_key.insert(key.clone(), source.clone());
+            }
+        }
+    }
+
     let mut workspace_files = Vec::new();
     let mut complete_packages = vec![true; inputs.len()];
     for (index, _, module_tree, source_by_key) in &package_trees {
@@ -4282,6 +4297,8 @@ fn module_tree_workspace_check_diagnostics(
             phase1_package_collection_order(inputs, package_graph_for_scopes.as_ref())?;
         let mut finalized_foreign_scopes =
             BTreeMap::<PackageKey, sai_driver::Phase1ModuleMemberScopePackage>::new();
+        let mut finalized_collections =
+            BTreeMap::<PackageKey, sai_driver::Phase1PackageScopesCollection>::new();
         for index in collection_order {
             let (_, _, module_tree, source_by_key) = &package_trees[index];
             let input = &inputs[index];
@@ -4350,10 +4367,107 @@ fn module_tree_workspace_check_diagnostics(
                     package_key.clone(),
                     collection.module_member_scope_package(),
                 );
+                finalized_collections.insert(package_key, collection);
+            }
+        }
+
+        if let Some(graph) = package_graph_for_scopes.as_ref() {
+            for index in phase1_package_collection_order(inputs, Some(graph))? {
+                if !complete_packages[index] {
+                    continue;
+                }
+                let (_, _, module_tree, _) = &package_trees[index];
+                let input = &inputs[index];
+                let package_key = PackageKey::new(input.package_key.clone())
+                    .map_err(|error| format!("invalid package key: {error:?}"))?;
+                let Some(collection) = finalized_collections.get(&package_key) else {
+                    continue;
+                };
+                let Some(foreign_packages) =
+                    active_source_member_packages_for(&package_key, graph, &finalized_collections)
+                else {
+                    continue;
+                };
+                let member_scopes = database
+                    .collect_active_source_member_scopes(collection, graph, &foreign_packages)
+                    .map_err(|error| {
+                        format!("active source member-scope closure failed: {error:?}")
+                    })?;
+                let resolutions = database
+                    .resolve_type_owner_paths_with_member_scopes(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                    )
+                    .map_err(|error| format!("type-owner path query failed: {error:?}"))?;
+                let mut owner_diagnostics = Vec::new();
+                for owner in resolutions.owners() {
+                    match owner.module_path_diagnostics() {
+                        Ok(diagnostics) => owner_diagnostics.extend(diagnostics.iter().cloned()),
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("top-level type path resolution failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
+                }
+                let (owner_diagnostics, owner_errors, owner_warnings, owner_infos) =
+                    phase1_check_diagnostics(
+                        &owner_diagnostics,
+                        &workspace_source_by_key,
+                        &input.package_identity,
+                        include_source_lines,
+                    );
+                diagnostics.extend(owner_diagnostics);
+                errors = errors.saturating_add(owner_errors);
+                warnings = warnings.saturating_add(owner_warnings);
+                infos = infos.saturating_add(owner_infos);
             }
         }
     }
     Ok((diagnostics, errors, warnings, infos))
+}
+
+fn active_source_member_packages_for(
+    requester: &PackageKey,
+    graph: &sai_driver::package_graph::PackageGraph,
+    finalized_collections: &BTreeMap<PackageKey, sai_driver::Phase1PackageScopesCollection>,
+) -> Option<Vec<sai_driver::Phase1ModuleMemberScopePackage>> {
+    use sai_driver::package_graph::PackageForm;
+
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![requester.clone()];
+    while let Some(key) = pending.pop() {
+        if !reachable.insert(key.clone()) {
+            continue;
+        }
+        let node = graph.node(&key)?;
+        if node.form() != PackageForm::Source {
+            reachable.remove(&key);
+            continue;
+        }
+        for edge in node.active_edges() {
+            let target = graph.node(edge.target())?;
+            if target.form() == PackageForm::Source {
+                pending.push(target.key().clone());
+            }
+        }
+    }
+    reachable.remove(requester);
+    reachable
+        .into_iter()
+        .map(|key| {
+            finalized_collections
+                .get(&key)
+                .map(sai_driver::Phase1PackageScopesCollection::module_member_scope_package)
+        })
+        .collect()
 }
 
 fn phase1_package_collection_order(
@@ -4440,11 +4554,13 @@ fn phase1_check_diagnostics(
                 .cloned()
                 .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
             let mut source_index = CliSourceIndex::new(source);
-            source_index.location(
+            let mut cli_location = source_index.location(
                 &display_path,
                 location.span.range.start().to_usize()..location.span.range.end().to_usize(),
                 include_source_lines,
-            )
+            );
+            cli_location.package = location.file.package.clone();
+            cli_location
         });
         let mut cli_diagnostic = CliDiagnostic {
             code: diagnostic.code.as_str(),
@@ -4475,13 +4591,14 @@ fn phase1_check_diagnostics(
                     .cloned()
                     .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
                 let mut source_index = CliSourceIndex::new(source);
+                let mut cli_location = source_index.location(
+                    &display_path,
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize(),
+                    include_source_lines,
+                );
+                cli_location.package = location.file.package.clone();
                 Some(CheckRelated {
-                    location: source_index.location(
-                        &display_path,
-                        location.span.range.start().to_usize()
-                            ..location.span.range.end().to_usize(),
-                        include_source_lines,
-                    ),
+                    location: cli_location,
                     what: what.clone(),
                 })
             })
@@ -4530,11 +4647,13 @@ fn check_additional_children(
                     .cloned()
                     .unwrap_or_else(|| (location.file.path.clone(), Arc::from([])));
                 let mut source_index = CliSourceIndex::new(source);
-                source_index.location(
+                let mut cli_location = source_index.location(
                     &display_path,
                     location.span.range.start().to_usize()..location.span.range.end().to_usize(),
                     include_source_lines,
-                )
+                );
+                cli_location.package = location.file.package.clone();
+                cli_location
             });
             CheckChild {
                 kind: child.kind,
@@ -4835,7 +4954,7 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
         argument_index: None,
         argument: String::new(),
         help: Some(format!(
-            "root and active source-dependency syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and root core export-name checks are implemented; {} remain unavailable",
+            "root and active source-dependency syntax parsing, module-tree validation, target filtering, Phase 1 declarations, and root core export-name checks are implemented, including qualified top-level type-member visibility diagnostics; {} remain unavailable",
             unsupported.join(", ")
         )),
         data: Some(format!(
@@ -8204,6 +8323,7 @@ impl CliSourceIndex {
         };
         CliLocation {
             path: path.to_owned(),
+            package: None,
             start: start_position,
             end: end_position,
             source_line,
@@ -10578,7 +10698,7 @@ fn json_location(location: &CliLocation) -> String {
 }
 
 fn json_location_with_package(location: &CliLocation, package: Option<&str>) -> String {
-    let package = package.map_or_else(
+    let package = location.package.as_deref().or(package).map_or_else(
         || "null".to_owned(),
         |identity| format!("\"{}\"", escape_json(identity)),
     );
@@ -11205,6 +11325,7 @@ mod tests {
     ) -> CheckDiagnostic {
         let primary = path.map(|path| CliLocation {
             path: path.to_owned(),
+            package: None,
             start: CliPosition {
                 byte: start,
                 line: 1,

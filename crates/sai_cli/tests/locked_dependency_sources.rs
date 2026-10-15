@@ -241,6 +241,155 @@ fn locked_check_resolves_foreign_imports_after_dependency_reexports() {
 }
 
 #[test]
+fn locked_check_reports_private_type_members_through_transitive_source_scopes() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let middle = root.join("middle");
+    let leaf = middle.join("leaf");
+    fs::create_dir_all(root.join("src")).expect("create root source directory");
+    fs::create_dir_all(middle.join("src")).expect("create middle source directory");
+    fs::create_dir_all(leaf.join("src")).expect("create leaf source directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:middle @ ^1 from path \"middle\" }\n"
+        ),
+    )
+    .expect("write root package manifest");
+    let root_source = concat!(
+        "use acme:middle as middle\n",
+        "type Record {\n",
+        "  public: middle.api.PublicType\n",
+        "}\n"
+    );
+    fs::write(root.join("src/lib.sai"), root_source).expect("write root source");
+    fs::write(
+        middle.join("sai.package"),
+        concat!(
+            "package acme:middle @ 1.0.0\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:leaf @ ^1 from path \"leaf\" }\n"
+        ),
+    )
+    .expect("write middle package manifest");
+    fs::write(
+        middle.join("src/lib.sai"),
+        concat!(
+            "use acme:leaf/model as leaf_model\n",
+            "pub use acme:leaf.{api}\n",
+            "type MiddleRecord {\n",
+            "  value: leaf_model.PrivateType\n",
+            "  missing: leaf_model.MissingType\n",
+            "}\n",
+        ),
+    )
+    .expect("write middle package scopes and type owner");
+    fs::write(
+        leaf.join("sai.package"),
+        "package acme:leaf @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
+    )
+    .expect("write leaf package manifest");
+    fs::write(
+        leaf.join("src/lib.sai"),
+        "pub interface api {\n type PublicType = U32\n}\n",
+    )
+    .expect("write leaf package root");
+    fs::write(
+        leaf.join("src/model.sai"),
+        "pub type PublicType = U32\ntype PrivateType = U32\n",
+    )
+    .expect("write leaf module with public and private types");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:middle @ ^1 -> 1.0.0 from path \"middle\"\n",
+            "\n",
+            "package acme:leaf @ 1.0.0\n",
+            "    source path \"middle/leaf\"\n",
+            "\n",
+            "package acme:middle @ 1.0.0\n",
+            "    source path \"middle\"\n",
+            "    requires acme:leaf @ ^1 -> 1.0.0 from path \"leaf\"\n"
+        ),
+    )
+    .expect("write complete format-2 transitive path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let private_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"PRIVATE_ITEM\""))
+        .collect::<Vec<_>>();
+    assert_eq!(private_diagnostics.len(), 1, "{stdout}");
+    let private = private_diagnostics[0];
+    let middle_source = concat!(
+        "use acme:leaf/model as leaf_model\n",
+        "pub use acme:leaf.{api}\n",
+        "type MiddleRecord {\n",
+        "  value: leaf_model.PrivateType\n",
+        "  missing: leaf_model.MissingType\n",
+        "}\n",
+    );
+    let reference_start = middle_source
+        .find("PrivateType")
+        .expect("private reference exists");
+    let leaf_model_source = "pub type PublicType = U32\ntype PrivateType = U32\n";
+    let declaration_start = leaf_model_source
+        .find("PrivateType")
+        .expect("private declaration exists");
+    assert!(
+        private.contains("\"package\":\"acme:middle@1.0.0\"")
+            && private.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+            && private.contains(&format!("\"start\":{{\"byte\":{reference_start},")),
+        "{private}"
+    );
+    assert!(
+        private.contains("\"what\":\"private member declared here\"")
+            && private.contains(
+                "\"path\":\"dep:acme:leaf@1.0.0/src/model.sai\",\"package\":\"acme:leaf@1.0.0\""
+            )
+            && private.contains(&format!(
+                "\"start\":{{\"byte\":{declaration_start},\"line\":2"
+            )),
+        "the foreign declaration is attached at its exact source location: {private}"
+    );
+    assert!(!stdout.contains("\"code\":\"UNRESOLVED_NAME\""), "{stdout}");
+    assert!(
+        !stdout.contains("\"stage\":3,\"feature\":\"dependencies\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the existing incomplete-analysis outcome remains in effect: {stdout}"
+    );
+}
+
+#[test]
 fn locked_check_still_checks_active_dependency_sources_when_root_source_is_missing() {
     let temporary = TestDirectory::new();
     let root = temporary.0.join("project");
