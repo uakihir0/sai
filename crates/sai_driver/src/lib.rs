@@ -1684,6 +1684,7 @@ pub struct WorldItemTestOnlyResolution {
     world_owner: OwnerId,
     owner: OwnerId,
     kind: WorldItemTestOnlyKind,
+    type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -1700,6 +1701,14 @@ impl WorldItemTestOnlyResolution {
 
     pub const fn kind(&self) -> WorldItemTestOnlyKind {
         self.kind
+    }
+
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<Option<&TypeOwnerPathResolution>, &OwnerControlFlowResolutionError> {
+        self.type_path_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
     }
 
     pub fn test_only_path_resolution(
@@ -2953,6 +2962,26 @@ fn owner_test_only_path_candidates<'hir>(owner: &HirOwner<'hir>) -> Vec<OwnerPat
     owner_test_only_path_candidates_with_body(owner, true)
 }
 
+fn world_item_signature_type_path_candidates<'hir>(
+    owner: &HirOwner<'hir>,
+) -> Option<Vec<OwnerPathHead<'hir>>> {
+    let is_function = match owner.node {
+        OwnerNode::WorldItem(item) => {
+            matches!(
+                item.kind,
+                WorldItemKind::ImportFn { .. } | WorldItemKind::ExportFn { .. }
+            )
+        }
+        _ => false,
+    };
+    is_function.then(|| {
+        owner_test_only_path_candidates(owner)
+            .into_iter()
+            .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+            .collect()
+    })
+}
+
 fn owner_test_only_path_candidates_with_body<'hir>(
     owner: &HirOwner<'hir>,
     include_body: bool,
@@ -3734,6 +3763,58 @@ fn world_item_test_only_kind(kind: ItemTreeKind) -> Option<WorldItemTestOnlyKind
         ItemTreeKind::WorldInclude => WorldItemTestOnlyKind::Include,
         _ => return None,
     })
+}
+
+fn world_item_syntax_generic_parameter_names(
+    entry: &ItemTreeEntry,
+    world_owner: OwnerId,
+    item_owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+) -> Result<HashSet<Symbol>, OwnerControlFlowResolutionError> {
+    let syntax = inputs
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .ok_or(OwnerControlFlowResolutionError::MissingWorldItemSyntax {
+            world: world_owner,
+            item: item_owner,
+        })?;
+    let function = match entry.kind {
+        ItemTreeKind::WorldItem { import: true } => ast::WorldImport::cast(syntax)
+            .ok_or(OwnerControlFlowResolutionError::MissingWorldItemSyntax {
+                world: world_owner,
+                item: item_owner,
+            })?
+            .function(),
+        ItemTreeKind::WorldItem { import: false } => ast::WorldExport::cast(syntax)
+            .ok_or(OwnerControlFlowResolutionError::MissingWorldItemSyntax {
+                world: world_owner,
+                item: item_owner,
+            })?
+            .function(),
+        _ => return Ok(HashSet::new()),
+    };
+    let mut names = HashSet::new();
+    if let Some(generic_params) = function.and_then(|function| function.generic_params()) {
+        for parameter in generic_params.type_params() {
+            if let Some(name) = parameter.name()
+                && let Some(symbol) = intern_ast_name(&name, symbols)
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?
+            {
+                names.insert(symbol);
+            }
+        }
+        for parameter in generic_params.const_params() {
+            if let Some(name) = parameter.name()
+                && let Some(symbol) = intern_ast_name(&name, symbols)
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?
+            {
+                names.insert(symbol);
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn world_function_syntax_test_only_path_candidates(
@@ -9005,6 +9086,7 @@ impl RootDatabase {
                             HirLoweringError::ItemTreeEntryMismatch,
                         ),
                     )?;
+                    let mut type_path_resolution = None;
                     let mut item_lowering_diagnostics = Vec::new();
                     let item_result: Result<
                         (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
@@ -9027,6 +9109,44 @@ impl RootDatabase {
                         )
                         .map_err(OwnerControlFlowResolutionError::Lowering)?;
                         item_lowering_diagnostics.extend(item_hir.diagnostics.iter().cloned());
+                        let signature_type_candidates =
+                            world_item_signature_type_path_candidates(&item_hir);
+                        let type_resolution = match signature_type_candidates {
+                            Some(candidates) => {
+                                match world_item_syntax_generic_parameter_names(
+                                    entry,
+                                    descriptor.owner,
+                                    item_owner,
+                                    &inputs,
+                                    &self.symbols,
+                                ) {
+                                    Ok(generic_names) => {
+                                        let mut generic_resolutions =
+                                            owner_type_generic_resolutions(&item_hir);
+                                        for name in generic_names {
+                                            // World-function generics are
+                                            // parser-recovered and absent
+                                            // from HIR. Preserve their
+                                            // shadowing without making them
+                                            // ordinary definitions.
+                                            generic_resolutions.entry(name).or_insert(Res::Err);
+                                        }
+                                        resolve_partial_type_owner_paths(
+                                            item_owner,
+                                            &candidates,
+                                            &generic_resolutions,
+                                            &self.primitive_prelude,
+                                            &module_scope,
+                                            collection.module_tree.package,
+                                        )
+                                        .map(Some)
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            None => Ok(None),
+                        };
+                        type_path_resolution = Some(type_resolution);
                         let mut candidates = owner_test_only_path_candidates(&item_hir);
                         let (mut recovered_candidates, generic_parameters, local_heads) =
                             world_item_syntax_test_only_path_candidates(
@@ -9082,12 +9202,20 @@ impl RootDatabase {
                         sort_phase1_diagnostics(&mut diagnostics);
                         Ok((path_resolution, diagnostics))
                     })();
+                    let type_path_resolution = match (type_path_resolution, &item_result) {
+                        (Some(resolution), _) => resolution,
+                        (None, Err(error)) => Err(error.clone()),
+                        (None, Ok(_)) => {
+                            unreachable!("successfully lowered world item has a type result")
+                        }
+                    };
                     match item_result {
                         Ok((path_resolution, diagnostics)) => {
                             items.push(WorldItemTestOnlyResolution {
                                 world_owner: descriptor.owner,
                                 owner: item_owner,
                                 kind,
+                                type_path_resolution,
                                 test_only_path_resolution: Ok(path_resolution),
                                 test_only_diagnostics: Ok(diagnostics),
                                 lowering_diagnostics: item_lowering_diagnostics,
@@ -9098,6 +9226,7 @@ impl RootDatabase {
                                 world_owner: descriptor.owner,
                                 owner: item_owner,
                                 kind,
+                                type_path_resolution,
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error),
                                 lowering_diagnostics: item_lowering_diagnostics,
@@ -17902,9 +18031,10 @@ mod tests {
             "  include common\n",
             "  include fixture\n",
             "  import acme:test-support/fixtures\n",
-            "  import fn lookup(value: fixture.Request) -> fixture.Response\n",
-            "  export fn render(value: plain.Request) -> fixture.Response\n",
+            "  import fn lookup(value: fixture.Request, primitive: U32, nested: Option<U32>) -> fixture.Response\n",
+            "  export fn render(value: plain.Request, primitive: U32) -> fixture.Response\n",
             "  import filtered.hidden\n",
+            "  export fn steady() -> U32\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(
@@ -17965,7 +18095,7 @@ mod tests {
                 .is_empty(),
             "root-module test-only imports do not leak into a child module"
         );
-        assert_eq!(client.items().len(), 8);
+        assert_eq!(client.items().len(), 9);
         assert_eq!(
             client
                 .items()
@@ -17981,6 +18111,7 @@ mod tests {
                 WorldItemTestOnlyKind::Import,
                 WorldItemTestOnlyKind::Export,
                 WorldItemTestOnlyKind::Import,
+                WorldItemTestOnlyKind::Export,
             ]
         );
 
@@ -18068,7 +18199,10 @@ mod tests {
                     .clone())
                 .collect::<Vec<_>>(),
             [
-                head_span("import fn lookup(value: fixture.Request)", "fixture"),
+                head_span(
+                    "import fn lookup(value: fixture.Request, primitive: U32, nested: Option<U32>) -> fixture.Response",
+                    "fixture",
+                ),
                 head_span("-> fixture.Response", "fixture"),
             ]
         );
@@ -18078,13 +18212,98 @@ mod tests {
                 .expect("export signature reference diagnostic has a primary span")
                 .span,
             head_span(
-                "export fn render(value: plain.Request) -> fixture.Response",
+                "export fn render(value: plain.Request, primitive: U32) -> fixture.Response",
                 "fixture",
             )
         );
         assert!(
             diagnostics_for(7).is_empty(),
             "a target-filtered test-only use does not leave a visible binding"
+        );
+        assert!(
+            diagnostics_for(8).is_empty(),
+            "a primitive-only world function signature has no test-only diagnostics"
+        );
+
+        for item_index in [0, 1, 2, 3, 4, 7] {
+            assert!(
+                client.items()[item_index]
+                    .type_path_resolution()
+                    .expect("non-function world item has no signature type result")
+                    .is_none(),
+                "module, interface, and include paths stay outside the signature type channel"
+            );
+        }
+        let import_types = client.items()[5]
+            .type_path_resolution()
+            .expect("world import signature type results succeed")
+            .expect("world function imports carry signature type results");
+        assert_eq!(import_types.owner(), client.items()[5].owner());
+        assert!(
+            import_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "primitive world function parameter types use the primitive Prelude"
+        );
+        assert!(
+            import_types.paths().values().any(|path| {
+                path.base == Res::Err && path.resolved_segments == 1 && path.segment_count == 2
+            }),
+            "test-only qualified signature heads are rejected while suffixes stay deferred"
+        );
+        let option_symbol = database
+            .symbols
+            .intern("Option")
+            .expect("Option name is interned");
+        assert!(
+            import_types
+                .deferred_paths()
+                .iter()
+                .any(|path| path.name == option_symbol),
+            "non-primitive canonical names stay deferred in world signatures"
+        );
+        let export_types = client.items()[6]
+            .type_path_resolution()
+            .expect("world export signature type results succeed")
+            .expect("world function exports carry signature type results");
+        assert_eq!(export_types.owner(), client.items()[6].owner());
+        let plain_symbol = database
+            .symbols
+            .intern("plain")
+            .expect("plain module alias name is interned");
+        let plain_binding = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .scope
+            .get(&plain_symbol)
+            .expect("ordinary plain module alias exists")
+            .res;
+        assert!(
+            export_types
+                .paths()
+                .values()
+                .any(|path| path.base == plain_binding),
+            "ordinary world signature aliases resolve from the exact file scope"
+        );
+        assert!(
+            export_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "world export signatures resolve primitive types"
+        );
+        let steady_types = client.items()[8]
+            .type_path_resolution()
+            .expect("sibling world signature type result succeeds")
+            .expect("world functions carry signature type results");
+        assert!(
+            steady_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "a sibling function keeps its result when another signature binding is malformed"
         );
         assert!(
             diagnostics_for(0)[0].related().iter().any(|related| matches!(
@@ -18162,6 +18381,61 @@ mod tests {
                 .is_ok(),
             "a failing import child does not suppress the next export child"
         );
+        assert!(
+            isolated.owners()[1].items()[5]
+                .test_only_diagnostics()
+                .is_err(),
+            "a malformed use syntax pointer still fails its signature diagnostic"
+        );
+        assert!(
+            isolated.owners()[1].items()[5]
+                .type_path_resolution()
+                .expect("signature type heads survive diagnostic construction failure")
+                .expect("world function has a retained signature")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "signature type heads are rejected before diagnostic-note construction fails"
+        );
+
+        let mut broken_binding = collection.clone();
+        let root_scope = &mut broken_binding.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let fixture_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "fixture")
+            })
+            .expect("fixture module alias exists");
+        let fixture_binding = root_scope
+            .scope
+            .get_mut(&fixture_symbol)
+            .expect("fixture alias binding exists");
+        fixture_binding.origin = BindingOrigin::Use {
+            import: ImportIndex(u32::MAX),
+        };
+        let isolated = database
+            .resolve_world_test_only_paths(&broken_binding, &module_tree, &snapshot)
+            .expect("a malformed child binding remains local");
+        assert!(
+            isolated.owners()[1].items()[5]
+                .type_path_resolution()
+                .is_err(),
+            "the malformed import index becomes a typed signature-result error"
+        );
+        assert!(
+            isolated.owners()[1].items()[8]
+                .type_path_resolution()
+                .expect("sibling signature still has a type result")
+                .expect("sibling world function type result succeeds")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "a broken binding in one signature does not poison a sibling signature"
+        );
 
         let mut broken_parent = collection.clone();
         let common_owner = results.owners()[0].owner();
@@ -18191,16 +18465,19 @@ mod tests {
     fn world_test_only_paths_recover_forbidden_function_syntax_and_shadows() {
         let root = concat!(
             "use acme:test-support/fixtures as fixture\n",
-            "use acme:test-support/fixtures.{T, N}\n",
+            "use acme:test-support/fixtures.{N}\n",
+            "type T = Bool\n",
+            "type WhereOnly = Bool\n",
+            "type BodyOnly = Bool\n",
             "world client {\n",
-            "  import fn generic<T, const N: U32>(fixture: Bool, value: Container<fixture.Request>, size: fixture.Buffer<N>) -> fixture.Result\n",
-            "    where T: fixture.Bound\n",
+            "  import fn generic<T, const N: U32>(fixture: Bool, typed: T, value: Container<fixture.Request>, size: fixture.Buffer<N>) -> fixture.Result\n",
+            "    where WhereOnly: fixture.Bound\n",
             "    borrows { fixture.region }\n",
             "    effects { fs, fixture.network }\n",
             "    requires fixture.ready\n",
             "    ensures fixture.valid\n",
             "  import fn clauses() borrows { fixture.region } requires fixture.ready ensures fixture.valid\n",
-            "  export fn recovered(value: Bool) { fixture.invoke(value) }\n",
+            "  export fn recovered(value: Bool) { let typed: BodyOnly = value; fixture.invoke(typed) }\n",
             "  import fn shadowed() { let fixture = true; fixture }\n",
             "}\n",
         );
@@ -18235,6 +18512,208 @@ mod tests {
         assert!(results.owners()[0].error().is_none());
         let items = results.owners()[0].items();
         assert_eq!(items.len(), 4);
+        let generic_types = items[0]
+            .type_path_resolution()
+            .expect("world generic signature type result succeeds")
+            .expect("world function import retains a signature type result");
+        let t_symbol = database.symbols.intern("T").expect("T is interned");
+        let module_t = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .scope
+            .get(&t_symbol)
+            .expect("module T alias exists")
+            .res;
+        assert!(
+            generic_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "retained paths shadowed by parser-recovered generics use an error sentinel"
+        );
+        assert!(
+            !generic_types
+                .paths()
+                .values()
+                .any(|path| path.base == module_t),
+            "a forbidden world generic does not resolve to a same-named module type"
+        );
+        let world_owner = results.owners()[0].owner();
+        let world_descriptor = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.owner == world_owner)
+            .expect("world owner descriptor exists");
+        let inputs = database
+            .current_owner_inputs(&snapshot, world_descriptor.file, &collection.target_cfg)
+            .expect("current world inputs are available");
+        let top_level_index = index_top_level_owner_descriptors(&collection);
+        let parent_descriptor = find_top_level_owner_descriptor(
+            &top_level_index,
+            world_owner,
+            world_descriptor.file,
+            world_descriptor.item_id,
+            TopLevelOwnerKind::World,
+        )
+        .expect("world descriptor matches its active source item");
+        let parent_entry = inputs
+            .filtered_item_tree
+            .items
+            .iter()
+            .find(|entry| {
+                entry.ast_id == world_descriptor.item_id && entry.kind == ItemTreeKind::World
+            })
+            .expect("target-filtered world item exists");
+        let def_paths = database
+            .def_paths
+            .get(&world_owner.def_id.package())
+            .expect("package definition paths are available");
+        let parent_path = def_paths
+            .resolve_def_id(world_owner.def_id.to_def_id())
+            .expect("world definition path resolves")
+            .expect("world definition path exists");
+        let arena = HirArena::new();
+        let context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            &snapshot,
+            &inputs.parsed.root,
+            &arena,
+            &database.symbols,
+            def_paths,
+        );
+        let (parent_hir, _) = lower_top_level_owner(
+            parent_descriptor,
+            &parent_path,
+            &inputs.filtered_item_tree,
+            &inputs.retained_item_kinds,
+            &context,
+        )
+        .expect("world HIR lowers");
+        let parent_items = match parent_hir.node {
+            OwnerNode::Item(item) => match item.kind {
+                ItemKind::World { items } => items,
+                _ => panic!("world descriptor lowers to a world"),
+            },
+            _ => panic!("world descriptor lowers to an item owner"),
+        };
+        let child_entries = parent_entry
+            .children
+            .iter()
+            .filter(|entry| world_item_test_only_kind(entry.kind).is_some())
+            .collect::<Vec<_>>();
+        let item_owner = items[0].owner();
+        let item_position = parent_items
+            .iter()
+            .position(|owner| *owner == item_owner)
+            .expect("generic signature owner belongs to its world");
+        let item_entry = child_entries[item_position];
+        let item_path = def_paths
+            .resolve_def_id(item_owner.def_id.to_def_id())
+            .expect("world item definition path resolves")
+            .expect("world item definition path exists");
+        let (item_hir, _) = lower_world_item_owner(
+            item_owner,
+            &item_path,
+            &parent_hir,
+            WorldItemIds {
+                world: world_descriptor.item_id,
+                item: item_entry.ast_id,
+            },
+            &inputs.filtered_item_tree,
+            &context,
+        )
+        .expect("generic world item HIR lowers");
+        let candidates = world_item_signature_type_path_candidates(&item_hir)
+            .expect("generic world function has signature type candidates");
+        let expected_type_ids = candidates
+            .iter()
+            .map(|candidate| candidate.hir_id)
+            .collect::<std::collections::HashSet<_>>();
+        let actual_type_ids = generic_types
+            .paths()
+            .keys()
+            .copied()
+            .chain(
+                generic_types
+                    .deferred_paths()
+                    .iter()
+                    .map(|path| path.hir_id),
+            )
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            actual_type_ids, expected_type_ids,
+            "world results contain exactly the retained HIR signature type candidate IDs"
+        );
+        let typed_t_start =
+            root.find("typed: T").expect("typed T parameter exists") + "typed: ".len();
+        let typed_t_candidate = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.span.range.start().to_usize() == typed_t_start
+                    && candidate.name == t_symbol
+            })
+            .expect("the retained typed T path is a type candidate");
+        assert_eq!(
+            generic_types.paths().get(&typed_t_candidate.hir_id),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 1,
+                segment_count: 1,
+            }),
+            "the retained path spelled T receives the parser-recovered generic sentinel"
+        );
+        let where_only_symbol = database
+            .symbols
+            .intern("WhereOnly")
+            .expect("WhereOnly is interned");
+        let where_only_binding = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root scope exists")
+            .scope
+            .get(&where_only_symbol)
+            .expect("WhereOnly alias exists")
+            .res;
+        assert!(
+            !generic_types
+                .paths()
+                .values()
+                .any(|path| path.base == where_only_binding),
+            "AST-only where-clause paths do not enter the HIR signature type result"
+        );
+        let body_only_symbol = database
+            .symbols
+            .intern("BodyOnly")
+            .expect("BodyOnly is interned");
+        let body_only_binding = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root scope exists")
+            .scope
+            .get(&body_only_symbol)
+            .expect("BodyOnly alias exists")
+            .res;
+        assert!(
+            !items[2]
+                .type_path_resolution()
+                .expect("recovered world function type result succeeds")
+                .expect("world export signature has a type result")
+                .paths()
+                .values()
+                .any(|path| path.base == body_only_binding),
+            "parser-recovered body type annotations do not enter the HIR signature result"
+        );
+        for item in items {
+            assert!(
+                item.type_path_resolution()
+                    .expect("world function type result resolves")
+                    .is_some(),
+                "every retained world function signature has its own type result"
+            );
+        }
 
         let diagnostics_for = |index: usize| {
             items[index]
@@ -18258,7 +18737,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let head_span = |snippet: &str, head: &str| {
-            let snippet_start = root.rfind(snippet).expect("source snippet exists");
+            let snippet_start = root
+                .rfind(snippet)
+                .unwrap_or_else(|| panic!("source snippet exists: {snippet:?}"));
             let head_start = snippet.find(head).expect("snippet has expected head");
             sai_diagnostics::Span::new(
                 module_tree.modules[0].file,
@@ -18277,7 +18758,7 @@ mod tests {
                 head_span("Container<fixture.Request>", "fixture"),
                 head_span("fixture.Buffer<N>", "fixture"),
                 head_span("-> fixture.Result", "fixture"),
-                head_span("T: fixture.Bound", "fixture"),
+                head_span("WhereOnly: fixture.Bound", "fixture"),
                 head_span("effects { fs, fixture.network }", "fixture"),
             ],
             "a value parameter does not shadow a nested type path, while generic type and const parameters shadow imports and value paths"
@@ -18293,12 +18774,111 @@ mod tests {
         );
         assert_eq!(
             head_spans(2),
-            [head_span("{ fixture.invoke(value) }", "fixture")],
+            [head_span("fixture.invoke(typed)", "fixture")],
             "a parser-recovered world function body retains outside-test diagnostics"
         );
         assert!(
             head_spans(3).is_empty(),
             "body-local bindings shadow same-named test-only module aliases"
+        );
+    }
+
+    #[test]
+    fn world_signature_type_heads_use_each_files_module_scope() {
+        let root = concat!(
+            "type Shared = U32\n",
+            "type RootOnly = Bool\n",
+            "world root_api { export fn read(value: Shared, root: RootOnly) -> U32 }\n",
+        );
+        let child = concat!(
+            "type Shared = I32\n",
+            "world child_api { export fn read(value: Shared, root: RootOnly) -> I32 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                Arc::<[u8]>::from(&b"package acme:phase1 @ 1.0.0\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("same-named aliases collect in both source files");
+        let results = database
+            .resolve_world_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("world signature types resolve");
+        assert_eq!(results.owners().len(), 2);
+        assert!(results.owners().iter().all(|owner| owner.error().is_none()));
+        assert_eq!(results.owners()[0].items().len(), 1);
+        assert_eq!(results.owners()[1].items().len(), 1);
+
+        let shared_symbol = database
+            .symbols
+            .intern("Shared")
+            .expect("Shared name is interned");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let child_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let root_shared = root_scope
+            .scope
+            .get(&shared_symbol)
+            .expect("root Shared alias exists")
+            .res;
+        let child_shared = child_scope
+            .scope
+            .get(&shared_symbol)
+            .expect("child Shared alias exists")
+            .res;
+        assert_ne!(root_shared, child_shared);
+
+        let root_types = results.owners()[0].items()[0]
+            .type_path_resolution()
+            .expect("root world signature result succeeds")
+            .expect("world function signature has a type result");
+        let child_types = results.owners()[1].items()[0]
+            .type_path_resolution()
+            .expect("child world signature result succeeds")
+            .expect("world function signature has a type result");
+        assert!(
+            root_types
+                .paths()
+                .values()
+                .any(|path| path.base == root_shared),
+            "root signatures resolve the root file's Shared alias"
+        );
+        assert!(
+            child_types
+                .paths()
+                .values()
+                .any(|path| path.base == child_shared),
+            "child signatures resolve the child file's same-named Shared alias"
+        );
+        assert!(
+            !child_types
+                .paths()
+                .values()
+                .any(|path| path.base == root_shared),
+            "root-file aliases never leak into child world signatures"
+        );
+        let root_only_symbol = database
+            .symbols
+            .intern("RootOnly")
+            .expect("RootOnly name is interned");
+        assert!(
+            child_types
+                .deferred_paths()
+                .iter()
+                .any(|path| path.name == root_only_symbol),
+            "a root-only type remains deferred from the child file"
         );
     }
 
