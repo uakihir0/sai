@@ -29,7 +29,7 @@ use sai_hir::item_tree::{
     interface_member_path_component, interface_member_path_disambiguator,
 };
 use sai_hir::{
-    DefId, DefPath, DefPathData, DefPathError, DefPathInterner, DefPathInternerError,
+    BindingId, DefId, DefPath, DefPathData, DefPathError, DefPathInterner, DefPathInternerError,
     DisambiguatedDefPathData, LocalDefId, OwnerId, PackageId, Symbol, Visibility,
 };
 use sai_intern::{InternError, Interner, LookupError, PackageIdError, PackageInterner};
@@ -76,14 +76,28 @@ pub enum DefKind {
 ///
 /// Later resolver phases extend this with interfaces, imported items, locals,
 /// and primitive types. Current declaration and local-module-alias passes
-/// construct definition resolutions.
+/// construct definition resolutions; the owner-local pass constructs locals.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Res {
     Def(DefKind, DefId),
+    Local(BindingId),
     Err,
     /// A binding from a `requires test` dependency whose target has not been
     /// resolved in this build.
     TestOnly(ImportIndex),
+}
+
+/// The resolution attached to one path node.
+///
+/// `resolved_segments` is the number of path segments covered by `base`;
+/// `segment_count` is the path's segment count. For a local receiver such as
+/// `x.a.b`, local resolution records `x`'s `Path` node and its one segment;
+/// the trailing field accesses remain for later member and type resolution.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PathRes {
+    pub base: Res,
+    pub resolved_segments: u32,
+    pub segment_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2462,7 +2476,7 @@ fn local_interface_target(
         .get(&interface_name)?;
     match binding.res {
         Res::Def(DefKind::Interface, def_id) => Some(def_id),
-        Res::Def(_, _) | Res::Err | Res::TestOnly(_) => None,
+        Res::Def(_, _) | Res::Local(_) | Res::Err | Res::TestOnly(_) => None,
     }
 }
 
@@ -6121,7 +6135,7 @@ mod tests {
             "import path: {:?}",
             match option_import {
                 Res::Def(_, def_id) => core_paths.resolve_def_id(def_id).unwrap(),
-                Res::Err | Res::TestOnly(_) => None,
+                Res::Local(_) | Res::Err | Res::TestOnly(_) => None,
             }
         );
         assert_eq!(

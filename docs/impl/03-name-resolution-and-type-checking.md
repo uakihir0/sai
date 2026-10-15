@@ -588,7 +588,7 @@ pub enum Res {
 pub struct PathRes {
     pub base: Res,                // resolution of the longest prefix that spec/04 resolves
     pub resolved_segments: u32,   // number of segments covered by `base`
-    pub segment_count: u32,       // total segments of the path or of the field chain (below)
+    pub segment_count: u32,       // path/qualified-chain length; a local receiver counts its Path only
 }
 pub struct ResolvedOwner {
     pub paths: HashMap<HirId, PathRes>,          // key: the HirId of a Path, or of the outermost Field of a qualified chain
@@ -648,6 +648,10 @@ enum RibKind {
 5. Every new local binding (parameter, closure parameter, pattern binding, `let`/`var`) whose name is a module alias of `S(M)` is `SHADOWS_MODULE`. The binding is still introduced, so later uses resolve to it and do not cascade.
 6. A generic parameter of a method whose name is a generic parameter of the enclosing `impl` or `trait` is `SHADOWS_GENERIC_PARAM`; two generic parameters of one list are `DUPLICATE_BINDING`.
 7. For `match` arms, the arm rib holds the pattern's bindings and covers the guard and the body. For `if let` and `while let`, which impl/02 lowers to `Match`, the user arm's rib covers its body only, which is the condition scope of spec/04 §4.7.1. For `for`, the user pattern is inside the `Some(..)` arm of the inner match, which gives the fresh-per-iteration loop pattern scope.
+
+**Current owner-local resolution helper (IR-517).** `sai_resolve::owner::resolve_owner_locals` walks a borrowed `Body` without letting arena references escape. It registers parameters, closure parameters, `let`/`var` pattern bindings, match-arm bindings, region bindings, and generated loop-pattern bindings in lexical ribs; it resolves one-segment `PathRoot::Plain` expression paths to `Res::Local` and records `Symbol::ERROR` paths as `Res::Err`. A local receiver such as `x.a.b` records the `Path(x)` node with one resolved segment; the following fields remain for later type/member resolution. Module alias names from the current `S(M)` are an explicit input and matching local declarations receive `SHADOWS_MODULE`. The walk covers the body value, function contracts, and invariant predicates. A local miss is left for generic, module, or prelude lookup, and non-expression type/pattern paths are not resolved here.
+
+The helper takes the borrowed `Body`, its `HirSourceMap`, and the current `WorkspaceSnapshot`. It requires the Body and map to share the lowering-time `HirSourceId`, then checks owner identity and the map's file, path, package, document version, and raw bytes against that snapshot. This prevents an older Body from being paired with a new source map and permits an unchanged owner file to retain its source map when an unrelated workspace file changes. The owned `LocalResolution` records the file provenance, body-source identity, and module-alias set used for resolution; its provenance check takes the current map, snapshot, and aliases and rejects changed inputs without invalidating on unrelated workspace changes. This is an uncached local slice, not the `resolve_owner` query or the complete `ResolvedOwner`: signature/generic paths, chain heads, label results, and composed fallback lookup remain deferred. Duplicate binding recovery keeps the first binding in a rib; the later duplicate receives `DUPLICATE_BINDING`.
 
 ### 3.4.4 Diagnostics of lookup
 

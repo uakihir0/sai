@@ -1,6 +1,8 @@
 use crate::expressions::Expr;
+use crate::source_map::HirSourceId;
 use crate::types::{EffectRef, Name, Provenance, Ty};
 use crate::{BindingId, HirId, OwnerId, Safety};
+use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FnSig<'hir> {
@@ -23,13 +25,36 @@ pub struct FnParam<'hir> {
     pub ty: &'hir Ty<'hir>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Body<'hir> {
     pub owner: OwnerId,
+    pub source_id: HirSourceId,
     pub params: &'hir [BodyParam],
     pub value: &'hir Expr<'hir>,
     pub contracts: &'hir [Contract<'hir>],
     pub invariant_preds: &'hir [&'hir Expr<'hir>],
+}
+
+impl PartialEq for Body<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.params == other.params
+            && self.value == other.value
+            && self.contracts == other.contracts
+            && self.invariant_preds == other.invariant_preds
+    }
+}
+
+impl Eq for Body<'_> {}
+
+impl Hash for Body<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
+        self.params.hash(state);
+        self.value.hash(state);
+        self.contracts.hash(state);
+        self.invariant_preds.hash(state);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -149,10 +174,15 @@ mod tests {
         let predicates = [&expr];
         let body = Body {
             owner: hir_id.owner,
+            source_id: HirSourceId::default(),
             params: &body_params,
             value: &expr,
             contracts: &contracts,
             invariant_preds: &predicates,
+        };
+        let relowered_body = Body {
+            source_id: HirSourceId::fresh(),
+            ..body
         };
 
         assert_eq!(sig.params[0].name, Some(name));
@@ -161,6 +191,12 @@ mod tests {
         assert_eq!(body.params[0].binding, BindingId::default());
         assert_eq!(body.contracts[0].kind, ContractKind::Requires);
         assert_eq!(body.invariant_preds, &[&expr]);
+        assert_eq!(body, relowered_body);
+        let mut body_hasher = std::collections::hash_map::DefaultHasher::new();
+        body.hash(&mut body_hasher);
+        let mut relowered_body_hasher = std::collections::hash_map::DefaultHasher::new();
+        relowered_body.hash(&mut relowered_body_hasher);
+        assert_eq!(body_hasher.finish(), relowered_body_hasher.finish());
 
         let other_hir_id = test_hir_id("g");
         assert_ne!(body.owner, other_hir_id.owner);

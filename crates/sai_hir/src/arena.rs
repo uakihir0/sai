@@ -790,6 +790,7 @@ mod tests {
         let invariant_preds = arena.alloc_expr_refs(&[expression]);
         let body = arena.alloc_body(Body {
             owner: hir_id.owner,
+            source_id: crate::source_map::HirSourceId::default(),
             params: body_params,
             value: expression,
             contracts,

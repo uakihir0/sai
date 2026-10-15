@@ -1,15 +1,43 @@
 use crate::{
-    BindingId, DefPathInterner, HirId, IndexVec, IndexVecError, ItemLocalId, LocalDefId, OwnerId,
-    Span, SpanCtxt,
+    BindingId, DefPathInterner, FileId, HirId, IndexVec, IndexVecError, ItemLocalId, LocalDefId,
+    OwnerId, Span, SpanCtxt,
 };
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Span as DiagnosticSpan};
 use sai_syntax::{SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, ast::AstIdMap};
+use sai_vfs::WorkspaceSnapshot;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_HIR_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Runtime identity shared by one lowered owner's bodies and source map.
+///
+/// This identity is deliberately excluded from semantic equality and hashing:
+/// it validates that borrowed HIR data is paired with the source map produced
+/// by the same lowering pass, but does not affect incremental HIR semantics.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct HirSourceId(u64);
+
+impl HirSourceId {
+    pub(crate) fn fresh() -> Self {
+        let id = NEXT_HIR_SOURCE_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("HIR source identity space exhausted");
+        Self(id)
+    }
+}
 
 /// Source relationships for one HIR owner.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct HirSourceMap {
     owner: OwnerId,
+    source_id: HirSourceId,
+    file: FileId,
+    source_ref: SourceRef,
+    source_bytes: Arc<[u8]>,
     node_to_syntax: IndexVec<ItemLocalId, SyntaxNodePtr>,
     syntax_to_nodes: HashMap<SyntaxNodePtr, Vec<ItemLocalId>>,
     binding_to_syntax: IndexVec<BindingId, SyntaxNodePtr>,
@@ -17,8 +45,35 @@ pub struct HirSourceMap {
 }
 
 impl HirSourceMap {
+    pub const fn source_id(&self) -> HirSourceId {
+        self.source_id
+    }
+
     pub const fn owner(&self) -> OwnerId {
         self.owner
+    }
+
+    pub const fn file(&self) -> FileId {
+        self.file
+    }
+
+    pub fn source_ref(&self) -> &SourceRef {
+        &self.source_ref
+    }
+
+    pub fn matches_snapshot_file(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        snapshot.file(self.file).is_some_and(|file| {
+            file.matches_reference(
+                &self.source_ref.path,
+                self.source_ref.package.as_deref(),
+                self.source_ref.snapshot,
+            ) && file.source().id() == self.file
+                && file.source().raw_bytes() == self.source_bytes.as_ref()
+        })
+    }
+
+    pub fn matches_body(&self, body: &crate::body::Body<'_>) -> bool {
+        self.owner == body.owner && self.source_id == body.source_id
     }
 
     pub fn node_to_syntax(&self) -> &IndexVec<ItemLocalId, SyntaxNodePtr> {
@@ -55,12 +110,30 @@ impl HirSourceMap {
     }
 }
 
+impl PartialEq for HirSourceMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.file == other.file
+            && self.source_ref == other.source_ref
+            && self.source_bytes == other.source_bytes
+            && self.node_to_syntax == other.node_to_syntax
+            && self.syntax_to_nodes == other.syntax_to_nodes
+            && self.binding_to_syntax == other.binding_to_syntax
+            && self.diagnostics == other.diagnostics
+    }
+}
+
+impl Eq for HirSourceMap {}
+
 /// Builds a source map while checking every syntax node against one parsed
 /// file root and snapshot.
 pub struct HirSourceMapBuilder<'root> {
     owner: OwnerId,
+    source_id: HirSourceId,
     snapshot: sai_vfs::WorkspaceSnapshot,
     file: crate::FileId,
+    source_ref: SourceRef,
+    source_bytes: Arc<[u8]>,
     root: &'root SyntaxNode,
     owner_syntax: SyntaxNode,
     def_path_interner: Option<&'root DefPathInterner>,
@@ -87,12 +160,24 @@ impl<'root> HirSourceMapBuilder<'root> {
         if !ast_ids.matches_root(file, root) {
             return Err(HirSourceMapError::AstIdMapMismatch);
         }
+        let snapshot_file = snapshot
+            .file(file)
+            .ok_or(HirSourceMapError::FileMissingFromSnapshot)?;
+        let source_ref = SourceRef {
+            path: snapshot_file.path().to_owned(),
+            package: snapshot_file.package().map(str::to_owned),
+            snapshot: snapshot_file.document_version(),
+        };
+        let source_bytes = snapshot_file.source().raw_bytes_arc();
 
         let owner_pointer = syntax_pointer(file, root, owner_syntax)?;
         let mut builder = Self {
             owner,
+            source_id: HirSourceId::fresh(),
             snapshot: snapshot.clone(),
             file,
+            source_ref,
+            source_bytes,
             root,
             owner_syntax: owner_syntax.clone(),
             def_path_interner: None,
@@ -116,6 +201,10 @@ impl<'root> HirSourceMapBuilder<'root> {
 
     pub(crate) const fn owner(&self) -> OwnerId {
         self.owner
+    }
+
+    pub const fn source_id(&self) -> HirSourceId {
+        self.source_id
     }
 
     pub(crate) fn owner_syntax(&self) -> &SyntaxNode {
@@ -319,6 +408,10 @@ impl<'root> HirSourceMapBuilder<'root> {
     pub fn finish(self) -> HirSourceMap {
         HirSourceMap {
             owner: self.owner,
+            source_id: self.source_id,
+            file: self.file,
+            source_ref: self.source_ref,
+            source_bytes: self.source_bytes,
             node_to_syntax: self.node_to_syntax,
             syntax_to_nodes: self.syntax_to_nodes,
             binding_to_syntax: self.binding_to_syntax,
@@ -361,6 +454,7 @@ fn syntax_pointer(
 pub enum HirSourceMapError {
     AstIdMapMismatch,
     WorkspaceSnapshotMismatch,
+    FileMissingFromSnapshot,
     DiagnosticNotValidForSnapshot,
     SourceTextNotValidForSnapshot,
     UnknownBindingAlias,
@@ -450,6 +544,10 @@ mod tests {
             .expect("diagnostic belongs to the map snapshot");
         let map = builder.finish();
 
+        assert_eq!(map.file(), file);
+        assert_eq!(map.source_ref().path, "src/lib.sai");
+        assert_eq!(map.source_ref().snapshot, Some(1));
+        assert!(map.matches_snapshot_file(&snapshot));
         assert_eq!(map.node_to_syntax().len(), 3);
         assert_eq!(map.binding_to_syntax().len(), 1);
         assert_eq!(
@@ -471,6 +569,30 @@ mod tests {
                 .with_workspace_snapshot(&snapshot)
                 .is_ok()
         );
+
+        let mut equivalent_builder =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("equivalent builder");
+        equivalent_builder
+            .add_node(name.syntax())
+            .expect("first equivalent HIR node");
+        equivalent_builder
+            .add_node(name.syntax())
+            .expect("second equivalent HIR node");
+        equivalent_builder
+            .add_binding(name.syntax())
+            .expect("equivalent binding");
+        equivalent_builder
+            .push_diagnostic(Diagnostic::new(
+                Code::ExpectedToken,
+                Severity::Error,
+                "test diagnostic",
+                None,
+            ))
+            .expect("equivalent diagnostic");
+        let equivalent = equivalent_builder.finish();
+        assert_ne!(map.source_id(), equivalent.source_id());
+        assert_eq!(map, equivalent);
 
         let other_owner = owner_id("g");
         assert!(

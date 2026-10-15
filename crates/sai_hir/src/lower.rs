@@ -428,6 +428,7 @@ pub fn lower_refined_owner<'hir>(
     };
     let body = context.arena.alloc_body(Body {
         owner,
+        source_id: source_map.source_id(),
         params: &[],
         value,
         contracts: &[],
@@ -540,6 +541,7 @@ pub fn lower_distinct_owner<'hir>(
             )?;
             Some(context.arena.alloc_body(Body {
                 owner,
+                source_id: source_map.source_id(),
                 params: &[],
                 value,
                 contracts: &[],
@@ -552,6 +554,7 @@ pub fn lower_distinct_owner<'hir>(
             let value = lower_error_expr(&error_syntax, context.arena, &mut source_map)?;
             Some(context.arena.alloc_body(Body {
                 owner,
+                source_id: source_map.source_id(),
                 params: &[],
                 value,
                 contracts: &[],
@@ -3614,6 +3617,7 @@ pub fn lower_const_owner<'hir>(
     };
     let body = context.arena.alloc_body(Body {
         owner,
+        source_id: source_map.source_id(),
         params: &[],
         value,
         contracts: &[],
@@ -3724,6 +3728,7 @@ pub fn lower_invariant_owner<'hir>(
     });
     let body = context.arena.alloc_body(Body {
         owner,
+        source_id: source_map.source_id(),
         params: &[],
         value,
         contracts: &[],
@@ -3821,6 +3826,7 @@ pub fn lower_test_owner<'hir>(
     };
     let body = context.arena.alloc_body(Body {
         owner,
+        source_id: source_map.source_id(),
         params: &[],
         value,
         contracts: &[],
@@ -3949,6 +3955,7 @@ pub fn lower_property_owner<'hir>(
     };
     let body = context.arena.alloc_body(Body {
         owner,
+        source_id: source_map.source_id(),
         params: context.arena.alloc_body_params(&body_params),
         value,
         contracts: &[],
@@ -5193,6 +5200,7 @@ fn lower_function_inner<'hir>(
     };
     let body = arena.alloc_body(Body {
         owner: source_map.owner(),
+        source_id: source_map.source_id(),
         params: arena.alloc_body_params(&body_params),
         value: body_value,
         contracts: arena.alloc_contracts(&lowered_contracts),

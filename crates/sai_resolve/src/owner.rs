@@ -1,20 +1,696 @@
 //! Owner-local control-flow resolution.
 //!
-//! This module starts the owner-resolution phase with loop labels. It returns
-//! owned maps and diagnostics, so no HIR arena borrows escape the pass.
+//! This module contains owner-local name/control-flow resolution helpers. They
+//! return owned maps and diagnostics, so no HIR arena borrows escape a pass.
 
 use sai_diagnostics::{
     Child, ChildKind, Code, Diagnostic, Location, Related, Severity, SourceRef,
     Span as DiagnosticSpan,
 };
 use sai_hir::body::Body;
-use sai_hir::expressions::{Arg, Block, Expr, ExprKind, FmtPiece, Label, Stmt, StmtKind};
-use sai_hir::patterns::{Pat, PatKind, PatRangeEnd};
-use sai_hir::types::{GenericArg, GenericArgs, Ty, TyKind};
-use sai_hir::{DesugaringKind, HirId, Safety, Span as HirSpan, SpanCtxt};
+use sai_hir::expressions::{
+    Arg, Arm, Block, ClosureParam, Expr, ExprKind, FmtPiece, Label, Stmt, StmtKind,
+};
+use sai_hir::patterns::{BindingMode, Pat, PatKind, PatRangeEnd};
+use sai_hir::source_map::HirSourceMap;
+use sai_hir::types::{GenericArg, GenericArgs, PathRoot, Ty, TyKind};
+use sai_hir::{
+    BindingId, DesugaringKind, HirId, OwnerId, Safety, Span as HirSpan, SpanCtxt, Symbol,
+};
 use sai_intern::Interner;
-use sai_vfs::SourceFile;
+use sai_vfs::{FileId, SourceFile, WorkspaceSnapshot};
 use std::collections::{HashMap, HashSet};
+
+use super::package_scopes::{PathRes, Res};
+
+/// The class of a local binding retained for later type and lint analysis.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BindingKind {
+    Let,
+    Var,
+    Param,
+    VarParam,
+    Pattern { var: bool },
+    ClosureParam { var: bool },
+    Synthetic,
+}
+
+/// Snapshot-relative metadata for one binding ID in an owner's HIR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalBinding {
+    pub name: Option<Symbol>,
+    pub span: Option<HirSpan>,
+    pub kind: BindingKind,
+}
+
+/// The local portion of path resolution for one HIR owner.
+///
+/// A missing path is intentionally left for generic, module, and prelude
+/// lookup. This result owns no HIR references. Its IDs and spans are tied to
+/// the source map's owner file and the module aliases used during resolution.
+#[derive(Clone, Debug)]
+pub struct LocalResolution {
+    pub owner: OwnerId,
+    pub source_ref: SourceRef,
+    pub source_file: FileId,
+    pub paths: HashMap<HirId, PathRes>,
+    pub bindings: HashMap<BindingId, LocalBinding>,
+    pub diagnostics: Vec<Diagnostic>,
+    body_source_id: sai_hir::source_map::HirSourceId,
+    module_aliases: HashSet<Symbol>,
+}
+
+impl PartialEq for LocalResolution {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.source_ref == other.source_ref
+            && self.source_file == other.source_file
+            && self.paths == other.paths
+            && self.bindings == other.bindings
+            && self.diagnostics == other.diagnostics
+            && self.module_aliases == other.module_aliases
+    }
+}
+
+impl Eq for LocalResolution {}
+
+impl LocalResolution {
+    fn new(
+        owner: OwnerId,
+        source_ref: SourceRef,
+        source_file: FileId,
+        body_source_id: sai_hir::source_map::HirSourceId,
+        module_aliases: &HashSet<Symbol>,
+    ) -> Self {
+        Self {
+            owner,
+            source_ref,
+            source_file,
+            paths: HashMap::new(),
+            bindings: HashMap::new(),
+            diagnostics: Vec::new(),
+            body_source_id,
+            module_aliases: module_aliases.clone(),
+        }
+    }
+
+    pub fn matches_source(
+        &self,
+        source_map: &HirSourceMap,
+        snapshot: &WorkspaceSnapshot,
+        module_aliases: &HashSet<Symbol>,
+    ) -> bool {
+        self.owner == source_map.owner()
+            && self.source_file == source_map.file()
+            && self.body_source_id == source_map.source_id()
+            && self.source_ref == *source_map.source_ref()
+            && source_map.matches_snapshot_file(snapshot)
+            && self.module_aliases == *module_aliases
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalResolutionError {
+    InvalidSourceSpan,
+    MismatchedSourceFile,
+    MismatchedSourceSnapshot,
+    MismatchedOwner,
+    MismatchedBodySource,
+    MissingSourceFile,
+    ForeignLocalSymbol,
+}
+
+#[derive(Clone, Copy)]
+struct LocalBindingEntry {
+    binding: BindingId,
+    name: sai_hir::types::Name,
+}
+
+#[derive(Default)]
+struct LocalRib {
+    bindings: HashMap<Symbol, LocalBindingEntry>,
+}
+
+enum PatternBindingContext {
+    Let { direct: bool },
+    VarStatement,
+    Pattern,
+}
+
+enum LocalWork<'hir> {
+    Expr(&'hir Expr<'hir>),
+    Block(&'hir Block<'hir>),
+    Stmt(&'hir Stmt<'hir>),
+    Arm(&'hir Arm<'hir>),
+    BindPattern {
+        pattern: &'hir Pat<'hir>,
+        context: PatternBindingContext,
+    },
+    ExitScope,
+}
+
+/// Resolves simple value paths to local bindings in one owner's body.
+///
+/// The walk covers the executable body, contracts, and invariant predicates.
+/// It resolves only one-segment `PathRoot::Plain` expression paths; all other
+/// path roots and names with no local match remain available to later owner,
+/// module, and prelude resolution.
+pub fn resolve_owner_locals(
+    body: &Body<'_>,
+    source_map: &HirSourceMap,
+    snapshot: &WorkspaceSnapshot,
+    symbols: &Interner,
+    module_aliases: &HashSet<Symbol>,
+) -> Result<LocalResolution, LocalResolutionError> {
+    if source_map.owner() != body.owner {
+        return Err(LocalResolutionError::MismatchedOwner);
+    }
+    if !source_map.matches_body(body) {
+        return Err(LocalResolutionError::MismatchedBodySource);
+    }
+    let snapshot_file = snapshot
+        .file(source_map.file())
+        .ok_or(LocalResolutionError::MissingSourceFile)?;
+    if !source_map.matches_snapshot_file(snapshot) {
+        return Err(LocalResolutionError::MismatchedSourceSnapshot);
+    }
+    let source = snapshot_file.source().as_ref();
+    let source_ref = source_map.source_ref();
+    for alias in module_aliases {
+        validate_local_symbol(*alias, symbols)?;
+    }
+    let mut result = LocalResolution::new(
+        body.owner,
+        source_ref.clone(),
+        source.id(),
+        body.source_id,
+        module_aliases,
+    );
+    let mut ribs = vec![LocalRib::default()];
+    for param in body.params {
+        let kind = if param.mutable {
+            BindingKind::VarParam
+        } else {
+            BindingKind::Param
+        };
+        register_optional_binding(
+            param.binding,
+            param.name,
+            kind,
+            &mut ribs,
+            &mut result,
+            source_ref,
+            source,
+            symbols,
+            module_aliases,
+            true,
+        )?;
+    }
+
+    let mut work = Vec::new();
+    for predicate in body.invariant_preds.iter().rev() {
+        work.push(LocalWork::Expr(predicate));
+    }
+    for contract in body.contracts.iter().rev() {
+        work.push(LocalWork::Expr(contract.expr));
+    }
+    work.push(LocalWork::Expr(body.value));
+
+    while let Some(task) = work.pop() {
+        match task {
+            LocalWork::Expr(expr) => match expr.kind {
+                ExprKind::Lit(_)
+                | ExprKind::ImplicitMember(_)
+                | ExprKind::Continue { .. }
+                | ExprKind::ContractResult
+                | ExprKind::Err => {}
+                ExprKind::Break { value, .. } => {
+                    if let Some(value) = value {
+                        work.push(LocalWork::Expr(value));
+                    }
+                }
+                ExprKind::Path(path) => {
+                    if path.hir_id.owner != body.owner {
+                        return Err(LocalResolutionError::MismatchedOwner);
+                    }
+                    if path.root == PathRoot::Plain && path.segments.len() == 1 {
+                        let name = path.segments[0].name;
+                        if name.sym.is_error() {
+                            result.paths.insert(
+                                path.hir_id,
+                                PathRes {
+                                    base: Res::Err,
+                                    resolved_segments: 1,
+                                    segment_count: 1,
+                                },
+                            );
+                        } else {
+                            validate_local_symbol(name.sym, symbols)?;
+                            if let Some(binding) = lookup_local_binding(&ribs, name.sym) {
+                                result.paths.insert(
+                                    path.hir_id,
+                                    PathRes {
+                                        base: Res::Local(binding),
+                                        resolved_segments: 1,
+                                        segment_count: 1,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                ExprKind::Field { base, .. }
+                | ExprKind::TupleField { base, .. }
+                | ExprKind::Unary(_, base)
+                | ExprKind::Borrow(_, base)
+                | ExprKind::Try(base)
+                | ExprKind::Await(base) => work.push(LocalWork::Expr(base)),
+                ExprKind::Call { callee, args, base } => {
+                    if let Some(base) = base {
+                        work.push(LocalWork::Expr(base));
+                    }
+                    for arg in args.iter().rev() {
+                        work.push(LocalWork::Expr(arg.expr));
+                    }
+                    work.push(LocalWork::Expr(callee));
+                }
+                ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+                    work.push(LocalWork::Expr(right));
+                    work.push(LocalWork::Expr(left));
+                }
+                ExprKind::Range { start, end, .. } => {
+                    if let Some(end) = end {
+                        work.push(LocalWork::Expr(end));
+                    }
+                    if let Some(start) = start {
+                        work.push(LocalWork::Expr(start));
+                    }
+                }
+                ExprKind::Tuple(items) | ExprKind::Array(items) => {
+                    for item in items.iter().rev() {
+                        work.push(LocalWork::Expr(item));
+                    }
+                }
+                ExprKind::Block(block) => work.push(LocalWork::Block(block)),
+                ExprKind::AsyncBlock { block, .. } => work.push(LocalWork::Block(block)),
+                ExprKind::If { cond, then, els } => {
+                    if let Some(els) = els {
+                        work.push(LocalWork::Expr(els));
+                    }
+                    work.push(LocalWork::Block(then));
+                    work.push(LocalWork::Expr(cond));
+                }
+                ExprKind::Match {
+                    scrutinee, arms, ..
+                } => {
+                    for arm in arms.iter().rev() {
+                        work.push(LocalWork::Arm(arm));
+                    }
+                    work.push(LocalWork::Expr(scrutinee));
+                }
+                ExprKind::Loop { body, .. } => work.push(LocalWork::Block(body)),
+                ExprKind::Return(value) => {
+                    if let Some(value) = value {
+                        work.push(LocalWork::Expr(value));
+                    }
+                }
+                ExprKind::Closure(closure) => {
+                    ribs.push(LocalRib::default());
+                    for param in closure.params {
+                        register_closure_param(
+                            param,
+                            &mut ribs,
+                            &mut result,
+                            source_ref,
+                            source,
+                            symbols,
+                            module_aliases,
+                        )?;
+                    }
+                    work.push(LocalWork::ExitScope);
+                    work.push(LocalWork::Block(closure.body));
+                }
+                ExprKind::Region {
+                    name,
+                    binding,
+                    block,
+                } => {
+                    ribs.push(LocalRib::default());
+                    register_optional_binding(
+                        binding,
+                        Some(name),
+                        BindingKind::Synthetic,
+                        &mut ribs,
+                        &mut result,
+                        source_ref,
+                        source,
+                        symbols,
+                        module_aliases,
+                        false,
+                    )?;
+                    work.push(LocalWork::ExitScope);
+                    work.push(LocalWork::Block(block));
+                }
+                ExprKind::FormatString(pieces) => {
+                    for piece in pieces.iter().rev() {
+                        if let FmtPiece::Arg { expr, .. } = piece {
+                            work.push(LocalWork::Expr(expr));
+                        }
+                    }
+                }
+                ExprKind::ContractOld { args, base } => {
+                    if let Some(base) = base {
+                        work.push(LocalWork::Expr(base));
+                    }
+                    for arg in args.iter().rev() {
+                        work.push(LocalWork::Expr(arg.expr));
+                    }
+                }
+                ExprKind::AsCast { operand, .. } => work.push(LocalWork::Expr(operand)),
+            },
+            LocalWork::Block(block) => {
+                ribs.push(LocalRib::default());
+                work.push(LocalWork::ExitScope);
+                if let Some(tail) = block.tail {
+                    work.push(LocalWork::Expr(tail));
+                }
+                for stmt in block.stmts.iter().rev() {
+                    work.push(LocalWork::Stmt(stmt));
+                }
+            }
+            LocalWork::Stmt(stmt) => match stmt.kind {
+                StmtKind::Let { pat, init, els, .. } => {
+                    let context = if stmt.span.ctxt == SpanCtxt::Desugared(DesugaringKind::VarStmt)
+                    {
+                        PatternBindingContext::VarStatement
+                    } else {
+                        PatternBindingContext::Let {
+                            direct: matches!(
+                                pat.kind,
+                                PatKind::Binding {
+                                    mode: BindingMode::Value,
+                                    sub: None,
+                                    ..
+                                }
+                            ),
+                        }
+                    };
+                    work.push(LocalWork::BindPattern {
+                        pattern: pat,
+                        context,
+                    });
+                    if let Some(els) = els {
+                        work.push(LocalWork::Block(els));
+                    }
+                    work.push(LocalWork::Expr(init));
+                }
+                StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                    work.push(LocalWork::Expr(rhs));
+                    work.push(LocalWork::Expr(lhs));
+                }
+                StmtKind::Assert { cond, msg, .. } => {
+                    if let Some(msg) = msg {
+                        work.push(LocalWork::Expr(msg));
+                    }
+                    work.push(LocalWork::Expr(cond));
+                }
+                StmtKind::Expr(expr) => work.push(LocalWork::Expr(expr)),
+            },
+            LocalWork::Arm(arm) => {
+                ribs.push(LocalRib::default());
+                register_pattern_bindings(
+                    arm.pat,
+                    PatternBindingContext::Pattern,
+                    &mut ribs,
+                    &mut result,
+                    source_ref,
+                    source,
+                    symbols,
+                    module_aliases,
+                    false,
+                )?;
+                work.push(LocalWork::ExitScope);
+                work.push(LocalWork::Expr(arm.body));
+                if let Some(guard) = arm.guard {
+                    work.push(LocalWork::Expr(guard));
+                }
+            }
+            LocalWork::BindPattern { pattern, context } => {
+                register_pattern_bindings(
+                    pattern,
+                    context,
+                    &mut ribs,
+                    &mut result,
+                    source_ref,
+                    source,
+                    symbols,
+                    module_aliases,
+                    true,
+                )?;
+            }
+            LocalWork::ExitScope => {
+                if ribs.len() <= 1 {
+                    return Err(LocalResolutionError::MismatchedOwner);
+                }
+                ribs.pop();
+            }
+        }
+    }
+
+    sort_owner_diagnostics(&mut result.diagnostics);
+    Ok(result)
+}
+
+fn lookup_local_binding(ribs: &[LocalRib], symbol: Symbol) -> Option<BindingId> {
+    ribs.iter()
+        .rev()
+        .find_map(|rib| rib.bindings.get(&symbol).map(|entry| entry.binding))
+}
+
+fn register_closure_param(
+    param: &ClosureParam<'_>,
+    ribs: &mut [LocalRib],
+    result: &mut LocalResolution,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+    symbols: &Interner,
+    module_aliases: &HashSet<Symbol>,
+) -> Result<(), LocalResolutionError> {
+    register_optional_binding(
+        param.binding,
+        param.name,
+        BindingKind::ClosureParam { var: param.mutable },
+        ribs,
+        result,
+        source_ref,
+        source,
+        symbols,
+        module_aliases,
+        true,
+    )
+}
+
+fn register_optional_binding(
+    binding: BindingId,
+    name: Option<sai_hir::types::Name>,
+    kind: BindingKind,
+    ribs: &mut [LocalRib],
+    result: &mut LocalResolution,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+    symbols: &Interner,
+    module_aliases: &HashSet<Symbol>,
+    diagnose_duplicate: bool,
+) -> Result<(), LocalResolutionError> {
+    if let Some(name) = name {
+        validate_local_symbol(name.sym, symbols)?;
+    }
+    result.bindings.entry(binding).or_insert(LocalBinding {
+        name: name.map(|name| name.sym),
+        span: name.map(|name| name.span),
+        kind,
+    });
+    if let Some(name) = name.filter(|name| !name.sym.is_error()) {
+        register_named_binding(
+            binding,
+            name,
+            ribs,
+            result,
+            source_ref,
+            source,
+            symbols,
+            module_aliases,
+            diagnose_duplicate,
+        )?;
+    }
+    Ok(())
+}
+
+fn register_pattern_bindings(
+    pattern: &Pat<'_>,
+    context: PatternBindingContext,
+    ribs: &mut [LocalRib],
+    result: &mut LocalResolution,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+    symbols: &Interner,
+    module_aliases: &HashSet<Symbol>,
+    diagnose_duplicate: bool,
+) -> Result<(), LocalResolutionError> {
+    let mut patterns = vec![pattern];
+    let mut pattern_symbols = HashSet::new();
+    while let Some(pattern) = patterns.pop() {
+        match pattern.kind {
+            PatKind::Binding {
+                mode,
+                name,
+                binding,
+                sub,
+            } => {
+                validate_local_symbol(name.sym, symbols)?;
+                let kind = if pattern.span.ctxt == SpanCtxt::Desugared(DesugaringKind::VarStmt) {
+                    BindingKind::Var
+                } else if pattern.span.ctxt != SpanCtxt::Root {
+                    BindingKind::Synthetic
+                } else {
+                    match context {
+                        PatternBindingContext::Let { direct: true } => BindingKind::Let,
+                        PatternBindingContext::VarStatement => BindingKind::Var,
+                        PatternBindingContext::Let { direct: false }
+                        | PatternBindingContext::Pattern => BindingKind::Pattern {
+                            var: mode == BindingMode::Var,
+                        },
+                    }
+                };
+                result.bindings.entry(binding).or_insert(LocalBinding {
+                    name: Some(name.sym),
+                    span: Some(name.span),
+                    kind,
+                });
+                if !name.sym.is_error() && pattern_symbols.insert(name.sym) {
+                    register_named_binding(
+                        binding,
+                        name,
+                        ribs,
+                        result,
+                        source_ref,
+                        source,
+                        symbols,
+                        module_aliases,
+                        diagnose_duplicate,
+                    )?;
+                }
+                if let Some(sub) = sub {
+                    patterns.push(sub);
+                }
+            }
+            PatKind::Tuple(items) | PatKind::Or(items) => {
+                patterns.extend(items.iter().rev());
+            }
+            PatKind::Slice {
+                before,
+                rest,
+                after,
+            } => {
+                patterns.extend(after.iter().rev());
+                if let Some(Some(rest)) = rest {
+                    patterns.push(rest);
+                }
+                patterns.extend(before.iter().rev());
+            }
+            PatKind::Ctor { args, .. } | PatKind::ImplicitMember { args, .. } => {
+                if let Some(args) = args {
+                    for arg in args.iter().rev() {
+                        patterns.push(&arg.pat);
+                    }
+                }
+            }
+            PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Err => {}
+        }
+    }
+    Ok(())
+}
+
+fn register_named_binding(
+    binding: BindingId,
+    name: sai_hir::types::Name,
+    ribs: &mut [LocalRib],
+    result: &mut LocalResolution,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+    symbols: &Interner,
+    module_aliases: &HashSet<Symbol>,
+    diagnose_duplicate: bool,
+) -> Result<(), LocalResolutionError> {
+    if module_aliases.contains(&name.sym) {
+        let spelling = symbols
+            .resolve(name.sym)
+            .map_err(|_| LocalResolutionError::ForeignLocalSymbol)?;
+        let primary = local_source_location(name.span, source_ref, source)?;
+        let mut diagnostic = Diagnostic::new(
+            Code::ShadowsModule,
+            Severity::Error,
+            format!("`{spelling}` shadows a module or interface binding"),
+            Some(primary),
+        );
+        diagnostic.primary_label = "shadows module binding".to_owned();
+        result.diagnostics.push(diagnostic);
+    }
+
+    let rib = ribs
+        .last_mut()
+        .ok_or(LocalResolutionError::MismatchedOwner)?;
+    if let Some(previous) = rib.bindings.get(&name.sym).copied() {
+        if diagnose_duplicate && previous.binding != binding {
+            let spelling = symbols
+                .resolve(name.sym)
+                .map_err(|_| LocalResolutionError::ForeignLocalSymbol)?;
+            let primary = local_source_location(name.span, source_ref, source)?;
+            let earlier = local_source_location(previous.name.span, source_ref, source)?;
+            let mut diagnostic = Diagnostic::new(
+                Code::DuplicateBinding,
+                Severity::Error,
+                format!("`{spelling}` is already bound in this scope"),
+                Some(primary),
+            );
+            diagnostic.primary_label = "duplicate binding".to_owned();
+            diagnostic
+                .push_related(Related::DeclaredHere {
+                    location: earlier,
+                    what: "earlier binding".to_owned(),
+                })
+                .expect("unbound diagnostics accept related locations");
+            result.diagnostics.push(diagnostic);
+        }
+    } else {
+        rib.bindings
+            .insert(name.sym, LocalBindingEntry { binding, name });
+    }
+    Ok(())
+}
+
+fn local_source_location(
+    span: HirSpan,
+    source_ref: &SourceRef,
+    source: &SourceFile,
+) -> Result<Location, LocalResolutionError> {
+    if span.file != source.id() {
+        return Err(LocalResolutionError::MismatchedSourceFile);
+    }
+    Location::from_decoded_source(
+        source_ref.clone(),
+        DiagnosticSpan::new(span.file, span.range),
+        source,
+    )
+    .ok_or(LocalResolutionError::InvalidSourceSpan)
+}
+
+fn validate_local_symbol(symbol: Symbol, symbols: &Interner) -> Result<(), LocalResolutionError> {
+    if !symbol.is_error() && symbol.session_id() != symbols.session_id() {
+        return Err(LocalResolutionError::ForeignLocalSymbol);
+    }
+    Ok(())
+}
 
 /// An unused label discovered by loop resolution.
 ///
@@ -1015,14 +1691,19 @@ fn push_path_args<'hir>(work: &mut Vec<Work<'hir>>, path: sai_hir::types::Path<'
 mod tests {
     use super::*;
     use sai_hir::arena::HirArena;
-    use sai_hir::body::{Contract, ContractKind};
-    use sai_hir::expressions::{CaptureBy, Closure, LoopSource};
+    use sai_hir::body::{BodyParam, Contract, ContractKind};
+    use sai_hir::expressions::{CaptureBy, Closure, LoopSource, MatchSource};
+    use sai_hir::patterns::{BindingMode, Pat};
+    use sai_hir::source_map::HirSourceMapBuilder;
+    use sai_hir::types::{Name, Path, PathRoot, PathSegment};
     use sai_hir::{
         DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId,
         Span as HirSpan, SpanCtxt,
     };
     use sai_intern::{Idx, Interner, ItemLocalId, PackageInterner};
-    use sai_vfs::{FileId, SourceFile, TextRange, TextSize};
+    use sai_syntax::ast::AstIdMap;
+    use sai_vfs::{FileId, SnapshotFile, SourceFile, TextRange, TextSize, WorkspaceSnapshot};
+    use std::sync::Arc;
 
     fn owner_id() -> OwnerId {
         owner_id_with_local().0
@@ -1081,6 +1762,1083 @@ mod tests {
             },
             SourceFile::new(file, " ".repeat(128), false).expect("source creates"),
         )
+    }
+
+    fn local_source_context(
+        owner: OwnerId,
+    ) -> (WorkspaceSnapshot, sai_hir::source_map::HirSourceMap) {
+        local_source_context_with(owner, &" ".repeat(128), None)
+    }
+
+    fn local_source_context_with(
+        owner: OwnerId,
+        text: &str,
+        document_version: Option<u64>,
+    ) -> (WorkspaceSnapshot, sai_hir::source_map::HirSourceMap) {
+        let file = FileId::new(1);
+        let source = Arc::new(SourceFile::new(file, text, false).expect("source creates"));
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            source,
+            "src/lib.sai",
+            None,
+            document_version,
+        )])
+        .expect("snapshot creates");
+        let parsed = sai_syntax::parse(&snapshot, file).expect("source parses");
+        let ast_ids = AstIdMap::new(file, &parsed.root).expect("AST IDs");
+        let source_map =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &parsed.root)
+                .expect("source map starts")
+                .finish();
+        (snapshot, source_map)
+    }
+
+    fn local_name(symbol: sai_hir::Symbol, start: u32, end: u32) -> Name {
+        Name {
+            sym: symbol,
+            span: hir_span(start, end),
+        }
+    }
+
+    fn local_path_expr<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        local: u32,
+        start: u32,
+        end: u32,
+        symbol: sai_hir::Symbol,
+        root: PathRoot,
+    ) -> &'hir Expr<'hir> {
+        let segment = PathSegment {
+            hir_id: hir_id(owner, local + 2),
+            name: local_name(symbol, start, end),
+            args: None,
+        };
+        let path = Path {
+            hir_id: hir_id(owner, local + 1),
+            root,
+            segments: arena.alloc_path_segments(&[segment]),
+            span: hir_span(start, end),
+        };
+        expr(arena, owner, local, start, end, ExprKind::Path(path))
+    }
+
+    fn local_binding_pat<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        local: u32,
+        name: Name,
+        binding: BindingId,
+        mode: BindingMode,
+    ) -> &'hir Pat<'hir> {
+        arena.alloc_pat(Pat {
+            hir_id: hir_id(owner, local),
+            kind: PatKind::Binding {
+                mode,
+                name,
+                binding,
+                sub: None,
+            },
+            span: name.span,
+        })
+    }
+
+    fn block_with_stmts<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        local: u32,
+        stmts: &[Stmt<'hir>],
+        tail: Option<&'hir Expr<'hir>>,
+    ) -> &'hir Block<'hir> {
+        arena.alloc_block(Block {
+            hir_id: hir_id(owner, local),
+            stmts: arena.alloc_stmts(stmts),
+            tail,
+            safety: sai_hir::Safety::Safe,
+            span: hir_span(0, 120),
+        })
+    }
+
+    fn body<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        source_id: sai_hir::source_map::HirSourceId,
+        params: &'hir [BodyParam],
+        value: &'hir Expr<'hir>,
+        contracts: &'hir [Contract<'hir>],
+    ) -> &'hir Body<'hir> {
+        arena.alloc_body(sai_hir::body::Body {
+            owner,
+            source_id,
+            params,
+            value,
+            contracts,
+            invariant_preds: &[],
+        })
+    }
+
+    #[test]
+    fn local_paths_respect_parameter_and_initializer_binding_order() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let x = symbols.intern("x").expect("symbol interns");
+        let parameter = BodyParam {
+            hir_id: hir_id(owner, 1),
+            binding: BindingId::from_raw(0),
+            name: Some(local_name(x, 0, 1)),
+            mutable: false,
+        };
+        let params = [parameter];
+        let initializer_use = local_path_expr(&arena, owner, 10, 20, 21, x, PathRoot::Plain);
+        let pattern = local_binding_pat(
+            &arena,
+            owner,
+            20,
+            local_name(x, 25, 26),
+            BindingId::from_raw(1),
+            BindingMode::Value,
+        );
+        let statement = Stmt {
+            hir_id: hir_id(owner, 22),
+            kind: StmtKind::Let {
+                pat: pattern,
+                ty: None,
+                init: initializer_use,
+                els: None,
+            },
+            span: hir_span(25, 32),
+        };
+        let later_use = local_path_expr(&arena, owner, 30, 40, 41, x, PathRoot::Plain);
+        let field_a_name = symbols.intern("a").expect("symbol interns");
+        let field_b_name = symbols.intern("b").expect("symbol interns");
+        let field_chain_root = local_path_expr(&arena, owner, 50, 42, 43, x, PathRoot::Plain);
+        let field_a = expr(
+            &arena,
+            owner,
+            53,
+            42,
+            44,
+            ExprKind::Field {
+                base: field_chain_root,
+                name: local_name(field_a_name, 43, 44),
+                args: None,
+            },
+        );
+        let field_b = expr(
+            &arena,
+            owner,
+            54,
+            42,
+            46,
+            ExprKind::Field {
+                base: field_a,
+                name: local_name(field_b_name, 45, 46),
+                args: None,
+            },
+        );
+        let tail = expr(
+            &arena,
+            owner,
+            55,
+            40,
+            46,
+            ExprKind::Tuple(arena.alloc_exprs(&[*later_use, *field_b])),
+        );
+        let value = expr(
+            &arena,
+            owner,
+            40,
+            0,
+            50,
+            ExprKind::Block(block_with_stmts(
+                &arena,
+                owner,
+                41,
+                &[statement],
+                Some(tail),
+            )),
+        );
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(&arena, owner, source_map.source_id(), &params, value, &[]);
+
+        let result = resolve_owner_locals(body, &source_map, &snapshot, &symbols, &HashSet::new())
+            .expect("local paths resolve");
+        assert!(result.matches_source(&source_map, &snapshot, &HashSet::new()));
+        let (same_file_snapshot, _) = local_source_context(owner);
+        assert!(source_map.matches_snapshot_file(&same_file_snapshot));
+        let same_file_result = resolve_owner_locals(
+            body,
+            &source_map,
+            &same_file_snapshot,
+            &symbols,
+            &HashSet::new(),
+        )
+        .expect("unchanged owner source remains valid");
+        assert!(same_file_result.matches_source(&source_map, &same_file_snapshot, &HashSet::new()));
+        let unchanged_file = Arc::new(
+            SourceFile::new(FileId::new(1), " ".repeat(128), false).expect("owner source creates"),
+        );
+        let unrelated_file = Arc::new(
+            SourceFile::new(FileId::new(2), "fn other() {}", false)
+                .expect("unrelated source creates"),
+        );
+        let changed_workspace = WorkspaceSnapshot::new([
+            SnapshotFile::new(unchanged_file, "src/lib.sai", None, None),
+            SnapshotFile::new(unrelated_file, "src/other.sai", None, None),
+        ])
+        .expect("workspace with unrelated source creates");
+        assert!(source_map.matches_snapshot_file(&changed_workspace));
+        assert!(result.matches_source(&source_map, &changed_workspace, &HashSet::new()));
+        let (different_version, _) = local_source_context_with(owner, &" ".repeat(128), Some(2));
+        assert!(!source_map.matches_snapshot_file(&different_version));
+        assert!(!result.matches_source(&source_map, &different_version, &HashSet::new()));
+        let (stale_snapshot, _) =
+            local_source_context_with(owner, &format!("x{}", " ".repeat(127)), None);
+        assert!(!source_map.matches_snapshot_file(&stale_snapshot));
+        assert!(!result.matches_source(&source_map, &stale_snapshot, &HashSet::new()));
+        let (_, another_source_map) = local_source_context(owner);
+        assert_ne!(source_map.source_id(), another_source_map.source_id());
+        assert_eq!(
+            resolve_owner_locals(
+                body,
+                &another_source_map,
+                &snapshot,
+                &symbols,
+                &HashSet::new(),
+            ),
+            Err(LocalResolutionError::MismatchedBodySource)
+        );
+        assert_eq!(
+            resolve_owner_locals(
+                body,
+                &source_map,
+                &stale_snapshot,
+                &symbols,
+                &HashSet::new()
+            )
+            .unwrap_err(),
+            LocalResolutionError::MismatchedSourceSnapshot
+        );
+
+        assert_eq!(
+            result.paths.get(&match initializer_use.kind {
+                ExprKind::Path(path) => path.hir_id,
+                _ => unreachable!(),
+            }),
+            Some(&PathRes {
+                base: Res::Local(BindingId::from_raw(0)),
+                resolved_segments: 1,
+                segment_count: 1,
+            })
+        );
+        let ExprKind::Path(later_path) = later_use.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            result
+                .paths
+                .get(&later_path.hir_id)
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(1)))
+        );
+        let ExprKind::Path(field_chain_path) = field_chain_root.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            result.paths.get(&field_chain_path.hir_id),
+            Some(&PathRes {
+                base: Res::Local(BindingId::from_raw(1)),
+                resolved_segments: 1,
+                segment_count: 1,
+            })
+        );
+        assert_eq!(
+            result
+                .bindings
+                .get(&BindingId::from_raw(0))
+                .map(|binding| binding.kind),
+            Some(BindingKind::Param)
+        );
+        assert_eq!(
+            result
+                .bindings
+                .get(&BindingId::from_raw(1))
+                .map(|binding| binding.kind),
+            Some(BindingKind::Let)
+        );
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn local_bindings_report_module_alias_shadowing() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let alias = symbols.intern("alias").expect("symbol interns");
+        let module_aliases = HashSet::from([alias]);
+        let params = [BodyParam {
+            hir_id: hir_id(owner, 1),
+            binding: BindingId::from_raw(0),
+            name: Some(local_name(alias, 0, 1)),
+            mutable: false,
+        }];
+
+        let let_pattern = local_binding_pat(
+            &arena,
+            owner,
+            2,
+            local_name(alias, 10, 11),
+            BindingId::from_raw(1),
+            BindingMode::Value,
+        );
+        let let_init = expr(
+            &arena,
+            owner,
+            3,
+            12,
+            13,
+            ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+        );
+        let let_statement = Stmt {
+            hir_id: hir_id(owner, 4),
+            kind: StmtKind::Let {
+                pat: let_pattern,
+                ty: None,
+                init: let_init,
+                els: None,
+            },
+            span: hir_span(10, 13),
+        };
+        let let_block = block_with_stmts(&arena, owner, 5, &[let_statement], None);
+        let let_expr = expr(&arena, owner, 6, 9, 14, ExprKind::Block(let_block));
+
+        let arm_pattern = local_binding_pat(
+            &arena,
+            owner,
+            7,
+            local_name(alias, 20, 21),
+            BindingId::from_raw(2),
+            BindingMode::Value,
+        );
+        let arm_body = expr(
+            &arena,
+            owner,
+            8,
+            22,
+            23,
+            ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+        );
+        let arm = sai_hir::expressions::Arm {
+            hir_id: hir_id(owner, 9),
+            pat: arm_pattern,
+            guard: None,
+            body: arm_body,
+            span: hir_span(20, 23),
+            synthesized: false,
+        };
+        let match_expr = expr(
+            &arena,
+            owner,
+            10,
+            19,
+            24,
+            ExprKind::Match {
+                scrutinee: expr(
+                    &arena,
+                    owner,
+                    11,
+                    18,
+                    19,
+                    ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+                ),
+                arms: arena.alloc_arms(&[arm]),
+                source: MatchSource::Normal,
+            },
+        );
+
+        let closure_param = sai_hir::expressions::ClosureParam {
+            hir_id: hir_id(owner, 12),
+            binding: BindingId::from_raw(3),
+            name: Some(local_name(alias, 30, 31)),
+            mutable: false,
+            ty: None,
+        };
+        let closure_params = [closure_param];
+        let closure_body_expr = expr(
+            &arena,
+            owner,
+            13,
+            32,
+            33,
+            ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+        );
+        let closure = arena.alloc_closure(Closure {
+            def_id: owner.def_id,
+            capture: CaptureBy::Infer,
+            params: &closure_params,
+            ret: None,
+            body: block(&arena, owner, 14, Some(closure_body_expr)),
+        });
+        let closure_expr = expr(&arena, owner, 15, 29, 34, ExprKind::Closure(closure));
+        let value = expr(
+            &arena,
+            owner,
+            16,
+            9,
+            35,
+            ExprKind::Tuple(arena.alloc_exprs(&[*let_expr, *match_expr, *closure_expr])),
+        );
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(&arena, owner, source_map.source_id(), &params, value, &[]);
+
+        let result = resolve_owner_locals(body, &source_map, &snapshot, &symbols, &module_aliases)
+            .expect("local paths resolve");
+        assert!(result.matches_source(&source_map, &snapshot, &module_aliases));
+        assert!(!result.matches_source(&source_map, &snapshot, &HashSet::new()));
+        let shadow_diagnostics = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::ShadowsModule)
+            .collect::<Vec<_>>();
+
+        assert_eq!(shadow_diagnostics.len(), 4);
+        assert!(
+            shadow_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Error)
+        );
+        assert!(
+            shadow_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.primary().is_some())
+        );
+    }
+
+    #[test]
+    fn local_scopes_preserve_first_duplicate_and_do_not_leak_shadowing() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let x = symbols.intern("x").expect("symbol interns");
+        let missing = symbols.intern("missing").expect("symbol interns");
+        let first = local_binding_pat(
+            &arena,
+            owner,
+            1,
+            local_name(x, 1, 2),
+            BindingId::from_raw(1),
+            BindingMode::Value,
+        );
+        let duplicate = local_binding_pat(
+            &arena,
+            owner,
+            2,
+            local_name(x, 11, 12),
+            BindingId::from_raw(2),
+            BindingMode::Value,
+        );
+        let first_stmt = Stmt {
+            hir_id: hir_id(owner, 3),
+            kind: StmtKind::Let {
+                pat: first,
+                ty: None,
+                init: expr(
+                    &arena,
+                    owner,
+                    4,
+                    3,
+                    4,
+                    ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+                ),
+                els: None,
+            },
+            span: hir_span(0, 5),
+        };
+        let duplicate_stmt = Stmt {
+            hir_id: hir_id(owner, 5),
+            kind: StmtKind::Let {
+                pat: duplicate,
+                ty: None,
+                init: expr(
+                    &arena,
+                    owner,
+                    6,
+                    13,
+                    14,
+                    ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+                ),
+                els: None,
+            },
+            span: hir_span(10, 15),
+        };
+        let inner_binding = local_binding_pat(
+            &arena,
+            owner,
+            7,
+            local_name(x, 21, 22),
+            BindingId::from_raw(3),
+            BindingMode::Value,
+        );
+        let inner_stmt = Stmt {
+            hir_id: hir_id(owner, 8),
+            kind: StmtKind::Let {
+                pat: inner_binding,
+                ty: None,
+                init: expr(
+                    &arena,
+                    owner,
+                    9,
+                    23,
+                    24,
+                    ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+                ),
+                els: None,
+            },
+            span: hir_span(20, 25),
+        };
+        let inner_use = local_path_expr(&arena, owner, 10, 30, 31, x, PathRoot::Plain);
+        let inner_expr = expr(
+            &arena,
+            owner,
+            12,
+            19,
+            35,
+            ExprKind::Block(block_with_stmts(
+                &arena,
+                owner,
+                13,
+                &[inner_stmt],
+                Some(inner_use),
+            )),
+        );
+        let outer_use = local_path_expr(&arena, owner, 14, 40, 41, x, PathRoot::Plain);
+        let missing_use = local_path_expr(&arena, owner, 16, 45, 52, missing, PathRoot::Plain);
+        let rooted_use = local_path_expr(&arena, owner, 18, 55, 56, x, PathRoot::SelfValue);
+        let tuple = expr(
+            &arena,
+            owner,
+            20,
+            19,
+            58,
+            ExprKind::Tuple(arena.alloc_exprs(&[
+                *inner_expr,
+                *outer_use,
+                *missing_use,
+                *rooted_use,
+            ])),
+        );
+        let value = expr(
+            &arena,
+            owner,
+            21,
+            0,
+            60,
+            ExprKind::Block(block_with_stmts(
+                &arena,
+                owner,
+                22,
+                &[first_stmt, duplicate_stmt],
+                Some(tuple),
+            )),
+        );
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(&arena, owner, source_map.source_id(), &[], value, &[]);
+
+        let result = resolve_owner_locals(body, &source_map, &snapshot, &symbols, &HashSet::new())
+            .expect("local paths resolve");
+
+        let ExprKind::Path(inner_path) = inner_use.kind else {
+            unreachable!()
+        };
+        let ExprKind::Path(outer_path) = outer_use.kind else {
+            unreachable!()
+        };
+        let ExprKind::Path(missing_path) = missing_use.kind else {
+            unreachable!()
+        };
+        let ExprKind::Path(rooted_path) = rooted_use.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            result
+                .paths
+                .get(&inner_path.hir_id)
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(3)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&outer_path.hir_id)
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(1)))
+        );
+        assert!(!result.paths.contains_key(&missing_path.hir_id));
+        assert!(!result.paths.contains_key(&rooted_path.hir_id));
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::DuplicateBinding]
+        );
+        assert_eq!(
+            result.diagnostics[0]
+                .primary()
+                .expect("duplicate has a primary span")
+                .span
+                .range
+                .start()
+                .raw(),
+            11
+        );
+        let Related::DeclaredHere { location, .. } = &result.diagnostics[0].related()[0] else {
+            panic!("duplicate binding points to its earlier declaration");
+        };
+        assert_eq!(location.span.range.start().raw(), 1);
+        assert_eq!(
+            result
+                .paths
+                .get(&outer_path.hir_id)
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(1))),
+            "the earlier same-scope binding remains the recovery target"
+        );
+    }
+
+    #[test]
+    fn let_else_region_and_generated_loop_bindings_have_their_own_scopes() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let x = symbols.intern("x").expect("symbol interns");
+        let region = symbols.intern("region").expect("symbol interns");
+        let iter = symbols.intern("%iter").expect("symbol interns");
+        let parameter = BodyParam {
+            hir_id: hir_id(owner, 1),
+            binding: BindingId::from_raw(0),
+            name: Some(local_name(x, 0, 1)),
+            mutable: false,
+        };
+        let params = [parameter];
+        let initializer_use = local_path_expr(&arena, owner, 10, 5, 6, x, PathRoot::Plain);
+        let else_use = local_path_expr(&arena, owner, 12, 8, 9, x, PathRoot::Plain);
+        let else_block = block(&arena, owner, 14, Some(else_use));
+        let let_pattern = local_binding_pat(
+            &arena,
+            owner,
+            15,
+            local_name(x, 10, 11),
+            BindingId::from_raw(1),
+            BindingMode::Value,
+        );
+        let let_stmt = Stmt {
+            hir_id: hir_id(owner, 16),
+            kind: StmtKind::Let {
+                pat: let_pattern,
+                ty: None,
+                init: initializer_use,
+                els: Some(else_block),
+            },
+            span: hir_span(5, 15),
+        };
+        let after_let = local_path_expr(&arena, owner, 17, 16, 17, x, PathRoot::Plain);
+
+        let region_name = Name {
+            sym: region,
+            span: HirSpan {
+                ctxt: SpanCtxt::Root,
+                ..hir_span(27, 33)
+            },
+        };
+        let region_use = local_path_expr(&arena, owner, 18, 29, 35, region, PathRoot::Plain);
+        let region_body = block(&arena, owner, 19, Some(region_use));
+        let region_expr = expr(
+            &arena,
+            owner,
+            20,
+            20,
+            36,
+            ExprKind::Region {
+                name: region_name,
+                binding: BindingId::from_raw(2),
+                block: region_body,
+            },
+        );
+
+        let generated_span = HirSpan {
+            ctxt: SpanCtxt::Desugared(DesugaringKind::ForLoop),
+            ..hir_span(40, 45)
+        };
+        let generated_pat = arena.alloc_pat(Pat {
+            hir_id: hir_id(owner, 21),
+            kind: PatKind::Binding {
+                mode: BindingMode::Var,
+                name: Name {
+                    sym: iter,
+                    span: generated_span,
+                },
+                binding: BindingId::from_raw(3),
+                sub: None,
+            },
+            span: generated_span,
+        });
+        let generated_use = local_path_expr(&arena, owner, 22, 46, 51, iter, PathRoot::Plain);
+        let generated_arm = sai_hir::expressions::Arm {
+            hir_id: hir_id(owner, 23),
+            pat: generated_pat,
+            guard: None,
+            body: generated_use,
+            span: generated_span,
+            synthesized: true,
+        };
+        let for_match = expr(
+            &arena,
+            owner,
+            24,
+            40,
+            52,
+            ExprKind::Match {
+                scrutinee: expr(
+                    &arena,
+                    owner,
+                    25,
+                    38,
+                    39,
+                    ExprKind::Lit(sai_hir::literals::Lit::Bool(true)),
+                ),
+                arms: arena.alloc_arms(&[generated_arm]),
+                source: MatchSource::ForLoop,
+            },
+        );
+        let after_arm = local_path_expr(&arena, owner, 26, 53, 58, iter, PathRoot::Plain);
+        let error_name = local_path_expr(&arena, owner, 27, 59, 60, Symbol::ERROR, PathRoot::Plain);
+        let tail = expr(
+            &arena,
+            owner,
+            28,
+            16,
+            61,
+            ExprKind::Tuple(arena.alloc_exprs(&[
+                *after_let,
+                *region_expr,
+                *for_match,
+                *after_arm,
+                *error_name,
+            ])),
+        );
+        let value = expr(
+            &arena,
+            owner,
+            29,
+            0,
+            62,
+            ExprKind::Block(block_with_stmts(&arena, owner, 30, &[let_stmt], Some(tail))),
+        );
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(&arena, owner, source_map.source_id(), &params, value, &[]);
+
+        let result = resolve_owner_locals(body, &source_map, &snapshot, &symbols, &HashSet::new())
+            .expect("local paths resolve");
+        let path_id = |expr: &Expr<'_>| match expr.kind {
+            ExprKind::Path(path) => path.hir_id,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(initializer_use))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(0)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(else_use))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(0)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(after_let))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(1)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(region_use))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(2)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(generated_use))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(3)))
+        );
+        assert!(!result.paths.contains_key(&path_id(after_arm)));
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(error_name))
+                .map(|resolution| resolution.base),
+            Some(Res::Err)
+        );
+        assert_eq!(
+            result
+                .bindings
+                .get(&BindingId::from_raw(2))
+                .map(|binding| binding.kind),
+            Some(BindingKind::Synthetic)
+        );
+        assert_eq!(
+            result
+                .bindings
+                .get(&BindingId::from_raw(3))
+                .map(|binding| binding.kind),
+            Some(BindingKind::Synthetic)
+        );
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn local_paths_cover_match_closure_async_and_contract_scopes() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let x = symbols.intern("x").expect("symbol interns");
+        let y = symbols.intern("y").expect("symbol interns");
+        let params = [
+            BodyParam {
+                hir_id: hir_id(owner, 1),
+                binding: BindingId::from_raw(0),
+                name: Some(local_name(x, 0, 1)),
+                mutable: false,
+            },
+            BodyParam {
+                hir_id: hir_id(owner, 2),
+                binding: BindingId::from_raw(1),
+                name: Some(local_name(y, 2, 3)),
+                mutable: false,
+            },
+        ];
+        let scrutinee = local_path_expr(&arena, owner, 10, 10, 11, x, PathRoot::Plain);
+        let first_arm_pat = local_binding_pat(
+            &arena,
+            owner,
+            20,
+            local_name(y, 12, 13),
+            BindingId::from_raw(2),
+            BindingMode::Value,
+        );
+        let first_guard = local_path_expr(&arena, owner, 21, 14, 15, y, PathRoot::Plain);
+        let first_body = local_path_expr(&arena, owner, 22, 16, 17, y, PathRoot::Plain);
+        let second_arm_pat = local_binding_pat(
+            &arena,
+            owner,
+            23,
+            local_name(y, 18, 19),
+            BindingId::from_raw(3),
+            BindingMode::Value,
+        );
+        let second_body = local_path_expr(&arena, owner, 24, 20, 21, y, PathRoot::Plain);
+        let arms = [
+            sai_hir::expressions::Arm {
+                hir_id: hir_id(owner, 25),
+                pat: first_arm_pat,
+                guard: Some(first_guard),
+                body: first_body,
+                span: hir_span(12, 17),
+                synthesized: false,
+            },
+            sai_hir::expressions::Arm {
+                hir_id: hir_id(owner, 26),
+                pat: second_arm_pat,
+                guard: None,
+                body: second_body,
+                span: hir_span(18, 22),
+                synthesized: false,
+            },
+        ];
+        let matched = expr(
+            &arena,
+            owner,
+            27,
+            10,
+            23,
+            ExprKind::Match {
+                scrutinee,
+                arms: arena.alloc_arms(&arms),
+                source: MatchSource::Normal,
+            },
+        );
+        let closure_param = sai_hir::expressions::ClosureParam {
+            hir_id: hir_id(owner, 28),
+            binding: BindingId::from_raw(4),
+            name: Some(local_name(x, 30, 31)),
+            mutable: true,
+            ty: None,
+        };
+        let closure_params = [closure_param];
+        let closure_x = local_path_expr(&arena, owner, 29, 32, 33, x, PathRoot::Plain);
+        let closure_y = local_path_expr(&arena, owner, 31, 34, 35, y, PathRoot::Plain);
+        let closure_tuple = expr(
+            &arena,
+            owner,
+            33,
+            32,
+            36,
+            ExprKind::Tuple(arena.alloc_exprs(&[*closure_x, *closure_y])),
+        );
+        let closure_body = block(&arena, owner, 34, Some(closure_tuple));
+        let closure = arena.alloc_closure(Closure {
+            def_id: owner.def_id,
+            capture: CaptureBy::Infer,
+            params: &closure_params,
+            ret: None,
+            body: closure_body,
+        });
+        let closure_expr = expr(&arena, owner, 35, 30, 37, ExprKind::Closure(closure));
+        let async_y = local_path_expr(&arena, owner, 36, 38, 39, y, PathRoot::Plain);
+        let async_body = block(&arena, owner, 37, Some(async_y));
+        let async_expr = expr(
+            &arena,
+            owner,
+            38,
+            37,
+            40,
+            ExprKind::AsyncBlock {
+                def_id: owner.def_id,
+                capture: CaptureBy::Infer,
+                block: async_body,
+            },
+        );
+        let break_value = local_path_expr(&arena, owner, 42, 42, 43, x, PathRoot::Plain);
+        let break_expr = expr(
+            &arena,
+            owner,
+            43,
+            41,
+            44,
+            ExprKind::Break {
+                label: None,
+                value: Some(break_value),
+            },
+        );
+        let value = expr(
+            &arena,
+            owner,
+            39,
+            10,
+            44,
+            ExprKind::Tuple(arena.alloc_exprs(&[
+                *matched,
+                *closure_expr,
+                *async_expr,
+                *break_expr,
+            ])),
+        );
+        let contract_use = local_path_expr(&arena, owner, 40, 50, 51, x, PathRoot::Plain);
+        let contract = Contract {
+            hir_id: hir_id(owner, 41),
+            kind: ContractKind::Requires,
+            expr: contract_use,
+        };
+        let contracts = [contract];
+        let (snapshot, source_map) = local_source_context(owner);
+        let body = body(
+            &arena,
+            owner,
+            source_map.source_id(),
+            &params,
+            value,
+            &contracts,
+        );
+
+        let result = resolve_owner_locals(body, &source_map, &snapshot, &symbols, &HashSet::new())
+            .expect("local paths resolve");
+        let path_id = |expr: &Expr<'_>| match expr.kind {
+            ExprKind::Path(path) => path.hir_id,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(scrutinee))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(0)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(first_guard))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(2)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(first_body))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(2)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(second_body))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(3)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(closure_x))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(4)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(closure_y))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(1)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(async_y))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(1)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(contract_use))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(0)))
+        );
+        assert_eq!(
+            result
+                .paths
+                .get(&path_id(break_value))
+                .map(|resolution| resolution.base),
+            Some(Res::Local(BindingId::from_raw(0)))
+        );
+        assert_eq!(
+            result
+                .bindings
+                .get(&BindingId::from_raw(4))
+                .map(|binding| binding.kind),
+            Some(BindingKind::ClosureParam { var: true })
+        );
+        assert!(result.diagnostics.is_empty());
     }
 
     #[test]
@@ -1204,6 +2962,7 @@ mod tests {
         ];
         let body = Body {
             owner,
+            source_id: sai_hir::source_map::HirSourceId::default(),
             params: &[],
             value: function_loop,
             contracts: &contracts,
@@ -1402,6 +3161,7 @@ mod tests {
         let body_value = expr(&arena, owner, 23, 0, 1, ExprKind::Err);
         let body = Body {
             owner,
+            source_id: sai_hir::source_map::HirSourceId::default(),
             params: &[],
             value: body_value,
             contracts: &contracts,
@@ -1443,6 +3203,7 @@ mod tests {
         let invariant_predicates = [predicate, invariant_return];
         let invariant_body = Body {
             owner,
+            source_id: sai_hir::source_map::HirSourceId::default(),
             params: &[],
             value: body_value,
             contracts: &[],
