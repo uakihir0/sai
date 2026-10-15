@@ -1941,12 +1941,14 @@ pub enum InterfaceMemberKind {
     ResourceMethod,
 }
 
-/// Test-only reference results for one resource method signature.
+/// Partial type heads and test-only reference results for one resource method
+/// signature.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceResourceMethodTestOnlyResolution {
     interface_owner: OwnerId,
     resource_owner: OwnerId,
     owner: OwnerId,
+    type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -1965,6 +1967,12 @@ impl InterfaceResourceMethodTestOnlyResolution {
         self.owner
     }
 
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
+        self.type_path_resolution.as_ref()
+    }
+
     pub fn test_only_path_resolution(
         &self,
     ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
@@ -1980,12 +1988,14 @@ impl InterfaceResourceMethodTestOnlyResolution {
     }
 }
 
-/// Test-only reference results for one direct interface declaration.
+/// Partial type heads and test-only reference results for one direct interface
+/// declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceMemberTestOnlyResolution {
     interface_owner: OwnerId,
     owner: OwnerId,
     kind: InterfaceMemberKind,
+    type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -2004,6 +2014,12 @@ impl InterfaceMemberTestOnlyResolution {
 
     pub const fn kind(&self) -> InterfaceMemberKind {
         self.kind
+    }
+
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
+        self.type_path_resolution.as_ref()
     }
 
     pub fn test_only_path_resolution(
@@ -4177,6 +4193,35 @@ fn rejected_test_only_type_path_ids(
     Ok(rejected_paths)
 }
 
+fn resolve_partial_type_owner_paths(
+    owner: OwnerId,
+    candidates: &[OwnerPathHead<'_>],
+    generic_resolutions: &HashMap<Symbol, Res>,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    module_scope: &Phase1ModuleScopes,
+    requesting_package: PackageId,
+) -> Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError> {
+    let generic_parameters = generic_resolutions.keys().copied().collect();
+    let rejected_test_only_paths =
+        rejected_test_only_type_path_ids(owner, candidates, &generic_parameters, module_scope)?;
+    match primitive_prelude {
+        Ok(primitive_prelude) => Ok(resolve_type_owner_module_paths(
+            owner,
+            candidates,
+            generic_resolutions,
+            primitive_prelude,
+            &rejected_test_only_paths,
+            module_scope,
+            None,
+            requesting_package,
+            None,
+        )),
+        Err(error) => Err(OwnerControlFlowResolutionError::PrimitivePrelude(
+            error.clone(),
+        )),
+    }
+}
+
 fn collect_refined_generic_syntax_test_only_diagnostics(
     owner: OwnerId,
     item_id: ast::ErasedAstId,
@@ -4479,6 +4524,16 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
         OwnerNode::ImplItem(item) => match item.kind {
             ImplItemKind::Fn { generics, .. } => generics,
             ImplItemKind::AssocType { .. } => return HashMap::new(),
+        },
+        OwnerNode::InterfaceItem(item) => match item.kind {
+            HirInterfaceItemKind::Struct { generics, .. }
+            | HirInterfaceItemKind::Alias { generics, .. }
+            | HirInterfaceItemKind::Enum { generics, .. }
+            | HirInterfaceItemKind::Fn { generics, .. }
+            | HirInterfaceItemKind::ResourceMember { generics, .. } => generics,
+            HirInterfaceItemKind::Refined { .. } | HirInterfaceItemKind::Resource { .. } => {
+                return HashMap::new();
+            }
         },
         _ => return HashMap::new(),
     };
@@ -9861,6 +9916,7 @@ impl RootDatabase {
                             HirLoweringError::ItemTreeEntryMismatch,
                         ),
                     )?;
+                    let mut type_path_resolution = None;
                     let mut lowering_diagnostics = Vec::new();
                     let member_result: Result<
                         (
@@ -9888,6 +9944,24 @@ impl RootDatabase {
                         )
                         .map_err(OwnerControlFlowResolutionError::Lowering)?;
                         lowering_diagnostics.extend(member_hir.diagnostics.iter().cloned());
+                        let candidates = owner_test_only_path_candidates(&member_hir);
+                        let mut generic_resolutions = owner_type_generic_resolutions(&member_hir);
+                        if kind == InterfaceMemberKind::Refined {
+                            // Refined HIR omits its invalid generic syntax.
+                            // Preserve lexical shadowing without fabricating
+                            // a generic definition.
+                            for name in item_tree_entry_generic_parameters(entry) {
+                                generic_resolutions.entry(name).or_insert(Res::Err);
+                            }
+                        }
+                        type_path_resolution = Some(resolve_partial_type_owner_paths(
+                            member_owner,
+                            &candidates,
+                            &generic_resolutions,
+                            &self.primitive_prelude,
+                            module_scope,
+                            collection.module_tree.package,
+                        ));
                         let (path_resolution, diagnostics) =
                             collect_interface_owner_test_only_paths(
                                 member_owner,
@@ -9934,6 +10008,7 @@ impl RootDatabase {
                                     .into_iter()
                                     .zip(resource_members.iter().copied())
                                 {
+                                    let mut type_path_resolution = None;
                                     let mut method_lowering_diagnostics = Vec::new();
                                     let method_result: Result<
                                         (
@@ -9972,6 +10047,19 @@ impl RootDatabase {
                                             .map_err(OwnerControlFlowResolutionError::Lowering)?;
                                         method_lowering_diagnostics
                                             .extend(method_hir.diagnostics.iter().cloned());
+                                        let candidates =
+                                            owner_test_only_path_candidates(&method_hir);
+                                        let generic_resolutions =
+                                            owner_type_generic_resolutions(&method_hir);
+                                        type_path_resolution =
+                                            Some(resolve_partial_type_owner_paths(
+                                                method_owner,
+                                                &candidates,
+                                                &generic_resolutions,
+                                                &self.primitive_prelude,
+                                                module_scope,
+                                                collection.module_tree.package,
+                                            ));
                                         Ok(collect_interface_owner_test_only_paths(
                                             method_owner,
                                             InterfaceMemberKind::ResourceMethod,
@@ -9984,6 +10072,16 @@ impl RootDatabase {
                                             &context,
                                         ))
                                     })();
+                                    let type_path_resolution = match (
+                                        type_path_resolution,
+                                        &method_result,
+                                    ) {
+                                        (Some(resolution), _) => resolution,
+                                        (None, Err(error)) => Err(error.clone()),
+                                        (None, Ok(_)) => unreachable!(
+                                            "successfully lowered resource method has type heads"
+                                        ),
+                                    };
                                     let (path_resolution, test_only_diagnostics) =
                                         match method_result {
                                             Ok((path_resolution, diagnostics)) => {
@@ -9996,6 +10094,7 @@ impl RootDatabase {
                                             interface_owner: descriptor.owner,
                                             resource_owner: member_owner,
                                             owner: method_owner,
+                                            type_path_resolution,
                                             test_only_path_resolution: path_resolution,
                                             test_only_diagnostics,
                                             lowering_diagnostics: method_lowering_diagnostics,
@@ -10012,6 +10111,13 @@ impl RootDatabase {
                         ))
                     })();
 
+                    let type_path_resolution = match (type_path_resolution, &member_result) {
+                        (Some(resolution), _) => resolution,
+                        (None, Err(error)) => Err(error.clone()),
+                        (None, Ok(_)) => {
+                            unreachable!("successfully lowered interface member has type heads")
+                        }
+                    };
                     let (
                         test_only_path_resolution,
                         test_only_diagnostics,
@@ -10027,6 +10133,7 @@ impl RootDatabase {
                         interface_owner: descriptor.owner,
                         owner: member_owner,
                         kind,
+                        type_path_resolution,
                         test_only_path_resolution,
                         test_only_diagnostics,
                         lowering_diagnostics,
@@ -19874,13 +19981,14 @@ mod tests {
             "use acme:test-support/fixtures as fixture\n",
             "use acme:test-support/fixtures as fs\n",
             "use acme:test-support/fixtures.{Fixture}\n",
+            "type Array<T> = T\n",
             "interface api {\n",
-            "  type Record<T: fixture.RecordBound> { direct: Fixture, nested: Box<fixture.FieldType>, callback: fn() effects { fs.read, fixture.field_effect } }\n",
-            "  type Alias<T: fixture.AliasBound> = Box<fixture.AliasType>\n",
+            "  type Record<T: fixture.RecordBound, const N: U32> { direct: Fixture, nested: Box<fixture.FieldType>, generic: T, array: Array<U32>, count: N, callback: fn() effects { fs.read, fixture.field_effect } }\n",
+            "  type Alias<T: fixture.AliasBound> = Option<Box<fixture.AliasType>>\n",
             "  enum Choice<T: fixture.EnumBound> { Item(T, fixture.VariantType) }\n",
             "  type Shadow<Fixture> = Fixture\n",
-            "  fn call(value: Fixture) -> fixture.Returned\n",
-            "  resource File { fn read(value: Fixture) -> fixture.ResourceReturned }\n",
+            "  fn call(value: U32, array: Array<U32>) -> fixture.Returned\n",
+            "  resource File { fn read(value: U32, array: Array<U32>) -> fixture.ResourceReturned }\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -19992,9 +20100,7 @@ mod tests {
                 span_for("fixture.AliasType", "fixture", 0),
                 span_for("fixture.EnumBound", "fixture", 0),
                 span_for("fixture.VariantType", "fixture", 0),
-                span_for("value: Fixture", "Fixture", 0),
                 span_for("fixture.Returned", "fixture", 0),
-                span_for("value: Fixture", "Fixture", 1),
                 span_for("fixture.ResourceReturned", "fixture", 0),
             ],
             "field, nested type, variant, function, and resource signatures use their exact heads"
@@ -20069,6 +20175,124 @@ mod tests {
                 .values()
                 .all(|path| path.base == Res::Err)
         );
+        let record_types = interface.members()[0]
+            .type_path_resolution()
+            .expect("record type heads resolve independently");
+        assert_eq!(record_types.owner(), interface.members()[0].owner());
+        assert_eq!(
+            record_types.paths().len() + record_types.deferred_paths().len(),
+            9,
+            "only the record's retained type heads enter its result; effect heads are excluded"
+        );
+        let record_owner = interface.members()[0].owner();
+        let record_t = database
+            .symbols
+            .intern("T")
+            .expect("record generic name is interned");
+        let record_n = database
+            .symbols
+            .intern("N")
+            .expect("record const generic name is interned");
+        let record_generics = database
+            .def_paths
+            .get(&record_owner.def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                record_owner.def_id,
+                &[(record_t, false, 0), (record_n, true, 0)],
+            )
+            .expect("record generic definitions are stable");
+        assert!(
+            record_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, record_generics[0].to_def_id())
+            }),
+            "interface declaration type generics retain their exact child identity"
+        );
+        assert!(
+            record_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::ConstParam, record_generics[1].to_def_id())
+            }),
+            "interface declaration const generics retain their exact child identity"
+        );
+        assert!(
+            record_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "interface const-generic types use the primitive Prelude"
+        );
+        let array_symbol = database
+            .symbols
+            .intern("Array")
+            .expect("Array alias name is interned");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let array_alias = root_scope
+            .scope
+            .get(&array_symbol)
+            .expect("root Array alias is in module scope")
+            .res;
+        assert!(
+            record_types
+                .paths()
+                .values()
+                .any(|path| path.base == array_alias),
+            "a module alias takes precedence over a same-named Prelude constructor"
+        );
+        let alias_types = interface.members()[1]
+            .type_path_resolution()
+            .expect("alias type heads resolve independently");
+        let option_symbol = database
+            .symbols
+            .intern("Option")
+            .expect("Option name is interned");
+        assert!(
+            alias_types
+                .deferred_paths()
+                .iter()
+                .any(|path| path.name == option_symbol),
+            "non-primitive Prelude constructors stay deferred"
+        );
+        let function_types = interface.members()[4]
+            .type_path_resolution()
+            .expect("interface function type heads resolve independently");
+        assert_eq!(function_types.owner(), interface.members()[4].owner());
+        assert!(
+            function_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "interface function signature types resolve through the primitive Prelude"
+        );
+        assert!(
+            function_types
+                .paths()
+                .values()
+                .any(|path| path.base == array_alias),
+            "interface function signature types use the exact file's module scope"
+        );
+        assert!(
+            function_types.paths().values().any(|path| {
+                path.base == Res::Err && path.resolved_segments == 1 && path.segment_count == 2
+            }),
+            "qualified heads retain the unresolved suffix for later member lookup"
+        );
+        let method_types = interface.members()[5].resource_methods()[0]
+            .type_path_resolution()
+            .expect("resource method type heads resolve independently");
+        assert_eq!(
+            method_types.owner(),
+            interface.members()[5].resource_methods()[0].owner()
+        );
+        assert!(
+            method_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "resource method signature types resolve through the primitive Prelude"
+        );
     }
 
     #[test]
@@ -20076,13 +20300,14 @@ mod tests {
         let root = concat!(
             "use acme:test-support/fixtures.{Fixture}\n",
             "use acme:test-support/fixtures as fixture\n",
+            "type Ordinary = U32\n",
             "interface api {\n",
             "  type Positive = I32 where {\n",
             "    let fixture = true\n",
             "    fixture\n",
             "    match true { Fixture.Ready => Fixture.allowed }\n",
             "  }\n",
-            "  type Shadow<Fixture> = I32 where { Fixture.allowed }\n",
+            "  type Shadow<Ordinary> = Ordinary where { Ordinary.allowed }\n",
             "  type Unshadowed = I32 where { fixture.allowed }\n",
             "}\n",
         );
@@ -20119,6 +20344,21 @@ mod tests {
                 .paths()
                 .is_empty(),
             "the refinement predicate has no HIR path IDs and must not receive fabricated results"
+        );
+        assert_eq!(
+            member
+                .type_path_resolution()
+                .expect("refined base type result succeeds")
+                .paths()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [PathRes {
+                base: Res::PrimTy(sai_resolve::prelude::PrimTy::I32),
+                resolved_segments: 1,
+                segment_count: 1,
+            }],
+            "only the HIR-retained refined base enters the type-head result"
         );
         let diagnostics = member
             .test_only_diagnostics()
@@ -20181,6 +20421,21 @@ mod tests {
             "nested refined type parameters shadow same-named imported module aliases"
         );
         assert_eq!(
+            results.owners()[0].members()[1]
+                .type_path_resolution()
+                .expect("invalid refined-generic type result succeeds")
+                .paths()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [PathRes {
+                base: Res::Err,
+                resolved_segments: 1,
+                segment_count: 1,
+            }],
+            "invalid refined generic syntax shadows a same-named module type without a DefId"
+        );
+        assert_eq!(
             results.owners()[0].members()[2]
                 .test_only_diagnostics()
                 .expect("unshadowed refined expression diagnostics succeed")
@@ -20241,6 +20496,18 @@ mod tests {
             .expect("recovered interface function syntax is scanned");
         let function = &results.owners()[0].members()[0];
         assert_eq!(function.kind(), InterfaceMemberKind::Function);
+        let function_types = function
+            .type_path_resolution()
+            .expect("retained interface signature type heads resolve");
+        assert_eq!(function_types.paths().len(), 2);
+        assert!(function_types.deferred_paths().is_empty());
+        assert!(
+            function_types
+                .paths()
+                .values()
+                .all(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::Bool) }),
+            "recovered contract/body paths are absent from the HIR type result"
+        );
         assert!(
             function
                 .test_only_path_resolution()
@@ -20416,14 +20683,16 @@ mod tests {
         let root = concat!(
             "use acme:test-support/fixtures as fixture\n",
             "use acme:test-support/fixtures.{Fixture}\n",
+            "type Shared<T> = T\n",
             "interface root_api {\n",
-            "  type Bad = fixture.RootType\n",
+            "  type Bad = Shared<fixture.RootType>\n",
             "  type Good = Fixture\n",
             "}\n",
         );
         let child = concat!(
             "use acme:test-support/fixtures as fixture\n",
-            "interface child_api { type Child = fixture.ChildType }\n",
+            "type Shared<T> = T\n",
+            "interface child_api { type Child = Shared<fixture.ChildType> }\n",
         );
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(root.as_bytes(), child.as_bytes());
@@ -20469,6 +20738,27 @@ mod tests {
         let results = database
             .resolve_interface_test_only_paths(&broken_collection, &module_tree, &snapshot)
             .expect("interface path failures remain isolated by child owner");
+        let shared_symbol = database
+            .symbols
+            .intern("Shared")
+            .expect("Shared symbol is interned");
+        let root_shared = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .scope
+            .get(&shared_symbol)
+            .expect("root module Shared alias exists")
+            .res;
+        let child_shared = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists")
+            .scope
+            .get(&shared_symbol)
+            .expect("child module Shared alias exists")
+            .res;
+        assert_ne!(root_shared, child_shared);
         assert_eq!(results.owners().len(), 2);
         assert!(results.owners().iter().all(|owner| owner.error().is_none()));
         assert!(
@@ -20476,6 +20766,33 @@ mod tests {
                 .test_only_diagnostics()
                 .is_err(),
             "the broken import note is isolated to the child that uses it"
+        );
+        assert!(
+            results.owners()[0].members()[0]
+                .type_path_resolution()
+                .expect("type heads survive broken test-only diagnostic metadata")
+                .paths()
+                .values()
+                .any(|path| path.base == root_shared),
+            "the exact-file module binding remains in the type result after diagnostic failure"
+        );
+        assert!(
+            results.owners()[0].members()[0]
+                .type_path_resolution()
+                .expect("type heads survive broken test-only diagnostic metadata")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "test-only type heads are rejected before diagnostic-note construction fails"
+        );
+        assert!(
+            results.owners()[0].members()[1]
+                .type_path_resolution()
+                .expect("sibling member type heads resolve")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "a sibling member still resolves its rejected test-only type heads"
         );
         assert_eq!(
             results.owners()[0].members()[1]
@@ -20492,6 +20809,24 @@ mod tests {
                 .len(),
             1,
             "the other interface uses its own source file module scope"
+        );
+        assert!(
+            results.owners()[1].members()[0]
+                .type_path_resolution()
+                .expect("child interface type heads resolve")
+                .paths()
+                .values()
+                .any(|path| path.base == child_shared),
+            "the child interface uses its own same-named alias"
+        );
+        assert!(
+            !results.owners()[1].members()[0]
+                .type_path_resolution()
+                .expect("child interface type heads resolve")
+                .paths()
+                .values()
+                .any(|path| path.base == root_shared),
+            "a root-only alias never leaks into a child interface type result"
         );
 
         let mut broken_parent = collection.clone();
