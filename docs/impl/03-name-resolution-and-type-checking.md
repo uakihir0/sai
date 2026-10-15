@@ -686,7 +686,8 @@ walker. `PathRoot` handling, unqualified-name/rib lookup, expression `Field`
 chain recognition, type-relative lookup, and diagnostic construction remain
 outside this helper.
 
-**Top-level type-owner prefix lookup (IR-542).** The driver builds a temporary
+**Top-level type-owner prefix lookup and access diagnostics (IR-542–IR-543).**
+The driver builds a temporary
 `ModuleMemberIndex` from the current package and a validated closure of every
 reachable active source package. The closure is separate from Phase 1's
 direct-import scopes: it is checked against the same package graph, snapshot,
@@ -701,8 +702,13 @@ checking. Missing members and inaccessible members are retained as typed
 errors with the reference segment and declaration span. Missing source scopes
 fail closure construction; artifact and WIT member suffixes remain deferred
 to their later resolvers. An erroneous head continues to suppress suffix
-lookup. This adapter does not yet map typed errors to final diagnostics or
-integrate with command-level `check`.
+lookup. For current top-level type owners, an inaccessible member becomes a
+snapshot-bound `PRIVATE_ITEM` diagnostic at the reference segment with the
+defining declaration as a related location, including when that declaration
+is in a foreign source file. Missing members remain typed errors until the
+complete `UNRESOLVED_NAME` candidate and unique-import-fix contract is
+implemented. Missing target scopes remain closure errors rather than source
+diagnostics. This adapter does not yet integrate with command-level `check`.
 
 ### 3.4.3 Ribs
 
