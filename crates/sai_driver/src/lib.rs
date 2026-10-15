@@ -945,6 +945,7 @@ pub struct Phase1ActiveSourceMemberScopes {
     package_graph_fingerprint: Fingerprint,
     source_packages: Vec<Phase1ModuleMemberScopePackage>,
     source_graph_packages: HashSet<PackageId>,
+    package_identities: BTreeMap<String, String>,
     closure_fingerprint: Fingerprint,
 }
 
@@ -955,6 +956,10 @@ impl Phase1ActiveSourceMemberScopes {
 
     pub fn source_packages(&self) -> &[Phase1ModuleMemberScopePackage] {
         &self.source_packages
+    }
+
+    fn package_identity(&self, package_key: &str) -> Option<&str> {
+        self.package_identities.get(package_key).map(String::as_str)
     }
 
     pub const fn closure_fingerprint(&self) -> Fingerprint {
@@ -1224,6 +1229,7 @@ pub struct TypeOwnerResolution {
     path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
 }
 
@@ -1250,6 +1256,16 @@ impl TypeOwnerResolution {
 
     pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
         self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    /// Source diagnostics for inaccessible members in qualified type paths.
+    ///
+    /// Missing members remain typed path failures until their candidate and
+    /// import-fix diagnostic contract is implemented.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics.as_ref().map(Vec::as_slice)
     }
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
@@ -2119,10 +2135,16 @@ pub enum OwnerControlFlowResolutionError {
     ItemTree(ItemTreeQueryError),
     TargetFilter(TargetFilterError),
     DefPathInterner(DefPathInternerError),
+    SymbolLookup(LookupError),
     MissingDefPath(OwnerId),
     DescriptorNotInCurrentTarget {
         owner: OwnerId,
         file: FileId,
+    },
+    MissingSourcePackageIdentity {
+        owner: OwnerId,
+        file: FileId,
+        package_key: String,
     },
     TopLevelOwnerDescriptorMismatch {
         owner: OwnerId,
@@ -7523,6 +7545,17 @@ impl RootDatabase {
                 })
             })
             .collect::<Result<HashSet<_>, _>>()?;
+        let package_identities = source_keys
+            .iter()
+            .filter_map(|key| {
+                graph.node(key).map(|node| {
+                    (
+                        key.as_str().to_owned(),
+                        format!("{}@{}", node.identity(), node.version()),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut package_fingerprints = all_collections
             .iter()
             .map(|(key, package)| (key.clone(), package.input_fingerprint))
@@ -7543,6 +7576,7 @@ impl RootDatabase {
             package_graph_fingerprint: graph_fingerprint,
             source_packages,
             source_graph_packages,
+            package_identities,
             closure_fingerprint,
         })
     }
@@ -7645,7 +7679,8 @@ impl RootDatabase {
                         kind: descriptor.kind,
                         path_resolution: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
-                        test_only_diagnostics: Err(error),
+                        test_only_diagnostics: Err(error.clone()),
+                        module_path_diagnostics: Err(error),
                         lowering_diagnostics,
                     });
                     continue;
@@ -7656,6 +7691,7 @@ impl RootDatabase {
                 (
                     TypeOwnerPathResolution,
                     OwnerTestOnlyPathResolution,
+                    Vec<Diagnostic>,
                     Vec<Diagnostic>,
                 ),
                 OwnerControlFlowResolutionError,
@@ -7750,17 +7786,36 @@ impl RootDatabase {
                     collection.module_tree.package,
                     member_scopes.map(|scopes| &scopes.source_graph_packages),
                 );
-                Ok((path_resolution, test_only_path_resolution, diagnostics))
+                let module_path_diagnostics = self.type_owner_module_path_diagnostics(
+                    descriptor.owner,
+                    &path_resolution,
+                    &inputs,
+                    snapshot,
+                    &collection.target_cfg,
+                    member_scopes,
+                )?;
+                Ok((
+                    path_resolution,
+                    test_only_path_resolution,
+                    diagnostics,
+                    module_path_diagnostics,
+                ))
             })();
 
             match analysis {
-                Ok((path_resolution, test_only_path_resolution, diagnostics)) => {
+                Ok((
+                    path_resolution,
+                    test_only_path_resolution,
+                    diagnostics,
+                    module_path_diagnostics,
+                )) => {
                     owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         path_resolution: Ok(path_resolution),
                         test_only_path_resolution: Ok(test_only_path_resolution),
                         test_only_diagnostics: Ok(diagnostics),
+                        module_path_diagnostics: Ok(module_path_diagnostics),
                         lowering_diagnostics,
                     });
                 }
@@ -7770,7 +7825,8 @@ impl RootDatabase {
                         kind: descriptor.kind,
                         path_resolution: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
-                        test_only_diagnostics: Err(error),
+                        test_only_diagnostics: Err(error.clone()),
+                        module_path_diagnostics: Err(error),
                         lowering_diagnostics,
                     });
                 }
@@ -7785,6 +7841,104 @@ impl RootDatabase {
                 .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
+    }
+
+    fn type_owner_module_path_diagnostics(
+        &mut self,
+        owner: OwnerId,
+        path_resolution: &TypeOwnerPathResolution,
+        requesting_inputs: &CurrentOwnerInputs,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
+        let mut diagnostics = Vec::new();
+        let mut requesting_package_identity = None;
+        for path_error in path_resolution.module_path_errors() {
+            let ModulePathError::InaccessibleMember {
+                name,
+                span,
+                declaration_span,
+                ..
+            } = path_error.error()
+            else {
+                continue;
+            };
+            if requesting_package_identity.is_none() {
+                let file = requesting_inputs.source.id();
+                let file_key = self.files.file_key(file).ok_or(
+                    OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                )?;
+                requesting_package_identity = Some(
+                    member_scopes
+                        .and_then(|scopes| scopes.package_identity(file_key.package_key()))
+                        .ok_or_else(|| {
+                            OwnerControlFlowResolutionError::MissingSourcePackageIdentity {
+                                owner,
+                                file,
+                                package_key: file_key.package_key().to_owned(),
+                            }
+                        })?
+                        .to_owned(),
+                );
+            }
+            let name = self
+                .symbols
+                .resolve(name)
+                .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+            let primary = sai_diagnostics::Location::from_decoded_source(
+                requesting_inputs.source_ref.clone(),
+                sai_diagnostics::Span::new(span.file, span.range),
+                &requesting_inputs.source,
+            )
+            .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                owner,
+            ))?;
+            let declaration_file_key = self.files.file_key(declaration_span.file).ok_or(
+                OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+            )?;
+            let declaration_package_identity = member_scopes
+                .and_then(|scopes| scopes.package_identity(declaration_file_key.package_key()))
+                .ok_or_else(
+                    || OwnerControlFlowResolutionError::MissingSourcePackageIdentity {
+                        owner,
+                        file: declaration_span.file,
+                        package_key: declaration_file_key.package_key().to_owned(),
+                    },
+                )?
+                .to_owned();
+            let declaration_inputs =
+                self.current_owner_inputs(snapshot, declaration_span.file, target_cfg)?;
+            let declaration = sai_diagnostics::Location::from_decoded_source(
+                declaration_inputs.source_ref.clone(),
+                sai_diagnostics::Span::new(declaration_span.file, declaration_span.range),
+                &declaration_inputs.source,
+            )
+            .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                owner,
+            ))?;
+            let mut diagnostic = Diagnostic::new(
+                sai_diagnostics::Code::PrivateItem,
+                sai_diagnostics::Severity::Error,
+                format!("member `{name}` is private in package `{declaration_package_identity}`"),
+                Some(primary),
+            );
+            diagnostic.primary_label = "inaccessible member".to_owned();
+            diagnostic.package = requesting_package_identity.clone();
+            diagnostic
+                .push_related(Related::DeclaredHere {
+                    location: declaration,
+                    what: "private member declared here".to_owned(),
+                })
+                .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+            diagnostics.push(
+                diagnostic
+                    .with_workspace_snapshot(snapshot)
+                    .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?,
+            );
+        }
+        sort_phase1_diagnostics(&mut diagnostics);
+        Ok(diagnostics)
     }
 
     /// Diagnoses test-only references in direct world imports, exports, and
@@ -15642,6 +15796,17 @@ mod tests {
         );
         snapshot_files.extend(middle_snapshot_files);
         snapshot_files.extend(leaf_snapshot_files);
+        let snapshot_files = snapshot_files
+            .into_iter()
+            .map(|file| {
+                SnapshotFile::new(
+                    Arc::clone(file.source()),
+                    file.path().to_owned(),
+                    None,
+                    file.document_version(),
+                )
+            })
+            .collect::<Vec<_>>();
         let snapshot =
             WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
         let graph = PackageGraph::new(
@@ -15789,13 +15954,16 @@ mod tests {
             .symbols
             .intern("MissingType")
             .expect("missing type name interns");
-        let (private_hir_id, private_span) = path_errors
+        let (private_hir_id, private_span, private_declaration_span) = path_errors
             .module_path_errors()
             .iter()
             .find_map(|entry| match entry.error() {
-                ModulePathError::InaccessibleMember { name, span, .. } if name == private_name => {
-                    Some((entry.hir_id(), span))
-                }
+                ModulePathError::InaccessibleMember {
+                    name,
+                    span,
+                    declaration_span,
+                    ..
+                } if name == private_name => Some((entry.hir_id(), span, declaration_span)),
                 _ => None,
             })
             .expect("private transitive member is rejected");
@@ -15822,6 +15990,82 @@ mod tests {
                 sai_diagnostics::TextSize::new((private_start + "PrivateType".len()) as u32,),
             )
             .expect("private member range is ordered")
+        );
+        let private_diagnostics = results.owners()[2]
+            .module_path_diagnostics()
+            .expect("private-member diagnostics map successfully");
+        assert_eq!(
+            private_diagnostics.len(),
+            1,
+            "only the inaccessible member becomes a diagnostic"
+        );
+        let private_diagnostic = &private_diagnostics[0];
+        assert_eq!(private_diagnostic.code, sai_diagnostics::Code::PrivateItem);
+        assert_eq!(
+            private_diagnostic.package.as_deref(),
+            Some("acme:check@1.0.0"),
+            "requester identity comes from the validated package graph"
+        );
+        assert!(
+            private_diagnostic
+                .message
+                .contains("private in package `acme:leaf@1.0.0`"),
+            "the defining identity comes from the validated package graph"
+        );
+        assert!(private_diagnostic.fixes().is_empty());
+        assert!(private_diagnostic.has_workspace_snapshot());
+        let private_location = private_diagnostic
+            .primary()
+            .expect("private member diagnostic has a primary location");
+        let private_source = snapshot
+            .file(private_span.file)
+            .expect("private reference source belongs to the snapshot");
+        assert_eq!(private_location.file.path, private_source.path());
+        assert_eq!(
+            private_location.file.package.as_deref(),
+            private_source.package()
+        );
+        assert_eq!(
+            private_location.span,
+            sai_diagnostics::Span::new(
+                private_span.file,
+                private_source
+                    .source()
+                    .to_original_range(private_span.range)
+                    .expect("private reference span maps to original bytes"),
+            )
+        );
+        let private_declaration_source = snapshot
+            .file(private_declaration_span.file)
+            .expect("private declaration source belongs to the snapshot");
+        let private_declaration = private_diagnostic
+            .related()
+            .iter()
+            .find_map(|related| match related {
+                Related::DeclaredHere { location, what } => {
+                    assert_eq!(what, "private member declared here");
+                    Some(location)
+                }
+                _ => None,
+            })
+            .expect("private member diagnostic points to its declaration");
+        assert_eq!(
+            private_declaration.file.path,
+            private_declaration_source.path()
+        );
+        assert_eq!(
+            private_declaration.file.package.as_deref(),
+            private_declaration_source.package()
+        );
+        assert_eq!(
+            private_declaration.span,
+            sai_diagnostics::Span::new(
+                private_declaration_span.file,
+                private_declaration_source
+                    .source()
+                    .to_original_range(private_declaration_span.range)
+                    .expect("private declaration span maps to original bytes"),
+            )
         );
         assert_eq!(
             path_errors
