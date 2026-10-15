@@ -804,6 +804,15 @@ remain separate from test-only diagnostic paths. Qualified suffixes and
 associated declarations or methods are deferred; canonical non-primitive
 names also remain deferred until standard-package definitions are available.
 
+**Associated trait/impl member type heads (IR-553).** Each associated child
+owner exposes partial type-head results for associated type bounds or
+definitions and for method signatures, generic bounds, `where` clauses, body
+annotations, casts, and contract bodies. Parent generics are included in each
+member scope, with method generics taking precedence when names overlap. The
+result stays independent from test-only diagnostics and expression lookup,
+uses the parent's exact file scope, and resolves no qualified member suffixes.
+Failure in one child does not stop type results for sibling declarations.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
