@@ -44,6 +44,7 @@ pub enum ModulePathError {
         segment_index: usize,
         name: Symbol,
         span: sai_hir::Span,
+        target: ModuleTarget,
     },
     /// A member exists, but its effective visibility does not permit access.
     InaccessibleMember {
@@ -123,6 +124,7 @@ pub fn resolve_module_prefix(
                     segment_index,
                     name: segment.name.sym,
                     span: segment.name.span,
+                    target,
                 });
             }
             ModuleMemberLookup::Inaccessible(binding) => {
@@ -398,6 +400,8 @@ mod tests {
                 segment_index: 0,
                 name: absent,
                 span: segment_span,
+                target: ModuleTarget::from_res(Res::Def(DefKind::Module, root.to_def_id()))
+                    .expect("module resolution has a target"),
             })
         );
     }
