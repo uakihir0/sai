@@ -2121,19 +2121,21 @@ impl FunctionOwnerResolutions {
 /// Compatibility name for the original label result collection.
 pub type FunctionOwnerLabelResolutions = FunctionOwnerResolutions;
 
-/// Predicate diagnostics and local-name resolutions produced for one
-/// top-level owner.
+/// Predicate diagnostics and path resolutions produced for one top-level
+/// owner.
 ///
 /// The temporary HIR arena and source map used to produce these results are
 /// discarded before the value is returned. Predicate diagnostics and local
 /// name results are independent so a local-resolution failure does not hide
-/// owner-specific predicate diagnostics.
+/// owner-specific predicate diagnostics. Type-head results are currently
+/// available only for invariant owners.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PredicateOwnerResolution {
     owner: OwnerId,
     resolution: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+    type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
@@ -2166,6 +2168,16 @@ impl PredicateOwnerResolution {
         &self,
     ) -> Result<Option<&ModuleResolution>, &OwnerControlFlowResolutionError> {
         self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns first-segment resolution for type paths in an invariant target
+    /// and predicate body. Other predicate adapters leave this channel absent.
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<Option<&TypeOwnerPathResolution>, &OwnerControlFlowResolutionError> {
+        self.type_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
     }
@@ -6848,9 +6860,11 @@ impl RootDatabase {
     /// module tree and snapshot, then diagnoses forbidden predicate syntax.
     ///
     /// This is an uncached bridge: HIR and source maps remain local to each
-    /// iteration, and only owned diagnostics and errors are returned. The
-    /// descriptor order is preserved so nested definition paths are interned
-    /// deterministically.
+    /// iteration, and only owned paths, diagnostics, and errors are returned.
+    /// The descriptor order is preserved so nested definition paths are
+    /// interned deterministically. Invariant type heads are returned in their
+    /// own partial result, separate from expression lookup and test-only
+    /// diagnostics.
     pub fn resolve_invariant_owner_predicates(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -6884,6 +6898,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                type_path_resolution: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -6905,6 +6920,7 @@ impl RootDatabase {
                     (
                         Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
                         Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                        Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
                         Result<
                             Option<OwnerTestOnlyPathResolution>,
                             OwnerControlFlowResolutionError,
@@ -6970,6 +6986,37 @@ impl RootDatabase {
                         ),
                         Err(error) => Err(error.clone()),
                     };
+                    let no_generic_parameters = HashSet::new();
+                    let rejected_type_paths = match &module_scope {
+                        Ok(module_scope) => rejected_test_only_type_path_ids(
+                            descriptor.owner,
+                            &path_candidates,
+                            &no_generic_parameters,
+                            module_scope,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let type_path_resolution =
+                        match (&module_scope, &self.primitive_prelude, rejected_type_paths) {
+                            (Ok(module_scope), Ok(primitive_prelude), Ok(rejected_type_paths)) => {
+                                Ok(Some(resolve_type_owner_module_paths(
+                                    descriptor.owner,
+                                    &path_candidates,
+                                    &HashMap::new(),
+                                    primitive_prelude,
+                                    &rejected_type_paths,
+                                    module_scope,
+                                    None,
+                                    descriptor.owner.def_id.package(),
+                                    None,
+                                )))
+                            }
+                            (Err(error), _, _) => Err(error.clone()),
+                            (_, Err(error), _) => Err(
+                                OwnerControlFlowResolutionError::PrimitivePrelude(error.clone()),
+                            ),
+                            (_, _, Err(error)) => Err(error),
+                        };
                     let path_resolution = match &module_scope {
                         Ok(_) => Ok(Some(resolved_paths)),
                         Err(error) => Err(error.clone()),
@@ -6989,6 +7036,7 @@ impl RootDatabase {
                         return Ok((
                             Ok(None),
                             Ok(None),
+                            type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics.map(Some),
                             predicate_diagnostics,
@@ -7043,6 +7091,7 @@ impl RootDatabase {
                             Ok((
                                 Ok(Some(locals)),
                                 module_resolution,
+                                type_path_resolution,
                                 path_resolution,
                                 test_only_diagnostics,
                                 predicate_diagnostics,
@@ -7051,6 +7100,7 @@ impl RootDatabase {
                         Err(error) => Ok((
                             Err(error.clone()),
                             Err(error.clone()),
+                            type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics.map(Some),
                             predicate_diagnostics,
@@ -7060,11 +7110,13 @@ impl RootDatabase {
                 let (
                     local_resolution,
                     module_resolution,
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     resolution,
                 ) = analysis.unwrap_or_else(|error| {
                     (
+                        Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
@@ -7077,6 +7129,7 @@ impl RootDatabase {
                     resolution,
                     local_resolution,
                     module_resolution,
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -7133,6 +7186,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                type_path_resolution: Ok(None),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -7366,6 +7420,7 @@ impl RootDatabase {
                     resolution,
                     local_resolution,
                     module_resolution,
+                    type_path_resolution: Ok(None),
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -7421,6 +7476,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                type_path_resolution: Ok(None),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -7619,6 +7675,7 @@ impl RootDatabase {
                     resolution,
                     local_resolution,
                     module_resolution,
+                    type_path_resolution: Ok(None),
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -13497,6 +13554,21 @@ mod tests {
             [Res::Err, Res::Err],
             "the imported invariant target and its predicate-body type are rejected"
         );
+        let fixture_type_heads = fixture_owner
+            .type_path_resolution()
+            .expect("invariant type-head resolution succeeds")
+            .expect("invariant adapter resolves its type heads");
+        assert_eq!(fixture_type_heads.owner(), fixture_owner.owner());
+        assert_eq!(fixture_type_heads.paths().len(), 2);
+        assert_eq!(
+            fixture_type_heads
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err, Res::Err],
+            "ordinary type resolution keeps rejected test-only target and body heads erroneous"
+        );
         let fixture_module_paths = fixture_owner
             .module_resolution()
             .expect("invariant expression lookup succeeds")
@@ -13744,6 +13816,178 @@ mod tests {
     }
 
     #[test]
+    fn invariant_owner_resolves_type_heads_in_exact_module_scope() {
+        let root = concat!("type RootOnly = Bool\n", "const VALUE: Bool = true\n",);
+        let child = concat!(
+            "type LocalType = Bool\n",
+            "invariant LocalType { { let local: U32 = 0; VALUE } }\n",
+            "invariant RootOnly { { let local: Option<U32> = 0; VALUE } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("invariant scopes collect");
+        assert_eq!(collection.scopes().invariant_owners.len(), 2);
+
+        let child_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let binding_for = |name: &str| {
+            child_scope
+                .scope
+                .iter()
+                .find_map(|(symbol, binding)| {
+                    (database.resolve_symbol(*symbol).ok()?.as_ref() == name).then_some(binding.res)
+                })
+                .unwrap_or_else(|| panic!("child module scope contains `{name}`"))
+        };
+        let local_type = binding_for("LocalType");
+
+        let results = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("invariant type heads resolve");
+        assert_eq!(results.owners().len(), 2);
+
+        let local_target = results.owners()[0]
+            .type_path_resolution()
+            .expect("local target type lookup succeeds")
+            .expect("first invariant has a type result");
+        assert!(
+            local_target.paths().values().any(|path| {
+                path.base == local_type && matches!(path.base, Res::Def(DefKind::Alias, _))
+            }),
+            "a child invariant target resolves the child file's local type alias"
+        );
+        assert!(
+            local_target
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "a primitive body annotation resolves through the primitive-only Prelude"
+        );
+
+        let local_expression = results.owners()[0]
+            .module_resolution()
+            .expect("child expression lookup succeeds")
+            .expect("first invariant has expression resolution");
+        assert!(local_expression.paths.is_empty());
+        assert_eq!(
+            local_expression.deferred_paths.len(),
+            1,
+            "the child file does not resolve the root-only expression binding"
+        );
+
+        let root_target = results.owners()[1]
+            .type_path_resolution()
+            .expect("root-only target lookup stays a partial success")
+            .expect("second invariant has a type result");
+        assert!(
+            root_target
+                .paths()
+                .values()
+                .all(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "only the primitive generic argument resolves from the child file"
+        );
+        let deferred_names = root_target
+            .deferred_paths()
+            .iter()
+            .map(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .expect("deferred name resolves")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            deferred_names
+                .iter()
+                .any(|name| name.as_ref() == "RootOnly"),
+            "the root-only alias remains deferred"
+        );
+        assert!(
+            deferred_names.iter().any(|name| name.as_ref() == "Option"),
+            "unavailable canonical items remain deferred"
+        );
+        assert!(
+            root_target
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "generic arguments in an invariant body still resolve primitive heads"
+        );
+    }
+
+    #[test]
+    fn invariant_type_paths_reject_later_heads_after_diagnostic_failure() {
+        let root = concat!(
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures as later_type\n",
+            "invariant Fixture { { let local: later_type.Widget = true; true } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only invariant type imports are collected");
+
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let broken_type_import_index = module_scope
+            .imports
+            .iter()
+            .position(|import| {
+                database
+                    .resolve_symbol(import.name)
+                    .is_ok_and(|name| name.as_ref() == "Fixture")
+            })
+            .expect("Fixture import exists");
+        module_scope.imports[broken_type_import_index].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+
+        let results = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("diagnostic construction failure stays owner-local");
+        let owner = &results.owners()[0];
+        assert!(matches!(
+            owner.test_only_diagnostics(),
+            Err(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                import,
+                ..
+            }) if import.0 as usize == broken_type_import_index
+        ));
+        let type_paths = owner
+            .type_path_resolution()
+            .expect("invariant type resolution remains independent")
+            .expect("the invariant has a type path result");
+        assert_eq!(
+            type_paths
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err, Res::Err],
+            "the later predicate-body type import remains rejected"
+        );
+    }
+
+    #[test]
     fn refinement_owner_adapter_checks_refined_and_distinct_predicate_values() {
         let root = concat!(
             "type Positive = I32 where { let local = true; local? }\n",
@@ -13788,6 +14032,12 @@ mod tests {
             [sai_diagnostics::Code::InvalidContractExpression]
         );
         for owner in &resolved.owners()[..2] {
+            assert!(
+                owner
+                    .type_path_resolution()
+                    .expect("refinement adapter does not resolve type heads")
+                    .is_none()
+            );
             let locals = owner
                 .local_resolution()
                 .expect("refinement local resolution succeeds")
@@ -15036,6 +15286,12 @@ mod tests {
 
         assert!(resolved.matches_collection(&collection));
         assert_eq!(resolved.owners().len(), 3);
+        assert!(
+            resolved.owners()[0]
+                .type_path_resolution()
+                .expect("extern predicate adapter does not resolve type heads")
+                .is_none()
+        );
         assert_eq!(
             resolved.owners()[0]
                 .resolution()
