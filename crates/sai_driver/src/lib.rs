@@ -833,6 +833,7 @@ pub struct Phase1PackageScopesCollection {
     input_fingerprint: Fingerprint,
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
+    build_context: Phase1BuildContext,
     module_tree: ModuleTree,
 }
 
@@ -843,6 +844,10 @@ impl Phase1PackageScopesCollection {
 
     pub fn scopes(&self) -> &Phase1PackageScopes {
         &self.scopes
+    }
+
+    pub const fn build_context(&self) -> Phase1BuildContext {
+        self.build_context
     }
 
     pub fn into_scopes(self) -> Phase1PackageScopes {
@@ -1014,12 +1019,83 @@ impl PredicateOwnerResolutions {
     }
 }
 
+/// Owned lexical-local results for one test or property owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestPropertyOwnerResolution {
+    owner: OwnerId,
+    kind: TopLevelOwnerKind,
+    local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl TestPropertyOwnerResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn kind(&self) -> TopLevelOwnerKind {
+        self.kind
+    }
+
+    pub fn local_resolution(
+        &self,
+    ) -> Result<Option<&LocalResolution>, &OwnerControlFlowResolutionError> {
+        self.local_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Per-owner lexical-local results for a test-analysis request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestPropertyOwnerResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    build_context: Phase1BuildContext,
+    owners: Vec<TestPropertyOwnerResolution>,
+}
+
+impl TestPropertyOwnerResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+            && self.build_context == collection.build_context
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn build_context(&self) -> Phase1BuildContext {
+        self.build_context
+    }
+
+    pub fn owners(&self) -> &[TestPropertyOwnerResolution] {
+        &self.owners
+    }
+}
+
 /// Failure while lowering or resolving a current-snapshot function or
 /// predicate owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnerControlFlowResolutionError {
     SnapshotMismatch,
     ModuleTreeMismatch,
+    TestAnalysisDisabled,
     MissingSnapshotFile(FileId),
     Parse(ParseQueryError),
     ItemTree(ItemTreeQueryError),
@@ -1321,7 +1397,14 @@ fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol
                 Res::Def(DefKind::Module | DefKind::Interface, _)
             );
             let is_unresolved_test_only_module_alias = import.test_only
-                && matches!(binding.res, Res::TestOnly(res_import) if res_import == import_index);
+                && match binding.res {
+                    Res::TestOnly(res_import) => res_import == import_index,
+                    // Test-only module aliases rejected because the current
+                    // package cannot use test edges remain syntax-known
+                    // module names even though Phase 1 stores `Res::Err`.
+                    Res::Err => true,
+                    Res::Def(_, _) | Res::Local(_) => false,
+                };
             (is_resolved_module_alias || is_unresolved_test_only_module_alias).then_some(*name)
         })
         .collect()
@@ -2757,6 +2840,7 @@ impl RootDatabase {
             input_fingerprint: output.input_fingerprint,
             snapshot_id: snapshot.id(),
             target_cfg: target_cfg.clone(),
+            build_context,
             module_tree: module_tree.clone(),
         })
     }
@@ -2992,6 +3076,141 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Resolves lexical locals in top-level tests and properties when test
+    /// analysis is active for this package collection.
+    ///
+    /// This uncached bridge uses the exact current lowering and source map for
+    /// each target-filtered owner. Ordinary builds are rejected before any
+    /// test or property body is lowered.
+    pub fn resolve_test_property_owner_locals(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<TestPropertyOwnerResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        if !collection.build_context.analyzes_tests {
+            return Err(OwnerControlFlowResolutionError::TestAnalysisDisabled);
+        }
+
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.kind,
+                    TopLevelOwnerKind::Test | TopLevelOwnerKind::Property
+                )
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let mut owners = Vec::with_capacity(descriptors.len());
+        let mut group_start = 0;
+        while group_start < descriptors.len() {
+            let file = descriptors[group_start].file;
+            let mut group_end = group_start + 1;
+            while group_end < descriptors.len() && descriptors[group_end].file == file {
+                group_end += 1;
+            }
+            let inputs =
+                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        owners.extend(descriptors[group_start..group_end].iter().map(
+                            |descriptor| TestPropertyOwnerResolution {
+                                owner: descriptor.owner,
+                                kind: descriptor.kind,
+                                local_resolution: Err(error.clone()),
+                                lowering_diagnostics: Vec::new(),
+                            },
+                        ));
+                        group_start = group_end;
+                        continue;
+                    }
+                };
+            let module_aliases = module_aliases_for_file(collection, module_tree, file);
+
+            for descriptor in &descriptors[group_start..group_end] {
+                let mut lowering_diagnostics = Vec::new();
+                let local_resolution = (|| {
+                    let owner_descriptor = find_top_level_owner_descriptor(
+                        &top_level_owner_index,
+                        descriptor.owner,
+                        descriptor.file,
+                        descriptor.item_id,
+                        descriptor.kind,
+                    )?;
+                    let def_paths = self
+                        .def_paths
+                        .get(&descriptor.owner.def_id.package())
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+                    let expected_path = def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+
+                    let arena = HirArena::new();
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.parsed.root,
+                        &arena,
+                        &self.symbols,
+                        def_paths,
+                    );
+                    let (hir_owner, source_map) = lower_top_level_owner(
+                        owner_descriptor,
+                        &expected_path,
+                        &inputs.filtered_item_tree,
+                        &inputs.retained_item_kinds,
+                        &context,
+                    )?;
+                    lowering_diagnostics = hir_owner.diagnostics.clone();
+                    match hir_owner.body {
+                        Some(body) => match &module_aliases {
+                            Ok(module_aliases) => resolve_owner_locals(
+                                body,
+                                &source_map,
+                                snapshot,
+                                &self.symbols,
+                                module_aliases,
+                            )
+                            .map(Some)
+                            .map_err(OwnerControlFlowResolutionError::Locals),
+                            Err(error) => Err(error.clone()),
+                        },
+                        None => Ok(None),
+                    }
+                })();
+                owners.push(TestPropertyOwnerResolution {
+                    owner: descriptor.owner,
+                    kind: descriptor.kind,
+                    local_resolution,
+                    lowering_diagnostics,
+                });
+            }
+            group_start = group_end;
+        }
+        Ok(TestPropertyOwnerResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            build_context: collection.build_context,
             owners,
         })
     }
@@ -4387,6 +4606,226 @@ mod tests {
             "a name from the root module does not leak into a child module's unqualified scope"
         );
         assert_eq!(child_owner.deferred_paths[0].name, root_value_symbol);
+    }
+
+    #[test]
+    fn test_property_local_resolution_requires_active_test_analysis() {
+        let root = concat!(
+            "test \"disabled\" { unknown_in_test }\n",
+            "property \"disabled-property\" (value: Bool) { value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("ordinary package scopes collect");
+        assert!(!collection.build_context().analyzes_tests);
+        assert_eq!(
+            collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .filter(|descriptor| matches!(
+                    descriptor.kind,
+                    TopLevelOwnerKind::Test | TopLevelOwnerKind::Property
+                ))
+                .count(),
+            2,
+            "test-name owner descriptors remain available outside test analysis"
+        );
+        assert_eq!(
+            database.resolve_test_property_owner_locals(&collection, &module_tree, &snapshot),
+            Err(OwnerControlFlowResolutionError::TestAnalysisDisabled),
+            "ordinary builds cannot accidentally lower test or property bodies"
+        );
+    }
+
+    #[test]
+    fn test_property_local_resolution_uses_test_context_and_target_filtered_owners() {
+        let root = concat!(
+            "use acme:test-support/fixtures as client\n",
+            "@target(\"wasm32-core\")\n",
+            "test \"local\" { let client = true; client }\n",
+            "@target(\"wasm64-core\")\n",
+            "test \"filtered\" { absent_test_only_here }\n",
+            "@target(\"wasm32-core\")\n",
+            "property \"property\" (client: Bool) { client }\n",
+            "@target(\"wasm64-core\")\n",
+            "property \"filtered-property\" (value: Bool) { absent_property_only_here }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: false,
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                context,
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("non-root test analysis collects package scopes");
+        let module_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        assert_eq!(module_scope.imports.len(), 1);
+        assert!(module_scope.imports[0].test_only);
+        assert!(
+            matches!(module_scope.imports[0].res, Res::TestOnly(_)),
+            "unavailable test-only bindings keep their explicit identity"
+        );
+        assert!(
+            collection.scopes().diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::TestDependencyUnavailable
+            }),
+            "the unavailable non-root test dependency remains diagnosed in Phase 1"
+        );
+
+        let results = database
+            .resolve_test_property_owner_locals(&collection, &module_tree, &snapshot)
+            .expect("active non-root test analysis resolves local owners");
+        assert!(results.matches_collection(&collection));
+        assert_eq!(
+            results
+                .owners()
+                .iter()
+                .map(TestPropertyOwnerResolution::kind)
+                .collect::<Vec<_>>(),
+            [TopLevelOwnerKind::Test, TopLevelOwnerKind::Property],
+            "only owners retained for the selected target are lowered"
+        );
+        for owner in results.owners() {
+            let local = owner
+                .local_resolution()
+                .expect("owner local resolution succeeds")
+                .expect("test and property owners have bodies");
+            assert!(
+                local
+                    .paths
+                    .values()
+                    .all(|path| matches!(path.base, Res::Local(_))),
+                "body and property-parameter references resolve as locals"
+            );
+            assert!(
+                local
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
+                "a local binding shadows the syntax-known test-only module alias"
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_local_resolution_keeps_inactive_test_module_aliases() {
+        let root = concat!(
+            "use acme:test-support/fixtures as client\n",
+            "test \"local\" { let client = true; client }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: true,
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 only { wasm64-core } }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                context,
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("target-excluded test requirement remains in package scopes");
+        let module_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        assert!(module_scope.imports[0].test_only);
+        assert_eq!(module_scope.imports[0].res, Res::Err);
+        assert!(
+            collection
+                .scopes()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::InactiveDependency }),
+            "the test-only import remains diagnosed as inactive"
+        );
+
+        let results = database
+            .resolve_test_property_owner_locals(&collection, &module_tree, &snapshot)
+            .expect("test analysis still resolves the retained test body");
+        let local = results.owners()[0]
+            .local_resolution()
+            .expect("local resolution succeeds")
+            .expect("test owner has a body");
+        assert!(
+            local
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_)))
+        );
+        assert!(
+            local
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
+            "an inactive test-only module alias remains a syntax-known module name"
+        );
+    }
+
+    #[test]
+    fn test_property_local_resolution_keeps_processing_after_one_owner_failure() {
+        let root = concat!(
+            "test \"first\" { true }\n",
+            "property \"second\" (value: Bool) { value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let mut collection = database
+            .collect_phase1_package_scopes_collection(&module_tree, &snapshot, &target_cfg, context)
+            .expect("test-analysis package scopes collect");
+        let property_item_id = collection.scopes.top_level_owners[1].item_id;
+        collection.scopes.top_level_owners[0].item_id = property_item_id;
+
+        let results = database
+            .resolve_test_property_owner_locals(&collection, &module_tree, &snapshot)
+            .expect("one bad descriptor remains an owner-local failure");
+        assert_eq!(results.owners().len(), 2);
+        assert!(results.owners()[0].local_resolution().is_err());
+        assert!(
+            results.owners()[1]
+                .local_resolution()
+                .expect("the following owner still resolves")
+                .is_some()
+        );
     }
 
     #[test]
