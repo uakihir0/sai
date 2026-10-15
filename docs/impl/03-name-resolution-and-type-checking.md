@@ -336,7 +336,9 @@ signatures, including parser-recovered syntax. Package-qualified `WorldRef`
 resolution remains with the WIT resolver; spec/14 does not yet define how a
 direct `requires test` package path is diagnosed. The grammar exposes no
 additional extern-child form beyond function heads, which IR-532 already
-covers; the property-parameter exception is preserved during test analysis.
+covers; IR-541 adds partial first-head type-path resolution for the existing
+top-level type owners. The property-parameter exception is preserved during
+test analysis.
 The complete canonical prelude and general tracked `package_scopes(PackageId)`
 query also remain deferred.
 
@@ -945,7 +947,7 @@ test-only diagnostics without manufacturing HIR path results. AST-only
 predicate and recovered function scans include constructor and range-pattern
 heads, and nested refined declarations use their ItemTree generic parameters
 for shadowing. Parent, child, and resource-method failures stay isolated. This
-remains a diagnostic pass; ordinary type/effect/member lookup, full world/WIT
+remains a diagnostic pass; full ordinary type/effect/member lookup, full world/WIT
 resolution (including package-qualified references), and command-level `check`
 integration remain pending.
 
@@ -962,7 +964,8 @@ force. Top-level resource field types are included at this stage because
 resources already lower as ordinary top-level type owners; resources add no
 generic parameter scope. IR-539 covers effect `covers` references, and IR-540
 covers test-only module-binding heads in direct world items and boundary
-signatures. Ordinary type, member, and Prelude resolution, package-qualified
+signatures. IR-541 adds first-head resolution for the same top-level type
+owners. Full ordinary type/member and Prelude resolution, package-qualified
 world/WIT resolution, and command-level `check` integration remain pending.
 The grammar exposes no further extern-child form beyond function heads, which
 IR-532 covers.
@@ -1000,6 +1003,22 @@ so, which source span and related note the diagnostic should use. They do not
 have a test-only `use` binding to point back to. Until spec/14 defines this
 case, IR-540 leaves it outside the binding-based test-only pass. Ordinary
 world/WIT name resolution and package availability validation remain pending.
+
+**Top-level type-path resolution (IR-541).** `resolve_type_owner_paths`
+returns type-path results and the existing test-only diagnostics from one
+lowering pass over current-target top-level structs, aliases, enums, and
+resources. It resolves each plain type path's first segment by generic
+parameter, then exact-file module scope; generic type and const parameters
+retain their `DefKind` and `DefId`, and the first source declaration wins
+duplicate-name recovery. Ordinary bindings preserve their known
+`Res`, including known wrong-kind entities, while test-only imports are
+diagnosed by import origin regardless of `Res` and receive `Res::Err`.
+Qualified paths resolve one head and retain the full segment count so a later
+module-prefix or type-relative pass can continue. Misses, including
+Prelude-provided names, remain source-ordered deferred candidates; this slice
+does not emit unresolved-name diagnostics or resolve qualified tails.
+`resolve_type_owner_test_only_paths` remains a compatibility wrapper over the
+combined pass.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
@@ -1091,8 +1110,10 @@ refined/distinct, and extern owners, while IR-534 covers direct trait/impl
 headers, IR-535–IR-536 cover associated declaration signatures, method bodies,
 and contracts, IR-537 covers interfaces, and IR-538 covers top-level
 struct/alias/enum/resource declarations. IR-539 and IR-540 add test-only
-reference diagnostics for effects and world owners. Ordinary effect and full
-world/WIT resolution, plus remaining extern-child owners, remain for later
+reference diagnostics for effects and world owners. IR-541 adds partial
+first-head type-path resolution for top-level type declarations. Full ordinary
+type/effect/member lookup, canonical Prelude fallback, package-qualified
+world/WIT resolution, and final unresolved-name diagnostics remain for later
 integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
