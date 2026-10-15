@@ -927,14 +927,18 @@ impl FunctionOwnerResolutions {
 /// Compatibility name for the original label result collection.
 pub type FunctionOwnerLabelResolutions = FunctionOwnerResolutions;
 
-/// Predicate diagnostics produced for one top-level owner.
+/// Predicate diagnostics and local-name resolutions produced for one
+/// top-level owner.
 ///
-/// The temporary HIR arena and source map used to produce these diagnostics
-/// are discarded before the value is returned.
+/// The temporary HIR arena and source map used to produce these results are
+/// discarded before the value is returned. Predicate diagnostics and local
+/// name results are independent so a local-resolution failure does not hide
+/// owner-specific predicate diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PredicateOwnerResolution {
     owner: OwnerId,
     resolution: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// predicate resolver's diagnostics so the caller can preserve phase
     /// order.
@@ -948,6 +952,14 @@ impl PredicateOwnerResolution {
 
     pub fn resolution(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
         self.resolution.as_deref()
+    }
+
+    pub fn local_resolution(
+        &self,
+    ) -> Result<Option<&LocalResolution>, &OwnerControlFlowResolutionError> {
+        self.local_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
     }
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
@@ -2955,6 +2967,7 @@ impl RootDatabase {
                             |descriptor| PredicateOwnerResolution {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
+                                local_resolution: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -2962,9 +2975,11 @@ impl RootDatabase {
                         continue;
                     }
                 };
+            let module_aliases = module_aliases_for_file(collection, module_tree, file);
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
+                let mut local_resolution = None;
                 let resolution = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -2996,7 +3011,7 @@ impl RootDatabase {
                         &self.symbols,
                         def_paths,
                     );
-                    let (hir_owner, _source_map) = lower_top_level_owner(
+                    let (hir_owner, source_map) = lower_top_level_owner(
                         owner_descriptor,
                         &expected_path,
                         &inputs.filtered_item_tree,
@@ -3005,20 +3020,41 @@ impl RootDatabase {
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     match hir_owner.body {
-                        Some(body) => resolve_owner_control_flow(
-                            body,
-                            &inputs.source_ref,
-                            inputs.source.as_ref(),
-                            &self.symbols,
-                        )
-                        .map(|result| result.diagnostics)
-                        .map_err(OwnerControlFlowResolutionError::Labels),
-                        None => Ok(Vec::new()),
+                        Some(body) => {
+                            let locals = match &module_aliases {
+                                Ok(module_aliases) => resolve_owner_locals(
+                                    body,
+                                    &source_map,
+                                    snapshot,
+                                    &self.symbols,
+                                    module_aliases,
+                                )
+                                .map(Some)
+                                .map_err(OwnerControlFlowResolutionError::Locals),
+                                Err(error) => Err(error.clone()),
+                            };
+                            local_resolution = Some(locals);
+                            resolve_owner_control_flow(
+                                body,
+                                &inputs.source_ref,
+                                inputs.source.as_ref(),
+                                &self.symbols,
+                            )
+                            .map(|result| result.diagnostics)
+                            .map_err(OwnerControlFlowResolutionError::Labels)
+                        }
+                        None => {
+                            local_resolution = Some(Ok(None));
+                            Ok(Vec::new())
+                        }
                     }
                 })();
+                let local_resolution =
+                    local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
+                    local_resolution,
                     lowering_diagnostics,
                 });
             }
@@ -3069,6 +3105,7 @@ impl RootDatabase {
                             |descriptor| PredicateOwnerResolution {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
+                                local_resolution: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -3076,9 +3113,11 @@ impl RootDatabase {
                         continue;
                     }
                 };
+            let module_aliases = module_aliases_for_file(collection, module_tree, file);
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
+                let mut local_resolution = None;
                 let resolution = (|| {
                     let owner_kind = match descriptor.kind {
                         RefinementPredicateOwnerKind::Refined => TopLevelOwnerKind::Refined,
@@ -3114,7 +3153,7 @@ impl RootDatabase {
                         &self.symbols,
                         def_paths,
                     );
-                    let (hir_owner, _source_map) = lower_top_level_owner(
+                    let (hir_owner, source_map) = lower_top_level_owner(
                         owner_descriptor,
                         &expected_path,
                         &inputs.filtered_item_tree,
@@ -3123,18 +3162,39 @@ impl RootDatabase {
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     match hir_owner.body {
-                        Some(body) => resolve_predicate_expression(
-                            body.value,
-                            &inputs.source_ref,
-                            inputs.source.as_ref(),
-                        )
-                        .map_err(OwnerControlFlowResolutionError::Labels),
-                        None => Ok(Vec::new()),
+                        Some(body) => {
+                            let locals = match &module_aliases {
+                                Ok(module_aliases) => resolve_owner_locals(
+                                    body,
+                                    &source_map,
+                                    snapshot,
+                                    &self.symbols,
+                                    module_aliases,
+                                )
+                                .map(Some)
+                                .map_err(OwnerControlFlowResolutionError::Locals),
+                                Err(error) => Err(error.clone()),
+                            };
+                            local_resolution = Some(locals);
+                            resolve_predicate_expression(
+                                body.value,
+                                &inputs.source_ref,
+                                inputs.source.as_ref(),
+                            )
+                            .map_err(OwnerControlFlowResolutionError::Labels)
+                        }
+                        None => {
+                            local_resolution = Some(Ok(None));
+                            Ok(Vec::new())
+                        }
                     }
                 })();
+                let local_resolution =
+                    local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
+                    local_resolution,
                     lowering_diagnostics,
                 });
             }
@@ -3186,6 +3246,7 @@ impl RootDatabase {
                             |descriptor| PredicateOwnerResolution {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
+                                local_resolution: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -3193,9 +3254,11 @@ impl RootDatabase {
                         continue;
                     }
                 };
+            let module_aliases = module_aliases_for_file(collection, module_tree, file);
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
+                let mut local_resolution = None;
                 let resolution = (|| {
                     let block_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -3254,7 +3317,7 @@ impl RootDatabase {
                     )?;
                     lowering_diagnostics.extend(block_hir.diagnostics.iter().cloned());
 
-                    let (hir_owner, _source_map) = lower_extern_item_owner(
+                    let (hir_owner, source_map) = lower_extern_item_owner(
                         descriptor.owner,
                         &expected_path,
                         &block_hir,
@@ -3268,20 +3331,41 @@ impl RootDatabase {
                     .map_err(OwnerControlFlowResolutionError::Lowering)?;
                     lowering_diagnostics.extend(hir_owner.diagnostics.iter().cloned());
                     match hir_owner.body {
-                        Some(body) => resolve_owner_control_flow(
-                            body,
-                            &inputs.source_ref,
-                            inputs.source.as_ref(),
-                            &self.symbols,
-                        )
-                        .map(|result| result.diagnostics)
-                        .map_err(OwnerControlFlowResolutionError::Labels),
-                        None => Ok(Vec::new()),
+                        Some(body) => {
+                            let locals = match &module_aliases {
+                                Ok(module_aliases) => resolve_owner_locals(
+                                    body,
+                                    &source_map,
+                                    snapshot,
+                                    &self.symbols,
+                                    module_aliases,
+                                )
+                                .map(Some)
+                                .map_err(OwnerControlFlowResolutionError::Locals),
+                                Err(error) => Err(error.clone()),
+                            };
+                            local_resolution = Some(locals);
+                            resolve_owner_control_flow(
+                                body,
+                                &inputs.source_ref,
+                                inputs.source.as_ref(),
+                                &self.symbols,
+                            )
+                            .map(|result| result.diagnostics)
+                            .map_err(OwnerControlFlowResolutionError::Labels)
+                        }
+                        None => {
+                            local_resolution = Some(Ok(None));
+                            Ok(Vec::new())
+                        }
                     }
                 })();
+                let local_resolution =
+                    local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
+                    local_resolution,
                     lowering_diagnostics,
                 });
             }
@@ -4169,8 +4253,13 @@ mod tests {
 
     #[test]
     fn invariant_owner_adapter_reports_forbidden_predicate_syntax() {
-        let root = b"invariant Account { true?, true }\ninvariant Safe { true }\n";
-        let (mut database, module_tree, snapshot, _) = phase1_fixture(root, b"");
+        let root = concat!(
+            "use acme:phase1/child as local\n",
+            "invariant Account { { let local = true; local? }, true }\n",
+            "invariant Safe { true }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), b"pub fn child_fn() {}\n");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let collection = database
             .collect_phase1_package_scopes_collection(
@@ -4197,19 +4286,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             [sai_diagnostics::Code::InvalidContractExpression]
         );
+        let account_locals = resolved.owners()[0]
+            .local_resolution()
+            .expect("invariant local resolution succeeds")
+            .expect("invariant owner has a body");
+        assert_eq!(account_locals.bindings.len(), 1);
+        assert_eq!(account_locals.paths.len(), 1);
+        assert!(
+            account_locals
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_))),
+            "the block-local use resolves even though the predicate has a separate restriction diagnostic"
+        );
+        assert_eq!(
+            account_locals
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule)
+                .count(),
+            1,
+            "local bindings in invariant predicates use the exact module's aliases"
+        );
         assert!(
             resolved.owners()[1]
                 .resolution()
                 .expect("second invariant lowers")
                 .is_empty()
         );
+        let safe_locals = resolved.owners()[1]
+            .local_resolution()
+            .expect("second invariant local resolution succeeds")
+            .expect("second invariant owner has a body");
+        assert!(safe_locals.bindings.is_empty());
+        assert!(safe_locals.paths.is_empty());
     }
 
     #[test]
     fn refinement_owner_adapter_checks_refined_and_distinct_predicate_values() {
         let root = concat!(
-            "type Positive = I32 where self?\n",
-            "distinct Age = U8 where loop { break 'missing }\n",
+            "type Positive = I32 where { let local = true; local? }\n",
+            "distinct Age = U8 where { let local = true; local? }\n",
             "distinct Plain = U8\n",
             "type Safe = I32 where self > 0\n",
         );
@@ -4249,11 +4366,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             [sai_diagnostics::Code::InvalidContractExpression]
         );
+        for owner in &resolved.owners()[..2] {
+            let locals = owner
+                .local_resolution()
+                .expect("refinement local resolution succeeds")
+                .expect("predicate owner has a body");
+            assert_eq!(locals.bindings.len(), 1);
+            assert_eq!(locals.paths.len(), 1);
+            assert!(
+                locals
+                    .paths
+                    .values()
+                    .all(|path| matches!(path.base, Res::Local(_))),
+                "refinement local use resolves independently of predicate diagnostics"
+            );
+        }
         assert!(
             resolved.owners()[2]
                 .resolution()
                 .expect("valid refined owner lowers")
                 .is_empty()
+        );
+        let self_locals = resolved.owners()[2]
+            .local_resolution()
+            .expect("valid refined local resolution succeeds")
+            .expect("valid refined owner has a body");
+        assert!(
+            self_locals.paths.is_empty(),
+            "implicit self remains for owner-aware resolution"
         );
     }
 
@@ -4267,6 +4407,7 @@ mod tests {
             "  fn safe(value: Bool) -> Bool ",
             "requires { value } ",
             "ensures { result }\n",
+            "  fn no_contract();\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -4278,14 +4419,14 @@ mod tests {
                 Phase1BuildContext::default(),
             )
             .expect("extern function owners collect");
-        assert_eq!(collection.scopes().extern_function_owners.len(), 2);
+        assert_eq!(collection.scopes().extern_function_owners.len(), 3);
 
         let resolved = database
             .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
             .expect("extern function predicates resolve");
 
         assert!(resolved.matches_collection(&collection));
-        assert_eq!(resolved.owners().len(), 2);
+        assert_eq!(resolved.owners().len(), 3);
         assert_eq!(
             resolved.owners()[0]
                 .resolution()
@@ -4303,6 +4444,32 @@ mod tests {
                 .resolution()
                 .expect("second extern function lowers")
                 .is_empty()
+        );
+        let safe_locals = resolved.owners()[1]
+            .local_resolution()
+            .expect("extern local resolution succeeds")
+            .expect("extern declaration retains a contract body");
+        assert_eq!(safe_locals.bindings.len(), 1);
+        assert_eq!(safe_locals.paths.len(), 1);
+        assert!(
+            safe_locals
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_))),
+            "extern contract parameters resolve through the function's source map"
+        );
+        assert!(
+            resolved.owners()[2]
+                .resolution()
+                .expect("bodyless extern function lowers")
+                .is_empty()
+        );
+        assert!(
+            resolved.owners()[2]
+                .local_resolution()
+                .expect("bodyless extern local resolution succeeds")
+                .is_none(),
+            "an extern function without a body or contracts has no local scope"
         );
     }
 
