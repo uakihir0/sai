@@ -1025,26 +1025,53 @@ impl TraitImplHeaderResolutions {
     }
 }
 
-/// Test-only references found in one direct top-level type declaration.
-///
-/// Struct and resource fields, alias targets, enum payloads, and declaration
-/// generic bounds are attributed to their enclosing top-level owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TypeOwnerTestOnlyResolution {
+pub struct TypeOwnerPathResolution {
+    owner: OwnerId,
+    paths: HashMap<HirId, PathRes>,
+    deferred_paths: Vec<DeferredPath>,
+}
+
+impl TypeOwnerPathResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn paths(&self) -> &HashMap<HirId, PathRes> {
+        &self.paths
+    }
+
+    pub fn deferred_paths(&self) -> &[DeferredPath] {
+        &self.deferred_paths
+    }
+}
+
+/// Partial type-path and test-only resolution for one direct top-level type
+/// declaration. Struct and resource fields, alias targets, enum payloads,
+/// and declaration generic bounds are attributed to their enclosing owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeOwnerResolution {
     owner: OwnerId,
     kind: TopLevelOwnerKind,
+    path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
 }
 
-impl TypeOwnerTestOnlyResolution {
+impl TypeOwnerResolution {
     pub const fn owner(&self) -> OwnerId {
         self.owner
     }
 
     pub const fn kind(&self) -> TopLevelOwnerKind {
         self.kind
+    }
+
+    pub fn path_resolution(
+        &self,
+    ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
+        self.path_resolution.as_ref()
     }
 
     pub fn test_only_path_resolution(
@@ -1062,16 +1089,19 @@ impl TypeOwnerTestOnlyResolution {
     }
 }
 
-/// Provenance-tagged test-only diagnostics for direct top-level type owners.
+/// Compatibility name for the original type-owner test-only adapter result.
+pub type TypeOwnerTestOnlyResolution = TypeOwnerResolution;
+
+/// Provenance-tagged partial type-path results and test-only diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TypeOwnerTestOnlyResolutions {
+pub struct TypeOwnerResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
-    owners: Vec<TypeOwnerTestOnlyResolution>,
+    owners: Vec<TypeOwnerResolution>,
 }
 
-impl TypeOwnerTestOnlyResolutions {
+impl TypeOwnerResolutions {
     pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
         self.snapshot_id
     }
@@ -1090,10 +1120,13 @@ impl TypeOwnerTestOnlyResolutions {
         &self.target_cfg
     }
 
-    pub fn owners(&self) -> &[TypeOwnerTestOnlyResolution] {
+    pub fn owners(&self) -> &[TypeOwnerResolution] {
         &self.owners
     }
 }
+
+/// Compatibility name for the original type-owner test-only adapter result.
+pub type TypeOwnerTestOnlyResolutions = TypeOwnerResolutions;
 
 /// Test-only references found in one top-level effect declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3862,6 +3895,78 @@ fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
         .map(|parameter| parameter.name.sym)
         .filter(|name| !name.is_error())
         .collect()
+}
+
+fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> {
+    let generics = match owner.node {
+        OwnerNode::Item(item) => match item.kind {
+            ItemKind::Struct { generics, .. }
+            | ItemKind::Alias { generics, .. }
+            | ItemKind::Enum { generics, .. } => generics,
+            ItemKind::Resource { .. } => return HashMap::new(),
+            _ => return HashMap::new(),
+        },
+        _ => return HashMap::new(),
+    };
+    let mut resolutions = HashMap::with_capacity(generics.params.len());
+    for parameter in generics.params {
+        if parameter.name.is_error() {
+            continue;
+        }
+        let kind = match parameter.kind {
+            GenericParamKind::Type { .. } => DefKind::TyParam,
+            GenericParamKind::Const { .. } => DefKind::ConstParam,
+        };
+        // Duplicate generic names are diagnosed by semantic validation. For
+        // recovery, the earliest binding wins as it does in lexical ribs.
+        resolutions
+            .entry(parameter.name.sym)
+            .or_insert(Res::Def(kind, parameter.def_id.to_def_id()));
+    }
+    resolutions
+}
+
+fn resolve_type_owner_module_paths(
+    owner: OwnerId,
+    candidates: &[OwnerPathHead],
+    generic_resolutions: &HashMap<Symbol, Res>,
+    test_only_paths: &OwnerTestOnlyPathResolution,
+    module_scope: &Phase1ModuleScopes,
+) -> TypeOwnerPathResolution {
+    let mut paths = HashMap::new();
+    let mut deferred_paths = Vec::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+    {
+        let base = if let Some(resolution) = generic_resolutions.get(&candidate.name) {
+            *resolution
+        } else if test_only_paths.paths.contains_key(&candidate.hir_id) {
+            Res::Err
+        } else if let Some(binding) = module_scope.scope.get(&candidate.name) {
+            binding.res
+        } else {
+            deferred_paths.push(DeferredPath {
+                hir_id: candidate.hir_id,
+                name: candidate.name,
+                span: candidate.span,
+            });
+            continue;
+        };
+        paths.insert(
+            candidate.hir_id,
+            PathRes {
+                base,
+                resolved_segments: 1,
+                segment_count: candidate.segment_count,
+            },
+        );
+    }
+    TypeOwnerPathResolution {
+        owner,
+        paths,
+        deferred_paths,
+    }
 }
 
 fn item_tree_generic_parameters(
@@ -6979,19 +7084,29 @@ impl RootDatabase {
         })
     }
 
-    /// Diagnoses test-only references in direct top-level type declarations.
-    ///
-    /// The pass checks struct and resource fields, alias targets, enum
-    /// payloads, declaration generic bounds, and where clauses. Fields and
-    /// variants are attributed to their enclosing top-level owner. Top-level
-    /// resources are included because their field types are declaration
-    /// references even though resources do not declare generic parameters.
+    /// Compatibility wrapper for [`RootDatabase::resolve_type_owner_paths`].
     pub fn resolve_type_owner_test_only_paths(
         &mut self,
         collection: &Phase1PackageScopesCollection,
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<TypeOwnerTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_type_owner_paths(collection, module_tree, snapshot)
+    }
+
+    /// Partially resolves type paths and diagnoses test-only references in
+    /// direct top-level struct, alias, enum, and resource declarations.
+    ///
+    /// Generic parameters precede the exact file's module scope. Misses remain
+    /// deferred for Prelude and unresolved-name resolution; qualified paths
+    /// resolve only their first segment. The returned test-only diagnostics
+    /// and rejected path map are produced by the same lowering pass.
+    pub fn resolve_type_owner_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<TypeOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -7026,9 +7141,10 @@ impl RootDatabase {
             ) {
                 Ok(inputs) => inputs,
                 Err(error) => {
-                    owners.push(TypeOwnerTestOnlyResolution {
+                    owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
+                        path_resolution: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
                         lowering_diagnostics,
@@ -7038,7 +7154,11 @@ impl RootDatabase {
             };
 
             let analysis: Result<
-                (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                (
+                    TypeOwnerPathResolution,
+                    OwnerTestOnlyPathResolution,
+                    Vec<Diagnostic>,
+                ),
                 OwnerControlFlowResolutionError,
             > = (|| {
                 let owner_descriptor = find_top_level_owner_descriptor(
@@ -7104,8 +7224,9 @@ impl RootDatabase {
 
                 let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
                 let candidates = owner_test_only_path_candidates(&hir_owner);
-                let generic_parameters = owner_generic_parameters(&hir_owner);
-                let mut path_resolution = OwnerTestOnlyPathResolution {
+                let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                let generic_parameters = generic_resolutions.keys().copied().collect();
+                let mut test_only_path_resolution = OwnerTestOnlyPathResolution {
                     owner: descriptor.owner,
                     paths: HashMap::new(),
                 };
@@ -7114,29 +7235,38 @@ impl RootDatabase {
                     &candidates,
                     &generic_parameters,
                     &module_scope,
-                    &mut path_resolution,
+                    &mut test_only_path_resolution,
                     &self.symbols,
                     &inputs,
                     snapshot,
                 )?;
                 sort_phase1_diagnostics(&mut diagnostics);
-                Ok((path_resolution, diagnostics))
+                let path_resolution = resolve_type_owner_module_paths(
+                    descriptor.owner,
+                    &candidates,
+                    &generic_resolutions,
+                    &test_only_path_resolution,
+                    &module_scope,
+                );
+                Ok((path_resolution, test_only_path_resolution, diagnostics))
             })();
 
             match analysis {
-                Ok((path_resolution, diagnostics)) => {
-                    owners.push(TypeOwnerTestOnlyResolution {
+                Ok((path_resolution, test_only_path_resolution, diagnostics)) => {
+                    owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
-                        test_only_path_resolution: Ok(path_resolution),
+                        path_resolution: Ok(path_resolution),
+                        test_only_path_resolution: Ok(test_only_path_resolution),
                         test_only_diagnostics: Ok(diagnostics),
                         lowering_diagnostics,
                     });
                 }
                 Err(error) => {
-                    owners.push(TypeOwnerTestOnlyResolution {
+                    owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
+                        path_resolution: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
                         lowering_diagnostics,
@@ -7145,7 +7275,7 @@ impl RootDatabase {
             }
         }
 
-        Ok(TypeOwnerTestOnlyResolutions {
+        Ok(TypeOwnerResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -14740,6 +14870,23 @@ mod tests {
                 "rejected top-level type heads become error sentinels"
             );
         }
+        assert_eq!(
+            results
+                .owners()
+                .iter()
+                .map(|owner| {
+                    owner
+                        .path_resolution()
+                        .expect("type owner path results succeed")
+                        .paths()
+                        .values()
+                        .filter(|path| path.base == Res::Err)
+                        .count()
+                })
+                .collect::<Vec<_>>(),
+            [3, 4, 4, 1, 1, 0],
+            "combined type-path results retain test-only error sentinels while generic shadowing wins"
+        );
 
         // Test-only classification follows import provenance even if Phase 1
         // already resolved the binding to a definition.
@@ -14782,6 +14929,23 @@ mod tests {
                 diagnostic_spans(resolved),
                 diagnostic_spans(baseline),
                 "test-only import origins remain rejected after their results become definitions"
+            );
+            assert_eq!(
+                resolved
+                    .path_resolution()
+                    .expect("resolved test-only type paths succeed")
+                    .paths()
+                    .values()
+                    .filter(|path| path.base == Res::Err)
+                    .count(),
+                baseline
+                    .path_resolution()
+                    .expect("baseline type paths succeed")
+                    .paths()
+                    .values()
+                    .filter(|path| path.base == Res::Err)
+                    .count(),
+                "test-only type heads remain error sentinels after Phase 1 supplies a definition"
             );
         }
 
@@ -14848,6 +15012,332 @@ mod tests {
                 .expect("visible alias diagnostics succeed")
                 .is_empty(),
             "the active alias is checked and no filtered owner leaks into results"
+        );
+    }
+
+    #[test]
+    fn type_owner_paths_resolve_generics_and_module_heads_with_deferred_misses() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "type Alias<T, const N: U32> = Container<T, N>\n",
+            "type Record<T> {\n",
+            "  generic: T\n",
+            "  qualified: fixture.Widget\n",
+            "  imported: Fixture\n",
+            "  missing: MissingType\n",
+            "}\n",
+            "enum Choice<T> {\n",
+            "  Value(T, fixture.Payload)\n",
+            "}\n",
+            "resource Handle {\n",
+            "  value: Fixture\n",
+            "}\n",
+            "type Shadow<Fixture> = Fixture\n",
+            "type ConstShadow<const Fixture: U32> = Fixture\n",
+            "type Duplicate<T, const T: U32> = T\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("type source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only aliases collect");
+        let test_only_results = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("test-only type heads and generic precedence resolve together");
+        assert!(
+            test_only_results.owners()[5]
+                .test_only_diagnostics()
+                .expect("const-shadow test-only diagnostics succeed")
+                .is_empty(),
+            "a const generic shadows a same-named test-only module alias"
+        );
+        assert!(
+            test_only_results.owners()[5]
+                .path_resolution()
+                .expect("const-shadow path results succeed")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::ConstParam, _))),
+            "the shadowing const generic keeps its definition identity"
+        );
+
+        // Make the exact imports ordinary resolved bindings to exercise the
+        // ordinary type path channel independently of test-only diagnostics.
+        let fake_type_def = collection.scopes().top_level_owners[0]
+            .owner
+            .def_id
+            .to_def_id();
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let fixture_module = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "fixture")
+            })
+            .expect("module alias binding exists");
+        let fixture_type = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "Fixture")
+            })
+            .expect("item type binding exists");
+        let mut ordinary_collection = collection.clone();
+        let root_scope = &mut ordinary_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        for (symbol, resolution) in [
+            (fixture_module, Res::Def(DefKind::Module, fake_type_def)),
+            (fixture_type, Res::Def(DefKind::Alias, fake_type_def)),
+        ] {
+            let import_index = match root_scope
+                .scope
+                .get(&symbol)
+                .expect("import binding exists")
+                .origin
+            {
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+                BindingOrigin::Decl => panic!("fixture names are imported"),
+            };
+            root_scope.scope.get_mut(&symbol).unwrap().res = resolution;
+            let import = &mut root_scope.imports[import_index.0 as usize];
+            import.res = resolution;
+            import.test_only = false;
+        }
+        let results = database
+            .resolve_type_owner_paths(&ordinary_collection, &module_tree, &snapshot)
+            .expect("ordinary type heads partially resolve");
+        assert!(results.matches_snapshot(&snapshot));
+        assert!(results.matches_collection(&ordinary_collection));
+        assert_eq!(results.target_cfg(), &target_cfg);
+        assert_eq!(
+            results
+                .owners()
+                .iter()
+                .map(TypeOwnerResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Struct,
+                TopLevelOwnerKind::Enum,
+                TopLevelOwnerKind::Resource,
+                TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Alias,
+            ]
+        );
+        assert!(
+            results.owners().iter().all(|owner| owner
+                .test_only_diagnostics()
+                .is_ok_and(|items| items.is_empty())),
+            "ordinary import metadata produces no test-only diagnostics"
+        );
+
+        let alias = results.owners()[0]
+            .path_resolution()
+            .expect("alias path results succeed");
+        assert_eq!(alias.paths().len(), 2);
+        assert!(
+            alias
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::TyParam, _)))
+        );
+        assert!(
+            alias
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::ConstParam, _)))
+        );
+        assert!(
+            alias.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Container")
+            }),
+            "unresolved nominal and prelude-only names stay deferred"
+        );
+
+        let record = results.owners()[1]
+            .path_resolution()
+            .expect("record path results succeed");
+        assert_eq!(record.paths().len(), 3);
+        assert!(
+            record
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::TyParam, _)))
+        );
+        assert!(
+            record
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Def(DefKind::Alias, fake_type_def))
+        );
+        assert!(
+            record.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::Module, fake_type_def)
+                    && path.resolved_segments == 1
+                    && path.segment_count == 2
+            }),
+            "qualified types resolve one module head and preserve the suffix length"
+        );
+        assert!(
+            record.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "MissingType")
+            }),
+            "an ordinary miss remains available for later Prelude or unresolved-name handling"
+        );
+
+        let enum_paths = results.owners()[2]
+            .path_resolution()
+            .expect("enum path results succeed");
+        assert_eq!(
+            enum_paths
+                .paths()
+                .values()
+                .filter(|path| path.base == Res::Def(DefKind::Module, fake_type_def))
+                .count(),
+            1,
+            "enum payload paths are resolved under the enum owner"
+        );
+        let resource_paths = results.owners()[3]
+            .path_resolution()
+            .expect("resource path results succeed");
+        assert_eq!(
+            resource_paths.paths().values().copied().collect::<Vec<_>>(),
+            [PathRes {
+                base: Res::Def(DefKind::Alias, fake_type_def),
+                resolved_segments: 1,
+                segment_count: 1,
+            }],
+            "resource fields use the enclosing resource owner"
+        );
+        assert!(
+            results.owners()[4]
+                .path_resolution()
+                .expect("shadowing alias path results succeed")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::TyParam, _))),
+            "a type parameter shadows an imported type with the same name"
+        );
+        let const_shadow = results.owners()[5]
+            .path_resolution()
+            .expect("const shadowing alias path results succeed");
+        assert!(
+            const_shadow
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::ConstParam, _))),
+            "a const parameter shadows the module scope and retains its wrong-kind identity"
+        );
+        assert!(
+            const_shadow.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "U32")
+            }),
+            "primitive names remain deferred for the later Prelude lookup"
+        );
+
+        let duplicate = results.owners()[6]
+            .path_resolution()
+            .expect("duplicate-generic recovery succeeds");
+        let duplicate_owner = results.owners()[6].owner();
+        let duplicate_name = database
+            .symbols
+            .intern("T")
+            .expect("generic name is interned");
+        let def_paths = database
+            .def_paths
+            .get(&duplicate_owner.def_id.package())
+            .expect("package definition paths are available");
+        let duplicate_ids = def_paths
+            .intern_generic_params(
+                duplicate_owner.def_id,
+                &[(duplicate_name, false, 0), (duplicate_name, true, 0)],
+            )
+            .expect("duplicate parameters retain distinct definition identities");
+        assert_eq!(duplicate.paths().len(), 1);
+        assert_eq!(
+            duplicate.paths().values().next().map(|path| path.base),
+            Some(Res::Def(DefKind::TyParam, duplicate_ids[0].to_def_id())),
+            "the earliest generic binding wins recovery, including across parameter kinds"
+        );
+        assert!(
+            results.owners()[6]
+                .lowering_diagnostics()
+                .iter()
+                .all(|diagnostic| { diagnostic.code != sai_diagnostics::Code::DuplicateBinding }),
+            "duplicate generic diagnostics remain the responsibility of later semantic validation"
+        );
+
+        let mut wrong_kind_collection = ordinary_collection.clone();
+        let root_scope = &mut wrong_kind_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let wrong_kind = Res::Def(DefKind::Effect, fake_type_def);
+        root_scope.scope.get_mut(&fixture_type).unwrap().res = wrong_kind;
+        let import_index = match root_scope
+            .scope
+            .get(&fixture_type)
+            .expect("item import remains in scope")
+            .origin
+        {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("fixture type remains an import"),
+        };
+        root_scope.imports[import_index.0 as usize].res = wrong_kind;
+        let wrong_kind_results = database
+            .resolve_type_owner_paths(&wrong_kind_collection, &module_tree, &snapshot)
+            .expect("known wrong-kind bindings remain available to later checking");
+        assert!(
+            wrong_kind_results.owners()[1]
+                .path_resolution()
+                .expect("record wrong-kind paths resolve")
+                .paths()
+                .values()
+                .any(|path| path.base == wrong_kind),
+            "module bindings retain known wrong-kind entities for the later type checker"
+        );
+        assert_eq!(
+            wrong_kind_results.owners()[3]
+                .path_resolution()
+                .expect("resource wrong-kind paths resolve")
+                .paths()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [PathRes {
+                base: wrong_kind,
+                resolved_segments: 1,
+                segment_count: 1,
+            }]
         );
     }
 
