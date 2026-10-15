@@ -230,7 +230,7 @@ pub fn lower_function_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -331,7 +331,7 @@ pub fn lower_alias_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -443,7 +443,7 @@ pub fn lower_refined_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -578,7 +578,7 @@ pub fn lower_distinct_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -687,7 +687,7 @@ pub fn lower_struct_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -769,7 +769,7 @@ pub fn lower_resource_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -944,7 +944,7 @@ pub fn lower_enum_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -1099,7 +1099,7 @@ pub fn lower_derived_impl_owners<'hir>(
         {
             return Err(HirLoweringError::ItemTreeEntryMismatch);
         }
-        let diagnostics = source_map.diagnostics().to_vec();
+        let diagnostics = source_map.diagnostics(context.snapshot)?;
         owners.push((
             HirOwner {
                 id: owner_id,
@@ -1219,7 +1219,7 @@ pub fn lower_trait_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -1303,7 +1303,7 @@ pub fn lower_interface_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -1387,7 +1387,7 @@ pub fn lower_world_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -1467,7 +1467,7 @@ pub fn lower_extern_block_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -1652,7 +1652,7 @@ pub fn lower_extern_item_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -1941,7 +1941,7 @@ pub fn lower_world_item_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -2476,7 +2476,7 @@ pub fn lower_interface_item_owner<'hir>(
                 span,
             });
             let source_map = source_map.finish();
-            let diagnostics = source_map.diagnostics().to_vec();
+            let diagnostics = source_map.diagnostics(context.snapshot)?;
             return Ok((
                 HirOwner {
                     id: owner,
@@ -2513,7 +2513,7 @@ pub fn lower_interface_item_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -2815,7 +2815,7 @@ pub fn lower_interface_resource_member_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -2998,7 +2998,7 @@ pub fn lower_impl_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -3215,7 +3215,7 @@ pub fn lower_trait_item_owner<'hir>(
                 span,
             });
             let source_map = source_map.finish();
-            let diagnostics = source_map.diagnostics().to_vec();
+            let diagnostics = source_map.diagnostics(context.snapshot)?;
             Ok((
                 HirOwner {
                     id: owner,
@@ -3258,7 +3258,7 @@ pub fn lower_trait_item_owner<'hir>(
                 span,
             });
             let source_map = source_map.finish();
-            let diagnostics = source_map.diagnostics().to_vec();
+            let diagnostics = source_map.diagnostics(context.snapshot)?;
             Ok((
                 HirOwner {
                     id: owner,
@@ -3481,7 +3481,7 @@ pub fn lower_impl_item_owner<'hir>(
                 span,
             });
             let source_map = source_map.finish();
-            let diagnostics = source_map.diagnostics().to_vec();
+            let diagnostics = source_map.diagnostics(context.snapshot)?;
             Ok((
                 HirOwner {
                     id: owner,
@@ -3525,7 +3525,7 @@ pub fn lower_impl_item_owner<'hir>(
                 span,
             });
             let source_map = source_map.finish();
-            let diagnostics = source_map.diagnostics().to_vec();
+            let diagnostics = source_map.diagnostics(context.snapshot)?;
             Ok((
                 HirOwner {
                     id: owner,
@@ -3632,7 +3632,7 @@ pub fn lower_const_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -3743,7 +3743,7 @@ pub fn lower_invariant_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -3843,7 +3843,7 @@ pub fn lower_test_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -3973,7 +3973,7 @@ pub fn lower_property_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -4046,7 +4046,7 @@ pub fn lower_effect_owner<'hir>(
         span,
     });
     let source_map = source_map.finish();
-    let diagnostics = source_map.diagnostics().to_vec();
+    let diagnostics = source_map.diagnostics(context.snapshot)?;
     Ok((
         HirOwner {
             id: owner,
@@ -13143,7 +13143,13 @@ mod tests {
             ExprKind::Call { args, .. }
                 if args.first().is_some_and(|arg| arg.expr.kind == ExprKind::Err)
         ));
-        assert!(source_map.finish().diagnostics().is_empty());
+        assert!(
+            source_map
+                .finish()
+                .diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -13623,7 +13629,13 @@ mod tests {
             source_map.syntax_for_binding(item_binding).unwrap().kind(),
             SyntaxKind::BINDING_PAT
         );
-        assert_eq!(source_map.diagnostics().len(), 0);
+        assert_eq!(
+            source_map
+                .diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -13844,7 +13856,13 @@ mod tests {
             source_map.syntax_for_node(outer_scrutinee.hir_id),
             Some(&iterable_ptr)
         );
-        assert_eq!(source_map.diagnostics().len(), 0);
+        assert_eq!(
+            source_map
+                .diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -14206,7 +14224,13 @@ mod tests {
             panic!("the second statement is an unannotated let");
         };
         assert_eq!(init.kind, ExprKind::Err);
-        assert!(source_map.finish().diagnostics().is_empty());
+        assert!(
+            source_map
+                .finish()
+                .diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -14438,7 +14462,13 @@ mod tests {
                 if symbols.resolve(text).unwrap().as_ref() == "message"
         ));
         assert_eq!(symbols.resolve(cond_text).unwrap().as_ref(), "");
-        assert!(source_map.finish().diagnostics().is_empty());
+        assert!(
+            source_map
+                .finish()
+                .diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -14999,7 +15029,12 @@ mod tests {
                 .text_range()
         );
         let source_map = source_map.finish();
-        assert!(source_map.diagnostics().is_empty());
+        assert!(
+            source_map
+                .diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -16136,7 +16171,9 @@ mod tests {
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 19);
         assert!(
-            map.diagnostics().is_empty(),
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty(),
             "the parser's INVALID_TUPLE_INDEX diagnostic remains authoritative"
         );
     }
@@ -16451,7 +16488,11 @@ mod tests {
             .expect("parser-recovered range lowers");
         assert_eq!(lowered.kind, ExprKind::Err);
         let map = source_map.finish();
-        assert!(map.diagnostics().is_empty());
+        assert!(
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
         assert_eq!(map.node_to_syntax().len(), 2);
     }
 
@@ -16500,7 +16541,13 @@ mod tests {
             }
         ));
         assert!(matches!(end.kind, ExprKind::Path(_)));
-        assert!(source_map.finish().diagnostics().is_empty());
+        assert!(
+            source_map
+                .finish()
+                .diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -16572,7 +16619,11 @@ mod tests {
         );
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 29);
-        assert!(map.diagnostics().is_empty());
+        assert!(
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -16627,7 +16678,11 @@ mod tests {
         assert_eq!(lowered.kind, ExprKind::Err);
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 2);
-        assert!(map.diagnostics().is_empty());
+        assert!(
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -16820,7 +16875,11 @@ mod tests {
         assert_eq!(lowered.kind, ExprKind::Err);
         let map = source_map.finish();
         assert_eq!(map.node_to_syntax().len(), 2);
-        assert!(map.diagnostics().is_empty());
+        assert!(
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -16887,7 +16946,11 @@ mod tests {
             .expect("recovered argument syntax resolves");
         assert_eq!(error_syntax.kind(), SyntaxKind::ERROR);
         assert!(error_syntax.text_range().is_empty());
-        assert!(map.diagnostics().is_empty());
+        assert!(
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
+                .is_empty()
+        );
 
         let file = crate::FileId::new(92);
         let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() { call(@inline 1) }\n");
@@ -17821,8 +17884,9 @@ mod tests {
         let map = source_map.finish();
         assert_eq!(map.binding_to_syntax().len(), 9);
         let duplicate_diagnostics = map
-            .diagnostics()
-            .iter()
+            .diagnostics(&snapshot)
+            .expect("diagnostics bind")
+            .into_iter()
             .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
             .collect::<Vec<_>>();
         assert_eq!(duplicate_diagnostics.len(), 1);
@@ -17846,8 +17910,9 @@ mod tests {
         );
 
         let mismatch_diagnostics = map
-            .diagnostics()
-            .iter()
+            .diagnostics(&snapshot)
+            .expect("diagnostics bind")
+            .into_iter()
             .filter(|diagnostic| diagnostic.code == Code::OrPatternBindingMismatch)
             .collect::<Vec<_>>();
         assert_eq!(mismatch_diagnostics.len(), 2);
@@ -17943,7 +18008,8 @@ mod tests {
 
         let map = source_map.finish();
         assert_eq!(
-            map.diagnostics()
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
                 .iter()
                 .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
                 .count(),
@@ -17997,8 +18063,9 @@ mod tests {
 
         let map = source_map.finish();
         let duplicate_diagnostics = map
-            .diagnostics()
-            .iter()
+            .diagnostics(&snapshot)
+            .expect("diagnostics bind")
+            .into_iter()
             .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
             .collect::<Vec<_>>();
         assert_eq!(duplicate_diagnostics.len(), 1);
@@ -18024,7 +18091,8 @@ mod tests {
             assert_eq!(pointer, &expected);
         }
         assert_eq!(
-            map.diagnostics()
+            map.diagnostics(&snapshot)
+                .expect("diagnostics bind")
                 .iter()
                 .filter(|diagnostic| diagnostic.code == Code::OrPatternBindingMismatch)
                 .count(),
@@ -24833,7 +24901,12 @@ mod tests {
                     .zip(expected_traits.iter().zip(&attrs.derives))
             {
                 assert_eq!(source_map.owner(), derived_owner.id);
-                assert!(source_map.diagnostics().is_empty());
+                assert!(
+                    source_map
+                        .diagnostics(&snapshot)
+                        .expect("diagnostics bind")
+                        .is_empty()
+                );
                 assert!(derived_owner.body.is_none());
                 assert!(derived_owner.raw_attrs.is_empty());
                 let OwnerNode::DerivedImpl(derived) = derived_owner.node else {

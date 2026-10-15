@@ -167,6 +167,18 @@ impl SyntaxNodePtr {
         self.range
     }
 
+    /// Whether two pointers identify the same node within identical source.
+    ///
+    /// Unlike derived pointer equality, this ignores the red-root identity. Callers must
+    /// first establish that both pointers refer to the same unchanged source
+    /// file.
+    pub fn is_same_source_node(&self, other: &Self) -> bool {
+        self.file == other.file
+            && self.node_index == other.node_index
+            && self.kind == other.kind
+            && self.range == other.range
+    }
+
     pub fn resolve(&self, file: FileId, root: &SyntaxNode) -> Option<SyntaxNode> {
         if file != self.file
             || !self.identity.belongs_to_file(file)
@@ -175,6 +187,19 @@ impl SyntaxNodePtr {
             return None;
         }
 
+        self.resolve_by_shape(file, root)
+    }
+
+    /// Rebuilds this pointer against another red root for the same unchanged
+    /// source file. The node index, kind, and range must still match.
+    pub fn rebind(&self, file: FileId, root: &SyntaxNode) -> Option<Self> {
+        Self::new(file, &self.resolve_by_shape(file, root)?).ok()
+    }
+
+    fn resolve_by_shape(&self, file: FileId, root: &SyntaxNode) -> Option<SyntaxNode> {
+        if file != self.file || !self.identity.belongs_to_file(file) {
+            return None;
+        }
         let data = root
             .1
             .index

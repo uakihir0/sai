@@ -1534,6 +1534,47 @@ impl Diagnostic {
             package: self.package.clone(),
         })
     }
+
+    /// Converts a diagnostic validated for the supplied snapshot and file
+    /// into a snapshot-independent template.
+    ///
+    /// Unlike [`Self::to_template`], this accepts the diagnostic's workspace
+    /// binding because that binding is validated here and deliberately
+    /// discarded. Every explicit location must belong to `file_id` and
+    /// `source_ref`; contextual state that needs broader snapshot provenance
+    /// remains unsupported.
+    pub fn to_template_for_file(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        file_id: FileId,
+        source_ref: &SourceRef,
+    ) -> Result<DiagnosticTemplate, DiagnosticTemplateError> {
+        self.clone()
+            .with_workspace_snapshot(snapshot)
+            .map_err(|_| DiagnosticTemplateError::ContextualState)?;
+
+        let location_matches_file = |location: Option<&Location>| {
+            location.is_none_or(|location| {
+                location.span.file == file_id && location.file == *source_ref
+            })
+        };
+        if !location_matches_file(self.primary.as_ref())
+            || !self
+                .labels
+                .iter()
+                .all(|label| location_matches_file(Some(&label.location)))
+            || !self
+                .children
+                .iter()
+                .all(|child| location_matches_file(child.location.as_ref()))
+        {
+            return Err(DiagnosticTemplateError::MixedSource);
+        }
+
+        let mut source_independent = self.clone();
+        source_independent.workspace_snapshot = None;
+        source_independent.to_template()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

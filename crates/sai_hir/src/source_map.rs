@@ -2,7 +2,9 @@ use crate::{
     BindingId, DefPathInterner, FileId, HirId, IndexVec, IndexVecError, ItemLocalId, LocalDefId,
     OwnerId, Span, SpanCtxt,
 };
-use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Span as DiagnosticSpan};
+use sai_diagnostics::{
+    Code, Diagnostic, DiagnosticTemplate, Location, Severity, SourceRef, Span as DiagnosticSpan,
+};
 use sai_syntax::{SyntaxNode, SyntaxNodePtr, SyntaxNodePtrError, ast::AstIdMap};
 use sai_vfs::WorkspaceSnapshot;
 use std::collections::HashMap;
@@ -41,7 +43,7 @@ pub struct HirSourceMap {
     node_to_syntax: IndexVec<ItemLocalId, SyntaxNodePtr>,
     syntax_to_nodes: HashMap<SyntaxNodePtr, Vec<ItemLocalId>>,
     binding_to_syntax: IndexVec<BindingId, SyntaxNodePtr>,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<SourceMapDiagnostic>,
 }
 
 impl HirSourceMap {
@@ -76,6 +78,44 @@ impl HirSourceMap {
         self.owner == body.owner && self.source_id == body.source_id
     }
 
+    /// Rebuilds a stored syntax pointer against the current red root when the
+    /// source file is unchanged.
+    pub fn rebind_syntax_pointer(
+        &self,
+        pointer: &SyntaxNodePtr,
+        ast_ids: &AstIdMap,
+        snapshot: &WorkspaceSnapshot,
+        root: &SyntaxNode,
+    ) -> Result<Option<SyntaxNodePtr>, HirSourceMapError> {
+        if !self.matches_snapshot_file(snapshot) {
+            return Err(HirSourceMapError::SourceTextNotValidForSnapshot);
+        }
+        if !ast_ids.matches_snapshot(snapshot) {
+            return Err(HirSourceMapError::WorkspaceSnapshotMismatch);
+        }
+        if !ast_ids.matches_root(self.file, root) {
+            return Err(HirSourceMapError::AstIdMapMismatch);
+        }
+        if pointer.file() != self.file {
+            return Err(HirSourceMapError::SyntaxFileMismatch);
+        }
+        if !self
+            .node_to_syntax
+            .iter_enumerated()
+            .map(|(_, stored)| stored)
+            .chain(
+                self.binding_to_syntax
+                    .iter_enumerated()
+                    .map(|(_, stored)| stored),
+            )
+            .chain(self.syntax_to_nodes.keys())
+            .any(|stored| stored == pointer)
+        {
+            return Err(HirSourceMapError::SyntaxPointerNotInSourceMap);
+        }
+        Ok(pointer.rebind(self.file, root))
+    }
+
     pub fn node_to_syntax(&self) -> &IndexVec<ItemLocalId, SyntaxNodePtr> {
         &self.node_to_syntax
     }
@@ -88,8 +128,33 @@ impl HirSourceMap {
         &self.binding_to_syntax
     }
 
-    pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
+    /// Binds source-local diagnostics to the snapshot that consumes this map.
+    ///
+    /// Snapshot-independent diagnostics can be rebound when the owner's file
+    /// is unchanged, even if another workspace file changed. Diagnostics that
+    /// carry broader contextual state retain their original snapshot binding
+    /// and cannot be reused across snapshots.
+    pub fn diagnostics(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<Diagnostic>, HirSourceMapError> {
+        if !self.matches_snapshot_file(snapshot) {
+            return Err(HirSourceMapError::SourceTextNotValidForSnapshot);
+        }
+        self.diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let diagnostic = match diagnostic {
+                    SourceMapDiagnostic::Template(template) => template
+                        .bind(self.file, self.source_ref.clone())
+                        .with_workspace_snapshot(snapshot),
+                    SourceMapDiagnostic::SnapshotBound(diagnostic) => {
+                        diagnostic.clone().with_workspace_snapshot(snapshot)
+                    }
+                };
+                diagnostic.map_err(|_| HirSourceMapError::DiagnosticNotValidForSnapshot)
+            })
+            .collect()
     }
 
     pub fn syntax_for_node(&self, id: HirId) -> Option<&SyntaxNodePtr> {
@@ -110,15 +175,48 @@ impl HirSourceMap {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceMapDiagnostic {
+    Template(DiagnosticTemplate),
+    SnapshotBound(Diagnostic),
+}
+
+fn same_pointer_index_vec<I: sai_intern::Idx>(
+    left: &IndexVec<I, SyntaxNodePtr>,
+    right: &IndexVec<I, SyntaxNodePtr>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter_enumerated().zip(right.iter_enumerated()).all(
+            |((left_id, left), (right_id, right))| {
+                left_id == right_id && left.is_same_source_node(right)
+            },
+        )
+}
+
+fn same_syntax_to_nodes(
+    left: &HashMap<SyntaxNodePtr, Vec<ItemLocalId>>,
+    right: &HashMap<SyntaxNodePtr, Vec<ItemLocalId>>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(left_pointer, left_nodes)| {
+            right.iter().any(|(right_pointer, right_nodes)| {
+                left_pointer.is_same_source_node(right_pointer) && left_nodes == right_nodes
+            })
+        })
+}
+
+// Source maps represent file-local syntax relationships, so equality ignores
+// red-root identities only after owner-file provenance and bytes match. A
+// caller that needs current syntax nodes must use `rebind_syntax_pointer`.
 impl PartialEq for HirSourceMap {
     fn eq(&self, other: &Self) -> bool {
         self.owner == other.owner
             && self.file == other.file
             && self.source_ref == other.source_ref
             && self.source_bytes == other.source_bytes
-            && self.node_to_syntax == other.node_to_syntax
-            && self.syntax_to_nodes == other.syntax_to_nodes
-            && self.binding_to_syntax == other.binding_to_syntax
+            && same_pointer_index_vec(&self.node_to_syntax, &other.node_to_syntax)
+            && same_syntax_to_nodes(&self.syntax_to_nodes, &other.syntax_to_nodes)
+            && same_pointer_index_vec(&self.binding_to_syntax, &other.binding_to_syntax)
             && self.diagnostics == other.diagnostics
     }
 }
@@ -142,7 +240,7 @@ pub struct HirSourceMapBuilder<'root> {
     syntax_to_nodes: HashMap<SyntaxNodePtr, Vec<ItemLocalId>>,
     binding_to_syntax: IndexVec<BindingId, SyntaxNodePtr>,
     binding_ids_by_syntax: HashMap<SyntaxNodePtr, BindingId>,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<SourceMapDiagnostic>,
 }
 
 impl<'root> HirSourceMapBuilder<'root> {
@@ -401,7 +499,12 @@ impl<'root> HirSourceMapBuilder<'root> {
         let diagnostic = diagnostic
             .with_workspace_snapshot(&self.snapshot)
             .map_err(|_| HirSourceMapError::DiagnosticNotValidForSnapshot)?;
-        self.diagnostics.push(diagnostic);
+        let stored =
+            match diagnostic.to_template_for_file(&self.snapshot, self.file, &self.source_ref) {
+                Ok(template) => SourceMapDiagnostic::Template(template),
+                Err(_) => SourceMapDiagnostic::SnapshotBound(diagnostic),
+            };
+        self.diagnostics.push(stored);
         Ok(())
     }
 
@@ -459,6 +562,7 @@ pub enum HirSourceMapError {
     SourceTextNotValidForSnapshot,
     UnknownBindingAlias,
     NestedDefinitionIdMismatch,
+    SyntaxPointerNotInSourceMap,
     SyntaxFileMismatch,
     SyntaxTreeMismatch,
     TooManyNodes,
@@ -562,9 +666,12 @@ mod tests {
             map.syntax_for_binding(binding).unwrap().kind(),
             SyntaxKind::NAME
         );
-        assert_eq!(map.diagnostics().len(), 1);
+        let diagnostics = map
+            .diagnostics(&snapshot)
+            .expect("diagnostics bind to the current snapshot");
+        assert_eq!(diagnostics.len(), 1);
         assert!(
-            map.diagnostics()[0]
+            diagnostics[0]
                 .clone()
                 .with_workspace_snapshot(&snapshot)
                 .is_ok()
@@ -601,6 +708,208 @@ mod tests {
                 local_id: first.local_id,
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn source_map_rebinds_local_diagnostics_after_unrelated_file_changes() {
+        let file = crate::FileId::new(54);
+        let unrelated_file = crate::FileId::new(55);
+        let owner_source =
+            Arc::new(SourceFile::new(file, "fn f() {}\n", false).expect("valid owner source"));
+        let make_snapshot = |unrelated_text: &str, document_version| {
+            let unrelated_source = Arc::new(
+                SourceFile::new(unrelated_file, unrelated_text, false)
+                    .expect("valid unrelated source"),
+            );
+            WorkspaceSnapshot::new([
+                SnapshotFile::new(Arc::clone(&owner_source), "src/lib.sai", None, Some(1)),
+                SnapshotFile::new(
+                    unrelated_source,
+                    "src/other.sai",
+                    None,
+                    Some(document_version),
+                ),
+            ])
+            .expect("valid workspace snapshot")
+        };
+        let owner = owner_id("f");
+        let build_source_map = |snapshot: &WorkspaceSnapshot| {
+            let parsed = sai_syntax::parse(snapshot, file).expect("parse succeeds");
+            let ast_ids = AstIdMap::new(file, &parsed.root).expect("AST IDs");
+            let function = function_node(&parsed.root);
+            let mut builder =
+                HirSourceMapBuilder::new(owner, &ast_ids, snapshot, &parsed.root, &function)
+                    .expect("builder");
+            builder.add_node(&function).expect("owner node is recorded");
+            builder
+                .push_error_diagnostic_for_node(Code::ExpectedToken, "local diagnostic", &function)
+                .expect("diagnostic belongs to the owner file");
+            (builder.finish(), ast_ids, parsed)
+        };
+
+        let first_snapshot = make_snapshot("fn first() {}\n", 1);
+        let second_snapshot = make_snapshot("fn second() {}\n", 2);
+        let (first_map, _, _) = build_source_map(&first_snapshot);
+        let (second_map, second_ast_ids, second_parse) = build_source_map(&second_snapshot);
+        assert!(first_map.matches_snapshot_file(&second_snapshot));
+        assert!(same_pointer_index_vec(
+            &first_map.node_to_syntax,
+            &second_map.node_to_syntax
+        ));
+        assert!(same_syntax_to_nodes(
+            &first_map.syntax_to_nodes,
+            &second_map.syntax_to_nodes
+        ));
+        assert!(first_map.diagnostics == second_map.diagnostics);
+        assert!(same_pointer_index_vec(
+            &first_map.binding_to_syntax,
+            &second_map.binding_to_syntax
+        ));
+        assert_eq!(first_map.owner, second_map.owner);
+        assert_eq!(first_map.file, second_map.file);
+        assert_eq!(first_map.source_ref, second_map.source_ref);
+        assert_eq!(first_map.source_bytes, second_map.source_bytes);
+        assert_eq!(first_map, second_map);
+        let original_pointer = first_map
+            .node_to_syntax()
+            .get(ItemLocalId::default())
+            .expect("source map has its owner pointer");
+        let rebound_pointer = first_map
+            .rebind_syntax_pointer(
+                original_pointer,
+                &second_ast_ids,
+                &second_snapshot,
+                &second_parse.root,
+            )
+            .expect("source pointer can be rebound")
+            .expect("source pointer identifies a node in the current root");
+        assert!(rebound_pointer.resolve(file, &second_parse.root).is_some());
+
+        let rebound = first_map
+            .diagnostics(&second_snapshot)
+            .expect("local diagnostics rebind to the current snapshot");
+        assert_eq!(rebound.len(), 1);
+        assert!(
+            rebound[0]
+                .clone()
+                .with_workspace_snapshot(&second_snapshot)
+                .is_ok()
+        );
+
+        let changed_owner = Arc::new(
+            SourceFile::new(file, "fn f() { true }\n", false).expect("valid owner source"),
+        );
+        let changed_snapshot = WorkspaceSnapshot::new([
+            SnapshotFile::new(changed_owner, "src/lib.sai", None, Some(2)),
+            SnapshotFile::new(
+                Arc::new(
+                    SourceFile::new(unrelated_file, "fn second() {}\n", false)
+                        .expect("valid unrelated source"),
+                ),
+                "src/other.sai",
+                None,
+                Some(2),
+            ),
+        ])
+        .expect("valid changed workspace snapshot");
+        assert_eq!(
+            first_map.diagnostics(&changed_snapshot),
+            Err(HirSourceMapError::SourceTextNotValidForSnapshot)
+        );
+    }
+
+    #[test]
+    fn source_map_rejects_foreign_pointer_before_rebinding() {
+        let file = crate::FileId::new(58);
+        let (snapshot, parsed, ast_ids) = parse_file(file, "fn f() {}\n");
+        let function = function_node(&parsed.root);
+        let owner = owner_id("f");
+        let mut builder =
+            HirSourceMapBuilder::new(owner, &ast_ids, &snapshot, &parsed.root, &function)
+                .expect("builder");
+        builder.add_node(&function).expect("owner node is recorded");
+        let map = builder.finish();
+
+        let (_, foreign_parse, _) = parse_file(file, "fn g() {}\n");
+        let foreign_function = function_node(&foreign_parse.root);
+        let foreign_pointer =
+            SyntaxNodePtr::new(file, &foreign_function).expect("foreign pointer is valid");
+        let stored_pointer = map
+            .node_to_syntax()
+            .get(ItemLocalId::default())
+            .expect("source map has its owner pointer");
+        assert!(
+            foreign_pointer.is_same_source_node(stored_pointer),
+            "the collision must exercise equal node shape across unrelated roots"
+        );
+
+        assert_eq!(
+            map.rebind_syntax_pointer(&foreign_pointer, &ast_ids, &snapshot, &parsed.root),
+            Err(HirSourceMapError::SyntaxPointerNotInSourceMap)
+        );
+    }
+
+    #[test]
+    fn source_map_keeps_contextual_diagnostics_bound_to_their_snapshot() {
+        let file = crate::FileId::new(56);
+        let unrelated_file = crate::FileId::new(57);
+        let owner_source =
+            Arc::new(SourceFile::new(file, "fn f() {}\n", false).expect("valid owner source"));
+        let make_snapshot = |unrelated_text: &str, document_version| {
+            WorkspaceSnapshot::new([
+                SnapshotFile::new(Arc::clone(&owner_source), "src/lib.sai", None, Some(1)),
+                SnapshotFile::new(
+                    Arc::new(
+                        SourceFile::new(unrelated_file, unrelated_text, false)
+                            .expect("valid unrelated source"),
+                    ),
+                    "src/other.sai",
+                    None,
+                    Some(document_version),
+                ),
+            ])
+            .expect("valid workspace snapshot")
+        };
+        let owner = owner_id("f");
+        let build_source_map = |snapshot: &WorkspaceSnapshot| {
+            let parsed = sai_syntax::parse(snapshot, file).expect("parse succeeds");
+            let ast_ids = AstIdMap::new(file, &parsed.root).expect("AST IDs");
+            let function = function_node(&parsed.root);
+            let mut builder =
+                HirSourceMapBuilder::new(owner, &ast_ids, snapshot, &parsed.root, &function)
+                    .expect("builder");
+            let diagnostic = Diagnostic::new(
+                Code::ExpectedToken,
+                Severity::Error,
+                "contextual diagnostic",
+                None,
+            )
+            .with_cause(sai_diagnostics::CauseKey::new([
+                sai_diagnostics::PoisonFact::ErrorType("cause".to_owned()),
+            ]))
+            .expect("diagnostic cause is valid");
+            builder
+                .push_diagnostic(diagnostic)
+                .expect("diagnostic belongs to its source map snapshot");
+            builder.finish()
+        };
+
+        let first_snapshot = make_snapshot("fn first() {}\n", 1);
+        let second_snapshot = make_snapshot("fn second() {}\n", 2);
+        let first_map = build_source_map(&first_snapshot);
+        let second_map = build_source_map(&second_snapshot);
+        assert_ne!(first_map, second_map);
+        assert_eq!(
+            first_map
+                .diagnostics(&first_snapshot)
+                .expect("diagnostics remain valid for their own snapshot")
+                .len(),
+            1
+        );
+        assert_eq!(
+            first_map.diagnostics(&second_snapshot),
+            Err(HirSourceMapError::DiagnosticNotValidForSnapshot)
         );
     }
 
