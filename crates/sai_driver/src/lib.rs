@@ -6589,8 +6589,8 @@ impl RootDatabase {
     }
 
     /// Resolves lexical locals and one-segment module paths in top-level
-    /// constant initializers, plus type-path heads in the declared type and
-    /// initializer body, including test-only reference diagnostics.
+    /// constant initializers, plus qualified local type paths in the declared
+    /// type and initializer body, including test-only reference diagnostics.
     ///
     /// This uncached bridge uses the exact current lowering and source map for
     /// each target-filtered owner. Constant-expression legality and final
@@ -6608,6 +6608,8 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = collection
             .scopes
@@ -6740,9 +6742,9 @@ impl RootDatabase {
                                     primitive_prelude,
                                     &rejected_type_paths,
                                     module_scope,
-                                    None,
+                                    Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    None,
+                                    Some(&source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -12335,9 +12337,17 @@ mod tests {
             "const PRIMITIVE: U32 = 0\n",
             "const DEFERRED: Option<U32> = 0\n",
             "const QUALIFIED: child_alias.Widget = 0\n",
+            "const NESTED: child_alias.api.Request.Associated = 0\n",
+            "const MISSING: child_alias.MissingType = 0\n",
             "const BODY: Bool = { let local: U32 = 0; true }\n",
         );
-        let child = "pub fn child_fn() {}\n";
+        let child = concat!(
+            "pub type Widget = U32\n",
+            "pub interface api {\n",
+            "  type Request = U32\n",
+            "}\n",
+            "pub fn child_fn() {}\n",
+        );
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(root.as_bytes(), child.as_bytes());
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -12363,13 +12373,45 @@ mod tests {
                 .unwrap_or_else(|| panic!("module scope contains `{name}`"))
         };
         let array = binding_for("Array");
-        let child_alias = binding_for("child_alias");
         let value = binding_for("VALUE");
+        let child_module_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let widget_binding = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget alias is declared");
+        let api_name = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let request_name = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let request_binding = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (child_module_scope
+                    .members
+                    .get(&api_name)
+                    .is_some_and(|binding| binding.res == Res::Def(DefKind::Interface, *def_id)))
+                .then(|| interface.members.get(&request_name))
+                .flatten()
+            })
+            .expect("interface api declares Request");
 
         let resolved = database
             .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
             .expect("const owners resolve type path heads");
-        assert_eq!(resolved.owners().len(), 6);
+        assert_eq!(resolved.owners().len(), 8);
 
         let module_type = resolved.owners()[1]
             .type_path_resolution()
@@ -12436,12 +12478,68 @@ mod tests {
             .expect("const has a type path result");
         assert!(
             qualified.paths().values().any(|path| {
-                path.base == child_alias && path.resolved_segments == 1 && path.segment_count == 2
+                path.base == widget_binding.res
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2
             }),
-            "qualified const types resolve only the module head"
+            "qualified const types resolve through a local module's type member"
         );
 
-        let body = resolved.owners()[5]
+        let nested = resolved.owners()[5]
+            .type_path_resolution()
+            .expect("nested qualified const type lookup succeeds")
+            .expect("nested const has a type path result");
+        assert!(
+            nested.paths().values().any(|path| {
+                path.base == request_binding.res
+                    && path.resolved_segments == 3
+                    && path.segment_count == 4
+            }),
+            "module-to-interface traversal stops at the first type member"
+        );
+
+        let missing = resolved.owners()[6]
+            .type_path_resolution()
+            .expect("missing qualified const type lookup succeeds")
+            .expect("missing const has a type path result");
+        assert_eq!(missing.module_path_errors().len(), 1);
+        let missing_offset = root
+            .find("child_alias.MissingType")
+            .expect("missing type member path exists");
+        let missing_error = &missing.module_path_errors()[0];
+        let (missing_name, missing_segment, missing_span) = match missing_error.error() {
+            ModulePathError::MissingMember {
+                name,
+                segment_index,
+                span,
+                ..
+            } => (name, segment_index, span),
+            error => panic!("expected a missing-member error, got {error:?}"),
+        };
+        assert!(
+            database
+                .resolve_symbol(missing_name)
+                .is_ok_and(|name| name.as_ref() == "MissingType")
+        );
+        assert_eq!(missing_segment, 0);
+        let missing_start = missing_offset + "child_alias.".len();
+        assert_eq!(missing_span.file, module_tree.modules[0].file);
+        assert_eq!(missing_span.range.start().to_usize(), missing_start);
+        assert_eq!(
+            missing_span.range.end().to_usize(),
+            missing_start + "MissingType".len()
+        );
+        assert_eq!(
+            missing.paths().get(&missing_error.hir_id()),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            }),
+            "a missing local member records an error through that exact path segment"
+        );
+
+        let body = resolved.owners()[7]
             .type_path_resolution()
             .expect("initializer body type lookup succeeds")
             .expect("const has a type path result");
@@ -12968,6 +13066,23 @@ mod tests {
                 segment_count: 2,
             }),
             "the test-only module head is rejected while its qualified tail stays deferred"
+        );
+        let qualified_type_paths = qualified
+            .type_path_resolution()
+            .expect("ordinary qualified const type lookup succeeds")
+            .expect("qualified const has an ordinary type path result");
+        assert_eq!(
+            qualified_type_paths
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "a rejected test-only module head remains an error"
+        );
+        assert!(
+            qualified_type_paths.module_path_errors().is_empty(),
+            "a rejected test-only head must not trigger local member lookup"
         );
         let qualified_diagnostics = qualified
             .test_only_diagnostics()
