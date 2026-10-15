@@ -672,7 +672,30 @@ enum RibKind {
 
 The helper takes the borrowed `Body`, its `HirSourceMap`, and the current `WorkspaceSnapshot`. It requires the Body and map to share the lowering-time `HirSourceId`, then checks owner identity and the map's file, path, package, document version, and raw bytes against that snapshot. This prevents an older Body from being paired with a new source map and permits an unchanged owner file to retain its source map when an unrelated workspace file changes. The owned `LocalResolution` records the file provenance, body-source identity, and module-alias set used for resolution; its provenance check takes the current map, snapshot, and aliases and rejects changed inputs without invalidating on unrelated workspace changes. This is an uncached local slice, not the `resolve_owner` query or the complete `ResolvedOwner`: signature/generic paths, chain heads, label results, and composed fallback lookup remain deferred. Duplicate binding recovery keeps the first binding in a rib; the later duplicate receives `DUPLICATE_BINDING`.
 
-**Function-owner driver bridge (IR-518).** `RootDatabase::resolve_function_owner_analyses` now runs the local pass alongside loop-label resolution for each current target-filtered top-level function descriptor. It uses the source map produced by that same lowering and selects aliases from the exact `S(M)` associated with the descriptor's file. A module alias is an imported module/interface binding with no item list; direct interface declarations are excluded. A syntax-known module binding from an unresolved test-only use remains an alias for `SHADOWS_MODULE` even when Phase 1 retains `Res::TestOnly`. Results retain the existing collection, snapshot, and target provenance, and failures remain isolated per function owner. The old label-named adapter remains as a compatibility entry point to the combined result. This integration does not add generic, module, interface, prelude, or test-only reference fallback; a local miss remains available to those later passes.
+**Function-owner driver bridge (IR-518).** `RootDatabase::resolve_function_owner_analyses` now runs the local pass alongside loop-label resolution for each current target-filtered top-level function descriptor. It uses the source map produced by that same lowering and selects aliases from the exact `S(M)` associated with the descriptor's file. A module alias is an imported module/interface binding with no item list; direct interface declarations are excluded. A syntax-known module binding from an unresolved test-only use remains an alias for `SHADOWS_MODULE` even when Phase 1 retains `Res::TestOnly`. Results retain the existing collection, snapshot, and target provenance, and failures remain isolated per function owner. The old label-named adapter remains as a compatibility entry point to the combined result. IR-527 adds test-only reference diagnostics for module-fallback body expressions and non-expression type, effect, and pattern paths in function signatures and bodies; ordinary type, effect, interface, and Prelude fallback remains a later stage.
+
+**Function test-only reference diagnostics (IR-527).** After module lookup, the
+top-level function adapter checks deferred body-expression paths against the
+effective binding origin and diagnoses references to test-only imports. It
+also walks parameter and return types, generic bounds and const parameter
+types, where predicates, nested function-pointer/tuple/borrow types, generic
+type arguments, body type annotations and casts, closure parameter and return
+types, explicit generic type arguments, and constructor/range pattern paths.
+Effect references are checked in function signatures, nested function-pointer
+types, and bounds; built-in effect roots retain their spec/08 precedence over
+module bindings. Type and pattern candidates are checked after function
+generic parameters, while effect lookup does not use generic or local-value
+shadowing. Local value ribs do not shadow types. A qualified path checks its
+first module head and records one resolved segment, leaving the tail to later
+member/effect lookup. Rejected type, effect, and pattern heads are kept in a
+separate `FunctionTestOnlyPathResolution`, not expression
+`ModuleResolution`. Both expression and non-expression references use the
+originating use declaration's complete `PKG_PATH` as a related note, and
+rejected results become `Res::Err` to suppress cascades. Diagnostics are
+owner-scoped and sorted across the signature and body. This remains a partial
+fallback: ordinary type/effect resolution, Prelude lookup, final
+unresolved-name diagnostics, and non-function owner kinds are not handled
+here.
 
 ### 3.4.4 Diagnostics of lookup
 
