@@ -11,7 +11,7 @@ use sai_hir::OwnerId;
 use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
-use sai_hir::items::HirOwner;
+use sai_hir::items::{HirOwner, ItemKind, OwnerNode};
 use sai_hir::lower::{
     ExternItemIds, HirLoweringContext, HirLoweringError, lower_alias_owner, lower_const_owner,
     lower_distinct_owner, lower_effect_owner, lower_enum_owner, lower_extern_block_owner,
@@ -36,12 +36,13 @@ use sai_package::mvs_diagnostics::{
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_resolve::owner::{
-    LabelResolution, LabelResolutionError, LocalResolution, LocalResolutionError,
-    resolve_owner_control_flow, resolve_owner_locals, resolve_predicate_expression,
+    LabelResolution, LabelResolutionError, LocalResolution, LocalResolutionError, ModuleResolution,
+    resolve_owner_control_flow, resolve_owner_locals, resolve_owner_module_paths,
+    resolve_predicate_expression,
 };
 use sai_resolve::package_scopes::{
     BindingOrigin, DefKind, FilteredModule, ForeignPackageScope, PackageScopesError,
-    PackageUseRequirement, RefinementPredicateOwnerKind, Res,
+    PackageUseRequirement, Phase1ModuleScopes, RefinementPredicateOwnerKind, Res,
     collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
     suppress_export_name_feature_gate,
 };
@@ -858,6 +859,7 @@ pub struct FunctionOwnerResolution {
     owner: OwnerId,
     resolution: Result<LabelResolution, FunctionOwnerResolutionError>,
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
+    module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// label resolver's diagnostics so the caller can preserve phase order.
     lowering_diagnostics: Vec<Diagnostic>,
@@ -876,6 +878,16 @@ impl FunctionOwnerResolution {
         &self,
     ) -> Result<Option<&LocalResolution>, &FunctionOwnerResolutionError> {
         self.local_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns module-scope path results for names not resolved as locals or
+    /// generic parameters, plus candidates still deferred for later lookup.
+    pub fn module_resolution(
+        &self,
+    ) -> Result<Option<&ModuleResolution>, &FunctionOwnerResolutionError> {
+        self.module_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
     }
@@ -1257,6 +1269,14 @@ fn module_aliases_for_file(
     module_tree: &ModuleTree,
     file: FileId,
 ) -> Result<HashSet<Symbol>, OwnerControlFlowResolutionError> {
+    module_scope_for_file(collection, module_tree, file).map(module_aliases_for_scope)
+}
+
+fn module_scope_for_file<'a>(
+    collection: &'a Phase1PackageScopesCollection,
+    module_tree: &ModuleTree,
+    file: FileId,
+) -> Result<&'a Phase1ModuleScopes, OwnerControlFlowResolutionError> {
     if collection.scopes.modules.len() != module_tree.modules.len() {
         return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
     }
@@ -1279,7 +1299,11 @@ fn module_aliases_for_file(
         .scopes
         .module(module_id)
         .ok_or(OwnerControlFlowResolutionError::MissingModuleScope(file))?;
-    Ok(module_scope
+    Ok(module_scope)
+}
+
+fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol> {
+    module_scope
         .scope
         .iter()
         .filter_map(|(name, binding)| {
@@ -1300,7 +1324,22 @@ fn module_aliases_for_file(
                 && matches!(binding.res, Res::TestOnly(res_import) if res_import == import_index);
             (is_resolved_module_alias || is_unresolved_test_only_module_alias).then_some(*name)
         })
-        .collect())
+        .collect()
+}
+
+fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
+    let OwnerNode::Item(item) = owner.node else {
+        return HashSet::new();
+    };
+    let ItemKind::Fn { generics, .. } = item.kind else {
+        return HashSet::new();
+    };
+    generics
+        .params
+        .iter()
+        .map(|parameter| parameter.name.sym)
+        .filter(|name| !name.is_error())
+        .collect()
 }
 
 impl From<ParseQueryError> for Phase1CollectionError {
@@ -2781,8 +2820,9 @@ impl RootDatabase {
 
     /// Compatibility entry point for the combined function-owner analysis.
     ///
-    /// The returned label-named result also contains local path resolutions;
-    /// new callers should use [`Self::resolve_function_owner_analyses`].
+    /// The returned label-named result also contains local and one-segment
+    /// module path resolutions; new callers should use
+    /// [`Self::resolve_function_owner_analyses`].
     pub fn resolve_function_owner_labels(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -2792,9 +2832,9 @@ impl RootDatabase {
         self.resolve_function_owner_analyses(collection, module_tree, snapshot)
     }
 
-    /// Resolves loop labels and local paths for each current top-level
-    /// function owner. Module aliases are taken from the exact module scope
-    /// associated with each descriptor's file.
+    /// Resolves loop labels, lexical locals, and one-segment module paths for
+    /// each current top-level function owner. Module scopes and aliases are
+    /// taken from the exact scope associated with each descriptor's file.
     ///
     /// This is an uncached bridge: HIR and source maps remain local to each
     /// iteration, and only owned results and diagnostics are returned.
@@ -2830,6 +2870,7 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
+                                module_resolution: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -2837,11 +2878,16 @@ impl RootDatabase {
                         continue;
                     }
                 };
-            let module_aliases = module_aliases_for_file(collection, module_tree, file);
+            let module_scope = module_scope_for_file(collection, module_tree, file);
+            let module_aliases = module_scope
+                .as_ref()
+                .map(|scope| module_aliases_for_scope(scope))
+                .map_err(Clone::clone);
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
+                let mut module_resolution = None;
                 let resolution = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -2890,8 +2936,8 @@ impl RootDatabase {
                                 &self.symbols,
                             )
                             .map_err(FunctionOwnerLabelResolutionError::Labels);
-                            let locals = match &module_aliases {
-                                Ok(module_aliases) => resolve_owner_locals(
+                            let locals = match (&module_scope, &module_aliases) {
+                                (Ok(_), Ok(module_aliases)) => resolve_owner_locals(
                                     body,
                                     &source_map,
                                     snapshot,
@@ -2899,23 +2945,44 @@ impl RootDatabase {
                                     module_aliases,
                                 )
                                 .map_err(FunctionOwnerLabelResolutionError::Locals),
-                                Err(error) => Err(error.clone()),
+                                (Err(error), _) | (_, Err(error)) => Err(error.clone()),
                             };
-                            local_resolution = Some(locals.map(Some));
+                            match locals {
+                                Ok(locals) => {
+                                    let module_paths = match &module_scope {
+                                        Ok(module_scope) => Ok(resolve_owner_module_paths(
+                                            &locals,
+                                            module_scope,
+                                            &owner_generic_parameters(&hir_owner),
+                                        )),
+                                        Err(error) => Err(error.clone()),
+                                    };
+                                    module_resolution = Some(module_paths.map(Some));
+                                    local_resolution = Some(Ok(Some(locals)));
+                                }
+                                Err(error) => {
+                                    module_resolution = Some(Err(error.clone()));
+                                    local_resolution = Some(Err(error));
+                                }
+                            };
                             labels
                         }
                         None => {
                             local_resolution = Some(Ok(None));
+                            module_resolution = Some(Ok(None));
                             Ok(LabelResolution::default())
                         }
                     }
                 })();
                 let local_resolution =
                     local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let module_resolution =
+                    module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 owners.push(FunctionOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
+                    module_resolution,
                     lowering_diagnostics,
                 });
             }
@@ -4093,6 +4160,236 @@ mod tests {
     }
 
     #[test]
+    fn function_owner_adapter_resolves_module_paths_after_locals_and_generics() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "use acme:phase1/child.{child_fn}\n",
+            "const RootValue: Bool = true\n",
+            "fn helper() {}\n",
+            "fn same_module() { helper }\n",
+            "fn imported() { child_fn }\n",
+            "fn constant() { RootValue }\n",
+            "fn qualified() { child_alias.child_fn() }\n",
+            "fn local(helper: Bool) { helper }\n",
+            "fn generic<RootValue>() { RootValue }\n",
+            "fn unresolved() -> Bool requires { contract_missing } ",
+            "{ not_in_scope + also_missing }\n",
+        );
+        let child = "pub fn child_fn() { RootValue }\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("function module scopes collect");
+
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let binding_for = |name: &str| {
+            root_scope
+                .scope
+                .iter()
+                .find_map(|(symbol, binding)| {
+                    (database.resolve_symbol(*symbol).ok()?.as_ref() == name).then_some(binding.res)
+                })
+                .unwrap_or_else(|| panic!("root module contains `{name}`"))
+        };
+        let helper = binding_for("helper");
+        let imported = binding_for("child_fn");
+        let child_alias = binding_for("child_alias");
+        let root_value = binding_for("RootValue");
+        let root_value_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "RootValue")
+            })
+            .expect("RootValue symbol is in the root module scope");
+
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analysis resolves local and module paths");
+        assert_eq!(resolved.owners().len(), 9);
+        assert_eq!(
+            resolved.owners()[1]
+                .module_resolution()
+                .expect("same-module fallback succeeds")
+                .expect("helper body has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [helper]
+        );
+        assert_eq!(
+            resolved.owners()[2]
+                .module_resolution()
+                .expect("item-import fallback succeeds")
+                .expect("imported body has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [imported]
+        );
+        assert_eq!(
+            resolved.owners()[3]
+                .module_resolution()
+                .expect("constant fallback succeeds")
+                .expect("constant body has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [root_value]
+        );
+        assert_eq!(
+            resolved.owners()[4]
+                .module_resolution()
+                .expect("module-alias fallback succeeds")
+                .expect("qualified body has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [child_alias]
+        );
+        assert!(
+            matches!(helper, Res::Def(DefKind::Fn, _))
+                && matches!(imported, Res::Def(DefKind::Fn, _))
+                && matches!(child_alias, Res::Def(DefKind::Module, _))
+                && matches!(root_value, Res::Def(DefKind::Const, _))
+        );
+
+        let local_owner = &resolved.owners()[5];
+        let local = local_owner
+            .local_resolution()
+            .expect("local lookup succeeds")
+            .expect("local owner has a body");
+        assert!(
+            local
+                .paths
+                .values()
+                .all(|path| matches!(path.base, Res::Local(_)))
+        );
+        assert!(
+            local_owner
+                .module_resolution()
+                .expect("module fallback succeeds")
+                .expect("local owner has a module result")
+                .paths
+                .is_empty(),
+            "a local binding wins before the same-spelled module function"
+        );
+
+        let generic_owner = resolved.owners()[6]
+            .module_resolution()
+            .expect("generic-shadowed module lookup succeeds")
+            .expect("generic owner has a module result");
+        assert!(generic_owner.paths.is_empty());
+        assert!(
+            generic_owner
+                .deferred_paths
+                .iter()
+                .any(|path| path.name == root_value_symbol),
+            "an in-scope generic is left for generic lookup instead of being captured by the constant"
+        );
+
+        let unresolved_owner = resolved.owners()[7]
+            .module_resolution()
+            .expect("module miss remains a successful partial pass")
+            .expect("unresolved owner has a module result");
+        assert!(unresolved_owner.paths.is_empty());
+        let unresolved_names = unresolved_owner
+            .deferred_paths
+            .iter()
+            .map(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .expect("deferred name belongs to this symbol interner")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unresolved_names,
+            [
+                "contract_missing".to_owned(),
+                "not_in_scope".to_owned(),
+                "also_missing".to_owned()
+            ],
+            "contract and body misses remain deferred in source order"
+        );
+
+        let mut errored_scope = root_scope.clone();
+        let diagnosed_candidate = unresolved_owner.deferred_paths[0];
+        errored_scope.scope.insert(
+            diagnosed_candidate.name,
+            sai_resolve::package_scopes::Binding {
+                res: Res::Err,
+                name_span: sai_diagnostics::Span::new(
+                    diagnosed_candidate.span.file,
+                    diagnosed_candidate.span.range,
+                ),
+                origin: BindingOrigin::Decl,
+                visibility: sai_hir::Visibility::Private,
+            },
+        );
+        let local_resolution = resolved.owners()[7]
+            .local_resolution()
+            .expect("local resolution succeeds")
+            .expect("unresolved function has a local result");
+        let error_binding_resolution = resolve_owner_module_paths(
+            local_resolution,
+            &errored_scope,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            error_binding_resolution
+                .paths
+                .get(&diagnosed_candidate.hir_id)
+                .map(|path| path.base),
+            Some(Res::Err),
+            "already-diagnosed module names resolve to the error sentinel"
+        );
+        let remaining_misses = error_binding_resolution
+            .deferred_paths
+            .iter()
+            .map(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .expect("deferred name belongs to this symbol interner")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining_misses,
+            ["not_in_scope".to_owned(), "also_missing".to_owned()]
+        );
+
+        let child_owner = resolved.owners()[8]
+            .module_resolution()
+            .expect("child module lookup succeeds")
+            .expect("child owner has a module result");
+        assert!(child_owner.paths.is_empty());
+        assert_eq!(
+            child_owner.deferred_paths.len(),
+            1,
+            "a name from the root module does not leak into a child module's unqualified scope"
+        );
+        assert_eq!(child_owner.deferred_paths[0].name, root_value_symbol);
+    }
+
+    #[test]
     fn function_owner_adapter_does_not_treat_a_direct_interface_as_a_module_alias() {
         let root = "interface codec {}\nfn run(codec: Bool) { codec }\n";
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -4127,6 +4424,7 @@ mod tests {
         let root = concat!(
             "use acme:test-support/fixtures as client\n",
             "fn run(client: Bool) { client }\n",
+            "fn test_use() { client }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -4166,6 +4464,18 @@ mod tests {
             1,
             "a test-only module alias remains a module alias before test analysis resolves it"
         );
+        assert_eq!(resolved.owners().len(), 2);
+        assert!(matches!(
+            resolved.owners()[1]
+                .module_resolution()
+                .expect("test-only marker resolution succeeds")
+                .expect("test-use body has a module result")
+                .paths
+                .values()
+                .next()
+                .map(|path| path.base),
+            Some(Res::TestOnly(_))
+        ));
     }
 
     #[test]

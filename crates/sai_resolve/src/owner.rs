@@ -21,7 +21,7 @@ use sai_intern::Interner;
 use sai_vfs::{FileId, SourceFile, WorkspaceSnapshot};
 use std::collections::{HashMap, HashSet};
 
-use super::package_scopes::{PathRes, Res};
+use super::package_scopes::{PathRes, Phase1ModuleScopes, Res};
 
 /// The class of a local binding retained for later type and lint analysis.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -43,6 +43,17 @@ pub struct LocalBinding {
     pub kind: BindingKind,
 }
 
+/// An unqualified expression path that missed the lexical-local pass.
+///
+/// Candidates preserve source order and location for generic,
+/// module, prelude, and diagnostic fallback passes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeferredPath {
+    pub hir_id: HirId,
+    pub name: Symbol,
+    pub span: HirSpan,
+}
+
 /// The local portion of path resolution for one HIR owner.
 ///
 /// A missing path is intentionally left for generic, module, and prelude
@@ -56,6 +67,7 @@ pub struct LocalResolution {
     pub paths: HashMap<HirId, PathRes>,
     pub bindings: HashMap<BindingId, LocalBinding>,
     pub diagnostics: Vec<Diagnostic>,
+    pub deferred_paths: Vec<DeferredPath>,
     body_source_id: sai_hir::source_map::HirSourceId,
     module_aliases: HashSet<Symbol>,
 }
@@ -68,6 +80,7 @@ impl PartialEq for LocalResolution {
             && self.paths == other.paths
             && self.bindings == other.bindings
             && self.diagnostics == other.diagnostics
+            && self.deferred_paths == other.deferred_paths
             && self.module_aliases == other.module_aliases
     }
 }
@@ -89,6 +102,7 @@ impl LocalResolution {
             paths: HashMap::new(),
             bindings: HashMap::new(),
             diagnostics: Vec::new(),
+            deferred_paths: Vec::new(),
             body_source_id,
             module_aliases: module_aliases.clone(),
         }
@@ -207,14 +221,19 @@ pub fn resolve_owner_locals(
         )?;
     }
 
-    let mut work = Vec::new();
-    for predicate in body.invariant_preds.iter().rev() {
-        work.push(LocalWork::Expr(predicate));
-    }
-    for contract in body.contracts.iter().rev() {
-        work.push(LocalWork::Expr(contract.expr));
-    }
-    work.push(LocalWork::Expr(body.value));
+    let mut body_roots = body
+        .invariant_preds
+        .iter()
+        .copied()
+        .chain(body.contracts.iter().map(|contract| contract.expr))
+        .chain([body.value])
+        .collect::<Vec<_>>();
+    body_roots.sort_by_key(|expr| expr.span.range.start());
+    let mut work = body_roots
+        .into_iter()
+        .rev()
+        .map(LocalWork::Expr)
+        .collect::<Vec<_>>();
 
     while let Some(task) = work.pop() {
         match task {
@@ -255,6 +274,12 @@ pub fn resolve_owner_locals(
                                         segment_count: 1,
                                     },
                                 );
+                            } else {
+                                result.deferred_paths.push(DeferredPath {
+                                    hir_id: path.hir_id,
+                                    name: name.sym,
+                                    span: name.span,
+                                });
                             }
                         }
                     }
@@ -459,6 +484,60 @@ pub fn resolve_owner_locals(
 
     sort_owner_diagnostics(&mut result.diagnostics);
     Ok(result)
+}
+
+/// Module-scope resolutions for candidates not claimed by lexical locals.
+///
+/// Names present in `generic_parameters` remain deferred so module scope
+/// cannot capture an in-scope generic. Misses also remain deferred for
+/// prelude lookup and final unresolved-name diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleResolution {
+    pub owner: OwnerId,
+    pub paths: HashMap<HirId, PathRes>,
+    pub deferred_paths: Vec<DeferredPath>,
+}
+
+/// Resolves deferred one-segment expression paths through the current module
+/// scope after lexical locals and generic parameters.
+///
+/// `Res::TestOnly` is retained as an explicit unresolved binding marker for
+/// the later owner-aware pass, which reports its build-context diagnostic.
+/// Module-scope misses stay deferred; this partial pass does not perform
+/// prelude lookup or emit unresolved-name diagnostics.
+pub fn resolve_owner_module_paths(
+    locals: &LocalResolution,
+    module_scope: &Phase1ModuleScopes,
+    generic_parameters: &HashSet<Symbol>,
+) -> ModuleResolution {
+    let mut resolution = ModuleResolution {
+        owner: locals.owner,
+        paths: HashMap::new(),
+        deferred_paths: Vec::new(),
+    };
+    for candidate in &locals.deferred_paths {
+        if generic_parameters.contains(&candidate.name) {
+            resolution.deferred_paths.push(*candidate);
+            continue;
+        }
+        let Some(binding) = module_scope.scope.get(&candidate.name) else {
+            resolution.deferred_paths.push(*candidate);
+            continue;
+        };
+        if matches!(binding.res, Res::Def(_, _) | Res::Err | Res::TestOnly(_)) {
+            resolution.paths.insert(
+                candidate.hir_id,
+                PathRes {
+                    base: binding.res,
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            );
+        } else {
+            resolution.deferred_paths.push(*candidate);
+        }
+    }
+    resolution
 }
 
 fn lookup_local_binding(ribs: &[LocalRib], symbol: Symbol) -> Option<BindingId> {
