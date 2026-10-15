@@ -769,9 +769,17 @@ results for their target and predicate-body types. The pass preserves rejected
 test-only heads independently of diagnostic collection, uses the exact file
 module scope before the primitive-only Prelude, and keeps its result separate
 from expression `ModuleResolution`. Qualified suffixes and canonical names
-without supplied standard-package scopes remain deferred. Refinement and
-extern predicate adapters leave the optional type-head channel absent until
-their own increments.
+without supplied standard-package scopes remain deferred.
+
+**Extern-function type heads (IR-550).** Extern function owners expose the
+same optional partial result for signature and contract/body type paths,
+including bodyless signatures. Resolve function type and const generics before
+independently rejecting test-only heads, then use the exact source file's
+module scope and primitive-only Prelude. Keep the result separate from
+expression module lookup and predicate diagnostics. Qualified suffixes and
+canonical names without supplied standard-package scopes remain deferred.
+Refinement and distinct predicate adapters still leave the channel absent
+until their own increments.
 
 ### 3.4.3 Ribs
 
