@@ -7050,6 +7050,8 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.invariant_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
@@ -7178,9 +7180,9 @@ impl RootDatabase {
                                     primitive_prelude,
                                     &rejected_type_paths,
                                     module_scope,
-                                    None,
+                                    Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    None,
+                                    Some(&source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -7339,6 +7341,8 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.refinement_predicate_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
@@ -7524,9 +7528,9 @@ impl RootDatabase {
                                     primitive_prelude,
                                     &rejected_type_paths,
                                     module_scope,
-                                    None,
+                                    Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    None,
+                                    Some(&source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -14814,19 +14818,24 @@ mod tests {
             .get(&symbol("T"))
             .expect("root T alias exists")
             .res;
-        let child_module = root_scope
-            .scope
-            .get(&symbol("child_alias"))
-            .expect("root child module alias exists")
-            .res;
         let shared_symbol = symbol("Shared");
-        let child_shared = collection
+        let child_module_scope = collection
             .scopes()
             .module(ModuleId::from_raw(1))
-            .expect("child module scope exists")
+            .expect("child module scope exists");
+        let child_shared = child_module_scope
             .scope
             .get(&shared_symbol)
             .expect("child Shared alias exists")
+            .res;
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let child_widget = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget alias exists")
             .res;
 
         let resolved = database
@@ -14893,13 +14902,13 @@ mod tests {
         );
         assert!(
             root_scope_types.paths().values().any(|path| {
-                path.base == child_module && path.resolved_segments == 1 && path.segment_count == 2
+                path.base == child_widget && path.resolved_segments == 2 && path.segment_count == 2
             }),
-            "a qualified type head resolves only the module alias and retains its suffix"
+            "a qualified type head resolves through a local module member"
         );
         assert!(
             root_scope_types.module_path_errors().is_empty(),
-            "member suffix lookup remains deferred at the type-head stage"
+            "present module members do not produce lookup errors"
         );
 
         let age = &resolved.owners()[2];
@@ -14999,6 +15008,150 @@ mod tests {
                     .is_ok_and(|name| name.as_ref() == "RootOnly")
             }),
             "the child refined owner does not capture the root-only alias"
+        );
+    }
+
+    #[test]
+    fn predicate_owner_resolves_local_qualified_type_prefixes() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "invariant Bool { { let nested: child_alias.api.Request.Associated = true; ",
+            "let qualified: child_alias.Widget = true; true } }\n",
+            "type Refined = U32 where { let qualified: child_alias.Widget = true; ",
+            "let missing: child_alias.MissingType = true; true }\n",
+        );
+        let child = concat!(
+            "type Widget = Bool\n",
+            "interface api {\n",
+            "  type Request = Bool\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("predicate owners collect");
+        assert_eq!(collection.scopes().invariant_owners.len(), 1);
+        assert_eq!(collection.scopes().refinement_predicate_owners.len(), 1);
+
+        let child_module_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let widget_binding = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget alias is declared");
+        let api_name = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let request_name = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let request_binding = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (child_module_scope
+                    .members
+                    .get(&api_name)
+                    .is_some_and(|binding| binding.res == Res::Def(DefKind::Interface, *def_id)))
+                .then(|| interface.members.get(&request_name))
+                .flatten()
+            })
+            .expect("interface api declares Request");
+
+        let invariants = database
+            .resolve_invariant_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("invariant type prefixes resolve");
+        let invariant_types = invariants.owners()[0]
+            .type_path_resolution()
+            .expect("invariant type lookup succeeds")
+            .expect("invariant has a type result");
+        assert!(
+            invariant_types.paths().values().any(|path| {
+                path.base == widget_binding.res
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2
+            }),
+            "an invariant body type resolves through a local module member"
+        );
+        assert!(
+            invariant_types.paths().values().any(|path| {
+                path.base == request_binding.res
+                    && path.resolved_segments == 3
+                    && path.segment_count == 4
+            }),
+            "an invariant body resolves through a local interface and defers its suffix"
+        );
+        assert!(
+            invariant_types.module_path_errors().is_empty(),
+            "all invariant member prefixes are present"
+        );
+
+        let refinements = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("refined type prefixes resolve");
+        let refined_types = refinements.owners()[0]
+            .type_path_resolution()
+            .expect("refined type lookup succeeds")
+            .expect("refined owner has a type result");
+        assert!(
+            refined_types.paths().values().any(|path| {
+                path.base == widget_binding.res
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2
+            }),
+            "a refined predicate body resolves through a local module type member"
+        );
+        assert_eq!(refined_types.module_path_errors().len(), 1);
+        let missing_offset = root
+            .find("child_alias.MissingType")
+            .expect("missing type member path exists");
+        let missing_error = &refined_types.module_path_errors()[0];
+        let (missing_name, missing_segment, missing_span) = match missing_error.error() {
+            ModulePathError::MissingMember {
+                name,
+                segment_index,
+                span,
+                ..
+            } => (name, segment_index, span),
+            error => panic!("expected a missing-member error, got {error:?}"),
+        };
+        assert!(
+            database
+                .resolve_symbol(missing_name)
+                .is_ok_and(|name| name.as_ref() == "MissingType")
+        );
+        assert_eq!(missing_segment, 0);
+        let missing_start = missing_offset + "child_alias.".len();
+        assert_eq!(missing_span.file, module_tree.modules[0].file);
+        assert_eq!(missing_span.range.start().to_usize(), missing_start);
+        assert_eq!(
+            missing_span.range.end().to_usize(),
+            missing_start + "MissingType".len()
+        );
+        assert_eq!(
+            refined_types.paths().get(&missing_error.hir_id()),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            }),
+            "a missing local member records an error through that exact path segment"
         );
     }
 
@@ -15244,6 +15397,10 @@ mod tests {
                 .values()
                 .any(|path| path.base == Res::Err),
             "the test-only qualified base head is rejected"
+        );
+        assert!(
+            age_partial_types.module_path_errors().is_empty(),
+            "a rejected test-only head does not trigger local member lookup"
         );
         assert!(
             age_partial_types
