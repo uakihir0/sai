@@ -209,6 +209,11 @@ pub struct Phase1PackageScopes {
     pub interfaces: HashMap<DefId, InterfaceScope>,
     /// First definition for each export name in a root core-module build.
     pub exports: BTreeMap<String, LocalDefId>,
+    /// Direct top-level HIR owners in module and source order. This owner
+    /// index includes declarations with duplicate or recovery names when
+    /// Phase 1 assigned them a canonical path. Nested members and synthetic
+    /// owners remain in their dedicated descriptor tables.
+    pub top_level_owners: Vec<TopLevelOwnerDescriptor>,
     /// Top-level function owners in module and source order. These IDs are
     /// retained at the point Phase 1 interns them, so duplicate declarations
     /// and declarations with recovery names remain addressable by HIR
@@ -288,6 +293,41 @@ pub struct ExternFunctionOwnerDescriptor {
     pub file: FileId,
     pub block_item_id: ErasedAstId,
     pub item_id: ErasedAstId,
+}
+
+/// Direct top-level owner kinds indexed by `Phase1PackageScopes`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TopLevelOwnerKind {
+    Function,
+    Struct,
+    Alias,
+    Refined,
+    Enum,
+    Distinct,
+    Resource,
+    Trait,
+    Impl,
+    Const,
+    Invariant,
+    Effect,
+    Interface,
+    World,
+    ExternBlock,
+    Test,
+    Property,
+}
+
+/// Source descriptor for one direct top-level HIR owner.
+///
+/// `item_id` is meaningful only with `file`; consumers must resolve it through
+/// the current snapshot's `AstIdMap` before lowering. The canonical owner ID
+/// was assigned during the same Phase 1 traversal that assigns disambiguators.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TopLevelOwnerDescriptor {
+    pub owner: OwnerId,
+    pub file: FileId,
+    pub item_id: ErasedAstId,
+    pub kind: TopLevelOwnerKind,
 }
 
 /// A finalized source-package scope that may be imported by a consumer.
@@ -449,6 +489,7 @@ pub fn collect_phase1(
     let package_identity = packages.resolve(module_tree.package)?.to_string();
     let mut scopes = Vec::with_capacity(module_tree.modules.len());
     let mut interfaces = HashMap::new();
+    let mut top_level_owners = Vec::new();
     let mut function_owners = Vec::new();
     let mut invariant_owners = Vec::new();
     let mut refinement_predicate_owners = Vec::new();
@@ -535,6 +576,12 @@ pub fn collect_phase1(
                         symbols,
                         def_paths,
                     )?;
+                    top_level_owners.push(TopLevelOwnerDescriptor {
+                        owner: OwnerId { def_id: block_id },
+                        file: module.file,
+                        item_id: entry.ast_id,
+                        kind: TopLevelOwnerKind::ExternBlock,
+                    });
                     let mut child_disambiguators = HashMap::<DefPathData, u32>::new();
                     for child in &entry.children {
                         if child.kind != ItemTreeKind::ExternFn {
@@ -574,7 +621,7 @@ pub fn collect_phase1(
                     }
                 }
                 ItemTreeKind::Test | ItemTreeKind::Property => {
-                    collect_test_name(
+                    if let Some(owner) = collect_test_name(
                         entry,
                         &module_path,
                         module_tree.package,
@@ -586,7 +633,18 @@ pub fn collect_phase1(
                         packages,
                         symbols,
                         def_paths,
-                    )?;
+                    )? {
+                        top_level_owners.push(TopLevelOwnerDescriptor {
+                            owner,
+                            file: module.file,
+                            item_id: entry.ast_id,
+                            kind: match entry.kind {
+                                ItemTreeKind::Test => TopLevelOwnerKind::Test,
+                                ItemTreeKind::Property => TopLevelOwnerKind::Property,
+                                _ => unreachable!("only test and property entries are collected"),
+                            },
+                        });
+                    }
                 }
                 ItemTreeKind::Impl => {
                     let component = DefPathData::Impl {
@@ -594,7 +652,7 @@ pub fn collect_phase1(
                     };
                     let disambiguator =
                         next_disambiguator(&mut module_disambiguators, component.clone())?;
-                    intern_path(
+                    let local_def_id = intern_path(
                         module_tree.package,
                         &module_path,
                         component,
@@ -603,6 +661,14 @@ pub fn collect_phase1(
                         symbols,
                         def_paths,
                     )?;
+                    top_level_owners.push(TopLevelOwnerDescriptor {
+                        owner: OwnerId {
+                            def_id: local_def_id,
+                        },
+                        file: module.file,
+                        item_id: entry.ast_id,
+                        kind: TopLevelOwnerKind::Impl,
+                    });
                 }
                 ItemTreeKind::Invariant => {
                     let component = DefPathData::Invariant(entry.name);
@@ -624,6 +690,14 @@ pub fn collect_phase1(
                         file: module.file,
                         item_id: entry.ast_id,
                     });
+                    top_level_owners.push(TopLevelOwnerDescriptor {
+                        owner: OwnerId {
+                            def_id: local_def_id,
+                        },
+                        file: module.file,
+                        item_id: entry.ast_id,
+                        kind: TopLevelOwnerKind::Invariant,
+                    });
                 }
                 _ => {
                     let Some((kind, component)) = binding_identity(entry.kind, entry.name) else {
@@ -640,6 +714,16 @@ pub fn collect_phase1(
                         symbols,
                         def_paths,
                     )?;
+                    if let Some(owner_kind) = top_level_owner_kind(entry.kind) {
+                        top_level_owners.push(TopLevelOwnerDescriptor {
+                            owner: OwnerId {
+                                def_id: local_def_id,
+                            },
+                            file: module.file,
+                            item_id: entry.ast_id,
+                            kind: owner_kind,
+                        });
+                    }
                     if entry.kind == ItemTreeKind::Function {
                         function_owners.push(FunctionOwnerDescriptor {
                             owner: OwnerId {
@@ -772,6 +856,7 @@ pub fn collect_phase1(
         modules: scopes,
         interfaces,
         exports,
+        top_level_owners,
         function_owners,
         invariant_owners,
         refinement_predicate_owners,
@@ -3517,14 +3602,14 @@ fn collect_test_name(
     packages: &PackageInterner,
     symbols: &Interner,
     def_paths: &DefPathInterner,
-) -> Result<(), PackageScopesError> {
+) -> Result<Option<OwnerId>, PackageScopesError> {
     let syntax = resolve_entry_syntax(entry, input)?;
     let (name, range) = match entry.kind {
         ItemTreeKind::Test => {
             let declaration =
                 ast::TestDecl::cast(syntax).ok_or(PackageScopesError::NameMismatch)?;
             let Some(name) = declaration.name() else {
-                return Ok(());
+                return Ok(None);
             };
             (name.value().into_owned(), name.syntax().text_range())
         }
@@ -3532,7 +3617,7 @@ fn collect_test_name(
             let declaration =
                 ast::PropertyDecl::cast(syntax).ok_or(PackageScopesError::NameMismatch)?;
             let Some(name) = declaration.name() else {
-                return Ok(());
+                return Ok(None);
             };
             (name.value().into_owned(), name.syntax().text_range())
         }
@@ -3548,15 +3633,17 @@ fn collect_test_name(
         _ => return Err(PackageScopesError::NameMismatch),
     };
     let disambiguator = next_disambiguator(disambiguators, component.clone())?;
-    intern_path(
-        package,
-        module_path,
-        component,
-        disambiguator,
-        packages,
-        symbols,
-        def_paths,
-    )?;
+    let owner = OwnerId {
+        def_id: intern_path(
+            package,
+            module_path,
+            component,
+            disambiguator,
+            packages,
+            symbols,
+            def_paths,
+        )?,
+    };
 
     if name.is_empty() || name.chars().any(char::is_control) {
         diagnostics.push(declaration_diagnostic(
@@ -3566,7 +3653,7 @@ fn collect_test_name(
             location,
             package_identity,
         ));
-        return Ok(());
+        return Ok(Some(owner));
     }
     if let Some(previous) = test_names.get(&name) {
         let mut diagnostic = declaration_diagnostic(
@@ -3586,7 +3673,25 @@ fn collect_test_name(
     } else {
         test_names.insert(name, location);
     }
-    Ok(())
+    Ok(Some(owner))
+}
+
+fn top_level_owner_kind(kind: ItemTreeKind) -> Option<TopLevelOwnerKind> {
+    Some(match kind {
+        ItemTreeKind::Function => TopLevelOwnerKind::Function,
+        ItemTreeKind::Struct => TopLevelOwnerKind::Struct,
+        ItemTreeKind::Alias => TopLevelOwnerKind::Alias,
+        ItemTreeKind::Refined => TopLevelOwnerKind::Refined,
+        ItemTreeKind::Enum => TopLevelOwnerKind::Enum,
+        ItemTreeKind::Distinct => TopLevelOwnerKind::Distinct,
+        ItemTreeKind::Resource => TopLevelOwnerKind::Resource,
+        ItemTreeKind::Trait => TopLevelOwnerKind::Trait,
+        ItemTreeKind::Const => TopLevelOwnerKind::Const,
+        ItemTreeKind::Effect => TopLevelOwnerKind::Effect,
+        ItemTreeKind::Interface => TopLevelOwnerKind::Interface,
+        ItemTreeKind::World => TopLevelOwnerKind::World,
+        _ => return None,
+    })
 }
 
 fn binding_identity(kind: ItemTreeKind, name: Symbol) -> Option<(DefKind, DefPathData)> {
@@ -3615,11 +3720,11 @@ fn extern_block_component(
 ) -> Result<DefPathData, PackageScopesError> {
     let syntax = resolve_entry_syntax(entry, input)?;
     let declaration = ast::ExternBlock::cast(syntax).ok_or(PackageScopesError::NameMismatch)?;
-    let abi = declaration
+    let abi_text = declaration
         .abi()
-        .map(|literal| symbols.intern(literal.value().as_ref()))
-        .transpose()?
-        .unwrap_or(Symbol::ERROR);
+        .map(|literal| literal.value().into_owned())
+        .unwrap_or_default();
+    let abi = symbols.intern(&abi_text)?;
     let module = declaration
         .module()
         .and_then(|module| module.value())
@@ -4063,6 +4168,7 @@ mod tests {
                 modules: module_scopes,
                 interfaces: HashMap::new(),
                 exports: BTreeMap::new(),
+                top_level_owners: Vec::new(),
                 function_owners: Vec::new(),
                 invariant_owners: Vec::new(),
                 refinement_predicate_owners: Vec::new(),
@@ -4092,6 +4198,15 @@ mod tests {
         }
 
         fn new_with_identity(text: &str, target: &str, identity: &str) -> Self {
+            Self::new_with_parse_recovery(text, target, identity, false)
+        }
+
+        fn new_with_parse_recovery(
+            text: &str,
+            target: &str,
+            identity: &str,
+            allow_parse_errors: bool,
+        ) -> Self {
             let package_interner = PackageInterner::new();
             let package = package_interner
                 .intern(identity)
@@ -4106,11 +4221,13 @@ mod tests {
             )])
             .expect("snapshot is valid");
             let parsed = sai_syntax::parse(&snapshot, file).expect("source parses");
-            assert!(
-                parsed.errors.is_empty(),
-                "parse errors: {:?}",
-                parsed.errors
-            );
+            if !allow_parse_errors {
+                assert!(
+                    parsed.errors.is_empty(),
+                    "parse errors: {:?}",
+                    parsed.errors
+                );
+            }
             let ast_ids = ast::AstIdMap::new(file, &parsed.root).expect("AST IDs bind");
             let symbols = Interner::new();
             let target_cfg =
@@ -6790,6 +6907,149 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn top_level_owner_descriptors_preserve_order_identity_and_target_filtering() {
+        let source = concat!(
+            "@target(\"wasm64-core\")\n",
+            "fn filtered() {}\n",
+            "fn same() {}\n",
+            "fn same() {}\n",
+            "type Record {}\n",
+            "invariant Account { fn() { true } }\n",
+        );
+        let fixture = Fixture::new(source, "wasm32-core");
+        let (scopes, paths) = fixture.collect();
+        let descriptors = &scopes.top_level_owners;
+        let hidden_name = fixture.symbols.intern("filtered").unwrap();
+        let unfiltered_tree = ItemTree::collect(
+            fixture.file,
+            fixture.source.text(),
+            &fixture.parsed.root,
+            &fixture.ast_ids,
+            &fixture.symbols,
+        )
+        .expect("unfiltered item tree collects");
+
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.kind)
+                .collect::<Vec<_>>(),
+            [
+                TopLevelOwnerKind::Function,
+                TopLevelOwnerKind::Function,
+                TopLevelOwnerKind::Struct,
+                TopLevelOwnerKind::Invariant,
+            ]
+        );
+        assert!(
+            descriptors
+                .iter()
+                .all(|descriptor| descriptor.file == fixture.file),
+            "each AST ID is paired with the module file that owns it"
+        );
+        assert!(
+            descriptors.iter().all(|descriptor| {
+                fixture
+                    .filtered
+                    .item_tree
+                    .items
+                    .iter()
+                    .any(|entry| entry.ast_id == descriptor.item_id)
+            }),
+            "every descriptor points to a target-filtered item in its file"
+        );
+        let filtered_item = unfiltered_tree
+            .items
+            .iter()
+            .find(|entry| entry.name == hidden_name)
+            .expect("unfiltered tree includes the target-filtered declaration");
+        assert!(
+            !descriptors
+                .iter()
+                .any(|descriptor| descriptor.item_id == filtered_item.ast_id),
+            "a target-filtered declaration has no owner descriptor"
+        );
+        let duplicate_disambiguators = descriptors
+            .iter()
+            .take(2)
+            .map(|descriptor| {
+                paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .unwrap()
+                    .unwrap()
+                    .data()
+                    .last()
+                    .unwrap()
+                    .disambiguator
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_disambiguators, [0, 1]);
+    }
+
+    #[test]
+    fn top_level_owner_descriptors_keep_recovery_name_identity() {
+        let mut fixture = Fixture::new("fn named() {}\n", "wasm32-core");
+        fixture.filtered.item_tree.items[0].name = Symbol::ERROR;
+        let (scopes, paths) = fixture.collect();
+        let [descriptor] = scopes.top_level_owners.as_slice() else {
+            panic!("the recovery-named function keeps one owner descriptor");
+        };
+        assert_eq!(descriptor.kind, TopLevelOwnerKind::Function);
+        assert_eq!(descriptor.file, fixture.file);
+        let path = paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            path.data().last().unwrap().data,
+            DefPathData::ValueNs(Symbol::ERROR)
+        );
+    }
+
+    #[test]
+    fn extern_block_owner_descriptor_matches_lowering_when_abi_is_missing() {
+        let fixture = Fixture::new_with_parse_recovery(
+            "extern { fn f() }\n",
+            "wasm32-core",
+            "acme:phase1#0.1",
+            true,
+        );
+        let (scopes, paths) = fixture.collect();
+        let descriptor = scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::ExternBlock)
+            .expect("extern block has a top-level owner descriptor");
+        let expected_path = paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            expected_path.data().last().unwrap().data,
+            DefPathData::ExternBlock { abi, module: None }
+                if abi == fixture.symbols.intern("").unwrap()
+        ));
+
+        let arena = sai_hir::arena::HirArena::new();
+        let context = sai_hir::lower::HirLoweringContext::new(
+            &fixture.ast_ids,
+            &fixture.snapshot,
+            &fixture.parsed.root,
+            &arena,
+            &fixture.symbols,
+            &paths,
+        );
+        sai_hir::lower::lower_extern_block_owner(
+            descriptor.owner,
+            &expected_path,
+            &fixture.filtered.item_tree,
+            descriptor.item_id,
+            &context,
+        )
+        .expect("Phase 1's recovered ABI identity matches HIR lowering");
     }
 
     #[test]

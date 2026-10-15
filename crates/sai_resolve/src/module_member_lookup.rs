@@ -221,6 +221,7 @@ mod tests {
             modules,
             interfaces,
             exports: BTreeMap::new(),
+            top_level_owners: Vec::new(),
             function_owners: Vec::new(),
             invariant_owners: Vec::new(),
             refinement_predicate_owners: Vec::new(),

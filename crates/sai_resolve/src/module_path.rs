@@ -243,6 +243,7 @@ mod tests {
             modules,
             interfaces,
             exports: Default::default(),
+            top_level_owners: Vec::new(),
             function_owners: Vec::new(),
             invariant_owners: Vec::new(),
             refinement_predicate_owners: Vec::new(),
