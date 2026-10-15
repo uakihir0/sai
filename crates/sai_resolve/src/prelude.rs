@@ -71,8 +71,9 @@ pub struct CanonicalPreludeItem {
 
 /// One binding in the prelude.
 ///
-/// Primitive types are kept separate because the current resolver `Res` does
-/// not yet represent them. Standard-library items retain their ordinary `Res`.
+/// Primitive bindings remain explicit in the provider so callers can
+/// distinguish built-in names from canonical standard-library items. `Res`
+/// can also represent these primitives for owner-level path results.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PreludeBinding {
     Primitive(PrimTy),

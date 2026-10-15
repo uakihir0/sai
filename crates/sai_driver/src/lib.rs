@@ -2342,7 +2342,7 @@ fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol
                     // package cannot use test edges remain syntax-known
                     // module names even though Phase 1 stores `Res::Err`.
                     Res::Err => true,
-                    Res::Def(_, _) | Res::Local(_) => false,
+                    Res::Def(_, _) | Res::Local(_) | Res::PrimTy(_) => false,
                 };
             (is_resolved_module_alias || is_unresolved_test_only_module_alias).then_some(*name)
         })

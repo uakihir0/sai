@@ -14,6 +14,7 @@
 
 use super::{ChildEntry, ModuleData, ModuleId, ModuleTree};
 use crate::module_target::{ModuleTargetError, resolve_foreign_module_target};
+use crate::prelude::PrimTy;
 use crate::use_binding::{UseBindingNameError, derive_use_binding_name};
 use crate::use_item_binding::{UseItemBindingError, derive_use_item_binding};
 use crate::use_path::{ParsedUsePath, UsePathError, parse_use_path};
@@ -74,12 +75,13 @@ pub enum DefKind {
 
 /// A resolved entity used in module namespace bindings.
 ///
-/// Later resolver phases extend this with interfaces, imported items, locals,
-/// and primitive types. Current declaration and local-module-alias passes
-/// construct definition resolutions; the owner-local pass constructs locals.
+/// Later resolver phases extend this with interfaces, imported items, and
+/// locals. Primitive type resolutions are represented here but are not yet
+/// inserted into owner or package scopes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Res {
     Def(DefKind, DefId),
+    PrimTy(PrimTy),
     Local(BindingId),
     Err,
     /// A binding from a `requires test` dependency whose target has not been
@@ -2561,7 +2563,7 @@ fn local_interface_target(
         .get(&interface_name)?;
     match binding.res {
         Res::Def(DefKind::Interface, def_id) => Some(def_id),
-        Res::Def(_, _) | Res::Local(_) | Res::Err | Res::TestOnly(_) => None,
+        Res::Def(_, _) | Res::Local(_) | Res::PrimTy(_) | Res::Err | Res::TestOnly(_) => None,
     }
 }
 
@@ -3926,6 +3928,46 @@ mod tests {
     use sai_syntax::{Parse, ast};
     use sai_vfs::{SnapshotFile, WorkspaceSnapshot};
     use std::sync::Arc;
+
+    #[test]
+    fn primitive_resolutions_preserve_each_canonical_variant() {
+        let primitives = [
+            PrimTy::I8,
+            PrimTy::I16,
+            PrimTy::I32,
+            PrimTy::I64,
+            PrimTy::U8,
+            PrimTy::U16,
+            PrimTy::U32,
+            PrimTy::U64,
+            PrimTy::ISize,
+            PrimTy::USize,
+            PrimTy::F32,
+            PrimTy::F64,
+            PrimTy::Bool,
+            PrimTy::Byte,
+            PrimTy::Char,
+            PrimTy::Never,
+            PrimTy::Array,
+        ];
+        let resolutions: HashSet<_> = primitives.into_iter().map(Res::PrimTy).collect();
+
+        assert_eq!(resolutions.len(), primitives.len());
+        assert!(resolutions.contains(&Res::PrimTy(PrimTy::I64)));
+        assert!(resolutions.contains(&Res::PrimTy(PrimTy::Array)));
+        assert_ne!(
+            Res::PrimTy(PrimTy::I64),
+            Res::PrimTy(PrimTy::Array),
+            "the integer alias and structural array constructor stay distinct"
+        );
+
+        let path = PathRes {
+            base: Res::PrimTy(PrimTy::I64),
+            resolved_segments: 1,
+            segment_count: 1,
+        };
+        assert_eq!(path.base, Res::PrimTy(PrimTy::I64));
+    }
 
     struct Fixture {
         package: PackageId,
@@ -6252,7 +6294,7 @@ mod tests {
             "import path: {:?}",
             match option_import {
                 Res::Def(_, def_id) => core_paths.resolve_def_id(def_id).unwrap(),
-                Res::Local(_) | Res::Err | Res::TestOnly(_) => None,
+                Res::Local(_) | Res::PrimTy(_) | Res::Err | Res::TestOnly(_) => None,
             }
         );
         assert_eq!(

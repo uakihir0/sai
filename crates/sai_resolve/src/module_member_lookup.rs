@@ -32,7 +32,7 @@ impl ModuleTarget {
     pub const fn from_res(res: Res) -> Option<Self> {
         match res {
             Res::Def(DefKind::Module | DefKind::Interface, def_id) => Some(Self { def_id }),
-            Res::Def(_, _) | Res::Local(_) | Res::Err | Res::TestOnly(_) => None,
+            Res::Def(_, _) | Res::Local(_) | Res::PrimTy(_) | Res::Err | Res::TestOnly(_) => None,
         }
     }
 
