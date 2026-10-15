@@ -876,7 +876,7 @@ pub struct FunctionOwnerResolution {
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     test_only_path_resolution:
-        Result<Option<FunctionTestOnlyPathResolution>, FunctionOwnerResolutionError>,
+        Result<Option<OwnerTestOnlyPathResolution>, FunctionOwnerResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, FunctionOwnerResolutionError>,
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// label resolver's diagnostics so the caller can preserve phase order.
@@ -912,7 +912,7 @@ impl FunctionOwnerResolution {
 
     pub fn test_only_path_resolution(
         &self,
-    ) -> Result<Option<&FunctionTestOnlyPathResolution>, &FunctionOwnerResolutionError> {
+    ) -> Result<Option<&OwnerTestOnlyPathResolution>, &FunctionOwnerResolutionError> {
         self.test_only_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
@@ -927,17 +927,17 @@ impl FunctionOwnerResolution {
     }
 }
 
-/// Non-expression function paths rejected because their module binding is
+/// Non-expression owner paths rejected because their module binding is
 /// test-only. This includes types, effects, and path patterns.
 ///
 /// Other paths remain for later generic/module/prelude/effect resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FunctionTestOnlyPathResolution {
+pub struct OwnerTestOnlyPathResolution {
     owner: OwnerId,
     paths: HashMap<HirId, PathRes>,
 }
 
-impl FunctionTestOnlyPathResolution {
+impl OwnerTestOnlyPathResolution {
     pub const fn owner(&self) -> OwnerId {
         self.owner
     }
@@ -946,6 +946,12 @@ impl FunctionTestOnlyPathResolution {
         &self.paths
     }
 }
+
+/// Compatibility name for the function-specific non-expression path result.
+///
+/// The representation is now shared with other owner kinds, but callers that
+/// name the original public function result type can keep doing so.
+pub type FunctionTestOnlyPathResolution = OwnerTestOnlyPathResolution;
 
 /// Compatibility name for the original label result type.
 pub type FunctionOwnerLabelResolution = FunctionOwnerResolution;
@@ -1151,6 +1157,8 @@ pub struct ConstOwnerResolution {
     owner: OwnerId,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+    test_only_path_resolution:
+        Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
 }
@@ -1172,6 +1180,14 @@ impl ConstOwnerResolution {
         &self,
     ) -> Result<Option<&ModuleResolution>, &OwnerControlFlowResolutionError> {
         self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<Option<&OwnerTestOnlyPathResolution>, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
     }
@@ -1516,22 +1532,22 @@ fn module_scope_for_file<'a>(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FunctionPathKind {
+enum OwnerPathKind {
     Type,
     Effect,
     Pattern,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FunctionPathHead {
+struct OwnerPathHead {
     hir_id: HirId,
     name: Symbol,
     span: sai_hir::Span,
     segment_count: u32,
-    kind: FunctionPathKind,
+    kind: OwnerPathKind,
 }
 
-fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathHead> {
+fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
     enum Work<'hir> {
         Expr(&'hir HirExpr<'hir>),
         Block(&'hir HirBlock<'hir>),
@@ -1541,7 +1557,7 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
         Bound(Bound<'hir>),
         Path {
             path: HirPath<'hir>,
-            kind: FunctionPathKind,
+            kind: OwnerPathKind,
         },
         Args(GenericArgs<'hir>),
         Effect(HirEffectRef<'hir>),
@@ -1550,30 +1566,33 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
     let OwnerNode::Item(item) = owner.node else {
         return Vec::new();
     };
-    let ItemKind::Fn { sig, generics, .. } = item.kind else {
-        return Vec::new();
-    };
     let mut work = Vec::new();
-    for parameter in sig.params {
-        work.push(Work::Ty(parameter.ty));
-    }
-    if let Some(effects) = sig.effects {
-        work.extend(effects.iter().copied().map(Work::Effect));
-    }
-    if let Some(ret) = sig.ret {
-        work.push(Work::Ty(ret));
-    }
-    for parameter in generics.params {
-        match parameter.kind {
-            GenericParamKind::Type { bounds } => {
-                work.extend(bounds.iter().copied().map(Work::Bound));
+    match item.kind {
+        ItemKind::Fn { sig, generics, .. } => {
+            for parameter in sig.params {
+                work.push(Work::Ty(parameter.ty));
             }
-            GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
+            if let Some(effects) = sig.effects {
+                work.extend(effects.iter().copied().map(Work::Effect));
+            }
+            if let Some(ret) = sig.ret {
+                work.push(Work::Ty(ret));
+            }
+            for parameter in generics.params {
+                match parameter.kind {
+                    GenericParamKind::Type { bounds } => {
+                        work.extend(bounds.iter().copied().map(Work::Bound));
+                    }
+                    GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
+                }
+            }
+            for predicate in generics.where_preds {
+                work.push(Work::Ty(predicate.ty));
+                work.extend(predicate.bounds.iter().copied().map(Work::Bound));
+            }
         }
-    }
-    for predicate in generics.where_preds {
-        work.push(Work::Ty(predicate.ty));
-        work.extend(predicate.bounds.iter().copied().map(Work::Bound));
+        ItemKind::Const { ty } => work.push(Work::Ty(ty)),
+        _ => return Vec::new(),
     }
     if let Some(body) = owner.body {
         work.push(Work::Expr(body.value));
@@ -1737,13 +1756,13 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
                     if let Some(PatRangeEnd::Path(path)) = end {
                         work.push(Work::Path {
                             path,
-                            kind: FunctionPathKind::Pattern,
+                            kind: OwnerPathKind::Pattern,
                         });
                     }
                     if let Some(PatRangeEnd::Path(path)) = start {
                         work.push(Work::Path {
                             path,
-                            kind: FunctionPathKind::Pattern,
+                            kind: OwnerPathKind::Pattern,
                         });
                     }
                 }
@@ -1767,7 +1786,7 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
                     }
                     work.push(Work::Path {
                         path,
-                        kind: FunctionPathKind::Pattern,
+                        kind: OwnerPathKind::Pattern,
                     });
                 }
                 PatKind::ImplicitMember { args, .. } => {
@@ -1779,7 +1798,7 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
             Work::Ty(ty) => match ty.kind {
                 TyKind::Path(path) => work.push(Work::Path {
                     path,
-                    kind: FunctionPathKind::Type,
+                    kind: OwnerPathKind::Type,
                 }),
                 TyKind::Borrow(_, inner) => work.push(Work::Ty(inner)),
                 TyKind::Tuple(elements) => {
@@ -1808,7 +1827,7 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
                 match bound.kind {
                     BoundKind::Trait(path) => work.push(Work::Path {
                         path,
-                        kind: FunctionPathKind::Type,
+                        kind: OwnerPathKind::Type,
                     }),
                     BoundKind::FnSugar { params, ret, .. } => {
                         if let Some(ret) = ret {
@@ -1825,7 +1844,7 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
                 {
                     let name = segment.name.sym;
                     if !name.is_error() {
-                        paths.push(FunctionPathHead {
+                        paths.push(OwnerPathHead {
                             hir_id: path.hir_id,
                             name,
                             span: segment.name.span,
@@ -1845,12 +1864,12 @@ fn function_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<FunctionPathH
                     && let Ok(segment_count) = u32::try_from(effect.segments.len())
                     && !segment.sym.is_error()
                 {
-                    paths.push(FunctionPathHead {
+                    paths.push(OwnerPathHead {
                         hir_id: effect.hir_id,
                         name: segment.sym,
                         span: segment.span,
                         segment_count,
-                        kind: FunctionPathKind::Effect,
+                        kind: OwnerPathKind::Effect,
                     });
                 }
             }
@@ -1943,24 +1962,22 @@ fn collect_test_only_reference_diagnostics(
 
 fn collect_test_only_non_expression_reference_diagnostics(
     owner: OwnerId,
-    candidates: &[FunctionPathHead],
+    candidates: &[OwnerPathHead],
     generic_parameters: &HashSet<Symbol>,
     module_scope: &Phase1ModuleScopes,
-    path_resolution: &mut FunctionTestOnlyPathResolution,
+    path_resolution: &mut OwnerTestOnlyPathResolution,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
     let mut diagnostics = Vec::new();
     for candidate in candidates {
-        if matches!(
-            candidate.kind,
-            FunctionPathKind::Type | FunctionPathKind::Pattern
-        ) && generic_parameters.contains(&candidate.name)
+        if matches!(candidate.kind, OwnerPathKind::Type | OwnerPathKind::Pattern)
+            && generic_parameters.contains(&candidate.name)
         {
             continue;
         }
-        if candidate.kind == FunctionPathKind::Effect
+        if candidate.kind == OwnerPathKind::Effect
             && is_builtin_effect_root(candidate.name, symbols)
         {
             continue;
@@ -3707,9 +3724,9 @@ impl RootDatabase {
                         &context,
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
-                    let function_paths = function_test_only_path_candidates(&hir_owner);
+                    let function_paths = owner_test_only_path_candidates(&hir_owner);
                     let generic_parameters = owner_generic_parameters(&hir_owner);
-                    let mut resolved_function_paths = FunctionTestOnlyPathResolution {
+                    let mut resolved_function_paths = OwnerTestOnlyPathResolution {
                         owner: descriptor.owner,
                         paths: HashMap::new(),
                     };
@@ -3875,6 +3892,7 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
@@ -3895,6 +3913,10 @@ impl RootDatabase {
                     (
                         Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
                         Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                        Result<
+                            Option<OwnerTestOnlyPathResolution>,
+                            OwnerControlFlowResolutionError,
+                        >,
                         Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
                     ),
                     OwnerControlFlowResolutionError,
@@ -3936,8 +3958,35 @@ impl RootDatabase {
                         &context,
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
+                    let path_candidates = owner_test_only_path_candidates(&hir_owner);
+                    let mut resolved_paths = OwnerTestOnlyPathResolution {
+                        owner: descriptor.owner,
+                        paths: HashMap::new(),
+                    };
+                    let non_expression_diagnostics = match &module_scope {
+                        Ok(module_scope) => collect_test_only_non_expression_reference_diagnostics(
+                            descriptor.owner,
+                            &path_candidates,
+                            &HashSet::new(),
+                            module_scope,
+                            &mut resolved_paths,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let path_resolution = match &module_scope {
+                        Ok(_) => Ok(Some(resolved_paths)),
+                        Err(error) => Err(error.clone()),
+                    };
                     let Some(body) = hir_owner.body else {
-                        return Ok((Ok(None), Ok(None), Ok(Vec::new())));
+                        return Ok((
+                            Ok(None),
+                            Ok(None),
+                            path_resolution,
+                            non_expression_diagnostics,
+                        ));
                     };
                     let locals = match &module_aliases {
                         Ok(module_aliases) => resolve_owner_locals(
@@ -3960,7 +4009,7 @@ impl RootDatabase {
                                 ))),
                                 Err(error) => Err(error.clone()),
                             };
-                            let test_only_diagnostics = match &module_scope {
+                            let expression_diagnostics = match &module_scope {
                                 Ok(module_scope) => match &mut module_resolution {
                                     Ok(Some(module_resolution)) => {
                                         collect_test_only_reference_diagnostics(
@@ -3977,17 +4026,48 @@ impl RootDatabase {
                                 },
                                 Err(error) => Err(error.clone()),
                             };
-                            Ok((Ok(Some(locals)), module_resolution, test_only_diagnostics))
+                            let test_only_diagnostics =
+                                match (non_expression_diagnostics, expression_diagnostics) {
+                                    (Ok(mut non_expression), Ok(expression)) => {
+                                        non_expression.extend(expression);
+                                        sort_phase1_diagnostics(&mut non_expression);
+                                        Ok(non_expression)
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => Err(error),
+                                };
+                            Ok((
+                                Ok(Some(locals)),
+                                module_resolution,
+                                path_resolution,
+                                test_only_diagnostics,
+                            ))
                         }
-                        Err(error) => Ok((Err(error.clone()), Err(error.clone()), Err(error))),
+                        Err(error) => Ok((
+                            Err(error.clone()),
+                            Err(error.clone()),
+                            path_resolution,
+                            non_expression_diagnostics,
+                        )),
                     }
                 })();
-                let (local_resolution, module_resolution, test_only_diagnostics) = analysis
-                    .unwrap_or_else(|error| (Err(error.clone()), Err(error.clone()), Err(error)));
+                let (
+                    local_resolution,
+                    module_resolution,
+                    test_only_path_resolution,
+                    test_only_diagnostics,
+                ) = analysis.unwrap_or_else(|error| {
+                    (
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error.clone()),
+                        Err(error),
+                    )
+                });
                 owners.push(ConstOwnerResolution {
                     owner: descriptor.owner,
                     local_resolution,
                     module_resolution,
+                    test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
                 });
@@ -6449,6 +6529,378 @@ mod tests {
                 .len(),
             1,
             "an item import is diagnosed through its import origin"
+        );
+    }
+
+    #[test]
+    fn const_owner_test_only_type_paths_are_diagnosed() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{flag}\n",
+            "const BOTH: Wrapper<Fixture> = flag\n",
+            "const QUALIFIED: fixture.Type = true\n",
+            "const BODY: Bool = { let value: Fixture = true; value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only type imports are retained for const analysis");
+        let (fixture_import, type_symbol, type_import) = {
+            let scope = collection
+                .scopes()
+                .module(ModuleId::ROOT)
+                .expect("root module scope exists");
+            let symbol_named = |name: &str| {
+                scope
+                    .scope
+                    .keys()
+                    .copied()
+                    .find(|symbol| {
+                        database
+                            .resolve_symbol(*symbol)
+                            .is_ok_and(|spelling| spelling.as_ref() == name)
+                    })
+                    .unwrap_or_else(|| panic!("module scope contains `{name}`"))
+            };
+            let import_for = |symbol| match scope
+                .scope
+                .get(&symbol)
+                .expect("requested binding exists")
+                .origin
+            {
+                BindingOrigin::Decl => panic!("`{symbol:?}` comes from a use binding"),
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            };
+            let fixture_symbol = symbol_named("fixture");
+            let type_symbol = symbol_named("Fixture");
+            let value_symbol = symbol_named("flag");
+            let fixture_import = import_for(fixture_symbol);
+            let type_import = import_for(type_symbol);
+            let value_import = import_for(value_symbol);
+            for index in [fixture_import, type_import, value_import] {
+                assert!(scope.imports[index.0 as usize].test_only);
+                assert!(matches!(
+                    scope.imports[index.0 as usize].res,
+                    Res::TestOnly(_)
+                ));
+            }
+            (fixture_import, type_symbol, type_import)
+        };
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve test-only type paths");
+        assert_eq!(results.owners().len(), 3);
+        let both = &results.owners()[0];
+        let both_type_paths = both
+            .test_only_path_resolution()
+            .expect("const type lookup succeeds")
+            .expect("const has a non-expression path result");
+        assert_eq!(both_type_paths.owner(), both.owner());
+        assert_eq!(both_type_paths.paths().len(), 1);
+        let resolved_type = both_type_paths
+            .paths()
+            .values()
+            .next()
+            .expect("declared const type was rejected");
+        assert_eq!(resolved_type.base, Res::Err);
+        assert_eq!(resolved_type.resolved_segments, 1);
+        assert_eq!(resolved_type.segment_count, 1);
+        let both_module_paths = both
+            .module_resolution()
+            .expect("const expression module lookup succeeds")
+            .expect("const has an expression path result");
+        assert_eq!(
+            both_module_paths
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "the initializer's test-only value reference is diagnosed independently"
+        );
+        let both_diagnostics = both
+            .test_only_diagnostics()
+            .expect("const reference diagnostics succeed");
+        assert_eq!(both_diagnostics.len(), 2);
+        let type_start = root
+            .find("const BOTH: Wrapper<Fixture>")
+            .expect("const declaration exists") as u32
+            + "const BOTH: Wrapper<".len() as u32;
+        let value_start = root
+            .find("= flag")
+            .expect("const initializer reference exists") as u32
+            + "= ".len() as u32;
+        assert_eq!(
+            both_diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("test-only reference has a primary location")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(type_start),
+                        sai_diagnostics::TextSize::new(type_start + "Fixture".len() as u32),
+                    )
+                    .expect("type head span is ordered"),
+                ),
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(value_start),
+                        sai_diagnostics::TextSize::new(value_start + "flag".len() as u32),
+                    )
+                    .expect("value span is ordered"),
+                ),
+            ],
+            "type and expression diagnostics are merged by source location"
+        );
+
+        let use_span_for = |text: &str| {
+            let start =
+                root.find(text)
+                    .unwrap_or_else(|| panic!("use path `{text}` exists")) as u32;
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + text.len() as u32),
+                )
+                .expect("use package path range is ordered"),
+            )
+        };
+        let alias_use_span = use_span_for("acme:test-support/fixtures");
+        let type_use_start = root
+            .find("acme:test-support/fixtures.{Fixture}")
+            .expect("type item use exists") as u32;
+        let type_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(type_use_start),
+                sai_diagnostics::TextSize::new(
+                    type_use_start + "acme:test-support/fixtures".len() as u32,
+                ),
+            )
+            .expect("type package path range is ordered"),
+        );
+        let value_use_start = root
+            .find("acme:test-support/fixtures.{flag}")
+            .expect("value item use exists") as u32;
+        let value_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(value_use_start),
+                sai_diagnostics::TextSize::new(
+                    value_use_start + "acme:test-support/fixtures".len() as u32,
+                ),
+            )
+            .expect("value package path range is ordered"),
+        );
+        for (diagnostic, expected_use_span) in [
+            (&both_diagnostics[0], &type_use_span),
+            (&both_diagnostics[1], &value_use_span),
+        ] {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            assert!(diagnostic.related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. } if &location.span == expected_use_span
+            )));
+        }
+
+        let qualified = &results.owners()[1];
+        let qualified_paths = qualified
+            .test_only_path_resolution()
+            .expect("qualified const type lookup succeeds")
+            .expect("qualified const has a path result");
+        assert_eq!(qualified_paths.paths().len(), 1);
+        assert_eq!(
+            qualified_paths.paths().values().next(),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 1,
+                segment_count: 2,
+            }),
+            "the test-only module head is rejected while its qualified tail stays deferred"
+        );
+        let qualified_diagnostics = qualified
+            .test_only_diagnostics()
+            .expect("qualified const type diagnostic succeeds");
+        assert_eq!(qualified_diagnostics.len(), 1);
+        let qualified_start = root
+            .find("const QUALIFIED: fixture.")
+            .expect("qualified type declaration exists") as u32
+            + "const QUALIFIED: ".len() as u32;
+        assert_eq!(
+            qualified_diagnostics[0]
+                .primary()
+                .expect("qualified type reference has a primary location")
+                .span,
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(qualified_start),
+                    sai_diagnostics::TextSize::new(qualified_start + "fixture".len() as u32,),
+                )
+                .expect("qualified module head span is ordered"),
+            )
+        );
+        assert!(
+            qualified_diagnostics[0]
+                .related()
+                .iter()
+                .any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. } if location.span == alias_use_span
+                ))
+        );
+
+        let body_owner = &results.owners()[2];
+        let body_paths = body_owner
+            .test_only_path_resolution()
+            .expect("initializer type lookup succeeds")
+            .expect("const initializer has a non-expression path result");
+        assert_eq!(body_paths.paths().len(), 1);
+        assert_eq!(
+            body_paths.paths().values().next().map(|path| path.base),
+            Some(Res::Err),
+            "a test-only type annotation inside the initializer body is rejected"
+        );
+        let body_diagnostics = body_owner
+            .test_only_diagnostics()
+            .expect("initializer type diagnostics succeed");
+        assert_eq!(body_diagnostics.len(), 1);
+        let body_type_start =
+            root.find("value: Fixture")
+                .expect("initializer local type annotation exists") as u32
+                + "value: ".len() as u32;
+        assert_eq!(
+            body_diagnostics[0]
+                .primary()
+                .expect("initializer type reference has a primary location")
+                .span,
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(body_type_start),
+                    sai_diagnostics::TextSize::new(body_type_start + "Fixture".len() as u32,),
+                )
+                .expect("initializer type head span is ordered"),
+            )
+        );
+        assert!(body_diagnostics[0].related().iter().any(|related| matches!(
+            related,
+            Related::DeclaredHere { location, .. } if &location.span == &type_use_span
+        )));
+
+        let resolved_type = Res::Def(
+            DefKind::Struct,
+            collection.scopes.top_level_owners[0]
+                .owner
+                .def_id
+                .to_def_id(),
+        );
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            scope.imports[type_import.0 as usize].res = resolved_type;
+            scope
+                .scope
+                .get_mut(&type_symbol)
+                .expect("type binding exists")
+                .res = resolved_type;
+        }
+        let resolved_results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("resolved test-only type imports remain diagnosable");
+        assert_eq!(
+            resolved_results.owners()[0]
+                .test_only_diagnostics()
+                .expect("origin-based const diagnostics succeed")
+                .len(),
+            2,
+            "const type diagnostics follow the import origin even when Res is Def"
+        );
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            scope.imports[type_import.0 as usize].res = Res::Err;
+            scope
+                .scope
+                .get_mut(&type_symbol)
+                .expect("type binding exists")
+                .res = Res::Err;
+        }
+        let diagnosed_results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("diagnosed test-only type imports remain diagnosable");
+        assert_eq!(
+            diagnosed_results.owners()[0]
+                .test_only_diagnostics()
+                .expect("diagnosed const imports retain their origin")
+                .len(),
+            2,
+            "const type diagnostics follow the import origin even when Res is Err"
+        );
+
+        {
+            let scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            scope.imports[type_import.0 as usize].test_only = false;
+        }
+        let ordinary_results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("ordinary type errors remain in their own diagnostic channel");
+        assert_eq!(
+            ordinary_results.owners()[0]
+                .test_only_diagnostics()
+                .expect("ordinary type import diagnostics succeed")
+                .len(),
+            1,
+            "only the test-only initializer value remains diagnosed"
+        );
+        assert!(
+            ordinary_results.owners()[0]
+                .test_only_path_resolution()
+                .expect("ordinary type path lookup succeeds")
+                .expect("ordinary type path result is present")
+                .paths()
+                .is_empty(),
+            "ordinary Res::Err type bindings do not cascade into this diagnostic"
+        );
+        assert!(
+            ordinary_results.owners()[1]
+                .test_only_diagnostics()
+                .expect("qualified test-only type diagnostic still succeeds")
+                .len()
+                == 1
+        );
+
+        // The fixture alias remains test-only through the whole check.
+        assert!(
+            collection.scopes.modules[ModuleId::ROOT.raw() as usize].imports
+                [fixture_import.0 as usize]
+                .test_only
         );
     }
 
