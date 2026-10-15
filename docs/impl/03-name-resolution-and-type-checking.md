@@ -827,8 +827,9 @@ After local lookup, one-segment plain expression paths resolve through the
 same file's module scope. Test-only and diagnosed module bindings retain their
 `Res` values, while misses remain deferred. Test and property owners have no
 generic parameters, so this bridge supplies an empty generic-name set. Prelude
-lookup, qualified-member tails, type-position paths, test-only diagnostics,
-tracked `hir_owner`/`resolve_owner` queries, and type checking remain deferred.
+lookup, qualified-member tails, type-position paths, test-only diagnostics for
+other non-test owner kinds, tracked `hir_owner`/`resolve_owner` queries, and
+type checking remain deferred.
 
 **Constant-owner path analysis (IR-525).** For every target-filtered top-level
 const descriptor, the driver lowers the current initializer and resolves its
@@ -836,10 +837,23 @@ plain one-segment expression paths through lexical locals and then the
 `Phase1ModuleScopes` selected by the exact source file. Constants have no
 generic parameters or body-local bindings in the accepted const-expression
 grammar, so this bridge passes an empty generic set and leaves misses deferred.
-It preserves `Res::Err` and `Res::TestOnly` for a later owner-aware diagnostic
-pass. It does not validate §6.27 constant-expression legality, resolve
-type-position paths or qualified tails, perform prelude lookup, or emit final
-unresolved-name diagnostics.
+IR-526 checks deferred initializer paths against the effective binding origin;
+test-only references produce a diagnostic and become `Res::Err`, regardless
+of the import's current `Res`. Other `Res::Err` and `Res::TestOnly` values are
+preserved. This partial pass does not validate §6.27 constant-expression
+legality, resolve type-position paths or qualified tails, perform prelude
+lookup, or emit final unresolved-name diagnostics.
+
+**Const test-only reference diagnostics (IR-526).** After local and module
+lookup for a const initializer, the driver examines each deferred one-segment
+expression path in source order. It follows the exact module binding's
+`BindingOrigin` to its `ImportBinding` and checks `test_only`, independent of
+the binding's `Res`. Local shadowing has already removed that path from the
+deferred set. Each test-only reference gets `TEST_DEPENDENCY_OUTSIDE_TEST` at
+the path and a note at the originating use's complete `PKG_PATH`; the path
+result becomes `Res::Err` so later phases do not cascade. This slice covers
+const initializer expressions only. Const type paths and test-only references
+in other non-test owners remain for the tracked owner resolver.
 
 ### 3.4.6 Visibility
 
