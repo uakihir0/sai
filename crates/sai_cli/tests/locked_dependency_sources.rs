@@ -265,7 +265,8 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         "use acme:middle as middle\n",
         "type Record {\n",
         "  public: middle.api.PublicType\n",
-        "}\n"
+        "}\n",
+        "type RootTypo = middle.api.PublicTypo\n",
     );
     fs::write(root.join("src/lib.sai"), root_source).expect("write root source");
     fs::write(
@@ -285,7 +286,8 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             "pub use acme:leaf.{api}\n",
             "type MiddleRecord {\n",
             "  value: leaf_model.PrivateType\n",
-            "  missing: leaf_model.MissingType\n",
+            "  missing: leaf_model.PublicTypo\n",
+            "  hidden_missing: leaf_model.PrivatType\n",
             "}\n",
         ),
     )
@@ -297,7 +299,16 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
     .expect("write leaf package manifest");
     fs::write(
         leaf.join("src/lib.sai"),
-        "pub interface api {\n type PublicType = U32\n}\n",
+        concat!(
+            "pub interface api {\n",
+            "  type PublicTppe = U32\n",
+            "  type PublicType = U32\n",
+            "  type PublicTypoC = U32\n",
+            "  type PublicTypoB = U32\n",
+            "  type PublicTypoA = U32\n",
+            "  type PublicTypoE = U32\n",
+            "}\n",
+        ),
     )
     .expect("write leaf package root");
     fs::write(
@@ -377,7 +388,65 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             )),
         "the foreign declaration is attached at its exact source location: {private}"
     );
-    assert!(!stdout.contains("\"code\":\"UNRESOLVED_NAME\""), "{stdout}");
+    let unresolved_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
+        .collect::<Vec<_>>();
+    assert_eq!(unresolved_diagnostics.len(), 3, "{stdout}");
+    let middle_source = concat!(
+        "use acme:leaf/model as leaf_model\n",
+        "pub use acme:leaf.{api}\n",
+        "type MiddleRecord {\n",
+        "  value: leaf_model.PrivateType\n",
+        "  missing: leaf_model.PublicTypo\n",
+        "  hidden_missing: leaf_model.PrivatType\n",
+        "}\n",
+    );
+    let missing_start = middle_source
+        .find("PublicTypo")
+        .expect("missing reference exists");
+    let missing = unresolved_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains("PublicTypo")
+        })
+        .expect("missing member diagnostic is present");
+    assert!(
+        missing.contains("\"package\":\"acme:middle@1.0.0\"")
+            && missing.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+            && missing.contains("no item `PublicTypo` in module `acme:leaf@1.0.0/model`")
+            && missing.contains("\"candidates\":[\"PublicType\"]")
+            && missing.contains(&format!("\"start\":{{\"byte\":{missing_start},")),
+        "{missing}"
+    );
+    let hidden = unresolved_diagnostics
+        .iter()
+        .find(|line| line.contains("PrivatType"))
+        .expect("private lookalike miss is diagnosed");
+    assert!(
+        hidden.contains("\"candidates\":[]"),
+        "private members of a dependency are not suggested: {hidden}"
+    );
+    let root_missing_start = root_source
+        .find("PublicTypo")
+        .expect("root missing reference exists");
+    let root_missing = unresolved_diagnostics
+        .iter()
+        .find(|line| line.contains("\"path\":\"src/lib.sai\"") && line.contains("PublicTypo"))
+        .expect("root transitive missing member diagnostic is present");
+    assert!(
+        root_missing.contains("\"package\":\"acme:check@0.1.0\"")
+            && root_missing.contains("no item `PublicTypo` in module `acme:leaf@1.0.0/api`")
+            && root_missing
+                .contains("\"candidates\":[\"PublicType\",\"PublicTypoC\",\"PublicTypoB\"]")
+            && root_missing.contains(&format!("\"start\":{{\"byte\":{root_missing_start},")),
+        "{root_missing}"
+    );
+    assert!(
+        root_missing.contains("similar names: `PublicType`, `PublicTypoC`, `PublicTypoB`"),
+        "the help child preserves the same ordered, capped candidates: {root_missing}"
+    );
     assert!(
         !stdout.contains("\"stage\":3,\"feature\":\"dependencies\""),
         "{stdout}"
@@ -386,6 +455,10 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
             && !stdout.contains("\"type\":\"result\""),
         "the existing incomplete-analysis outcome remains in effect: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""),
+        "{stdout}"
     );
 }
 
