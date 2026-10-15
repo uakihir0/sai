@@ -301,8 +301,11 @@ imports remain deferred until external item and prelude identities are
 available.
 
 Foreign package and interface member tables remain deferred, as do active-edge
-identity checks for imports from foreign targets, test-only reference checks,
-and the final `package_scopes(PackageId)` query.
+identity checks for imports from foreign targets, test-only reference checks
+for owner kinds not yet covered by the incremental owner adapters, and the
+final `package_scopes(PackageId)` query. The adapters below cover top-level
+functions, consts, invariants, refined types, and refinement-bearing distinct
+types; this is not the complete tracked owner resolver.
 The resolver does not yet build the complete canonical prelude
 `BTreeMap<Symbol, Res>` described in §3.3.7; the current bridge compares local
 definition paths for the supported item-import cases.
@@ -794,8 +797,8 @@ rejected path heads to `Res::Err`, and returns separate module-resolution,
 path-resolution, and diagnostic channels. Test-only diagnostics are source
 ordered and preserve per-owner failures; path results are keyed by HIR path in
 a map. The new channels are optional on the shared
-predicate result because refinement and extern predicate adapters have not
-yet adopted this pass; those adapters retain their existing behavior.
+predicate result because the extern predicate adapter has not yet adopted
+this pass; that adapter retains its existing behavior.
 
 **Top-level refinement predicates (IR-515).** The bridge now also validates
 `Body::value` for top-level `type R = B where p` and `distinct D = B where p`
@@ -804,9 +807,26 @@ so prohibited jumps receive `INVALID_CONTRACT_EXPRESSION` without label or
 outside-function cascades. Distinct declarations without a refinement clause
 are not indexed. IR-521 also resolves block-local names in each predicate from
 the same lowering result, while leaving implicit `self` for owner-aware
-resolution. Generic, module, interface, prelude, and test-only fallback,
-type resolution, nested interface type declarations, and other owner kinds
-remain deferred.
+resolution. Generic, interface, and prelude fallback, ordinary type
+resolution, nested interface type declarations, and other owner kinds remain
+deferred. IR-531 adds exact-module and test-only path checks for top-level
+refined and refinement-bearing distinct owners only.
+
+**Refinement test-only references (IR-531).** The refined/distinct predicate
+adapter resolves expression paths after local names and checks the base type,
+predicate HIR types, generic bounds, const-parameter types, and recovered
+generic `where` clauses against the exact module scope. Distinct generic names
+shadow module bindings. Invalid refined declarations have no generic fields
+in HIR, so their generic names come from the current filtered ItemTree and
+their generic-syntax `PathType` and `PathExpr` heads, plus nested types and
+effects inside function-sugar bounds, are diagnosed from the current AST.
+Function-sugar names such as `Fn` remain bound to their core lang items. The
+AST scan emits diagnostics
+without fabricating HIR path results. HIR-backed paths retain separate
+expression and non-expression results; test-only diagnostics are merged in
+source order and use import origins with complete `PKG_PATH` notes. This pass
+does not provide general type, effect, interface, Prelude, or final
+unresolved-name resolution.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
@@ -891,8 +911,9 @@ deferred set. Each test-only reference gets `TEST_DEPENDENCY_OUTSIDE_TEST` at
 the path and a note at the originating use's complete `PKG_PATH`; the path
 result becomes `Res::Err` so later phases do not cascade. IR-526 covered const
 initializer expressions only. IR-528 below extends the same diagnostic rule to
-const declaration-type heads; test-only references in other non-test owners
-remain for the tracked owner resolver.
+const declaration-type heads; IR-529 and IR-531 add invariant and
+refined/distinct predicate owners. Extern, trait, impl, interface, and other
+non-test owner kinds remain for later integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
 the declared type before its body-dependent local-resolution branch and also
