@@ -41,7 +41,7 @@ use sai_resolve::owner::{
     resolve_predicate_expression,
 };
 use sai_resolve::package_scopes::{
-    BindingOrigin, DefKind, FilteredModule, ForeignPackageScope, PackageScopesError,
+    BindingOrigin, DefKind, FilteredModule, ForeignPackageScope, ImportIndex, PackageScopesError,
     PackageUseRequirement, Phase1ModuleScopes, RefinementPredicateOwnerKind, Res,
     collect_module_alias_bindings_with_foreign_scopes, collect_phase1,
     suppress_export_name_feature_gate,
@@ -55,7 +55,8 @@ use sai_resolve::use_target_diagnostics::{
 };
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
-use sai_syntax::{Parse, ParseQueryError, SyntaxQueries, ast};
+use sai_syntax::ast::{self, AstNode, AstToken};
+use sai_syntax::{Parse, ParseQueryError, SyntaxQueries};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
@@ -1106,6 +1107,7 @@ pub struct ConstOwnerResolution {
     owner: OwnerId,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
 }
 
@@ -1128,6 +1130,10 @@ impl ConstOwnerResolution {
         self.module_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
     }
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
@@ -1195,6 +1201,15 @@ pub enum OwnerControlFlowResolutionError {
         current: ItemTreeKind,
     },
     MissingModuleScope(FileId),
+    MissingImportBinding {
+        owner: OwnerId,
+        import: ImportIndex,
+    },
+    MissingTestOnlyUseSyntax {
+        owner: OwnerId,
+        import: ImportIndex,
+    },
+    InvalidSourceLocation(OwnerId),
     Lowering(HirLoweringError),
     Labels(LabelResolutionError),
     Locals(LocalResolutionError),
@@ -1454,6 +1469,108 @@ fn module_scope_for_file<'a>(
         .module(module_id)
         .ok_or(OwnerControlFlowResolutionError::MissingModuleScope(file))?;
     Ok(module_scope)
+}
+
+fn collect_const_test_only_reference_diagnostics(
+    owner: OwnerId,
+    locals: &LocalResolution,
+    module_scope: &Phase1ModuleScopes,
+    module_resolution: &mut ModuleResolution,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
+    let mut diagnostics = Vec::new();
+    for candidate in &locals.deferred_paths {
+        let Some(binding) = module_scope.scope.get(&candidate.name) else {
+            continue;
+        };
+        let import_index = match binding.origin {
+            BindingOrigin::Decl => continue,
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+        };
+        let import = module_scope.imports.get(import_index.0 as usize).ok_or(
+            OwnerControlFlowResolutionError::MissingImportBinding {
+                owner,
+                import: import_index,
+            },
+        )?;
+        if !import.test_only {
+            continue;
+        }
+
+        let path = module_resolution.paths.entry(candidate.hir_id).or_insert(
+            sai_resolve::package_scopes::PathRes {
+                base: binding.res,
+                resolved_segments: 1,
+                segment_count: 1,
+            },
+        );
+        path.base = Res::Err;
+        module_resolution
+            .deferred_paths
+            .retain(|deferred| deferred.hir_id != candidate.hir_id);
+
+        let reference = sai_diagnostics::Location::from_decoded_source(
+            inputs.source_ref.clone(),
+            sai_diagnostics::Span::new(candidate.span.file, candidate.span.range),
+            &inputs.source,
+        )
+        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            owner,
+        ))?;
+        let syntax = inputs
+            .ast_ids
+            .pointer(import.use_ast_id)
+            .and_then(|pointer| {
+                pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
+            })
+            .ok_or(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                owner,
+                import: import_index,
+            })?;
+        let use_decl = ast::UseDecl::cast(syntax).ok_or(
+            OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                owner,
+                import: import_index,
+            },
+        )?;
+        let package_path = use_decl.package().ok_or(
+            OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                owner,
+                import: import_index,
+            },
+        )?;
+        let use_location = sai_diagnostics::Location::from_decoded_source(
+            inputs.source_ref.clone(),
+            sai_diagnostics::Span::new(
+                inputs.filtered_item_tree.file,
+                package_path.syntax().text_range(),
+            ),
+            &inputs.source,
+        )
+        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            owner,
+        ))?;
+        let mut diagnostic = Diagnostic::new(
+            sai_diagnostics::Code::TestDependencyOutsideTest,
+            sai_diagnostics::Severity::Error,
+            "test-only bindings may be referenced only from test or property owners",
+            Some(reference),
+        );
+        diagnostic.primary_label = "test-only reference outside a test or property".to_owned();
+        diagnostic.package = inputs.source_ref.package.clone();
+        diagnostic
+            .push_related(Related::DeclaredHere {
+                location: use_location,
+                what: "test-only use".to_owned(),
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+        let diagnostic = diagnostic
+            .with_workspace_snapshot(snapshot)
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+        diagnostics.push(diagnostic);
+    }
+    Ok(diagnostics)
 }
 
 fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol> {
@@ -3159,7 +3276,7 @@ impl RootDatabase {
     }
 
     /// Resolves lexical locals and one-segment module paths in top-level
-    /// constant initializers.
+    /// constant initializers, including test-only reference diagnostics.
     ///
     /// This uncached bridge uses the exact current lowering and source map for
     /// each target-filtered owner. Constant-expression legality and final
@@ -3202,6 +3319,7 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -3221,6 +3339,7 @@ impl RootDatabase {
                     (
                         Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
                         Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                        Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
                     ),
                     OwnerControlFlowResolutionError,
                 > = (|| {
@@ -3262,7 +3381,7 @@ impl RootDatabase {
                     )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     let Some(body) = hir_owner.body else {
-                        return Ok((Ok(None), Ok(None)));
+                        return Ok((Ok(None), Ok(None), Ok(Vec::new())));
                     };
                     let locals = match &module_aliases {
                         Ok(module_aliases) => resolve_owner_locals(
@@ -3277,7 +3396,7 @@ impl RootDatabase {
                     };
                     match locals {
                         Ok(locals) => {
-                            let module_resolution = match &module_scope {
+                            let mut module_resolution = match &module_scope {
                                 Ok(module_scope) => Ok(Some(resolve_owner_module_paths(
                                     &locals,
                                     module_scope,
@@ -3285,17 +3404,35 @@ impl RootDatabase {
                                 ))),
                                 Err(error) => Err(error.clone()),
                             };
-                            Ok((Ok(Some(locals)), module_resolution))
+                            let test_only_diagnostics = match &module_scope {
+                                Ok(module_scope) => match &mut module_resolution {
+                                    Ok(Some(module_resolution)) => {
+                                        collect_const_test_only_reference_diagnostics(
+                                            descriptor.owner,
+                                            &locals,
+                                            module_scope,
+                                            module_resolution,
+                                            &inputs,
+                                            snapshot,
+                                        )
+                                    }
+                                    Ok(None) => Ok(Vec::new()),
+                                    Err(error) => Err(error.clone()),
+                                },
+                                Err(error) => Err(error.clone()),
+                            };
+                            Ok((Ok(Some(locals)), module_resolution, test_only_diagnostics))
                         }
-                        Err(error) => Ok((Err(error.clone()), Err(error))),
+                        Err(error) => Ok((Err(error.clone()), Err(error.clone()), Err(error))),
                     }
                 })();
-                let (local_resolution, module_resolution) =
-                    analysis.unwrap_or_else(|error| (Err(error.clone()), Err(error)));
+                let (local_resolution, module_resolution, test_only_diagnostics) = analysis
+                    .unwrap_or_else(|error| (Err(error.clone()), Err(error.clone()), Err(error)));
                 owners.push(ConstOwnerResolution {
                     owner: descriptor.owner,
                     local_resolution,
                     module_resolution,
+                    test_only_diagnostics,
                     lowering_diagnostics,
                 });
             }
@@ -4972,7 +5109,7 @@ mod tests {
     fn const_owner_paths_preserve_test_only_resolution_markers() {
         let root = concat!(
             "use acme:test-support/fixtures as fixture\n",
-            "const COPY: Bool = fixture\n",
+            "const COPY: Bool = fixture && fixture\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -4985,7 +5122,7 @@ mod tests {
             &b"package acme:phase1 @ 1.0.0\n\
               requires test { acme:test-support @ ^1 }\n"[..],
         );
-        let collection = database
+        let mut collection = database
             .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
                 &module_tree,
                 &snapshot,
@@ -5017,8 +5154,283 @@ mod tests {
                 .values()
                 .map(|path| path.base)
                 .collect::<Vec<_>>(),
-            [expected],
-            "the later owner-aware pass can still diagnose test-only use in a const"
+            [Res::Err, Res::Err],
+            "the const owner diagnostic suppresses later cascades"
+        );
+        let diagnostics = results.owners()[0]
+            .test_only_diagnostics()
+            .expect("test-only reference analysis succeeds");
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "each reference gets its own diagnostic"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code
+                    == sai_diagnostics::Code::TestDependencyOutsideTest)
+        );
+        let initializer_start = root
+            .find("const COPY: Bool = ")
+            .expect("const initializer exists") as u32
+            + "const COPY: Bool = ".len() as u32;
+        let reference_starts = [
+            initializer_start,
+            initializer_start + "fixture && ".len() as u32,
+        ];
+        let primary_spans = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("primary span exists")
+                    .span
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primary_spans,
+            reference_starts.map(|reference_start| {
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(reference_start),
+                        sai_diagnostics::TextSize::new(reference_start + "fixture".len() as u32),
+                    )
+                    .expect("reference range is ordered"),
+                )
+            })
+        );
+        let use_path_start = root
+            .find("acme:test-support/fixtures")
+            .expect("test-only package path exists") as u32;
+        let expected_use_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(use_path_start),
+                sai_diagnostics::TextSize::new(
+                    use_path_start + "acme:test-support/fixtures".len() as u32,
+                ),
+            )
+            .expect("package path range is ordered"),
+        );
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic
+                .related()
+                .iter()
+                .find_map(|related| match related {
+                    Related::DeclaredHere { location, .. } => Some(&location.span),
+                    _ => None,
+                })
+                == Some(&expected_use_span)
+        }));
+
+        let resolved_def = Res::Def(
+            DefKind::Const,
+            collection.scopes.top_level_owners[0]
+                .owner
+                .def_id
+                .to_def_id(),
+        );
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let test_only_name = module_scope.imports[0].name;
+        module_scope.imports[0].res = resolved_def;
+        module_scope
+            .scope
+            .get_mut(&test_only_name)
+            .expect("test-only binding exists")
+            .res = resolved_def;
+        let resolved_results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("active test-only resolutions remain diagnosable");
+        assert_eq!(
+            resolved_results.owners()[0]
+                .module_resolution()
+                .expect("module lookup succeeds")
+                .expect("const owner has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err, Res::Err],
+            "test-only references are rejected even when their import resolves"
+        );
+        assert_eq!(
+            resolved_results.owners()[0]
+                .test_only_diagnostics()
+                .expect("diagnostic collection succeeds")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn const_owner_test_only_item_bindings_are_diagnosed() {
+        let root = concat!(
+            "use acme:test-support/fixtures.{flag}\n",
+            "const COPY: Bool = flag\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only item use is retained without test analysis");
+        let import = &collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .imports[0];
+        assert!(import.test_only);
+        assert!(import.item_index.is_some());
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const path analysis succeeds");
+        let owner = &results.owners()[0];
+        assert_eq!(
+            owner
+                .module_resolution()
+                .expect("module resolution succeeds")
+                .expect("const owner has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err]
+        );
+        assert_eq!(
+            owner
+                .test_only_diagnostics()
+                .expect("diagnostic collection succeeds")
+                .len(),
+            1,
+            "an item import is diagnosed through its import origin"
+        );
+    }
+
+    #[test]
+    fn const_owner_test_only_diagnostics_respect_local_precedence() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "const COPY: Bool = { let fixture = true; fixture }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only use is retained");
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const path analysis succeeds for recovered block syntax");
+        let owner = &results.owners()[0];
+        let local = owner
+            .local_resolution()
+            .expect("local resolution succeeds")
+            .expect("block initializer has a local result");
+        assert!(
+            local
+                .paths
+                .values()
+                .any(|path| matches!(path.base, Res::Local(_))),
+            "the block local wins over the same-named test-only import"
+        );
+        assert!(
+            owner
+                .test_only_diagnostics()
+                .expect("diagnostic collection succeeds")
+                .is_empty(),
+            "a locally resolved path is not a test-only module reference"
+        );
+    }
+
+    #[test]
+    fn const_owner_ordinary_error_import_does_not_look_test_only() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "const COPY: Bool = fixture\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only import remains in module scope");
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let import_index = ImportIndex(0);
+        let imported_name = module_scope.imports[import_index.0 as usize].name;
+        module_scope.imports[import_index.0 as usize].test_only = false;
+        module_scope.imports[import_index.0 as usize].res = Res::Err;
+        let binding = module_scope
+            .scope
+            .get_mut(&imported_name)
+            .expect("module binding exists");
+        binding.res = Res::Err;
+        assert!(!module_scope.imports[import_index.0 as usize].test_only);
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const path analysis succeeds");
+        let owner = &results.owners()[0];
+        assert_eq!(
+            owner
+                .module_resolution()
+                .expect("module resolution succeeds")
+                .expect("const owner has a module result")
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err]
+        );
+        assert!(
+            owner
+                .test_only_diagnostics()
+                .expect("diagnostic collection succeeds")
+                .is_empty(),
+            "an ordinary failed import keeps its own diagnostic without a test-only cascade"
         );
     }
 
@@ -5075,6 +5487,14 @@ mod tests {
             [Res::Err],
             "the const path retains its inactive-import sentinel"
         );
+        assert_eq!(
+            inactive_import_results.owners()[0]
+                .test_only_diagnostics()
+                .expect("diagnostic collection succeeds")
+                .len(),
+            1,
+            "inactive test-only imports still diagnose their reference"
+        );
 
         let const_item_id = collection.scopes.top_level_owners[1].item_id;
         collection.scopes.top_level_owners[0].item_id = const_item_id;
@@ -5085,6 +5505,7 @@ mod tests {
         assert_eq!(results.owners().len(), 2);
         assert!(results.owners()[0].local_resolution().is_err());
         assert!(results.owners()[0].module_resolution().is_err());
+        assert!(results.owners()[0].test_only_diagnostics().is_err());
         assert!(
             results.owners()[1]
                 .local_resolution()
@@ -5096,6 +5517,12 @@ mod tests {
             .expect("the following module lookup succeeds")
             .expect("SECOND has a module result");
         assert!(second_module.paths.is_empty());
+        assert!(
+            results.owners()[1]
+                .test_only_diagnostics()
+                .expect("SECOND diagnostic collection succeeds")
+                .is_empty()
+        );
     }
 
     #[test]
