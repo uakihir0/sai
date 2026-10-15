@@ -854,6 +854,15 @@ later diagnostic mapping. Rejected test-only heads remain `Res::Err` and do
 not start member traversal. Foreign module aliases stay deferred until a
 validated active-source closure is available.
 
+**Qualified local predicate-owner type prefixes (IR-558).** Invariant,
+refined, and refinement-bearing distinct owner type paths continue through
+current-package module and interface members. Stop at the first non-module
+member, retain the full path length and type-relative suffix, and keep missing
+local members as typed path errors. Same-package private members remain
+visible. Rejected test-only heads do not produce member lookup errors, and
+expression lookup remains separate. Foreign scopes and WIT members stay
+deferred.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
