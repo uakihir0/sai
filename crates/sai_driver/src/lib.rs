@@ -9575,6 +9575,7 @@ mod tests {
             "use acme:test-support/fixtures as fixture\n",
             "use acme:test-support/fixtures.{Fixture}\n",
             "use acme:test-support/fixtures.{flag}\n",
+            "fn real_definition() {}\n",
             "unsafe extern \"wasm\" module \"env\" {\n",
             "  fn bodyless(value: Fixture) -> Fixture;\n",
             "  fn generic<Fixture>(value: Fixture) -> Fixture;\n",
@@ -9793,31 +9794,123 @@ mod tests {
             "later owners continue resolving after one descriptor fails"
         );
 
+        // A real Def resolution must not erase the originating test-only
+        // classification. Both import records and their visible bindings
+        // carry the same definition, as after successful import resolution.
+        let (fixture_symbol, fixture_import, flag_symbol, flag_import) = {
+            let root_scope = collection
+                .scopes()
+                .module(ModuleId::ROOT)
+                .expect("root module scope exists");
+            let binding_for = |name: &str| {
+                root_scope
+                    .scope
+                    .iter()
+                    .find(|(symbol, _)| {
+                        database
+                            .resolve_symbol(**symbol)
+                            .is_ok_and(|spelling| spelling.as_ref() == name)
+                    })
+                    .unwrap_or_else(|| panic!("root module scope contains `{name}`"))
+            };
+            let (fixture_symbol, fixture_binding) = binding_for("Fixture");
+            let (flag_symbol, flag_binding) = binding_for("flag");
+            let import_index = |binding: &sai_resolve::package_scopes::Binding| {
+                let (BindingOrigin::Use { import } | BindingOrigin::PubUse { import }) =
+                    binding.origin
+                else {
+                    panic!("test-only binding comes from an import");
+                };
+                import
+            };
+            (
+                *fixture_symbol,
+                import_index(fixture_binding),
+                *flag_symbol,
+                import_index(flag_binding),
+            )
+        };
+        let resolved_definition = Res::Def(
+            DefKind::Fn,
+            collection.scopes.function_owners[0]
+                .owner
+                .def_id
+                .to_def_id(),
+        );
+        let mut resolved_import_collection = collection.clone();
+        {
+            let root_scope =
+                &mut resolved_import_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            for (symbol, import) in [(fixture_symbol, fixture_import), (flag_symbol, flag_import)] {
+                assert!(
+                    root_scope.imports[import.0 as usize].test_only,
+                    "the import remains classified as test-only"
+                );
+                root_scope.imports[import.0 as usize].res = resolved_definition;
+                root_scope
+                    .scope
+                    .get_mut(&symbol)
+                    .expect("visible test-only binding exists")
+                    .res = resolved_definition;
+            }
+        }
+        let resolved_imports = database
+            .resolve_extern_function_predicates(
+                &resolved_import_collection,
+                &module_tree,
+                &snapshot,
+            )
+            .expect("resolved test-only imports remain diagnosable");
+        let resolved_bodyless = &resolved_imports.owners()[0];
+        let resolved_bodyless_diagnostics = resolved_bodyless
+            .test_only_diagnostics()
+            .expect("resolved bodyless signature diagnostics succeed")
+            .expect("extern adapter keeps its signature diagnostic pass");
+        assert_eq!(resolved_bodyless_diagnostics.len(), 2);
+        for diagnostic in resolved_bodyless_diagnostics {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            assert_import_note(diagnostic, &fixture_package_path);
+        }
+        assert!(
+            resolved_bodyless
+                .test_only_path_resolution()
+                .expect("resolved signature path lookup succeeds")
+                .expect("bodyless signature path results exist")
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "resolved test-only signature paths are rewritten to the error sentinel"
+        );
+
+        let resolved_contracted = &resolved_imports.owners()[2];
+        let resolved_contract_diagnostics = resolved_contracted
+            .test_only_diagnostics()
+            .expect("resolved contract diagnostics succeed")
+            .expect("extern contract diagnostic pass is present");
+        assert_eq!(resolved_contract_diagnostics.len(), 2);
+        for diagnostic in resolved_contract_diagnostics {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TestDependencyOutsideTest
+            );
+            assert_import_note(diagnostic, &flag_package_path);
+        }
+        assert!(
+            resolved_contracted
+                .module_resolution()
+                .expect("resolved contract module lookup succeeds")
+                .expect("contract module results exist")
+                .paths
+                .values()
+                .all(|path| path.base == Res::Err),
+            "resolved test-only contract paths are rewritten to the error sentinel"
+        );
+
         // Reclassifying an imported name as ordinary keeps it outside the
         // test-only diagnostic channel while preserving signature diagnostics.
-        let flag_symbol = collection
-            .scopes
-            .module(ModuleId::ROOT)
-            .expect("root scope exists")
-            .scope
-            .keys()
-            .copied()
-            .find(|symbol| {
-                database
-                    .resolve_symbol(*symbol)
-                    .is_ok_and(|name| name.as_ref() == "flag")
-            })
-            .expect("flag module binding exists");
-        let flag_import = match collection
-            .scopes
-            .module(ModuleId::ROOT)
-            .expect("root scope exists")
-            .scope[&flag_symbol]
-            .origin
-        {
-            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
-            BindingOrigin::Decl => panic!("flag comes from an import"),
-        };
         let root_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
         root_scope.imports[flag_import.0 as usize].test_only = false;
         let ordinary_import = database
