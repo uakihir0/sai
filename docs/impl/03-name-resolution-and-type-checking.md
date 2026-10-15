@@ -627,7 +627,7 @@ Resolution of a canonical path walks the module tree of `sai:core` or `sai:alloc
 
 The prelude is a fixed table `prelude: BTreeMap<Symbol, Res>` built once from the list of spec/16 §16.4, by canonical path as for lang items. The reserved type names map to `Res::PrimTy(..)`: `Int ↦ I64`, `UInt ↦ U64` (D-TYPE-01), `Never ↦ PrimTy::Never`. `Array` maps to the built-in array constructor `Res::PrimTy(PrimTy::Array)`, because `Array<T, N>` is a structural type (spec/05 §5.1.3) even though it has a library module for its associated functions (§3.9.3).
 
-**Canonical prelude provider (IR-530) and primitive resolutions (IR-533).** `sai_resolve::prelude` defines all 50 canonical standard-library item paths and the 19 primitive type and constructor names, and builds the complete set of 69 names from a caller-supplied canonical-item resolver. The builder checks each item’s expected kind and standard-package identity. `Res::PrimTy(PrimTy)` now represents primitive resolutions, while `PreludeBinding` remains explicit so callers can distinguish built-in bindings from canonical library items. The provider uses a symbol-keyed hash map for lookup plus an entry slice sorted by spelling, since `Symbol` does not implement `Ord`. The provider is defined and tested, but is not yet wired into owner lookup or package-scope construction.
+**Canonical prelude provider (IR-530), primitive resolutions (IR-533), and early primitive lookup (IR-546).** `sai_resolve::prelude` defines all 50 canonical standard-library item paths and the 19 primitive type and constructor names, and builds the complete set of 69 names from a caller-supplied canonical-item resolver. The builder checks each item’s expected kind and standard-package identity. `Res::PrimTy(PrimTy)` represents primitive resolutions, while `PreludeBinding` remains explicit so callers can distinguish built-in bindings from canonical library items. The provider uses a symbol-keyed hash map for lookup plus an entry slice sorted by spelling, since `Symbol` does not implement `Ord`. Top-level struct, alias, enum, and resource type-owner lookup now consults a primitive-only table after generic and exact module-scope lookup. That static table participates in the tracked query identity. Non-primitive canonical entries such as `Option` and `String` remain deferred because this checkout does not yet supply the `sai:core` and `sai:alloc` package scopes needed to construct their real `DefId`s.
 
 ## 3.4 Resolving paths in owners
 
@@ -733,6 +733,17 @@ excluded while same-package private members remain eligible. No `use` fix is
 offered for a missing qualified suffix: importing the suffix into the current
 scope cannot make the original `module.missing` path resolve. Unqualified
 name fixes remain a separate resolver obligation.
+
+**Primitive Prelude fallback for type-owner heads (IR-546).** Top-level
+struct, alias, enum, and resource paths consult the fixed primitive binding
+table after generic parameters and the exact file's module scope. A primitive
+head resolves as `Res::PrimTy`; any type-relative suffix remains for the type
+checker. The tracked path-query identity includes a fingerprint of the
+primitive name-to-type mapping. Other misses, including canonical standard
+items such as `Option` and `String`, remain deferred until real `sai:core` and
+`sai:alloc` member scopes are provided. The checkout has no standard-library
+source tree or provider for those scopes, so the complete Prelude must not be
+assembled with placeholder definition identities.
 
 ### 3.4.3 Ribs
 
