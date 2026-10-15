@@ -1095,6 +1095,68 @@ impl TypeOwnerTestOnlyResolutions {
     }
 }
 
+/// Test-only references found in one top-level effect declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectOwnerTestOnlyResolution {
+    owner: OwnerId,
+    test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl EffectOwnerTestOnlyResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution.as_ref()
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Provenance-tagged test-only diagnostics for top-level effect declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectOwnerTestOnlyResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<EffectOwnerTestOnlyResolution>,
+}
+
+impl EffectOwnerTestOnlyResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[EffectOwnerTestOnlyResolution] {
+        &self.owners
+    }
+}
+
 /// The kind of associated trait or impl declaration checked by the
 /// test-only reference pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1755,6 +1817,7 @@ pub enum OwnerControlFlowResolutionError {
         owner: OwnerId,
         import: ImportIndex,
     },
+    MissingEffectDeclarationSyntax(OwnerId),
     MissingRefinedTypeSyntax(OwnerId),
     MissingInterfaceFunctionSyntax(OwnerId),
     InvalidSourceLocation(OwnerId),
@@ -2258,6 +2321,10 @@ fn owner_test_only_path_candidates_with_body(
                 work.extend(fields.iter().map(|field| Work::Ty(field.ty)));
                 None
             }
+            ItemKind::Effect { covers } => {
+                work.extend(covers.iter().copied().map(Work::Effect));
+                None
+            }
             ItemKind::Trait { .. } | ItemKind::Impl { .. } => None,
             _ => None,
         },
@@ -2306,7 +2373,8 @@ fn owner_test_only_path_candidates_with_body(
             ItemKind::Struct { .. }
             | ItemKind::Alias { .. }
             | ItemKind::Enum { .. }
-            | ItemKind::Resource { .. } => {}
+            | ItemKind::Resource { .. }
+            | ItemKind::Effect { .. } => {}
             ItemKind::Trait {
                 generics,
                 supertraits,
@@ -2880,6 +2948,30 @@ fn intern_ast_name_ref(
     }
     let normalized = sai_syntax::normalize_identifier(identifier);
     Ok(Some(symbols.intern(&normalized)?))
+}
+
+fn effect_syntax_test_only_path_candidates(
+    declaration: &ast::EffectDecl,
+    file: FileId,
+    symbols: &Interner,
+) -> Result<Vec<RefinedGenericSyntaxPathHead>, HirLoweringError> {
+    let mut paths = Vec::new();
+    if let Some(set) = declaration.covers().and_then(|clause| clause.set()) {
+        for effect in set.effects() {
+            if let Some(name) = effect.segments().next()
+                && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+            {
+                paths.push(RefinedGenericSyntaxPathHead {
+                    name: symbol,
+                    span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                    kind: OwnerPathKind::Effect,
+                });
+            }
+        }
+    }
+    paths.sort_by_key(|path| (path.span.range.start(), path.span.range.end()));
+    paths.dedup_by_key(|path| path.span);
+    Ok(paths)
 }
 
 fn is_builtin_effect_root(symbol: Symbol, symbols: &Interner) -> bool {
@@ -6217,6 +6309,192 @@ impl RootDatabase {
             group_start = group_end;
         }
         Ok(PredicateOwnerResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Diagnoses test-only references in top-level effect `covers` clauses.
+    ///
+    /// Built-in effect roots retain their precedence over module bindings.
+    /// This pass does not resolve ordinary effect paths or validate the
+    /// transitive coverage graph.
+    pub fn resolve_effect_test_only_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<EffectOwnerTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Effect)
+            .collect::<Vec<_>>();
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let mut owners = Vec::with_capacity(descriptors.len());
+
+        for descriptor in descriptors {
+            let mut lowering_diagnostics = Vec::new();
+            let inputs = match self.current_owner_inputs(
+                snapshot,
+                descriptor.file,
+                &collection.target_cfg,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    owners.push(EffectOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        test_only_path_resolution: Err(error.clone()),
+                        test_only_diagnostics: Err(error),
+                        lowering_diagnostics,
+                    });
+                    continue;
+                }
+            };
+
+            let analysis: Result<
+                (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                OwnerControlFlowResolutionError,
+            > = (|| {
+                let owner_descriptor = find_top_level_owner_descriptor(
+                    &top_level_owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    descriptor.kind,
+                )?;
+                if inputs.retained_item_kinds.get(&descriptor.item_id)
+                    != Some(&ItemTreeKind::Effect)
+                {
+                    return Err(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                }
+
+                let def_paths = self
+                    .def_paths
+                    .get(&descriptor.owner.def_id.package())
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let expected_path = def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.parsed.root,
+                    &arena,
+                    &self.symbols,
+                    def_paths,
+                );
+                let (hir_owner, _source_map) = lower_top_level_owner(
+                    owner_descriptor,
+                    &expected_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )?;
+                lowering_diagnostics.extend(hir_owner.diagnostics.iter().cloned());
+
+                let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let candidates = owner_test_only_path_candidates(&hir_owner);
+                let syntax = inputs
+                    .ast_ids
+                    .pointer(descriptor.item_id)
+                    .and_then(|pointer| {
+                        pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
+                    })
+                    .ok_or(
+                        OwnerControlFlowResolutionError::MissingEffectDeclarationSyntax(
+                            descriptor.owner,
+                        ),
+                    )?;
+                let declaration = ast::EffectDecl::cast(syntax).ok_or(
+                    OwnerControlFlowResolutionError::MissingEffectDeclarationSyntax(
+                        descriptor.owner,
+                    ),
+                )?;
+                let hir_head_spans = candidates
+                    .iter()
+                    .map(|candidate| {
+                        sai_diagnostics::Span::new(candidate.span.file, candidate.span.range)
+                    })
+                    .collect::<HashSet<_>>();
+                let mut recovered_candidates = effect_syntax_test_only_path_candidates(
+                    &declaration,
+                    descriptor.file,
+                    &self.symbols,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                recovered_candidates.retain(|candidate| !hir_head_spans.contains(&candidate.span));
+                let mut path_resolution = OwnerTestOnlyPathResolution {
+                    owner: descriptor.owner,
+                    paths: HashMap::new(),
+                };
+                let mut diagnostics = collect_test_only_module_head_diagnostics(
+                    descriptor.owner,
+                    &candidates,
+                    &HashSet::new(),
+                    &module_scope,
+                    &mut path_resolution,
+                    &self.symbols,
+                    &inputs,
+                    snapshot,
+                )?;
+                diagnostics.extend(collect_ast_test_only_path_diagnostics(
+                    descriptor.owner,
+                    &recovered_candidates,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &module_scope,
+                    &self.symbols,
+                    &inputs,
+                    snapshot,
+                )?);
+                sort_phase1_diagnostics(&mut diagnostics);
+                Ok((path_resolution, diagnostics))
+            })();
+
+            match analysis {
+                Ok((path_resolution, diagnostics)) => {
+                    owners.push(EffectOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        test_only_path_resolution: Ok(path_resolution),
+                        test_only_diagnostics: Ok(diagnostics),
+                        lowering_diagnostics,
+                    });
+                }
+                Err(error) => {
+                    owners.push(EffectOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        test_only_path_resolution: Err(error.clone()),
+                        test_only_diagnostics: Err(error),
+                        lowering_diagnostics,
+                    });
+                }
+            }
+        }
+
+        Ok(EffectOwnerTestOnlyResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -12735,6 +13013,343 @@ mod tests {
                 .expect("child member remains available")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn effect_test_only_paths_cover_covers_references() {
+        let root = concat!(
+            "use acme:test-support/fixtures as db\n",
+            "use acme:test-support/fixtures as fs\n",
+            "use acme:test-support/fixtures.{remote}\n",
+            "effect audit covers { db.write, remote, fs.read }\n",
+            "effect followup covers { db.observe }\n",
+            "@target(\"wasm64-core\")\n",
+            "effect filtered covers { db.hidden }\n",
+        );
+        let child = "effect child covers { db.child }\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("effect test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only effect imports collect");
+        let results = database
+            .resolve_effect_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("effect covers references resolve");
+        assert!(results.matches_snapshot(&snapshot));
+        assert!(results.matches_collection(&collection));
+        assert_eq!(results.target_cfg(), &target_cfg);
+        assert_eq!(
+            results
+                .owners()
+                .iter()
+                .map(EffectOwnerTestOnlyResolution::owner)
+                .collect::<Vec<_>>(),
+            collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Effect)
+                .map(|descriptor| descriptor.owner)
+                .collect::<Vec<_>>(),
+            "the active root and child effects are returned while the target-filtered effect is omitted"
+        );
+        assert_eq!(results.owners().len(), 3);
+
+        let span_for = |needle: &str, head: &str| {
+            let start = root
+                .find(needle)
+                .expect("diagnostic source fragment exists")
+                + needle
+                    .find(head)
+                    .expect("diagnostic head occurs in source fragment");
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + head.len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        fn diagnostics_for(owner: &EffectOwnerTestOnlyResolution) -> &[Diagnostic] {
+            owner
+                .test_only_diagnostics()
+                .expect("effect owner diagnostics succeed")
+        }
+        let diagnostic_spans = |owner: &EffectOwnerTestOnlyResolution| {
+            diagnostics_for(owner)
+                .iter()
+                .map(|diagnostic| {
+                    assert_eq!(
+                        diagnostic.code,
+                        sai_diagnostics::Code::TestDependencyOutsideTest
+                    );
+                    diagnostic
+                        .primary()
+                        .expect("test-only effect reference has a primary span")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            diagnostic_spans(&results.owners()[0]),
+            [span_for("db.write", "db"), span_for(", remote,", "remote"),],
+            "module-alias and item imports are diagnosed at their first effect path head"
+        );
+        assert_eq!(
+            diagnostic_spans(&results.owners()[1]),
+            [span_for("db.observe", "db")],
+            "each direct effect declaration keeps an independent result"
+        );
+        assert!(
+            diagnostic_spans(&results.owners()[2]).is_empty(),
+            "test-only imports from the root module are not visible in the child module"
+        );
+        assert!(
+            !results.owners()[0]
+                .test_only_diagnostics()
+                .expect("effect diagnostics succeed")
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .is_some_and(|primary| primary.span == span_for("fs.read", "fs"))
+                }),
+            "built-in effect roots take precedence over a same-named test-only module alias"
+        );
+
+        let package_path = |occurrence: usize| {
+            let start = root
+                .match_indices("acme:test-support/fixtures")
+                .nth(occurrence)
+                .expect("test-only import path exists")
+                .0;
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (start + "acme:test-support/fixtures".len()) as u32,
+                    ),
+                )
+                .expect("package path range is ordered"),
+            )
+        };
+        let db_package_path = package_path(0);
+        let remote_package_path = package_path(2);
+        for diagnostic in results.owners().iter().flat_map(diagnostics_for) {
+            let span = &diagnostic
+                .primary()
+                .expect("diagnostic has a primary span")
+                .span;
+            let reference = root
+                .get(span.range.start().to_usize()..span.range.end().to_usize())
+                .expect("diagnostic span lies in the root source");
+            let expected_path = if reference == "remote" {
+                &remote_package_path
+            } else {
+                &db_package_path
+            };
+            assert!(diagnostic.related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. } if &location.span == expected_path
+            )));
+        }
+        for owner in results.owners() {
+            let path_resolutions = owner
+                .test_only_path_resolution()
+                .expect("effect path results succeed")
+                .paths()
+                .values()
+                .map(|path| (path.resolved_segments, path.segment_count))
+                .collect::<HashSet<_>>();
+            let expected_path_resolutions = if owner.owner() == results.owners()[0].owner() {
+                HashSet::from([(1, 1), (1, 2)])
+            } else if owner.owner() == results.owners()[1].owner() {
+                HashSet::from([(1, 2)])
+            } else {
+                HashSet::new()
+            };
+            assert_eq!(
+                path_resolutions, expected_path_resolutions,
+                "qualified effect paths retain their tail segment count"
+            );
+            assert_eq!(
+                owner
+                    .test_only_path_resolution()
+                    .expect("effect path results succeed")
+                    .paths()
+                    .len(),
+                diagnostics_for(owner).len()
+            );
+            assert!(
+                owner
+                    .test_only_path_resolution()
+                    .expect("effect path results succeed")
+                    .paths()
+                    .values()
+                    .all(|path| path.base == Res::Err),
+                "test-only effect heads become error sentinels"
+            );
+        }
+
+        let effect_def = results.owners()[0].owner().def_id.to_def_id();
+        let mut resolved_import_collection = collection.clone();
+        let root_scope =
+            &mut resolved_import_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        for binding in root_scope.scope.values_mut() {
+            let import_index = match binding.origin {
+                BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+                BindingOrigin::Decl => continue,
+            };
+            let import = &mut root_scope.imports[import_index.0 as usize];
+            if import.test_only {
+                let resolved = if import.item_index.is_some() {
+                    Res::Def(DefKind::Effect, effect_def)
+                } else {
+                    Res::Def(DefKind::Module, effect_def)
+                };
+                import.res = resolved;
+                binding.res = resolved;
+            }
+        }
+        let resolved_import_results = database
+            .resolve_effect_test_only_paths(&resolved_import_collection, &module_tree, &snapshot)
+            .expect("resolved test-only imports remain classified by origin");
+        for (resolved, baseline) in resolved_import_results
+            .owners()
+            .iter()
+            .zip(results.owners())
+        {
+            assert_eq!(
+                diagnostic_spans(resolved),
+                diagnostic_spans(baseline),
+                "test-only effect origins remain rejected after their results become definitions"
+            );
+        }
+
+        let mut ordinary_collection = collection.clone();
+        for import in &mut ordinary_collection.scopes.modules[ModuleId::ROOT.raw() as usize].imports
+        {
+            import.test_only = false;
+        }
+        let ordinary_results = database
+            .resolve_effect_test_only_paths(&ordinary_collection, &module_tree, &snapshot)
+            .expect("ordinary effect imports remain valid");
+        assert!(ordinary_results.owners().iter().all(|owner| {
+            matches!(owner.test_only_diagnostics(), Ok(diagnostics) if diagnostics.is_empty())
+        }));
+
+        let mut broken_collection = collection.clone();
+        let effect_index = broken_collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .position(|descriptor| descriptor.kind == TopLevelOwnerKind::Effect)
+            .expect("effect owner descriptor exists");
+        broken_collection.scopes.top_level_owners[effect_index].item_id =
+            ast::ErasedAstId::new(u32::MAX);
+        let isolated = database
+            .resolve_effect_test_only_paths(&broken_collection, &module_tree, &snapshot)
+            .expect("effect descriptor failures remain isolated");
+        assert!(
+            isolated.owners()[0].test_only_diagnostics().is_err(),
+            "the malformed effect descriptor reports its owner-local failure"
+        );
+        assert!(
+            isolated
+                .owners()
+                .iter()
+                .skip(1)
+                .all(|owner| owner.test_only_diagnostics().is_ok()),
+            "later root and child effect declarations continue resolving"
+        );
+    }
+
+    #[test]
+    fn effect_test_only_paths_recover_valid_references_from_malformed_covers() {
+        let root = concat!(
+            "use acme:test-support/fixtures as db\n",
+            "effect malformed covers { db.recovered, null }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("malformed effect source parses with recovery");
+        assert!(
+            !parsed.errors.is_empty(),
+            "the malformed cover is diagnosed"
+        );
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only effect imports collect despite cover recovery");
+        let results = database
+            .resolve_effect_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("malformed effect owner remains available");
+        assert_eq!(results.owners().len(), 1);
+        let owner = &results.owners()[0];
+        let diagnostics = owner
+            .test_only_diagnostics()
+            .expect("recovered effect diagnostics succeed");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::TestDependencyOutsideTest
+        );
+        let head_start = root.find("db.recovered").expect("test-only ref exists");
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("diagnostic has a primary span")
+                .span,
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(head_start as u32),
+                    sai_diagnostics::TextSize::new((head_start + 2) as u32),
+                )
+                .expect("effect head range is ordered"),
+            )
+        );
+        assert!(
+            owner
+                .test_only_path_resolution()
+                .expect("malformed effect path result succeeds")
+                .paths()
+                .is_empty(),
+            "AST recovery reports the forbidden ref without fabricating a HIR path result"
         );
     }
 
