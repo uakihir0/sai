@@ -3272,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn target_collection_does_not_revalidate_parser_rejected_attribute_positions() {
+    fn target_collection_keeps_invalid_attribute_target_entries() {
         fn find_entry<'a>(
             entries: &'a [ItemTreeEntry],
             symbols: &Interner,
@@ -3295,6 +3295,10 @@ mod tests {
             "    @deprecated @derive(Clone) import fn now() -> U64\n",
             "    @deprecated @derive(Clone) include base\n",
             "}\n",
+            "trait Api {\n",
+            "    @target(\"wasm64-core\") type Associated\n",
+            "    @target(\"wasm64-core\") fn method() {}\n",
+            "}\n",
         );
         let file = FileId::new(728);
         let (parsed, ast_ids, symbols, _, snapshot) = collect_with_snapshot(source, file);
@@ -3315,10 +3319,23 @@ mod tests {
             &target_cfg("wasm32-core", &[]),
         )
         .expect("target collection succeeds");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(
+                    |diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+                )
+                .count(),
+            2,
+            "associated @target attributes are diagnosed by HIR validation"
+        );
         assert!(
-            result.diagnostics.is_empty(),
-            "HIR must not duplicate parser diagnostics or stage errors: {:?}",
-            result.diagnostics
+            result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget),
+            "HIR emits only the invalid-target diagnostics for associated attributes"
         );
 
         for (kind, name) in [
@@ -3326,6 +3343,8 @@ mod tests {
             (ItemTreeKind::TypeParam, "T"),
             (ItemTreeKind::WorldItem { import: true }, "now"),
             (ItemTreeKind::WorldInclude, "base"),
+            (ItemTreeKind::AssocType, "Associated"),
+            (ItemTreeKind::AssocFn, "method"),
         ] {
             let entry = find_entry(&result.item_tree.items, &symbols, kind, name)
                 .unwrap_or_else(|| panic!("missing retained {kind:?} `{name}`"));
@@ -3336,7 +3355,27 @@ mod tests {
             assert!(attrs.inline.is_none());
             assert!(attrs.deprecated.is_none());
             assert!(attrs.derives.is_empty());
-            assert!(attrs.diagnostics.is_empty());
+            let invalid_target_count = attrs
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+                })
+                .count();
+            assert_eq!(
+                invalid_target_count,
+                usize::from(matches!(
+                    kind,
+                    ItemTreeKind::AssocType | ItemTreeKind::AssocFn
+                )),
+                "associated @target attributes are diagnosed while the members remain retained"
+            );
+            assert!(
+                attrs.diagnostics.iter().all(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+                }),
+                "invalid target is the only HIR validation diagnostic for these entries"
+            );
         }
     }
 
