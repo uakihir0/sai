@@ -1440,6 +1440,11 @@ impl TraitImplHeaderResolutions {
     }
 }
 
+/// Partial type-head and qualified-member results shared by type, function,
+/// and const owners.
+///
+/// A type head is resolved without requiring member scopes. When those scopes
+/// are available, the same result also retains typed qualified-member errors.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypeOwnerPathResolution {
     owner: OwnerId,
@@ -1485,11 +1490,9 @@ impl TypeOwnerModulePathError {
     }
 }
 
-/// Partial type-path resolution for one type or function owner.
-///
-/// For top-level type declarations, fields, targets, payloads, and declaration
-/// generic bounds belong to the enclosing owner. Function results cover
-/// signature types, generic bounds, and body type paths.
+/// Partial type-path and test-only results for one direct top-level type
+/// declaration. Fields, targets, payloads, and declaration generic bounds
+/// belong to the enclosing owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypeOwnerResolution {
     owner: OwnerId,
@@ -2308,12 +2311,13 @@ impl TestPropertyOwnerResolutions {
     }
 }
 
-/// Owned lexical-local and module-path results for one constant initializer.
+/// Owned lexical-local, module-path, and type-path results for one constant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConstOwnerResolution {
     owner: OwnerId,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+    type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
@@ -2337,6 +2341,17 @@ impl ConstOwnerResolution {
         &self,
     ) -> Result<Option<&ModuleResolution>, &OwnerControlFlowResolutionError> {
         self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns first-segment resolution for type paths in the constant's
+    /// declared type and initializer. Qualified suffixes remain for later
+    /// member-scope resolution.
+    pub fn type_path_resolution(
+        &self,
+    ) -> Result<Option<&TypeOwnerPathResolution>, &OwnerControlFlowResolutionError> {
+        self.type_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
     }
@@ -4097,6 +4112,40 @@ fn collect_test_only_module_head_diagnostics(
         )?);
     }
     Ok(diagnostics)
+}
+
+fn rejected_test_only_type_path_ids(
+    owner: OwnerId,
+    candidates: &[OwnerPathHead<'_>],
+    generic_parameters: &HashSet<Symbol>,
+    module_scope: &Phase1ModuleScopes,
+) -> Result<HashSet<HirId>, OwnerControlFlowResolutionError> {
+    let mut rejected_paths = HashSet::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+    {
+        if generic_parameters.contains(&candidate.name) {
+            continue;
+        }
+        let Some(binding) = module_scope.scope.get(&candidate.name) else {
+            continue;
+        };
+        let import_index = match binding.origin {
+            BindingOrigin::Decl => continue,
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+        };
+        let import = module_scope.imports.get(import_index.0 as usize).ok_or(
+            OwnerControlFlowResolutionError::MissingImportBinding {
+                owner,
+                import: import_index,
+            },
+        )?;
+        if import.test_only {
+            rejected_paths.insert(candidate.hir_id);
+        }
+    }
+    Ok(rejected_paths)
 }
 
 fn collect_refined_generic_syntax_test_only_diagnostics(
@@ -6216,40 +6265,42 @@ impl RootDatabase {
                         ),
                         Err(error) => Err(error.clone()),
                     };
-                    let rejected_type_paths = function_paths
-                        .iter()
-                        .filter(|candidate| {
-                            candidate.kind == OwnerPathKind::Type
-                                && resolved_function_paths
-                                    .paths
-                                    .contains_key(&candidate.hir_id)
-                        })
-                        .map(|candidate| candidate.hir_id)
-                        .collect::<HashSet<_>>();
                     test_only_path_resolution = Some(match &module_scope {
                         Ok(_) => Ok(Some(resolved_function_paths)),
                         Err(error) => Err(error.clone()),
                     });
                     let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
-                    type_path_resolution = Some(match (&module_scope, &self.primitive_prelude) {
-                        (Ok(module_scope), Ok(primitive_prelude)) => {
-                            Ok(Some(resolve_type_owner_module_paths(
-                                descriptor.owner,
-                                &function_paths,
-                                &generic_resolutions,
-                                primitive_prelude,
-                                &rejected_type_paths,
-                                module_scope,
-                                None,
-                                descriptor.owner.def_id.package(),
-                                None,
-                            )))
-                        }
-                        (Err(error), _) => Err(error.clone()),
-                        (_, Err(error)) => Err(OwnerControlFlowResolutionError::PrimitivePrelude(
-                            error.clone(),
-                        )),
-                    });
+                    let rejected_type_paths = match &module_scope {
+                        Ok(module_scope) => rejected_test_only_type_path_ids(
+                            descriptor.owner,
+                            &function_paths,
+                            &generic_parameters,
+                            module_scope,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    type_path_resolution = Some(
+                        match (&module_scope, &self.primitive_prelude, rejected_type_paths) {
+                            (Ok(module_scope), Ok(primitive_prelude), Ok(rejected_type_paths)) => {
+                                Ok(Some(resolve_type_owner_module_paths(
+                                    descriptor.owner,
+                                    &function_paths,
+                                    &generic_resolutions,
+                                    primitive_prelude,
+                                    &rejected_type_paths,
+                                    module_scope,
+                                    None,
+                                    descriptor.owner.def_id.package(),
+                                    None,
+                                )))
+                            }
+                            (Err(error), _, _) => Err(error.clone()),
+                            (_, Err(error), _) => Err(
+                                OwnerControlFlowResolutionError::PrimitivePrelude(error.clone()),
+                            ),
+                            (_, _, Err(error)) => Err(error),
+                        },
+                    );
                     match hir_owner.body {
                         Some(body) => {
                             let labels = resolve_owner_control_flow(
@@ -6356,7 +6407,8 @@ impl RootDatabase {
     }
 
     /// Resolves lexical locals and one-segment module paths in top-level
-    /// constant initializers, including test-only reference diagnostics.
+    /// constant initializers, plus type-path heads in the declared type and
+    /// initializer body, including test-only reference diagnostics.
     ///
     /// This uncached bridge uses the exact current lowering and source map for
     /// each target-filtered owner. Constant-expression legality and final
@@ -6399,6 +6451,7 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
+                                type_path_resolution: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -6420,6 +6473,7 @@ impl RootDatabase {
                     (
                         Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
                         Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                        Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
                         Result<
                             Option<OwnerTestOnlyPathResolution>,
                             OwnerControlFlowResolutionError,
@@ -6483,6 +6537,38 @@ impl RootDatabase {
                         ),
                         Err(error) => Err(error.clone()),
                     };
+                    let no_generic_parameters = HashSet::new();
+                    let rejected_type_paths = match &module_scope {
+                        Ok(module_scope) => rejected_test_only_type_path_ids(
+                            descriptor.owner,
+                            &path_candidates,
+                            &no_generic_parameters,
+                            module_scope,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                    let type_path_resolution =
+                        match (&module_scope, &self.primitive_prelude, rejected_type_paths) {
+                            (Ok(module_scope), Ok(primitive_prelude), Ok(rejected_type_paths)) => {
+                                Ok(Some(resolve_type_owner_module_paths(
+                                    descriptor.owner,
+                                    &path_candidates,
+                                    &generic_resolutions,
+                                    primitive_prelude,
+                                    &rejected_type_paths,
+                                    module_scope,
+                                    None,
+                                    descriptor.owner.def_id.package(),
+                                    None,
+                                )))
+                            }
+                            (Err(error), _, _) => Err(error.clone()),
+                            (_, Err(error), _) => Err(
+                                OwnerControlFlowResolutionError::PrimitivePrelude(error.clone()),
+                            ),
+                            (_, _, Err(error)) => Err(error),
+                        };
                     let path_resolution = match &module_scope {
                         Ok(_) => Ok(Some(resolved_paths)),
                         Err(error) => Err(error.clone()),
@@ -6491,6 +6577,7 @@ impl RootDatabase {
                         return Ok((
                             Ok(None),
                             Ok(None),
+                            type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics,
                         ));
@@ -6545,6 +6632,7 @@ impl RootDatabase {
                             Ok((
                                 Ok(Some(locals)),
                                 module_resolution,
+                                type_path_resolution,
                                 path_resolution,
                                 test_only_diagnostics,
                             ))
@@ -6552,6 +6640,7 @@ impl RootDatabase {
                         Err(error) => Ok((
                             Err(error.clone()),
                             Err(error.clone()),
+                            type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics,
                         )),
@@ -6560,10 +6649,12 @@ impl RootDatabase {
                 let (
                     local_resolution,
                     module_resolution,
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                 ) = analysis.unwrap_or_else(|error| {
                     (
+                        Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
@@ -6574,6 +6665,7 @@ impl RootDatabase {
                     owner: descriptor.owner,
                     local_resolution,
                     module_resolution,
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -11495,15 +11587,19 @@ mod tests {
     #[test]
     fn const_owner_paths_use_target_filtered_exact_file_scopes() {
         let root = concat!(
+            "type RootOnly = Bool\n",
             "const BASE: Bool = true\n",
             "const COPY: Bool = BASE\n",
             "@target(\"wasm64-core\")\n",
             "const FILTERED: Bool = true\n",
         );
         let child = concat!(
+            "type LocalType = Bool\n",
             "const LOCAL: Bool = false\n",
             "const LOCAL_COPY: Bool = LOCAL\n",
             "const CHILD_COPY: Bool = BASE\n",
+            "const LOCAL_TYPED: LocalType = false\n",
+            "const ROOT_TYPE_MISS: RootOnly = false\n",
         );
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(root.as_bytes(), child.as_bytes());
@@ -11535,6 +11631,7 @@ mod tests {
             .module(ModuleId::from_raw(1))
             .expect("child module scope exists");
         let child_local = binding_for(child_scope, "LOCAL");
+        let child_local_type = binding_for(child_scope, "LocalType");
         let base_symbol = root_scope
             .scope
             .keys()
@@ -11552,7 +11649,7 @@ mod tests {
         assert!(results.matches_collection(&collection));
         assert_eq!(
             results.owners().len(),
-            5,
+            7,
             "the target-excluded const is absent from the current owner list"
         );
         let copied_root_value = results.owners()[1]
@@ -11592,6 +11689,170 @@ mod tests {
         assert_eq!(
             child_root_miss.deferred_paths[0].name, base_symbol,
             "a root-file const is not exposed in the child module's unqualified scope"
+        );
+
+        let child_local_type_resolution = results.owners()[5]
+            .type_path_resolution()
+            .expect("child type lookup succeeds")
+            .expect("LOCAL_TYPED has a type path result");
+        assert_eq!(
+            child_local_type_resolution
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [child_local_type],
+            "a child const resolves a sibling type alias from the child file scope"
+        );
+
+        let root_only_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "RootOnly")
+            })
+            .expect("RootOnly has an interned symbol");
+        let child_root_type_miss = results.owners()[6]
+            .type_path_resolution()
+            .expect("child type lookup remains a successful partial pass")
+            .expect("ROOT_TYPE_MISS has a type path result");
+        assert!(child_root_type_miss.paths().is_empty());
+        assert_eq!(child_root_type_miss.deferred_paths().len(), 1);
+        assert_eq!(
+            child_root_type_miss.deferred_paths()[0].name,
+            root_only_symbol,
+            "a root-file type alias is not exposed in the child module's unqualified scope"
+        );
+    }
+
+    #[test]
+    fn const_owner_resolves_primitive_and_module_type_path_heads() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "type Array<T> = T\n",
+            "const VALUE: Bool = true\n",
+            "const MODULE: Array<U32> = VALUE\n",
+            "const PRIMITIVE: U32 = 0\n",
+            "const DEFERRED: Option<U32> = 0\n",
+            "const QUALIFIED: child_alias.Widget = 0\n",
+            "const BODY: Bool = { let local: U32 = 0; true }\n",
+        );
+        let child = "pub fn child_fn() {}\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let binding_for = |name: &str| {
+            root_scope
+                .scope
+                .iter()
+                .find_map(|(symbol, binding)| {
+                    (database.resolve_symbol(*symbol).ok()?.as_ref() == name).then_some(binding.res)
+                })
+                .unwrap_or_else(|| panic!("module scope contains `{name}`"))
+        };
+        let array = binding_for("Array");
+        let child_alias = binding_for("child_alias");
+        let value = binding_for("VALUE");
+
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve type path heads");
+        assert_eq!(resolved.owners().len(), 6);
+
+        let module_type = resolved.owners()[1]
+            .type_path_resolution()
+            .expect("module type resolution succeeds")
+            .expect("const has a type path result");
+        assert!(
+            module_type
+                .paths()
+                .values()
+                .any(|path| path.base == array && matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "a valid module type alias shadows the primitive Array entry"
+        );
+        assert!(
+            module_type
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "primitive heads resolve inside const generic type arguments"
+        );
+        let module_expression = resolved.owners()[1]
+            .module_resolution()
+            .expect("initializer expression lookup succeeds")
+            .expect("const has a module result");
+        assert_eq!(module_expression.paths.len(), 1);
+        assert_eq!(
+            module_expression
+                .paths
+                .values()
+                .next()
+                .map(|path| path.base),
+            Some(value),
+            "the type annotation stays out of the initializer expression result"
+        );
+
+        let primitive = resolved.owners()[2]
+            .type_path_resolution()
+            .expect("primitive const type lookup succeeds")
+            .expect("const has a type path result");
+        assert_eq!(
+            primitive
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::PrimTy(sai_resolve::prelude::PrimTy::U32)]
+        );
+
+        let deferred = resolved.owners()[3]
+            .type_path_resolution()
+            .expect("deferred const type lookup succeeds")
+            .expect("const has a type path result");
+        assert!(
+            deferred.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Option")
+            }),
+            "canonical non-primitive names remain deferred without standard package scopes"
+        );
+
+        let qualified = resolved.owners()[4]
+            .type_path_resolution()
+            .expect("qualified const type lookup succeeds")
+            .expect("const has a type path result");
+        assert!(
+            qualified.paths().values().any(|path| {
+                path.base == child_alias && path.resolved_segments == 1 && path.segment_count == 2
+            }),
+            "qualified const types resolve only the module head"
+        );
+
+        let body = resolved.owners()[5]
+            .type_path_resolution()
+            .expect("initializer body type lookup succeeds")
+            .expect("const has a type path result");
+        assert!(
+            body.paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "initializer body annotations participate in type-head resolution"
         );
     }
 
@@ -11756,6 +12017,76 @@ mod tests {
     }
 
     #[test]
+    fn const_type_paths_reject_test_only_imports_after_earlier_diagnostic_failure() {
+        let root = concat!(
+            "use acme:test-support/fixtures as broken_type\n",
+            "use acme:test-support/fixtures as later_type\n",
+            "const VALUE: broken_type.Widget = { let local: later_type.Widget = 0; 0 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only imports are collected");
+
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let broken_type_import_index = module_scope
+            .imports
+            .iter()
+            .position(|import| {
+                database
+                    .resolve_symbol(import.name)
+                    .is_ok_and(|name| name.as_ref() == "broken_type")
+            })
+            .expect("broken_type import exists");
+        module_scope.imports[broken_type_import_index].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("a diagnostic failure does not abort type path resolution");
+        let owner = &results.owners()[0];
+        assert!(
+            matches!(
+                owner.test_only_diagnostics(),
+                Err(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                    import,
+                    ..
+                }) if import.0 as usize == broken_type_import_index
+            ),
+            "the earlier declared type makes test-only diagnostic collection fail"
+        );
+        let type_paths = owner
+            .type_path_resolution()
+            .expect("type path resolution remains independent")
+            .expect("the const has a type path result");
+        assert_eq!(
+            type_paths
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err, Res::Err],
+            "a later initializer type import stays rejected despite the earlier failure"
+        );
+    }
+
+    #[test]
     fn const_owner_test_only_item_bindings_are_diagnosed() {
         let root = concat!(
             "use acme:test-support/fixtures.{flag}\n",
@@ -11902,6 +12233,19 @@ mod tests {
         assert_eq!(resolved_type.base, Res::Err);
         assert_eq!(resolved_type.resolved_segments, 1);
         assert_eq!(resolved_type.segment_count, 1);
+        let ordinary_type_paths = both
+            .type_path_resolution()
+            .expect("ordinary const type lookup succeeds")
+            .expect("const has an ordinary type path result");
+        assert_eq!(
+            ordinary_type_paths
+                .paths()
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "rejected test-only type heads do not fall through to module or Prelude lookup"
+        );
         let both_module_paths = both
             .module_resolution()
             .expect("const expression module lookup succeeds")
