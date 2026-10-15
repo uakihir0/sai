@@ -846,6 +846,14 @@ and WIT member scopes are later work. Generic, test-only, exact-file module,
 and primitive Prelude precedence remains unchanged, and expression module
 lookup stays separate.
 
+**Qualified local const type prefixes (IR-557).** Const declared types and
+initializer type paths continue through current-package module and interface
+members. Stop at the first non-module member, retain the full path length and
+type-relative suffix, and keep missing local members as typed path errors for
+later diagnostic mapping. Rejected test-only heads remain `Res::Err` and do
+not start member traversal. Foreign module aliases stay deferred until a
+validated active-source closure is available.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
