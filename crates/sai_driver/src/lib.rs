@@ -13,13 +13,14 @@ use sai_hir::expressions::{
     Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
 };
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
-use sai_hir::items::{HirOwner, ImplKind, ItemKind, OwnerNode};
+use sai_hir::items::{HirOwner, ImplItemKind, ImplKind, ItemKind, OwnerNode, TraitItemKind};
 use sai_hir::lower::{
     ExternItemIds, HirLoweringContext, HirLoweringError, lower_alias_owner, lower_const_owner,
     lower_distinct_owner, lower_effect_owner, lower_enum_owner, lower_extern_block_owner,
-    lower_extern_item_owner, lower_function_owner, lower_impl_owner, lower_interface_owner,
-    lower_invariant_owner, lower_property_owner, lower_refined_owner, lower_resource_owner,
-    lower_struct_owner, lower_test_owner, lower_trait_owner, lower_world_owner,
+    lower_extern_item_owner, lower_function_owner, lower_impl_item_owner, lower_impl_owner,
+    lower_interface_owner, lower_invariant_owner, lower_property_owner, lower_refined_owner,
+    lower_resource_owner, lower_struct_owner, lower_test_owner, lower_trait_item_owner,
+    lower_trait_owner, lower_world_owner,
 };
 use sai_hir::patterns::{Pat as HirPat, PatKind, PatRangeEnd};
 use sai_hir::source_map::HirSourceMap;
@@ -1017,6 +1018,126 @@ impl TraitImplHeaderResolutions {
     }
 }
 
+/// The kind of associated trait or impl declaration checked by the
+/// test-only signature pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TraitImplMemberKind {
+    TraitAssociatedType,
+    TraitMethod,
+    ImplAssociatedType,
+    ImplMethod,
+}
+
+/// Test-only references found in one associated declaration signature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraitImplMemberTestOnlyResolution {
+    parent_owner: OwnerId,
+    owner: OwnerId,
+    kind: TraitImplMemberKind,
+    test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl TraitImplMemberTestOnlyResolution {
+    pub const fn parent_owner(&self) -> OwnerId {
+        self.parent_owner
+    }
+
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn kind(&self) -> TraitImplMemberKind {
+        self.kind
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution.as_ref()
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Results for the associated declarations of one direct trait or impl.
+///
+/// A parent error is kept separate because its current syntax may be
+/// unavailable, in which case its associated declarations cannot be
+/// enumerated. When the parent lowers, each associated declaration has its
+/// own result and failure channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraitImplMemberOwnerResolution {
+    owner: OwnerId,
+    kind: TopLevelOwnerKind,
+    error: Option<OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+    members: Vec<TraitImplMemberTestOnlyResolution>,
+}
+
+impl TraitImplMemberOwnerResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn kind(&self) -> TopLevelOwnerKind {
+        self.kind
+    }
+
+    pub fn error(&self) -> Option<&OwnerControlFlowResolutionError> {
+        self.error.as_ref()
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+
+    pub fn members(&self) -> &[TraitImplMemberTestOnlyResolution] {
+        &self.members
+    }
+}
+
+/// Provenance-tagged test-only diagnostics for associated trait and impl
+/// declaration signatures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraitImplMemberTestOnlyResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<TraitImplMemberOwnerResolution>,
+}
+
+impl TraitImplMemberTestOnlyResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[TraitImplMemberOwnerResolution] {
+        &self.owners
+    }
+}
+
 /// Compatibility name for the function-specific non-expression path result.
 ///
 /// The representation is now shared with other owner kinds, but callers that
@@ -1450,6 +1571,23 @@ fn item_tree_kind_for_top_level_owner(kind: TopLevelOwnerKind) -> ItemTreeKind {
     }
 }
 
+fn trait_impl_member_kind(
+    parent_kind: TopLevelOwnerKind,
+    member_kind: ItemTreeKind,
+) -> Option<TraitImplMemberKind> {
+    match (parent_kind, member_kind) {
+        (TopLevelOwnerKind::Trait, ItemTreeKind::AssocType) => {
+            Some(TraitImplMemberKind::TraitAssociatedType)
+        }
+        (TopLevelOwnerKind::Trait, ItemTreeKind::AssocFn) => Some(TraitImplMemberKind::TraitMethod),
+        (TopLevelOwnerKind::Impl, ItemTreeKind::AssocType) => {
+            Some(TraitImplMemberKind::ImplAssociatedType)
+        }
+        (TopLevelOwnerKind::Impl, ItemTreeKind::AssocFn) => Some(TraitImplMemberKind::ImplMethod),
+        _ => None,
+    }
+}
+
 fn lower_top_level_owner<'hir>(
     descriptor: TopLevelOwnerDescriptor,
     expected_path: &DefPath,
@@ -1653,6 +1791,17 @@ struct RefinedGenericSyntaxPathHead {
 }
 
 fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
+    owner_test_only_path_candidates_with_body(owner, true)
+}
+
+fn owner_test_only_signature_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
+    owner_test_only_path_candidates_with_body(owner, false)
+}
+
+fn owner_test_only_path_candidates_with_body(
+    owner: &HirOwner<'_>,
+    include_body: bool,
+) -> Vec<OwnerPathHead> {
     enum Work<'hir> {
         Expr(&'hir HirExpr<'hir>),
         Block(&'hir HirBlock<'hir>),
@@ -1677,6 +1826,14 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
             _ => None,
         },
         OwnerNode::ExternItem(item) => Some((item.sig, item.generics)),
+        OwnerNode::TraitItem(item) => match item.kind {
+            TraitItemKind::Fn { sig, generics, .. } => Some((sig, generics)),
+            TraitItemKind::AssocType { .. } => None,
+        },
+        OwnerNode::ImplItem(item) => match item.kind {
+            ImplItemKind::Fn { sig, generics, .. } => Some((sig, generics)),
+            ImplItemKind::AssocType { .. } => None,
+        },
         _ => return Vec::new(),
     };
     if let Some((sig, generics)) = signature {
@@ -1702,8 +1859,8 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
             work.extend(predicate.bounds.iter().copied().map(Work::Bound));
         }
     }
-    if let OwnerNode::Item(item) = owner.node {
-        match item.kind {
+    match owner.node {
+        OwnerNode::Item(item) => match item.kind {
             ItemKind::Fn { .. } => {}
             ItemKind::Trait {
                 generics,
@@ -1752,9 +1909,19 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
                 kind: OwnerPathKind::Type,
             }),
             _ => return Vec::new(),
-        }
-    } else if !matches!(owner.node, OwnerNode::ExternItem(_)) {
-        return Vec::new();
+        },
+        OwnerNode::TraitItem(item) => match item.kind {
+            TraitItemKind::AssocType { bounds } => {
+                work.extend(bounds.iter().copied().map(Work::Bound));
+            }
+            TraitItemKind::Fn { .. } => {}
+        },
+        OwnerNode::ImplItem(item) => match item.kind {
+            ImplItemKind::AssocType { ty } => work.push(Work::Ty(ty)),
+            ImplItemKind::Fn { .. } => {}
+        },
+        OwnerNode::ExternItem(_) => {}
+        _ => return Vec::new(),
     }
     for generics in header_generics {
         for parameter in generics.params {
@@ -1770,7 +1937,7 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
             work.extend(predicate.bounds.iter().copied().map(Work::Bound));
         }
     }
-    if let Some(body) = owner.body {
+    if include_body && let Some(body) = owner.body {
         work.push(Work::Expr(body.value));
         work.extend(
             body.contracts
@@ -2470,6 +2637,14 @@ fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
             _ => return HashSet::new(),
         },
         OwnerNode::ExternItem(item) => item.generics,
+        OwnerNode::TraitItem(item) => match item.kind {
+            TraitItemKind::Fn { generics, .. } => generics,
+            TraitItemKind::AssocType { .. } => return HashSet::new(),
+        },
+        OwnerNode::ImplItem(item) => match item.kind {
+            ImplItemKind::Fn { generics, .. } => generics,
+            ImplItemKind::AssocType { .. } => return HashSet::new(),
+        },
         _ => return HashSet::new(),
     };
     generics
@@ -5562,6 +5737,289 @@ impl RootDatabase {
         }
 
         Ok(TraitImplHeaderResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Diagnoses test-only references in associated trait and impl
+    /// declaration signatures.
+    ///
+    /// The pass checks associated type bounds and definition types plus
+    /// method signatures, generic bounds, and where clauses. Method bodies
+    /// and contracts are left for owner resolution after local bindings are
+    /// available.
+    pub fn resolve_trait_impl_member_test_only_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<TraitImplMemberTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.kind,
+                    TopLevelOwnerKind::Trait | TopLevelOwnerKind::Impl
+                )
+            })
+            .collect::<Vec<_>>();
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let mut owners = Vec::with_capacity(descriptors.len());
+
+        for descriptor in descriptors {
+            let inputs = match self.current_owner_inputs(
+                snapshot,
+                descriptor.file,
+                &collection.target_cfg,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    owners.push(TraitImplMemberOwnerResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        error: Some(error),
+                        lowering_diagnostics: Vec::new(),
+                        members: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+
+            let analysis: Result<
+                (Vec<TraitImplMemberTestOnlyResolution>, Vec<Diagnostic>),
+                OwnerControlFlowResolutionError,
+            > = (|| {
+                let parent_descriptor = find_top_level_owner_descriptor(
+                    &top_level_owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    descriptor.kind,
+                )?;
+                let parent_item_kind = item_tree_kind_for_top_level_owner(descriptor.kind);
+                if !matches!(
+                    (descriptor.kind, parent_item_kind),
+                    (TopLevelOwnerKind::Trait, ItemTreeKind::Trait)
+                        | (TopLevelOwnerKind::Impl, ItemTreeKind::Impl)
+                ) || inputs.retained_item_kinds.get(&descriptor.item_id)
+                    != Some(&parent_item_kind)
+                {
+                    return Err(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                }
+
+                let parent_entry = inputs
+                    .filtered_item_tree
+                    .items
+                    .iter()
+                    .find(|entry| {
+                        entry.ast_id == descriptor.item_id && entry.kind == parent_item_kind
+                    })
+                    .ok_or(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    )?;
+                let member_entries = parent_entry
+                    .children
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn)
+                    })
+                    .collect::<Vec<_>>();
+
+                let def_paths = self
+                    .def_paths
+                    .get(&descriptor.owner.def_id.package())
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let expected_parent_path = def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.parsed.root,
+                    &arena,
+                    &self.symbols,
+                    def_paths,
+                );
+                let (parent_hir, _) = lower_top_level_owner(
+                    parent_descriptor,
+                    &expected_parent_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )?;
+                let parent_members = match parent_hir.node {
+                    OwnerNode::Item(item) => match (descriptor.kind, item.kind) {
+                        (TopLevelOwnerKind::Trait, ItemKind::Trait { items, .. })
+                        | (TopLevelOwnerKind::Impl, ItemKind::Impl { items, .. }) => items,
+                        _ => {
+                            return Err(
+                                OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                                    owner: descriptor.owner,
+                                    file: descriptor.file,
+                                    descriptor: descriptor.kind,
+                                    current: parent_item_kind,
+                                },
+                            );
+                        }
+                    },
+                    _ => {
+                        return Err(
+                            OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+                };
+                if member_entries.len() != parent_members.len() {
+                    return Err(OwnerControlFlowResolutionError::Lowering(
+                        HirLoweringError::ItemTreeEntryMismatch,
+                    ));
+                }
+
+                let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let parent_generics = owner_generic_parameters(&parent_hir);
+                let mut members = Vec::with_capacity(member_entries.len());
+                for (entry, member_owner) in member_entries
+                    .into_iter()
+                    .zip(parent_members.iter().copied())
+                {
+                    let Some(kind) = trait_impl_member_kind(descriptor.kind, entry.kind) else {
+                        return Err(OwnerControlFlowResolutionError::Lowering(
+                            HirLoweringError::ItemTreeEntryMismatch,
+                        ));
+                    };
+                    let mut lowering_diagnostics = Vec::new();
+                    let member_analysis: Result<
+                        (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                        OwnerControlFlowResolutionError,
+                    > = (|| {
+                        let expected_member_path = def_paths
+                            .resolve_def_id(member_owner.def_id.to_def_id())
+                            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                                member_owner,
+                            ))?;
+                        let (member_hir, _) = match descriptor.kind {
+                            TopLevelOwnerKind::Trait => lower_trait_item_owner(
+                                member_owner,
+                                &expected_member_path,
+                                &parent_hir,
+                                descriptor.item_id,
+                                entry.ast_id,
+                                &inputs.filtered_item_tree,
+                                &context,
+                            ),
+                            TopLevelOwnerKind::Impl => lower_impl_item_owner(
+                                member_owner,
+                                &expected_member_path,
+                                &parent_hir,
+                                descriptor.item_id,
+                                entry.ast_id,
+                                &inputs.filtered_item_tree,
+                                &context,
+                            ),
+                            _ => {
+                                return Err(
+                                    OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                                        owner: descriptor.owner,
+                                        file: descriptor.file,
+                                    },
+                                );
+                            }
+                        }
+                        .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                        lowering_diagnostics.extend(member_hir.diagnostics.iter().cloned());
+                        let candidates = owner_test_only_signature_path_candidates(&member_hir);
+                        let mut generic_parameters = parent_generics.clone();
+                        generic_parameters.extend(owner_generic_parameters(&member_hir));
+                        let mut path_resolution = OwnerTestOnlyPathResolution {
+                            owner: member_owner,
+                            paths: HashMap::new(),
+                        };
+                        let mut diagnostics =
+                            collect_test_only_non_expression_reference_diagnostics(
+                                member_owner,
+                                &candidates,
+                                &generic_parameters,
+                                module_scope,
+                                &mut path_resolution,
+                                &self.symbols,
+                                &inputs,
+                                snapshot,
+                            )?;
+                        sort_phase1_diagnostics(&mut diagnostics);
+                        Ok((path_resolution, diagnostics))
+                    })();
+
+                    let (test_only_path_resolution, test_only_diagnostics) = match member_analysis {
+                        Ok((path_resolution, diagnostics)) => {
+                            (Ok(path_resolution), Ok(diagnostics))
+                        }
+                        Err(error) => (Err(error.clone()), Err(error)),
+                    };
+                    members.push(TraitImplMemberTestOnlyResolution {
+                        parent_owner: descriptor.owner,
+                        owner: member_owner,
+                        kind,
+                        test_only_path_resolution,
+                        test_only_diagnostics,
+                        lowering_diagnostics,
+                    });
+                }
+                Ok((members, parent_hir.diagnostics.to_vec()))
+            })();
+
+            match analysis {
+                Ok((members, lowering_diagnostics)) => {
+                    owners.push(TraitImplMemberOwnerResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        error: None,
+                        lowering_diagnostics,
+                        members,
+                    });
+                }
+                Err(error) => {
+                    owners.push(TraitImplMemberOwnerResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        error: Some(error),
+                        lowering_diagnostics: Vec::new(),
+                        members: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        Ok(TraitImplMemberTestOnlyResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -9843,7 +10301,10 @@ mod tests {
             )
         };
         let span_of = |needle: &str, offset: usize| {
-            let start = root.find(needle).expect("reference text exists") + offset;
+            let start = root
+                .find(needle)
+                .unwrap_or_else(|| panic!("reference text `{needle}` exists"))
+                + offset;
             let suffix = &root[start..];
             let head_len = suffix
                 .find(|character: char| !character.is_alphanumeric() && character != '_')
@@ -10324,6 +10785,420 @@ mod tests {
                 .expect("bodyless extern local resolution succeeds")
                 .is_none(),
             "an extern function without a body or contracts has no local scope"
+        );
+    }
+
+    #[test]
+    fn trait_impl_member_test_only_paths_cover_associated_signatures() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures as fs\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{Fixture as M}\n",
+            "fn real_definition() {}\n",
+            "trait Api<Fixture> {\n",
+            "  type Associated: fixture.AssociatedBound\n",
+            "  fn trait_method<M: fixture.MethodBound>(value: M, other: Container<fixture.NestedParam>) -> fixture.Returned where M: fixture.WhereBound effects { fs.read, fixture.method_effect }\n",
+            "  fn shadowed<M>(value: M) -> Fixture\n",
+            "}\n",
+            "impl<T: fixture.ImplBound> Api<T> for fixture.SelfType {\n",
+            "  type ImplAssociated = fixture.ImplAssociated\n",
+            "  fn impl_method<N: fixture.ImplMethodBound>(value: fixture.ImplParam) -> fixture.ImplReturned where N: fixture.ImplWhereBound effects { fixture.impl_effect } { fixture.impl_body }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed_root = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed_root.errors.is_empty(), "{:?}", parsed_root.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only imports and associated owners collect");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated signatures resolve");
+        assert!(results.matches_collection(&collection));
+        assert_eq!(results.owners().len(), 2);
+        assert_eq!(results.owners()[0].kind(), TopLevelOwnerKind::Trait);
+        assert_eq!(results.owners()[1].kind(), TopLevelOwnerKind::Impl);
+        assert!(
+            results.owners().iter().all(|owner| owner.error().is_none()),
+            "each current trait and impl parent lowers independently"
+        );
+        assert_eq!(
+            results.owners()[0]
+                .members()
+                .iter()
+                .map(TraitImplMemberTestOnlyResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                TraitImplMemberKind::TraitAssociatedType,
+                TraitImplMemberKind::TraitMethod,
+                TraitImplMemberKind::TraitMethod,
+            ],
+            "associated types and each retained method receive separate owner results"
+        );
+        assert_eq!(
+            results.owners()[1]
+                .members()
+                .iter()
+                .map(TraitImplMemberTestOnlyResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                TraitImplMemberKind::ImplAssociatedType,
+                TraitImplMemberKind::ImplMethod,
+            ]
+        );
+
+        let span_of = |needle: &str, offset: usize| {
+            let start = root.find(needle).expect("reference text exists") + offset;
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + "fixture".len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        let package_path_span = |occurrence: usize| {
+            let start = root
+                .match_indices("acme:test-support/fixtures")
+                .nth(occurrence)
+                .expect("expected import path exists")
+                .0;
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (start + "acme:test-support/fixtures".len()) as u32,
+                    ),
+                )
+                .expect("package path range is ordered"),
+            )
+        };
+        fn diagnostics_for(member: &TraitImplMemberTestOnlyResolution) -> &[Diagnostic] {
+            member
+                .test_only_diagnostics()
+                .expect("member diagnostics succeed")
+        }
+        let diagnostic_spans = |diagnostics: &[Diagnostic]| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("test-only member path has a primary span")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let assert_import_note = |diagnostic: &Diagnostic, expected: &sai_diagnostics::Span| {
+            assert!(diagnostic.related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. } if &location.span == expected
+            )));
+        };
+        let fixture_package_path = package_path_span(0);
+        let type_package_path = package_path_span(2);
+
+        let trait_members = results.owners()[0].members();
+        assert_eq!(
+            diagnostic_spans(diagnostics_for(&trait_members[0])),
+            [span_of("fixture.AssociatedBound", 0)],
+            "trait associated-type bounds are checked"
+        );
+        let method_diagnostics = diagnostics_for(&trait_members[1]);
+        assert_eq!(
+            diagnostic_spans(method_diagnostics),
+            [
+                span_of("fixture.MethodBound", 0),
+                span_of("fixture.NestedParam", 0),
+                span_of("fixture.Returned", 0),
+                span_of("fixture.WhereBound", 0),
+                span_of("fixture.method_effect", 0),
+            ],
+            "method generic bounds, return types, effects, and where clauses are checked while method parameters resolve as generics"
+        );
+        for diagnostic in diagnostics_for(&trait_members[0])
+            .iter()
+            .chain(method_diagnostics)
+        {
+            let primary = diagnostic
+                .primary()
+                .expect("trait member diagnostic has a primary span");
+            let referenced = &root[primary.span.range.start().raw() as usize
+                ..primary.span.range.end().raw() as usize];
+            assert_import_note(
+                diagnostic,
+                if referenced == "Fixture" {
+                    &type_package_path
+                } else {
+                    &fixture_package_path
+                },
+            );
+        }
+        assert!(
+            method_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code
+                    == sai_diagnostics::Code::TestDependencyOutsideTest),
+            "all rejected trait signature paths use the test-only diagnostic"
+        );
+        assert_eq!(
+            trait_members[0]
+                .test_only_path_resolution()
+                .expect("associated type path results succeed")
+                .paths()
+                .len(),
+            1
+        );
+        assert_eq!(
+            trait_members[1]
+                .test_only_path_resolution()
+                .expect("method path results succeed")
+                .paths()
+                .len(),
+            method_diagnostics.len()
+        );
+        assert!(
+            diagnostics_for(&trait_members[2]).is_empty(),
+            "the parent Fixture generic and method M generic shadow imported types"
+        );
+
+        let impl_members = results.owners()[1].members();
+        assert_eq!(
+            diagnostic_spans(diagnostics_for(&impl_members[0])),
+            [span_of("fixture.ImplAssociated", 0)],
+            "impl associated-type definitions are checked"
+        );
+        assert_eq!(
+            diagnostic_spans(diagnostics_for(&impl_members[1])),
+            [
+                span_of("fixture.ImplMethodBound", 0),
+                span_of("fixture.ImplParam", 0),
+                span_of("fixture.ImplReturned", 0),
+                span_of("fixture.ImplWhereBound", 0),
+                span_of("fixture.impl_effect", 0),
+            ],
+            "impl method generics and signature paths are checked"
+        );
+
+        let root_scope = &collection.scopes().modules[ModuleId::ROOT.raw() as usize];
+        let fixture_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "fixture")
+            })
+            .expect("fixture alias exists");
+        let fixture_import = match root_scope
+            .scope
+            .get(&fixture_symbol)
+            .expect("fixture alias binding exists")
+            .origin
+        {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("fixture alias comes from a use"),
+        };
+        let real_def = collection.scopes().function_owners[0]
+            .owner
+            .def_id
+            .to_def_id();
+        let mut resolved_import_collection = collection.clone();
+        {
+            let root_scope =
+                &mut resolved_import_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            assert!(root_scope.imports[fixture_import.0 as usize].test_only);
+            root_scope.imports[fixture_import.0 as usize].res = Res::Def(DefKind::Fn, real_def);
+            root_scope
+                .scope
+                .get_mut(&fixture_symbol)
+                .expect("fixture alias binding exists")
+                .res = Res::Def(DefKind::Fn, real_def);
+        }
+        let resolved_import_results = database
+            .resolve_trait_impl_member_test_only_paths(
+                &resolved_import_collection,
+                &module_tree,
+                &snapshot,
+            )
+            .expect("resolved test-only member imports remain diagnosable");
+        assert_eq!(
+            diagnostics_for(&resolved_import_results.owners()[0].members()[0]).len(),
+            1
+        );
+        assert!(
+            resolved_import_results
+                .owners()
+                .iter()
+                .flat_map(TraitImplMemberOwnerResolution::members)
+                .all(|member| {
+                    diagnostics_for(member).iter().all(|diagnostic| {
+                        diagnostic.code == sai_diagnostics::Code::TestDependencyOutsideTest
+                    }) && member
+                        .test_only_path_resolution()
+                        .expect("resolved member path results succeed")
+                        .paths()
+                        .values()
+                        .all(|path| path.base == Res::Err)
+                }),
+            "test-only member diagnostics follow import origin even when Res is Def"
+        );
+
+        let mut ordinary_collection = collection.clone();
+        ordinary_collection.scopes.modules[ModuleId::ROOT.raw() as usize].imports
+            [fixture_import.0 as usize]
+            .test_only = false;
+        let ordinary_results = database
+            .resolve_trait_impl_member_test_only_paths(
+                &ordinary_collection,
+                &module_tree,
+                &snapshot,
+            )
+            .expect("ordinary member imports remain usable");
+        assert!(
+            ordinary_results
+                .owners()
+                .iter()
+                .flat_map(TraitImplMemberOwnerResolution::members)
+                .all(|member| diagnostics_for(member).is_empty()),
+            "ordinary module imports do not receive test-only diagnostics"
+        );
+    }
+
+    #[test]
+    fn trait_impl_member_test_only_paths_use_each_files_scope_and_isolate_parents() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "trait RootApi { fn root_method() -> fixture.RootType }\n",
+        );
+        let child = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "trait ChildApi { fn child_method() -> fixture.ChildType }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only imports are retained in each module");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated signatures resolve in their own module scopes");
+        assert_eq!(results.owners().len(), 2);
+        assert!(
+            results
+                .owners()
+                .iter()
+                .all(|owner| owner.error().is_none() && owner.members().len() == 1)
+        );
+        for (module_index, needle) in ["fixture.RootType", "fixture.ChildType"]
+            .into_iter()
+            .enumerate()
+        {
+            let member = &results.owners()[module_index].members()[0];
+            let diagnostics = member
+                .test_only_diagnostics()
+                .expect("member scope resolution succeeds");
+            assert_eq!(diagnostics.len(), 1);
+            let expected_reference = sai_diagnostics::Span::new(
+                module_tree.modules[module_index].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(if module_index == 0 {
+                        root.find(needle).expect("root reference exists") as u32
+                    } else {
+                        child.find(needle).expect("child reference exists") as u32
+                    }),
+                    sai_diagnostics::TextSize::new(
+                        (if module_index == 0 {
+                            root.find(needle).expect("root reference exists")
+                        } else {
+                            child.find(needle).expect("child reference exists")
+                        } + "fixture".len()) as u32,
+                    ),
+                )
+                .expect("reference range is ordered"),
+            );
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("member diagnostic has a primary span")
+                    .span,
+                expected_reference
+            );
+            let source = if module_index == 0 { root } else { child };
+            let use_start = source
+                .find("acme:test-support/fixtures")
+                .expect("module test-only use exists");
+            let expected_use = sai_diagnostics::Span::new(
+                module_tree.modules[module_index].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(use_start as u32),
+                    sai_diagnostics::TextSize::new(
+                        (use_start + "acme:test-support/fixtures".len()) as u32,
+                    ),
+                )
+                .expect("module package path range is ordered"),
+            );
+            assert!(diagnostics[0].related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. } if location.span == expected_use
+            )));
+        }
+
+        let mut broken_collection = collection.clone();
+        let root_owner = results.owners()[0].owner();
+        let root_index = broken_collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .position(|descriptor| descriptor.owner == root_owner)
+            .expect("root trait descriptor exists");
+        broken_collection.scopes.top_level_owners[root_index].item_id =
+            ast::ErasedAstId::new(u32::MAX);
+        let isolated = database
+            .resolve_trait_impl_member_test_only_paths(&broken_collection, &module_tree, &snapshot)
+            .expect("a bad parent descriptor does not stop other parents");
+        assert!(isolated.owners()[0].error().is_some());
+        assert!(isolated.owners()[0].members().is_empty());
+        assert!(isolated.owners()[1].error().is_none());
+        assert_eq!(
+            isolated.owners()[1].members()[0]
+                .test_only_diagnostics()
+                .expect("child member remains available")
+                .len(),
+            1
         );
     }
 
