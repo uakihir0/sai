@@ -589,6 +589,8 @@ Resolution of a canonical path walks the module tree of `sai:core` or `sai:alloc
 
 The prelude is a fixed table `prelude: BTreeMap<Symbol, Res>` built once from the list of spec/16 §16.4, by canonical path as for lang items. The reserved type names map to `Res::PrimTy(..)`: `Int ↦ I64`, `UInt ↦ U64` (D-TYPE-01), `Never ↦ PrimTy::Never`. `Array` maps to the built-in array constructor `Res::PrimTy(PrimTy::Array)`, because `Array<T, N>` is a structural type (spec/05 §5.1.3) even though it has a library module for its associated functions (§3.9.3).
 
+**Canonical prelude provider (IR-530).** `sai_resolve::prelude` now defines all 50 canonical standard-library item paths and the 19 primitive type and constructor names, and builds the complete set of 69 names from a caller-supplied canonical-item resolver. The builder checks each item’s expected kind and standard-package identity. The current API uses `PreludeBinding` to keep primitive type and constructor bindings separate from ordinary `Res`, since `Res` does not yet represent `PrimTy`; it uses a symbol-keyed hash map for lookup plus an entry slice sorted by spelling, since `Symbol` does not implement `Ord`. This provider is defined and tested, but is not yet wired into owner lookup or package-scope construction.
+
 ## 3.4 Resolving paths in owners
 
 ### 3.4.1 Resolutions
@@ -779,8 +781,21 @@ runs the local-name pass over those predicate expressions using the same
 lowered `Body` and `HirSourceMap`, so block bindings and their later uses are
 resolved and module-alias shadowing is reported. This remains a partial local
 pass: implicit `self` and other owner-specific lookup are deferred, as are
-generic/module/prelude fallback, associated and other owner kinds, tracked
-`hir_owner`, and full `resolve_owner`.
+generic and prelude fallback, associated and other owner kinds, tracked
+`hir_owner`, and full `resolve_owner`. IR-529 adds module fallback for
+invariant expression paths only; it does not provide general type, member, or
+module lookup for other owner kinds.
+
+**Invariant test-only references (IR-529).** The invariant adapter also walks
+the target type and non-expression paths in predicate HIR, then resolves
+deferred expression paths through the exact module scope. It follows import
+origins to diagnose test-only bindings independently of `Res`, changes only
+rejected path heads to `Res::Err`, and returns separate module-resolution,
+path-resolution, and diagnostic channels. Test-only diagnostics are source
+ordered and preserve per-owner failures; path results are keyed by HIR path in
+a map. The new channels are optional on the shared
+predicate result because refinement and extern predicate adapters have not
+yet adopted this pass; those adapters retain their existing behavior.
 
 **Top-level refinement predicates (IR-515).** The bridge now also validates
 `Body::value` for top-level `type R = B where p` and `distinct D = B where p`
