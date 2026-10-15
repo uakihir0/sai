@@ -11,11 +11,15 @@ use sai_hir::OwnerId;
 use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
+use sai_hir::items::HirOwner;
 use sai_hir::lower::{
-    ExternItemIds, HirLoweringContext, HirLoweringError, lower_distinct_owner,
-    lower_extern_block_owner, lower_extern_item_owner, lower_function_owner, lower_invariant_owner,
-    lower_refined_owner,
+    ExternItemIds, HirLoweringContext, HirLoweringError, lower_alias_owner, lower_const_owner,
+    lower_distinct_owner, lower_effect_owner, lower_enum_owner, lower_extern_block_owner,
+    lower_extern_item_owner, lower_function_owner, lower_impl_owner, lower_interface_owner,
+    lower_invariant_owner, lower_property_owner, lower_refined_owner, lower_resource_owner,
+    lower_struct_owner, lower_test_owner, lower_trait_owner, lower_world_owner,
 };
+use sai_hir::source_map::HirSourceMap;
 use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -42,7 +46,8 @@ use sai_resolve::package_scopes::{
     suppress_export_name_feature_gate,
 };
 pub use sai_resolve::package_scopes::{
-    Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes,
+    Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes, TopLevelOwnerDescriptor,
+    TopLevelOwnerKind,
 };
 use sai_resolve::use_target_diagnostics::{
     UseTargetDiagnosticsError, collect_local_use_target_diagnostics,
@@ -997,7 +1002,20 @@ pub enum OwnerControlFlowResolutionError {
     TargetFilter(TargetFilterError),
     DefPathInterner(DefPathInternerError),
     MissingDefPath(OwnerId),
-    DescriptorNotInCurrentTarget { owner: OwnerId, file: FileId },
+    DescriptorNotInCurrentTarget {
+        owner: OwnerId,
+        file: FileId,
+    },
+    TopLevelOwnerDescriptorMismatch {
+        owner: OwnerId,
+        file: FileId,
+    },
+    TopLevelOwnerKindMismatch {
+        owner: OwnerId,
+        file: FileId,
+        descriptor: TopLevelOwnerKind,
+        current: ItemTreeKind,
+    },
     MissingModuleScope(FileId),
     Lowering(HirLoweringError),
     Labels(LabelResolutionError),
@@ -1017,6 +1035,209 @@ struct CurrentOwnerInputs {
     filtered_item_tree: ItemTree,
     retained_item_kinds: HashMap<ast::ErasedAstId, ItemTreeKind>,
     source_ref: SourceRef,
+}
+
+fn index_top_level_owner_descriptors(
+    collection: &Phase1PackageScopesCollection,
+) -> HashMap<OwnerId, Option<TopLevelOwnerDescriptor>> {
+    let mut index = HashMap::with_capacity(collection.scopes.top_level_owners.len());
+    for descriptor in &collection.scopes.top_level_owners {
+        if let Some(indexed) = index.get_mut(&descriptor.owner) {
+            *indexed = None;
+        } else {
+            index.insert(descriptor.owner, Some(*descriptor));
+        }
+    }
+    index
+}
+
+fn find_top_level_owner_descriptor(
+    index: &HashMap<OwnerId, Option<TopLevelOwnerDescriptor>>,
+    owner: OwnerId,
+    file: FileId,
+    item_id: ast::ErasedAstId,
+    kind: TopLevelOwnerKind,
+) -> Result<TopLevelOwnerDescriptor, OwnerControlFlowResolutionError> {
+    match index.get(&owner).and_then(|descriptor| *descriptor) {
+        Some(descriptor)
+            if descriptor.file == file
+                && descriptor.item_id == item_id
+                && descriptor.kind == kind =>
+        {
+            Ok(descriptor)
+        }
+        _ => Err(OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch { owner, file }),
+    }
+}
+
+fn item_tree_kind_for_top_level_owner(kind: TopLevelOwnerKind) -> ItemTreeKind {
+    match kind {
+        TopLevelOwnerKind::Function => ItemTreeKind::Function,
+        TopLevelOwnerKind::Struct => ItemTreeKind::Struct,
+        TopLevelOwnerKind::Alias => ItemTreeKind::Alias,
+        TopLevelOwnerKind::Refined => ItemTreeKind::Refined,
+        TopLevelOwnerKind::Enum => ItemTreeKind::Enum,
+        TopLevelOwnerKind::Distinct => ItemTreeKind::Distinct,
+        TopLevelOwnerKind::Resource => ItemTreeKind::Resource,
+        TopLevelOwnerKind::Trait => ItemTreeKind::Trait,
+        TopLevelOwnerKind::Impl => ItemTreeKind::Impl,
+        TopLevelOwnerKind::Const => ItemTreeKind::Const,
+        TopLevelOwnerKind::Invariant => ItemTreeKind::Invariant,
+        TopLevelOwnerKind::Effect => ItemTreeKind::Effect,
+        TopLevelOwnerKind::Interface => ItemTreeKind::Interface,
+        TopLevelOwnerKind::World => ItemTreeKind::World,
+        TopLevelOwnerKind::ExternBlock => ItemTreeKind::ExternBlock,
+        TopLevelOwnerKind::Test => ItemTreeKind::Test,
+        TopLevelOwnerKind::Property => ItemTreeKind::Property,
+    }
+}
+
+fn lower_top_level_owner<'hir>(
+    descriptor: TopLevelOwnerDescriptor,
+    expected_path: &DefPath,
+    item_tree: &'hir ItemTree,
+    retained_item_kinds: &HashMap<ast::ErasedAstId, ItemTreeKind>,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(HirOwner<'hir>, HirSourceMap), OwnerControlFlowResolutionError> {
+    let Some(current_kind) = retained_item_kinds.get(&descriptor.item_id).copied() else {
+        return Err(
+            OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                owner: descriptor.owner,
+                file: descriptor.file,
+            },
+        );
+    };
+    let expected_kind = item_tree_kind_for_top_level_owner(descriptor.kind);
+    if current_kind != expected_kind {
+        return Err(OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+            owner: descriptor.owner,
+            file: descriptor.file,
+            descriptor: descriptor.kind,
+            current: current_kind,
+        });
+    }
+    let lowered = match descriptor.kind {
+        TopLevelOwnerKind::Function => lower_function_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Struct => lower_struct_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Alias => lower_alias_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Refined => lower_refined_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Enum => lower_enum_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Distinct => lower_distinct_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Resource => lower_resource_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Trait => lower_trait_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Impl => lower_impl_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Const => lower_const_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Invariant => lower_invariant_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Effect => lower_effect_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Interface => lower_interface_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::World => lower_world_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::ExternBlock => lower_extern_block_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Test => lower_test_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+        TopLevelOwnerKind::Property => lower_property_owner(
+            descriptor.owner,
+            expected_path,
+            item_tree,
+            descriptor.item_id,
+            context,
+        ),
+    };
+    lowered.map_err(OwnerControlFlowResolutionError::Lowering)
 }
 
 fn module_aliases_for_file(
@@ -2578,6 +2799,7 @@ impl RootDatabase {
             return Err(FunctionOwnerLabelResolutionError::ModuleTreeMismatch);
         }
 
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -2609,16 +2831,13 @@ impl RootDatabase {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
                 let resolution = (|| {
-                    if inputs.retained_item_kinds.get(&descriptor.item_id)
-                        != Some(&ItemTreeKind::Function)
-                    {
-                        return Err(
-                            FunctionOwnerLabelResolutionError::DescriptorNotInCurrentTarget {
-                                owner: descriptor.owner,
-                                file: descriptor.file,
-                            },
-                        );
-                    }
+                    let owner_descriptor = find_top_level_owner_descriptor(
+                        &top_level_owner_index,
+                        descriptor.owner,
+                        descriptor.file,
+                        descriptor.item_id,
+                        TopLevelOwnerKind::Function,
+                    )?;
 
                     let def_paths = self
                         .def_paths
@@ -2642,14 +2861,13 @@ impl RootDatabase {
                         &self.symbols,
                         def_paths,
                     );
-                    let (hir_owner, source_map) = lower_function_owner(
-                        descriptor.owner,
+                    let (hir_owner, source_map) = lower_top_level_owner(
+                        owner_descriptor,
                         &expected_path,
                         &inputs.filtered_item_tree,
-                        descriptor.item_id,
+                        &inputs.retained_item_kinds,
                         &context,
-                    )
-                    .map_err(FunctionOwnerLabelResolutionError::Lowering)?;
+                    )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     match hir_owner.body {
                         Some(body) => {
@@ -2719,6 +2937,7 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.invariant_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -2747,16 +2966,13 @@ impl RootDatabase {
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let resolution = (|| {
-                    if inputs.retained_item_kinds.get(&descriptor.item_id)
-                        != Some(&ItemTreeKind::Invariant)
-                    {
-                        return Err(
-                            OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
-                                owner: descriptor.owner,
-                                file: descriptor.file,
-                            },
-                        );
-                    }
+                    let owner_descriptor = find_top_level_owner_descriptor(
+                        &top_level_owner_index,
+                        descriptor.owner,
+                        descriptor.file,
+                        descriptor.item_id,
+                        TopLevelOwnerKind::Invariant,
+                    )?;
 
                     let def_paths = self
                         .def_paths
@@ -2780,14 +2996,13 @@ impl RootDatabase {
                         &self.symbols,
                         def_paths,
                     );
-                    let (hir_owner, _source_map) = lower_invariant_owner(
-                        descriptor.owner,
+                    let (hir_owner, _source_map) = lower_top_level_owner(
+                        owner_descriptor,
                         &expected_path,
                         &inputs.filtered_item_tree,
-                        descriptor.item_id,
+                        &inputs.retained_item_kinds,
                         &context,
-                    )
-                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                    )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     match hir_owner.body {
                         Some(body) => resolve_owner_control_flow(
@@ -2836,6 +3051,7 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.refinement_predicate_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -2864,18 +3080,17 @@ impl RootDatabase {
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let resolution = (|| {
-                    let expected_kind = match descriptor.kind {
-                        RefinementPredicateOwnerKind::Refined => ItemTreeKind::Refined,
-                        RefinementPredicateOwnerKind::Distinct => ItemTreeKind::Distinct,
+                    let owner_kind = match descriptor.kind {
+                        RefinementPredicateOwnerKind::Refined => TopLevelOwnerKind::Refined,
+                        RefinementPredicateOwnerKind::Distinct => TopLevelOwnerKind::Distinct,
                     };
-                    if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&expected_kind) {
-                        return Err(
-                            OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
-                                owner: descriptor.owner,
-                                file: descriptor.file,
-                            },
-                        );
-                    }
+                    let owner_descriptor = find_top_level_owner_descriptor(
+                        &top_level_owner_index,
+                        descriptor.owner,
+                        descriptor.file,
+                        descriptor.item_id,
+                        owner_kind,
+                    )?;
 
                     let def_paths = self
                         .def_paths
@@ -2899,23 +3114,13 @@ impl RootDatabase {
                         &self.symbols,
                         def_paths,
                     );
-                    let (hir_owner, _source_map) = match descriptor.kind {
-                        RefinementPredicateOwnerKind::Refined => lower_refined_owner(
-                            descriptor.owner,
-                            &expected_path,
-                            &inputs.filtered_item_tree,
-                            descriptor.item_id,
-                            &context,
-                        ),
-                        RefinementPredicateOwnerKind::Distinct => lower_distinct_owner(
-                            descriptor.owner,
-                            &expected_path,
-                            &inputs.filtered_item_tree,
-                            descriptor.item_id,
-                            &context,
-                        ),
-                    }
-                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                    let (hir_owner, _source_map) = lower_top_level_owner(
+                        owner_descriptor,
+                        &expected_path,
+                        &inputs.filtered_item_tree,
+                        &inputs.retained_item_kinds,
+                        &context,
+                    )?;
                     lowering_diagnostics = hir_owner.diagnostics.clone();
                     match hir_owner.body {
                         Some(body) => resolve_predicate_expression(
@@ -2963,6 +3168,7 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.extern_function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -2991,6 +3197,13 @@ impl RootDatabase {
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let resolution = (|| {
+                    let block_descriptor = find_top_level_owner_descriptor(
+                        &top_level_owner_index,
+                        descriptor.block_owner,
+                        descriptor.file,
+                        descriptor.block_item_id,
+                        TopLevelOwnerKind::ExternBlock,
+                    )?;
                     if inputs.retained_item_kinds.get(&descriptor.block_item_id)
                         != Some(&ItemTreeKind::ExternBlock)
                         || inputs.retained_item_kinds.get(&descriptor.item_id)
@@ -3032,14 +3245,13 @@ impl RootDatabase {
                         &self.symbols,
                         def_paths,
                     );
-                    let (block_hir, _block_source_map) = lower_extern_block_owner(
-                        descriptor.block_owner,
+                    let (block_hir, _block_source_map) = lower_top_level_owner(
+                        block_descriptor,
                         &block_path,
                         &inputs.filtered_item_tree,
-                        descriptor.block_item_id,
+                        &inputs.retained_item_kinds,
                         &context,
-                    )
-                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                    )?;
                     lowering_diagnostics.extend(block_hir.diagnostics.iter().cloned());
 
                     let (hir_owner, _source_map) = lower_extern_item_owner(
@@ -3510,6 +3722,99 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    #[test]
+    fn top_level_owner_kinds_map_to_their_item_tree_kinds() {
+        let cases = [
+            (TopLevelOwnerKind::Function, ItemTreeKind::Function),
+            (TopLevelOwnerKind::Struct, ItemTreeKind::Struct),
+            (TopLevelOwnerKind::Alias, ItemTreeKind::Alias),
+            (TopLevelOwnerKind::Refined, ItemTreeKind::Refined),
+            (TopLevelOwnerKind::Enum, ItemTreeKind::Enum),
+            (TopLevelOwnerKind::Distinct, ItemTreeKind::Distinct),
+            (TopLevelOwnerKind::Resource, ItemTreeKind::Resource),
+            (TopLevelOwnerKind::Trait, ItemTreeKind::Trait),
+            (TopLevelOwnerKind::Impl, ItemTreeKind::Impl),
+            (TopLevelOwnerKind::Const, ItemTreeKind::Const),
+            (TopLevelOwnerKind::Invariant, ItemTreeKind::Invariant),
+            (TopLevelOwnerKind::Effect, ItemTreeKind::Effect),
+            (TopLevelOwnerKind::Interface, ItemTreeKind::Interface),
+            (TopLevelOwnerKind::World, ItemTreeKind::World),
+            (TopLevelOwnerKind::ExternBlock, ItemTreeKind::ExternBlock),
+            (TopLevelOwnerKind::Test, ItemTreeKind::Test),
+            (TopLevelOwnerKind::Property, ItemTreeKind::Property),
+        ];
+        for (owner_kind, item_tree_kind) in cases {
+            assert_eq!(
+                item_tree_kind_for_top_level_owner(owner_kind),
+                item_tree_kind
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_owner_dispatch_rejects_current_item_kind_mismatch() {
+        let root = b"fn f() {}\n";
+        let child = b"";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root, child);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let descriptor = *collection
+            .scopes
+            .top_level_owners
+            .first()
+            .expect("function owner is indexed");
+        let inputs = database
+            .current_owner_inputs(&snapshot, descriptor.file, &collection.target_cfg)
+            .expect("current owner inputs are available");
+        let mut retained_item_kinds = inputs.retained_item_kinds.clone();
+        retained_item_kinds.insert(descriptor.item_id, ItemTreeKind::Struct);
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&descriptor.owner.def_id.package())
+                .expect("owner package has a DefPath interner"),
+        );
+        let expected_path = def_paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .expect("owner path resolves")
+            .expect("owner path exists");
+        let arena = HirArena::new();
+        let context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            &snapshot,
+            &inputs.parsed.root,
+            &arena,
+            &database.symbols,
+            &def_paths,
+        );
+        let error = match lower_top_level_owner(
+            descriptor,
+            &expected_path,
+            &inputs.filtered_item_tree,
+            &retained_item_kinds,
+            &context,
+        ) {
+            Ok(_) => panic!("a mismatched current item kind must not lower"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                owner: descriptor.owner,
+                file: descriptor.file,
+                descriptor: TopLevelOwnerKind::Function,
+                current: ItemTreeKind::Struct,
+            }
+        );
     }
 
     #[test]
@@ -4097,7 +4402,7 @@ mod tests {
     }
 
     #[test]
-    fn function_owner_label_adapter_keeps_processing_after_one_lowering_failure() {
+    fn function_owner_label_adapter_keeps_processing_after_one_descriptor_failure() {
         let root = "fn first() {}\nfn later() { break; }\n";
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -4109,8 +4414,8 @@ mod tests {
                 Phase1BuildContext::default(),
             )
             .expect("Phase 1 collection succeeds");
-        // Simulate an internal descriptor-corruption failure: the public
-        // collection keeps this owner index immutable to callers.
+        // Simulate an internal descriptor-corruption failure in the legacy
+        // function index: the public collection keeps this index immutable.
         let later_owner = collection.scopes.function_owners[1].owner;
         collection.scopes.function_owners[0].owner = later_owner;
 
@@ -4120,15 +4425,11 @@ mod tests {
         assert_eq!(resolved.owners().len(), 2);
         assert!(matches!(
             resolved.owners()[0].resolution(),
-            Err(FunctionOwnerLabelResolutionError::Lowering(
-                HirLoweringError::ItemTreeEntryMismatch
-            ))
+            Err(FunctionOwnerLabelResolutionError::TopLevelOwnerDescriptorMismatch { .. })
         ));
         assert!(matches!(
             resolved.owners()[0].local_resolution(),
-            Err(FunctionOwnerResolutionError::Lowering(
-                HirLoweringError::ItemTreeEntryMismatch
-            ))
+            Err(FunctionOwnerResolutionError::TopLevelOwnerDescriptorMismatch { .. })
         ));
         let later = resolved.owners()[1]
             .resolution()
