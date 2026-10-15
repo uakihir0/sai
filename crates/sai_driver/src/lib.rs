@@ -13,7 +13,7 @@ use sai_hir::expressions::{
     Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
 };
 use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
-use sai_hir::items::{HirOwner, ItemKind, OwnerNode};
+use sai_hir::items::{HirOwner, ImplKind, ItemKind, OwnerNode};
 use sai_hir::lower::{
     ExternItemIds, HirLoweringContext, HirLoweringError, lower_alias_owner, lower_const_owner,
     lower_distinct_owner, lower_effect_owner, lower_enum_owner, lower_extern_block_owner,
@@ -947,6 +947,76 @@ impl OwnerTestOnlyPathResolution {
     }
 }
 
+/// Test-only path results for one direct trait or impl header.
+///
+/// This pass checks only declaration-header references; it does not resolve
+/// ordinary module paths or associated members.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraitImplHeaderResolution {
+    owner: OwnerId,
+    kind: TopLevelOwnerKind,
+    test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl TraitImplHeaderResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn kind(&self) -> TopLevelOwnerKind {
+        self.kind
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution.as_ref()
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Provenance-tagged trait and impl header test-only diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraitImplHeaderResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<TraitImplHeaderResolution>,
+}
+
+impl TraitImplHeaderResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[TraitImplHeaderResolution] {
+        &self.owners
+    }
+}
+
 /// Compatibility name for the function-specific non-expression path result.
 ///
 /// The representation is now shared with other owner kinds, but callers that
@@ -1599,9 +1669,11 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
     }
 
     let mut work = Vec::new();
+    let mut header_generics = Vec::new();
     let signature = match owner.node {
         OwnerNode::Item(item) => match item.kind {
             ItemKind::Fn { sig, generics, .. } => Some((sig, generics)),
+            ItemKind::Trait { .. } | ItemKind::Impl { .. } => None,
             _ => None,
         },
         OwnerNode::ExternItem(item) => Some((item.sig, item.generics)),
@@ -1633,6 +1705,31 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
     if let OwnerNode::Item(item) = owner.node {
         match item.kind {
             ItemKind::Fn { .. } => {}
+            ItemKind::Trait {
+                generics,
+                supertraits,
+                ..
+            } => {
+                header_generics.push(generics);
+                work.extend(supertraits.iter().copied().map(Work::Bound));
+            }
+            ItemKind::Impl { generics, kind, .. } => {
+                header_generics.push(generics);
+                match kind {
+                    ImplKind::Inherent { self_ty } => work.push(Work::Ty(self_ty)),
+                    ImplKind::Trait { trait_ref, self_ty } => {
+                        work.push(Work::Ty(self_ty));
+                        work.push(Work::Path {
+                            path: trait_ref,
+                            kind: OwnerPathKind::Type,
+                        });
+                    }
+                    ImplKind::Interface { path } => work.push(Work::Path {
+                        path,
+                        kind: OwnerPathKind::Type,
+                    }),
+                }
+            }
             ItemKind::Const { ty } => work.push(Work::Ty(ty)),
             ItemKind::Refined { base } => work.push(Work::Ty(base)),
             ItemKind::Distinct { generics, base, .. } => {
@@ -1658,6 +1755,20 @@ fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
         }
     } else if !matches!(owner.node, OwnerNode::ExternItem(_)) {
         return Vec::new();
+    }
+    for generics in header_generics {
+        for parameter in generics.params {
+            match parameter.kind {
+                GenericParamKind::Type { bounds } => {
+                    work.extend(bounds.iter().copied().map(Work::Bound));
+                }
+                GenericParamKind::Const { ty } => work.push(Work::Ty(ty)),
+            }
+        }
+        for predicate in generics.where_preds {
+            work.push(Work::Ty(predicate.ty));
+            work.extend(predicate.bounds.iter().copied().map(Work::Bound));
+        }
     }
     if let Some(body) = owner.body {
         work.push(Work::Expr(body.value));
@@ -2352,7 +2463,10 @@ fn module_aliases_for_scope(module_scope: &Phase1ModuleScopes) -> HashSet<Symbol
 fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
     let generics = match owner.node {
         OwnerNode::Item(item) => match item.kind {
-            ItemKind::Fn { generics, .. } | ItemKind::Distinct { generics, .. } => generics,
+            ItemKind::Fn { generics, .. }
+            | ItemKind::Distinct { generics, .. }
+            | ItemKind::Trait { generics, .. }
+            | ItemKind::Impl { generics, .. } => generics,
             _ => return HashSet::new(),
         },
         OwnerNode::ExternItem(item) => item.generics,
@@ -5280,6 +5394,174 @@ impl RootDatabase {
             group_start = group_end;
         }
         Ok(PredicateOwnerResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Diagnoses test-only path references in direct trait and impl headers.
+    ///
+    /// The pass checks declaration generics, bounds, where clauses,
+    /// supertraits, impl self types, and impl trait/interface targets. It does
+    /// not perform ordinary type or module lookup and does not process
+    /// associated members.
+    pub fn resolve_trait_impl_header_test_only_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<TraitImplHeaderResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.kind,
+                    TopLevelOwnerKind::Trait | TopLevelOwnerKind::Impl
+                )
+            })
+            .collect::<Vec<_>>();
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let mut owners = Vec::with_capacity(descriptors.len());
+
+        for descriptor in descriptors {
+            let mut lowering_diagnostics = Vec::new();
+            let inputs = match self.current_owner_inputs(
+                snapshot,
+                descriptor.file,
+                &collection.target_cfg,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    owners.push(TraitImplHeaderResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        test_only_path_resolution: Err(error.clone()),
+                        test_only_diagnostics: Err(error),
+                        lowering_diagnostics,
+                    });
+                    continue;
+                }
+            };
+
+            let analysis: Result<
+                (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                OwnerControlFlowResolutionError,
+            > = (|| {
+                let owner_descriptor = find_top_level_owner_descriptor(
+                    &top_level_owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    descriptor.kind,
+                )?;
+                let expected_item_kind = match descriptor.kind {
+                    TopLevelOwnerKind::Trait => ItemTreeKind::Trait,
+                    TopLevelOwnerKind::Impl => ItemTreeKind::Impl,
+                    _ => {
+                        return Err(
+                            OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+                };
+                if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&expected_item_kind)
+                {
+                    return Err(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                }
+
+                let def_paths = self
+                    .def_paths
+                    .get(&descriptor.owner.def_id.package())
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let expected_path = def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.parsed.root,
+                    &arena,
+                    &self.symbols,
+                    def_paths,
+                );
+                let (hir_owner, _source_map) = lower_top_level_owner(
+                    owner_descriptor,
+                    &expected_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )?;
+                lowering_diagnostics.extend(hir_owner.diagnostics.iter().cloned());
+
+                let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let candidates = owner_test_only_path_candidates(&hir_owner);
+                let generic_parameters = owner_generic_parameters(&hir_owner);
+                let mut path_resolution = OwnerTestOnlyPathResolution {
+                    owner: descriptor.owner,
+                    paths: HashMap::new(),
+                };
+                let mut diagnostics = collect_test_only_non_expression_reference_diagnostics(
+                    descriptor.owner,
+                    &candidates,
+                    &generic_parameters,
+                    &module_scope,
+                    &mut path_resolution,
+                    &self.symbols,
+                    &inputs,
+                    snapshot,
+                )?;
+                sort_phase1_diagnostics(&mut diagnostics);
+                Ok((path_resolution, diagnostics))
+            })();
+
+            match analysis {
+                Ok((path_resolution, diagnostics)) => {
+                    owners.push(TraitImplHeaderResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        test_only_path_resolution: Ok(path_resolution),
+                        test_only_diagnostics: Ok(diagnostics),
+                        lowering_diagnostics,
+                    });
+                }
+                Err(error) => {
+                    owners.push(TraitImplHeaderResolution {
+                        owner: descriptor.owner,
+                        kind: descriptor.kind,
+                        test_only_path_resolution: Err(error.clone()),
+                        test_only_diagnostics: Err(error),
+                        lowering_diagnostics,
+                    });
+                }
+            }
+        }
+
+        Ok(TraitImplHeaderResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -9491,6 +9773,482 @@ mod tests {
             related,
             Related::DeclaredHere { location, .. } if location.span == expected_use_span
         )));
+    }
+
+    #[test]
+    fn trait_impl_header_test_only_paths_cover_direct_headers_only() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures.{Fixture as Fn}\n",
+            "use acme:test-support/fixtures.{Fixture as FnMut}\n",
+            "use acme:test-support/fixtures as fs\n",
+            "fn local_function() {}\n",
+            "@target(\"wasm64-core\") trait Filtered: fixture.Filtered {}\n",
+            "trait Header<T: Fn(Fixture), ",
+            "const N: fixture.ConstType>: fixture.Super ",
+            "where T: (FnMut() -> Bool effects { fs.read, fixture.effect }) + fixture.Where {\n",
+            "  type Associated: fixture.Associated\n",
+            "  fn method() -> fixture.Returned\n",
+            "}\n",
+            "trait Shadow<Fixture> where Fixture: fixture.ShadowBound {}\n",
+            "impl<T: fixture.ImplBound, const N: fixture.ImplSize> ",
+            "fixture.Trait<T> for fixture.SelfType where T: fixture.ImplWhere {}\n",
+            "impl fixture.Api {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only header imports are retained");
+        let results = database
+            .resolve_trait_impl_header_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("trait and impl headers resolve");
+        assert!(results.matches_collection(&collection));
+        assert_eq!(
+            results
+                .owners()
+                .iter()
+                .map(|owner| owner.kind())
+                .collect::<Vec<_>>(),
+            [
+                TopLevelOwnerKind::Trait,
+                TopLevelOwnerKind::Trait,
+                TopLevelOwnerKind::Impl,
+                TopLevelOwnerKind::Impl,
+            ],
+            "the target-excluded trait has no current owner descriptor"
+        );
+
+        let span_for = |start: usize, text: &str| {
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + text.len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        let span_of = |needle: &str, offset: usize| {
+            let start = root.find(needle).expect("reference text exists") + offset;
+            let suffix = &root[start..];
+            let head_len = suffix
+                .find(|character: char| !character.is_alphanumeric() && character != '_')
+                .unwrap_or(suffix.len());
+            span_for(start, &suffix[..head_len])
+        };
+        let package_path_span = |occurrence: usize| {
+            let start = root
+                .match_indices("acme:test-support/fixtures")
+                .nth(occurrence)
+                .expect("expected import path exists")
+                .0;
+            span_for(start, "acme:test-support/fixtures")
+        };
+        fn diagnostics_for(owner: &TraitImplHeaderResolution) -> &[Diagnostic] {
+            owner
+                .test_only_diagnostics()
+                .expect("header diagnostics succeed")
+        }
+        let diagnostic_spans = |diagnostics: &[Diagnostic]| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("test-only header path has a primary span")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let fixture_package_path = package_path_span(0);
+        let type_package_path = package_path_span(1);
+        let assert_import_note = |diagnostic: &Diagnostic, expected: &sai_diagnostics::Span| {
+            assert!(diagnostic.related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. } if &location.span == expected
+            )));
+        };
+
+        let trait_diagnostics = diagnostics_for(&results.owners()[0]);
+        assert_eq!(
+            diagnostic_spans(trait_diagnostics),
+            [
+                span_of("Fn(Fixture)", "Fn(".len()),
+                span_of("fixture.ConstType", 0),
+                span_of("fixture.Super", 0),
+                span_of("fixture.effect", 0),
+                span_of("fixture.Where", 0),
+            ],
+            "trait generic bounds, nested Fn type/effect paths, const parameter types, supertraits, and where bounds are checked"
+        );
+        assert!(
+            trait_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code
+                    == sai_diagnostics::Code::TestDependencyOutsideTest)
+        );
+        for diagnostic in trait_diagnostics {
+            let reference = &root[diagnostic
+                .primary()
+                .expect("trait header diagnostic has a primary span")
+                .span
+                .range
+                .start()
+                .raw() as usize
+                ..diagnostic
+                    .primary()
+                    .expect("trait header diagnostic has a primary span")
+                    .span
+                    .range
+                    .end()
+                    .raw() as usize];
+            assert_import_note(
+                diagnostic,
+                if reference == "Fixture" {
+                    &type_package_path
+                } else {
+                    &fixture_package_path
+                },
+            );
+        }
+        assert_eq!(
+            results.owners()[0]
+                .test_only_path_resolution()
+                .expect("trait non-expression paths resolve")
+                .paths()
+                .len(),
+            5
+        );
+        assert!(
+            !trait_diagnostics.iter().any(|diagnostic| {
+                let span = &diagnostic.primary().expect("diagnostic has a span").span;
+                span == &span_of("fixture.Associated", 0) || span == &span_of("fixture.Returned", 0)
+            }),
+            "associated declarations remain outside the direct trait header pass"
+        );
+
+        let shadow_diagnostics = diagnostics_for(&results.owners()[1]);
+        assert_eq!(
+            diagnostic_spans(shadow_diagnostics),
+            [span_of("fixture.ShadowBound", 0)],
+            "the generic Fixture suppresses its same-named imported type path"
+        );
+        assert_import_note(&shadow_diagnostics[0], &fixture_package_path);
+
+        let impl_diagnostics = diagnostics_for(&results.owners()[2]);
+        assert_eq!(
+            diagnostic_spans(impl_diagnostics),
+            [
+                span_of("fixture.ImplBound", 0),
+                span_of("fixture.ImplSize", 0),
+                span_of("fixture.Trait", 0),
+                span_of("fixture.SelfType", 0),
+                span_of("fixture.ImplWhere", 0),
+            ],
+            "impl generics, where bounds, trait target, and self type are checked"
+        );
+        let interface_impl_diagnostics = diagnostics_for(&results.owners()[3]);
+        assert_eq!(
+            diagnostic_spans(interface_impl_diagnostics),
+            [span_of("fixture.Api", 0)],
+            "interface implementation targets are checked"
+        );
+        for diagnostic in impl_diagnostics
+            .iter()
+            .chain(interface_impl_diagnostics.iter())
+        {
+            assert_import_note(diagnostic, &fixture_package_path);
+        }
+        assert!(
+            !trait_diagnostics.iter().any(|diagnostic| {
+                diagnostic.primary().is_some_and(|primary| {
+                    &root[primary.span.range.start().raw() as usize
+                        ..primary.span.range.end().raw() as usize]
+                        == "Fn"
+                        || &root[primary.span.range.start().raw() as usize
+                            ..primary.span.range.end().raw() as usize]
+                            == "FnMut"
+                        || &root[primary.span.range.start().raw() as usize
+                            ..primary.span.range.end().raw() as usize]
+                            == "fs"
+                })
+            }),
+            "Fn and FnMut sugar plus the built-in fs effect root take precedence over imported names"
+        );
+
+        // Source declarations provide valid DefIds for the already-resolved
+        // import entries. Test-only classification follows import provenance.
+        let fixture_symbol = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root scope exists")
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "fixture")
+            })
+            .expect("fixture alias exists");
+        let type_symbol = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root scope exists")
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "Fixture")
+            })
+            .expect("Fixture type import exists");
+        let import_index = |symbol| match collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root scope exists")
+            .scope
+            .get(&symbol)
+            .expect("module binding exists")
+            .origin
+        {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("test-only name comes from an import"),
+        };
+        let fixture_import = import_index(fixture_symbol);
+        let type_import = import_index(type_symbol);
+        let function_def = collection.scopes.function_owners[0]
+            .owner
+            .def_id
+            .to_def_id();
+        let mut resolved_import_collection = collection.clone();
+        {
+            let root_scope =
+                &mut resolved_import_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+            for (symbol, import, resolution) in [
+                (
+                    fixture_symbol,
+                    fixture_import,
+                    Res::Def(DefKind::Fn, function_def),
+                ),
+                (
+                    type_symbol,
+                    type_import,
+                    Res::Def(DefKind::Fn, function_def),
+                ),
+            ] {
+                assert!(root_scope.imports[import.0 as usize].test_only);
+                root_scope.imports[import.0 as usize].res = resolution;
+                root_scope
+                    .scope
+                    .get_mut(&symbol)
+                    .expect("test-only binding exists")
+                    .res = resolution;
+            }
+        }
+        let resolved_imports = database
+            .resolve_trait_impl_header_test_only_paths(
+                &resolved_import_collection,
+                &module_tree,
+                &snapshot,
+            )
+            .expect("resolved test-only header imports remain diagnosable");
+        assert_eq!(
+            resolved_imports.owners()[0]
+                .test_only_diagnostics()
+                .expect("resolved trait header diagnostics succeed")
+                .len(),
+            5
+        );
+        assert!(
+            resolved_imports.owners()[0]
+                .test_only_path_resolution()
+                .expect("resolved trait path results succeed")
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "resolved test-only trait paths are rewritten to the error sentinel"
+        );
+        assert_eq!(
+            resolved_imports.owners()[2]
+                .test_only_diagnostics()
+                .expect("resolved impl header diagnostics succeed")
+                .len(),
+            5
+        );
+        for owner in resolved_imports.owners() {
+            for diagnostic in diagnostics_for(owner) {
+                let primary = diagnostic
+                    .primary()
+                    .expect("resolved header diagnostic has a primary span");
+                let reference = &root[primary.span.range.start().raw() as usize
+                    ..primary.span.range.end().raw() as usize];
+                assert_import_note(
+                    diagnostic,
+                    if reference == "Fixture" {
+                        &type_package_path
+                    } else {
+                        &fixture_package_path
+                    },
+                );
+            }
+            assert!(
+                owner
+                    .test_only_path_resolution()
+                    .expect("resolved header path results succeed")
+                    .paths()
+                    .values()
+                    .all(|path| path.base == Res::Err),
+                "resolved test-only header paths are rewritten to the error sentinel"
+            );
+        }
+
+        let mut ordinary_collection = collection.clone();
+        ordinary_collection.scopes.modules[ModuleId::ROOT.raw() as usize].imports
+            [fixture_import.0 as usize]
+            .test_only = false;
+        let ordinary_results = database
+            .resolve_trait_impl_header_test_only_paths(
+                &ordinary_collection,
+                &module_tree,
+                &snapshot,
+            )
+            .expect("ordinary header imports remain resolvable");
+        assert_eq!(
+            diagnostic_spans(diagnostics_for(&ordinary_results.owners()[0])),
+            [span_of("Fn(Fixture)", "Fn(".len())],
+            "ordinary module-alias imports are not diagnosed but the test-only Fixture import is"
+        );
+        assert!(
+            ordinary_results
+                .owners()
+                .iter()
+                .skip(1)
+                .all(|owner| diagnostics_for(owner).is_empty()),
+            "ordinary imports do not receive test-only diagnostics"
+        );
+
+        // A malformed descriptor fails only its own owner; later direct
+        // trait and impl header owners still complete.
+        let mut broken_collection = collection.clone();
+        let header_owner = results.owners()[0].owner();
+        let shadow_owner = results.owners()[1].owner();
+        let header_index = broken_collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .position(|descriptor| descriptor.owner == header_owner)
+            .expect("trait descriptor exists");
+        let shadow_item = broken_collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.owner == shadow_owner)
+            .expect("shadow trait descriptor exists")
+            .item_id;
+        broken_collection.scopes.top_level_owners[header_index].item_id = shadow_item;
+        let isolated = database
+            .resolve_trait_impl_header_test_only_paths(&broken_collection, &module_tree, &snapshot)
+            .expect("header descriptor failures remain isolated");
+        assert!(
+            isolated.owners()[0].test_only_diagnostics().is_err(),
+            "the malformed header descriptor reports an owner-local failure"
+        );
+        assert!(
+            isolated
+                .owners()
+                .iter()
+                .skip(1)
+                .all(|owner| owner.test_only_diagnostics().is_ok()),
+            "subsequent trait and impl headers continue resolving"
+        );
+    }
+
+    #[test]
+    fn trait_impl_header_test_only_paths_use_each_files_module_scope() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "trait RootHeader: fixture.Type {}\n",
+        );
+        let child = "trait ChildHeader: fixture.Type {}\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("root test-only import is retained");
+        let results = database
+            .resolve_trait_impl_header_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("each trait header resolves against its file scope");
+        assert_eq!(results.owners().len(), 2);
+        assert_eq!(results.owners()[0].kind(), TopLevelOwnerKind::Trait);
+        assert_eq!(results.owners()[1].kind(), TopLevelOwnerKind::Trait);
+        let root_diagnostics = results.owners()[0]
+            .test_only_diagnostics()
+            .expect("root module header lookup succeeds");
+        assert_eq!(root_diagnostics.len(), 1);
+        assert_eq!(
+            root_diagnostics[0]
+                .primary()
+                .expect("root reference has a primary span")
+                .span,
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(
+                        root.find("fixture.Type").expect("root reference exists") as u32,
+                    ),
+                    sai_diagnostics::TextSize::new(
+                        (root.find("fixture.Type").expect("root reference exists")
+                            + "fixture".len()) as u32,
+                    ),
+                )
+                .expect("root reference range is ordered"),
+            )
+        );
+        assert_eq!(
+            results.owners()[1]
+                .test_only_diagnostics()
+                .expect("child module header lookup succeeds")
+                .len(),
+            0,
+            "the root module's test-only alias is not visible in the child module"
+        );
+        assert!(
+            results.owners()[1]
+                .test_only_path_resolution()
+                .expect("child header path lookup succeeds")
+                .paths()
+                .is_empty()
+        );
     }
 
     #[test]
