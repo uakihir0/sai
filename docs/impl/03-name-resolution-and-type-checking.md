@@ -329,9 +329,11 @@ trait/impl headers, and associated trait/impl declarations including method
 bodies and contracts, and direct interface declarations including resource
 method signatures and recovery-only interface body/contract syntax. IR-538
 adds top-level structs, aliases, enums, and resources, including generic
-bounds, `where` clauses, alias targets, fields, and enum payloads. Effects,
-worlds, and remaining extern-child owners are pending; the property-parameter
-exception is preserved during test analysis.
+bounds, `where` clauses, alias targets, fields, and enum payloads. IR-539 adds
+test-only diagnostics for effect `covers` declarations. World/WIT references
+remain pending. The grammar exposes no additional extern-child form beyond
+function heads, which IR-532 already covers; the property-parameter exception
+is preserved during test analysis.
 The complete canonical prelude and general tracked `package_scopes(PackageId)`
 query also remain deferred.
 
@@ -868,7 +870,7 @@ Test-only references are classified through the originating import even when
 the visible binding carries `Res::Def`, and rejected paths become `Res::Err`
 with the source `PKG_PATH` note. Signature and contract diagnostics are merged
 in source order. This remains an incremental extern adapter, not complete
-extern-child or general type/effect resolution.
+extern or general type/effect resolution.
 
 **Trait and impl header test-only references (IR-534).** The top-level header
 adapter checks trait generic bounds, const-parameter types, `where` clauses,
@@ -940,8 +942,8 @@ test-only diagnostics without manufacturing HIR path results. AST-only
 predicate and recovered function scans include constructor and range-pattern
 heads, and nested refined declarations use their ItemTree generic parameters
 for shadowing. Parent, child, and resource-method failures stay isolated. This
-remains a diagnostic pass; ordinary type/effect/member lookup, world and
-other owner kinds, and command-level `check` integration remain pending.
+remains a diagnostic pass; ordinary type/effect/member lookup, world/WIT
+references, and command-level `check` integration remain pending.
 
 **Top-level type test-only references (IR-538).** The driver diagnoses
 references to test-only imports in direct top-level structs, aliases, enums,
@@ -954,9 +956,20 @@ independently of `Res`, emits exact first-segment spans with the original
 result channel. Target filtering and per-owner failure isolation remain in
 force. Top-level resource field types are included at this stage because
 resources already lower as ordinary top-level type owners; resources add no
-generic parameter scope. Ordinary type, member, and Prelude resolution,
-effects, worlds, remaining extern-child owners, and command-level `check`
-integration remain pending.
+generic parameter scope. IR-539 below covers effect `covers` references.
+Ordinary type, member, and Prelude resolution, world/WIT references, and
+command-level `check` integration remain pending. The grammar exposes no
+further extern-child form beyond function heads, which IR-532 covers.
+
+**Effect `covers` test-only references (IR-539).** The driver diagnoses
+test-only imports used as the first segment of a top-level effect's `covers`
+paths, using that effect's exact file scope and the originating import's
+`test_only` flag. Built-in effect roots keep precedence over module aliases.
+Well-formed HIR paths retain `Res::Err` results with one resolved head and the
+full segment count. When a malformed covers set is lowered as empty, a
+recovery-only AST scan diagnoses valid references without creating HIR path
+results. Ordinary effect lookup, complete covers-graph validation, world/WIT
+references, and command-level `check` integration remain pending.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
