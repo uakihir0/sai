@@ -1641,7 +1641,9 @@ fn add_label_suggestions(
     Ok(())
 }
 
-fn edit_distance_at_most_two(left: &str, right: &str) -> Option<usize> {
+/// Compute the bounded Damerau–Levenshtein distance for diagnostic name
+/// suggestions. Returns `None` when the distance exceeds two.
+pub fn edit_distance_at_most_two(left: &str, right: &str) -> Option<usize> {
     let left = left.chars().collect::<Vec<_>>();
     let right = right.chars().collect::<Vec<_>>();
     if left.len().abs_diff(right.len()) > 2 {
