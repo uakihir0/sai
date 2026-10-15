@@ -813,6 +813,19 @@ remains for a later pass. This slice does not resolve prelude names, qualified
 members, or non-function owner kinds, and does not emit final unresolved-name
 diagnostics.
 
+**Test and property local resolution (IR-523).** The driver retains the
+`Phase1BuildContext` on each package-scope collection and enables this adapter
+only when `analyzes_tests` is true, independently of `is_root_package`.
+Target-filtered test and property descriptors are lowered from current file
+inputs, then `resolve_owner_locals` runs against each owner's paired `Body`
+and `HirSourceMap`, using module aliases from that exact file scope. Results
+retain collection provenance and isolate lowering/local-resolution failures
+per owner. Test-only module aliases with no item list remain syntax-known for
+`SHADOWS_MODULE` even when an inactive test-only import has `Res::Err`.
+This slice resolves lexical locals only; it does not resolve generic,
+module-item, prelude, or qualified-member references, nor does it add tracked
+`hir_owner`/`resolve_owner` queries or type checking.
+
 ### 3.4.6 Visibility
 
 `visible(e, M)` (spec/04 §4.6.1) is evaluated for every path segment that names an item or a member, at the point where the segment is resolved: by the resolver for module members and `use` items, and by the type checker for type-relative members (variants never fail, since they have the enum's visibility; inherent associated functions and methods, spec/05 §5.13.5) and for fields (`PRIVATE_FIELD`, spec/04 §4.6.3, §4.6.4). The visibility of an entity is read from its `ItemTree` entry or from the dependency's metadata, never from HIR, so the check does not depend on the target's body.
