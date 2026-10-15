@@ -327,9 +327,11 @@ owner adapters cover top-level functions, extern functions, consts,
 invariants, refined types, refinement-bearing distinct types, direct
 trait/impl headers, and associated trait/impl declarations including method
 bodies and contracts, and direct interface declarations including resource
-method signatures and recovery-only interface body/contract syntax. Other
-remaining owner kinds are pending; the property-parameter exception is
-preserved during test analysis.
+method signatures and recovery-only interface body/contract syntax. IR-538
+adds top-level structs, aliases, enums, and resources, including generic
+bounds, `where` clauses, alias targets, fields, and enum payloads. Effects,
+worlds, and remaining extern-child owners are pending; the property-parameter
+exception is preserved during test analysis.
 The complete canonical prelude and general tracked `package_scopes(PackageId)`
 query also remain deferred.
 
@@ -941,6 +943,21 @@ for shadowing. Parent, child, and resource-method failures stay isolated. This
 remains a diagnostic pass; ordinary type/effect/member lookup, world and
 other owner kinds, and command-level `check` integration remain pending.
 
+**Top-level type test-only references (IR-538).** The driver diagnoses
+references to test-only imports in direct top-level structs, aliases, enums,
+and resources. It checks declaration generic bounds and `where` clauses,
+alias targets, struct/resource fields, and tuple/record enum payloads, keeping
+field and variant paths under the enclosing type owner. It uses the exact
+source-file scope, applies generic type-name shadowing, checks import origin
+independently of `Res`, emits exact first-segment spans with the original
+`PKG_PATH`, and stores rejected heads as `Res::Err` in a diagnostic-only
+result channel. Target filtering and per-owner failure isolation remain in
+force. Top-level resource field types are included at this stage because
+resources already lower as ordinary top-level type owners; resources add no
+generic parameter scope. Ordinary type, member, and Prelude resolution,
+effects, worlds, remaining extern-child owners, and command-level `check`
+integration remain pending.
+
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
 block/child `OwnerId`s, rebinds both AST IDs from current target-filtered
@@ -1026,9 +1043,10 @@ result becomes `Res::Err` so later phases do not cascade. IR-526 covered const
 initializer expressions only. IR-528 below extends the same diagnostic rule to
 const declaration-type heads; IR-529, IR-531, and IR-532 add invariant,
 refined/distinct, and extern owners, while IR-534 covers direct trait/impl
-headers and IR-535–IR-536 cover associated declaration signatures, method
-bodies, and contracts. Interface and other non-test owner kinds remain for
-later integration.
+headers, IR-535–IR-536 cover associated declaration signatures, method bodies,
+and contracts, IR-537 covers interfaces, and IR-538 covers top-level
+struct/alias/enum/resource declarations. Effects, worlds, and remaining
+extern-child owners remain for later integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
 the declared type before its body-dependent local-resolution branch and also
