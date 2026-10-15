@@ -835,6 +835,17 @@ function `where` clauses and body annotations omitted from HIR remain
 diagnostic-only. Qualified suffixes and non-primitive Prelude names remain
 deferred.
 
+**Qualified local function type prefixes (IR-556).** Function type paths
+continue through current-package module and interface members after resolving
+their first head. Stop when a member is no longer module-like, retaining the
+full path length and leaving its type-relative suffix for later resolution.
+Missing local members are retained as typed path errors for diagnostic
+mapping. A foreign module alias whose package scope is not in this local
+index remains deferred; validated foreign source closure, visibility errors,
+and WIT member scopes are later work. Generic, test-only, exact-file module,
+and primitive Prelude precedence remains unchanged, and expression module
+lookup stays separate.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
