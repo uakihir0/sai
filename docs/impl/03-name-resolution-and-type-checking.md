@@ -794,6 +794,16 @@ ordinary path map. Expression `ModuleResolution` remains independent.
 Qualified suffixes and canonical names without supplied standard-package
 scopes remain deferred.
 
+**Trait and impl header type heads (IR-552).** Direct trait and impl headers
+expose partial type-head results for generic bounds and const-parameter types,
+`where` clauses, supertraits, impl trait or interface targets, and impl self
+types. Resolve exact type and const generic definitions first, then reject
+test-only imports independently of diagnostic collection, and use the exact
+source file's module scope before primitive Prelude entries. These results
+remain separate from test-only diagnostic paths. Qualified suffixes and
+associated declarations or methods are deferred; canonical non-primitive
+names also remain deferred until standard-package definitions are available.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
