@@ -69,6 +69,10 @@ pub use sai_resolve::package_scopes::{
     Phase1BuildContext, Phase1CollectionConfig, Phase1PackageScopes, TopLevelOwnerDescriptor,
     TopLevelOwnerKind,
 };
+use sai_resolve::prelude::{
+    Prelude, PreludeBinding, PrimitivePreludeBuildError, build_primitive_prelude,
+    primitive_prelude_fingerprint,
+};
 use sai_resolve::use_target_diagnostics::{
     UseTargetDiagnosticsError, collect_local_use_target_diagnostics,
 };
@@ -106,6 +110,7 @@ pub struct RootDatabase {
     packages: Arc<PackageInterner>,
     files: FileInterner,
     symbols: Arc<Interner>,
+    primitive_prelude: Result<Prelude, PrimitivePreludeBuildError>,
     /// Retained for the lifetime of this database so every `DefId` returned
     /// by Phase 1 remains associated with its original package-local paths.
     def_paths: HashMap<PackageId, Arc<DefPathInterner>>,
@@ -537,6 +542,7 @@ struct TypeOwnerPathQueryIdentity {
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Fingerprint,
     scope_lookup_fingerprint: Fingerprint,
+    primitive_prelude_fingerprint: Fingerprint,
 }
 
 impl StableHash for TypeOwnerPathQueryIdentity {
@@ -545,6 +551,7 @@ impl StableHash for TypeOwnerPathQueryIdentity {
         self.collection_input_fingerprint.stable_hash(hasher);
         self.member_scope_closure_fingerprint.stable_hash(hasher);
         self.scope_lookup_fingerprint.stable_hash(hasher);
+        self.primitive_prelude_fingerprint.stable_hash(hasher);
     }
 }
 
@@ -569,6 +576,7 @@ struct PreparedTypeOwnerPathQuery {
     owner: OwnerId,
     candidates: Vec<OwnedTypeOwnerPathCandidate>,
     generic_resolutions: HashMap<Symbol, Res>,
+    primitive_prelude: Prelude,
     rejected_test_only_paths: HashSet<HirId>,
     module_scope: Phase1ModuleScopes,
     package_scopes: Phase1PackageScopes,
@@ -2373,6 +2381,7 @@ impl ConstOwnerResolutions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnerControlFlowResolutionError {
     Query(QueryError),
+    PrimitivePrelude(PrimitivePreludeBuildError),
     SnapshotMismatch,
     ModuleTreeMismatch,
     ModuleMemberScopes(Phase1ModuleMemberScopeError),
@@ -4390,6 +4399,7 @@ fn resolve_type_owner_module_paths(
     owner: OwnerId,
     candidates: &[OwnerPathHead<'_>],
     generic_resolutions: &HashMap<Symbol, Res>,
+    primitive_prelude: &Prelude,
     rejected_test_only_paths: &HashSet<HirId>,
     module_scope: &Phase1ModuleScopes,
     members: Option<&ModuleMemberIndex<'_>>,
@@ -4409,6 +4419,10 @@ fn resolve_type_owner_module_paths(
             Res::Err
         } else if let Some(binding) = module_scope.scope.get(&candidate.name) {
             binding.res
+        } else if let Some(PreludeBinding::Primitive(primitive)) =
+            primitive_prelude.get(candidate.name)
+        {
+            Res::PrimTy(*primitive)
         } else {
             deferred_paths.push(DeferredPath {
                 hir_id: candidate.hir_id,
@@ -4515,6 +4529,7 @@ fn resolve_prepared_type_owner_paths(
         prepared.owner,
         &candidates,
         &prepared.generic_resolutions,
+        &prepared.primitive_prelude,
         &prepared.rejected_test_only_paths,
         &prepared.module_scope,
         Some(&members),
@@ -5274,6 +5289,7 @@ impl RootDatabase {
         let resolve = ModuleTreeQueries::new(vfs.clone())?;
         let packages = Arc::new(PackageInterner::new());
         let symbols = Arc::new(Interner::new());
+        let primitive_prelude = build_primitive_prelude(&symbols);
         let package_scopes =
             Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
         let type_owner_paths = TypeOwnerPathQueries::new()?;
@@ -5290,6 +5306,7 @@ impl RootDatabase {
             packages,
             files: FileInterner::new(),
             symbols,
+            primitive_prelude,
             def_paths: HashMap::new(),
             package_scopes,
             type_owner_paths,
@@ -7884,8 +7901,9 @@ impl RootDatabase {
     /// Partially resolves type paths and diagnoses test-only references in
     /// direct top-level struct, alias, enum, and resource declarations.
     ///
-    /// Generic parameters precede the exact file's module scope. Misses remain
-    /// deferred for Prelude and unresolved-name resolution; qualified paths
+    /// Generic parameters precede the exact file's module scope, which
+    /// precedes primitive Prelude entries. Other misses remain deferred for
+    /// canonical Prelude and unresolved-name resolution; qualified paths
     /// resolve only their first segment. The returned test-only diagnostics
     /// and rejected path map are produced by the same lowering pass.
     pub fn resolve_type_owner_paths(
@@ -7963,6 +7981,10 @@ impl RootDatabase {
             })
             .collect::<Vec<_>>();
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let primitive_prelude = self
+            .primitive_prelude
+            .clone()
+            .map_err(OwnerControlFlowResolutionError::PrimitivePrelude)?;
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
@@ -8105,6 +8127,7 @@ impl RootDatabase {
                                 })
                                 .collect(),
                             generic_resolutions: generic_resolutions.clone(),
+                            primitive_prelude: primitive_prelude.clone(),
                             rejected_test_only_paths: test_only_path_resolution
                                 .paths
                                 .keys()
@@ -8128,6 +8151,7 @@ impl RootDatabase {
                                 &prepared.module_scope,
                                 &prepared.foreign_package_scopes,
                             ),
+                            primitive_prelude_fingerprint: primitive_prelude_fingerprint(),
                         };
                         self.type_owner_paths
                             .resolve(&mut self.query_database, key, identity, prepared)?
@@ -8138,6 +8162,7 @@ impl RootDatabase {
                             descriptor.owner,
                             &candidates,
                             &generic_resolutions,
+                            &primitive_prelude,
                             &test_only_path_resolution.paths.keys().copied().collect(),
                             &module_scope,
                             members,
@@ -16272,6 +16297,7 @@ mod tests {
                     "lib.sai",
                     b"use acme:middle as middle\n\
                       use acme:check/local as local\n\
+                      use acme:check/local.{Array}\n\
                       use acme:leaf/model as leaf_model\n\
                       interface api { type Request = U32 }\n\
                       type FromInterface = api.Request\n\
@@ -16283,9 +16309,15 @@ mod tests {
                         hidden_missing: leaf_model.PrivatType\n\
                         tail: middle.api.PublicType.Associated\n\
                       }\n\
-                      type Generic<T> = middle.api.PublicType<T>\n",
+                      type Generic<T> = middle.api.PublicType<T>\n\
+                      type FromPrimitive = U32\n\
+                      type GenericPrimitive<U32> = U32\n\
+                      type FromModule = Array\n",
                 ),
-                ("local.sai", b"pub type LocalType = U32\n"),
+                (
+                    "local.sai",
+                    b"pub type LocalType = U32\npub type Array = U32\n",
+                ),
             ],
         );
         let (_, middle_tree, middle_snapshot_files) = multi_package_fixture(
@@ -16457,6 +16489,60 @@ mod tests {
             )
             .expect("type owner paths resolve through transitive member scopes");
         assert!(results.matches_member_scopes(&root_collection, &member_scopes));
+        fn owner_named<'a>(
+            database: &RootDatabase,
+            owners: &'a [TypeOwnerResolution],
+            expected_name: &str,
+        ) -> Option<&'a TypeOwnerResolution> {
+            owners.iter().find(|owner| {
+                database
+                    .resolve_def_path(owner.owner().def_id.to_def_id())
+                    .ok()
+                    .flatten()
+                    .and_then(|path| {
+                        path.data()
+                            .last()
+                            .and_then(|component| match &component.data {
+                                DefPathData::TypeNs(symbol) => database
+                                    .resolve_symbol(*symbol)
+                                    .ok()
+                                    .map(|name| name.as_ref() == expected_name),
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+        }
+        assert!(
+            owner_named(&database, results.owners(), "FromPrimitive")
+                .expect("primitive alias owner is collected")
+                .path_resolution()
+                .expect("primitive alias path result succeeds")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "tracked member-scope resolution also includes primitive Prelude heads"
+        );
+        assert!(
+            owner_named(&database, results.owners(), "GenericPrimitive")
+                .expect("generic-shadow owner is collected")
+                .path_resolution()
+                .expect("generic-shadow path result succeeds")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::TyParam, _))),
+            "the prepared tracked query preserves generic precedence over primitive Prelude"
+        );
+        assert!(
+            owner_named(&database, results.owners(), "FromModule")
+                .expect("module-shadow owner is collected")
+                .path_resolution()
+                .expect("module-shadow path result succeeds")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "the prepared tracked query preserves a valid module item over Array"
+        );
         assert_eq!(
             results.member_scope_closure_fingerprint(),
             Some(member_scopes.closure_fingerprint())
@@ -16476,6 +16562,11 @@ mod tests {
             .query
             .get(&mut database.query_database, cached_path_key)
             .expect("type-owner paths remain available");
+        assert_eq!(
+            first_cached_paths.identity.primitive_prelude_fingerprint,
+            primitive_prelude_fingerprint(),
+            "the tracked owner path identity includes primitive prelude semantics"
+        );
         assert!(
             Arc::ptr_eq(&first_cached_paths, &repeated_cached_paths),
             "equal owner and scope inputs reuse the tracked path result"
@@ -16511,6 +16602,7 @@ mod tests {
             .expect("private transitive member is rejected");
         let private_start = b"use acme:middle as middle\n\
                   use acme:check/local as local\n\
+                  use acme:check/local.{Array}\n\
                   use acme:leaf/model as leaf_model\n\
                   interface api { type Request = U32 }\n\
                   type FromInterface = api.Request\n\
@@ -16802,6 +16894,8 @@ mod tests {
             "  generic: T\n",
             "  qualified: fixture.Widget\n",
             "  imported: Fixture\n",
+            "  standard: String\n",
+            "  option: Option\n",
             "  missing: MissingType\n",
             "}\n",
             "enum Choice<T> {\n",
@@ -16813,6 +16907,9 @@ mod tests {
             "type Shadow<Fixture> = Fixture\n",
             "type ConstShadow<const Fixture: U32> = Fixture\n",
             "type Duplicate<T, const T: U32> = T\n",
+            "type PrimitiveShadow<U32> = U32\n",
+            "type Array = U32\n",
+            "type ArrayShadow = Array\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let parsed = database
@@ -16925,6 +17022,9 @@ mod tests {
                 TopLevelOwnerKind::Alias,
                 TopLevelOwnerKind::Alias,
                 TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Alias,
             ]
         );
         assert!(
@@ -16937,7 +17037,7 @@ mod tests {
         let alias = results.owners()[0]
             .path_resolution()
             .expect("alias path results succeed");
-        assert_eq!(alias.paths().len(), 2);
+        assert_eq!(alias.paths().len(), 3);
         assert!(
             alias
                 .paths()
@@ -16956,7 +17056,14 @@ mod tests {
                     .resolve_symbol(path.name)
                     .is_ok_and(|name| name.as_ref() == "Container")
             }),
-            "unresolved nominal and prelude-only names stay deferred"
+            "unresolved nominal names stay deferred"
+        );
+        assert!(
+            alias
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "primitive prelude names resolve to their primitive type"
         );
 
         let record = results.owners()[1]
@@ -16991,6 +17098,16 @@ mod tests {
             }),
             "an ordinary miss remains available for later Prelude or unresolved-name handling"
         );
+        for name in ["Option", "String"] {
+            assert!(
+                record.deferred_paths().iter().any(|path| {
+                    database
+                        .resolve_symbol(path.name)
+                        .is_ok_and(|deferred| deferred.as_ref() == name)
+                }),
+                "non-primitive prelude item {name} remains deferred without core/alloc scopes"
+            );
+        }
 
         let enum_paths = results.owners()[2]
             .path_resolution()
@@ -17036,12 +17153,11 @@ mod tests {
             "a const parameter shadows the module scope and retains its wrong-kind identity"
         );
         assert!(
-            const_shadow.deferred_paths().iter().any(|path| {
-                database
-                    .resolve_symbol(path.name)
-                    .is_ok_and(|name| name.as_ref() == "U32")
-            }),
-            "primitive names remain deferred for the later Prelude lookup"
+            const_shadow
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "primitive bounds resolve through the primitive prelude"
         );
 
         let duplicate = results.owners()[6]
@@ -17062,11 +17178,19 @@ mod tests {
                 &[(duplicate_name, false, 0), (duplicate_name, true, 0)],
             )
             .expect("duplicate parameters retain distinct definition identities");
-        assert_eq!(duplicate.paths().len(), 1);
-        assert_eq!(
-            duplicate.paths().values().next().map(|path| path.base),
-            Some(Res::Def(DefKind::TyParam, duplicate_ids[0].to_def_id())),
+        assert_eq!(duplicate.paths().len(), 2);
+        assert!(
+            duplicate.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, duplicate_ids[0].to_def_id())
+            }),
             "the earliest generic binding wins recovery, including across parameter kinds"
+        );
+        assert!(
+            duplicate
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
+            "primitive generic bounds resolve alongside the duplicate parameter"
         );
         assert!(
             results.owners()[6]
@@ -17074,6 +17198,26 @@ mod tests {
                 .iter()
                 .all(|diagnostic| { diagnostic.code != sai_diagnostics::Code::DuplicateBinding }),
             "duplicate generic diagnostics remain the responsibility of later semantic validation"
+        );
+        let primitive_shadow = results.owners()[7]
+            .path_resolution()
+            .expect("primitive-shadow path results succeed");
+        assert!(
+            primitive_shadow
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::TyParam, _))),
+            "a generic parameter shadows a same-named primitive prelude entry"
+        );
+        let module_shadow = results.owners()[9]
+            .path_resolution()
+            .expect("module-shadow path results succeed");
+        assert!(
+            module_shadow
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "a valid module-scope item shadows the Array primitive constructor"
         );
 
         let mut wrong_kind_collection = ordinary_collection.clone();

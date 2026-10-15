@@ -9,6 +9,7 @@
 use crate::package_scopes::{DefKind, Res};
 use sai_hir::{PackageId, Symbol};
 use sai_intern::{InternError, Interner, PackageIdError, PackageInterner};
+use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
 use std::collections::HashMap;
 
 /// Primitive types and constructors available through the prelude.
@@ -80,6 +81,19 @@ pub enum PreludeBinding {
     Item(Res),
 }
 
+/// Error while building the primitive-only prelude.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimitivePreludeBuildError {
+    Symbol(InternError),
+    DuplicateName(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreludeInternError {
+    Symbol(InternError),
+    DuplicateName(&'static str),
+}
+
 /// Complete prelude lookup table with deterministic lexical iteration.
 ///
 /// `Symbol` is an opaque session-local key and does not implement `Ord`, so
@@ -110,6 +124,39 @@ impl Prelude {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// Build the primitive aliases and constructors without requiring standard
+/// package scopes.
+///
+/// The returned table is suitable for early name resolution. Canonical
+/// `sai:core` and `sai:alloc` items are intentionally omitted until their
+/// package member scopes are available.
+pub fn build_primitive_prelude(symbols: &Interner) -> Result<Prelude, PrimitivePreludeBuildError> {
+    let named_bindings = PRIMITIVE_BINDINGS
+        .into_iter()
+        .map(|(name, primitive)| (name, PreludeBinding::Primitive(primitive)))
+        .collect();
+    intern_named_bindings(symbols, named_bindings).map_err(|error| match error {
+        PreludeInternError::Symbol(error) => PrimitivePreludeBuildError::Symbol(error),
+        PreludeInternError::DuplicateName(name) => PrimitivePreludeBuildError::DuplicateName(name),
+    })
+}
+
+/// Fingerprint the fixed name-to-primitive table used by early resolution.
+///
+/// This value is an input to the driver's tracked type-owner path query, so a
+/// change to either a primitive spelling or its resolution invalidates cached
+/// paths even when the package scopes are unchanged.
+pub fn primitive_prelude_fingerprint() -> Fingerprint {
+    let mut hasher = StableHasher::new();
+    hasher.write_tag(0xE0);
+    hasher.write_len(u64::try_from(PRIMITIVE_BINDINGS.len()).unwrap_or(u64::MAX));
+    for (name, primitive) in PRIMITIVE_BINDINGS {
+        name.stable_hash(&mut hasher);
+        primitive.stable_hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 macro_rules! prelude_type {
@@ -355,13 +402,23 @@ pub fn build_prelude<E>(
         named_bindings.push((item.name, PreludeBinding::Item(resolved)));
     }
 
+    intern_named_bindings(symbols, named_bindings).map_err(|error| match error {
+        PreludeInternError::Symbol(error) => PreludeBuildError::Symbol(error),
+        PreludeInternError::DuplicateName(name) => PreludeBuildError::DuplicateName(name),
+    })
+}
+
+fn intern_named_bindings(
+    symbols: &Interner,
+    mut named_bindings: Vec<(&'static str, PreludeBinding)>,
+) -> Result<Prelude, PreludeInternError> {
     named_bindings.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let mut by_symbol = HashMap::with_capacity(named_bindings.len());
     let mut entries = Vec::with_capacity(named_bindings.len());
     for (name, binding) in named_bindings {
-        let symbol = symbols.intern(name).map_err(PreludeBuildError::Symbol)?;
+        let symbol = symbols.intern(name).map_err(PreludeInternError::Symbol)?;
         if by_symbol.insert(symbol, binding).is_some() {
-            return Err(PreludeBuildError::DuplicateName(name));
+            return Err(PreludeInternError::DuplicateName(name));
         }
         entries.push((symbol, binding));
     }
@@ -410,6 +467,32 @@ const PRIMITIVE_BINDINGS: [(&str, PrimTy); 19] = [
     ("Array", PrimTy::Array),
 ];
 
+impl StableHash for PrimTy {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        let tag = match self {
+            Self::I8 => 0,
+            Self::I16 => 1,
+            Self::I32 => 2,
+            Self::I64 => 3,
+            Self::U8 => 4,
+            Self::U16 => 5,
+            Self::U32 => 6,
+            Self::U64 => 7,
+            Self::ISize => 8,
+            Self::USize => 9,
+            Self::F32 => 10,
+            Self::F64 => 11,
+            Self::Bool => 12,
+            Self::Byte => 13,
+            Self::Char => 14,
+            Self::Never => 15,
+            Self::Array => 16,
+        };
+        hasher.write_tag(0xE1);
+        tag.stable_hash(hasher);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +528,33 @@ mod tests {
             kind,
             DefId::from_foreign(package, DefIndex::from_raw(index)),
         )
+    }
+
+    #[test]
+    fn builds_the_primitive_prelude_without_standard_package_items() {
+        let symbols = Interner::new();
+        let prelude = build_primitive_prelude(&symbols).expect("primitive names intern");
+
+        assert_eq!(prelude.len(), PRIMITIVE_BINDINGS.len());
+        assert_eq!(prelude.len(), 19);
+        for (name, expected) in PRIMITIVE_BINDINGS {
+            let symbol = symbols.intern(name).expect("primitive name interns");
+            assert_eq!(
+                prelude.get(symbol),
+                Some(&PreludeBinding::Primitive(expected)),
+                "{name} retains its specified primitive resolution"
+            );
+        }
+        assert!(prelude.entries().windows(2).all(|pair| {
+            let previous = symbols.resolve(pair[0].0).expect("symbol resolves");
+            let next = symbols.resolve(pair[1].0).expect("symbol resolves");
+            previous.as_bytes() < next.as_bytes()
+        }));
+        assert_ne!(
+            primitive_prelude_fingerprint().raw(),
+            0,
+            "the fixed prelude table has a tracked identity"
+        );
     }
 
     #[test]
