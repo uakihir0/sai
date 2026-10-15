@@ -627,7 +627,7 @@ Resolution of a canonical path walks the module tree of `sai:core` or `sai:alloc
 
 The prelude is a fixed table `prelude: BTreeMap<Symbol, Res>` built once from the list of spec/16 §16.4, by canonical path as for lang items. The reserved type names map to `Res::PrimTy(..)`: `Int ↦ I64`, `UInt ↦ U64` (D-TYPE-01), `Never ↦ PrimTy::Never`. `Array` maps to the built-in array constructor `Res::PrimTy(PrimTy::Array)`, because `Array<T, N>` is a structural type (spec/05 §5.1.3) even though it has a library module for its associated functions (§3.9.3).
 
-**Canonical prelude provider (IR-530), primitive resolutions (IR-533), and early primitive lookup (IR-546–547).** `sai_resolve::prelude` defines all 50 canonical standard-library item paths and the 19 primitive type and constructor names, and builds the complete set of 69 names from a caller-supplied canonical-item resolver. The builder checks each item’s expected kind and standard-package identity. `Res::PrimTy(PrimTy)` represents primitive resolutions, while `PreludeBinding` remains explicit so callers can distinguish built-in bindings from canonical library items. The provider uses a symbol-keyed hash map for lookup plus an entry slice sorted by spelling, since `Symbol` does not implement `Ord`. Top-level struct, alias, enum, and resource type-owner lookup, plus free-function signature and body type heads, consult a primitive-only table after generic parameters, rejected test-only references, and the exact file's module scope. Function type-head results are kept separate from expression `ModuleResolution`; qualified suffixes and other misses stay available to later resolution. The static table participates in the tracked type-owner query identity. Non-primitive canonical entries such as `Option` and `String` remain deferred because this checkout does not yet supply the `sai:core` and `sai:alloc` package scopes needed to construct their real `DefId`s.
+**Canonical prelude provider (IR-530), primitive resolutions (IR-533), and early primitive lookup (IR-546–548).** `sai_resolve::prelude` defines all 50 canonical standard-library item paths and the 19 primitive type and constructor names, and builds the complete set of 69 names from a caller-supplied canonical-item resolver. The builder checks each item’s expected kind and standard-package identity. `Res::PrimTy(PrimTy)` represents primitive resolutions, while `PreludeBinding` remains explicit so callers can distinguish built-in bindings from canonical library items. The provider uses a symbol-keyed hash map for lookup plus an entry slice sorted by spelling, since `Symbol` does not implement `Ord`. Top-level struct, alias, enum, resource, const, and free-function type heads consult a primitive-only table after generic parameters, rejected test-only references, and the exact file's module scope. Const and function type-head results are kept separate from expression `ModuleResolution`; qualified suffixes and other misses stay available to later resolution. The static table participates in the tracked type-owner query identity. Non-primitive canonical entries such as `Option` and `String` remain deferred because this checkout does not yet supply the `sai:core` and `sai:alloc` package scopes needed to construct their real `DefId`s.
 
 ## 3.4 Resolving paths in owners
 
@@ -755,6 +755,14 @@ and other misses remain deferred. These type paths do not enter
 `ModuleResolution`, which continues to represent local and module lookup for
 expression names. The pass runs even for owners without bodies so signature
 types are still available to later phases.
+
+**Constant type heads (IR-548).** Top-level const owners expose the same
+partial result for their declared type and type paths in initializer bodies.
+Rejected test-only heads remain `Res::Err`; other heads use the exact file
+module scope before the primitive-only Prelude, and unresolved canonical items
+such as `Option` stay deferred. Type paths remain separate from module lookup
+for initializer expressions. Const analysis computes this result before
+checking whether an initializer body exists.
 
 ### 3.4.3 Ribs
 
