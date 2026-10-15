@@ -51,6 +51,8 @@ use sai_package::mvs_diagnostics::{
 };
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
+use sai_resolve::module_member_lookup::ModuleMemberIndex;
+use sai_resolve::module_path::{ModulePathError, resolve_module_prefix};
 use sai_resolve::owner::{
     DeferredPath, LabelResolution, LabelResolutionError, LocalResolution, LocalResolutionError,
     ModuleResolution, resolve_owner_control_flow, resolve_owner_locals, resolve_owner_module_paths,
@@ -351,6 +353,14 @@ struct Phase1ForeignPackageIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct Phase1ActiveSourceMemberScopeIdentity {
+    requester: PackageKey,
+    requester_input_fingerprint: Fingerprint,
+    package_graph_fingerprint: Fingerprint,
+    package_fingerprints: Vec<(PackageKey, Fingerprint)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Phase1PackageGraphProjection {
     Package {
         outgoing_edges: Vec<StableActivePackageEdge>,
@@ -568,6 +578,25 @@ impl StableHash for Phase1ForeignPackageIdentity {
         self.package_key.stable_hash(hasher);
         self.input_fingerprint.stable_hash(hasher);
     }
+}
+
+impl StableHash for Phase1ActiveSourceMemberScopeIdentity {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xDC);
+        self.requester.stable_hash(hasher);
+        self.requester_input_fingerprint.stable_hash(hasher);
+        self.package_graph_fingerprint.stable_hash(hasher);
+        self.package_fingerprints.stable_hash(hasher);
+    }
+}
+
+fn sort_foreign_scope_provenance(provenance: &mut [Phase1ForeignPackageIdentity]) {
+    provenance.sort_by(|left, right| {
+        left.visible_identity
+            .as_bytes()
+            .cmp(right.visible_identity.as_bytes())
+            .then_with(|| left.package_key.cmp(&right.package_key))
+    });
 }
 
 impl StableHash for Phase1PackageGraphProjection {
@@ -827,6 +856,24 @@ pub enum Phase1CollectionError {
     },
 }
 
+/// Invalid or incomplete input while assembling transitive active-source
+/// scopes for qualified module-member lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Phase1ModuleMemberScopeError {
+    PackageGraphMismatch(PackageKey),
+    PackageGraphMissingNode(PackageKey),
+    RequesterIsNotSource(PackageKey),
+    MissingSourcePackage(PackageKey),
+    UnexpectedPackage(PackageKey),
+    DuplicatePackage(PackageKey),
+    SnapshotMismatch(PackageKey),
+    TargetConfigMismatch(PackageKey),
+    PackageIdMismatch(PackageKey),
+    ScopePackageMismatch(PackageKey),
+    ModuleTreeScopeCountMismatch(PackageKey),
+    DirectScopeProvenanceMismatch(PackageKey),
+}
+
 /// A finalized, direct source dependency scope available to one package's
 /// Phase 2–3 import resolution.
 ///
@@ -835,26 +882,114 @@ pub enum Phase1CollectionError {
 /// graph validation never resolve a dependency by identity alone.
 #[derive(Clone, Debug)]
 pub struct Phase1ForeignPackageScopes {
-    pub visible_identity: String,
-    pub package_key: PackageKey,
-    pub module_tree: Arc<ModuleTree>,
-    pub scopes: Arc<Phase1PackageScopes>,
-    pub input_fingerprint: Fingerprint,
+    visible_identity: String,
+    package_key: PackageKey,
+    module_tree: Arc<ModuleTree>,
+    scopes: Arc<Phase1PackageScopes>,
+    input_fingerprint: Fingerprint,
+}
+
+/// A finalized package collection retained for qualified member lookup.
+///
+/// This is separate from [`Phase1ForeignPackageScopes`]: the latter is an
+/// edge-specific direct-import input, while this value retains the exact
+/// collection provenance needed to validate a transitive active-source
+/// closure.
+#[derive(Clone, Debug)]
+pub struct Phase1ModuleMemberScopePackage {
+    collection: Phase1PackageScopesCollection,
+}
+
+impl Phase1ModuleMemberScopePackage {
+    pub fn package_key(&self) -> &PackageKey {
+        &self.collection.package_key
+    }
+
+    pub fn module_tree(&self) -> &ModuleTree {
+        &self.collection.module_tree
+    }
+
+    pub fn scopes(&self) -> &Phase1PackageScopes {
+        &self.collection.scopes
+    }
+
+    pub const fn input_fingerprint(&self) -> Fingerprint {
+        self.collection.input_fingerprint
+    }
+
+    /// Adapts the finalized package into the direct-edge form used by Phase 1.
+    pub fn as_foreign_package_scopes(
+        &self,
+        visible_identity: impl Into<String>,
+    ) -> Phase1ForeignPackageScopes {
+        Phase1ForeignPackageScopes {
+            visible_identity: visible_identity.into(),
+            package_key: self.collection.package_key.clone(),
+            module_tree: Arc::new(self.collection.module_tree.clone()),
+            scopes: Arc::new(self.collection.scopes.clone()),
+            input_fingerprint: self.collection.input_fingerprint,
+        }
+    }
+}
+
+/// A validated active-source scope closure for qualified module-member paths.
+///
+/// The requesting collection and every reachable source dependency are bound
+/// to one active package graph, workspace snapshot, and target configuration.
+#[derive(Clone, Debug)]
+pub struct Phase1ActiveSourceMemberScopes {
+    requester: PackageKey,
+    requester_input_fingerprint: Fingerprint,
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    package_graph_fingerprint: Fingerprint,
+    source_packages: Vec<Phase1ModuleMemberScopePackage>,
+    source_graph_packages: HashSet<PackageId>,
+    closure_fingerprint: Fingerprint,
+}
+
+impl Phase1ActiveSourceMemberScopes {
+    pub fn requester(&self) -> &PackageKey {
+        &self.requester
+    }
+
+    pub fn source_packages(&self) -> &[Phase1ModuleMemberScopePackage] {
+        &self.source_packages
+    }
+
+    pub const fn closure_fingerprint(&self) -> Fingerprint {
+        self.closure_fingerprint
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.requester == collection.package_key
+            && self.requester_input_fingerprint == collection.input_fingerprint
+            && self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && collection.package_graph_fingerprint == Some(self.package_graph_fingerprint)
+    }
 }
 
 /// The finalized package scopes and the request provenance needed to bind
 /// their owner descriptors to the same source snapshot and target settings.
 #[derive(Clone, Debug)]
 pub struct Phase1PackageScopesCollection {
+    package_key: PackageKey,
     scopes: Phase1PackageScopes,
     input_fingerprint: Fingerprint,
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     build_context: Phase1BuildContext,
     module_tree: ModuleTree,
+    package_graph_fingerprint: Option<Fingerprint>,
+    foreign_scope_provenance: Vec<Phase1ForeignPackageIdentity>,
 }
 
 impl Phase1PackageScopesCollection {
+    pub fn package_key(&self) -> &PackageKey {
+        &self.package_key
+    }
+
     pub const fn input_fingerprint(&self) -> Fingerprint {
         self.input_fingerprint
     }
@@ -869,6 +1004,15 @@ impl Phase1PackageScopesCollection {
 
     pub fn into_scopes(self) -> Phase1PackageScopes {
         self.scopes
+    }
+
+    /// Retains this exact finalized collection for a later member-scope
+    /// closure. The returned value cannot be assembled from detached scopes
+    /// and a claimed fingerprint.
+    pub fn module_member_scope_package(&self) -> Phase1ModuleMemberScopePackage {
+        Phase1ModuleMemberScopePackage {
+            collection: self.clone(),
+        }
     }
 }
 
@@ -1030,6 +1174,7 @@ pub struct TypeOwnerPathResolution {
     owner: OwnerId,
     paths: HashMap<HirId, PathRes>,
     deferred_paths: Vec<DeferredPath>,
+    module_path_errors: Vec<TypeOwnerModulePathError>,
 }
 
 impl TypeOwnerPathResolution {
@@ -1043,6 +1188,29 @@ impl TypeOwnerPathResolution {
 
     pub fn deferred_paths(&self) -> &[DeferredPath] {
         &self.deferred_paths
+    }
+
+    /// Typed member lookup failures retained for the later diagnostic
+    /// mapping stage.
+    pub fn module_path_errors(&self) -> &[TypeOwnerModulePathError] {
+        &self.module_path_errors
+    }
+}
+
+/// A failed qualified member lookup attributed to one HIR path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypeOwnerModulePathError {
+    hir_id: HirId,
+    error: ModulePathError,
+}
+
+impl TypeOwnerModulePathError {
+    pub const fn hir_id(&self) -> HirId {
+        self.hir_id
+    }
+
+    pub const fn error(&self) -> ModulePathError {
+        self.error
     }
 }
 
@@ -1098,6 +1266,7 @@ pub struct TypeOwnerResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<TypeOwnerResolution>,
 }
 
@@ -1114,6 +1283,22 @@ impl TypeOwnerResolutions {
         self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    /// Checks both the requesting package collection and the validated
+    /// transitive member-scope closure used during resolution.
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.member_scope_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -1927,6 +2112,7 @@ impl ConstOwnerResolutions {
 pub enum OwnerControlFlowResolutionError {
     SnapshotMismatch,
     ModuleTreeMismatch,
+    ModuleMemberScopes(Phase1ModuleMemberScopeError),
     TestAnalysisDisabled,
     MissingSnapshotFile(FileId),
     Parse(ParseQueryError),
@@ -2393,12 +2579,13 @@ enum OwnerPathKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OwnerPathHead {
+struct OwnerPathHead<'hir> {
     hir_id: HirId,
     name: Symbol,
     span: sai_hir::Span,
     segment_count: u32,
     kind: OwnerPathKind,
+    segments: &'hir [sai_hir::types::PathSegment<'hir>],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2408,14 +2595,14 @@ struct RefinedGenericSyntaxPathHead {
     kind: OwnerPathKind,
 }
 
-fn owner_test_only_path_candidates(owner: &HirOwner<'_>) -> Vec<OwnerPathHead> {
+fn owner_test_only_path_candidates<'hir>(owner: &HirOwner<'hir>) -> Vec<OwnerPathHead<'hir>> {
     owner_test_only_path_candidates_with_body(owner, true)
 }
 
-fn owner_test_only_path_candidates_with_body(
-    owner: &HirOwner<'_>,
+fn owner_test_only_path_candidates_with_body<'hir>(
+    owner: &HirOwner<'hir>,
     include_body: bool,
-) -> Vec<OwnerPathHead> {
+) -> Vec<OwnerPathHead<'hir>> {
     enum Work<'hir> {
         Expr(&'hir HirExpr<'hir>),
         Block(&'hir HirBlock<'hir>),
@@ -2901,6 +3088,7 @@ fn owner_test_only_path_candidates_with_body(
                             span: segment.name.span,
                             segment_count,
                             kind,
+                            segments: path.segments,
                         });
                     }
                 }
@@ -2921,6 +3109,7 @@ fn owner_test_only_path_candidates_with_body(
                         span: segment.span,
                         segment_count,
                         kind: OwnerPathKind::Effect,
+                        segments: &[],
                     });
                 }
             }
@@ -3559,7 +3748,7 @@ fn collect_test_only_reference_diagnostics(
 
 fn collect_test_only_module_head_diagnostics(
     owner: OwnerId,
-    candidates: &[OwnerPathHead],
+    candidates: &[OwnerPathHead<'_>],
     generic_parameters: &HashSet<Symbol>,
     module_scope: &Phase1ModuleScopes,
     path_resolution: &mut OwnerTestOnlyPathResolution,
@@ -3928,13 +4117,17 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
 
 fn resolve_type_owner_module_paths(
     owner: OwnerId,
-    candidates: &[OwnerPathHead],
+    candidates: &[OwnerPathHead<'_>],
     generic_resolutions: &HashMap<Symbol, Res>,
     test_only_paths: &OwnerTestOnlyPathResolution,
     module_scope: &Phase1ModuleScopes,
+    members: Option<&ModuleMemberIndex<'_>>,
+    requesting_package: PackageId,
+    source_graph_packages: Option<&HashSet<PackageId>>,
 ) -> TypeOwnerPathResolution {
     let mut paths = HashMap::new();
     let mut deferred_paths = Vec::new();
+    let mut module_path_errors = Vec::new();
     for candidate in candidates
         .iter()
         .filter(|candidate| candidate.kind == OwnerPathKind::Type)
@@ -3953,19 +4146,68 @@ fn resolve_type_owner_module_paths(
             });
             continue;
         };
-        paths.insert(
-            candidate.hir_id,
-            PathRes {
-                base,
-                resolved_segments: 1,
-                segment_count: candidate.segment_count,
-            },
-        );
+        let mut path = PathRes {
+            base,
+            resolved_segments: 1,
+            segment_count: candidate.segment_count,
+        };
+        if let Some(members) = members {
+            let suffix = &candidate.segments[1..];
+            match resolve_module_prefix(base, suffix, requesting_package, members) {
+                Ok(prefix) => {
+                    path.base = prefix.base;
+                    path.resolved_segments = u32::try_from(1 + prefix.consumed_segments)
+                        .expect("path segment count was already checked");
+                }
+                Err(error) => match error {
+                    ModulePathError::MissingTargetScope {
+                        target,
+                        segment_index,
+                    } if !source_graph_packages
+                        .is_some_and(|packages| packages.contains(&target.package)) =>
+                    {
+                        // Artifact and WIT packages have no source Phase 1
+                        // scope. Leave their member suffix for those later
+                        // package-scope resolvers.
+                        let prefix = resolve_module_prefix(
+                            base,
+                            &suffix[..segment_index],
+                            requesting_package,
+                            members,
+                        )
+                        .expect("the prefix before a missing target scope was traversable");
+                        path.base = prefix.base;
+                        path.resolved_segments = u32::try_from(1 + prefix.consumed_segments)
+                            .expect("path segment count was already checked");
+                    }
+                    _ => {
+                        let failed_segment = module_path_error_segment_index(error);
+                        path.base = Res::Err;
+                        path.resolved_segments = u32::try_from(1 + failed_segment + 1)
+                            .unwrap_or(candidate.segment_count);
+                        module_path_errors.push(TypeOwnerModulePathError {
+                            hir_id: candidate.hir_id,
+                            error,
+                        });
+                    }
+                },
+            }
+        }
+        paths.insert(candidate.hir_id, path);
     }
     TypeOwnerPathResolution {
         owner,
         paths,
         deferred_paths,
+        module_path_errors,
+    }
+}
+
+fn module_path_error_segment_index(error: ModulePathError) -> usize {
+    match error {
+        ModulePathError::MissingMember { segment_index, .. }
+        | ModulePathError::InaccessibleMember { segment_index, .. }
+        | ModulePathError::MissingTargetScope { segment_index, .. } => segment_index,
     }
 }
 
@@ -5313,6 +5555,7 @@ impl RootDatabase {
         .map_err(PackageScopesError::from)?;
         let graph = self.package_graph.get(&mut self.query_database, 0)?;
         let package_graph = phase1_package_graph_projection(graph.as_ref().as_ref(), &package_key)?;
+        let package_graph_fingerprint = graph.as_ref().as_ref().map(fingerprint);
         for foreign in foreign_scopes {
             let expected_package = self
                 .packages
@@ -5367,6 +5610,15 @@ impl RootDatabase {
             foreign_scopes,
             &self.symbols,
         )?);
+        let mut foreign_scope_provenance = foreign_scopes
+            .iter()
+            .map(|foreign| Phase1ForeignPackageIdentity {
+                visible_identity: foreign.visible_identity.clone(),
+                package_key: foreign.package_key.clone(),
+                input_fingerprint: foreign.input_fingerprint,
+            })
+            .collect::<Vec<_>>();
+        sort_foreign_scope_provenance(&mut foreign_scope_provenance);
         let prepared = Arc::new(PreparedPhase1PackageScopes {
             module_tree: module_tree.clone(),
             snapshot: snapshot.clone(),
@@ -5390,7 +5642,7 @@ impl RootDatabase {
         let output = self
             .package_scopes
             .query
-            .get(&mut self.query_database, package_key)?;
+            .get(&mut self.query_database, package_key.clone())?;
         let memo = output.result.as_ref().map_err(Clone::clone)?;
         let mut scopes = memo.scopes.clone();
         for input in &prepared.modules {
@@ -5407,12 +5659,15 @@ impl RootDatabase {
         }
         sort_phase1_diagnostics(&mut scopes.diagnostics);
         Ok(Phase1PackageScopesCollection {
+            package_key,
             scopes,
             input_fingerprint: output.input_fingerprint,
             snapshot_id: snapshot.id(),
             target_cfg: target_cfg.clone(),
             build_context,
             module_tree: module_tree.clone(),
+            package_graph_fingerprint,
+            foreign_scope_provenance,
         })
     }
 
@@ -7094,6 +7349,204 @@ impl RootDatabase {
         self.resolve_type_owner_paths(collection, module_tree, snapshot)
     }
 
+    /// Validates the source package scope closure reachable from `collection`
+    /// through active graph edges. Artifact and WIT member scopes are not part
+    /// of this value and remain deferred to their later resolvers.
+    pub fn collect_active_source_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        graph: &PackageGraph,
+        finalized_packages: &[Phase1ModuleMemberScopePackage],
+    ) -> Result<Phase1ActiveSourceMemberScopes, Phase1ModuleMemberScopeError> {
+        let graph_fingerprint = fingerprint(graph);
+        let requester = collection.package_key.clone();
+        let requester_node = graph.node(&requester).ok_or_else(|| {
+            Phase1ModuleMemberScopeError::PackageGraphMissingNode(requester.clone())
+        })?;
+        if requester_node.form() != PackageForm::Source {
+            return Err(Phase1ModuleMemberScopeError::RequesterIsNotSource(
+                requester,
+            ));
+        }
+
+        let mut by_key = BTreeMap::new();
+        for package in finalized_packages {
+            let key = package.package_key().clone();
+            if by_key.insert(key.clone(), package).is_some() {
+                return Err(Phase1ModuleMemberScopeError::DuplicatePackage(key));
+            }
+        }
+
+        let mut source_keys = BTreeSet::new();
+        let mut pending = vec![requester.clone()];
+        while let Some(key) = pending.pop() {
+            if !source_keys.insert(key.clone()) {
+                continue;
+            }
+            let node = graph.node(&key).ok_or_else(|| {
+                Phase1ModuleMemberScopeError::PackageGraphMissingNode(key.clone())
+            })?;
+            if node.form() != PackageForm::Source {
+                source_keys.remove(&key);
+                continue;
+            }
+            for edge in node.active_edges() {
+                let target = graph.node(edge.target()).ok_or_else(|| {
+                    Phase1ModuleMemberScopeError::PackageGraphMissingNode(edge.target().clone())
+                })?;
+                if target.form() == PackageForm::Source {
+                    pending.push(target.key().clone());
+                }
+            }
+        }
+
+        let expected_foreign = source_keys
+            .iter()
+            .filter(|key| *key != &requester)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for key in by_key.keys() {
+            if !expected_foreign.contains(key) {
+                return Err(Phase1ModuleMemberScopeError::UnexpectedPackage(key.clone()));
+            }
+        }
+        for key in &expected_foreign {
+            if !by_key.contains_key(key) {
+                return Err(Phase1ModuleMemberScopeError::MissingSourcePackage(
+                    key.clone(),
+                ));
+            }
+        }
+
+        let mut all_collections = BTreeMap::new();
+        all_collections.insert(requester.clone(), collection);
+        for (key, package) in &by_key {
+            all_collections.insert(key.clone(), &package.collection);
+        }
+        for package_collection in all_collections.values() {
+            let key = &package_collection.package_key;
+            if package_collection.package_graph_fingerprint != Some(graph_fingerprint) {
+                return Err(Phase1ModuleMemberScopeError::PackageGraphMismatch(
+                    key.clone(),
+                ));
+            }
+            if package_collection.snapshot_id != collection.snapshot_id {
+                return Err(Phase1ModuleMemberScopeError::SnapshotMismatch(key.clone()));
+            }
+            if package_collection.target_cfg != collection.target_cfg {
+                return Err(Phase1ModuleMemberScopeError::TargetConfigMismatch(
+                    key.clone(),
+                ));
+            }
+            let package_id = self
+                .packages
+                .intern(key.as_str())
+                .map_err(|_| Phase1ModuleMemberScopeError::PackageIdMismatch(key.clone()))?;
+            if package_collection.module_tree.package != package_id {
+                return Err(Phase1ModuleMemberScopeError::PackageIdMismatch(key.clone()));
+            }
+            if package_collection.scopes.modules.len()
+                != package_collection.module_tree.modules.len()
+            {
+                return Err(Phase1ModuleMemberScopeError::ModuleTreeScopeCountMismatch(
+                    key.clone(),
+                ));
+            }
+            let all_definitions_match = package_collection
+                .scopes
+                .modules
+                .iter()
+                .all(|module| module.module_def_id.package() == package_id)
+                && package_collection
+                    .scopes
+                    .interfaces
+                    .keys()
+                    .all(|def_id| def_id.package == package_id)
+                && package_collection
+                    .scopes
+                    .top_level_owners
+                    .iter()
+                    .all(|owner| owner.owner.def_id.package() == package_id);
+            if !all_definitions_match {
+                return Err(Phase1ModuleMemberScopeError::ScopePackageMismatch(
+                    key.clone(),
+                ));
+            }
+        }
+
+        // Every source package collection must have been finalized with the
+        // exact active direct-source edges and child fingerprints from this
+        // same graph. This prevents a stale but same-target scope from
+        // satisfying the transitive closure.
+        for package_collection in all_collections.values() {
+            let node = graph.node(&package_collection.package_key).ok_or_else(|| {
+                Phase1ModuleMemberScopeError::PackageGraphMissingNode(
+                    package_collection.package_key.clone(),
+                )
+            })?;
+            let mut expected = Vec::new();
+            for edge in node.active_edges() {
+                let target = graph.node(edge.target()).ok_or_else(|| {
+                    Phase1ModuleMemberScopeError::PackageGraphMissingNode(edge.target().clone())
+                })?;
+                if target.form() != PackageForm::Source {
+                    continue;
+                }
+                let target_collection = all_collections.get(target.key()).ok_or_else(|| {
+                    Phase1ModuleMemberScopeError::MissingSourcePackage(target.key().clone())
+                })?;
+                expected.push(Phase1ForeignPackageIdentity {
+                    visible_identity: edge.visible_identity().to_owned(),
+                    package_key: target.key().clone(),
+                    input_fingerprint: target_collection.input_fingerprint,
+                });
+            }
+            sort_foreign_scope_provenance(&mut expected);
+            if package_collection.foreign_scope_provenance != expected {
+                return Err(Phase1ModuleMemberScopeError::DirectScopeProvenanceMismatch(
+                    package_collection.package_key.clone(),
+                ));
+            }
+        }
+
+        let source_packages = expected_foreign
+            .iter()
+            .filter_map(|key| by_key.get(key).map(|package| (*package).clone()))
+            .collect::<Vec<_>>();
+        let source_graph_packages = graph
+            .nodes()
+            .iter()
+            .filter(|node| node.form() == PackageForm::Source)
+            .map(|node| {
+                self.packages.intern(node.key().as_str()).map_err(|_| {
+                    Phase1ModuleMemberScopeError::PackageIdMismatch(node.key().clone())
+                })
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        let mut package_fingerprints = all_collections
+            .iter()
+            .map(|(key, package)| (key.clone(), package.input_fingerprint))
+            .collect::<Vec<_>>();
+        package_fingerprints.sort_by(|left, right| left.0.cmp(&right.0));
+        let closure_fingerprint = fingerprint(&Phase1ActiveSourceMemberScopeIdentity {
+            requester: requester.clone(),
+            requester_input_fingerprint: collection.input_fingerprint,
+            package_graph_fingerprint: graph_fingerprint,
+            package_fingerprints,
+        });
+
+        Ok(Phase1ActiveSourceMemberScopes {
+            requester,
+            requester_input_fingerprint: collection.input_fingerprint,
+            snapshot_id: collection.snapshot_id,
+            target_cfg: collection.target_cfg.clone(),
+            package_graph_fingerprint: graph_fingerprint,
+            source_packages,
+            source_graph_packages,
+            closure_fingerprint,
+        })
+    }
+
     /// Partially resolves type paths and diagnoses test-only references in
     /// direct top-level struct, alias, enum, and resource declarations.
     ///
@@ -7106,6 +7559,52 @@ impl RootDatabase {
         collection: &Phase1PackageScopesCollection,
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
+    ) -> Result<TypeOwnerResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_type_owner_paths_inner(collection, module_tree, snapshot, None, None)
+    }
+
+    /// Resolves top-level type paths using a validated active-source member
+    /// scope closure. Misses in source modules and inaccessible members are
+    /// retained as typed errors for the later diagnostic-mapping stage.
+    pub fn resolve_type_owner_paths_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<TypeOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        let members = ModuleMemberIndex::new(
+            std::iter::once(collection.scopes()).chain(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(|package| package.scopes()),
+            ),
+        );
+        self.resolve_type_owner_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(&members),
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_type_owner_paths_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        members: Option<&ModuleMemberIndex<'_>>,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
     ) -> Result<TypeOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -7247,6 +7746,9 @@ impl RootDatabase {
                     &generic_resolutions,
                     &test_only_path_resolution,
                     &module_scope,
+                    members,
+                    collection.module_tree.package,
+                    member_scopes.map(|scopes| &scopes.source_graph_packages),
                 );
                 Ok((path_resolution, test_only_path_resolution, diagnostics))
             })();
@@ -7279,6 +7781,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -8898,6 +9402,75 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    fn multi_package_fixture(
+        database: &mut RootDatabase,
+        package_key: &str,
+        package_identity: &str,
+        files: &[(&str, &[u8])],
+    ) -> (PackageId, ModuleTree, Vec<SnapshotFile>) {
+        let package = database
+            .intern_package(package_key)
+            .expect("package key interns");
+        let entries = files
+            .iter()
+            .map(|(path, _)| {
+                PackageFileEntry::new(*path, PackageFileKind::File)
+                    .expect("source file inventory entry is valid")
+            })
+            .collect::<Vec<_>>();
+        database
+            .set_package_files(
+                PackageKey::new(package_key).expect("package key is valid"),
+                PackageFilesSnapshot::new(true, entries)
+                    .expect("package source inventory is valid"),
+                Durability::Low,
+            )
+            .expect("package inventory is recorded");
+        for (path, contents) in files {
+            let source_path = format!("src/{path}");
+            database
+                .set_file_contents(
+                    FileKey::new(package_key, &source_path).expect("source file key is valid"),
+                    Arc::from(*contents),
+                    Durability::Low,
+                )
+                .expect("package source is recorded");
+        }
+        let module_tree = database
+            .module_tree(
+                package,
+                PackageSourceDirectory::new("src").expect("source directory is valid"),
+                None,
+            )
+            .expect("module tree is constructed")
+            .as_ref()
+            .clone();
+        let snapshot_files = module_tree
+            .modules
+            .iter()
+            .map(|module| {
+                let file_key = database
+                    .file_key(module.file)
+                    .expect("module file has a stable key")
+                    .clone();
+                let contents = match database
+                    .file_contents(file_key.clone())
+                    .expect("source contents are readable")
+                {
+                    Some(FileContents::Bytes(contents)) => contents,
+                    other => panic!("source bytes are missing: {other:?}"),
+                };
+                SnapshotFile::new(
+                    Arc::new(SourceFile::decode(module.file, &contents).expect("source decodes")),
+                    format!("{package_identity}/{}", file_key.path()),
+                    Some(package_identity.to_owned()),
+                    Some(17),
+                )
+            })
+            .collect();
+        (package, module_tree, snapshot_files)
     }
 
     #[test]
@@ -15013,6 +15586,370 @@ mod tests {
                 .is_empty(),
             "the active alias is checked and no filtered owner leaks into results"
         );
+    }
+
+    #[test]
+    fn type_owner_paths_walk_validated_transitive_module_and_interface_scopes() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:check#1",
+            "acme:check@1.0.0",
+            &[
+                (
+                    "lib.sai",
+                    b"use acme:middle as middle\n\
+                      use acme:check/local as local\n\
+                      use acme:leaf/model as leaf_model\n\
+                      interface api { type Request = U32 }\n\
+                      type FromInterface = api.Request\n\
+                      type FromLocalModule = local.LocalType\n\
+                      type Record {\n\
+                        public: middle.api.PublicType\n\
+                        private: leaf_model.PrivateType\n\
+                        missing: middle.api.MissingType\n\
+                        tail: middle.api.PublicType.Associated\n\
+                      }\n\
+                      type Generic<T> = middle.api.PublicType<T>\n",
+                ),
+                ("local.sai", b"pub type LocalType = U32\n"),
+            ],
+        );
+        let (_, middle_tree, middle_snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:middle#1",
+            "acme:middle@1.0.0",
+            &[("lib.sai", b"pub use acme:leaf.{api}\n")],
+        );
+        let (_, leaf_tree, leaf_snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:leaf#1",
+            "acme:leaf@1.0.0",
+            &[
+                (
+                    "lib.sai",
+                    b"pub interface api {\n\
+                      type PublicType = U32\n\
+                      type PrivateType = U32\n\
+                    }\n",
+                ),
+                (
+                    "model.sai",
+                    b"pub type PublicType = U32\n\
+                      type PrivateType = U32\n",
+                ),
+            ],
+        );
+        snapshot_files.extend(middle_snapshot_files);
+        snapshot_files.extend(leaf_snapshot_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:check#1",
+                    "acme:check",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![
+                        graph_edge("acme:middle#1", "acme:middle"),
+                        graph_edge("acme:leaf#1", "acme:leaf"),
+                    ],
+                ),
+                graph_node(
+                    "acme:middle#1",
+                    "acme:middle",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    vec![graph_edge("acme:leaf#1", "acme:leaf")],
+                ),
+                graph_node(
+                    "acme:leaf#1",
+                    "acme:leaf",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("active source graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is installed");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let leaf_collection = database
+            .collect_phase1_package_scopes_collection(
+                &leaf_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("leaf scopes collect");
+        let leaf_member_package = leaf_collection.module_member_scope_package();
+        let middle_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:middle @ 1.0.0\nrequires { acme:leaf @ ^1 }\n"[..]);
+        let middle_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &middle_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                middle_manifest,
+                PackageRole::Dependency,
+                &[leaf_member_package.as_foreign_package_scopes("acme:leaf")],
+            )
+            .expect("middle re-export scopes collect");
+        let middle_member_package = middle_collection.module_member_scope_package();
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:check @ 1.0.0\n\
+              requires {\n\
+                  acme:middle @ ^1\n\
+                  acme:leaf @ ^1\n\
+              }\n"[..],
+        );
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[
+                    middle_member_package.as_foreign_package_scopes("acme:middle"),
+                    leaf_member_package.as_foreign_package_scopes("acme:leaf"),
+                ],
+            )
+            .expect("root scopes collect");
+        let member_scopes = database
+            .collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[middle_member_package.clone(), leaf_member_package.clone()],
+            )
+            .expect("transitive source scope closure validates");
+        assert_eq!(
+            member_scopes
+                .source_packages()
+                .iter()
+                .map(|package| package.package_key().as_str())
+                .collect::<Vec<_>>(),
+            ["acme:leaf#1", "acme:middle#1"],
+            "the closure includes transitive source packages in stable package order"
+        );
+        assert!(matches!(
+            database.collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[middle_member_package.clone()],
+            ),
+            Err(Phase1ModuleMemberScopeError::MissingSourcePackage(key))
+                if key.as_str() == "acme:leaf#1"
+        ));
+        assert!(matches!(
+            database.collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[
+                    middle_member_package.clone(),
+                    middle_member_package.clone(),
+                    leaf_member_package.clone(),
+                ],
+            ),
+            Err(Phase1ModuleMemberScopeError::DuplicatePackage(key))
+                if key.as_str() == "acme:middle#1"
+        ));
+
+        let results = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("type owner paths resolve through transitive member scopes");
+        assert!(results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+
+        let path_errors = results.owners()[2]
+            .path_resolution()
+            .expect("record type paths resolve");
+        let private_name = database
+            .symbols
+            .intern("PrivateType")
+            .expect("private type name interns");
+        let missing_name = database
+            .symbols
+            .intern("MissingType")
+            .expect("missing type name interns");
+        let (private_hir_id, private_span) = path_errors
+            .module_path_errors()
+            .iter()
+            .find_map(|entry| match entry.error() {
+                ModulePathError::InaccessibleMember { name, span, .. } if name == private_name => {
+                    Some((entry.hir_id(), span))
+                }
+                _ => None,
+            })
+            .expect("private transitive member is rejected");
+        let private_start = b"use acme:middle as middle\n\
+                  use acme:check/local as local\n\
+                  use acme:leaf/model as leaf_model\n\
+                  interface api { type Request = U32 }\n\
+                  type FromInterface = api.Request\n\
+                  type FromLocalModule = local.LocalType\n\
+                  type Record {\n\
+                    public: middle.api.PublicType\n\
+                    private: leaf_model.PrivateType\n\
+                    missing: middle.api.MissingType\n\
+                    tail: middle.api.PublicType.Associated\n\
+                  }\n\
+                  type Generic<T> = middle.api.PublicType<T>\n"
+            .windows(b"PrivateType".len())
+            .position(|window| window == b"PrivateType")
+            .expect("private name is in root source");
+        assert_eq!(
+            private_span.range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(private_start as u32),
+                sai_diagnostics::TextSize::new((private_start + "PrivateType".len()) as u32,),
+            )
+            .expect("private member range is ordered")
+        );
+        assert_eq!(
+            path_errors
+                .paths()
+                .get(&private_hir_id)
+                .map(|path| path.base),
+            Some(Res::Err),
+            "a rejected private segment poisons the whole path"
+        );
+        let missing = path_errors
+            .module_path_errors()
+            .iter()
+            .find_map(|entry| match entry.error() {
+                ModulePathError::MissingMember { name, .. } if name == missing_name => Some(entry),
+                _ => None,
+            })
+            .expect("missing transitive member is retained as a typed failure");
+        assert!(matches!(
+            path_errors.paths().get(&missing.hir_id()),
+            Some(PathRes {
+                base: Res::Err,
+                resolved_segments: 3,
+                segment_count: 3,
+            })
+        ));
+        assert!(
+            path_errors.paths().values().any(|path| matches!(
+                path.base,
+                Res::Def(DefKind::Alias, _) if path.resolved_segments == 3 && path.segment_count == 4
+            )),
+            "the module walk stops at a type and leaves its type-relative suffix"
+        );
+        assert!(
+            results.owners()[0]
+                .path_resolution()
+                .expect("interface owner path resolves")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2),
+            "interface members use the same qualified member walker"
+        );
+        assert!(
+            results.owners()[1]
+                .path_resolution()
+                .expect("local-module owner path resolves")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2),
+            "local source modules use the same qualified member walker"
+        );
+
+        let mut suppressed_collection = root_collection.clone();
+        let middle_symbol = database
+            .symbols
+            .intern("middle")
+            .expect("module alias name interns");
+        let root_scope = &mut suppressed_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let binding = root_scope
+            .scope
+            .get_mut(&middle_symbol)
+            .expect("middle module alias exists");
+        binding.res = Res::Err;
+        let import_index = match binding.origin {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("middle is introduced by a use binding"),
+        };
+        root_scope.imports[import_index.0 as usize].res = Res::Err;
+        let leaf_model_symbol = database
+            .symbols
+            .intern("leaf_model")
+            .expect("leaf module alias name interns");
+        let binding = root_scope
+            .scope
+            .get_mut(&leaf_model_symbol)
+            .expect("leaf module alias exists");
+        binding.res = Res::Err;
+        let import_index = match binding.origin {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("leaf_model is introduced by a use binding"),
+        };
+        root_scope.imports[import_index.0 as usize].res = Res::Err;
+        let suppressed_scopes = database
+            .collect_active_source_member_scopes(
+                &suppressed_collection,
+                &graph,
+                &[middle_member_package.clone(), leaf_member_package.clone()],
+            )
+            .expect("suppressed resolution retains the same scope provenance");
+        let suppressed = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &suppressed_collection,
+                &root_tree,
+                &snapshot,
+                &suppressed_scopes,
+            )
+            .expect("already erroneous heads suppress member lookup");
+        let record = suppressed.owners()[2]
+            .path_resolution()
+            .expect("suppressed record paths resolve");
+        assert!(record.module_path_errors().is_empty());
+        assert!(
+            record
+                .paths()
+                .values()
+                .filter(|path| path.segment_count > 1)
+                .all(|path| path.base == Res::Err && path.resolved_segments == 1),
+            "an error head does not cascade into suffix member errors"
+        );
+
+        let changed_graph = PackageGraph::new(
+            Version::parse("1.8.3").expect("changed toolchain version is valid"),
+            graph.nodes().iter().cloned(),
+        )
+        .expect("changed graph remains valid");
+        assert!(matches!(
+            database.collect_active_source_member_scopes(
+                &root_collection,
+                &changed_graph,
+                &[middle_member_package.clone(), leaf_member_package.clone()],
+            ),
+            Err(Phase1ModuleMemberScopeError::PackageGraphMismatch(key))
+                if key.as_str() == "acme:check#1"
+        ));
+        assert_ne!(root_package, middle_collection.module_tree.package);
     }
 
     #[test]

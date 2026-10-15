@@ -4281,7 +4281,7 @@ fn module_tree_workspace_check_diagnostics(
         let collection_order =
             phase1_package_collection_order(inputs, package_graph_for_scopes.as_ref())?;
         let mut finalized_foreign_scopes =
-            BTreeMap::<PackageKey, sai_driver::Phase1ForeignPackageScopes>::new();
+            BTreeMap::<PackageKey, sai_driver::Phase1ModuleMemberScopePackage>::new();
         for index in collection_order {
             let (_, _, module_tree, source_by_key) = &package_trees[index];
             let input = &inputs[index];
@@ -4303,13 +4303,7 @@ fn module_tree_workspace_check_diagnostics(
                                     return None;
                                 }
                                 let scope = finalized_foreign_scopes.get(edge.target())?;
-                                Some(sai_driver::Phase1ForeignPackageScopes {
-                                    visible_identity: edge.visible_identity().to_owned(),
-                                    package_key: edge.target().clone(),
-                                    module_tree: Arc::clone(&scope.module_tree),
-                                    scopes: Arc::clone(&scope.scopes),
-                                    input_fingerprint: scope.input_fingerprint,
-                                })
+                                Some(scope.as_foreign_package_scopes(edge.visible_identity()))
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -4336,7 +4330,6 @@ fn module_tree_workspace_check_diagnostics(
                     &direct_foreign_scopes,
                 )
                 .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
-            let input_fingerprint = collection.input_fingerprint();
             let phase1 = collection.scopes();
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
@@ -4351,17 +4344,11 @@ fn module_tree_workspace_check_diagnostics(
             infos = infos.saturating_add(phase1_infos);
 
             if let Some(graph) = package_graph_for_scopes.as_ref()
-                && let Some(node) = graph.node(&package_key)
+                && graph.node(&package_key).is_some()
             {
                 finalized_foreign_scopes.insert(
                     package_key.clone(),
-                    sai_driver::Phase1ForeignPackageScopes {
-                        visible_identity: node.identity().to_owned(),
-                        package_key,
-                        module_tree: Arc::clone(module_tree),
-                        scopes: Arc::new(collection.into_scopes()),
-                        input_fingerprint,
-                    },
+                    collection.module_member_scope_package(),
                 );
             }
         }
