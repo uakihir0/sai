@@ -1100,8 +1100,75 @@ impl TestPropertyOwnerResolutions {
     }
 }
 
-/// Failure while lowering or resolving a current-snapshot function or
-/// predicate owner.
+/// Owned lexical-local and module-path results for one constant initializer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstOwnerResolution {
+    owner: OwnerId,
+    local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+    module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl ConstOwnerResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn local_resolution(
+        &self,
+    ) -> Result<Option<&LocalResolution>, &OwnerControlFlowResolutionError> {
+        self.local_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    pub fn module_resolution(
+        &self,
+    ) -> Result<Option<&ModuleResolution>, &OwnerControlFlowResolutionError> {
+        self.module_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Per-owner path results tagged with their package-collection provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstOwnerResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<ConstOwnerResolution>,
+}
+
+impl ConstOwnerResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[ConstOwnerResolution] {
+        &self.owners
+    }
+}
+
+/// Failure while lowering or resolving a current-snapshot HIR owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnerControlFlowResolutionError {
     SnapshotMismatch,
@@ -3091,6 +3158,157 @@ impl RootDatabase {
         })
     }
 
+    /// Resolves lexical locals and one-segment module paths in top-level
+    /// constant initializers.
+    ///
+    /// This uncached bridge uses the exact current lowering and source map for
+    /// each target-filtered owner. Constant-expression legality and final
+    /// unresolved-name diagnostics remain later phases.
+    pub fn resolve_const_owner_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<ConstOwnerResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Const)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut owners = Vec::with_capacity(descriptors.len());
+        let mut group_start = 0;
+        while group_start < descriptors.len() {
+            let file = descriptors[group_start].file;
+            let mut group_end = group_start + 1;
+            while group_end < descriptors.len() && descriptors[group_end].file == file {
+                group_end += 1;
+            }
+            let inputs =
+                match self.current_owner_inputs(snapshot, file, &collection.target_cfg) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        owners.extend(descriptors[group_start..group_end].iter().map(
+                            |descriptor| ConstOwnerResolution {
+                                owner: descriptor.owner,
+                                local_resolution: Err(error.clone()),
+                                module_resolution: Err(error.clone()),
+                                lowering_diagnostics: Vec::new(),
+                            },
+                        ));
+                        group_start = group_end;
+                        continue;
+                    }
+                };
+            let module_scope = module_scope_for_file(collection, module_tree, file);
+            let module_aliases = match &module_scope {
+                Ok(module_scope) => Ok(module_aliases_for_scope(module_scope)),
+                Err(error) => Err(error.clone()),
+            };
+
+            for descriptor in &descriptors[group_start..group_end] {
+                let mut lowering_diagnostics = Vec::new();
+                let analysis: Result<
+                    (
+                        Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
+                        Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                    ),
+                    OwnerControlFlowResolutionError,
+                > = (|| {
+                    let owner_descriptor = find_top_level_owner_descriptor(
+                        &top_level_owner_index,
+                        descriptor.owner,
+                        descriptor.file,
+                        descriptor.item_id,
+                        descriptor.kind,
+                    )?;
+                    let def_paths = self
+                        .def_paths
+                        .get(&descriptor.owner.def_id.package())
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+                    let expected_path = def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                        .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                            descriptor.owner,
+                        ))?;
+
+                    let arena = HirArena::new();
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.parsed.root,
+                        &arena,
+                        &self.symbols,
+                        def_paths,
+                    );
+                    let (hir_owner, source_map) = lower_top_level_owner(
+                        owner_descriptor,
+                        &expected_path,
+                        &inputs.filtered_item_tree,
+                        &inputs.retained_item_kinds,
+                        &context,
+                    )?;
+                    lowering_diagnostics = hir_owner.diagnostics.clone();
+                    let Some(body) = hir_owner.body else {
+                        return Ok((Ok(None), Ok(None)));
+                    };
+                    let locals = match &module_aliases {
+                        Ok(module_aliases) => resolve_owner_locals(
+                            body,
+                            &source_map,
+                            snapshot,
+                            &self.symbols,
+                            module_aliases,
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Locals),
+                        Err(error) => Err(error.clone()),
+                    };
+                    match locals {
+                        Ok(locals) => {
+                            let module_resolution = match &module_scope {
+                                Ok(module_scope) => Ok(Some(resolve_owner_module_paths(
+                                    &locals,
+                                    module_scope,
+                                    &HashSet::new(),
+                                ))),
+                                Err(error) => Err(error.clone()),
+                            };
+                            Ok((Ok(Some(locals)), module_resolution))
+                        }
+                        Err(error) => Ok((Err(error.clone()), Err(error))),
+                    }
+                })();
+                let (local_resolution, module_resolution) =
+                    analysis.unwrap_or_else(|error| (Err(error.clone()), Err(error)));
+                owners.push(ConstOwnerResolution {
+                    owner: descriptor.owner,
+                    local_resolution,
+                    module_resolution,
+                    lowering_diagnostics,
+                });
+            }
+            group_start = group_end;
+        }
+        Ok(ConstOwnerResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
     /// Resolves lexical locals and one-segment module paths in top-level tests
     /// and properties when test analysis is active for this package
     /// collection.
@@ -4645,6 +4863,239 @@ mod tests {
             "a name from the root module does not leak into a child module's unqualified scope"
         );
         assert_eq!(child_owner.deferred_paths[0].name, root_value_symbol);
+    }
+
+    #[test]
+    fn const_owner_paths_use_target_filtered_exact_file_scopes() {
+        let root = concat!(
+            "const BASE: Bool = true\n",
+            "const COPY: Bool = BASE\n",
+            "@target(\"wasm64-core\")\n",
+            "const FILTERED: Bool = true\n",
+        );
+        let child = concat!(
+            "const LOCAL: Bool = false\n",
+            "const LOCAL_COPY: Bool = LOCAL\n",
+            "const CHILD_COPY: Bool = BASE\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let binding_for = |scope: &Phase1ModuleScopes, name: &str| {
+            scope
+                .scope
+                .iter()
+                .find_map(|(symbol, binding)| {
+                    (database.resolve_symbol(*symbol).ok()?.as_ref() == name).then_some(binding.res)
+                })
+                .unwrap_or_else(|| panic!("module scope contains `{name}`"))
+        };
+        let base = binding_for(root_scope, "BASE");
+        let child_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let child_local = binding_for(child_scope, "LOCAL");
+        let base_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "BASE")
+            })
+            .expect("BASE has an interned symbol");
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        assert!(results.matches_collection(&collection));
+        assert_eq!(
+            results.owners().len(),
+            5,
+            "the target-excluded const is absent from the current owner list"
+        );
+        let copied_root_value = results.owners()[1]
+            .module_resolution()
+            .expect("root module lookup succeeds")
+            .expect("COPY has a module result");
+        assert_eq!(
+            copied_root_value
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [base],
+            "a const initializer resolves an unqualified const in its module"
+        );
+
+        let copied_child_value = results.owners()[3]
+            .module_resolution()
+            .expect("child module lookup succeeds")
+            .expect("LOCAL_COPY has a module result");
+        assert_eq!(
+            copied_child_value
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [child_local],
+            "a child const resolves a sibling const from the child file scope"
+        );
+
+        let child_root_miss = results.owners()[4]
+            .module_resolution()
+            .expect("child module miss remains a successful partial pass")
+            .expect("CHILD_COPY has a module result");
+        assert!(child_root_miss.paths.is_empty());
+        assert_eq!(child_root_miss.deferred_paths.len(), 1);
+        assert_eq!(
+            child_root_miss.deferred_paths[0].name, base_symbol,
+            "a root-file const is not exposed in the child module's unqualified scope"
+        );
+    }
+
+    #[test]
+    fn const_owner_paths_preserve_test_only_resolution_markers() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "const COPY: Bool = fixture\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let context = Phase1BuildContext {
+            is_root_package: false,
+            analyzes_tests: true,
+            ..Phase1BuildContext::default()
+        };
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                context,
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test dependency collection succeeds");
+        let expected = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .imports[0]
+            .res;
+        assert!(matches!(expected, Res::TestOnly(_)));
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owner analysis does not require test-analysis gating");
+        let module = results.owners()[0]
+            .module_resolution()
+            .expect("module lookup succeeds")
+            .expect("const owner has a module result");
+        assert_eq!(
+            module
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [expected],
+            "the later owner-aware pass can still diagnose test-only use in a const"
+        );
+    }
+
+    #[test]
+    fn const_owner_paths_preserve_diagnosed_imports_and_isolate_failures() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "const FIRST: Bool = fixture\n",
+            "const SECOND: Bool = true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 only { wasm64-core } }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("ordinary build collects test-only import bindings");
+        assert_eq!(
+            collection
+                .scopes()
+                .module(ModuleId::ROOT)
+                .expect("root module scope exists")
+                .imports[0]
+                .res,
+            Res::Err
+        );
+        let inactive_import_results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("inactive imports remain available to later owner diagnostics");
+        let first_module = inactive_import_results.owners()[0]
+            .module_resolution()
+            .expect("FIRST module lookup succeeds")
+            .expect("FIRST has a module result");
+        assert_eq!(
+            first_module
+                .paths
+                .values()
+                .map(|path| path.base)
+                .collect::<Vec<_>>(),
+            [Res::Err],
+            "the const path retains its inactive-import sentinel"
+        );
+
+        let const_item_id = collection.scopes.top_level_owners[1].item_id;
+        collection.scopes.top_level_owners[0].item_id = const_item_id;
+
+        let results = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("descriptor failures remain owner-local");
+        assert_eq!(results.owners().len(), 2);
+        assert!(results.owners()[0].local_resolution().is_err());
+        assert!(results.owners()[0].module_resolution().is_err());
+        assert!(
+            results.owners()[1]
+                .local_resolution()
+                .expect("the following const still resolves")
+                .is_some()
+        );
+        let second_module = results.owners()[1]
+            .module_resolution()
+            .expect("the following module lookup succeeds")
+            .expect("SECOND has a module result");
+        assert!(second_module.paths.is_empty());
     }
 
     #[test]
