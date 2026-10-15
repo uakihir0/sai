@@ -337,8 +337,10 @@ resolution remains with the WIT resolver; spec/14 does not yet define how a
 direct `requires test` package path is diagnosed. The grammar exposes no
 additional extern-child form beyond function heads, which IR-532 already
 covers; IR-541 adds partial first-head type-path resolution for the existing
-top-level type owners. The property-parameter exception is preserved during
-test analysis.
+top-level type owners, and IR-542 connects qualified module/interface prefixes
+to a validated active-source scope closure. Artifact and WIT member suffixes
+remain deferred. The property-parameter exception is preserved during test
+analysis.
 The complete canonical prelude and general tracked `package_scopes(PackageId)`
 query also remain deferred.
 
@@ -684,6 +686,24 @@ walker. `PathRoot` handling, unqualified-name/rib lookup, expression `Field`
 chain recognition, type-relative lookup, and diagnostic construction remain
 outside this helper.
 
+**Top-level type-owner prefix lookup (IR-542).** The driver builds a temporary
+`ModuleMemberIndex` from the current package and a validated closure of every
+reachable active source package. The closure is separate from Phase 1's
+direct-import scopes: it is checked against the same package graph, snapshot,
+target configuration, module trees, and exact direct-source-edge fingerprints
+before qualified lookup. Direct-edge inputs are opaque adapters derived from
+retained finalized collections, so callers cannot pair detached scopes with a
+claimed collection fingerprint; the CLI retains those collections in
+dependency-first order. Top-level struct, alias, enum, and resource type paths
+resolve module and interface segments through that index, then stop
+before the first non-module type so type-relative tails remain for type
+checking. Missing members and inaccessible members are retained as typed
+errors with the reference segment and declaration span. Missing source scopes
+fail closure construction; artifact and WIT member suffixes remain deferred
+to their later resolvers. An erroneous head continues to suppress suffix
+lookup. This adapter does not yet map typed errors to final diagnostics or
+integrate with command-level `check`.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
@@ -964,9 +984,11 @@ force. Top-level resource field types are included at this stage because
 resources already lower as ordinary top-level type owners; resources add no
 generic parameter scope. IR-539 covers effect `covers` references, and IR-540
 covers test-only module-binding heads in direct world items and boundary
-signatures. IR-541 adds first-head resolution for the same top-level type
-owners. Full ordinary type/member and Prelude resolution, package-qualified
-world/WIT resolution, and command-level `check` integration remain pending.
+signatures. IR-541 adds first-head resolution for these top-level type owners,
+and IR-542 walks their qualified module/interface prefixes with validated
+source scopes. Full ordinary type/member and Prelude resolution,
+package-qualified world/WIT resolution, final diagnostics, and command-level
+`check` integration remain pending.
 The grammar exposes no further extern-child form beyond function heads, which
 IR-532 covers.
 
@@ -1111,10 +1133,11 @@ headers, IR-535–IR-536 cover associated declaration signatures, method bodies,
 and contracts, IR-537 covers interfaces, and IR-538 covers top-level
 struct/alias/enum/resource declarations. IR-539 and IR-540 add test-only
 reference diagnostics for effects and world owners. IR-541 adds partial
-first-head type-path resolution for top-level type declarations. Full ordinary
-type/effect/member lookup, canonical Prelude fallback, package-qualified
-world/WIT resolution, and final unresolved-name diagnostics remain for later
-integration.
+first-head type-path resolution for top-level type declarations, and IR-542
+adds qualified module/interface prefixes for those paths using a validated
+active-source scope closure. Full ordinary type/effect/member lookup, canonical
+Prelude fallback, package-qualified world/WIT resolution, and final
+unresolved-name diagnostics remain for later integration.
 
 **Const test-only type diagnostics (IR-528).** The const owner adapter walks
 the declared type before its body-dependent local-resolution branch and also
