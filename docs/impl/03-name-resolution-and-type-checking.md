@@ -778,8 +778,21 @@ independently rejecting test-only heads, then use the exact source file's
 module scope and primitive-only Prelude. Keep the result separate from
 expression module lookup and predicate diagnostics. Qualified suffixes and
 canonical names without supplied standard-package scopes remain deferred.
-Refinement and distinct predicate adapters still leave the channel absent
-until their own increments.
+Refined/distinct predicate owners were added in IR-551; other predicate
+adapters still leave this channel absent.
+
+**Refinement and distinct type heads (IR-551).** Refined and
+refinement-bearing distinct owners expose partial type-head results for their
+base types, generic bounds when present in HIR, and predicate-body type
+paths. Distinct type and const generics resolve to their HIR definitions before
+test-only rejection, exact-file module lookup, and the primitive-only Prelude.
+Refined HIR deliberately omits generic parameters because refined types cannot
+be generic; for invalid generic syntax, the ItemTree names shadow module
+bindings as `Res::Err` without fabricating generic definition IDs. Generic
+syntax paths omitted from HIR remain diagnostic-only and do not appear in the
+ordinary path map. Expression `ModuleResolution` remains independent.
+Qualified suffixes and canonical names without supplied standard-package
+scopes remain deferred.
 
 ### 3.4.3 Ribs
 
