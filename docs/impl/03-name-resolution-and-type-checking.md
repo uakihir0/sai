@@ -823,6 +823,18 @@ shadowing without inventing a generic definition. Recovery-only refinement
 predicates, bodies, and contracts remain outside the HIR type result. Qualified
 suffixes and non-primitive Prelude names remain deferred.
 
+**World function signature type heads (IR-555).** Each retained world
+function import or export exposes a partial type-head result for its HIR
+signature. Resolve retained type and const generic definitions first; names
+recovered from invalid generic syntax shadow module bindings as `Res::Err`
+without fabricated definitions. Then reject test-only heads and use the exact
+source file's module scope before the primitive-only Prelude. World module,
+interface, and include references stay outside this channel even where the
+diagnostic path walker classifies a module path as a type path. Invalid
+function `where` clauses and body annotations omitted from HIR remain
+diagnostic-only. Qualified suffixes and non-primitive Prelude names remain
+deferred.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
