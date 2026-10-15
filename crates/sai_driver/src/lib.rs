@@ -7681,6 +7681,8 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.extern_function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
@@ -7838,9 +7840,9 @@ impl RootDatabase {
                                     primitive_prelude,
                                     &rejected_type_paths,
                                     module_scope,
-                                    None,
+                                    Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    None,
+                                    Some(&source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -16957,17 +16959,24 @@ mod tests {
     #[test]
     fn extern_function_adapter_resolves_type_path_heads_separately() {
         let root = concat!(
+            "use acme:phase1/child as child_alias\n",
             "type Array<T> = T\n",
             "type Shared<T> = T\n",
             "type RootOnly<T> = T\n",
             "unsafe extern \"wasm\" module \"env\" {\n",
             "  fn typed<T, const Count: U32>(value: Array<T>, shared: Shared<T>, ",
-            "size: Count, optional: Option<T>) -> U32;\n",
+            "size: Count, optional: Option<T>, qualified: child_alias.Widget, ",
+            "nested: child_alias.api.Request.Associated, ",
+            "missing: child_alias.MissingType) -> U32;\n",
             "  fn contracted(value: Bool) requires { let typed: U32 = true; typed } ",
             "ensures { result }\n",
             "}\n",
         );
         let child = concat!(
+            "type Widget = Bool\n",
+            "interface api {\n",
+            "  type Request = Bool\n",
+            "}\n",
             "type Shared<T> = T\n",
             "unsafe extern \"wasm\" module \"env\" {\n",
             "  fn child(value: Shared<U32>, root_only: RootOnly<U32>);\n",
@@ -17019,6 +17028,39 @@ mod tests {
             .get(&shared_symbol)
             .expect("child module Shared alias exists")
             .res;
+        let child_module_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let widget_binding = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget alias is declared");
+        let api_name = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let request_name = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let request_binding = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (child_module_scope
+                    .members
+                    .get(&api_name)
+                    .is_some_and(|binding| binding.res == Res::Def(DefKind::Interface, *def_id)))
+                .then(|| interface.members.get(&request_name))
+                .flatten()
+            })
+            .expect("interface api declares Request");
 
         let resolved = database
             .resolve_extern_function_predicates(&collection, &module_tree, &snapshot)
@@ -17072,6 +17114,58 @@ mod tests {
                 .values()
                 .any(|path| path.base == root_shared_resolution),
             "the root extern owner uses its file's Shared alias"
+        );
+        assert!(
+            typed_paths.paths().values().any(|path| {
+                path.base == widget_binding.res
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2
+            }),
+            "extern signatures resolve same-package private module members"
+        );
+        assert!(
+            typed_paths.paths().values().any(|path| {
+                path.base == request_binding.res
+                    && path.resolved_segments == 3
+                    && path.segment_count == 4
+            }),
+            "extern signatures stop at an interface type and retain its suffix"
+        );
+        assert_eq!(typed_paths.module_path_errors().len(), 1);
+        let missing_offset = root
+            .find("child_alias.MissingType")
+            .expect("missing type member path exists");
+        let missing_error = &typed_paths.module_path_errors()[0];
+        let (missing_name, missing_segment, missing_span) = match missing_error.error() {
+            ModulePathError::MissingMember {
+                name,
+                segment_index,
+                span,
+                ..
+            } => (name, segment_index, span),
+            error => panic!("expected a missing-member error, got {error:?}"),
+        };
+        assert!(
+            database
+                .resolve_symbol(missing_name)
+                .is_ok_and(|name| name.as_ref() == "MissingType")
+        );
+        assert_eq!(missing_segment, 0);
+        let missing_start = missing_offset + "child_alias.".len();
+        assert_eq!(missing_span.file, module_tree.modules[0].file);
+        assert_eq!(missing_span.range.start().to_usize(), missing_start);
+        assert_eq!(
+            missing_span.range.end().to_usize(),
+            missing_start + "MissingType".len()
+        );
+        assert_eq!(
+            typed_paths.paths().get(&missing_error.hir_id()),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            }),
+            "a missing extern member records an error through the exact path segment"
         );
         assert_eq!(
             typed_paths
@@ -17222,6 +17316,10 @@ mod tests {
                 .values()
                 .all(|path| path.base == Res::Err),
             "the later test-only contract type head stays rejected after diagnostic failure"
+        );
+        assert!(
+            type_paths.module_path_errors().is_empty(),
+            "rejected test-only extern heads do not trigger member lookup"
         );
     }
 
