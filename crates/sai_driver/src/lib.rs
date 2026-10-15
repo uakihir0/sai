@@ -17,17 +17,17 @@ use sai_hir::item_tree::{
 };
 use sai_hir::items::{
     HirOwner, ImplItemKind, ImplKind, InterfaceItemKind as HirInterfaceItemKind, ItemKind,
-    OwnerNode, TraitItemKind, VariantShape,
+    OwnerNode, TraitItemKind, VariantShape, WorldItemKind, WorldRef,
 };
 use sai_hir::lower::{
-    ExternItemIds, HirLoweringContext, HirLoweringError, InterfaceResourceMemberIds,
+    ExternItemIds, HirLoweringContext, HirLoweringError, InterfaceResourceMemberIds, WorldItemIds,
     lower_alias_owner, lower_const_owner, lower_distinct_owner, lower_effect_owner,
     lower_enum_owner, lower_extern_block_owner, lower_extern_item_owner, lower_function_owner,
     lower_impl_item_owner, lower_impl_owner, lower_interface_function_recovery_body,
     lower_interface_item_owner, lower_interface_owner, lower_interface_refinement_recovery_body,
     lower_interface_resource_member_owner, lower_invariant_owner, lower_property_owner,
     lower_refined_owner, lower_resource_owner, lower_struct_owner, lower_test_owner,
-    lower_trait_item_owner, lower_trait_owner, lower_world_owner,
+    lower_trait_item_owner, lower_trait_owner, lower_world_item_owner, lower_world_owner,
 };
 use sai_hir::patterns::{Pat as HirPat, PatKind, PatRangeEnd};
 use sai_hir::source_map::HirSourceMap;
@@ -1157,6 +1157,113 @@ impl EffectOwnerTestOnlyResolutions {
     }
 }
 
+/// The direct world declaration form checked by the test-only reference pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorldItemTestOnlyKind {
+    Import,
+    Export,
+    Include,
+}
+
+/// Test-only references found in one direct world item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldItemTestOnlyResolution {
+    world_owner: OwnerId,
+    owner: OwnerId,
+    kind: WorldItemTestOnlyKind,
+    test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl WorldItemTestOnlyResolution {
+    pub const fn world_owner(&self) -> OwnerId {
+        self.world_owner
+    }
+
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn kind(&self) -> WorldItemTestOnlyKind {
+        self.kind
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution.as_ref()
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Results for direct items of one current-target world owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldOwnerTestOnlyResolution {
+    owner: OwnerId,
+    error: Option<OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+    items: Vec<WorldItemTestOnlyResolution>,
+}
+
+impl WorldOwnerTestOnlyResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn error(&self) -> Option<&OwnerControlFlowResolutionError> {
+        self.error.as_ref()
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+
+    pub fn items(&self) -> &[WorldItemTestOnlyResolution] {
+        &self.items
+    }
+}
+
+/// Provenance-tagged test-only diagnostics for direct world declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldTestOnlyResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<WorldOwnerTestOnlyResolution>,
+}
+
+impl WorldTestOnlyResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[WorldOwnerTestOnlyResolution] {
+        &self.owners
+    }
+}
+
 /// The kind of associated trait or impl declaration checked by the
 /// test-only reference pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1818,6 +1925,10 @@ pub enum OwnerControlFlowResolutionError {
         import: ImportIndex,
     },
     MissingEffectDeclarationSyntax(OwnerId),
+    MissingWorldItemSyntax {
+        world: OwnerId,
+        item: OwnerId,
+    },
     MissingRefinedTypeSyntax(OwnerId),
     MissingInterfaceFunctionSyntax(OwnerId),
     InvalidSourceLocation(OwnerId),
@@ -2342,6 +2453,28 @@ fn owner_test_only_path_candidates_with_body(
             | HirInterfaceItemKind::ResourceMember { sig, generics, .. } => Some((sig, generics)),
             _ => None,
         },
+        OwnerNode::WorldItem(item) => {
+            match item.kind {
+                WorldItemKind::Import(WorldRef::Mod(path))
+                | WorldItemKind::Export(WorldRef::Mod(path))
+                | WorldItemKind::Include(WorldRef::Mod(path)) => work.push(Work::Path {
+                    path,
+                    kind: OwnerPathKind::Type,
+                }),
+                WorldItemKind::ImportFn { sig, .. } | WorldItemKind::ExportFn { sig, .. } => {
+                    work.extend(sig.params.iter().map(|parameter| Work::Ty(parameter.ty)));
+                    if let Some(ret) = sig.ret {
+                        work.push(Work::Ty(ret));
+                    }
+                    if let Some(effects) = sig.effects {
+                        work.extend(effects.iter().copied().map(Work::Effect));
+                    }
+                }
+                WorldItemKind::Import(_) | WorldItemKind::Export(_) | WorldItemKind::Include(_) => {
+                }
+            }
+            None
+        }
         _ => return Vec::new(),
     };
     if let Some((sig, generics)) = signature {
@@ -2462,6 +2595,7 @@ fn owner_test_only_path_candidates_with_body(
             | HirInterfaceItemKind::ResourceMember { .. } => {}
         },
         OwnerNode::ExternItem(_) => {}
+        OwnerNode::WorldItem(_) => {}
         _ => return Vec::new(),
     }
     for generics in header_generics {
@@ -2974,6 +3108,351 @@ fn effect_syntax_test_only_path_candidates(
     Ok(paths)
 }
 
+fn intern_ast_name(
+    name: &ast::Name,
+    symbols: &Interner,
+) -> Result<Option<Symbol>, HirLoweringError> {
+    let Some(token) = name.syntax().first_token() else {
+        return Ok(None);
+    };
+    if token.has_error() {
+        return Ok(None);
+    }
+    let written = token.text();
+    let raw_name = written.strip_prefix("r#");
+    let identifier = raw_name.unwrap_or(written);
+    let invalid_raw = matches!(raw_name, Some("self" | "Self" | "_"));
+    let reserved = raw_name.is_none() && sai_syntax::is_reserved_identifier(identifier);
+    if invalid_raw || reserved {
+        return Ok(None);
+    }
+    let normalized = sai_syntax::normalize_identifier(identifier);
+    Ok(Some(symbols.intern(&normalized)?))
+}
+
+fn world_ref_syntax_test_only_path_candidate(
+    reference: &ast::WorldRef,
+    file: FileId,
+    symbols: &Interner,
+) -> Result<Option<RefinedGenericSyntaxPathHead>, HirLoweringError> {
+    if reference.package().is_some() {
+        return Ok(None);
+    }
+    let Some(name) = reference.mod_path().and_then(|path| path.segments().next()) else {
+        return Ok(None);
+    };
+    let Some(symbol) = intern_ast_name_ref(&name, symbols)? else {
+        return Ok(None);
+    };
+    Ok(Some(RefinedGenericSyntaxPathHead {
+        name: symbol,
+        span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+        kind: OwnerPathKind::Type,
+    }))
+}
+
+fn world_item_test_only_kind(kind: ItemTreeKind) -> Option<WorldItemTestOnlyKind> {
+    Some(match kind {
+        ItemTreeKind::WorldItem { import: true } => WorldItemTestOnlyKind::Import,
+        ItemTreeKind::WorldItem { import: false } => WorldItemTestOnlyKind::Export,
+        ItemTreeKind::WorldInclude => WorldItemTestOnlyKind::Include,
+        _ => return None,
+    })
+}
+
+fn world_function_syntax_test_only_path_candidates(
+    function: &ast::FnDecl,
+    file: FileId,
+    symbols: &Interner,
+) -> Result<
+    (
+        Vec<RefinedGenericSyntaxPathHead>,
+        HashSet<Symbol>,
+        HashSet<sai_diagnostics::Span>,
+    ),
+    HirLoweringError,
+> {
+    let mut paths = Vec::new();
+    let mut generic_type_parameters = HashSet::new();
+    let mut const_generic_parameters = HashSet::new();
+    let mut local_value_names = HashSet::new();
+    let mut signature_roots = Vec::new();
+
+    if let Some(generic_params) = function.generic_params() {
+        for parameter in generic_params.type_params() {
+            if let Some(name) = parameter.name()
+                && let Some(symbol) = intern_ast_name(&name, symbols)?
+            {
+                generic_type_parameters.insert(symbol);
+            }
+        }
+        for parameter in generic_params.const_params() {
+            if let Some(name) = parameter.name()
+                && let Some(symbol) = intern_ast_name(&name, symbols)?
+            {
+                const_generic_parameters.insert(symbol);
+                local_value_names.insert(symbol);
+            }
+        }
+        signature_roots.push(generic_params.syntax().clone());
+    }
+    if let Some(parameters) = function.params() {
+        for parameter in parameters.params() {
+            if let Some(name) = parameter.name()
+                && let Some(symbol) = intern_ast_name(&name, symbols)?
+            {
+                local_value_names.insert(symbol);
+            }
+            if let Some(ty) = parameter.ty() {
+                signature_roots.push(ty.syntax().clone());
+            }
+        }
+    }
+    if let Some(ty) = function.ret_type().and_then(|ret| ret.ty()) {
+        signature_roots.push(ty.syntax().clone());
+    }
+    if let Some(where_clause) = function.where_clause() {
+        signature_roots.push(where_clause.syntax().clone());
+    }
+    if let Some(effects_clause) = function.effects_clause() {
+        signature_roots.push(effects_clause.syntax().clone());
+    }
+    for clause in function.requires_clauses() {
+        signature_roots.push(clause.syntax().clone());
+    }
+    for clause in function.ensures_clauses() {
+        signature_roots.push(clause.syntax().clone());
+    }
+    if let Some(borrows_clause) = function.borrows_clause() {
+        for provenance in borrows_clause.provenances() {
+            if let Some(name) = provenance.segments().next()
+                && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+            {
+                paths.push(RefinedGenericSyntaxPathHead {
+                    name: symbol,
+                    span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                    kind: OwnerPathKind::Expression,
+                });
+            }
+        }
+    }
+    for root in signature_roots {
+        paths.extend(syntax_path_candidates(&root, file, symbols)?);
+    }
+    paths.sort_by_key(|path| (path.span.range.start(), path.span.range.end()));
+    paths.dedup_by_key(|path| path.span);
+    let mut locally_resolved_expression_heads: HashSet<sai_diagnostics::Span> = paths
+        .iter()
+        .filter(|path| {
+            matches!(
+                path.kind,
+                OwnerPathKind::Expression | OwnerPathKind::Pattern
+            ) && local_value_names.contains(&path.name)
+        })
+        .map(|path| path.span)
+        .collect();
+    for arguments in function
+        .syntax()
+        .descendants()
+        .filter_map(ast::GenericArgList::cast)
+    {
+        for argument in arguments.type_args() {
+            let Some(path) = argument
+                .ty()
+                .and_then(|ty| ast::PathType::cast(ty.syntax().clone()))
+            else {
+                continue;
+            };
+            let segments = path.segments().collect::<Vec<_>>();
+            let [segment] = segments.as_slice() else {
+                continue;
+            };
+            if segment.generic_args().is_none()
+                && let Some(name) = segment.name()
+                && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+                && const_generic_parameters.contains(&symbol)
+            {
+                locally_resolved_expression_heads
+                    .insert(sai_diagnostics::Span::new(file, name.syntax().text_range()));
+            }
+        }
+    }
+    Ok((
+        paths,
+        generic_type_parameters,
+        locally_resolved_expression_heads,
+    ))
+}
+
+fn world_function_recovery_body_test_only_candidates(
+    function: &ast::FnDecl,
+    owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    context: &HirLoweringContext<'_, '_>,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<
+    (
+        Vec<RefinedGenericSyntaxPathHead>,
+        HashSet<sai_diagnostics::Span>,
+    ),
+    OwnerControlFlowResolutionError,
+> {
+    let (Some(body), source_map) = lower_interface_function_recovery_body(owner, function, context)
+        .map_err(OwnerControlFlowResolutionError::Lowering)?
+    else {
+        return Ok((Vec::new(), HashSet::new()));
+    };
+    let locals = resolve_owner_locals(body, &source_map, snapshot, symbols, &HashSet::new())
+        .map_err(OwnerControlFlowResolutionError::Locals)?;
+    let locally_resolved_heads = local_expression_path_head_spans(&locals, &source_map, inputs);
+    let mut paths = Vec::new();
+    for block in function
+        .syntax()
+        .descendants()
+        .filter(|node| node.kind() == sai_syntax::SyntaxKind::BLOCK)
+    {
+        paths.extend(
+            syntax_path_candidates(&block, inputs.filtered_item_tree.file, symbols)
+                .map_err(OwnerControlFlowResolutionError::Lowering)?,
+        );
+    }
+    paths.sort_by_key(|path| (path.span.range.start(), path.span.range.end()));
+    paths.dedup_by_key(|path| path.span);
+    Ok((paths, locally_resolved_heads))
+}
+
+fn world_item_syntax_test_only_path_candidates(
+    entry: &ItemTreeEntry,
+    world_owner: OwnerId,
+    item_owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    context: &HirLoweringContext<'_, '_>,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<
+    (
+        Vec<RefinedGenericSyntaxPathHead>,
+        HashSet<Symbol>,
+        HashSet<sai_diagnostics::Span>,
+    ),
+    OwnerControlFlowResolutionError,
+> {
+    let syntax = inputs
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .ok_or(OwnerControlFlowResolutionError::MissingWorldItemSyntax {
+            world: world_owner,
+            item: item_owner,
+        })?;
+    let mut paths = Vec::new();
+    let mut generic_type_parameters = HashSet::new();
+    let mut local_expression_heads = HashSet::new();
+    match entry.kind {
+        ItemTreeKind::WorldItem { import: true } => {
+            let declaration = ast::WorldImport::cast(syntax).ok_or(
+                OwnerControlFlowResolutionError::MissingWorldItemSyntax {
+                    world: world_owner,
+                    item: item_owner,
+                },
+            )?;
+            if let Some(function) = declaration.function() {
+                (paths, generic_type_parameters, local_expression_heads) =
+                    world_function_syntax_test_only_path_candidates(
+                        &function,
+                        inputs.filtered_item_tree.file,
+                        symbols,
+                    )
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                // The body is parser-recovered syntax and supplemental to the
+                // retained signature. An unsupported body must not discard
+                // diagnostics already collected from that signature.
+                if let Ok((body_paths, body_local_heads)) =
+                    world_function_recovery_body_test_only_candidates(
+                        &function, item_owner, inputs, symbols, context, snapshot,
+                    )
+                {
+                    paths.extend(body_paths);
+                    local_expression_heads.extend(body_local_heads);
+                }
+            } else if let Some(reference) = declaration.reference()
+                && let Some(candidate) = world_ref_syntax_test_only_path_candidate(
+                    &reference,
+                    inputs.filtered_item_tree.file,
+                    symbols,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)?
+            {
+                paths.push(candidate);
+            }
+        }
+        ItemTreeKind::WorldItem { import: false } => {
+            let declaration = ast::WorldExport::cast(syntax).ok_or(
+                OwnerControlFlowResolutionError::MissingWorldItemSyntax {
+                    world: world_owner,
+                    item: item_owner,
+                },
+            )?;
+            if let Some(function) = declaration.function() {
+                (paths, generic_type_parameters, local_expression_heads) =
+                    world_function_syntax_test_only_path_candidates(
+                        &function,
+                        inputs.filtered_item_tree.file,
+                        symbols,
+                    )
+                    .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                // The body is parser-recovered syntax and supplemental to the
+                // retained signature. An unsupported body must not discard
+                // diagnostics already collected from that signature.
+                if let Ok((body_paths, body_local_heads)) =
+                    world_function_recovery_body_test_only_candidates(
+                        &function, item_owner, inputs, symbols, context, snapshot,
+                    )
+                {
+                    paths.extend(body_paths);
+                    local_expression_heads.extend(body_local_heads);
+                }
+            } else if let Some(reference) = declaration.reference()
+                && let Some(candidate) = world_ref_syntax_test_only_path_candidate(
+                    &reference,
+                    inputs.filtered_item_tree.file,
+                    symbols,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)?
+            {
+                paths.push(candidate);
+            }
+        }
+        ItemTreeKind::WorldInclude => {
+            let declaration = ast::WorldInclude::cast(syntax).ok_or(
+                OwnerControlFlowResolutionError::MissingWorldItemSyntax {
+                    world: world_owner,
+                    item: item_owner,
+                },
+            )?;
+            if let Some(reference) = declaration.reference()
+                && let Some(candidate) = world_ref_syntax_test_only_path_candidate(
+                    &reference,
+                    inputs.filtered_item_tree.file,
+                    symbols,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)?
+            {
+                paths.push(candidate);
+            }
+        }
+        _ => {
+            return Err(OwnerControlFlowResolutionError::Lowering(
+                HirLoweringError::ItemTreeEntryMismatch,
+            ));
+        }
+    }
+    paths.sort_by_key(|path| (path.span.range.start(), path.span.range.end()));
+    paths.dedup_by_key(|path| path.span);
+    Ok((paths, generic_type_parameters, local_expression_heads))
+}
+
 fn is_builtin_effect_root(symbol: Symbol, symbols: &Interner) -> bool {
     let Ok(name) = symbols.resolve(symbol) else {
         return false;
@@ -3182,9 +3661,7 @@ fn collect_ast_test_only_path_diagnostics(
 ) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
     let mut diagnostics = Vec::new();
     for candidate in candidates {
-        if candidate.kind == OwnerPathKind::Expression
-            && locally_resolved_expression_heads.contains(&candidate.span)
-        {
+        if locally_resolved_expression_heads.contains(&candidate.span) {
             continue;
         }
         if matches!(
@@ -6669,6 +7146,287 @@ impl RootDatabase {
         }
 
         Ok(TypeOwnerTestOnlyResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Diagnoses test-only references in direct world imports, exports, and
+    /// world-function boundary signatures.
+    ///
+    /// Module-path heads of imports, exports, and includes consult the current
+    /// module scope. Package-qualified references remain with world/package
+    /// resolution; spec/14 defines this diagnostic for bindings introduced by
+    /// `use` and does not yet specify direct test-dependency `PKG_PATH` errors.
+    pub fn resolve_world_test_only_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+            .collect::<Vec<_>>();
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let mut owners = Vec::with_capacity(descriptors.len());
+
+        for descriptor in descriptors {
+            let inputs = match self.current_owner_inputs(
+                snapshot,
+                descriptor.file,
+                &collection.target_cfg,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    owners.push(WorldOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        error: Some(error),
+                        lowering_diagnostics: Vec::new(),
+                        items: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+            let mut lowering_diagnostics = Vec::new();
+            let analysis: Result<
+                Vec<WorldItemTestOnlyResolution>,
+                OwnerControlFlowResolutionError,
+            > = (|| {
+                let parent_descriptor = find_top_level_owner_descriptor(
+                    &top_level_owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    TopLevelOwnerKind::World,
+                )?;
+                if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::World)
+                {
+                    return Err(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                }
+                let parent_entry = inputs
+                    .filtered_item_tree
+                    .items
+                    .iter()
+                    .find(|entry| {
+                        entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::World
+                    })
+                    .ok_or(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    )?;
+                let child_entries = parent_entry
+                    .children
+                    .iter()
+                    .filter(|entry| world_item_test_only_kind(entry.kind).is_some())
+                    .collect::<Vec<_>>();
+                let def_paths = self
+                    .def_paths
+                    .get(&descriptor.owner.def_id.package())
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let expected_parent_path = def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.parsed.root,
+                    &arena,
+                    &self.symbols,
+                    def_paths,
+                );
+                let (parent_hir, _) = lower_top_level_owner(
+                    parent_descriptor,
+                    &expected_parent_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )?;
+                lowering_diagnostics.extend(parent_hir.diagnostics.iter().cloned());
+                let parent_items = match parent_hir.node {
+                    OwnerNode::Item(item) => match item.kind {
+                        ItemKind::World { items } => items,
+                        _ => {
+                            return Err(
+                                OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                                    owner: descriptor.owner,
+                                    file: descriptor.file,
+                                    descriptor: TopLevelOwnerKind::World,
+                                    current: ItemTreeKind::World,
+                                },
+                            );
+                        }
+                    },
+                    _ => {
+                        return Err(
+                            OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+                };
+                if child_entries.len() != parent_items.len() {
+                    return Err(OwnerControlFlowResolutionError::Lowering(
+                        HirLoweringError::ItemTreeEntryMismatch,
+                    ));
+                }
+
+                let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let mut items = Vec::with_capacity(child_entries.len());
+                for (entry, item_owner) in
+                    child_entries.into_iter().zip(parent_items.iter().copied())
+                {
+                    let kind = world_item_test_only_kind(entry.kind).ok_or(
+                        OwnerControlFlowResolutionError::Lowering(
+                            HirLoweringError::ItemTreeEntryMismatch,
+                        ),
+                    )?;
+                    let mut item_lowering_diagnostics = Vec::new();
+                    let item_result: Result<
+                        (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
+                        OwnerControlFlowResolutionError,
+                    > = (|| {
+                        let expected_item_path = def_paths
+                            .resolve_def_id(item_owner.def_id.to_def_id())
+                            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(item_owner))?;
+                        let (item_hir, _) = lower_world_item_owner(
+                            item_owner,
+                            &expected_item_path,
+                            &parent_hir,
+                            WorldItemIds {
+                                world: descriptor.item_id,
+                                item: entry.ast_id,
+                            },
+                            &inputs.filtered_item_tree,
+                            &context,
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                        item_lowering_diagnostics.extend(item_hir.diagnostics.iter().cloned());
+                        let mut candidates = owner_test_only_path_candidates(&item_hir);
+                        let (mut recovered_candidates, generic_parameters, local_heads) =
+                            world_item_syntax_test_only_path_candidates(
+                                entry,
+                                descriptor.owner,
+                                item_owner,
+                                &inputs,
+                                &self.symbols,
+                                &context,
+                                snapshot,
+                            )?;
+                        candidates.retain(|candidate| {
+                            !local_heads.contains(&sai_diagnostics::Span::new(
+                                candidate.span.file,
+                                candidate.span.range,
+                            ))
+                        });
+                        let hir_head_spans = candidates
+                            .iter()
+                            .map(|candidate| {
+                                sai_diagnostics::Span::new(
+                                    candidate.span.file,
+                                    candidate.span.range,
+                                )
+                            })
+                            .collect::<HashSet<_>>();
+                        let mut path_resolution = OwnerTestOnlyPathResolution {
+                            owner: item_owner,
+                            paths: HashMap::new(),
+                        };
+                        let mut diagnostics = collect_test_only_module_head_diagnostics(
+                            item_owner,
+                            &candidates,
+                            &generic_parameters,
+                            &module_scope,
+                            &mut path_resolution,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        )?;
+                        recovered_candidates
+                            .retain(|candidate| !hir_head_spans.contains(&candidate.span));
+                        diagnostics.extend(collect_ast_test_only_path_diagnostics(
+                            item_owner,
+                            &recovered_candidates,
+                            &generic_parameters,
+                            &local_heads,
+                            &module_scope,
+                            &self.symbols,
+                            &inputs,
+                            snapshot,
+                        )?);
+                        sort_phase1_diagnostics(&mut diagnostics);
+                        Ok((path_resolution, diagnostics))
+                    })();
+                    match item_result {
+                        Ok((path_resolution, diagnostics)) => {
+                            items.push(WorldItemTestOnlyResolution {
+                                world_owner: descriptor.owner,
+                                owner: item_owner,
+                                kind,
+                                test_only_path_resolution: Ok(path_resolution),
+                                test_only_diagnostics: Ok(diagnostics),
+                                lowering_diagnostics: item_lowering_diagnostics,
+                            });
+                        }
+                        Err(error) => {
+                            items.push(WorldItemTestOnlyResolution {
+                                world_owner: descriptor.owner,
+                                owner: item_owner,
+                                kind,
+                                test_only_path_resolution: Err(error.clone()),
+                                test_only_diagnostics: Err(error),
+                                lowering_diagnostics: item_lowering_diagnostics,
+                            });
+                        }
+                    }
+                }
+                Ok(items)
+            })();
+
+            match analysis {
+                Ok(items) => owners.push(WorldOwnerTestOnlyResolution {
+                    owner: descriptor.owner,
+                    error: None,
+                    lowering_diagnostics,
+                    items,
+                }),
+                Err(error) => owners.push(WorldOwnerTestOnlyResolution {
+                    owner: descriptor.owner,
+                    error: Some(error),
+                    lowering_diagnostics,
+                    items: Vec::new(),
+                }),
+            }
+        }
+
+        Ok(WorldTestOnlyResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -13013,6 +13771,421 @@ mod tests {
                 .expect("child member remains available")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn world_test_only_paths_cover_direct_children_and_keep_package_paths_separate() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{remote}\n",
+            "use acme:ordinary/fixtures as plain\n",
+            "@target(\"wasm64-core\")\n",
+            "use acme:test-support/fixtures as filtered\n",
+            "world common {}\n",
+            "world client {\n",
+            "  import fixture.clock\n",
+            "  export remote\n",
+            "  include common\n",
+            "  include fixture\n",
+            "  import acme:test-support/fixtures\n",
+            "  import fn lookup(value: fixture.Request) -> fixture.Response\n",
+            "  export fn render(value: plain.Request) -> fixture.Response\n",
+            "  import filtered.hidden\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            root.as_bytes(),
+            b"world child_api { import fixture.child }\n",
+        );
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("world source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires { acme:ordinary @ ^1 }\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("world module aliases collect");
+        let results = database
+            .resolve_world_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("world child references resolve");
+        assert!(results.matches_snapshot(&snapshot));
+        assert!(results.matches_collection(&collection));
+        assert_eq!(results.target_cfg(), &target_cfg);
+        assert_eq!(results.owners().len(), 3);
+        assert!(results.owners().iter().all(|owner| owner.error().is_none()));
+        assert_eq!(
+            results
+                .owners()
+                .iter()
+                .map(WorldOwnerTestOnlyResolution::owner)
+                .collect::<Vec<_>>(),
+            collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+                .map(|descriptor| descriptor.owner)
+                .collect::<Vec<_>>(),
+            "only current-target worlds are returned in package source order"
+        );
+
+        let client = &results.owners()[1];
+        assert_eq!(results.owners()[2].items().len(), 1);
+        assert!(
+            results.owners()[2].items()[0]
+                .test_only_diagnostics()
+                .expect("child module world resolves")
+                .is_empty(),
+            "root-module test-only imports do not leak into a child module"
+        );
+        assert_eq!(client.items().len(), 8);
+        assert_eq!(
+            client
+                .items()
+                .iter()
+                .map(WorldItemTestOnlyResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                WorldItemTestOnlyKind::Import,
+                WorldItemTestOnlyKind::Export,
+                WorldItemTestOnlyKind::Include,
+                WorldItemTestOnlyKind::Include,
+                WorldItemTestOnlyKind::Import,
+                WorldItemTestOnlyKind::Import,
+                WorldItemTestOnlyKind::Export,
+                WorldItemTestOnlyKind::Import,
+            ]
+        );
+
+        let diagnostics_for = |index: usize| {
+            client.items()[index]
+                .test_only_diagnostics()
+                .expect("child diagnostics resolve")
+        };
+        assert_eq!(
+            diagnostics_for(0).len(),
+            1,
+            "import interface ModPath heads see test-only aliases"
+        );
+        assert_eq!(
+            diagnostics_for(1).len(),
+            1,
+            "export interface ModPath heads see test-only item bindings"
+        );
+        assert!(
+            diagnostics_for(2).is_empty(),
+            "a valid local-world include is not a test-only use"
+        );
+        assert_eq!(
+            diagnostics_for(3).len(),
+            1,
+            "even an invalid include kind still references its test-only module binding"
+        );
+        assert!(
+            diagnostics_for(4).is_empty(),
+            "a direct WorldRef::Pkg stays outside the test-only use-binding diagnostic rule"
+        );
+        assert_eq!(
+            diagnostics_for(5).len(),
+            2,
+            "import function parameter and return types are checked"
+        );
+        assert_eq!(
+            diagnostics_for(6).len(),
+            1,
+            "export function return types are checked while ordinary imports stay allowed"
+        );
+
+        let head_span = |snippet: &str, head: &str| {
+            let snippet_start = root.find(snippet).expect("source snippet exists");
+            let head_start = snippet.find(head).expect("snippet has expected head");
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new((snippet_start + head_start) as u32),
+                    sai_diagnostics::TextSize::new(
+                        (snippet_start + head_start + head.len()) as u32,
+                    ),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        assert_eq!(
+            diagnostics_for(0)[0]
+                .primary()
+                .expect("import reference diagnostic has a primary span")
+                .span,
+            head_span("import fixture.clock", "fixture")
+        );
+        assert_eq!(
+            diagnostics_for(1)[0]
+                .primary()
+                .expect("export reference diagnostic has a primary span")
+                .span,
+            head_span("export remote", "remote")
+        );
+        assert_eq!(
+            diagnostics_for(3)[0]
+                .primary()
+                .expect("include reference diagnostic has a primary span")
+                .span,
+            head_span("include fixture", "fixture")
+        );
+        assert_eq!(
+            diagnostics_for(5)
+                .iter()
+                .map(|diagnostic| diagnostic
+                    .primary()
+                    .expect("signature reference diagnostic has a primary span")
+                    .span
+                    .clone())
+                .collect::<Vec<_>>(),
+            [
+                head_span("import fn lookup(value: fixture.Request)", "fixture"),
+                head_span("-> fixture.Response", "fixture"),
+            ]
+        );
+        assert_eq!(
+            diagnostics_for(6)[0]
+                .primary()
+                .expect("export signature reference diagnostic has a primary span")
+                .span,
+            head_span(
+                "export fn render(value: plain.Request) -> fixture.Response",
+                "fixture",
+            )
+        );
+        assert!(
+            diagnostics_for(7).is_empty(),
+            "a target-filtered test-only use does not leave a visible binding"
+        );
+        assert!(
+            diagnostics_for(0)[0].related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. }
+                    if location.span == head_span("use acme:test-support/fixtures as fixture", "acme:test-support/fixtures")
+            )),
+            "module-alias diagnostics point back to the complete PKG_PATH"
+        );
+        assert!(
+            diagnostics_for(1)[0].related().iter().any(|related| matches!(
+                related,
+                Related::DeclaredHere { location, .. }
+                    if location.span == head_span("use acme:test-support/fixtures.{remote}", "acme:test-support/fixtures")
+            )),
+            "item-binding diagnostics point back to their own use"
+        );
+
+        for item in client.items() {
+            let expected_diagnostic_count = item
+                .test_only_diagnostics()
+                .expect("child diagnostics resolve")
+                .len();
+            assert_eq!(
+                item.test_only_path_resolution()
+                    .expect("child path results resolve")
+                    .paths()
+                    .len(),
+                expected_diagnostic_count,
+                "every rejected retained HIR head receives one Res::Err path"
+            );
+            assert!(
+                item.test_only_path_resolution()
+                    .expect("child path results resolve")
+                    .paths()
+                    .values()
+                    .all(|path| path.base == Res::Err),
+                "rejected HIR world references use error sentinels"
+            );
+        }
+
+        let mut broken_import = collection.clone();
+        let root_scope = &mut broken_import.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let fixture_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "fixture")
+            })
+            .expect("fixture module alias exists");
+        let fixture_import = match root_scope
+            .scope
+            .get(&fixture_symbol)
+            .expect("fixture alias binding exists")
+            .origin
+        {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("fixture binding comes from a use"),
+        };
+        root_scope.imports[fixture_import.0 as usize].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+        let isolated = database
+            .resolve_world_test_only_paths(&broken_import, &module_tree, &snapshot)
+            .expect("child reference failures remain isolated");
+        assert!(
+            isolated.owners()[1].items()[0]
+                .test_only_diagnostics()
+                .is_err()
+        );
+        assert!(
+            isolated.owners()[1].items()[1]
+                .test_only_diagnostics()
+                .is_ok(),
+            "a failing import child does not suppress the next export child"
+        );
+
+        let mut broken_parent = collection.clone();
+        let common_owner = results.owners()[0].owner();
+        let common_descriptor = broken_parent
+            .scopes
+            .top_level_owners
+            .iter_mut()
+            .find(|descriptor| descriptor.owner == common_owner)
+            .expect("common world descriptor exists");
+        common_descriptor.item_id = ast::ErasedAstId::new(u32::MAX);
+        let isolated = database
+            .resolve_world_test_only_paths(&broken_parent, &module_tree, &snapshot)
+            .expect("world parent failures remain isolated");
+        assert!(isolated.owners()[0].error().is_some());
+        assert!(isolated.owners()[0].items().is_empty());
+        assert!(isolated.owners()[1].error().is_none());
+        assert_eq!(
+            isolated.owners()[1].items()[0]
+                .test_only_diagnostics()
+                .expect("sibling world remains resolved")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn world_test_only_paths_recover_forbidden_function_syntax_and_shadows() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{T, N}\n",
+            "world client {\n",
+            "  import fn generic<T, const N: U32>(fixture: Bool, value: Container<fixture.Request>, size: fixture.Buffer<N>) -> fixture.Result\n",
+            "    where T: fixture.Bound\n",
+            "    borrows { fixture.region }\n",
+            "    effects { fs, fixture.network }\n",
+            "    requires fixture.ready\n",
+            "    ensures fixture.valid\n",
+            "  import fn clauses() borrows { fixture.region } requires fixture.ready ensures fixture.valid\n",
+            "  export fn recovered(value: Bool) { fixture.invoke(value) }\n",
+            "  import fn shadowed() { let fixture = true; fixture }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("world source parses with forbidden FnHead recovery");
+        assert!(
+            !parsed.errors.is_empty(),
+            "world function generics, clauses and bodies are parser-diagnosed"
+        );
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only aliases collect for recovery owners");
+        let results = database
+            .resolve_world_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("world recovery references remain diagnosable");
+        assert_eq!(results.owners().len(), 1);
+        assert!(results.owners()[0].error().is_none());
+        let items = results.owners()[0].items();
+        assert_eq!(items.len(), 4);
+
+        let diagnostics_for = |index: usize| {
+            items[index]
+                .test_only_diagnostics()
+                .expect("world item recovery diagnostics resolve")
+        };
+        let head_spans = |index: usize| {
+            diagnostics_for(index)
+                .iter()
+                .map(|diagnostic| {
+                    assert_eq!(
+                        diagnostic.code,
+                        sai_diagnostics::Code::TestDependencyOutsideTest
+                    );
+                    diagnostic
+                        .primary()
+                        .expect("test-only recovery diagnostic has a primary span")
+                        .span
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let head_span = |snippet: &str, head: &str| {
+            let snippet_start = root.rfind(snippet).expect("source snippet exists");
+            let head_start = snippet.find(head).expect("snippet has expected head");
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new((snippet_start + head_start) as u32),
+                    sai_diagnostics::TextSize::new(
+                        (snippet_start + head_start + head.len()) as u32,
+                    ),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        assert_eq!(
+            head_spans(0),
+            [
+                head_span("Container<fixture.Request>", "fixture"),
+                head_span("fixture.Buffer<N>", "fixture"),
+                head_span("-> fixture.Result", "fixture"),
+                head_span("T: fixture.Bound", "fixture"),
+                head_span("effects { fs, fixture.network }", "fixture"),
+            ],
+            "a value parameter does not shadow a nested type path, while generic type and const parameters shadow imports and value paths"
+        );
+        assert_eq!(
+            head_spans(1),
+            [
+                head_span("borrows { fixture.region }", "fixture"),
+                head_span("requires fixture.ready", "fixture"),
+                head_span("ensures fixture.valid", "fixture"),
+            ],
+            "world function clauses retain value references without a same-named parameter"
+        );
+        assert_eq!(
+            head_spans(2),
+            [head_span("{ fixture.invoke(value) }", "fixture")],
+            "a parser-recovered world function body retains outside-test diagnostics"
+        );
+        assert!(
+            head_spans(3).is_empty(),
+            "body-local bindings shadow same-named test-only module aliases"
         );
     }
 
