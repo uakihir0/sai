@@ -5,6 +5,7 @@ pub mod module_path;
 pub mod module_target;
 pub mod owner;
 pub mod package_scopes;
+pub mod prelude;
 pub mod use_binding;
 pub mod use_item_binding;
 pub mod use_path;
