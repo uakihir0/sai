@@ -35,7 +35,7 @@ use sai_hir::types::{
     Bound, BoundKind, EffectRef as HirEffectRef, GenericArg, GenericArgs, GenericParamKind, Name,
     Path as HirPath, PathRoot, PathSegment, Ty, TyKind,
 };
-use sai_hir::{DefId, DefPath, DefPathInterner, DefPathInternerError};
+use sai_hir::{DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError};
 use sai_hir::{HirId, OwnerId};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -52,11 +52,12 @@ use sai_package::mvs_diagnostics::{
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
 use sai_resolve::module_member_lookup::ModuleMemberIndex;
+use sai_resolve::module_member_lookup::ModuleTarget;
 use sai_resolve::module_path::{ModulePathError, resolve_module_prefix};
 use sai_resolve::owner::{
     DeferredPath, LabelResolution, LabelResolutionError, LocalResolution, LocalResolutionError,
-    ModuleResolution, resolve_owner_control_flow, resolve_owner_locals, resolve_owner_module_paths,
-    resolve_predicate_expression,
+    ModuleResolution, edit_distance_at_most_two, resolve_owner_control_flow, resolve_owner_locals,
+    resolve_owner_module_paths, resolve_predicate_expression,
 };
 use sai_resolve::package_scopes::{
     BindingOrigin, DefKind, FilteredModule, ForeignPackageScope, ImportIndex, PackageScopesError,
@@ -2382,7 +2383,9 @@ pub enum OwnerControlFlowResolutionError {
     TargetFilter(TargetFilterError),
     DefPathInterner(DefPathInternerError),
     SymbolLookup(LookupError),
+    PackageId(PackageIdError),
     MissingDefPath(OwnerId),
+    MissingTargetDefPath(DefId),
     DescriptorNotInCurrentTarget {
         owner: OwnerId,
         file: FileId,
@@ -8146,6 +8149,7 @@ impl RootDatabase {
                     descriptor.owner,
                     &path_resolution,
                     &inputs,
+                    members,
                     snapshot,
                     &collection.target_cfg,
                     member_scopes,
@@ -8204,6 +8208,7 @@ impl RootDatabase {
         owner: OwnerId,
         path_resolution: &TypeOwnerPathResolution,
         requesting_inputs: &CurrentOwnerInputs,
+        members: Option<&ModuleMemberIndex<'_>>,
         snapshot: &WorkspaceSnapshot,
         target_cfg: &TargetCfg,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
@@ -8211,15 +8216,6 @@ impl RootDatabase {
         let mut diagnostics = Vec::new();
         let mut requesting_package_identity = None;
         for path_error in path_resolution.module_path_errors() {
-            let ModulePathError::InaccessibleMember {
-                name,
-                span,
-                declaration_span,
-                ..
-            } = path_error.error()
-            else {
-                continue;
-            };
             if requesting_package_identity.is_none() {
                 let file = requesting_inputs.source.id();
                 let file_key = self.files.file_key(file).ok_or(
@@ -8238,63 +8234,229 @@ impl RootDatabase {
                         .to_owned(),
                 );
             }
+            match path_error.error() {
+                ModulePathError::InaccessibleMember {
+                    name,
+                    span,
+                    declaration_span,
+                    ..
+                } => {
+                    let name = self
+                        .symbols
+                        .resolve(name)
+                        .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+                    let primary = sai_diagnostics::Location::from_decoded_source(
+                        requesting_inputs.source_ref.clone(),
+                        sai_diagnostics::Span::new(span.file, span.range),
+                        &requesting_inputs.source,
+                    )
+                    .ok_or(
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                    )?;
+                    let declaration_file_key = self.files.file_key(declaration_span.file).ok_or(
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                    )?;
+                    let declaration_package_identity = member_scopes
+                        .and_then(|scopes| {
+                            scopes.package_identity(declaration_file_key.package_key())
+                        })
+                        .ok_or_else(|| {
+                            OwnerControlFlowResolutionError::MissingSourcePackageIdentity {
+                                owner,
+                                file: declaration_span.file,
+                                package_key: declaration_file_key.package_key().to_owned(),
+                            }
+                        })?
+                        .to_owned();
+                    let declaration_inputs =
+                        self.current_owner_inputs(snapshot, declaration_span.file, target_cfg)?;
+                    let declaration = sai_diagnostics::Location::from_decoded_source(
+                        declaration_inputs.source_ref.clone(),
+                        sai_diagnostics::Span::new(declaration_span.file, declaration_span.range),
+                        &declaration_inputs.source,
+                    )
+                    .ok_or(
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                    )?;
+                    let mut diagnostic = Diagnostic::new(
+                        sai_diagnostics::Code::PrivateItem,
+                        sai_diagnostics::Severity::Error,
+                        format!(
+                            "member `{name}` is private in package `{declaration_package_identity}`"
+                        ),
+                        Some(primary),
+                    );
+                    diagnostic.primary_label = "inaccessible member".to_owned();
+                    diagnostic.package = requesting_package_identity.clone();
+                    diagnostic
+                        .push_related(Related::DeclaredHere {
+                            location: declaration,
+                            what: "private member declared here".to_owned(),
+                        })
+                        .map_err(|_| {
+                            OwnerControlFlowResolutionError::InvalidSourceLocation(owner)
+                        })?;
+                    diagnostics.push(diagnostic.with_workspace_snapshot(snapshot).map_err(
+                        |_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                    )?);
+                }
+                ModulePathError::MissingMember {
+                    name, span, target, ..
+                } => {
+                    let name = self
+                        .symbols
+                        .resolve(name)
+                        .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+                    let primary = sai_diagnostics::Location::from_decoded_source(
+                        requesting_inputs.source_ref.clone(),
+                        sai_diagnostics::Span::new(span.file, span.range),
+                        &requesting_inputs.source,
+                    )
+                    .ok_or(
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                    )?;
+                    let module_path = self.module_target_diagnostic_path(
+                        owner,
+                        target,
+                        requesting_inputs.source.id(),
+                        member_scopes,
+                    )?;
+                    let mut candidates = Vec::new();
+                    if let Some(visible_members) = members
+                        .and_then(|index| index.visible_members(target, owner.def_id.package()))
+                    {
+                        for (symbol, binding) in visible_members {
+                            if symbol.is_error() {
+                                continue;
+                            }
+                            let spelling = self
+                                .symbols
+                                .resolve(symbol)
+                                .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+                            if let Some(distance) = edit_distance_at_most_two(&name, &spelling) {
+                                candidates.push((
+                                    distance,
+                                    binding.name_span.range.start().raw(),
+                                    spelling.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    candidates.sort_by(|left, right| {
+                        (left.0, left.1, left.2.as_bytes()).cmp(&(
+                            right.0,
+                            right.1,
+                            right.2.as_bytes(),
+                        ))
+                    });
+                    candidates.truncate(3);
+                    let candidate_names = candidates
+                        .iter()
+                        .map(|(_, _, spelling)| spelling.clone())
+                        .collect::<Vec<_>>();
+                    let mut diagnostic = Diagnostic::new(
+                        sai_diagnostics::Code::UnresolvedName,
+                        sai_diagnostics::Severity::Error,
+                        format!("no item `{name}` in module `{module_path}`"),
+                        Some(primary),
+                    );
+                    diagnostic.primary_label = "unresolved name".to_owned();
+                    diagnostic.package = requesting_package_identity.clone();
+                    diagnostic.data.insert(
+                        "name".to_owned(),
+                        sai_diagnostics::Value::String(name.to_string()),
+                    );
+                    diagnostic.data.insert(
+                        "module".to_owned(),
+                        sai_diagnostics::Value::String(module_path),
+                    );
+                    diagnostic.data.insert(
+                        "candidates".to_owned(),
+                        sai_diagnostics::Value::Array(
+                            candidate_names
+                                .iter()
+                                .cloned()
+                                .map(sai_diagnostics::Value::String)
+                                .collect(),
+                        ),
+                    );
+                    if !candidate_names.is_empty() {
+                        diagnostic
+                            .push_child(Child {
+                                kind: sai_diagnostics::ChildKind::Help,
+                                message: format!(
+                                    "similar names: {}",
+                                    candidate_names
+                                        .iter()
+                                        .map(|candidate| format!("`{candidate}`"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                location: None,
+                            })
+                            .map_err(|_| {
+                                OwnerControlFlowResolutionError::InvalidSourceLocation(owner)
+                            })?;
+                    }
+                    diagnostics.push(diagnostic.with_workspace_snapshot(snapshot).map_err(
+                        |_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                    )?);
+                }
+                ModulePathError::MissingTargetScope { .. } => {}
+            }
+        }
+        sort_phase1_diagnostics(&mut diagnostics);
+        Ok(diagnostics)
+    }
+
+    fn module_target_diagnostic_path(
+        &self,
+        owner: OwnerId,
+        target: ModuleTarget,
+        requesting_file: FileId,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<String, OwnerControlFlowResolutionError> {
+        let target_def = target.def_id();
+        let package_key = self
+            .packages
+            .resolve(target_def.package)
+            .map_err(OwnerControlFlowResolutionError::PackageId)?;
+        let package_identity = match member_scopes {
+            Some(scopes) => scopes
+                .package_identity(&package_key)
+                .ok_or_else(
+                    || OwnerControlFlowResolutionError::MissingSourcePackageIdentity {
+                        owner,
+                        file: requesting_file,
+                        package_key: package_key.to_string(),
+                    },
+                )?
+                .to_owned(),
+            None => package_key.to_string(),
+        };
+        let def_paths = self.def_paths.get(&target_def.package).ok_or(
+            OwnerControlFlowResolutionError::MissingTargetDefPath(target_def),
+        )?;
+        let path = def_paths
+            .resolve_def_id(target_def)
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+            .ok_or(OwnerControlFlowResolutionError::MissingTargetDefPath(
+                target_def,
+            ))?;
+        let mut rendered = package_identity;
+        for component in path.data() {
+            let name = match &component.data {
+                DefPathData::Module(name) | DefPathData::Interface(name) => *name,
+                _ => continue,
+            };
             let name = self
                 .symbols
                 .resolve(name)
                 .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
-            let primary = sai_diagnostics::Location::from_decoded_source(
-                requesting_inputs.source_ref.clone(),
-                sai_diagnostics::Span::new(span.file, span.range),
-                &requesting_inputs.source,
-            )
-            .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
-                owner,
-            ))?;
-            let declaration_file_key = self.files.file_key(declaration_span.file).ok_or(
-                OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
-            )?;
-            let declaration_package_identity = member_scopes
-                .and_then(|scopes| scopes.package_identity(declaration_file_key.package_key()))
-                .ok_or_else(
-                    || OwnerControlFlowResolutionError::MissingSourcePackageIdentity {
-                        owner,
-                        file: declaration_span.file,
-                        package_key: declaration_file_key.package_key().to_owned(),
-                    },
-                )?
-                .to_owned();
-            let declaration_inputs =
-                self.current_owner_inputs(snapshot, declaration_span.file, target_cfg)?;
-            let declaration = sai_diagnostics::Location::from_decoded_source(
-                declaration_inputs.source_ref.clone(),
-                sai_diagnostics::Span::new(declaration_span.file, declaration_span.range),
-                &declaration_inputs.source,
-            )
-            .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
-                owner,
-            ))?;
-            let mut diagnostic = Diagnostic::new(
-                sai_diagnostics::Code::PrivateItem,
-                sai_diagnostics::Severity::Error,
-                format!("member `{name}` is private in package `{declaration_package_identity}`"),
-                Some(primary),
-            );
-            diagnostic.primary_label = "inaccessible member".to_owned();
-            diagnostic.package = requesting_package_identity.clone();
-            diagnostic
-                .push_related(Related::DeclaredHere {
-                    location: declaration,
-                    what: "private member declared here".to_owned(),
-                })
-                .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
-            diagnostics.push(
-                diagnostic
-                    .with_workspace_snapshot(snapshot)
-                    .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?,
-            );
+            rendered.push('/');
+            rendered.push_str(&name);
         }
-        sort_phase1_diagnostics(&mut diagnostics);
-        Ok(diagnostics)
+        Ok(rendered)
     }
 
     /// Diagnoses test-only references in direct world imports, exports, and
@@ -16117,7 +16279,8 @@ mod tests {
                       type Record {\n\
                         public: middle.api.PublicType\n\
                         private: leaf_model.PrivateType\n\
-                        missing: middle.api.MissingType\n\
+                        missing: middle.api.PublicTypo\n\
+                        hidden_missing: leaf_model.PrivatType\n\
                         tail: middle.api.PublicType.Associated\n\
                       }\n\
                       type Generic<T> = middle.api.PublicType<T>\n",
@@ -16327,8 +16490,12 @@ mod tests {
             .expect("private type name interns");
         let missing_name = database
             .symbols
-            .intern("MissingType")
+            .intern("PublicTypo")
             .expect("missing type name interns");
+        let hidden_missing_name = database
+            .symbols
+            .intern("PrivatType")
+            .expect("hidden missing type name interns");
         let (private_hir_id, private_span, private_declaration_span) = path_errors
             .module_path_errors()
             .iter()
@@ -16366,15 +16533,13 @@ mod tests {
             )
             .expect("private member range is ordered")
         );
-        let private_diagnostics = results.owners()[2]
+        let module_path_diagnostics = results.owners()[2]
             .module_path_diagnostics()
             .expect("private-member diagnostics map successfully");
-        assert_eq!(
-            private_diagnostics.len(),
-            1,
-            "only the inaccessible member becomes a diagnostic"
-        );
-        let private_diagnostic = &private_diagnostics[0];
+        let private_diagnostic = module_path_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::PrivateItem)
+            .expect("inaccessible member becomes a private diagnostic");
         assert_eq!(private_diagnostic.code, sai_diagnostics::Code::PrivateItem);
         assert_eq!(
             private_diagnostic.package.as_deref(),
@@ -16458,6 +16623,16 @@ mod tests {
                 _ => None,
             })
             .expect("missing transitive member is retained as a typed failure");
+        let hidden_missing = path_errors
+            .module_path_errors()
+            .iter()
+            .find_map(|entry| match entry.error() {
+                ModulePathError::MissingMember { name, .. } if name == hidden_missing_name => {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .expect("missing direct dependency member is retained as a typed failure");
         assert!(matches!(
             path_errors.paths().get(&missing.hir_id()),
             Some(PathRes {
@@ -16466,6 +16641,52 @@ mod tests {
                 segment_count: 3,
             })
         ));
+        assert!(matches!(
+            path_errors.paths().get(&hidden_missing.hir_id()),
+            Some(PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            })
+        ));
+        let unresolved_diagnostics = module_path_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnresolvedName)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unresolved_diagnostics.len(),
+            2,
+            "missing module members become unresolved-name diagnostics"
+        );
+        let suggested = unresolved_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("`PublicTypo`"))
+            .expect("transitive missing member is diagnosed");
+        assert!(
+            suggested.message.contains("module `acme:leaf@1.0.0/api`"),
+            "the diagnostic names the canonical re-export target"
+        );
+        assert_eq!(
+            suggested.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("PublicType".to_owned())
+            ]))
+        );
+        assert!(
+            suggested
+                .children()
+                .iter()
+                .any(|child| child.message == "similar names: `PublicType`")
+        );
+        let hidden = unresolved_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("`PrivatType`"))
+            .expect("private lookalike miss is diagnosed");
+        assert_eq!(
+            hidden.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(Vec::new())),
+            "foreign private members are excluded from suggestions"
+        );
         assert!(
             path_errors.paths().values().any(|path| matches!(
                 path.base,
