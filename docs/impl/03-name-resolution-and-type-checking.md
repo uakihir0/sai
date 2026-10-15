@@ -813,6 +813,16 @@ result stays independent from test-only diagnostics and expression lookup,
 uses the parent's exact file scope, and resolves no qualified member suffixes.
 Failure in one child does not stop type results for sibling declarations.
 
+**Interface member type heads (IR-554).** Each retained direct interface
+declaration and resource method exposes a partial type-head result under its
+canonical child owner. The HIR walker covers declaration field, alias, variant,
+refined-base, and signature types; exact type and const generic definitions
+precede test-only rejection, file-local module bindings, and primitive
+Prelude entries. Invalid refined generic syntax is retained as `Res::Err`
+shadowing without inventing a generic definition. Recovery-only refinement
+predicates, bodies, and contracts remain outside the HIR type result. Qualified
+suffixes and non-primitive Prelude names remain deferred.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
