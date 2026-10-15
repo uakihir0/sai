@@ -2128,7 +2128,7 @@ pub type FunctionOwnerLabelResolutions = FunctionOwnerResolutions;
 /// discarded before the value is returned. Predicate diagnostics and local
 /// name results are independent so a local-resolution failure does not hide
 /// owner-specific predicate diagnostics. Type-head results are available only
-/// for invariant and extern-function owners.
+/// for invariant, refined/distinct, and extern-function owners.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PredicateOwnerResolution {
     owner: OwnerId,
@@ -2172,8 +2172,9 @@ impl PredicateOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
-    /// Returns first-segment resolution for type paths in invariant and
-    /// extern-function owners. Other predicate adapters leave this channel absent.
+    /// Returns first-segment resolution for type paths in invariant,
+    /// refined/distinct, and extern-function owners. Other predicate adapters
+    /// leave this channel absent.
     pub fn type_path_resolution(
         &self,
     ) -> Result<Option<&TypeOwnerPathResolution>, &OwnerControlFlowResolutionError> {
@@ -4447,7 +4448,8 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
             ItemKind::Fn { generics, .. }
             | ItemKind::Struct { generics, .. }
             | ItemKind::Alias { generics, .. }
-            | ItemKind::Enum { generics, .. } => generics,
+            | ItemKind::Enum { generics, .. }
+            | ItemKind::Distinct { generics, .. } => generics,
             ItemKind::Resource { .. } => return HashMap::new(),
             _ => return HashMap::new(),
         },
@@ -7147,7 +7149,8 @@ impl RootDatabase {
     }
 
     /// Lowers Phase 1 refined and refinement-bearing distinct descriptors,
-    /// then diagnoses test-only references and forbidden predicate syntax.
+    /// resolves their partial type heads, and diagnoses test-only references
+    /// and forbidden predicate syntax.
     ///
     /// A predicate expression is not an executable owner body, so this uses
     /// the predicate-only resolver and does not resolve its loop labels.
@@ -7187,7 +7190,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
-                                type_path_resolution: Ok(None),
+                                type_path_resolution: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -7209,6 +7212,7 @@ impl RootDatabase {
                     (
                         Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
                         Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
+                        Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
                         Result<
                             Option<OwnerTestOnlyPathResolution>,
                             OwnerControlFlowResolutionError,
@@ -7268,6 +7272,18 @@ impl RootDatabase {
                             descriptor.item_id,
                         ));
                     }
+                    let mut generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                    if descriptor.kind == RefinementPredicateOwnerKind::Refined {
+                        // Refined HIR intentionally has no generic field.
+                        // Keep invalid generic syntax from capturing an
+                        // outer module binding without inventing a DefId.
+                        for name in item_tree_generic_parameters(
+                            &inputs.filtered_item_tree,
+                            descriptor.item_id,
+                        ) {
+                            generic_resolutions.entry(name).or_insert(Res::Err);
+                        }
+                    }
                     let refined_generic_syntax_diagnostics = match (descriptor.kind, &module_scope)
                     {
                         (RefinementPredicateOwnerKind::Refined, Ok(module_scope)) => {
@@ -7320,6 +7336,36 @@ impl RootDatabase {
                         Ok(_) => Ok(Some(resolved_paths)),
                         Err(error) => Err(error.clone()),
                     };
+                    let rejected_type_paths = match &module_scope {
+                        Ok(module_scope) => rejected_test_only_type_path_ids(
+                            descriptor.owner,
+                            &path_candidates,
+                            &generic_parameters,
+                            module_scope,
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let type_path_resolution =
+                        match (&module_scope, &self.primitive_prelude, rejected_type_paths) {
+                            (Ok(module_scope), Ok(primitive_prelude), Ok(rejected_type_paths)) => {
+                                Ok(Some(resolve_type_owner_module_paths(
+                                    descriptor.owner,
+                                    &path_candidates,
+                                    &generic_resolutions,
+                                    primitive_prelude,
+                                    &rejected_type_paths,
+                                    module_scope,
+                                    None,
+                                    descriptor.owner.def_id.package(),
+                                    None,
+                                )))
+                            }
+                            (Err(error), _, _) => Err(error.clone()),
+                            (_, Err(error), _) => Err(
+                                OwnerControlFlowResolutionError::PrimitivePrelude(error.clone()),
+                            ),
+                            (_, _, Err(error)) => Err(error),
+                        };
                     let predicate_diagnostics = match hir_owner.body {
                         Some(body) => resolve_predicate_expression(
                             body.value,
@@ -7333,6 +7379,7 @@ impl RootDatabase {
                         return Ok((
                             Ok(None),
                             Ok(None),
+                            type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics.map(Some),
                             predicate_diagnostics,
@@ -7387,6 +7434,7 @@ impl RootDatabase {
                             Ok((
                                 Ok(Some(locals)),
                                 module_resolution,
+                                type_path_resolution,
                                 path_resolution,
                                 test_only_diagnostics,
                                 predicate_diagnostics,
@@ -7395,6 +7443,7 @@ impl RootDatabase {
                         Err(error) => Ok((
                             Err(error.clone()),
                             Err(error.clone()),
+                            type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics.map(Some),
                             predicate_diagnostics,
@@ -7404,11 +7453,13 @@ impl RootDatabase {
                 let (
                     local_resolution,
                     module_resolution,
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     resolution,
                 ) = analysis.unwrap_or_else(|error| {
                     (
+                        Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
@@ -7421,7 +7472,7 @@ impl RootDatabase {
                     resolution,
                     local_resolution,
                     module_resolution,
-                    type_path_resolution: Ok(None),
+                    type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -14071,8 +14122,9 @@ mod tests {
             assert!(
                 owner
                     .type_path_resolution()
-                    .expect("refinement adapter does not resolve type heads")
-                    .is_none()
+                    .expect("refinement type path lookup succeeds")
+                    .is_some(),
+                "refined and distinct owners expose partial type-head results"
             );
             let locals = owner
                 .local_resolution()
@@ -14088,6 +14140,22 @@ mod tests {
                 "refinement local use resolves independently of predicate diagnostics"
             );
         }
+        for (owner, primitive) in [
+            (&resolved.owners()[0], sai_resolve::prelude::PrimTy::I32),
+            (&resolved.owners()[1], sai_resolve::prelude::PrimTy::U8),
+        ] {
+            let type_paths = owner
+                .type_path_resolution()
+                .expect("refinement type path lookup succeeds")
+                .expect("predicate owner has a type path result");
+            assert!(
+                type_paths
+                    .paths()
+                    .values()
+                    .any(|path| path.base == Res::PrimTy(primitive)),
+                "refined and distinct base types resolve through the primitive Prelude"
+            );
+        }
         assert!(
             resolved.owners()[2]
                 .resolution()
@@ -14099,8 +14167,336 @@ mod tests {
             .expect("valid refined local resolution succeeds")
             .expect("valid refined owner has a body");
         assert!(
+            resolved.owners()[2]
+                .type_path_resolution()
+                .expect("valid refined type lookup succeeds")
+                .expect("valid refined owner has a type path result")
+                .paths()
+                .values()
+                .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::I32)),
+            "a valid predicate-less expression body still keeps the base type result"
+        );
+        assert!(
             self_locals.paths.is_empty(),
             "implicit self remains for owner-aware resolution"
+        );
+    }
+
+    #[test]
+    fn refinement_owner_resolves_type_path_heads_separately() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "type Array<T> = T\n",
+            "type Shared<T> = T\n",
+            "type RootOnly<T> = T\n",
+            "type T = Bool\n",
+            "type Positive<T> = T where { let typed: Option<T> = true; ",
+            "let primitive: U32 = 0; true }\n",
+            "type RootScope = Shared<U32> where { let local: RootOnly<U32> = true; ",
+            "let qualified: child_alias.Widget = true; true }\n",
+            "distinct Age<T: Bound, const Count: U32> = Array<T> where { ",
+            "let typed: Option<T> = true; let count: Count = 0; true }\n",
+        );
+        let child = concat!(
+            "pub type Widget = U32\n",
+            "type Shared<T> = T\n",
+            "type ChildScope = Shared<U32> where { let local: RootOnly<U32> = true; true }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("refined and distinct owners collect");
+        assert_eq!(collection.scopes().refinement_predicate_owners.len(), 4);
+
+        let root_scope = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let symbol = |name: &str| {
+            root_scope
+                .scope
+                .keys()
+                .copied()
+                .find(|symbol| {
+                    database
+                        .resolve_symbol(*symbol)
+                        .is_ok_and(|resolved| resolved.as_ref() == name)
+                })
+                .unwrap_or_else(|| panic!("root module contains `{name}`"))
+        };
+        let root_shared = root_scope
+            .scope
+            .get(&symbol("Shared"))
+            .expect("root Shared alias exists")
+            .res;
+        let root_only = root_scope
+            .scope
+            .get(&symbol("RootOnly"))
+            .expect("root RootOnly alias exists")
+            .res;
+        let root_t = root_scope
+            .scope
+            .get(&symbol("T"))
+            .expect("root T alias exists")
+            .res;
+        let child_module = root_scope
+            .scope
+            .get(&symbol("child_alias"))
+            .expect("root child module alias exists")
+            .res;
+        let shared_symbol = symbol("Shared");
+        let child_shared = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists")
+            .scope
+            .get(&shared_symbol)
+            .expect("child Shared alias exists")
+            .res;
+
+        let resolved = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("refined and distinct type heads resolve separately");
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 4);
+
+        let positive = &resolved.owners()[0];
+        let positive_types = positive
+            .type_path_resolution()
+            .expect("refined type lookup succeeds")
+            .expect("refined owner has type path results");
+        assert!(
+            positive_types
+                .paths()
+                .values()
+                .filter(|path| path.base == Res::Err)
+                .count()
+                >= 2,
+            "invalid refined generic names do not capture the same-named module type"
+        );
+        assert!(
+            positive_types
+                .paths()
+                .values()
+                .all(|path| path.base != root_t),
+            "refined HIR without generic identity does not invent a type parameter DefId"
+        );
+        assert!(
+            positive_types.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Option")
+            }),
+            "canonical non-primitive types remain deferred in refined bodies"
+        );
+        assert!(
+            positive_types
+                .paths()
+                .values()
+                .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
+            "primitive heads in refined predicate annotations resolve"
+        );
+
+        let root_scope_owner = &resolved.owners()[1];
+        let root_scope_types = root_scope_owner
+            .type_path_resolution()
+            .expect("root refined scope lookup succeeds")
+            .expect("root refined scope owner has type path results");
+        assert!(
+            root_scope_types
+                .paths()
+                .values()
+                .any(|path| path.base == root_shared),
+            "the root refined owner uses the root file's Shared binding"
+        );
+        assert!(
+            root_scope_types
+                .paths()
+                .values()
+                .any(|path| path.base == root_only),
+            "root-local aliases remain available within root predicate types"
+        );
+        assert!(
+            root_scope_types.paths().values().any(|path| {
+                path.base == child_module && path.resolved_segments == 1 && path.segment_count == 2
+            }),
+            "a qualified type head resolves only the module alias and retains its suffix"
+        );
+        assert!(
+            root_scope_types.module_path_errors().is_empty(),
+            "member suffix lookup remains deferred at the type-head stage"
+        );
+
+        let age = &resolved.owners()[2];
+        let age_types = age
+            .type_path_resolution()
+            .expect("distinct type lookup succeeds")
+            .expect("distinct owner has type path results");
+        let type_parameter = database
+            .symbols
+            .intern("T")
+            .expect("type parameter name is interned");
+        let const_parameter = database
+            .symbols
+            .intern("Count")
+            .expect("const parameter name is interned");
+        let generic_definitions = database
+            .def_paths
+            .get(&age.owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(
+                age.owner().def_id,
+                &[(type_parameter, false, 0), (const_parameter, true, 0)],
+            )
+            .expect("distinct generic definitions are stable");
+        assert!(
+            age_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::TyParam, generic_definitions[0].to_def_id())
+            }),
+            "distinct type generics keep their exact type-parameter identity"
+        );
+        assert!(
+            age_types.paths().values().any(|path| {
+                path.base == Res::Def(DefKind::ConstParam, generic_definitions[1].to_def_id())
+            }),
+            "distinct const generics keep their exact const-parameter identity in type positions"
+        );
+        assert!(
+            age_types
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "distinct base aliases resolve after generic parameters"
+        );
+        assert!(
+            age_types.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Bound")
+            }),
+            "unresolved generic bounds remain deferred"
+        );
+        assert!(
+            age_types.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "Option")
+            }),
+            "canonical non-primitive types in distinct bodies remain deferred"
+        );
+        assert!(
+            age.module_resolution()
+                .expect("distinct expression lookup succeeds")
+                .expect("distinct owner has expression paths")
+                .paths
+                .is_empty(),
+            "type and const generic heads stay out of expression module lookup"
+        );
+
+        let child_owner_id = collection
+            .scopes()
+            .refinement_predicate_owners
+            .iter()
+            .find(|descriptor| descriptor.file == module_tree.modules[1].file)
+            .expect("child refined owner descriptor exists")
+            .owner;
+        let child_owner = resolved
+            .owners()
+            .iter()
+            .find(|owner| owner.owner() == child_owner_id)
+            .expect("child refined owner result exists");
+        let child_types = child_owner
+            .type_path_resolution()
+            .expect("child refined type lookup succeeds")
+            .expect("child refined owner has type path results");
+        assert!(
+            child_types
+                .paths()
+                .values()
+                .any(|path| path.base == child_shared)
+                && child_shared != root_shared,
+            "same-named aliases resolve to the definition in each refined owner's source file"
+        );
+        assert!(
+            child_types.deferred_paths().iter().any(|path| {
+                database
+                    .resolve_symbol(path.name)
+                    .is_ok_and(|name| name.as_ref() == "RootOnly")
+            }),
+            "the child refined owner does not capture the root-only alias"
+        );
+    }
+
+    #[test]
+    fn refinement_type_paths_reject_later_heads_after_diagnostic_failure() {
+        let root = concat!(
+            "use acme:test-support/fixtures as broken_type\n",
+            "use acme:test-support/fixtures as later_type\n",
+            "type Positive = broken_type.Widget where { ",
+            "let typed: later_type.Widget = true; true }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let mut collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: true,
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("refined test-only imports collect");
+        let module_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let broken_import_index = module_scope
+            .imports
+            .iter()
+            .position(|import| {
+                database
+                    .resolve_symbol(import.name)
+                    .is_ok_and(|name| name.as_ref() == "broken_type")
+            })
+            .expect("broken_type import exists");
+        module_scope.imports[broken_import_index].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+
+        let resolved = database
+            .resolve_refinement_owner_predicates(&collection, &module_tree, &snapshot)
+            .expect("refinement diagnostic failure stays owner-local");
+        let owner = &resolved.owners()[0];
+        assert!(matches!(
+            owner.test_only_diagnostics(),
+            Err(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
+                import,
+                ..
+            }) if import.0 as usize == broken_import_index
+        ));
+        let type_paths = owner
+            .type_path_resolution()
+            .expect("refinement type path lookup remains independent")
+            .expect("refined owner has type path results");
+        assert_eq!(type_paths.paths().len(), 2);
+        assert!(
+            type_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "a later predicate-body type head remains rejected after diagnostic collection fails"
         );
     }
 
@@ -14206,6 +14602,18 @@ mod tests {
                 .all(|path| path.base == Res::Err),
             "base and nested predicate type heads are rejected"
         );
+        let positive_partial_types = positive
+            .type_path_resolution()
+            .expect("refined partial type lookup succeeds")
+            .expect("refined owner includes type path results");
+        assert_eq!(positive_partial_types.paths().len(), 2);
+        assert!(
+            positive_partial_types
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "test-only refined base and predicate annotation stay rejected in the type result"
+        );
         let positive_module_paths = positive
             .module_resolution()
             .expect("refinement expression lookup succeeds")
@@ -14250,6 +14658,31 @@ mod tests {
                 .values()
                 .all(|path| path.base == Res::Err),
             "the qualified base head is rejected"
+        );
+        let age_partial_types = age
+            .type_path_resolution()
+            .expect("distinct partial type lookup succeeds")
+            .expect("distinct owner includes type path results");
+        let fixture_generic = database
+            .def_paths
+            .get(&age.owner().def_id.package())
+            .expect("package definition paths are available")
+            .intern_generic_params(age.owner().def_id, &[(type_symbol, false, 0)])
+            .expect("distinct type generic has a stable definition identity")[0]
+            .to_def_id();
+        assert!(
+            age_partial_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Err),
+            "the test-only qualified base head is rejected"
+        );
+        assert!(
+            age_partial_types
+                .paths()
+                .values()
+                .any(|path| path.base == Res::Def(DefKind::TyParam, fixture_generic)),
+            "a distinct type generic retains its exact identity over a same-named test-only import"
         );
         let age_module_paths = age
             .module_resolution()
@@ -14662,6 +15095,18 @@ mod tests {
                 .paths()
                 .is_empty(),
             "AST-only generic references do not fabricate HIR path results"
+        );
+        let type_paths = owner
+            .type_path_resolution()
+            .expect("refined partial type lookup succeeds")
+            .expect("refined owner has a type path result");
+        assert_eq!(type_paths.paths().len(), 1);
+        assert!(
+            type_paths
+                .paths()
+                .values()
+                .all(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U8)),
+            "ordinary type results include the HIR base but exclude AST-only generic bounds"
         );
 
         let diagnostics = owner
