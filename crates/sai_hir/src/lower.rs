@@ -117,8 +117,16 @@ pub fn lower_function<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(FnSig<'hir>, Option<&'hir Body<'hir>>), HirLoweringError> {
-    let (signature, _, body) =
-        lower_function_inner(declaration, arena, symbols, source_map, false, true, false)?;
+    let (signature, _, body) = lower_function_inner(
+        declaration,
+        arena,
+        symbols,
+        source_map,
+        false,
+        true,
+        false,
+        false,
+    )?;
     Ok((signature, body))
 }
 
@@ -141,7 +149,16 @@ pub fn lower_function_with_generics<'hir>(
     ),
     HirLoweringError,
 > {
-    lower_function_inner(declaration, arena, symbols, source_map, true, true, false)
+    lower_function_inner(
+        declaration,
+        arena,
+        symbols,
+        source_map,
+        true,
+        true,
+        false,
+        false,
+    )
 }
 
 /// Lower a function signature and generics without lowering a body or
@@ -155,9 +172,97 @@ pub fn lower_function_signature_with_generics<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(FnSig<'hir>, &'hir HirGenerics<'hir>), HirLoweringError> {
-    let (signature, generics, _) =
-        lower_function_inner(declaration, arena, symbols, source_map, true, false, false)?;
+    let (signature, generics, _) = lower_function_inner(
+        declaration,
+        arena,
+        symbols,
+        source_map,
+        true,
+        false,
+        false,
+        false,
+    )?;
     Ok((signature, generics))
+}
+
+/// Lowers a recovered body and contracts from an invalid interface function
+/// into a transient owner body for diagnostics.
+///
+/// Interface functions are signature-only in the retained HIR schema. Their
+/// parser-recovered body syntax is nevertheless lowered here so lexical
+/// bindings can take precedence during diagnostic-only analysis.
+pub fn lower_interface_function_recovery_body<'hir>(
+    owner: OwnerId,
+    declaration: &ast::FnDecl,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(Option<&'hir Body<'hir>>, HirSourceMap), HirLoweringError> {
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    let (_, _, body) = lower_function_inner(
+        declaration,
+        context.arena,
+        context.symbols,
+        &mut source_map,
+        true,
+        true,
+        false,
+        true,
+    )?;
+    Ok((body, source_map.finish()))
+}
+
+/// Lowers the invalid refinement predicate of an interface member into a
+/// transient owner body for diagnostic lexical-scope analysis.
+///
+/// Interface refinement clauses retain only their source span in HIR. This
+/// helper lowers the recovered predicate without adding it to the retained
+/// interface HIR owner.
+pub fn lower_interface_refinement_recovery_body<'hir>(
+    owner: OwnerId,
+    declaration: &ast::TypeDecl,
+    context: &HirLoweringContext<'_, 'hir>,
+) -> Result<(Option<&'hir Body<'hir>>, HirSourceMap), HirLoweringError> {
+    let definition = declaration
+        .alias_def()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let refinement = definition
+        .refinement()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let mut source_map = HirSourceMapBuilder::new(
+        owner,
+        context.ast_ids,
+        context.snapshot,
+        context.root,
+        declaration.syntax(),
+    )?
+    .with_def_path_interner(context.def_paths);
+    prepare_nested_definition_ids(declaration.syntax(), &mut source_map)?;
+    let body = refinement
+        .expression()
+        .map(|predicate| -> Result<&'hir Body<'hir>, HirLoweringError> {
+            let value = lower_expr_in_prepared_owner(
+                &predicate,
+                context.arena,
+                context.symbols,
+                &mut source_map,
+            )?;
+            Ok(context.arena.alloc_body(Body {
+                owner,
+                source_id: source_map.source_id(),
+                params: &[],
+                value,
+                contracts: &[],
+                invariant_preds: context.arena.alloc_expr_refs(&[]),
+            }))
+        })
+        .transpose()?;
+    Ok((body, source_map.finish()))
 }
 
 fn lower_world_function_signature<'hir>(
@@ -166,8 +271,16 @@ fn lower_world_function_signature<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<FnSig<'hir>, HirLoweringError> {
-    let (signature, _, _) =
-        lower_function_inner(declaration, arena, symbols, source_map, false, false, true)?;
+    let (signature, _, _) = lower_function_inner(
+        declaration,
+        arena,
+        symbols,
+        source_map,
+        false,
+        false,
+        true,
+        false,
+    )?;
     Ok(signature)
 }
 
@@ -4981,6 +5094,7 @@ fn lower_function_inner<'hir>(
     lower_generics: bool,
     lower_body: bool,
     allow_nested_declaration: bool,
+    recover_interface_body: bool,
 ) -> Result<
     (
         FnSig<'hir>,
@@ -5029,7 +5143,19 @@ fn lower_function_inner<'hir>(
     } else {
         Vec::new()
     };
-    let body = lower_body.then(|| declaration.body()).flatten();
+    let body = lower_body
+        .then(|| {
+            declaration.body().or_else(|| {
+                recover_interface_body.then(|| {
+                    declaration
+                        .syntax()
+                        .children()
+                        .filter(|child| child.kind() == SyntaxKind::ERROR)
+                        .find_map(|error| error.descendants().find_map(ast::Block::cast))
+                })?
+            })
+        })
+        .flatten();
     let has_body_owner = body.is_some() || !contracts.is_empty();
 
     for param in &params {

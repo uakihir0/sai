@@ -12,15 +12,22 @@ pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
     Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
 };
-use sai_hir::item_tree::{ItemTree, ItemTreeKind, TargetFilterError, TargetFilterResult};
-use sai_hir::items::{HirOwner, ImplItemKind, ImplKind, ItemKind, OwnerNode, TraitItemKind};
+use sai_hir::item_tree::{
+    ItemTree, ItemTreeEntry, ItemTreeKind, TargetFilterError, TargetFilterResult,
+};
+use sai_hir::items::{
+    HirOwner, ImplItemKind, ImplKind, InterfaceItemKind as HirInterfaceItemKind, ItemKind,
+    OwnerNode, TraitItemKind, VariantShape,
+};
 use sai_hir::lower::{
-    ExternItemIds, HirLoweringContext, HirLoweringError, lower_alias_owner, lower_const_owner,
-    lower_distinct_owner, lower_effect_owner, lower_enum_owner, lower_extern_block_owner,
-    lower_extern_item_owner, lower_function_owner, lower_impl_item_owner, lower_impl_owner,
-    lower_interface_owner, lower_invariant_owner, lower_property_owner, lower_refined_owner,
-    lower_resource_owner, lower_struct_owner, lower_test_owner, lower_trait_item_owner,
-    lower_trait_owner, lower_world_owner,
+    ExternItemIds, HirLoweringContext, HirLoweringError, InterfaceResourceMemberIds,
+    lower_alias_owner, lower_const_owner, lower_distinct_owner, lower_effect_owner,
+    lower_enum_owner, lower_extern_block_owner, lower_extern_item_owner, lower_function_owner,
+    lower_impl_item_owner, lower_impl_owner, lower_interface_function_recovery_body,
+    lower_interface_item_owner, lower_interface_owner, lower_interface_refinement_recovery_body,
+    lower_interface_resource_member_owner, lower_invariant_owner, lower_property_owner,
+    lower_refined_owner, lower_resource_owner, lower_struct_owner, lower_test_owner,
+    lower_trait_item_owner, lower_trait_owner, lower_world_owner,
 };
 use sai_hir::patterns::{Pat as HirPat, PatKind, PatRangeEnd};
 use sai_hir::source_map::HirSourceMap;
@@ -1162,6 +1169,166 @@ impl TraitImplMemberTestOnlyResolutions {
     }
 }
 
+/// The kind of direct interface declaration checked for test-only references.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceMemberKind {
+    Struct,
+    Alias,
+    Refined,
+    Enum,
+    Resource,
+    Function,
+    ResourceMethod,
+}
+
+/// Test-only reference results for one resource method signature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceResourceMethodTestOnlyResolution {
+    interface_owner: OwnerId,
+    resource_owner: OwnerId,
+    owner: OwnerId,
+    test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+}
+
+impl InterfaceResourceMethodTestOnlyResolution {
+    pub const fn interface_owner(&self) -> OwnerId {
+        self.interface_owner
+    }
+
+    pub const fn resource_owner(&self) -> OwnerId {
+        self.resource_owner
+    }
+
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution.as_ref()
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+}
+
+/// Test-only reference results for one direct interface declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceMemberTestOnlyResolution {
+    interface_owner: OwnerId,
+    owner: OwnerId,
+    kind: InterfaceMemberKind,
+    test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
+    test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+    resource_methods_error: Option<OwnerControlFlowResolutionError>,
+    resource_methods: Vec<InterfaceResourceMethodTestOnlyResolution>,
+}
+
+impl InterfaceMemberTestOnlyResolution {
+    pub const fn interface_owner(&self) -> OwnerId {
+        self.interface_owner
+    }
+
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn kind(&self) -> InterfaceMemberKind {
+        self.kind
+    }
+
+    pub fn test_only_path_resolution(
+        &self,
+    ) -> Result<&OwnerTestOnlyPathResolution, &OwnerControlFlowResolutionError> {
+        self.test_only_path_resolution.as_ref()
+    }
+
+    pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+
+    pub fn resource_methods_error(&self) -> Option<&OwnerControlFlowResolutionError> {
+        self.resource_methods_error.as_ref()
+    }
+
+    pub fn resource_methods(&self) -> &[InterfaceResourceMethodTestOnlyResolution] {
+        &self.resource_methods
+    }
+}
+
+/// Results for the declarations of one direct interface owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceOwnerTestOnlyResolution {
+    owner: OwnerId,
+    error: Option<OwnerControlFlowResolutionError>,
+    lowering_diagnostics: Vec<Diagnostic>,
+    members: Vec<InterfaceMemberTestOnlyResolution>,
+}
+
+impl InterfaceOwnerTestOnlyResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn error(&self) -> Option<&OwnerControlFlowResolutionError> {
+        self.error.as_ref()
+    }
+
+    pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
+        &self.lowering_diagnostics
+    }
+
+    pub fn members(&self) -> &[InterfaceMemberTestOnlyResolution] {
+        &self.members
+    }
+}
+
+/// Provenance-tagged test-only diagnostics for direct interface declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceTestOnlyResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    owners: Vec<InterfaceOwnerTestOnlyResolution>,
+}
+
+impl InterfaceTestOnlyResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[InterfaceOwnerTestOnlyResolution] {
+        &self.owners
+    }
+}
+
 /// Compatibility name for the function-specific non-expression path result.
 ///
 /// The representation is now shared with other owner kinds, but callers that
@@ -1519,6 +1686,7 @@ pub enum OwnerControlFlowResolutionError {
         import: ImportIndex,
     },
     MissingRefinedTypeSyntax(OwnerId),
+    MissingInterfaceFunctionSyntax(OwnerId),
     InvalidSourceLocation(OwnerId),
     Lowering(HirLoweringError),
     Labels(LabelResolutionError),
@@ -1610,6 +1778,155 @@ fn trait_impl_member_kind(
         (TopLevelOwnerKind::Impl, ItemTreeKind::AssocFn) => Some(TraitImplMemberKind::ImplMethod),
         _ => None,
     }
+}
+
+fn interface_member_kind(kind: ItemTreeKind) -> Option<InterfaceMemberKind> {
+    match kind {
+        ItemTreeKind::Struct => Some(InterfaceMemberKind::Struct),
+        ItemTreeKind::Alias => Some(InterfaceMemberKind::Alias),
+        ItemTreeKind::Refined => Some(InterfaceMemberKind::Refined),
+        ItemTreeKind::Enum => Some(InterfaceMemberKind::Enum),
+        ItemTreeKind::Resource => Some(InterfaceMemberKind::Resource),
+        ItemTreeKind::InterfaceFn => Some(InterfaceMemberKind::Function),
+        _ => None,
+    }
+}
+
+fn collect_interface_owner_test_only_paths(
+    owner: OwnerId,
+    item_kind: InterfaceMemberKind,
+    entry: &ItemTreeEntry,
+    hir_owner: &HirOwner<'_>,
+    module_scope: &Phase1ModuleScopes,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    context: &HirLoweringContext<'_, '_>,
+) -> (
+    OwnerTestOnlyPathResolution,
+    Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+) {
+    let mut generic_parameters = owner_generic_parameters(hir_owner);
+    if item_kind == InterfaceMemberKind::Refined {
+        generic_parameters.extend(item_tree_entry_generic_parameters(entry));
+    }
+
+    let mut path_resolution = OwnerTestOnlyPathResolution {
+        owner,
+        paths: HashMap::new(),
+    };
+    let hir_diagnostics = collect_test_only_module_head_diagnostics(
+        owner,
+        &owner_test_only_path_candidates(hir_owner),
+        &generic_parameters,
+        module_scope,
+        &mut path_resolution,
+        symbols,
+        inputs,
+        snapshot,
+    );
+    let syntax_diagnostics = match item_kind {
+        InterfaceMemberKind::Refined => {
+            let syntax = inputs
+                .ast_ids
+                .pointer(entry.ast_id)
+                .and_then(|pointer| {
+                    pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
+                })
+                .ok_or(OwnerControlFlowResolutionError::MissingRefinedTypeSyntax(
+                    owner,
+                ))
+                .and_then(|syntax| {
+                    ast::TypeDecl::cast(syntax).ok_or(
+                        OwnerControlFlowResolutionError::MissingRefinedTypeSyntax(owner),
+                    )
+                });
+            syntax.and_then(|type_decl| {
+                let (body, source_map) =
+                    lower_interface_refinement_recovery_body(owner, &type_decl, context)
+                        .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                let locally_resolved_expression_heads = if let Some(body) = body {
+                    let locals =
+                        resolve_owner_locals(body, &source_map, snapshot, symbols, &HashSet::new())
+                            .map_err(OwnerControlFlowResolutionError::Locals)?;
+                    local_expression_path_head_spans(&locals, &source_map, inputs)
+                } else {
+                    HashSet::new()
+                };
+                let candidates = interface_refinement_syntax_path_candidates(
+                    &type_decl,
+                    inputs.filtered_item_tree.file,
+                    symbols,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                collect_ast_test_only_path_diagnostics(
+                    owner,
+                    &candidates,
+                    &generic_parameters,
+                    &locally_resolved_expression_heads,
+                    module_scope,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )
+            })
+        }
+        InterfaceMemberKind::Function | InterfaceMemberKind::ResourceMethod => {
+            let syntax = inputs
+                .ast_ids
+                .pointer(entry.ast_id)
+                .and_then(|pointer| {
+                    pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
+                })
+                .ok_or(OwnerControlFlowResolutionError::MissingInterfaceFunctionSyntax(owner))
+                .and_then(|syntax| {
+                    ast::FnDecl::cast(syntax).ok_or(
+                        OwnerControlFlowResolutionError::MissingInterfaceFunctionSyntax(owner),
+                    )
+                });
+            syntax.and_then(|function| {
+                let (body, source_map) =
+                    lower_interface_function_recovery_body(owner, &function, context)
+                        .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                let locally_resolved_expression_heads = if let Some(body) = body {
+                    let locals =
+                        resolve_owner_locals(body, &source_map, snapshot, symbols, &HashSet::new())
+                            .map_err(OwnerControlFlowResolutionError::Locals)?;
+                    local_expression_path_head_spans(&locals, &source_map, inputs)
+                } else {
+                    HashSet::new()
+                };
+                interface_function_recovered_syntax_path_candidates(
+                    &function,
+                    inputs.filtered_item_tree.file,
+                    symbols,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)
+                .and_then(|candidates| {
+                    collect_ast_test_only_path_diagnostics(
+                        owner,
+                        &candidates,
+                        &generic_parameters,
+                        &locally_resolved_expression_heads,
+                        module_scope,
+                        symbols,
+                        inputs,
+                        snapshot,
+                    )
+                })
+            })
+        }
+        _ => Ok(Vec::new()),
+    };
+    let diagnostics = match (hir_diagnostics, syntax_diagnostics) {
+        (Ok(mut hir), Ok(syntax)) => {
+            hir.extend(syntax);
+            sort_phase1_diagnostics(&mut hir);
+            Ok(hir)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    };
+    (path_resolution, diagnostics)
 }
 
 fn lower_top_level_owner<'hir>(
@@ -1854,6 +2171,11 @@ fn owner_test_only_path_candidates_with_body(
             ImplItemKind::Fn { sig, generics, .. } => Some((sig, generics)),
             ImplItemKind::AssocType { .. } => None,
         },
+        OwnerNode::InterfaceItem(item) => match item.kind {
+            HirInterfaceItemKind::Fn { sig, generics }
+            | HirInterfaceItemKind::ResourceMember { sig, generics, .. } => Some((sig, generics)),
+            _ => None,
+        },
         _ => return Vec::new(),
     };
     if let Some((sig, generics)) = signature {
@@ -1939,6 +2261,34 @@ fn owner_test_only_path_candidates_with_body(
         OwnerNode::ImplItem(item) => match item.kind {
             ImplItemKind::AssocType { ty } => work.push(Work::Ty(ty)),
             ImplItemKind::Fn { .. } => {}
+        },
+        OwnerNode::InterfaceItem(item) => match item.kind {
+            HirInterfaceItemKind::Struct { generics, fields } => {
+                header_generics.push(generics);
+                work.extend(fields.iter().map(|field| Work::Ty(field.ty)));
+            }
+            HirInterfaceItemKind::Alias { generics, ty } => {
+                header_generics.push(generics);
+                work.push(Work::Ty(ty));
+            }
+            HirInterfaceItemKind::Refined { base, .. } => work.push(Work::Ty(base)),
+            HirInterfaceItemKind::Enum { generics, variants } => {
+                header_generics.push(generics);
+                for variant in variants.iter() {
+                    match variant.shape {
+                        VariantShape::Unit => {}
+                        VariantShape::Tuple(types) => {
+                            work.extend(types.iter().rev().map(Work::Ty));
+                        }
+                        VariantShape::Record(fields) => {
+                            work.extend(fields.iter().rev().map(|field| Work::Ty(field.ty)));
+                        }
+                    }
+                }
+            }
+            HirInterfaceItemKind::Resource { .. }
+            | HirInterfaceItemKind::Fn { .. }
+            | HirInterfaceItemKind::ResourceMember { .. } => {}
         },
         OwnerNode::ExternItem(_) => {}
         _ => return Vec::new(),
@@ -2311,6 +2661,102 @@ fn refined_generic_syntax_path_candidates(
     Ok(paths)
 }
 
+fn interface_refinement_syntax_path_candidates(
+    type_decl: &ast::TypeDecl,
+    file: FileId,
+    symbols: &Interner,
+) -> Result<Vec<RefinedGenericSyntaxPathHead>, HirLoweringError> {
+    let definition = type_decl
+        .alias_def()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let refinement = definition
+        .refinement()
+        .ok_or(HirLoweringError::ItemTreeEntryMismatch)?;
+    let Some(expression) = refinement.expression() else {
+        return Ok(Vec::new());
+    };
+
+    syntax_path_candidates(expression.syntax(), file, symbols)
+}
+
+fn interface_function_recovered_syntax_path_candidates(
+    function: &ast::FnDecl,
+    file: FileId,
+    symbols: &Interner,
+) -> Result<Vec<RefinedGenericSyntaxPathHead>, HirLoweringError> {
+    let mut paths = Vec::new();
+    for node in function.syntax().descendants().filter(|node| {
+        matches!(
+            node.kind(),
+            sai_syntax::SyntaxKind::BLOCK
+                | sai_syntax::SyntaxKind::REQUIRES_CLAUSE
+                | sai_syntax::SyntaxKind::ENSURES_CLAUSE
+        )
+    }) {
+        paths.extend(syntax_path_candidates(&node, file, symbols)?);
+    }
+    paths.sort_by_key(|path| (path.span.range.start(), path.span.range.end()));
+    paths.dedup_by_key(|path| path.span);
+    Ok(paths)
+}
+
+fn syntax_path_candidates(
+    syntax: &sai_syntax::SyntaxNode,
+    file: FileId,
+    symbols: &Interner,
+) -> Result<Vec<RefinedGenericSyntaxPathHead>, HirLoweringError> {
+    let mut paths = Vec::new();
+    for node in syntax.descendants() {
+        if let Some(path) = ast::PathType::cast(node.clone())
+            && let Some(name) = path.segments().next().and_then(|segment| segment.name())
+            && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+        {
+            paths.push(RefinedGenericSyntaxPathHead {
+                name: symbol,
+                span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                kind: OwnerPathKind::Type,
+            });
+        }
+
+        if let Some(path) = ast::PathExpr::cast(node.clone())
+            && let Some(name) = path.name()
+            && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+        {
+            paths.push(RefinedGenericSyntaxPathHead {
+                name: symbol,
+                span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                kind: OwnerPathKind::Expression,
+            });
+        }
+
+        if let Some(effect) = ast::EffectRef::cast(node.clone())
+            && let Some(name) = effect.segments().next()
+            && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+        {
+            paths.push(RefinedGenericSyntaxPathHead {
+                name: symbol,
+                span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                kind: OwnerPathKind::Effect,
+            });
+        }
+
+        if let Some(path) = ast::ConstPath::cast(node)
+            && let Some(name) = path.segments().next()
+            && let Some(symbol) = intern_ast_name_ref(&name, symbols)?
+        {
+            paths.push(RefinedGenericSyntaxPathHead {
+                name: symbol,
+                span: sai_diagnostics::Span::new(file, name.syntax().text_range()),
+                kind: OwnerPathKind::Pattern,
+            });
+        }
+    }
+
+    paths.sort_by_key(|path| (path.span.range.start(), path.span.range.end()));
+    paths.dedup_by_key(|path| path.span);
+    Ok(paths)
+}
+
 fn intern_ast_name_ref(
     name: &ast::NameRef,
     symbols: &Interner,
@@ -2466,6 +2912,8 @@ fn collect_test_only_module_head_diagnostics(
 fn collect_refined_generic_syntax_test_only_diagnostics(
     owner: OwnerId,
     item_id: ast::ErasedAstId,
+    hir_owner: &HirOwner<'_>,
+    source_map: &HirSourceMap,
     generic_parameters: &HashSet<Symbol>,
     module_scope: &Phase1ModuleScopes,
     symbols: &Interner,
@@ -2485,9 +2933,65 @@ fn collect_refined_generic_syntax_test_only_diagnostics(
     let candidates =
         refined_generic_syntax_path_candidates(&type_decl, inputs.filtered_item_tree.file, symbols)
             .map_err(OwnerControlFlowResolutionError::Lowering)?;
+    let locally_resolved_expression_heads = if let Some(body) = hir_owner.body {
+        let locals = resolve_owner_locals(body, source_map, snapshot, symbols, &HashSet::new())
+            .map_err(OwnerControlFlowResolutionError::Locals)?;
+        local_expression_path_head_spans(&locals, source_map, inputs)
+    } else {
+        HashSet::new()
+    };
 
+    collect_ast_test_only_path_diagnostics(
+        owner,
+        &candidates,
+        generic_parameters,
+        &locally_resolved_expression_heads,
+        module_scope,
+        symbols,
+        inputs,
+        snapshot,
+    )
+}
+
+fn local_expression_path_head_spans(
+    locals: &LocalResolution,
+    source_map: &HirSourceMap,
+    inputs: &CurrentOwnerInputs,
+) -> HashSet<sai_diagnostics::Span> {
+    locals
+        .paths
+        .iter()
+        .filter_map(|(hir_id, resolution)| {
+            matches!(resolution.base, Res::Local(_)).then_some(())?;
+            let pointer = source_map.syntax_for_node(*hir_id)?;
+            let syntax = pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)?;
+            let path = ast::PathExpr::cast(syntax)?;
+            let name = path.name()?;
+            Some(sai_diagnostics::Span::new(
+                inputs.filtered_item_tree.file,
+                name.syntax().text_range(),
+            ))
+        })
+        .collect()
+}
+
+fn collect_ast_test_only_path_diagnostics(
+    owner: OwnerId,
+    candidates: &[RefinedGenericSyntaxPathHead],
+    generic_parameters: &HashSet<Symbol>,
+    locally_resolved_expression_heads: &HashSet<sai_diagnostics::Span>,
+    module_scope: &Phase1ModuleScopes,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
     let mut diagnostics = Vec::new();
     for candidate in candidates {
+        if candidate.kind == OwnerPathKind::Expression
+            && locally_resolved_expression_heads.contains(&candidate.span)
+        {
+            continue;
+        }
         if matches!(
             candidate.kind,
             OwnerPathKind::Type | OwnerPathKind::Expression | OwnerPathKind::Pattern
@@ -2665,6 +3169,16 @@ fn owner_generic_parameters(owner: &HirOwner<'_>) -> HashSet<Symbol> {
             ImplItemKind::Fn { generics, .. } => generics,
             ImplItemKind::AssocType { .. } => return HashSet::new(),
         },
+        OwnerNode::InterfaceItem(item) => match item.kind {
+            HirInterfaceItemKind::Struct { generics, .. }
+            | HirInterfaceItemKind::Alias { generics, .. }
+            | HirInterfaceItemKind::Enum { generics, .. }
+            | HirInterfaceItemKind::Fn { generics, .. }
+            | HirInterfaceItemKind::ResourceMember { generics, .. } => generics,
+            HirInterfaceItemKind::Refined { .. } | HirInterfaceItemKind::Resource { .. } => {
+                return HashSet::new();
+            }
+        },
         _ => return HashSet::new(),
     };
     generics
@@ -2683,8 +3197,14 @@ fn item_tree_generic_parameters(
         .items
         .iter()
         .find(|entry| entry.ast_id == item_id)
-        .into_iter()
-        .flat_map(|entry| entry.children.iter())
+        .map(item_tree_entry_generic_parameters)
+        .unwrap_or_default()
+}
+
+fn item_tree_entry_generic_parameters(entry: &ItemTreeEntry) -> HashSet<Symbol> {
+    entry
+        .children
+        .iter()
         .filter(|entry| {
             matches!(
                 entry.kind,
@@ -5183,6 +5703,8 @@ impl RootDatabase {
                             collect_refined_generic_syntax_test_only_diagnostics(
                                 descriptor.owner,
                                 descriptor.item_id,
+                                &hir_owner,
+                                &source_map,
                                 &generic_parameters,
                                 module_scope,
                                 &self.symbols,
@@ -6137,6 +6659,365 @@ impl RootDatabase {
         }
 
         Ok(TraitImplMemberTestOnlyResolutions {
+            snapshot_id: snapshot.id(),
+            target_cfg: collection.target_cfg.clone(),
+            collection_input_fingerprint: collection.input_fingerprint,
+            owners,
+        })
+    }
+
+    /// Diagnoses test-only references in direct interface declarations.
+    ///
+    /// The adapter checks nested type paths and signature heads in the
+    /// interface's target-filtered child owners. Resource methods are lowered
+    /// through their resource owner and keep a separate result channel.
+    pub fn resolve_interface_test_only_paths(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<InterfaceTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+
+        let descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
+            .collect::<Vec<_>>();
+        let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let mut owners = Vec::with_capacity(descriptors.len());
+
+        for descriptor in descriptors {
+            let inputs = match self.current_owner_inputs(
+                snapshot,
+                descriptor.file,
+                &collection.target_cfg,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    owners.push(InterfaceOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        error: Some(error),
+                        lowering_diagnostics: Vec::new(),
+                        members: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+
+            let analysis: Result<
+                (Vec<InterfaceMemberTestOnlyResolution>, Vec<Diagnostic>),
+                OwnerControlFlowResolutionError,
+            > = (|| {
+                let parent_descriptor = find_top_level_owner_descriptor(
+                    &top_level_owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    TopLevelOwnerKind::Interface,
+                )?;
+                if inputs.retained_item_kinds.get(&descriptor.item_id)
+                    != Some(&ItemTreeKind::Interface)
+                {
+                    return Err(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                }
+                let parent_entry = inputs
+                    .filtered_item_tree
+                    .items
+                    .iter()
+                    .find(|entry| {
+                        entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Interface
+                    })
+                    .ok_or(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    )?;
+                let member_entries = parent_entry
+                    .children
+                    .iter()
+                    .filter(|entry| interface_member_kind(entry.kind).is_some())
+                    .collect::<Vec<_>>();
+
+                let def_paths = self
+                    .def_paths
+                    .get(&descriptor.owner.def_id.package())
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let expected_parent_path = def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let arena = HirArena::new();
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.parsed.root,
+                    &arena,
+                    &self.symbols,
+                    def_paths,
+                );
+                let (parent_hir, _) = lower_top_level_owner(
+                    parent_descriptor,
+                    &expected_parent_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )?;
+                let parent_members = match parent_hir.node {
+                    OwnerNode::Item(item) => match item.kind {
+                        ItemKind::Interface { items } => items,
+                        _ => {
+                            return Err(
+                                OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                                    owner: descriptor.owner,
+                                    file: descriptor.file,
+                                    descriptor: TopLevelOwnerKind::Interface,
+                                    current: ItemTreeKind::Interface,
+                                },
+                            );
+                        }
+                    },
+                    _ => {
+                        return Err(
+                            OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                            },
+                        );
+                    }
+                };
+                if member_entries.len() != parent_members.len() {
+                    return Err(OwnerControlFlowResolutionError::Lowering(
+                        HirLoweringError::ItemTreeEntryMismatch,
+                    ));
+                }
+
+                let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let mut members = Vec::with_capacity(member_entries.len());
+                for (entry, member_owner) in member_entries
+                    .into_iter()
+                    .zip(parent_members.iter().copied())
+                {
+                    let kind = interface_member_kind(entry.kind).ok_or(
+                        OwnerControlFlowResolutionError::Lowering(
+                            HirLoweringError::ItemTreeEntryMismatch,
+                        ),
+                    )?;
+                    let mut lowering_diagnostics = Vec::new();
+                    let member_result: Result<
+                        (
+                            OwnerTestOnlyPathResolution,
+                            Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+                            Vec<InterfaceResourceMethodTestOnlyResolution>,
+                            Option<OwnerControlFlowResolutionError>,
+                        ),
+                        OwnerControlFlowResolutionError,
+                    > = (|| {
+                        let expected_member_path = def_paths
+                            .resolve_def_id(member_owner.def_id.to_def_id())
+                            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                                member_owner,
+                            ))?;
+                        let (member_hir, _) = lower_interface_item_owner(
+                            member_owner,
+                            &expected_member_path,
+                            &parent_hir,
+                            descriptor.item_id,
+                            entry.ast_id,
+                            &inputs.filtered_item_tree,
+                            &context,
+                        )
+                        .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                        lowering_diagnostics.extend(member_hir.diagnostics.iter().cloned());
+                        let (path_resolution, diagnostics) =
+                            collect_interface_owner_test_only_paths(
+                                member_owner,
+                                kind,
+                                entry,
+                                &member_hir,
+                                module_scope,
+                                &self.symbols,
+                                &inputs,
+                                snapshot,
+                                &context,
+                            );
+
+                        let mut resource_methods = Vec::new();
+                        let mut resource_methods_error = None;
+                        if kind == InterfaceMemberKind::Resource {
+                            let resource_members = match member_hir.node {
+                                OwnerNode::InterfaceItem(item) => match item.kind {
+                                    HirInterfaceItemKind::Resource { members } => members,
+                                    _ => {
+                                        return Err(OwnerControlFlowResolutionError::Lowering(
+                                            HirLoweringError::ItemTreeEntryMismatch,
+                                        ));
+                                    }
+                                },
+                                _ => {
+                                    return Err(OwnerControlFlowResolutionError::Lowering(
+                                        HirLoweringError::ItemTreeEntryMismatch,
+                                    ));
+                                }
+                            };
+                            let method_entries = entry
+                                .children
+                                .iter()
+                                .filter(|child| child.kind == ItemTreeKind::AssocFn)
+                                .collect::<Vec<_>>();
+                            if method_entries.len() != resource_members.len() {
+                                resource_methods_error =
+                                    Some(OwnerControlFlowResolutionError::Lowering(
+                                        HirLoweringError::ItemTreeEntryMismatch,
+                                    ));
+                            } else {
+                                for (method_entry, method_owner) in method_entries
+                                    .into_iter()
+                                    .zip(resource_members.iter().copied())
+                                {
+                                    let mut method_lowering_diagnostics = Vec::new();
+                                    let method_result: Result<
+                                        (
+                                            OwnerTestOnlyPathResolution,
+                                            Result<
+                                                Vec<Diagnostic>,
+                                                OwnerControlFlowResolutionError,
+                                            >,
+                                        ),
+                                        OwnerControlFlowResolutionError,
+                                    > = (|| {
+                                        let expected_method_path = def_paths
+                                            .resolve_def_id(method_owner.def_id.to_def_id())
+                                            .map_err(
+                                                OwnerControlFlowResolutionError::DefPathInterner,
+                                            )?
+                                            .ok_or(
+                                                OwnerControlFlowResolutionError::MissingDefPath(
+                                                    method_owner,
+                                                ),
+                                            )?;
+                                        let (method_hir, _) =
+                                            lower_interface_resource_member_owner(
+                                                method_owner,
+                                                &expected_method_path,
+                                                &parent_hir,
+                                                &member_hir,
+                                                InterfaceResourceMemberIds {
+                                                    interface: descriptor.item_id,
+                                                    resource: entry.ast_id,
+                                                    member: method_entry.ast_id,
+                                                },
+                                                &inputs.filtered_item_tree,
+                                                &context,
+                                            )
+                                            .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                                        method_lowering_diagnostics
+                                            .extend(method_hir.diagnostics.iter().cloned());
+                                        Ok(collect_interface_owner_test_only_paths(
+                                            method_owner,
+                                            InterfaceMemberKind::ResourceMethod,
+                                            method_entry,
+                                            &method_hir,
+                                            module_scope,
+                                            &self.symbols,
+                                            &inputs,
+                                            snapshot,
+                                            &context,
+                                        ))
+                                    })();
+                                    let (path_resolution, test_only_diagnostics) =
+                                        match method_result {
+                                            Ok((path_resolution, diagnostics)) => {
+                                                (Ok(path_resolution), diagnostics)
+                                            }
+                                            Err(error) => (Err(error.clone()), Err(error)),
+                                        };
+                                    resource_methods.push(
+                                        InterfaceResourceMethodTestOnlyResolution {
+                                            interface_owner: descriptor.owner,
+                                            resource_owner: member_owner,
+                                            owner: method_owner,
+                                            test_only_path_resolution: path_resolution,
+                                            test_only_diagnostics,
+                                            lowering_diagnostics: method_lowering_diagnostics,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        Ok((
+                            path_resolution,
+                            diagnostics,
+                            resource_methods,
+                            resource_methods_error,
+                        ))
+                    })();
+
+                    let (
+                        test_only_path_resolution,
+                        test_only_diagnostics,
+                        resource_methods,
+                        resource_methods_error,
+                    ) = match member_result {
+                        Ok((path_resolution, diagnostics, methods, methods_error)) => {
+                            (Ok(path_resolution), diagnostics, methods, methods_error)
+                        }
+                        Err(error) => (Err(error.clone()), Err(error), Vec::new(), None),
+                    };
+                    members.push(InterfaceMemberTestOnlyResolution {
+                        interface_owner: descriptor.owner,
+                        owner: member_owner,
+                        kind,
+                        test_only_path_resolution,
+                        test_only_diagnostics,
+                        lowering_diagnostics,
+                        resource_methods_error,
+                        resource_methods,
+                    });
+                }
+
+                Ok((members, parent_hir.diagnostics.to_vec()))
+            })();
+
+            match analysis {
+                Ok((members, lowering_diagnostics)) => {
+                    owners.push(InterfaceOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        error: None,
+                        lowering_diagnostics,
+                        members,
+                    });
+                }
+                Err(error) => {
+                    owners.push(InterfaceOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        error: Some(error),
+                        lowering_diagnostics: Vec::new(),
+                        members: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        Ok(InterfaceTestOnlyResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
@@ -11572,6 +12453,657 @@ mod tests {
             isolated.owners()[1].members()[0]
                 .test_only_diagnostics()
                 .expect("child member remains available")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn interface_test_only_paths_cover_direct_members_and_resource_methods() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures as fs\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "interface api {\n",
+            "  type Record<T: fixture.RecordBound> { direct: Fixture, nested: Box<fixture.FieldType>, callback: fn() effects { fs.read, fixture.field_effect } }\n",
+            "  type Alias<T: fixture.AliasBound> = Box<fixture.AliasType>\n",
+            "  enum Choice<T: fixture.EnumBound> { Item(T, fixture.VariantType) }\n",
+            "  type Shadow<Fixture> = Fixture\n",
+            "  fn call(value: Fixture) -> fixture.Returned\n",
+            "  resource File { fn read(value: Fixture) -> fixture.ResourceReturned }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only interface imports collect");
+        let results = database
+            .resolve_interface_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("interface test-only paths resolve");
+        assert!(results.matches_collection(&collection));
+        assert_eq!(results.owners().len(), 1);
+        let interface = &results.owners()[0];
+        assert!(interface.error().is_none());
+        assert_eq!(
+            interface
+                .members()
+                .iter()
+                .map(InterfaceMemberTestOnlyResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                InterfaceMemberKind::Struct,
+                InterfaceMemberKind::Alias,
+                InterfaceMemberKind::Enum,
+                InterfaceMemberKind::Alias,
+                InterfaceMemberKind::Function,
+                InterfaceMemberKind::Resource,
+            ]
+        );
+        assert_eq!(interface.members()[5].resource_methods().len(), 1);
+        assert_eq!(
+            interface.members()[5].resource_methods()[0].resource_owner(),
+            interface.members()[5].owner()
+        );
+
+        let mut actual = Vec::new();
+        for member in interface.members() {
+            actual.extend(
+                member
+                    .test_only_diagnostics()
+                    .expect("interface member diagnostics succeed")
+                    .iter()
+                    .map(|diagnostic| {
+                        let primary = diagnostic
+                            .primary()
+                            .expect("test-only reference has a primary span");
+                        assert_eq!(primary.span.file, module_tree.modules[0].file);
+                        primary.span.clone()
+                    }),
+            );
+            for method in member.resource_methods() {
+                actual.extend(
+                    method
+                        .test_only_diagnostics()
+                        .expect("resource method diagnostics succeed")
+                        .iter()
+                        .map(|diagnostic| {
+                            let primary = diagnostic
+                                .primary()
+                                .expect("test-only reference has a primary span");
+                            assert_eq!(primary.span.file, module_tree.modules[0].file);
+                            primary.span.clone()
+                        }),
+                );
+            }
+        }
+        let span_for = |needle: &str, prefix: &str, occurrence: usize| {
+            let start = root
+                .match_indices(needle)
+                .nth(occurrence)
+                .expect("diagnostic source fragment exists")
+                .0
+                + needle
+                    .find(prefix)
+                    .expect("prefix occurs in source fragment");
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + prefix.len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        assert_eq!(
+            actual,
+            [
+                span_for("fixture.RecordBound", "fixture", 0),
+                span_for("direct: Fixture", "Fixture", 0),
+                span_for("fixture.FieldType", "fixture", 0),
+                span_for("fixture.field_effect", "fixture", 0),
+                span_for("fixture.AliasBound", "fixture", 0),
+                span_for("fixture.AliasType", "fixture", 0),
+                span_for("fixture.EnumBound", "fixture", 0),
+                span_for("fixture.VariantType", "fixture", 0),
+                span_for("value: Fixture", "Fixture", 0),
+                span_for("fixture.Returned", "fixture", 0),
+                span_for("value: Fixture", "Fixture", 1),
+                span_for("fixture.ResourceReturned", "fixture", 0),
+            ],
+            "field, nested type, variant, function, and resource signatures use their exact heads"
+        );
+        let first_test_only_diagnostic = interface.members()[0]
+            .test_only_diagnostics()
+            .expect("record diagnostics succeed")
+            .first()
+            .expect("record has test-only type references");
+        assert_eq!(
+            first_test_only_diagnostic.code,
+            sai_diagnostics::Code::TestDependencyOutsideTest
+        );
+        let package_path_start = root
+            .find("acme:test-support/fixtures")
+            .expect("test-only package path exists");
+        let expected_package_path = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(package_path_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (package_path_start + "acme:test-support/fixtures".len()) as u32,
+                ),
+            )
+            .expect("package path range is ordered"),
+        );
+        assert!(
+            first_test_only_diagnostic
+                .related()
+                .iter()
+                .any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. } if location.span == expected_package_path
+                ))
+        );
+        assert!(
+            interface.members()[0]
+                .test_only_diagnostics()
+                .expect("record diagnostics succeed")
+                .iter()
+                .all(
+                    |diagnostic| diagnostic.primary().is_some_and(|primary| root.get(
+                        primary.span.range.start().to_usize()..primary.span.range.end().to_usize()
+                    ) != Some("fs"))
+                ),
+            "the built-in `fs` effect root retains precedence over a same-named import"
+        );
+        assert!(
+            interface.members()[3]
+                .test_only_diagnostics()
+                .expect("generic shadow diagnostics succeed")
+                .is_empty(),
+            "the interface type's generic shadows the same-named module import in its type paths"
+        );
+        for member in interface.members() {
+            let path_resolution = member
+                .test_only_path_resolution()
+                .expect("interface path resolution succeeds");
+            assert!(
+                path_resolution
+                    .paths()
+                    .values()
+                    .all(|path| path.base == Res::Err),
+                "rejected interface type and effect paths become error sentinels"
+            );
+        }
+        assert!(
+            interface.members()[5].resource_methods()[0]
+                .test_only_path_resolution()
+                .expect("resource method path resolution succeeds")
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err)
+        );
+    }
+
+    #[test]
+    fn interface_refinement_predicate_diagnostics_are_ast_only() {
+        let root = concat!(
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "use acme:test-support/fixtures as fixture\n",
+            "interface api {\n",
+            "  type Positive = I32 where {\n",
+            "    let fixture = true\n",
+            "    fixture\n",
+            "    match true { Fixture.Ready => Fixture.allowed }\n",
+            "  }\n",
+            "  type Shadow<Fixture> = I32 where { Fixture.allowed }\n",
+            "  type Unshadowed = I32 where { fixture.allowed }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only interface imports collect");
+        let results = database
+            .resolve_interface_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("interface refinement paths diagnose");
+        let member = &results.owners()[0].members()[0];
+        assert_eq!(member.kind(), InterfaceMemberKind::Refined);
+        assert!(
+            member
+                .test_only_path_resolution()
+                .expect("HIR path results succeed")
+                .paths()
+                .is_empty(),
+            "the refinement predicate has no HIR path IDs and must not receive fabricated results"
+        );
+        let diagnostics = member
+            .test_only_diagnostics()
+            .expect("AST-only refinement diagnostics succeed");
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "pattern and expression heads are checked while a local shadows the imported alias"
+        );
+        let span_for = |needle: &str| {
+            let start = root.find(needle).expect("predicate reference exists");
+            sai_diagnostics::Span::new(
+                module_tree.modules[0].file,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + "Fixture".len()) as u32),
+                )
+                .expect("reference range is ordered"),
+            )
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic
+                    .primary()
+                    .expect("test-only diagnostic has a primary span")
+                    .span
+                    .clone())
+                .collect::<Vec<_>>(),
+            [span_for("Fixture.Ready"), span_for("Fixture.allowed")]
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::TestDependencyOutsideTest
+            }),
+            "AST-only paths use the standard test-dependency diagnostic"
+        );
+        let use_start = root
+            .find("acme:test-support/fixtures")
+            .expect("test-only package path exists");
+        let expected_package_path = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(use_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (use_start + "acme:test-support/fixtures".len()) as u32,
+                ),
+            )
+            .expect("package path range is ordered"),
+        );
+        assert!(diagnostics[0].related().iter().any(|related| matches!(
+            related,
+            Related::DeclaredHere { location, .. } if location.span == expected_package_path
+        )));
+        assert!(
+            results.owners()[0].members()[1]
+                .test_only_diagnostics()
+                .expect("nested refined generic diagnostics succeed")
+                .is_empty(),
+            "nested refined type parameters shadow same-named imported module aliases"
+        );
+        assert_eq!(
+            results.owners()[0].members()[2]
+                .test_only_diagnostics()
+                .expect("unshadowed refined expression diagnostics succeed")
+                .len(),
+            1,
+            "an unshadowed module alias in a refinement predicate still diagnoses"
+        );
+    }
+
+    #[test]
+    fn interface_function_recovered_bodies_and_contracts_diagnose_ast_only_paths() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "interface api {\n",
+            "  fn call(value: Bool) -> Bool\n",
+            "    requires fixture.precondition\n",
+            "    ensures fixture.postcondition\n",
+            "    { match value { fixture.Ready => fixture.body_result } }\n",
+            "  resource File {\n",
+            "    fn read() requires fixture.resource_contract { fixture.resource_body }\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses with recoverable interface errors");
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::InterfaceFnClause })
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::InterfaceFnBody })
+        );
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only interface imports collect");
+        let results = database
+            .resolve_interface_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("recovered interface function syntax is scanned");
+        let function = &results.owners()[0].members()[0];
+        assert_eq!(function.kind(), InterfaceMemberKind::Function);
+        assert!(
+            function
+                .test_only_path_resolution()
+                .expect("HIR signature resolution succeeds")
+                .paths()
+                .is_empty(),
+            "recovered body and contract paths do not fabricate HIR results"
+        );
+        let diagnostics = function
+            .test_only_diagnostics()
+            .expect("AST-only body and contract diagnostics succeed");
+        assert_eq!(diagnostics.len(), 4);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic
+                    .primary()
+                    .expect("test-only diagnostic has a primary span")
+                    .span
+                    .clone())
+                .collect::<Vec<_>>(),
+            [
+                "fixture.precondition",
+                "fixture.postcondition",
+                "fixture.Ready",
+                "fixture.body_result",
+            ]
+            .map(|needle| {
+                let start = root.find(needle).expect("expected recovered path exists");
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(start as u32),
+                        sai_diagnostics::TextSize::new((start + "fixture".len()) as u32),
+                    )
+                    .expect("reference range is ordered"),
+                )
+            })
+        );
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::TestDependencyOutsideTest
+        }));
+        let use_start = root
+            .find("acme:test-support/fixtures")
+            .expect("test-only package path exists");
+        let expected_package_path = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(use_start as u32),
+                sai_diagnostics::TextSize::new(
+                    (use_start + "acme:test-support/fixtures".len()) as u32,
+                ),
+            )
+            .expect("package path range is ordered"),
+        );
+        assert!(diagnostics[0].related().iter().any(|related| matches!(
+            related,
+            Related::DeclaredHere { location, .. } if location.span == expected_package_path
+        )));
+        let method = &results.owners()[0].members()[1].resource_methods()[0];
+        assert!(
+            method
+                .test_only_path_resolution()
+                .expect("resource method HIR signature resolution succeeds")
+                .paths()
+                .is_empty(),
+            "recovered resource method paths do not fabricate HIR results"
+        );
+        let method_diagnostics = method
+            .test_only_diagnostics()
+            .expect("AST-only resource method diagnostics succeed");
+        assert_eq!(method_diagnostics.len(), 2);
+        assert_eq!(
+            method_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic
+                    .primary()
+                    .expect("resource method diagnostic has a primary span")
+                    .span
+                    .clone())
+                .collect::<Vec<_>>(),
+            ["fixture.resource_contract", "fixture.resource_body"].map(|needle| {
+                let start = root.find(needle).expect("expected resource path exists");
+                sai_diagnostics::Span::new(
+                    module_tree.modules[0].file,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(start as u32),
+                        sai_diagnostics::TextSize::new((start + "fixture".len()) as u32),
+                    )
+                    .expect("reference range is ordered"),
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn interface_recovered_expression_paths_respect_parameters_and_block_locals() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "interface api {\n",
+            "  fn parameter_shadow(fixture: Bool) -> Bool\n",
+            "    requires fixture.precondition { fixture.body_result }\n",
+            "  fn local_shadow(value: Bool) -> Bool\n",
+            "    { let fixture = value; fixture.body_result }\n",
+            "  resource File {\n",
+            "    fn parameter_shadow(fixture: Bool) -> Bool\n",
+            "      requires fixture.resource_precondition { fixture.resource_body }\n",
+            "    fn local_shadow(value: Bool) -> Bool\n",
+            "      { let fixture = value; fixture.resource_local }\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses with recoverable interface errors");
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::InterfaceFnClause })
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::InterfaceFnBody })
+        );
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only interface imports collect");
+        let results = database
+            .resolve_interface_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("recovered interface function locals resolve");
+        let members = results.owners()[0].members();
+        assert_eq!(members.len(), 3);
+        for function in &members[..2] {
+            assert!(
+                function
+                    .test_only_diagnostics()
+                    .expect("function local-shadow diagnostics succeed")
+                    .is_empty(),
+                "parameters and prior block locals shadow the imported alias"
+            );
+        }
+        assert_eq!(members[2].resource_methods().len(), 2);
+        for method in members[2].resource_methods() {
+            assert!(
+                method
+                    .test_only_diagnostics()
+                    .expect("resource method local-shadow diagnostics succeed")
+                    .is_empty(),
+                "resource method parameters and block locals shadow the imported alias"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_test_only_paths_use_file_scopes_and_isolate_failures() {
+        let root = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "use acme:test-support/fixtures.{Fixture}\n",
+            "interface root_api {\n",
+            "  type Bad = fixture.RootType\n",
+            "  type Good = Fixture\n",
+            "}\n",
+        );
+        let child = concat!(
+            "use acme:test-support/fixtures as fixture\n",
+            "interface child_api { type Child = fixture.ChildType }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = Arc::<[u8]>::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              requires test { acme:test-support @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &[],
+            )
+            .expect("test-only interface imports collect in each file");
+        let mut broken_collection = collection.clone();
+        let root_scope = &mut broken_collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let fixture_symbol = root_scope
+            .scope
+            .keys()
+            .copied()
+            .find(|symbol| {
+                database
+                    .resolve_symbol(*symbol)
+                    .is_ok_and(|name| name.as_ref() == "fixture")
+            })
+            .expect("root interface module alias exists");
+        let fixture_import = match root_scope
+            .scope
+            .get(&fixture_symbol)
+            .expect("module alias binding exists")
+            .origin
+        {
+            BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => import,
+            BindingOrigin::Decl => panic!("fixture alias comes from a use"),
+        };
+        root_scope.imports[fixture_import.0 as usize].use_ast_id = ast::ErasedAstId::new(u32::MAX);
+
+        let results = database
+            .resolve_interface_test_only_paths(&broken_collection, &module_tree, &snapshot)
+            .expect("interface path failures remain isolated by child owner");
+        assert_eq!(results.owners().len(), 2);
+        assert!(results.owners().iter().all(|owner| owner.error().is_none()));
+        assert!(
+            results.owners()[0].members()[0]
+                .test_only_diagnostics()
+                .is_err(),
+            "the broken import note is isolated to the child that uses it"
+        );
+        assert_eq!(
+            results.owners()[0].members()[1]
+                .test_only_diagnostics()
+                .expect("sibling member diagnostics succeed")
+                .len(),
+            1,
+            "the sibling continues through its valid item import"
+        );
+        assert_eq!(
+            results.owners()[1].members()[0]
+                .test_only_diagnostics()
+                .expect("child module diagnostics succeed")
+                .len(),
+            1,
+            "the other interface uses its own source file module scope"
+        );
+
+        let mut broken_parent = collection.clone();
+        let first_owner = results.owners()[0].owner();
+        let descriptor_index = broken_parent
+            .scopes
+            .top_level_owners
+            .iter()
+            .position(|descriptor| descriptor.owner == first_owner)
+            .expect("root interface descriptor exists");
+        broken_parent.scopes.top_level_owners[descriptor_index].item_id =
+            ast::ErasedAstId::new(u32::MAX);
+        let isolated = database
+            .resolve_interface_test_only_paths(&broken_parent, &module_tree, &snapshot)
+            .expect("a bad interface descriptor does not stop other interfaces");
+        assert!(isolated.owners()[0].error().is_some());
+        assert!(isolated.owners()[0].members().is_empty());
+        assert!(isolated.owners()[1].error().is_none());
+        assert_eq!(
+            isolated.owners()[1].members()[0]
+                .test_only_diagnostics()
+                .expect("other interface remains available")
                 .len(),
             1
         );
