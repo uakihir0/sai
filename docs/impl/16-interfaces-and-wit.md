@@ -872,6 +872,8 @@ For each bound resource `R ↦ C`:
 
 Functions exposed through an exported interface need an `effects` clause, which [08](08-effect-and-capability-analysis.md) checks (`MISSING_EFFECTS_DECLARATION`).
 
+**Implementation progress (IR-624A).** Matched interface-impl functions now reject generic parameter lists and `where` clauses with `GENERIC_INTERFACE_ITEM` at each exact clause span. The collector records that such a function pair is ineligible for signature comparison. This implements the first independent §16.7.2 check; normalized signature comparison and resource-member conformance remain.
+
 ### 16.7.3 Resource bindings
 
 For `type R = C` in an impl of an interface that declares the resource `R`, these are `INVALID_RESOURCE_BINDING` (spec/13 §13.3.3) at `C`, checked in this order:
