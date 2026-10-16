@@ -372,6 +372,14 @@ predicate/expression channels keep their existing behavior. Regressions cover
 transitive public, foreign private, and missing members for both adapter
 families; diagnostic mapping remains separate.
 
+**Extern-function type paths over validated source closures (IR-567).**
+Extern signatures and contract/body type paths use the same validated
+active-source closure as function, const, and predicate owners. The closure
+fingerprint is retained in the shared predicate-owner result; the package-local
+entry point and expression/predicate channels remain unchanged. A bodyless
+extern signature regression covers transitive public lookup, foreign private
+and missing member errors, closure provenance, and collection mismatch.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
