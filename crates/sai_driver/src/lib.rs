@@ -1727,6 +1727,7 @@ pub struct WorldItemTestOnlyResolution {
     owner: OwnerId,
     kind: WorldItemTestOnlyKind,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -1751,6 +1752,20 @@ impl WorldItemTestOnlyResolution {
         self.type_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns snapshot-bound diagnostics for inaccessible or missing
+    /// members in this world function's signature when analyzed with a
+    /// validated active-source closure.
+    ///
+    /// Package-local adapters leave this channel absent so callers can map
+    /// typed path failures with their own snapshot context.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn test_only_path_resolution(
@@ -9843,6 +9858,7 @@ impl RootDatabase {
                                 owner: item_owner,
                                 kind,
                                 type_path_resolution,
+                                module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Ok(path_resolution),
                                 test_only_diagnostics: Ok(diagnostics),
                                 lowering_diagnostics: item_lowering_diagnostics,
@@ -9854,6 +9870,7 @@ impl RootDatabase {
                                 owner: item_owner,
                                 kind,
                                 type_path_resolution,
+                                module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error),
                                 lowering_diagnostics: item_lowering_diagnostics,
@@ -9865,12 +9882,34 @@ impl RootDatabase {
             })();
 
             match analysis {
-                Ok(items) => owners.push(WorldOwnerTestOnlyResolution {
-                    owner: descriptor.owner,
-                    error: None,
-                    lowering_diagnostics,
-                    items,
-                }),
+                Ok(mut items) => {
+                    if let Some(member_scopes) = member_scopes {
+                        for item in &mut items {
+                            item.module_path_diagnostics = match item.type_path_resolution.as_ref()
+                            {
+                                Ok(Some(path_resolution)) => self
+                                    .type_owner_module_path_diagnostics(
+                                        item.owner,
+                                        path_resolution,
+                                        &inputs,
+                                        Some(&module_members),
+                                        snapshot,
+                                        &collection.target_cfg,
+                                        Some(member_scopes),
+                                    )
+                                    .map(Some),
+                                Ok(None) => Ok(Some(Vec::new())),
+                                Err(error) => Err(error.clone()),
+                            };
+                        }
+                    }
+                    owners.push(WorldOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        error: None,
+                        lowering_diagnostics,
+                        items,
+                    });
+                }
                 Err(error) => owners.push(WorldOwnerTestOnlyResolution {
                     owner: descriptor.owner,
                     error: Some(error),
@@ -23553,6 +23592,14 @@ mod tests {
                 &world_source_text[method_line_start..method_line_end],
                 method_line_start,
             );
+            assert_type_member_diagnostics(
+                foreign_world.items()[item_index]
+                    .module_path_diagnostics()
+                    .expect("world function member diagnostics resolve")
+                    .expect("the closure-aware world adapter maps type failures"),
+                &world_source_text[method_line_start..method_line_end],
+                method_line_start,
+            );
         }
         for item in &foreign_world.items()[2..] {
             assert!(
@@ -23561,7 +23608,29 @@ mod tests {
                     .is_none(),
                 "module, interface, and include references stay in the world namespace"
             );
+            assert!(
+                item.module_path_diagnostics()
+                    .expect("world reference diagnostic channel remains healthy")
+                    .expect("closure-aware world diagnostics are available")
+                    .is_empty(),
+                "module, interface, and include references have no type member diagnostics"
+            );
         }
+        let package_local_worlds = database
+            .resolve_world_test_only_paths(&root_collection, &root_tree, &snapshot)
+            .expect("package-local world results remain available");
+        assert!(
+            package_local_worlds
+                .owners()
+                .iter()
+                .flat_map(WorldOwnerTestOnlyResolution::items)
+                .all(|item| {
+                    item.module_path_diagnostics()
+                        .expect("package-local world diagnostic channel remains healthy")
+                        .is_none()
+                }),
+            "package-local world calls leave mapped type diagnostics absent"
+        );
 
         let changed_graph = PackageGraph::new(
             Version::parse("1.8.3").expect("changed toolchain version is valid"),

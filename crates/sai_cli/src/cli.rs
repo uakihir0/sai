@@ -4465,6 +4465,14 @@ fn module_tree_workspace_check_diagnostics(
                         &member_scopes,
                     )
                     .map_err(|error| format!("interface member analysis failed: {error:?}"))?;
+                let world_resolutions = database
+                    .resolve_world_test_only_paths_with_member_scopes(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                    )
+                    .map_err(|error| format!("world item analysis failed: {error:?}"))?;
                 let mut owner_diagnostics = Vec::new();
                 for owner in resolutions.owners() {
                     match owner.module_path_diagnostics() {
@@ -4654,6 +4662,39 @@ fn module_tree_workspace_check_diagnostics(
                                     ));
                                     errors = errors.saturating_add(1);
                                 }
+                            }
+                        }
+                    }
+                }
+                for owner in world_resolutions.owners() {
+                    if let Some(error) = owner.error() {
+                        diagnostics.push(check_diagnostic_with_package(
+                            check_internal_diagnostic(
+                                &format!("world owner analysis failed: {error:?}"),
+                                None,
+                            ),
+                            Some(&input.package_identity),
+                        ));
+                        errors = errors.saturating_add(1);
+                        continue;
+                    }
+                    for item in owner.items() {
+                        match item.module_path_diagnostics() {
+                            Ok(Some(diagnostics_for_item)) => {
+                                owner_diagnostics.extend(diagnostics_for_item.iter().cloned())
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                diagnostics.push(check_diagnostic_with_package(
+                                    check_internal_diagnostic(
+                                        &format!(
+                                            "world item type path processing failed: {error:?}"
+                                        ),
+                                        None,
+                                    ),
+                                    Some(&input.package_identity),
+                                ));
+                                errors = errors.saturating_add(1);
                             }
                         }
                     }

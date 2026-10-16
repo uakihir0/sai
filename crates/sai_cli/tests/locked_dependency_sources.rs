@@ -263,6 +263,10 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
     .expect("write root package manifest");
     let root_source = concat!(
         "use acme:middle as middle\n",
+        "world root_world {\n",
+        "  import fn root_world_import(missing: middle.api.PublicTypo) -> middle.api.PublicType\n",
+        "  export fn root_world_export(missing: middle.api.PublicTypo) -> middle.api.PublicType\n",
+        "}\n",
         "interface root_api {\n",
         "  type RootAlias = middle.api.PublicTypo\n",
         "  fn root_interface_member(missing: middle.api.PublicTypo)\n",
@@ -587,7 +591,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
         .collect::<Vec<_>>();
-    assert_eq!(unresolved_diagnostics.len(), 23, "{stdout}");
+    assert_eq!(unresolved_diagnostics.len(), 25, "{stdout}");
     for (owner_name, owner_source) in [
         ("interface member", "fn middle_interface_member"),
         ("resource method", "fn middle_resource_member"),
@@ -768,6 +772,8 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         ("interface member", "fn root_interface_member"),
         ("interface resource method", "fn root_resource_member"),
         ("interface alias", "type RootAlias"),
+        ("world import", "fn root_world_import"),
+        ("world export", "fn root_world_export"),
     ] {
         let owner_start = root_source
             .find(owner_source)
