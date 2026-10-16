@@ -122,6 +122,12 @@ pub enum LocalPackageIoOperation {
     OpenSourceFile,
     ReadSourceFile,
     InspectSourceEntry,
+    InspectWitDirectory,
+    OpenWitDirectory,
+    ReadWitDirectory,
+    OpenWitFile,
+    ReadWitFile,
+    InspectWitEntry,
 }
 
 /// A bound enforced while enumerating a local package source directory.
@@ -286,6 +292,168 @@ impl LocalPackageSourceSnapshot {
     }
 
     /// Returns the total UTF-8 path bytes inspected, including hidden entries.
+    pub const fn inspected_path_bytes(&self) -> u64 {
+        self.inspected_path_bytes
+    }
+}
+
+/// Maximum size of one local WIT file retained by a WIT directory snapshot.
+///
+/// This matches the per-file limit used by local source snapshots.
+pub const MAX_LOCAL_PACKAGE_WIT_FILE_BYTES: u64 = MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES;
+
+/// A bound enforced while enumerating a local WIT directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalPackageWitDirectorySnapshotLimit {
+    EntryCount,
+    PathBytes,
+    WitFileCount,
+    WitFileBytes,
+    TotalWitFileBytes,
+}
+
+/// Traversal bounds for one capability-backed WIT directory snapshot.
+///
+/// Defaults use the package-tree entry, path, file-count, and content-byte
+/// bounds. The individual WIT-file bound matches local source snapshots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalPackageWitDirectorySnapshotLimits {
+    pub entry_count: u64,
+    pub path_bytes: u64,
+    pub wit_file_count: u64,
+    pub total_wit_file_bytes: u64,
+}
+
+impl Default for LocalPackageWitDirectorySnapshotLimits {
+    fn default() -> Self {
+        Self {
+            entry_count: MAX_PACKAGE_TREE_ENTRIES,
+            path_bytes: MAX_PACKAGE_TREE_PATH_BYTES,
+            wit_file_count: MAX_PACKAGE_FILE_COUNT,
+            total_wit_file_bytes: MAX_PACKAGE_CONTENT_BYTES,
+        }
+    }
+}
+
+/// Work performed while reading a WIT directory, including bytes read before
+/// an error.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalPackageWitDirectorySnapshotProgress {
+    pub inspected_entry_count: u64,
+    pub inspected_path_bytes: u64,
+    pub wit_file_count: u64,
+    pub wit_file_bytes_read: u64,
+}
+
+/// Failure to read a complete local WIT directory snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageWitDirectorySnapshotError {
+    Directory(LocalPackageError),
+    PlatformNotSupported,
+    LimitExceeded(LocalPackageWitDirectorySnapshotLimit),
+    InvalidWitEntryPath,
+    Interrupted,
+}
+
+impl LocalPackageWitDirectorySnapshotError {
+    pub const fn is_interrupted(&self) -> bool {
+        matches!(self, Self::Interrupted)
+    }
+}
+
+impl From<LocalPackageError> for LocalPackageWitDirectorySnapshotError {
+    fn from(error: LocalPackageError) -> Self {
+        Self::Directory(error)
+    }
+}
+
+/// Whether a validated package-relative WIT directory could be opened safely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageWitDirectoryStatus {
+    Present,
+    Missing,
+    NotDirectory,
+    /// A component of the declared package-relative directory was a symlink.
+    Symlink {
+        component: Box<str>,
+    },
+}
+
+/// Kind of a direct-child entry whose name has the `.wit` suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalPackageWitEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// A direct-child `.wit` entry in a package-relative WIT directory.
+///
+/// Regular files retain their exact bytes. Directories, symlinks, and other
+/// filesystem entries with a `.wit` suffix are represented by `kind` and are
+/// never followed or read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalPackageWitEntry {
+    path: Box<str>,
+    kind: LocalPackageWitEntryKind,
+    bytes: Option<Arc<[u8]>>,
+}
+
+impl LocalPackageWitEntry {
+    /// Returns the package-relative path using `/` separators.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub const fn kind(&self) -> LocalPackageWitEntryKind {
+        self.kind
+    }
+
+    /// Returns the exact file bytes for regular files.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
+    }
+
+    /// Clones the shared file bytes without copying the payload.
+    pub fn bytes_arc(&self) -> Option<Arc<[u8]>> {
+        self.bytes.as_ref().map(Arc::clone)
+    }
+}
+
+/// A deterministic inventory and raw-byte snapshot of direct-child WIT files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalPackageWitDirectorySnapshot {
+    directory: LocalPackageWitDirectoryStatus,
+    entries: Vec<LocalPackageWitEntry>,
+    inspected_entry_count: u64,
+    inspected_path_bytes: u64,
+}
+
+impl LocalPackageWitDirectorySnapshot {
+    pub const fn directory(&self) -> &LocalPackageWitDirectoryStatus {
+        &self.directory
+    }
+
+    /// Returns sorted direct-child paths ending in `.wit`, including unsafe
+    /// entry kinds that were observed without following them.
+    pub fn entries(&self) -> &[LocalPackageWitEntry] {
+        &self.entries
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = &LocalPackageWitEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind == LocalPackageWitEntryKind::File)
+    }
+
+    /// Returns the number of directory entries inspected, including entries
+    /// omitted because their names do not end in `.wit`.
+    pub const fn inspected_entry_count(&self) -> u64 {
+        self.inspected_entry_count
+    }
+
+    /// Returns the total package-relative path bytes inspected.
     pub const fn inspected_path_bytes(&self) -> u64 {
         self.inspected_path_bytes
     }
@@ -767,6 +935,115 @@ impl LocalPackageDirectory {
         }
     }
 
+    /// Reads direct-child `.wit` files from any validated package-relative
+    /// WIT directory using the retained package-directory capability.
+    ///
+    /// The directory may be outside the manifest's source tree. Directory
+    /// path components are opened one at a time without following symlinks.
+    /// A missing directory, a non-directory component, and a symlink
+    /// component are returned as distinct statuses. Only direct-child names
+    /// ending in `.wit` are returned; regular files retain their exact bytes,
+    /// while symlink and non-file entries are represented by their kind and
+    /// are never followed.
+    ///
+    /// This operation is supported only on platforms where directory-relative
+    /// no-follow opens are available. It never reopens `self.path()`.
+    pub fn read_wit_directory_snapshot(
+        &self,
+        wit_directory: &ContentPackagePath,
+    ) -> Result<LocalPackageWitDirectorySnapshot, LocalPackageWitDirectorySnapshotError> {
+        self.read_wit_directory_snapshot_with_cancel(wit_directory, || false)
+    }
+
+    /// Reads a WIT directory snapshot while polling `is_cancelled` during
+    /// directory traversal and file reads.
+    pub fn read_wit_directory_snapshot_with_cancel(
+        &self,
+        wit_directory: &ContentPackagePath,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<LocalPackageWitDirectorySnapshot, LocalPackageWitDirectorySnapshotError> {
+        self.read_wit_directory_snapshot_with_limits_and_cancel(
+            wit_directory,
+            LocalPackageWitDirectorySnapshotLimits::default(),
+            is_cancelled,
+        )
+    }
+
+    /// Reads a WIT directory snapshot using explicit package or workspace
+    /// limits.
+    pub fn read_wit_directory_snapshot_with_limits_and_cancel(
+        &self,
+        wit_directory: &ContentPackagePath,
+        limits: LocalPackageWitDirectorySnapshotLimits,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<LocalPackageWitDirectorySnapshot, LocalPackageWitDirectorySnapshotError> {
+        self.read_wit_directory_snapshot_with_limits_progress_and_cancel(
+            wit_directory,
+            limits,
+            &mut LocalPackageWitDirectorySnapshotProgress::default(),
+            is_cancelled,
+        )
+    }
+
+    /// Reads a bounded WIT directory snapshot and reports work performed even
+    /// when the snapshot fails. `progress` is reset at the start of each call.
+    pub fn read_wit_directory_snapshot_with_limits_progress_and_cancel(
+        &self,
+        wit_directory: &ContentPackagePath,
+        limits: LocalPackageWitDirectorySnapshotLimits,
+        progress: &mut LocalPackageWitDirectorySnapshotProgress,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<LocalPackageWitDirectorySnapshot, LocalPackageWitDirectorySnapshotError> {
+        *progress = LocalPackageWitDirectorySnapshotProgress::default();
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            check_wit_snapshot_cancelled(&mut is_cancelled)?;
+            let (directory, root_directory) =
+                open_wit_directory_root(&self.directory, wit_directory, &mut is_cancelled)?;
+            let Some(root_directory) = root_directory else {
+                return Ok(LocalPackageWitDirectorySnapshot {
+                    directory,
+                    entries: Vec::new(),
+                    inspected_entry_count: 0,
+                    inspected_path_bytes: 0,
+                });
+            };
+
+            let mut snapshot = LocalPackageWitDirectorySnapshotAccumulator {
+                limits,
+                ..LocalPackageWitDirectorySnapshotAccumulator::default()
+            };
+            let walk_result = walk_local_wit_directory(
+                root_directory,
+                wit_directory.as_str(),
+                &mut snapshot,
+                &mut is_cancelled,
+            );
+            *progress = snapshot.progress();
+            walk_result?;
+            snapshot
+                .entries
+                .sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+            Ok(LocalPackageWitDirectorySnapshot {
+                directory,
+                entries: snapshot.entries,
+                inspected_entry_count: snapshot.inspected_entry_count,
+                inspected_path_bytes: snapshot.inspected_path_bytes,
+            })
+        }
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let _ = (self, wit_directory, limits, progress, &mut is_cancelled);
+            Err(LocalPackageWitDirectorySnapshotError::PlatformNotSupported)
+        }
+    }
+
     /// Reads and parses this package's manifest using the requested package
     /// role. The caller remains responsible for reporting parse diagnostics
     /// and validating package semantics before resolver use.
@@ -830,6 +1107,426 @@ impl LocalPackageSourceSnapshotAccumulator {
             sai_file_bytes_read: self.sai_file_bytes_read,
         }
     }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+#[derive(Default)]
+struct LocalPackageWitDirectorySnapshotAccumulator {
+    limits: LocalPackageWitDirectorySnapshotLimits,
+    entries: Vec<LocalPackageWitEntry>,
+    inspected_entry_count: u64,
+    inspected_path_bytes: u64,
+    wit_file_count: u64,
+    wit_file_bytes: u64,
+    wit_file_bytes_read: u64,
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+impl LocalPackageWitDirectorySnapshotAccumulator {
+    fn progress(&self) -> LocalPackageWitDirectorySnapshotProgress {
+        LocalPackageWitDirectorySnapshotProgress {
+            inspected_entry_count: self.inspected_entry_count,
+            inspected_path_bytes: self.inspected_path_bytes,
+            wit_file_count: self.wit_file_count,
+            wit_file_bytes_read: self.wit_file_bytes_read,
+        }
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn open_wit_directory_root(
+    package_directory: &File,
+    wit_directory: &ContentPackagePath,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(LocalPackageWitDirectoryStatus, Option<File>), LocalPackageWitDirectorySnapshotError> {
+    if wit_directory.as_str() == "." {
+        check_wit_snapshot_cancelled(is_cancelled)?;
+        return package_directory
+            .try_clone()
+            .map(|directory| (LocalPackageWitDirectoryStatus::Present, Some(directory)))
+            .map_err(|error| {
+                LocalPackageError::Io {
+                    operation: LocalPackageIoOperation::InspectWitDirectory,
+                    kind: error.kind(),
+                }
+                .into()
+            });
+    }
+
+    let mut parent = package_directory
+        .try_clone()
+        .map_err(|error| LocalPackageError::Io {
+            operation: LocalPackageIoOperation::InspectWitDirectory,
+            kind: error.kind(),
+        })?;
+    let mut relative_component = String::new();
+    let components = wit_directory.as_str().split('/').collect::<Vec<_>>();
+
+    for (index, component) in components.iter().enumerate() {
+        check_wit_snapshot_cancelled(is_cancelled)?;
+        if !relative_component.is_empty() {
+            relative_component.push('/');
+        }
+        relative_component.push_str(component);
+
+        let metadata = match statat(&parent, *component, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => {
+                return Ok((LocalPackageWitDirectoryStatus::Missing, None));
+            }
+            Err(rustix::io::Errno::NOTDIR) => {
+                return Ok((LocalPackageWitDirectoryStatus::NotDirectory, None));
+            }
+            Err(error) => {
+                return Err(local_source_io_error(
+                    LocalPackageIoOperation::InspectWitDirectory,
+                    error,
+                )
+                .into());
+            }
+        };
+        let file_type = FileType::from_raw_mode(metadata.st_mode);
+        if file_type.is_symlink() {
+            return Ok((
+                LocalPackageWitDirectoryStatus::Symlink {
+                    component: relative_component.into_boxed_str(),
+                },
+                None,
+            ));
+        }
+        if !file_type.is_dir() {
+            return Ok((LocalPackageWitDirectoryStatus::NotDirectory, None));
+        }
+
+        let opened = openat(
+            &parent,
+            *component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            let error: io::Error = error.into();
+            LocalPackageError::Io {
+                operation: LocalPackageIoOperation::OpenWitDirectory,
+                kind: error.kind(),
+            }
+        })?;
+        if directory_identity(&opened)? != local_source_stat_identity(&metadata) {
+            return Err(LocalPackageError::DirectoryChanged.into());
+        }
+
+        if index + 1 == components.len() {
+            return Ok((LocalPackageWitDirectoryStatus::Present, Some(opened)));
+        }
+        parent = opened;
+    }
+
+    Err(LocalPackageError::NotDirectory.into())
+}
+
+fn check_wit_snapshot_cancelled(
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), LocalPackageWitDirectorySnapshotError> {
+    if is_cancelled() {
+        Err(LocalPackageWitDirectorySnapshotError::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn walk_local_wit_directory(
+    root_directory: File,
+    wit_directory: &str,
+    snapshot: &mut LocalPackageWitDirectorySnapshotAccumulator,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), LocalPackageWitDirectorySnapshotError> {
+    check_wit_snapshot_cancelled(is_cancelled)?;
+    let mut reader = Dir::read_from(&root_directory).map_err(|error| {
+        let error: io::Error = error.into();
+        LocalPackageError::Io {
+            operation: LocalPackageIoOperation::ReadWitDirectory,
+            kind: error.kind(),
+        }
+    })?;
+    let mut names = Vec::new();
+    while let Some(entry) = reader.read() {
+        check_wit_snapshot_cancelled(is_cancelled)?;
+        let entry = entry.map_err(|error| {
+            let error: io::Error = error.into();
+            LocalPackageError::Io {
+                operation: LocalPackageIoOperation::ReadWitDirectory,
+                kind: error.kind(),
+            }
+        })?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let name = name.to_vec();
+        let package_relative_path_bytes = if wit_directory == "." {
+            name.clone()
+        } else {
+            let mut path = Vec::with_capacity(wit_directory.len() + 1 + name.len());
+            path.extend_from_slice(wit_directory.as_bytes());
+            path.push(b'/');
+            path.extend_from_slice(&name);
+            path
+        };
+        record_local_wit_entry_path(snapshot, package_relative_path_bytes.len())?;
+        names.push((name, package_relative_path_bytes));
+    }
+    names.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (name, package_relative_path_bytes) in names {
+        check_wit_snapshot_cancelled(is_cancelled)?;
+        // Match the VFS WIT inventory contract: `.wit` must be a non-empty
+        // basename suffix and is case-sensitive.
+        if name.len() <= b".wit".len() || !name.ends_with(b".wit") {
+            continue;
+        }
+        let name = std::str::from_utf8(&name)
+            .map_err(|_| LocalPackageWitDirectorySnapshotError::InvalidWitEntryPath)?;
+        let package_relative_path = std::str::from_utf8(&package_relative_path_bytes)
+            .map_err(|_| LocalPackageWitDirectorySnapshotError::InvalidWitEntryPath)?;
+        if !is_valid_local_source_relative_path(package_relative_path) {
+            return Err(LocalPackageWitDirectorySnapshotError::InvalidWitEntryPath);
+        }
+
+        let entry_metadata =
+            statat(&root_directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+                local_source_io_error(LocalPackageIoOperation::InspectWitEntry, error)
+            })?;
+        let file_type = FileType::from_raw_mode(entry_metadata.st_mode);
+        let (kind, bytes) = if file_type.is_symlink() {
+            (LocalPackageWitEntryKind::Symlink, None)
+        } else if file_type.is_dir() {
+            (LocalPackageWitEntryKind::Directory, None)
+        } else if file_type.is_file() {
+            let bytes = read_local_wit_file(
+                &root_directory,
+                name,
+                &entry_metadata,
+                snapshot,
+                is_cancelled,
+            )?;
+            (LocalPackageWitEntryKind::File, Some(bytes))
+        } else {
+            (LocalPackageWitEntryKind::Other, None)
+        };
+        snapshot.entries.push(LocalPackageWitEntry {
+            path: package_relative_path.to_owned().into_boxed_str(),
+            kind,
+            bytes,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn read_local_wit_file(
+    parent: &File,
+    name: &str,
+    entry_metadata: &rustix::fs::Stat,
+    snapshot: &mut LocalPackageWitDirectorySnapshotAccumulator,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Arc<[u8]>, LocalPackageWitDirectorySnapshotError> {
+    check_wit_snapshot_cancelled(is_cancelled)?;
+    let file_count = snapshot.wit_file_count.saturating_add(1);
+    if file_count > snapshot.limits.wit_file_count {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::WitFileCount,
+        ));
+    }
+    snapshot.wit_file_count = file_count;
+
+    let mut file = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        let error: io::Error = error.into();
+        LocalPackageError::Io {
+            operation: LocalPackageIoOperation::OpenWitFile,
+            kind: error.kind(),
+        }
+    })?;
+    let before = file.metadata().map_err(|error| LocalPackageError::Io {
+        operation: LocalPackageIoOperation::OpenWitFile,
+        kind: error.kind(),
+    })?;
+    if !before.is_file()
+        || local_source_file_identity(&before) != local_source_stat_identity(entry_metadata)
+    {
+        return Err(LocalPackageError::DirectoryChanged.into());
+    }
+    if before.len() > MAX_LOCAL_PACKAGE_WIT_FILE_BYTES {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::WitFileBytes,
+        ));
+    }
+    if snapshot.wit_file_bytes.saturating_add(before.len()) > snapshot.limits.total_wit_file_bytes {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::TotalWitFileBytes,
+        ));
+    }
+
+    let bytes = read_local_wit_bytes(&mut file, before.len(), snapshot, is_cancelled)?;
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let total_bytes = snapshot.wit_file_bytes.saturating_add(byte_count);
+    if total_bytes > snapshot.limits.total_wit_file_bytes {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::TotalWitFileBytes,
+        ));
+    }
+
+    let after = file.metadata().map_err(|error| LocalPackageError::Io {
+        operation: LocalPackageIoOperation::ReadWitFile,
+        kind: error.kind(),
+    })?;
+    if !local_source_file_metadata_unchanged(&before, &after)
+        || !local_wit_entry_still_matches(parent, name, &file)?
+    {
+        return Err(LocalPackageError::DirectoryChanged.into());
+    }
+
+    snapshot.wit_file_bytes = total_bytes;
+    Ok(Arc::from(bytes))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn read_local_wit_bytes(
+    reader: &mut impl Read,
+    expected_bytes: u64,
+    snapshot: &mut LocalPackageWitDirectorySnapshotAccumulator,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Vec<u8>, LocalPackageWitDirectorySnapshotError> {
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_bytes).unwrap_or(usize::MAX));
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        check_wit_snapshot_cancelled(is_cancelled)?;
+        let remaining_declared_bytes =
+            expected_bytes.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if remaining_declared_bytes == 0 {
+            break;
+        }
+        let requested = usize::try_from(remaining_declared_bytes.min(buffer.len() as u64))
+            .unwrap_or(buffer.len());
+        let read =
+            reader
+                .read(&mut buffer[..requested])
+                .map_err(|error| LocalPackageError::Io {
+                    operation: LocalPackageIoOperation::ReadWitFile,
+                    kind: error.kind(),
+                })?;
+        if read == 0 {
+            break;
+        }
+        snapshot.wit_file_bytes_read = snapshot
+            .wit_file_bytes_read
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        bytes.extend_from_slice(&buffer[..read]);
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LOCAL_PACKAGE_WIT_FILE_BYTES {
+            return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                LocalPackageWitDirectorySnapshotLimit::WitFileBytes,
+            ));
+        }
+        if snapshot
+            .wit_file_bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            > snapshot.limits.total_wit_file_bytes
+        {
+            return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                LocalPackageWitDirectorySnapshotLimit::TotalWitFileBytes,
+            ));
+        }
+    }
+
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if byte_count != expected_bytes {
+        return Err(LocalPackageError::DirectoryChanged.into());
+    }
+    if byte_count > MAX_LOCAL_PACKAGE_WIT_FILE_BYTES {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::WitFileBytes,
+        ));
+    }
+    let total_bytes = snapshot.wit_file_bytes.saturating_add(byte_count);
+    if total_bytes > snapshot.limits.total_wit_file_bytes {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::TotalWitFileBytes,
+        ));
+    }
+
+    Ok(bytes)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn local_wit_entry_still_matches(
+    parent: &File,
+    name: &str,
+    file: &File,
+) -> Result<bool, LocalPackageWitDirectorySnapshotError> {
+    let current = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| local_source_io_error(LocalPackageIoOperation::InspectWitEntry, error))?;
+    Ok(FileType::from_raw_mode(current.st_mode).is_file()
+        && local_source_stat_identity(&current)
+            == local_source_file_identity(&file.metadata().map_err(|error| {
+                LocalPackageWitDirectorySnapshotError::Directory(LocalPackageError::Io {
+                    operation: LocalPackageIoOperation::InspectWitEntry,
+                    kind: error.kind(),
+                })
+            })?))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn record_local_wit_entry_path(
+    snapshot: &mut LocalPackageWitDirectorySnapshotAccumulator,
+    path_bytes: usize,
+) -> Result<(), LocalPackageWitDirectorySnapshotError> {
+    snapshot.inspected_entry_count = snapshot.inspected_entry_count.saturating_add(1);
+    if snapshot.inspected_entry_count > snapshot.limits.entry_count {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::EntryCount,
+        ));
+    }
+    snapshot.inspected_path_bytes = snapshot
+        .inspected_path_bytes
+        .saturating_add(u64::try_from(path_bytes).unwrap_or(u64::MAX));
+    if snapshot.inspected_path_bytes > snapshot.limits.path_bytes {
+        return Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+            LocalPackageWitDirectorySnapshotLimit::PathBytes,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(
@@ -2543,6 +3240,41 @@ impl fmt::Display for LocalPackageSourceLimit {
     }
 }
 
+impl fmt::Display for LocalPackageWitDirectorySnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directory(error) => fmt::Display::fmt(error, formatter),
+            Self::PlatformNotSupported => {
+                formatter.write_str("this host cannot safely read a local WIT directory snapshot")
+            }
+            Self::LimitExceeded(limit) => {
+                write!(
+                    formatter,
+                    "local WIT directory snapshot exceeds the {limit} limit"
+                )
+            }
+            Self::InvalidWitEntryPath => {
+                formatter.write_str("local WIT directory contains an invalid relative path")
+            }
+            Self::Interrupted => {
+                formatter.write_str("local WIT directory snapshot was interrupted")
+            }
+        }
+    }
+}
+
+impl fmt::Display for LocalPackageWitDirectorySnapshotLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EntryCount => "entry-count limit",
+            Self::PathBytes => "cumulative path-length limit",
+            Self::WitFileCount => "WIT file-count limit",
+            Self::WitFileBytes => "per-file WIT size limit",
+            Self::TotalWitFileBytes => "total WIT size limit",
+        })
+    }
+}
+
 impl fmt::Display for LocalPackageIoOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let operation = match self {
@@ -2557,6 +3289,12 @@ impl fmt::Display for LocalPackageIoOperation {
             Self::OpenSourceFile => "opening a SAI source file",
             Self::ReadSourceFile => "reading a SAI source file",
             Self::InspectSourceEntry => "inspecting a source-tree entry",
+            Self::InspectWitDirectory => "inspecting a WIT directory",
+            Self::OpenWitDirectory => "opening a WIT directory",
+            Self::ReadWitDirectory => "reading a WIT directory",
+            Self::OpenWitFile => "opening a WIT file",
+            Self::ReadWitFile => "reading a WIT file",
+            Self::InspectWitEntry => "inspecting a WIT directory entry",
         };
         formatter.write_str(operation)
     }
@@ -2572,6 +3310,14 @@ impl fmt::Debug for LocalPackageDirectory {
 
 impl std::error::Error for LocalPackageError {}
 impl std::error::Error for LocalPackageSourceSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Directory(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl std::error::Error for LocalPackageWitDirectorySnapshotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Directory(error) => Some(error),
@@ -2799,6 +3545,7 @@ fn open_manifest(path: &Path) -> io::Result<File> {
 mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
+    use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2824,6 +3571,10 @@ mod tests {
         LocalPackageSourceEntryKind, LocalPackageSourceLimit, LocalPackageSourceResolveError,
         LocalPackageSourceRootStatus, LocalPackageSourceSnapshotError,
         LocalPackageSourceSnapshotLimits, LocalPackageSourceSnapshotProgress,
+        LocalPackageWitDirectorySnapshotAccumulator, LocalPackageWitDirectorySnapshotError,
+        LocalPackageWitDirectorySnapshotLimit, LocalPackageWitDirectorySnapshotLimits,
+        LocalPackageWitDirectorySnapshotProgress, LocalPackageWitDirectoryStatus,
+        LocalPackageWitEntryKind, MAX_LOCAL_PACKAGE_WIT_FILE_BYTES, read_local_wit_bytes,
         resolve_local_path_packages,
     };
 
@@ -3261,6 +4012,261 @@ mod tests {
             .expect_err("already-cancelled snapshot should stop");
         assert!(error.is_interrupted());
         assert_eq!(error, LocalPackageSourceSnapshotError::Interrupted);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn wit_directory_snapshot_reads_sorted_direct_children_outside_the_source_tree() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let wit_path = package_path.join("api");
+        fs::create_dir_all(wit_path.join("nested")).expect("create WIT directory");
+        fs::write(wit_path.join("z.wit"), b"z bytes\n").expect("write later WIT file");
+        fs::write(wit_path.join("a.wit"), b"\xff\0raw WIT bytes").expect("write raw WIT bytes");
+        fs::write(wit_path.join("readme.md"), b"not WIT").expect("write unrelated file");
+        fs::write(wit_path.join("nested/hidden.wit"), b"nested WIT")
+            .expect("write nested WIT file");
+        fs::create_dir(wit_path.join("directory.wit")).expect("create .wit directory");
+        let outside_wit = tree.path().join("outside.wit");
+        fs::write(&outside_wit, b"must not be read through a symlink")
+            .expect("write symlink target");
+        symlink(&outside_wit, wit_path.join("linked.wit")).expect("create WIT symlink");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let snapshot = package
+            .read_wit_directory_snapshot(
+                &ContentPackagePath::parse("api").expect("valid package-relative WIT path"),
+            )
+            .expect("read WIT directory snapshot");
+
+        assert_eq!(
+            snapshot.directory(),
+            &LocalPackageWitDirectoryStatus::Present
+        );
+        assert_eq!(
+            snapshot
+                .entries()
+                .iter()
+                .map(|entry| (entry.path(), entry.kind(), entry.bytes()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "api/a.wit",
+                    LocalPackageWitEntryKind::File,
+                    Some(&b"\xff\0raw WIT bytes"[..]),
+                ),
+                (
+                    "api/directory.wit",
+                    LocalPackageWitEntryKind::Directory,
+                    None,
+                ),
+                ("api/linked.wit", LocalPackageWitEntryKind::Symlink, None),
+                (
+                    "api/z.wit",
+                    LocalPackageWitEntryKind::File,
+                    Some(&b"z bytes\n"[..]),
+                ),
+            ]
+        );
+        assert_eq!(snapshot.files().count(), 2);
+        assert_eq!(snapshot.inspected_entry_count(), 6);
+        assert_eq!(
+            snapshot.inspected_path_bytes(),
+            [
+                "api/a.wit",
+                "api/directory.wit",
+                "api/linked.wit",
+                "api/nested",
+                "api/readme.md",
+                "api/z.wit",
+            ]
+            .iter()
+            .map(|path| path.len() as u64)
+            .sum::<u64>()
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn wit_directory_snapshot_preserves_missing_non_directory_and_symlink_statuses() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        fs::write(package_path.join("not-a-directory"), b"file").expect("write non-directory path");
+        let outside = tree.path().join("outside");
+        fs::create_dir(&outside).expect("create external directory");
+        fs::create_dir(outside.join("wit")).expect("create external WIT directory");
+        symlink(&outside, package_path.join("linked")).expect("create directory symlink");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let read = |path: &str| {
+            package
+                .read_wit_directory_snapshot(
+                    &ContentPackagePath::parse(path).expect("valid package-relative path"),
+                )
+                .expect("read WIT directory snapshot")
+        };
+
+        assert_eq!(
+            read("missing").directory(),
+            &LocalPackageWitDirectoryStatus::Missing
+        );
+        assert_eq!(
+            read("not-a-directory").directory(),
+            &LocalPackageWitDirectoryStatus::NotDirectory
+        );
+        let symlink_status = read("linked/wit");
+        assert_eq!(
+            symlink_status.directory(),
+            &LocalPackageWitDirectoryStatus::Symlink {
+                component: "linked".into(),
+            }
+        );
+        assert!(symlink_status.entries().is_empty());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn wit_directory_snapshot_enforces_workspace_limits_and_cancellation() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let wit_path = package_path.join("api");
+        fs::create_dir_all(&wit_path).expect("create WIT directory");
+        fs::write(wit_path.join("a.wit"), b"abc").expect("write first WIT file");
+        fs::write(wit_path.join("b.wit"), b"defg").expect("write second WIT file");
+        fs::write(wit_path.join("note.txt"), b"unrelated").expect("write unrelated file");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let wit_directory =
+            ContentPackagePath::parse("api").expect("valid package-relative WIT path");
+        let read_with_limits = |limits| {
+            package.read_wit_directory_snapshot_with_limits_and_cancel(
+                &wit_directory,
+                limits,
+                || false,
+            )
+        };
+        let unlimited = || LocalPackageWitDirectorySnapshotLimits {
+            entry_count: u64::MAX,
+            path_bytes: u64::MAX,
+            wit_file_count: u64::MAX,
+            total_wit_file_bytes: u64::MAX,
+        };
+
+        assert_eq!(
+            read_with_limits(LocalPackageWitDirectorySnapshotLimits {
+                entry_count: 2,
+                ..unlimited()
+            }),
+            Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                LocalPackageWitDirectorySnapshotLimit::EntryCount
+            ))
+        );
+        assert_eq!(
+            read_with_limits(LocalPackageWitDirectorySnapshotLimits {
+                path_bytes: 10,
+                ..unlimited()
+            }),
+            Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                LocalPackageWitDirectorySnapshotLimit::PathBytes
+            ))
+        );
+        assert_eq!(
+            read_with_limits(LocalPackageWitDirectorySnapshotLimits {
+                wit_file_count: 1,
+                ..unlimited()
+            }),
+            Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                LocalPackageWitDirectorySnapshotLimit::WitFileCount
+            ))
+        );
+        assert_eq!(
+            read_with_limits(LocalPackageWitDirectorySnapshotLimits {
+                total_wit_file_bytes: 5,
+                ..unlimited()
+            }),
+            Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                LocalPackageWitDirectorySnapshotLimit::TotalWitFileBytes
+            ))
+        );
+        assert_eq!(
+            package.read_wit_directory_snapshot_with_cancel(&wit_directory, || true),
+            Err(LocalPackageWitDirectorySnapshotError::Interrupted)
+        );
+
+        let mut progress = LocalPackageWitDirectorySnapshotProgress::default();
+        let cancelled = package.read_wit_directory_snapshot_with_limits_progress_and_cancel(
+            &wit_directory,
+            unlimited(),
+            &mut progress,
+            {
+                let mut calls = 0;
+                move || {
+                    calls += 1;
+                    calls > 5
+                }
+            },
+        );
+        assert_eq!(
+            cancelled,
+            Err(LocalPackageWitDirectorySnapshotError::Interrupted)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn wit_directory_snapshot_enforces_single_file_limit() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let wit_path = package_path.join("api");
+        fs::create_dir_all(&wit_path).expect("create WIT directory");
+        fs::File::create(wit_path.join("large.wit"))
+            .expect("create large WIT file")
+            .set_len(MAX_LOCAL_PACKAGE_WIT_FILE_BYTES + 1)
+            .expect("extend WIT file beyond the per-file limit");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        assert_eq!(
+            package.read_wit_directory_snapshot(
+                &ContentPackagePath::parse("api").expect("valid WIT path")
+            ),
+            Err(LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                LocalPackageWitDirectorySnapshotLimit::WitFileBytes
+            ))
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn wit_directory_snapshot_rejects_short_eof_before_declared_file_length() {
+        let mut reader = Cursor::new(b"short".as_slice());
+        let mut snapshot = LocalPackageWitDirectorySnapshotAccumulator::default();
+
+        assert_eq!(
+            read_local_wit_bytes(&mut reader, 10, &mut snapshot, &mut || false),
+            Err(LocalPackageWitDirectorySnapshotError::Directory(
+                LocalPackageError::DirectoryChanged
+            ))
+        );
+        assert_eq!(snapshot.wit_file_bytes_read, 5);
+        assert_eq!(snapshot.wit_file_bytes, 0);
     }
 
     #[test]
