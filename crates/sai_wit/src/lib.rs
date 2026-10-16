@@ -3,6 +3,7 @@
 mod closure;
 mod convert;
 mod dependency;
+mod generated;
 mod model;
 mod source_scan;
 mod stable_hash;
@@ -10,6 +11,7 @@ mod stable_hash;
 pub use closure::*;
 pub use convert::*;
 pub use dependency::*;
+pub use generated::*;
 pub use model::*;
 
 use sai_hir::{PackageId, Symbol};

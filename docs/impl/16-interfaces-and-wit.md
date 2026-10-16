@@ -76,7 +76,7 @@ pub trait WitHooks {
 pub struct GeneratedText {
     pub text: Arc<str>,                         // the WIT text of spec/13 §13.11.2
     pub complete: bool,                         // no item was omitted (§16.10.1)
-    pub origins: Arc<[(SmolStr, DefId)]>,       // WIT interface name → SAI interface, in WIT order
+    pub origins: Arc<[(String, DefId)]>,        // WIT interface name → SAI interface, in WIT order
 }
 ```
 
@@ -1081,7 +1081,7 @@ The memory layout of a flags type is its representation type: an unsigned intege
 ```rust
 pub struct GeneratedWit {
     pub package: Arc<WitPackage>,
-    pub origins: Arc<[(SmolStr, DefId)]>,
+    pub origins: Arc<[(String, DefId)]>,
     pub complete: bool,
 }
 ```
@@ -1250,13 +1250,13 @@ The codes below are defined in [spec/13](../spec/13-components-and-wit.md) or in
 
 ### IR-580: Deterministic in-memory WIT source loading
 
-`sai_wit` owns the WIT unit identity and the in-memory loader for VFS-provided direct-child `.wit` files. It sorts filenames by bytes, rejects duplicate and nested paths, reports invalid UTF-8 at the first byte, and maps `wit-parser` syntax spans back to the originating relative filename and byte range without reading the filesystem. The parsed package group remains an intermediate loader value; IR-581 adds package validation and the parser-independent model. Package-graph closure resolution and view definitions remain future steps. The selected `wit-parser` 0.246.0 uses Unicode 16.0.0 identifier tables and supports the workspace Rust 1.85 minimum.
+`sai_wit` owns the WIT unit identity and the in-memory loader for VFS-provided direct-child `.wit` files. It sorts filenames by bytes, rejects duplicate and nested paths, reports invalid UTF-8 at the first byte, and maps `wit-parser` syntax spans back to the originating relative filename and byte range without reading the filesystem. IR-581 adds package validation and the parser-independent model; IR-582 adds active-graph resolution and dependency closure. Stable view definitions remain future work. The selected `wit-parser` 0.246.0 uses Unicode 16.0.0 identifier tables and supports the workspace Rust 1.85 minimum.
 
 ### IR-581: Validate WIT units and build the stable package model
 
 `WitUnit` now validates package IDs and symbols through their matching interners, limits WASI units to the embedded catalog at `0.2.3`, and derives persistent view keys from the canonical package identity, compatibility line and unit kind. `sai_wit` converts resolved packages into an owned, parser-independent model with locally typed index vectors and explicit stable hashes. It reports package mismatch and nested-package declaration locations, records unsupported constructs on items, resource members and world functions, and propagates unsupported types in deterministic WIT traversal order through named references. A lexical normalization pass unwraps one named result and converts multiple named results for `wit-parser`, preserving source offsets and recording only the unsupported multiple-result function spans. Invalid and duplicate labels remain visible for parser rejection. Definitions and diagnostic details are recorded in `docs/design/implementation-review.md`.
 - **Human review:** **Review required:** Confirm the use of owned `String`s and local typed vectors instead of `SmolStr` and `sai_intern::IndexVec`; that the stable `Dir`/`Generated` view key uses package compatibility identity while declaration validation uses the full selected version; the seven-package WASI catalog/version restriction; and that parsed `map<K, V>` is recorded as unsupported. Review single and multiple named-result normalization, malformed-input preservation, and the fixed-point propagation of unsupported constructs through cycles.
-- **Remaining scope:** Resolve foreign package references from the package graph, establish WIT closures and generated-text hooks, then assign stable view `DefId`s and connect the model to direct interface-member scopes and name resolution.
+- **Remaining scope:** Add generated-text hooks, then assign stable view `DefId`s and connect the model to direct interface-member scopes and name resolution.
 
 ### IR-582: Resolve package references and construct WIT closures
 
@@ -1266,4 +1266,14 @@ The codes below are defined in [spec/13](../spec/13-components-and-wit.md) or in
 - **Verification:** `cargo test -p sai_wit --locked --quiet` passes all 66 tests. New cases cover build metadata, comments between `@` and the version, package mismatch and nested-package precedence over missing-reference errors, implicit package diagnostics, selected-version normalization, original UTF-8 source mapping and dependency-first `Resolve` insertion. `cargo test --workspace --locked --quiet`, `cargo fmt --all`, and `git diff --check` pass.
 - **Review:** The first hostile review found four issues: version tokens were assumed adjacent to `@`; implicit package references suggested an impossible manifest dependency; declaration checks ran after reference lookup; and valid build metadata was rejected. These are covered by the added source-range, graph, validation-order and SemVer regressions. Independent scanner and resolver re-reviews found no remaining actionable findings.
 - **Human review:** **Review required:** Confirm that the active graph is passed as an explicit projection; both directory and generated views may exist for one selected package; source rewriting and reparsing are the correct way to keep upstream parser spans consistent; and SemVer build metadata is accepted but ignored for precedence. Also review the first-reference ordering and the iterative post-order closure contract.
-- **Remaining scope:** Add generated WIT text hooks and connect the stable model to view `DefId`s, package scopes and name resolution.
+- **Remaining scope:** Connect generated WIT text to parsed packages, then connect the stable model and closures to view `DefId`s, package scopes, and name resolution.
+
+### IR-583: Add the generated WIT hook contract
+
+`sai_wit` now defines `GeneratedText` as a value-comparable snapshot of canonical WIT text, completeness, and WIT-interface-to-SAI-origin mappings. `WitHooks` lets a caller supply those snapshots without introducing a dependency on `sai_ty` or the driver. A snapshot converts to one in-memory `generated.wit` source file while retaining its metadata for view construction.
+- **Decision:** Store generated interface names as owned `String`s, and represent one canonical generated snapshot as a single synthetic source file named `generated.wit`.
+- **Reason:** The repository has no `SmolStr` dependency, and the parser-independent model already uses owned strings. One fixed virtual filename preserves deterministic parser/source-map identity and avoids reading generated content from disk.
+- **Verification:** `cargo test -p sai_wit --locked --quiet` passes all 69 tests. New tests cover value equality/hashing, completeness and origin preservation, repeatable synthetic-file identity, and parsing generated text through the same in-memory source boundary. Formatting and `git diff --check` pass.
+- **Review:** Hostile review found that the first hook type used `String` where the normative sample still said `SmolStr`; the contract was updated to `String`, matching the implementation choice. It also requested an end-to-end source-input parse regression, which now passes. Independent hostile re-review found no remaining actionable findings.
+- **Human review:** **Review required:** Confirm owned `String` origins in place of `SmolStr`, the single-file canonical generated-text boundary, and including origin mappings and completeness in value equality so query early cutoff rebuilds dependent views when provenance changes.
+- **Remaining scope:** Feed generated snapshots into `Generated(P)` package loading; then construct stable view `DefId`s and connect them to package scopes and name resolution.
