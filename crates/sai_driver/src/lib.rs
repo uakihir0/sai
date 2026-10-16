@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod package_graph;
+mod package_wit_name_queries;
 mod wit_package_queries;
 
 pub use sai_wit::WitPackageDiagnosticTemplate;
@@ -11,6 +12,8 @@ pub use wit_package_queries::{
 use wit_package_queries::{WitPackageQueries, WitViewQueries};
 
 use crate::package_graph::{PackageForm, PackageGraph, PackageGraphRole};
+use package_wit_name_queries::PackageWitNamesQueries;
+pub use package_wit_name_queries::PackageWitNamesQueryError;
 use sai_diagnostics::{
     CauseKey, Child, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related, SourceRef,
     source_text_status_diagnostic,
@@ -59,6 +62,7 @@ use sai_package::mvs_diagnostics::{
 };
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, Durability, InputQuery, QueryDatabase, QueryError};
+pub use sai_resolve::PackageWitNames;
 use sai_resolve::module_member_lookup::ModuleMemberIndex;
 use sai_resolve::module_member_lookup::ModuleTarget;
 use sai_resolve::module_path::{ModulePathError, resolve_module_prefix};
@@ -155,6 +159,7 @@ pub struct RootDatabase {
     /// when their origin definitions become available.
     wit_source_def_path_generations: InputQuery<String, u64>,
     package_scopes: Phase1PackageScopesQueries,
+    package_wit_names: PackageWitNamesQueries,
     type_owner_paths: TypeOwnerPathQueries,
     declared_requirements: DeclaredRequirementsQueries,
     wit_contracts: WitContractQueries,
@@ -1827,6 +1832,7 @@ pub enum Phase1CollectionError {
     ItemTree(ItemTreeQueryError),
     TargetFilter(TargetFilterError),
     PackageScopes(PackageScopesError),
+    PackageWitNamesQuery(PackageWitNamesQueryError),
     UseTargetDiagnostics(UseTargetDiagnosticsError),
     DefPathInterner(DefPathInternerError),
     MissingSnapshotFile(FileId),
@@ -2217,6 +2223,8 @@ impl Phase1ActiveWitViewScopes {
 pub struct Phase1PackageScopesCollection {
     package_key: PackageKey,
     scopes: Phase1PackageScopes,
+    package_wit_names: PackageWitNames,
+    package_wit_names_fingerprint: Fingerprint,
     input_fingerprint: Fingerprint,
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
@@ -2243,6 +2251,20 @@ impl Phase1PackageScopesCollection {
 
     pub fn scopes(&self) -> &Phase1PackageScopes {
         &self.scopes
+    }
+
+    /// The package-level WIT names and diagnostics derived from this exact
+    /// target-filtered Phase 1 collection.
+    pub fn package_wit_names(&self) -> &PackageWitNames {
+        &self.package_wit_names
+    }
+
+    /// Stable result fingerprint for `package_wit_names(P)`.
+    ///
+    /// It uses canonical definition paths and WIT generation order rather
+    /// than the session-local order of the returned definition-ID map.
+    pub const fn package_wit_names_fingerprint(&self) -> Fingerprint {
+        self.package_wit_names_fingerprint
     }
 
     pub const fn build_context(&self) -> Phase1BuildContext {
@@ -6794,6 +6816,11 @@ impl RootDatabase {
         let primitive_prelude = build_primitive_prelude(&symbols);
         let package_scopes =
             Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
+        let package_wit_names = PackageWitNamesQueries::new(
+            package_scopes.query.clone(),
+            Arc::clone(&packages),
+            Arc::clone(&symbols),
+        )?;
         let type_owner_paths = TypeOwnerPathQueries::new()?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
         let wit_contracts = WitContractQueries::new(declared_requirements.input.clone())?;
@@ -6842,6 +6869,7 @@ impl RootDatabase {
             wit_source_def_paths,
             wit_source_def_path_generations,
             package_scopes,
+            package_wit_names,
             type_owner_paths,
             declared_requirements,
             wit_contracts,
@@ -7944,6 +7972,10 @@ impl RootDatabase {
             Durability::Low,
         )?;
         let memo = output.result.as_ref().map_err(Clone::clone)?;
+        let (package_wit_names, package_wit_names_fingerprint) = self
+            .package_wit_names
+            .get(&mut self.query_database, package_key.clone(), snapshot)
+            .map_err(Phase1CollectionError::PackageWitNamesQuery)?;
         let mut scopes = memo.scopes.clone();
         for input in &prepared.modules {
             scopes
@@ -7961,6 +7993,8 @@ impl RootDatabase {
         Ok(Phase1PackageScopesCollection {
             package_key,
             scopes,
+            package_wit_names,
+            package_wit_names_fingerprint,
             input_fingerprint: output.input_fingerprint,
             snapshot_id: snapshot.id(),
             target_cfg: target_cfg.clone(),
@@ -13563,6 +13597,42 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    fn phase1_snapshot_from_vfs(
+        database: &mut RootDatabase,
+        module_tree: &ModuleTree,
+        version: u64,
+    ) -> WorkspaceSnapshot {
+        WorkspaceSnapshot::new(
+            module_tree
+                .modules
+                .iter()
+                .map(|module| {
+                    let key = database
+                        .file_key(module.file)
+                        .expect("module has a stable file key")
+                        .clone();
+                    let contents = match database
+                        .file_contents(key.clone())
+                        .expect("source input can be read")
+                    {
+                        Some(FileContents::Bytes(contents)) => contents,
+                        other => panic!("module source bytes are missing: {other:?}"),
+                    };
+                    SnapshotFile::new(
+                        Arc::new(
+                            SourceFile::decode(module.file, &contents)
+                                .expect("module source decodes"),
+                        ),
+                        key.path().to_owned(),
+                        Some("acme:phase1@1.0.0".to_owned()),
+                        Some(version),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("workspace snapshot is valid")
     }
 
     fn multi_package_fixture(
@@ -30164,6 +30234,226 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "the derived query should reuse the same memo for identical inputs"
+        );
+    }
+
+    #[test]
+    fn package_wit_names_query_uses_target_filtered_phase1_inputs() {
+        let root = b"interface net {}\n@target(\"wasm64-core\")\ninterface target_api {}\n@target(\"wasm64-core\")\nfn target_specific() {}\n";
+        let child = b"interface net {}\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root, child);
+        let wasm32 = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wasm32_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &wasm32,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection succeeds for wasm32");
+        assert!(
+            !phase1_has_function(
+                &database,
+                wasm32_collection.scopes(),
+                ModuleId::ROOT,
+                "target_specific"
+            ),
+            "the wasm64-only function is removed from wasm32 scopes"
+        );
+        assert_eq!(wasm32_collection.package_wit_names().names.len(), 3);
+        assert!(
+            wasm32_collection
+                .package_wit_names()
+                .names
+                .values()
+                .any(|name| name.as_str() == "target-api"),
+            "an invalid @target on an interface is diagnosed but does not remove its WIT name"
+        );
+        assert!(
+            wasm32_collection
+                .scopes()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget),
+            "interface @target is invalid and retained under the HIR contract"
+        );
+
+        let wasm64 = target_cfg_for_check("wasm64-core").expect("target config is valid");
+        let wasm64_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &wasm64,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection succeeds for wasm64");
+        assert!(phase1_has_function(
+            &database,
+            wasm64_collection.scopes(),
+            ModuleId::ROOT,
+            "target_specific"
+        ));
+        assert_eq!(wasm64_collection.package_wit_names().names.len(), 3);
+        assert!(
+            wasm64_collection
+                .package_wit_names()
+                .names
+                .values()
+                .any(|name| name.as_str() == "target-api")
+        );
+        let collision = wasm64_collection
+            .package_wit_names()
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .expect("both target-visible interfaces collide in the package WIT scope");
+        assert_eq!(
+            collision
+                .primary()
+                .map(|location| location.file.path.as_str()),
+            Some("src/child.sai")
+        );
+        assert!(
+            collision.related().iter().any(|related| matches!(
+                related,
+                sai_diagnostics::Related::DeclaredHere { location, .. }
+                    if location.file.path == "src/lib.sai"
+            )),
+            "the later declaration points back to the earlier interface"
+        );
+        assert_eq!(
+            wasm32_collection.package_wit_names_fingerprint(),
+            wasm64_collection.package_wit_names_fingerprint(),
+            "target-filtered body declarations do not perturb the package's interface and world names"
+        );
+    }
+
+    #[test]
+    fn package_wit_names_query_early_cuts_off_body_only_edits() {
+        let root = b"interface stable {}\nfn body() { 1; }\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root, b"interface stable {}\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let first = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("initial package WIT names collect");
+        let package_key = first.package_key().clone();
+        let first_memo = database
+            .package_wit_names
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("package WIT names query has a memo");
+
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai").expect("root file key is valid"),
+                Arc::from(&b"interface stable {}\nfn body() { 2; }\n"[..]),
+                Durability::Low,
+            )
+            .expect("body edit is tracked");
+        let changed_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 18);
+        let second = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &changed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("package WIT names recompute after the body edit");
+        let second_memo = database
+            .package_wit_names
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("recomputed package WIT names query has a memo");
+
+        assert_eq!(
+            first.package_wit_names_fingerprint(),
+            second.package_wit_names_fingerprint(),
+            "a body-only edit must preserve the WIT names result fingerprint"
+        );
+        assert!(
+            Arc::ptr_eq(&first_memo, &second_memo),
+            "the derived query should early-cut off when canonical names and diagnostics are unchanged"
+        );
+        let collision = second
+            .package_wit_names()
+            .diagnostics
+            .first()
+            .expect("the same cross-module collision remains after the body edit");
+        assert_eq!(
+            collision.primary().map(|location| location.file.snapshot),
+            Some(Some(18)),
+            "the memoized primary location is rebound to the requesting document version"
+        );
+        assert!(
+            collision.related().iter().any(|related| matches!(
+                related,
+                sai_diagnostics::Related::DeclaredHere { location, .. }
+                    if location.file.snapshot == Some(18)
+            )),
+            "the earlier declaration note is rebound to the requesting document version"
+        );
+    }
+
+    #[test]
+    fn package_wit_names_fingerprint_tracks_name_and_module_path_changes() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"interface stable {}\n", b"interface child_api {}\n");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let first = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("initial package WIT names collect");
+
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai").expect("root file key is valid"),
+                Arc::from(&b"interface renamed {}\n"[..]),
+                Durability::Low,
+            )
+            .expect("interface name edit is tracked");
+        let renamed_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 18);
+        let renamed = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &renamed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("renamed interface WIT name collects");
+        assert_ne!(
+            first.package_wit_names_fingerprint(),
+            renamed.package_wit_names_fingerprint(),
+            "a source-name change must update the result fingerprint"
+        );
+
+        let mut moved_module_tree = module_tree.clone();
+        let moved_path = database
+            .symbols
+            .intern("renamed_child")
+            .expect("module path symbol interns");
+        moved_module_tree.modules[1].path = vec![moved_path];
+        let moved = database
+            .collect_phase1_package_scopes_collection(
+                &moved_module_tree,
+                &renamed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("changed module path WIT names collect");
+        assert_ne!(
+            renamed.package_wit_names_fingerprint(),
+            moved.package_wit_names_fingerprint(),
+            "a module-path change must update the result fingerprint"
         );
     }
 
