@@ -2118,6 +2118,7 @@ pub struct InterfaceTestOnlyResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<InterfaceOwnerTestOnlyResolution>,
 }
 
@@ -2134,6 +2135,20 @@ impl InterfaceTestOnlyResolutions {
         self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.member_scope_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -10343,6 +10358,38 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<InterfaceTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_interface_test_only_paths_inner(collection, module_tree, snapshot, None)
+    }
+
+    /// Resolves interface declaration and resource-method type paths through
+    /// a validated active-source member-scope closure.
+    pub fn resolve_interface_test_only_paths_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<InterfaceTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_interface_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_interface_test_only_paths_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<InterfaceTestOnlyResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -10357,8 +10404,22 @@ impl RootDatabase {
             .copied()
             .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
             .collect::<Vec<_>>();
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let mut owners = Vec::with_capacity(descriptors.len());
 
@@ -10745,6 +10806,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -20796,7 +20859,14 @@ mod tests {
                       use acme:check/local as local\n\
                       use acme:check/local.{Array}\n\
                       use acme:leaf/model as leaf_model\n\
-                      interface api { type Request = U32 }\n\
+                      interface api {\n\
+                        type Request = U32\n\
+                        type Qualified = middle.api.PublicType\n\
+                        fn foreign_interface_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType\n\
+                        resource Remote {\n\
+                          fn foreign_resource_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType\n\
+                        }\n\
+                      }\n\
                       type FromInterface = api.Request\n\
                       type FromLocalModule = local.LocalType\n\
                       type Record {\n\
@@ -21872,9 +21942,13 @@ mod tests {
                 _ => None,
             })
             .expect("private transitive member is rejected");
-        let private_start = source_text
-            .find("private: leaf_model.PrivateType")
-            .expect("private name is in root source")
+        let record_start = source_text
+            .find("type Record")
+            .expect("record declaration is in root source");
+        let private_start = record_start
+            + source_text[record_start..]
+                .find("private: leaf_model.PrivateType")
+                .expect("record contains the private member")
             + "private: leaf_model.".len();
         assert_eq!(
             private_span.range,
@@ -22128,6 +22202,127 @@ mod tests {
                 .filter(|path| path.segment_count > 1)
                 .all(|path| path.base == Res::Err && path.resolved_segments == 1),
             "an error head does not cascade into suffix member errors"
+        );
+
+        let interface_results = database
+            .resolve_interface_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("interface member paths resolve through transitive member scopes");
+        let interface_parsed = database
+            .parse_file(&snapshot, root_tree.modules[0].file)
+            .expect("root interface source parses");
+        let interface_start = source_text
+            .find("interface api")
+            .expect("interface source exists");
+        let following_item_start = source_text
+            .find("type FromInterface")
+            .expect("the next top-level type follows the interface");
+        assert!(
+            interface_parsed.errors.iter().all(|diagnostic| {
+                diagnostic.primary().is_none_or(|primary| {
+                    let start = primary.span.range.start().to_usize();
+                    start < interface_start || start >= following_item_start
+                })
+            }),
+            "the transitive interface fixture parses without errors: {:?}",
+            interface_parsed.errors
+        );
+        assert!(interface_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            interface_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_interface_test_only_paths_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(
+            interface_results.owners().len(),
+            1,
+            "the fixture keeps one interface owner and independent child results"
+        );
+        let foreign_interface = &interface_results.owners()[0];
+        assert!(foreign_interface.error().is_none());
+        assert_eq!(
+            foreign_interface
+                .members()
+                .iter()
+                .map(InterfaceMemberTestOnlyResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                InterfaceMemberKind::Alias,
+                InterfaceMemberKind::Alias,
+                InterfaceMemberKind::Function,
+                InterfaceMemberKind::Resource,
+            ]
+        );
+        let interface_alias_paths = foreign_interface.members()[1]
+            .type_path_resolution()
+            .expect("interface alias type paths resolve through the closure");
+        assert!(
+            interface_alias_paths.paths().values().any(|path| {
+                path.base == expected_deep_public_type
+                    && path.resolved_segments == 3
+                    && path.segment_count == 3
+            }),
+            "interface associated type paths resolve to the canonical deep DefId"
+        );
+        assert!(
+            interface_alias_paths.module_path_errors().is_empty(),
+            "the public transitive interface alias produces no member lookup errors"
+        );
+        let interface_function_paths = foreign_interface.members()[2]
+            .type_path_resolution()
+            .expect("interface function type paths resolve through the closure");
+        let interface_function_start = source_text
+            .find("fn foreign_interface_member")
+            .expect("transitive interface function appears in the root source");
+        let interface_function_line_start = source_text[..interface_function_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let interface_function_line_end = source_text[interface_function_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| interface_function_start + index);
+        assert_foreign_predicate_paths(
+            interface_function_paths,
+            &source_text[interface_function_line_start..interface_function_line_end],
+            interface_function_line_start,
+        );
+        let interface_resource = &foreign_interface.members()[3];
+        assert!(interface_resource.resource_methods_error().is_none());
+        assert_eq!(interface_resource.resource_methods().len(), 1);
+        let interface_resource_method = &interface_resource.resource_methods()[0];
+        assert_eq!(
+            interface_resource_method.resource_owner(),
+            interface_resource.owner()
+        );
+        let resource_method_paths = interface_resource_method
+            .type_path_resolution()
+            .expect("interface resource method type paths resolve through the closure");
+        let resource_method_start = source_text
+            .find("fn foreign_resource_member")
+            .expect("transitive resource method appears in the root source");
+        let resource_method_line_start = source_text[..resource_method_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let resource_method_line_end = source_text[resource_method_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| resource_method_start + index);
+        assert_foreign_predicate_paths(
+            resource_method_paths,
+            &source_text[resource_method_line_start..resource_method_line_end],
+            resource_method_line_start,
         );
 
         let changed_graph = PackageGraph::new(
