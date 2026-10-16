@@ -380,6 +380,13 @@ entry point and expression/predicate channels remain unchanged. A bodyless
 extern signature regression covers transitive public lookup, foreign private
 and missing member errors, closure provenance, and collection mismatch.
 
+**Trait/impl header type paths over validated source closures (IR-568).**
+Trait and impl header type paths now use the validated active-source closure
+and retain its fingerprint in their result wrapper. Package-local behavior
+remains available. Regressions cover a trait generic bound, an impl trait
+target and self type, an interface-impl target, and a `where` bound through a
+transitive-only package, including foreign private and missing member errors.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
