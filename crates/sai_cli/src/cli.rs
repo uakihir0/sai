@@ -4449,6 +4449,14 @@ fn module_tree_workspace_check_diagnostics(
                         &member_scopes,
                     )
                     .map_err(|error| format!("trait/impl header analysis failed: {error:?}"))?;
+                let trait_impl_member_resolutions = database
+                    .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                    )
+                    .map_err(|error| format!("trait/impl member analysis failed: {error:?}"))?;
                 let mut owner_diagnostics = Vec::new();
                 for owner in resolutions.owners() {
                     match owner.module_path_diagnostics() {
@@ -4541,6 +4549,39 @@ fn module_tree_workspace_check_diagnostics(
                                 Some(&input.package_identity),
                             ));
                             errors = errors.saturating_add(1);
+                        }
+                    }
+                }
+                for owner in trait_impl_member_resolutions.owners() {
+                    if let Some(error) = owner.error() {
+                        diagnostics.push(check_diagnostic_with_package(
+                            check_internal_diagnostic(
+                                &format!("trait/impl owner analysis failed: {error:?}"),
+                                None,
+                            ),
+                            Some(&input.package_identity),
+                        ));
+                        errors = errors.saturating_add(1);
+                        continue;
+                    }
+                    for member in owner.members() {
+                        match member.module_path_diagnostics() {
+                            Ok(Some(diagnostics_for_owner)) => {
+                                owner_diagnostics.extend(diagnostics_for_owner.iter().cloned())
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                diagnostics.push(check_diagnostic_with_package(
+                                    check_internal_diagnostic(
+                                        &format!(
+                                            "trait/impl member type path processing failed: {error:?}"
+                                        ),
+                                        None,
+                                    ),
+                                    Some(&input.package_identity),
+                                ));
+                                errors = errors.saturating_add(1);
+                            }
                         }
                     }
                 }

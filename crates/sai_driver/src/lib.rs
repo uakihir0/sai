@@ -1861,6 +1861,7 @@ pub struct TraitImplMemberTestOnlyResolution {
     owner: OwnerId,
     kind: TraitImplMemberKind,
     type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
@@ -1885,6 +1886,19 @@ impl TraitImplMemberTestOnlyResolution {
         &self,
     ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
         self.type_path_resolution.as_ref()
+    }
+
+    /// Returns snapshot-bound type member diagnostics for this associated
+    /// declaration when analyzed with a validated active-source closure.
+    ///
+    /// Package-local adapters leave this channel absent so callers can keep
+    /// mapping their typed path results with their own snapshot context.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn test_only_path_resolution(
@@ -10567,6 +10581,7 @@ impl RootDatabase {
                         owner: member_owner,
                         kind,
                         type_path_resolution,
+                        module_path_diagnostics: Ok(None),
                         test_only_path_resolution,
                         test_only_diagnostics,
                         local_resolution,
@@ -10578,7 +10593,26 @@ impl RootDatabase {
             })();
 
             match analysis {
-                Ok((members, lowering_diagnostics)) => {
+                Ok((mut members, lowering_diagnostics)) => {
+                    if let Some(member_scopes) = member_scopes {
+                        for member in &mut members {
+                            member.module_path_diagnostics =
+                                match member.type_path_resolution.as_ref() {
+                                    Ok(path_resolution) => self
+                                        .type_owner_module_path_diagnostics(
+                                            member.owner,
+                                            path_resolution,
+                                            &inputs,
+                                            Some(&module_members),
+                                            snapshot,
+                                            &collection.target_cfg,
+                                            Some(member_scopes),
+                                        )
+                                        .map(Some),
+                                    Err(error) => Err(error.clone()),
+                                };
+                        }
+                    }
                     owners.push(TraitImplMemberOwnerResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
@@ -21184,10 +21218,12 @@ mod tests {
                       }\n\
                       trait ForeignHeader<Public: middle.api.PublicType, Private: leaf_model.PrivateType, Missing: middle.api.PublicTypo> {\n\
                         type ForeignAssociated: middle.api.PublicType\n\
+                        type ForeignMissingAssociated: middle.api.PublicTypo\n\
                         fn foreign_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo)\n\
                       }\n\
                       impl middle.api.PublicType for leaf_model.PrivateType where Self: middle.api.PublicTypo {\n\
                         type ForeignImplAssociated = middle.api.PublicType\n\
+                        type ForeignMissingImplAssociated = middle.api.PublicTypo\n\
                         fn foreign_impl_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) {}\n\
                       }\n\
                       impl middle.api {}\n\
@@ -22153,6 +22189,30 @@ mod tests {
                     "suggestions use the visible transitive target members"
                 );
             };
+        let assert_missing_type_member_diagnostic =
+            |diagnostics: &[Diagnostic], source: &str, source_offset: usize| {
+                assert_eq!(diagnostics.len(), 1);
+                let missing_span =
+                    member_range(source, source_offset, "middle.api.PublicTypo", "PublicTypo");
+                let missing = diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnresolvedName)
+                    .expect("missing type becomes UNRESOLVED_NAME");
+                assert_eq!(
+                    missing.primary().map(|location| &location.span),
+                    Some(&sai_diagnostics::Span::new(
+                        root_tree.modules[0].file,
+                        missing_span
+                    ))
+                );
+                assert_eq!(
+                    missing.data.get("candidates"),
+                    Some(&sai_diagnostics::Value::Array(vec![
+                        sai_diagnostics::Value::String("PublicType".to_owned())
+                    ])),
+                    "suggestions use the visible transitive target members"
+                );
+            };
         let assert_predicate_path_diagnostics =
             |owner: &PredicateOwnerResolution, source: &str, source_offset: usize| {
                 let diagnostics = owner
@@ -22326,13 +22386,14 @@ mod tests {
             "trait and both impl owners keep independent member collections"
         );
         let trait_members = member_results.owners()[0].members();
-        assert_eq!(trait_members.len(), 2);
+        assert_eq!(trait_members.len(), 3);
         assert_eq!(
             trait_members
                 .iter()
                 .map(|member| member.kind())
                 .collect::<Vec<_>>(),
             [
+                TraitImplMemberKind::TraitAssociatedType,
                 TraitImplMemberKind::TraitAssociatedType,
                 TraitImplMemberKind::TraitMethod
             ]
@@ -22348,6 +22409,32 @@ mod tests {
                     && path.segment_count == 3),
             "trait associated type bounds resolve through the transitive interface"
         );
+        let trait_associated_start = source_text
+            .find("type ForeignMissingAssociated")
+            .expect("transitive trait associated type appears in the root source");
+        let trait_associated_line_start = source_text[..trait_associated_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let trait_associated_line_end = source_text[trait_associated_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| trait_associated_start + index);
+        assert_missing_type_member_diagnostic(
+            trait_members[1]
+                .module_path_diagnostics()
+                .expect("trait associated type diagnostics resolve")
+                .expect("the closure-aware member adapter maps type failures"),
+            &source_text[trait_associated_line_start..trait_associated_line_end],
+            trait_associated_line_start,
+        );
+        assert!(
+            trait_members[1]
+                .type_path_resolution()
+                .expect("trait associated type paths resolve")
+                .module_path_errors()
+                .iter()
+                .any(|error| matches!(error.error(), ModulePathError::MissingMember { .. })),
+            "trait associated type keeps its typed missing-member failure"
+        );
         assert!(
             trait_members[0]
                 .type_path_resolution()
@@ -22355,7 +22442,7 @@ mod tests {
                 .module_path_errors()
                 .is_empty()
         );
-        let trait_method_paths = trait_members[1]
+        let trait_method_paths = trait_members[2]
             .type_path_resolution()
             .expect("trait method type paths resolve");
         let trait_method_start = source_text
@@ -22372,15 +22459,42 @@ mod tests {
             &source_text[trait_method_line_start..trait_method_line_end],
             trait_method_line_start,
         );
+        assert_type_member_diagnostics(
+            trait_members[2]
+                .module_path_diagnostics()
+                .expect("trait method member diagnostics resolve")
+                .expect("the closure-aware member adapter maps type failures"),
+            &source_text[trait_method_line_start..trait_method_line_end],
+            trait_method_line_start,
+        );
+        assert!(
+            trait_members[0]
+                .module_path_diagnostics()
+                .expect("trait associated type diagnostics resolve")
+                .expect("closure-aware associated type diagnostics are available")
+                .is_empty(),
+            "valid associated type bounds produce no mapped path diagnostics"
+        );
+        let package_local_members = database
+            .resolve_trait_impl_member_test_only_paths(&root_collection, &root_tree, &snapshot)
+            .expect("package-local trait and impl members remain available");
+        assert!(
+            package_local_members.owners()[0].members()[2]
+                .module_path_diagnostics()
+                .expect("package-local member diagnostic channel remains healthy")
+                .is_none(),
+            "package-local callers receive no snapshot-bound mapped member diagnostics"
+        );
 
         let impl_members = member_results.owners()[1].members();
-        assert_eq!(impl_members.len(), 2);
+        assert_eq!(impl_members.len(), 3);
         assert_eq!(
             impl_members
                 .iter()
                 .map(|member| member.kind())
                 .collect::<Vec<_>>(),
             [
+                TraitImplMemberKind::ImplAssociatedType,
                 TraitImplMemberKind::ImplAssociatedType,
                 TraitImplMemberKind::ImplMethod
             ]
@@ -22396,6 +22510,32 @@ mod tests {
                     && path.segment_count == 3),
             "impl associated type definitions resolve through the transitive interface"
         );
+        let impl_associated_start = source_text
+            .find("type ForeignMissingImplAssociated")
+            .expect("transitive impl associated type appears in the root source");
+        let impl_associated_line_start = source_text[..impl_associated_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let impl_associated_line_end = source_text[impl_associated_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| impl_associated_start + index);
+        assert_missing_type_member_diagnostic(
+            impl_members[1]
+                .module_path_diagnostics()
+                .expect("impl associated type diagnostics resolve")
+                .expect("the closure-aware member adapter maps type failures"),
+            &source_text[impl_associated_line_start..impl_associated_line_end],
+            impl_associated_line_start,
+        );
+        assert!(
+            impl_members[1]
+                .type_path_resolution()
+                .expect("impl associated type paths resolve")
+                .module_path_errors()
+                .iter()
+                .any(|error| matches!(error.error(), ModulePathError::MissingMember { .. })),
+            "impl associated type keeps its typed missing-member failure"
+        );
         assert!(
             impl_members[0]
                 .type_path_resolution()
@@ -22403,7 +22543,7 @@ mod tests {
                 .module_path_errors()
                 .is_empty()
         );
-        let impl_method_paths = impl_members[1]
+        let impl_method_paths = impl_members[2]
             .type_path_resolution()
             .expect("impl method type paths resolve");
         let impl_method_start = source_text
@@ -22419,6 +22559,22 @@ mod tests {
             impl_method_paths,
             &source_text[impl_method_line_start..impl_method_line_end],
             impl_method_line_start,
+        );
+        assert_type_member_diagnostics(
+            impl_members[2]
+                .module_path_diagnostics()
+                .expect("impl method member diagnostics resolve")
+                .expect("the closure-aware member adapter maps type failures"),
+            &source_text[impl_method_line_start..impl_method_line_end],
+            impl_method_line_start,
+        );
+        assert!(
+            impl_members[0]
+                .module_path_diagnostics()
+                .expect("impl associated type diagnostics resolve")
+                .expect("closure-aware associated type diagnostics are available")
+                .is_empty(),
+            "valid associated type definitions produce no mapped path diagnostics"
         );
 
         let extern_results = database

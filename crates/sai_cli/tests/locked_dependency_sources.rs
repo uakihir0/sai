@@ -278,8 +278,16 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         "unsafe extern \"wasm\" module \"env\" {\n",
         "  fn transitive_extern(missing: middle.api.PublicTypo)\n",
         "}\n",
-        "trait RootHeader<Missing: middle.api.PublicTypo> {}\n",
-        "impl middle.api.PublicType for middle.api.PublicType where Self: middle.api.PublicTypo {}\n",
+        "trait RootHeader<Missing: middle.api.PublicTypo> {\n",
+        "  type RootAssociated: middle.api.PublicType\n",
+        "  type RootMissingAssociated: middle.api.PublicTypo\n",
+        "  fn root_trait_member(missing: middle.api.PublicTypo)\n",
+        "}\n",
+        "impl middle.api.PublicType for middle.api.PublicType where Self: middle.api.PublicTypo {\n",
+        "  type RootImplAssociated = middle.api.PublicType\n",
+        "  type RootMissingImplAssociated = middle.api.PublicTypo\n",
+        "  fn root_impl_member(missing: middle.api.PublicTypo) {}\n",
+        "}\n",
     );
     fs::write(root.join("src/lib.sai"), root_source).expect("write root source");
     fs::write(
@@ -560,7 +568,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
         .collect::<Vec<_>>();
-    assert_eq!(unresolved_diagnostics.len(), 14, "{stdout}");
+    assert_eq!(unresolved_diagnostics.len(), 18, "{stdout}");
     for (owner_name, owner_source) in [
         ("invariant", "invariant U32"),
         ("refined type", "type MiddleRefined"),
@@ -671,6 +679,10 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             "impl header",
             "impl middle.api.PublicType for middle.api.PublicType",
         ),
+        ("trait member", "fn root_trait_member"),
+        ("impl member", "fn root_impl_member"),
+        ("trait associated type", "type RootMissingAssociated"),
+        ("impl associated type", "type RootMissingImplAssociated"),
     ] {
         let owner_start = root_source
             .find(owner_source)
