@@ -1232,3 +1232,9 @@ The codes below are defined in [spec/13](../spec/13-components-and-wit.md) or in
 | `MISSING_EFFECTS_DECLARATION` | error | defined in [spec/08](../spec/08-effects-and-capabilities.md) §8.9.3; reported by [08](08-effect-and-capability-analysis.md) for exposed functions (§16.7.2) |
 | `FEATURE_NOT_IMPLEMENTED` | error | defined in [spec/01](../spec/01-introduction.md) §1.4.5; `async` items and their uses before Stage 5 (§16.1.5, §16.3.3) |
 | `INTERNAL_COMPILER_ERROR` | error | defined in [spec/01](../spec/01-introduction.md) §1.10; a failure to load an embedded or generated unit (§16.2.2) |
+
+## Implementation progress
+
+### IR-580: Deterministic in-memory WIT source loading
+
+`sai_wit` now owns the WIT unit identity and an in-memory loader for VFS-provided direct-child `.wit` files. It sorts filenames by bytes, rejects duplicate and nested paths, reports invalid UTF-8 at the first byte, and maps `wit-parser` syntax spans back to the originating relative filename and byte range without reading the filesystem. The loader's parsed package group remains an intermediate value; package-graph closure resolution, package identity validation, the parser-independent model, and view definitions remain future steps. The selected `wit-parser` 0.246.0 uses Unicode 16.0.0 identifier tables and supports the workspace Rust 1.85 minimum.
