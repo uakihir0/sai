@@ -5092,6 +5092,7 @@ fn module_tree_workspace_check_diagnostics(
                 .diagnostics
                 .iter()
                 .chain(collection.interface_uses().diagnostics.iter())
+                .chain(collection.interface_check_diagnostics().iter())
                 .cloned()
                 .collect::<Vec<_>>();
             let (package_analysis_diagnostics, package_errors, package_warnings, package_infos) =

@@ -2233,6 +2233,7 @@ pub struct Phase1PackageScopesCollection {
     package_wit_names_fingerprint: Fingerprint,
     interface_uses: InterfaceUses,
     interface_uses_fingerprint: Fingerprint,
+    interface_check_diagnostics: Vec<Diagnostic>,
     input_fingerprint: Fingerprint,
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
@@ -2287,6 +2288,12 @@ impl Phase1PackageScopesCollection {
     /// definition paths, never the session-local order of the graph maps.
     pub const fn interface_uses_fingerprint(&self) -> Fingerprint {
         self.interface_uses_fingerprint
+    }
+
+    /// Snapshot-bound interface-item diagnostics derived while collecting
+    /// local interface owners.
+    pub fn interface_check_diagnostics(&self) -> &[Diagnostic] {
+        &self.interface_check_diagnostics
     }
 
     pub const fn build_context(&self) -> Phase1BuildContext {
@@ -8134,7 +8141,7 @@ impl RootDatabase {
             .package_wit_names
             .get(&mut self.query_database, package_key.clone(), snapshot)
             .map_err(Phase1CollectionError::PackageWitNamesQuery)?;
-        let (interface_uses, interface_uses_fingerprint) = self
+        let (interface_uses, interface_uses_fingerprint, interface_check_diagnostics) = self
             .interface_uses
             .get(&mut self.query_database, package_key.clone(), snapshot)
             .map_err(Phase1CollectionError::InterfaceUsesQuery)?;
@@ -8159,6 +8166,7 @@ impl RootDatabase {
             package_wit_names_fingerprint,
             interface_uses,
             interface_uses_fingerprint,
+            interface_check_diagnostics,
             input_fingerprint: output.input_fingerprint,
             snapshot_id: snapshot.id(),
             target_cfg: target_cfg.clone(),
@@ -27307,6 +27315,106 @@ mod tests {
             collection.interface_uses_fingerprint(),
             Fingerprint::default(),
             "tracked interface uses have a stable result fingerprint"
+        );
+    }
+
+    #[test]
+    fn interface_check_collection_binds_empty_type_diagnostics_to_the_snapshot() {
+        let root = concat!(
+            "pub interface codec {\n",
+            "  type EmptyRecord {}\n",
+            "  enum EmptyEnum {}\n",
+            "  type NonEmptyRecord { value: U32 }\n",
+            "  enum NonEmptyEnum { Ready }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let diagnostics = collection.interface_check_diagnostics();
+
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitEmptyType)
+        );
+        let primary_starts = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("empty type diagnostic has a primary location")
+                    .span
+                    .range
+                    .start()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            primary_starts[0] < primary_starts[1],
+            "empty record precedes empty enum in source order"
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("empty type diagnostic has a primary location")
+                    .file
+                    .snapshot
+                    == Some(17)
+            }),
+            "detached checks must bind to the current workspace snapshot"
+        );
+        let package_key = collection.package_key().clone();
+        let cached_interface_uses = database
+            .interface_uses
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("interface-use query memo is available");
+        let fingerprint = collection.interface_uses_fingerprint();
+
+        let newer_snapshot = snapshot_with_version(&snapshot, 18);
+        let rebound_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &newer_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("the same interface checks collect for a newer snapshot");
+        let rebound_diagnostics = rebound_collection.interface_check_diagnostics();
+        assert_eq!(rebound_diagnostics.len(), 2, "{rebound_diagnostics:?}");
+        assert!(
+            rebound_diagnostics.iter().all(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("empty type diagnostic has a primary location")
+                    .file
+                    .snapshot
+                    == Some(18)
+            }),
+            "cached interface-check diagnostics must bind to the newer snapshot"
+        );
+        assert_eq!(
+            rebound_collection.interface_uses_fingerprint(),
+            fingerprint,
+            "rebinding diagnostic locations must preserve the stable query result"
+        );
+        let rebound_interface_uses = database
+            .interface_uses
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("interface-use query memo remains available");
+        assert!(
+            Arc::ptr_eq(&cached_interface_uses, &rebound_interface_uses),
+            "version-only snapshot changes must reuse the detached diagnostic memo"
         );
     }
 

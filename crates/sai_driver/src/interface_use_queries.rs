@@ -9,7 +9,7 @@ use super::{
     owner_test_only_path_candidates, owner_type_generic_resolutions,
     resolve_partial_type_owner_paths,
 };
-use sai_diagnostics::{Diagnostic, Location, SourceRef};
+use sai_diagnostics::{Diagnostic, Location, Severity, SourceRef};
 use sai_hir::arena::HirArena;
 use sai_hir::item_tree::ItemTreeKind;
 use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, OwnerNode};
@@ -22,6 +22,7 @@ use sai_resolve::package_scopes::{
 };
 use sai_resolve::{InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
+use sai_ty::iface::interface_item_check;
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -41,6 +42,7 @@ pub enum InterfaceUsesQueryError {
 struct InterfaceUsesMemo {
     graph: InterfaceUses,
     diagnostics: Vec<DetachedWorkspaceDiagnostic>,
+    interface_check_diagnostics: Vec<DetachedWorkspaceDiagnostic>,
 }
 
 impl PartialEq for InterfaceUsesMemo {
@@ -48,6 +50,7 @@ impl PartialEq for InterfaceUsesMemo {
         self.graph.uses == other.graph.uses
             && self.graph.cyclic == other.graph.cyclic
             && self.diagnostics == other.diagnostics
+            && self.interface_check_diagnostics == other.interface_check_diagnostics
     }
 }
 
@@ -117,10 +120,16 @@ impl InterfaceUsesQueries {
                     &primitive_prelude,
                     &symbols,
                 )
-                .and_then(|input| {
+                .and_then(|(input, interface_check_diagnostics)| {
                     let graph = interface_uses(input.clone());
                     let result_fingerprint = stable_interface_uses_fingerprint(
-                        key, &input, &graph, &prepared, &packages, &symbols,
+                        key,
+                        &input,
+                        &graph,
+                        &interface_check_diagnostics,
+                        &prepared,
+                        &packages,
+                        &symbols,
                     )?;
                     let mut graph = graph;
                     let diagnostics = std::mem::take(&mut graph.diagnostics)
@@ -136,7 +145,27 @@ impl InterfaceUsesQueries {
                             Ok(detached)
                         })
                         .collect::<Result<Vec<_>, InterfaceUsesQueryError>>()?;
-                    Ok((InterfaceUsesMemo { graph, diagnostics }, result_fingerprint))
+                    let interface_check_diagnostics = interface_check_diagnostics
+                        .iter()
+                        .map(|diagnostic| {
+                            let mut detached = DetachedWorkspaceDiagnostic::from_diagnostic(
+                                diagnostic,
+                            )
+                            .map_err(|error| {
+                                InterfaceUsesQueryError::DiagnosticTemplate(format!("{error:?}"))
+                            })?;
+                            clear_document_versions(&mut detached);
+                            Ok(detached)
+                        })
+                        .collect::<Result<Vec<_>, InterfaceUsesQueryError>>()?;
+                    Ok((
+                        InterfaceUsesMemo {
+                            graph,
+                            diagnostics,
+                            interface_check_diagnostics,
+                        },
+                        result_fingerprint,
+                    ))
                 });
                 let (result, result_fingerprint) = match result {
                     Ok((memo, fingerprint)) => (Ok(memo), fingerprint),
@@ -159,7 +188,7 @@ impl InterfaceUsesQueries {
         database: &mut QueryDatabase,
         key: PackageKey,
         snapshot: &WorkspaceSnapshot,
-    ) -> Result<(InterfaceUses, Fingerprint), InterfaceUsesQueryError> {
+    ) -> Result<(InterfaceUses, Fingerprint, Vec<Diagnostic>), InterfaceUsesQueryError> {
         let output = self
             .query
             .get(database, key)
@@ -172,7 +201,17 @@ impl InterfaceUsesQueries {
             .map(|diagnostic| bind_current_snapshot(diagnostic, snapshot))
             .collect::<Result<Vec<_>, _>>()
             .map_err(InterfaceUsesQueryError::PackageScopes)?;
-        Ok((graph, output.result_fingerprint))
+        let interface_check_diagnostics = memo
+            .interface_check_diagnostics
+            .iter()
+            .map(|diagnostic| bind_current_snapshot(diagnostic, snapshot))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(InterfaceUsesQueryError::PackageScopes)?;
+        Ok((
+            graph,
+            output.result_fingerprint,
+            interface_check_diagnostics,
+        ))
     }
 }
 
@@ -182,7 +221,7 @@ fn collect_interface_uses_input(
     scopes: &Phase1PackageScopes,
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     symbols: &Interner,
-) -> Result<InterfaceUsesInput, InterfaceUsesQueryError> {
+) -> Result<(InterfaceUsesInput, Vec<Diagnostic>), InterfaceUsesQueryError> {
     let descriptors = interface_generation_order(
         &prepared.module_tree,
         scopes
@@ -219,6 +258,7 @@ fn collect_interface_uses_input(
 
     let mut package_identity = None;
     let mut references = Vec::<InterfaceUseReference>::new();
+    let mut interface_check_diagnostics = Vec::new();
     let interface_ids = descriptors
         .iter()
         .map(|descriptor| descriptor.owner.def_id)
@@ -353,6 +393,36 @@ fn collect_interface_uses_input(
             )
             .map_err(OwnerControlFlowResolutionError::Lowering)
             .map_err(InterfaceUsesQueryError::Collection)?;
+            if let Some(issue) = interface_item_check(&member_hir) {
+                let snapshot_file = prepared.snapshot.file(issue.span.file).ok_or_else(|| {
+                    InterfaceUsesQueryError::Collection(
+                        OwnerControlFlowResolutionError::MissingSnapshotFile(issue.span.file),
+                    )
+                })?;
+                let location = Location::from_decoded_source(
+                    SourceRef {
+                        path: inputs.source_ref.path.clone(),
+                        package: inputs.source_ref.package.clone(),
+                        snapshot: inputs.source_ref.snapshot,
+                    },
+                    sai_diagnostics::Span::new(issue.span.file, issue.span.range),
+                    &inputs.source,
+                )
+                .ok_or_else(|| {
+                    InterfaceUsesQueryError::Collection(
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),
+                    )
+                })?;
+                let mut diagnostic = Diagnostic::new(
+                    issue.code,
+                    Severity::Error,
+                    "WIT interface types must not be empty",
+                    Some(location),
+                );
+                diagnostic.primary_label = "empty WIT interface type".to_owned();
+                diagnostic.package = snapshot_file.package().map(str::to_owned);
+                interface_check_diagnostics.push(diagnostic);
+            }
             let kind = interface_member_kind(entry.kind).ok_or_else(|| {
                 InterfaceUsesQueryError::Collection(OwnerControlFlowResolutionError::Lowering(
                     sai_hir::lower::HirLoweringError::ItemTreeEntryMismatch,
@@ -465,11 +535,14 @@ fn collect_interface_uses_input(
     for reference in &mut references {
         reference.location.file.snapshot = None;
     }
-    Ok(InterfaceUsesInput {
-        package,
-        interfaces: interface_ids,
-        references,
-    })
+    Ok((
+        InterfaceUsesInput {
+            package,
+            interfaces: interface_ids,
+            references,
+        },
+        interface_check_diagnostics,
+    ))
 }
 
 fn collect_owner_references(
@@ -559,6 +632,7 @@ fn stable_interface_uses_fingerprint(
     package_key: &PackageKey,
     input: &InterfaceUsesInput,
     graph: &InterfaceUses,
+    interface_check_diagnostics: &[Diagnostic],
     prepared: &PreparedPhase1PackageScopes,
     packages: &PackageInterner,
     symbols: &Interner,
@@ -624,6 +698,12 @@ fn stable_interface_uses_fingerprint(
             child.message.stable_hash(&mut hasher);
             hash_optional_location(child.location.as_ref(), &sources, &mut hasher)?;
         }
+    }
+    hasher.write_len(u64::try_from(interface_check_diagnostics.len()).unwrap_or(u64::MAX));
+    for diagnostic in interface_check_diagnostics {
+        diagnostic.code.as_str().stable_hash(&mut hasher);
+        diagnostic.message.stable_hash(&mut hasher);
+        hash_optional_location(diagnostic.primary(), &sources, &mut hasher)?;
     }
     Ok(hasher.finish())
 }

@@ -233,3 +233,81 @@ fn check_reports_package_wit_name_collisions_and_counts_them() {
         "{stdout}"
     );
 }
+
+#[test]
+fn check_reports_empty_interface_records_and_enums() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    fs::write(
+        source_directory.join("lib.sai"),
+        concat!(
+            "pub interface api {\n",
+            "    type EmptyRecord {}\n",
+            "    enum EmptyEnum {}\n",
+            "    type NonEmptyRecord { value: U32 }\n",
+            "    enum NonEmptyEnum { Ready }\n",
+            "}\n"
+        ),
+    )
+    .expect("write empty and nonempty interface types");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let empty_types = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_EMPTY_TYPE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(empty_types.len(), 2, "{stdout}");
+    assert!(
+        empty_types[0].contains("\"primary_label\":\"empty WIT interface type\""),
+        "{}",
+        empty_types[0]
+    );
+    assert!(
+        empty_types[0].contains("\"primary\":{\"file\":{\"path\":\"src/lib.sai\""),
+        "{}",
+        empty_types[0]
+    );
+    assert!(
+        empty_types[0].contains("\"start\":{\"byte\":29,\"line\":2,"),
+        "{}",
+        empty_types[0]
+    );
+    assert!(
+        empty_types[1].contains("\"primary\":{\"file\":{\"path\":\"src/lib.sai\""),
+        "{}",
+        empty_types[1]
+    );
+    assert!(
+        empty_types[1].contains("\"start\":{\"byte\":53,\"line\":3,"),
+        "{}",
+        empty_types[1]
+    );
+    assert!(
+        stdout.contains("\"type\":\"summary\",\"errors\":3,"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"stage\":0,\"feature\":\"sai check\""),
+        "{stdout}"
+    );
+}

@@ -13,6 +13,7 @@ members = [
     "crates/sai_resolve",
     "crates/sai_stable_hash",
     "crates/sai_syntax",
+    "crates/sai_ty",
     "crates/sai_windows_fs",
     "crates/sai_vfs",
     "vendor/gix-protocol-0.65.1",
