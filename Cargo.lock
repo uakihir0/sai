@@ -3186,6 +3186,8 @@ dependencies = [
  "sai_hir",
  "sai_intern",
  "sai_package",
+ "sai_stable_hash",
+ "unicode-ident",
  "wit-parser",
 ]
 

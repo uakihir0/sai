@@ -1,19 +1,183 @@
 #![forbid(unsafe_code)]
 
+mod convert;
+mod model;
+mod source_scan;
+mod stable_hash;
+
+pub use convert::*;
+pub use model::*;
+
 use sai_hir::{PackageId, Symbol};
+use sai_intern::{Interner, LookupError, PackageIdError, PackageInterner};
+use sai_package::{mvs::MvsPackageVersion, version::Version};
+use sai_stable_hash::{StableHash, StableHasher};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::Arc;
 use wit_parser::{ParseError, SourceMap, UnresolvedPackageGroup};
+
+const EMBEDDED_WASI_PACKAGES: [&str; 7] = [
+    "cli",
+    "clocks",
+    "filesystem",
+    "http",
+    "io",
+    "random",
+    "sockets",
+];
+const EMBEDDED_WASI_VERSION: &str = "0.2.3";
 
 /// The WIT unit through which a package is viewed.
 ///
 /// Package IDs and symbols are session-local. Persistent view identities are
 /// derived from canonical package keys and WIT names instead.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum WitUnit {
+pub enum WitUnitKind {
     Wasi { package: Symbol },
-    Dir(PackageId),
-    Generated(PackageId),
+    Dir { package: PackageId },
+    Generated { package: PackageId },
+}
+
+#[derive(Clone, Debug)]
+pub struct WitUnit {
+    kind: WitUnitKind,
+    stable_key: Arc<str>,
+    canonical_name: Arc<str>,
+}
+
+impl PartialEq for WitUnit {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity_tag() == other.identity_tag() && self.stable_key == other.stable_key
+    }
+}
+
+impl Eq for WitUnit {}
+
+impl Hash for WitUnit {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity_tag().hash(state);
+        self.stable_key.hash(state);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WitUnitIdentityError {
+    UnknownPackage(PackageIdError),
+    UnknownSymbol(LookupError),
+    UnknownWasiPackage,
+    UnsupportedWasiVersion,
+    PackageKeyMismatch,
+}
+
+impl WitUnit {
+    pub fn wasi(
+        package: Symbol,
+        symbols: &Interner,
+        version: &Version,
+    ) -> Result<Self, WitUnitIdentityError> {
+        let name = symbols
+            .resolve(package)
+            .map_err(WitUnitIdentityError::UnknownSymbol)?;
+        if !EMBEDDED_WASI_PACKAGES.contains(&name.as_ref()) {
+            return Err(WitUnitIdentityError::UnknownWasiPackage);
+        }
+        if version.to_string() != EMBEDDED_WASI_VERSION {
+            return Err(WitUnitIdentityError::UnsupportedWasiVersion);
+        }
+        let name_with_version = format!("{name}@{version}");
+        Ok(Self {
+            kind: WitUnitKind::Wasi { package },
+            stable_key: Arc::from(format!("wit:wasi:{name_with_version}")),
+            canonical_name: Arc::from(format!("wasi:{name_with_version}")),
+        })
+    }
+
+    pub fn dir(
+        package: PackageId,
+        packages: &PackageInterner,
+        package_version: &MvsPackageVersion,
+    ) -> Result<Self, WitUnitIdentityError> {
+        let package_key = packages
+            .resolve(package)
+            .map_err(WitUnitIdentityError::UnknownPackage)?;
+        let expected_package_key = format!(
+            "{}#{}",
+            package_version.package(),
+            package_version.version().compatibility_line()
+        );
+        if package_key.as_ref() != expected_package_key {
+            return Err(WitUnitIdentityError::PackageKeyMismatch);
+        }
+        let canonical_name = format!(
+            "{}@{}",
+            package_version.package(),
+            package_version.version()
+        );
+        Ok(Self {
+            kind: WitUnitKind::Dir { package },
+            stable_key: Arc::from(format!("wit:dir:{package_key}")),
+            canonical_name: Arc::from(canonical_name),
+        })
+    }
+
+    pub fn generated(
+        package: PackageId,
+        packages: &PackageInterner,
+        package_version: &MvsPackageVersion,
+    ) -> Result<Self, WitUnitIdentityError> {
+        let package_key = packages
+            .resolve(package)
+            .map_err(WitUnitIdentityError::UnknownPackage)?;
+        let expected_package_key = format!(
+            "{}#{}",
+            package_version.package(),
+            package_version.version().compatibility_line()
+        );
+        if package_key.as_ref() != expected_package_key {
+            return Err(WitUnitIdentityError::PackageKeyMismatch);
+        }
+        let canonical_name = format!(
+            "{}@{}",
+            package_version.package(),
+            package_version.version()
+        );
+        Ok(Self {
+            kind: WitUnitKind::Generated { package },
+            stable_key: Arc::from(format!("wit:gen:{package_key}")),
+            canonical_name: Arc::from(canonical_name),
+        })
+    }
+
+    pub fn kind(&self) -> WitUnitKind {
+        self.kind
+    }
+
+    /// Returns the canonical identity used by persistent views and stable hashing.
+    pub fn stable_key(&self) -> &str {
+        &self.stable_key
+    }
+
+    pub fn canonical_name(&self) -> &str {
+        &self.canonical_name
+    }
+
+    fn identity_tag(&self) -> u8 {
+        match self.kind {
+            WitUnitKind::Wasi { .. } => 0x01,
+            WitUnitKind::Dir { .. } => 0x02,
+            WitUnitKind::Generated { .. } => 0x03,
+        }
+    }
+}
+
+impl StableHash for WitUnit {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xB0);
+        hasher.write_tag(self.identity_tag());
+        self.stable_key.stable_hash(hasher);
+    }
 }
 
 /// One VFS-provided WIT file.
@@ -104,6 +268,10 @@ pub struct ParsedWitPackageGroup {
     unit: WitUnit,
     group: UnresolvedPackageGroup,
     source_names: Vec<String>,
+    source_mappings: Vec<WitSourceMapping>,
+    package_name_location: Option<WitSourceLocation>,
+    nested_package_locations: Vec<WitSourceLocation>,
+    named_result_function_spans: Vec<Range<u32>>,
 }
 
 impl fmt::Debug for ParsedWitPackageGroup {
@@ -114,13 +282,15 @@ impl fmt::Debug for ParsedWitPackageGroup {
             .field("main_name", &self.group.main.name)
             .field("nested_count", &self.group.nested.len())
             .field("source_names", &self.source_names)
+            .field("package_name_location", &self.package_name_location)
+            .field("nested_package_locations", &self.nested_package_locations)
             .finish()
     }
 }
 
 impl ParsedWitPackageGroup {
     pub fn unit(&self) -> WitUnit {
-        self.unit
+        self.unit.clone()
     }
 
     pub fn main_name(&self) -> &wit_parser::PackageName {
@@ -155,7 +325,6 @@ pub fn parse_source_files(
 
     let mut previous_path: Option<&str> = None;
     let mut source_size = 0usize;
-    let mut source_mappings = Vec::with_capacity(files.len());
     for file in &files {
         if !is_direct_wit_filename(&file.relative_path) {
             return Err(WitParseError {
@@ -171,7 +340,6 @@ pub fn parse_source_files(
         }
         previous_path = Some(&file.relative_path);
 
-        let source_offset = source_size;
         source_size = source_size
             .checked_add(file.contents.len())
             .and_then(|size| size.checked_add(1))
@@ -180,11 +348,6 @@ pub fn parse_source_files(
                 kind: WitParseErrorKind::InputTooLarge,
                 location: None,
             })?;
-        source_mappings.push(WitSourceMapping {
-            path: file.relative_path.clone(),
-            offset: u32::try_from(source_offset).expect("source size was bounded to u32"),
-            contents_len: file.contents.len(),
-        });
     }
 
     let source_names = files
@@ -192,6 +355,11 @@ pub fn parse_source_files(
         .map(|file| file.relative_path.clone())
         .collect();
     let mut source_map = SourceMap::new();
+    let mut source_mappings = Vec::with_capacity(files.len());
+    let mut parser_size = 0usize;
+    let mut package_name_location = None;
+    let mut nested_package_locations = Vec::new();
+    let mut named_result_function_spans = Vec::new();
     for file in files {
         let contents = String::from_utf8(file.contents).map_err(|error| {
             let valid_up_to = error.utf8_error().valid_up_to();
@@ -204,17 +372,65 @@ pub fn parse_source_files(
                 }),
             }
         })?;
-        source_map.push_str(&file.relative_path, contents);
+        let scan = source_scan::scan_source(&contents);
+        let parser_offset = u32::try_from(parser_size).expect("source size was bounded to u32");
+        parser_size = parser_size
+            .checked_add(scan.parser_text.len())
+            .and_then(|size| size.checked_add(1))
+            .filter(|size| *size <= u32::MAX as usize)
+            .ok_or_else(|| WitParseError {
+                kind: WitParseErrorKind::InputTooLarge,
+                location: None,
+            })?;
+        let mapping = WitSourceMapping {
+            path: file.relative_path.clone(),
+            offset: parser_offset,
+            parser_len: scan.parser_text.len(),
+            parser_to_source: scan.parser_to_source,
+        };
+        if package_name_location.is_none() {
+            package_name_location =
+                scan.package_name_range
+                    .clone()
+                    .map(|range| WitSourceLocation {
+                        path: file.relative_path.clone(),
+                        range,
+                    });
+        }
+        nested_package_locations.extend(scan.nested_package_ranges.into_iter().map(|range| {
+            WitSourceLocation {
+                path: file.relative_path.clone(),
+                range,
+            }
+        }));
+        named_result_function_spans.extend(scan.named_result_function_ranges.into_iter().map(
+            |range| {
+                let start = mapping
+                    .offset
+                    .checked_add(u32::try_from(range.start).expect("file size is bounded"));
+                let end = mapping
+                    .offset
+                    .checked_add(u32::try_from(range.end).expect("file size is bounded"));
+                start.expect("group source spans are bounded")
+                    ..end.expect("group source spans are bounded")
+            },
+        ));
+        source_map.push_str(&file.relative_path, scan.parser_text);
+        source_mappings.push(mapping);
     }
 
-    source_map
-        .parse()
-        .map(|group| ParsedWitPackageGroup {
+    match source_map.parse() {
+        Ok(group) => Ok(ParsedWitPackageGroup {
             unit,
             group,
             source_names,
-        })
-        .map_err(|(_, error)| map_parse_error(&source_mappings, error))
+            source_mappings,
+            package_name_location,
+            nested_package_locations,
+            named_result_function_spans,
+        }),
+        Err((_, error)) => Err(map_parse_error(&source_mappings, error)),
+    }
 }
 
 fn is_direct_wit_filename(path: &str) -> bool {
@@ -231,10 +447,12 @@ fn is_direct_wit_filename(path: &str) -> bool {
         && path != ".."
 }
 
+#[derive(Clone, Debug)]
 struct WitSourceMapping {
     path: String,
     offset: u32,
-    contents_len: usize,
+    parser_len: usize,
+    parser_to_source: Vec<usize>,
 }
 
 fn map_parse_error(sources: &[WitSourceMapping], error: ParseError) -> WitParseError {
@@ -243,19 +461,19 @@ fn map_parse_error(sources: &[WitSourceMapping], error: ParseError) -> WitParseE
         .iter()
         .find(|source| {
             let start = u64::from(source.offset);
-            let end = start + source.contents_len as u64;
+            let end = start + source.parser_len as u64;
             u64::from(span.start()) >= start && u64::from(span.start()) <= end
         })
         .map(|source| {
             let start = usize::try_from(span.start() - source.offset)
                 .expect("span starts within the source file")
-                .min(source.contents_len);
+                .min(source.parser_len);
             let end = usize::try_from(span.end() - source.offset)
                 .expect("span ends within the source file")
-                .clamp(start, source.contents_len);
+                .clamp(start, source.parser_len);
             WitSourceLocation {
                 path: source.path.clone(),
-                range: start..end,
+                range: source.parser_to_source[start]..source.parser_to_source[end],
             }
         });
     WitParseError {
@@ -270,15 +488,21 @@ mod tests {
         ParsedWitPackageGroup, WitParseError, WitSourceFile, WitSourceLocation, WitUnit,
         parse_source_files,
     };
-    use sai_intern::PackageInterner;
+    use sai_intern::{Interner, PackageInterner};
+    use sai_package::{mvs::MvsPackageVersion, version::Version};
+    use sai_stable_hash::StableHash;
 
     fn dir_unit() -> WitUnit {
         let packages = PackageInterner::new();
-        WitUnit::Dir(
-            packages
-                .intern("acme:graphics")
-                .expect("valid test package key"),
+        let package = packages
+            .intern("acme:graphics#1")
+            .expect("valid test package key");
+        let version = MvsPackageVersion::new(
+            "acme:graphics",
+            Version::parse("1.2.3").expect("valid test version"),
         )
+        .expect("valid test package version");
+        WitUnit::dir(package, &packages, &version).expect("package ID matches package version")
     }
 
     fn parse(files: impl IntoIterator<Item = WitSourceFile>) -> ParsedWitPackageGroup {
@@ -293,7 +517,8 @@ mod tests {
         ];
         let unit = dir_unit();
 
-        let forward = parse_source_files(unit, files.clone()).expect("valid WIT source files");
+        let forward =
+            parse_source_files(unit.clone(), files.clone()).expect("valid WIT source files");
         let reverse =
             parse_source_files(unit, files.into_iter().rev()).expect("valid WIT source files");
 
@@ -331,6 +556,22 @@ mod tests {
             "parser byte offsets must map across preceding UTF-8 source files"
         );
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn maps_parser_errors_after_named_results_back_to_original_offsets() {
+        let source = "package acme:graphics@1.2.3;\ninterface shapes { named: func() -> (left: u32, right: string); broken: func() -> ?; }";
+        let error = parse_source_files(
+            dir_unit(),
+            [WitSourceFile::new("after-rewrite.wit", source)],
+        )
+        .expect_err("malformed declaration after named results must fail");
+
+        let location = error
+            .location()
+            .expect("parser error maps to a source file");
+        assert_eq!(location.path, "after-rewrite.wit");
+        assert_eq!(&source[location.range.clone()], "?");
     }
 
     #[test]
@@ -413,10 +654,76 @@ mod tests {
     fn directory_and_generated_units_are_distinct_nominal_views() {
         let packages = PackageInterner::new();
         let package = packages
-            .intern("acme:graphics")
+            .intern("acme:graphics#1")
             .expect("valid test package key");
+        let version = MvsPackageVersion::new(
+            "acme:graphics",
+            Version::parse("1.2.3").expect("valid test version"),
+        )
+        .expect("valid test package version");
 
-        assert_ne!(WitUnit::Dir(package), WitUnit::Generated(package));
+        assert_ne!(
+            WitUnit::dir(package, &packages, &version).expect("package ID matches package version"),
+            WitUnit::generated(package, &packages, &version)
+                .expect("package ID matches package version")
+        );
+    }
+
+    #[test]
+    fn wasi_units_are_limited_to_the_embedded_catalog_and_version() {
+        let symbols = Interner::new();
+        let unbundled = symbols.intern("unbundled").expect("valid test symbol");
+        let io = symbols.intern("io").expect("valid test symbol");
+        let version = Version::parse("0.2.3").expect("valid test version");
+
+        assert_eq!(
+            WitUnit::wasi(unbundled, &symbols, &version).unwrap_err(),
+            super::WitUnitIdentityError::UnknownWasiPackage
+        );
+        assert_eq!(
+            WitUnit::wasi(
+                io,
+                &symbols,
+                &Version::parse("0.2.2").expect("valid test version")
+            )
+            .unwrap_err(),
+            super::WitUnitIdentityError::UnsupportedWasiVersion
+        );
+        assert_eq!(
+            WitUnit::wasi(io, &symbols, &version)
+                .expect("embedded WASI package and version are accepted")
+                .canonical_name(),
+            "wasi:io@0.2.3"
+        );
+    }
+
+    #[test]
+    fn stable_unit_hash_ignores_session_local_package_ids() {
+        let first_packages = PackageInterner::new();
+        let second_packages = PackageInterner::new();
+        let first_id = first_packages
+            .intern("acme:graphics#1")
+            .expect("valid test package key");
+        let second_id = second_packages
+            .intern("acme:graphics#1")
+            .expect("valid test package key");
+        assert_ne!(first_id, second_id);
+
+        let version = MvsPackageVersion::new(
+            "acme:graphics",
+            Version::parse("1.2.3").expect("valid test version"),
+        )
+        .expect("valid test package version");
+        let first = WitUnit::dir(first_id, &first_packages, &version)
+            .expect("package ID matches package version");
+        let second = WitUnit::dir(second_id, &second_packages, &version)
+            .expect("package ID matches package version");
+        let generated = WitUnit::generated(second_id, &second_packages, &version)
+            .expect("package ID matches package version");
+
+        assert_eq!(first.stable_key(), "wit:dir:acme:graphics#1");
+        assert_eq!(first.fingerprint(), second.fingerprint());
+        assert_ne!(first.fingerprint(), generated.fingerprint());
     }
 
     #[test]
