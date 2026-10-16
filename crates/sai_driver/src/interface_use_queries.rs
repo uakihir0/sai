@@ -18,7 +18,8 @@ use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNod
 use sai_hir::lower::HirLoweringContext;
 use sai_hir::types::{GenericArg, Name, Ty, TyKind};
 use sai_hir::{
-    DefId, DefPathError, DefPathHash, DefPathInternerError, HirId, LocalDefId, OwnerId, Symbol,
+    DefId, DefPathData, DefPathError, DefPathHash, DefPathInternerError, HirId, LocalDefId,
+    OwnerId, Symbol,
 };
 use sai_intern::{Interner, PackageInterner};
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
@@ -27,17 +28,17 @@ use sai_resolve::package_scopes::{
     DefKind, PackageScopesError, PathRes, Phase1PackageScopes, Res, TopLevelOwnerKind,
 };
 use sai_resolve::{
-    InterfaceUseReference, InterfaceUses, InterfaceUsesInput, WitNameDefinition, interface_uses,
-    wit_name_collisions,
+    InterfaceUseReference, InterfaceUses, InterfaceUsesInput, WitNameCollision, WitNameDefinition,
+    interface_uses, sai_identifier_to_wit_name, wit_name_collisions,
 };
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
 use sai_ty::boundary::{
-    BoundaryAlias, BoundaryDefinition, BoundaryTypeContext, BoundaryTypeOutcome,
+    BoundaryAlias, BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
     IncompatibleReason, Position, boundary_type_with_references,
 };
 use sai_ty::iface::{InterfaceCheckError, InterfaceCheckIssue, interface_item_check};
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
-use sai_wit::WitViewDefKind;
+use sai_wit::{WitViewDefKind, WitViewEntity, wit_name_to_sai};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -45,6 +46,52 @@ struct LocalBoundaryAliases<'hir> {
     definitions: HashMap<DefId, BoundaryAlias<'hir>>,
     path_resolutions: HashMap<sai_hir::HirId, PathRes>,
     interface_references: HashMap<DefId, Vec<DefId>>,
+}
+
+#[derive(Clone, Debug)]
+struct BoundaryUseAliasName {
+    target: String,
+    emitted_name: String,
+    collision_name: String,
+    local_interface: Option<LocalDefId>,
+}
+
+#[derive(Clone, Debug)]
+struct GeneratedUseAlias {
+    target: String,
+    emitted_name: String,
+    collision_name: String,
+    definition: DefId,
+    owner: OwnerId,
+    span: sai_hir::Span,
+}
+
+struct InterfaceNameCollisionInput {
+    interface: LocalDefId,
+    file: FileId,
+    generated_use_aliases: Vec<GeneratedUseAlias>,
+    local_definitions: Vec<WitNameDefinition>,
+}
+
+#[derive(Clone, Debug)]
+enum InterfaceNameOrigin {
+    Local(String),
+    GeneratedUse { target: String, name: String },
+}
+
+#[derive(Clone, Debug)]
+struct InterfaceNameDefinition {
+    collision_name: String,
+    origin: InterfaceNameOrigin,
+    owner: OwnerId,
+    span: sai_hir::Span,
+}
+
+#[derive(Default)]
+struct FirstInterfaceName {
+    span: Option<sai_hir::Span>,
+    local_spellings: HashSet<String>,
+    generated_uses: HashSet<(String, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -329,8 +376,21 @@ fn append_wit_name_collision_diagnostics(
     source: &sai_vfs::SourceFile,
     snapshot: &WorkspaceSnapshot,
     diagnostics: &mut Vec<Diagnostic>,
+) -> Result<bool, InterfaceUsesQueryError> {
+    let collisions = wit_name_collisions(definitions);
+    let has_collisions = !collisions.is_empty();
+    append_wit_name_collisions(collisions, source_ref, source, snapshot, diagnostics)?;
+    Ok(has_collisions)
+}
+
+fn append_wit_name_collisions(
+    collisions: impl IntoIterator<Item = WitNameCollision>,
+    source_ref: &SourceRef,
+    source: &sai_vfs::SourceFile,
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), InterfaceUsesQueryError> {
-    for collision in wit_name_collisions(definitions) {
+    for collision in collisions {
         let snapshot_file = snapshot.file(collision.later_span.file).ok_or_else(|| {
             InterfaceUsesQueryError::Collection(
                 OwnerControlFlowResolutionError::MissingSnapshotFile(collision.later_span.file),
@@ -376,6 +436,260 @@ fn append_wit_name_collision_diagnostics(
         diagnostics.push(diagnostic);
     }
     Ok(())
+}
+
+fn interface_boundary_use_alias_names(
+    local_interface_type_members: &HashMap<DefId, LocalDefId>,
+    interface_boundary_types: &HashMap<DefId, BoundaryDefinition>,
+    interface_descriptors: &[super::TopLevelOwnerDescriptor],
+    scopes: &Phase1PackageScopes,
+    prepared: &PreparedPhase1PackageScopes,
+    symbols: &Interner,
+    ineligible_interfaces: &mut HashSet<LocalDefId>,
+) -> Result<HashMap<DefId, BoundaryUseAliasName>, InterfaceUsesQueryError> {
+    let mut names = HashMap::new();
+    let mut local_interface_names = HashMap::new();
+    let mut seen_interface_names = HashSet::new();
+    for descriptor in interface_descriptors {
+        let owner = descriptor.owner.def_id;
+        let Some(interface_name) = local_interface_wit_name(owner, prepared, symbols)? else {
+            ineligible_interfaces.insert(owner);
+            continue;
+        };
+        if seen_interface_names.insert(interface_name.clone()) {
+            local_interface_names.insert(owner, interface_name);
+        } else {
+            ineligible_interfaces.insert(owner);
+        }
+    }
+    for (interface, scope) in &scopes.interfaces {
+        for (symbol, binding) in &scope.members {
+            let Res::Def(_, definition) = binding.res else {
+                continue;
+            };
+            let Some(&owner) = local_interface_type_members.get(&definition) else {
+                continue;
+            };
+            if owner.to_def_id() != *interface
+                || !interface_boundary_types.contains_key(&definition)
+            {
+                continue;
+            }
+            let source_name = symbols
+                .resolve(*symbol)
+                .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+                .map_err(InterfaceUsesQueryError::Collection)?;
+            let Some(collision_name) = sai_identifier_to_wit_name(&source_name) else {
+                continue;
+            };
+            let Some(interface_name) = local_interface_names.get(&owner) else {
+                continue;
+            };
+            names.insert(
+                definition,
+                BoundaryUseAliasName {
+                    target: render_wit_name(interface_name),
+                    emitted_name: render_wit_name(&collision_name),
+                    collision_name,
+                    local_interface: Some(owner),
+                },
+            );
+        }
+    }
+
+    for foreign in &prepared.foreign_wit_views {
+        for view_interface in foreign.view.interfaces.values() {
+            for member in view_interface.members.values() {
+                if !interface_boundary_types.contains_key(&member.def)
+                    || !matches!(
+                        member.kind,
+                        WitViewDefKind::Struct
+                            | WitViewDefKind::Enum
+                            | WitViewDefKind::Resource
+                            | WitViewDefKind::Alias
+                    )
+                {
+                    continue;
+                }
+                let Some(definition) = foreign.view.definition(member.def) else {
+                    continue;
+                };
+                let WitViewEntity::Item { interface, item } = definition.entity else {
+                    continue;
+                };
+                let Some(wit_interface) = foreign.view.model.interfaces.get(interface) else {
+                    continue;
+                };
+                let Some(wit_item) = wit_interface.items.get(item) else {
+                    continue;
+                };
+                let Ok(source_name) = wit_name_to_sai(&wit_item.name, true) else {
+                    continue;
+                };
+                let Some(collision_name) = sai_identifier_to_wit_name(&source_name) else {
+                    continue;
+                };
+                names.insert(
+                    member.def,
+                    BoundaryUseAliasName {
+                        target: external_wit_interface_use_target(
+                            &foreign.view.model.name.namespace,
+                            &foreign.view.model.name.name,
+                            &wit_interface.name,
+                            foreign.view.model.name.version.as_ref(),
+                        ),
+                        emitted_name: render_wit_name(&wit_item.name),
+                        collision_name,
+                        local_interface: None,
+                    },
+                );
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn local_interface_wit_name(
+    interface: LocalDefId,
+    prepared: &PreparedPhase1PackageScopes,
+    symbols: &Interner,
+) -> Result<Option<String>, InterfaceUsesQueryError> {
+    let path = prepared
+        .def_paths
+        .resolve_def_id(interface.to_def_id())
+        .map_err(OwnerControlFlowResolutionError::DefPathInterner)
+        .map_err(InterfaceUsesQueryError::Collection)?
+        .ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(OwnerControlFlowResolutionError::MissingDefPath(
+                OwnerId { def_id: interface },
+            ))
+        })?;
+    let Some(DefPathData::Interface(name)) = path.data().last().map(|part| &part.data) else {
+        return Ok(None);
+    };
+    let source_name = symbols
+        .resolve(*name)
+        .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+        .map_err(InterfaceUsesQueryError::Collection)?;
+    Ok(sai_identifier_to_wit_name(&source_name))
+}
+
+fn external_wit_interface_use_target(
+    namespace: &str,
+    package: &str,
+    interface: &str,
+    version: Option<&sai_package::version::Version>,
+) -> String {
+    let mut target = format!(
+        "{}:{}/{}",
+        render_wit_name(namespace),
+        render_wit_name(package),
+        render_wit_name(interface)
+    );
+    if let Some(version) = version {
+        target.push('@');
+        target.push_str(&version.to_string());
+    }
+    target
+}
+
+fn render_wit_name(name: &str) -> String {
+    let name = name.strip_prefix('%').unwrap_or(name);
+    sai_wit::wit_identifier(name)
+}
+
+fn collect_interface_name_collisions(
+    mut generated_use_aliases: Vec<GeneratedUseAlias>,
+    local_definitions: impl IntoIterator<Item = WitNameDefinition>,
+) -> Vec<WitNameCollision> {
+    generated_use_aliases.sort_by(|left, right| {
+        left.target
+            .as_bytes()
+            .cmp(right.target.as_bytes())
+            .then_with(|| {
+                left.emitted_name
+                    .as_bytes()
+                    .cmp(right.emitted_name.as_bytes())
+            })
+            .then_with(|| left.span.range.start().cmp(&right.span.range.start()))
+    });
+    generated_use_aliases.dedup_by(|later, earlier| {
+        later.target == earlier.target && later.emitted_name == earlier.emitted_name
+    });
+
+    let mut first_by_wit_name = HashMap::<String, FirstInterfaceName>::new();
+    let mut collisions = Vec::new();
+    for alias in generated_use_aliases {
+        record_interface_name_definition(
+            InterfaceNameDefinition {
+                collision_name: alias.collision_name,
+                origin: InterfaceNameOrigin::GeneratedUse {
+                    target: alias.target,
+                    name: alias.emitted_name,
+                },
+                owner: alias.owner,
+                span: alias.span,
+            },
+            &mut first_by_wit_name,
+            &mut collisions,
+        );
+    }
+    for definition in local_definitions {
+        let Some(collision_name) = sai_identifier_to_wit_name(&definition.source_name) else {
+            continue;
+        };
+        record_interface_name_definition(
+            InterfaceNameDefinition {
+                collision_name,
+                origin: InterfaceNameOrigin::Local(definition.source_name),
+                owner: definition.owner,
+                span: definition.span,
+            },
+            &mut first_by_wit_name,
+            &mut collisions,
+        );
+    }
+    collisions
+}
+
+fn record_interface_name_definition(
+    definition: InterfaceNameDefinition,
+    first_by_wit_name: &mut HashMap<String, FirstInterfaceName>,
+    collisions: &mut Vec<WitNameCollision>,
+) {
+    let first = first_by_wit_name
+        .entry(definition.collision_name.clone())
+        .or_default();
+    let Some(earlier_span) = first.span else {
+        first.span = Some(definition.span);
+        remember_interface_name_origin(first, &definition.origin);
+        return;
+    };
+    let first_has_generated_use = !first.generated_uses.is_empty();
+    let should_report =
+        !matches!(&definition.origin, InterfaceNameOrigin::Local(_)) || first_has_generated_use;
+    if remember_interface_name_origin(first, &definition.origin) && should_report {
+        collisions.push(WitNameCollision {
+            wit_name: definition.collision_name,
+            earlier_span,
+            later_owner: definition.owner,
+            later_span: definition.span,
+        });
+    }
+}
+
+fn remember_interface_name_origin(
+    first: &mut FirstInterfaceName,
+    origin: &InterfaceNameOrigin,
+) -> bool {
+    match origin {
+        InterfaceNameOrigin::Local(source_name) => {
+            first.local_spellings.insert(source_name.clone())
+        }
+        InterfaceNameOrigin::GeneratedUse { target, name } => {
+            first.generated_uses.insert((target.clone(), name.clone()))
+        }
+    }
 }
 
 fn collect_interface_item_issues(
@@ -435,6 +749,16 @@ fn collect_interface_uses_input(
         .collect::<HashSet<_>>();
     let interface_boundary_types =
         interface_boundary_type_definitions(&interface_type_members, scopes, prepared);
+    let mut ineligible_interfaces = HashSet::new();
+    let boundary_use_alias_names = interface_boundary_use_alias_names(
+        &interface_type_members,
+        &interface_boundary_types,
+        &descriptors,
+        scopes,
+        prepared,
+        symbols,
+        &mut ineligible_interfaces,
+    )?;
     let mut module_inputs =
         HashMap::<FileId, CurrentOwnerInputs>::with_capacity(prepared.modules.len());
     for input in &prepared.modules {
@@ -469,6 +793,11 @@ fn collect_interface_uses_input(
     let mut package_identity = None;
     let mut references = Vec::<InterfaceUseReference>::new();
     let mut interface_check_diagnostics = Vec::new();
+    let mut collision_inputs = Vec::with_capacity(descriptors.len());
+    let mut poisoned_owners = HashSet::<OwnerId>::new();
+    let mut owner_dependencies = HashMap::<OwnerId, HashSet<DefId>>::new();
+    let mut resource_method_parents = HashMap::<OwnerId, OwnerId>::new();
+    let mut local_type_definitions_by_owner = HashMap::<OwnerId, DefId>::new();
     let interface_ids = descriptors
         .iter()
         .map(|descriptor| descriptor.owner.def_id)
@@ -580,6 +909,7 @@ fn collect_interface_uses_input(
                 .map_err(InterfaceUsesQueryError::Collection)?;
         let mut owner_references = Vec::new();
         let mut interface_item_names = Vec::with_capacity(member_entries.len());
+        let mut generated_use_aliases = Vec::<GeneratedUseAlias>::new();
         for (entry, member_owner) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -605,8 +935,13 @@ fn collect_interface_uses_input(
             .map_err(OwnerControlFlowResolutionError::Lowering)
             .map_err(InterfaceUsesQueryError::Collection)?;
             let flags_marker_accepted = inputs.accepted_flags_attributes.contains(&entry.ast_id);
+            let member_issues =
+                collect_interface_item_issues(&member_hir, flags_marker_accepted, symbols)?;
+            if !member_issues.is_empty() {
+                poisoned_owners.insert(member_owner);
+            }
             append_interface_item_diagnostics(
-                collect_interface_item_issues(&member_hir, flags_marker_accepted, symbols)?,
+                member_issues,
                 &inputs.source_ref,
                 &inputs.source,
                 &prepared.snapshot,
@@ -617,6 +952,17 @@ fn collect_interface_uses_input(
                     sai_hir::lower::HirLoweringError::ItemTreeEntryMismatch,
                 ))
             })?;
+            if matches!(
+                kind,
+                super::InterfaceMemberKind::Struct
+                    | super::InterfaceMemberKind::Alias
+                    | super::InterfaceMemberKind::Refined
+                    | super::InterfaceMemberKind::Enum
+                    | super::InterfaceMemberKind::Resource
+            ) {
+                local_type_definitions_by_owner
+                    .insert(member_owner, member_owner.def_id.to_def_id());
+            }
             let OwnerNode::InterfaceItem(item) = member_hir.node else {
                 return Err(InterfaceUsesQueryError::Collection(
                     OwnerControlFlowResolutionError::Lowering(
@@ -643,10 +989,11 @@ fn collect_interface_uses_input(
                 &interface_type_members,
                 inputs,
             )?;
-            append_interface_boundary_diagnostics(
+            if append_interface_boundary_diagnostics(
                 &member_hir,
                 &resolution,
                 &interface_boundary_types,
+                &boundary_use_alias_names,
                 &local_boundary_aliases,
                 descriptor.owner.def_id,
                 &interface_type_members,
@@ -655,8 +1002,12 @@ fn collect_interface_uses_input(
                 &inputs.source_ref,
                 &inputs.source,
                 &prepared.snapshot,
+                &mut generated_use_aliases,
+                &mut owner_dependencies,
                 &mut interface_check_diagnostics,
-            )?;
+            )? {
+                poisoned_owners.insert(member_owner);
+            }
             if kind != super::InterfaceMemberKind::Resource {
                 continue;
             }
@@ -696,6 +1047,7 @@ fn collect_interface_uses_input(
                 .into_iter()
                 .zip(resource_members.iter().copied())
             {
+                resource_method_parents.insert(method_owner, member_owner);
                 let expected_method_path = def_paths
                     .resolve_def_id(method_owner.def_id.to_def_id())
                     .map_err(OwnerControlFlowResolutionError::DefPathInterner)
@@ -720,8 +1072,12 @@ fn collect_interface_uses_input(
                 )
                 .map_err(OwnerControlFlowResolutionError::Lowering)
                 .map_err(InterfaceUsesQueryError::Collection)?;
+                let method_issues = collect_interface_item_issues(&method_hir, false, symbols)?;
+                if !method_issues.is_empty() {
+                    poisoned_owners.insert(method_owner);
+                }
                 append_interface_item_diagnostics(
-                    collect_interface_item_issues(&method_hir, false, symbols)?,
+                    method_issues,
                     &inputs.source_ref,
                     &inputs.source,
                     &prepared.snapshot,
@@ -748,10 +1104,11 @@ fn collect_interface_uses_input(
                     &interface_type_members,
                     inputs,
                 )?;
-                append_interface_boundary_diagnostics(
+                if append_interface_boundary_diagnostics(
                     &method_hir,
                     &resolution,
                     &interface_boundary_types,
+                    &boundary_use_alias_names,
                     &local_boundary_aliases,
                     descriptor.owner.def_id,
                     &interface_type_members,
@@ -760,24 +1117,29 @@ fn collect_interface_uses_input(
                     &inputs.source_ref,
                     &inputs.source,
                     &prepared.snapshot,
+                    &mut generated_use_aliases,
+                    &mut owner_dependencies,
                     &mut interface_check_diagnostics,
-                )?;
+                )? {
+                    poisoned_owners.insert(method_owner);
+                }
             }
-            append_wit_name_collision_diagnostics(
+            if append_wit_name_collision_diagnostics(
                 resource_member_names,
                 &inputs.source_ref,
                 &inputs.source,
                 &prepared.snapshot,
                 &mut interface_check_diagnostics,
-            )?;
+            )? {
+                poisoned_owners.insert(member_owner);
+            }
         }
-        append_wit_name_collision_diagnostics(
-            interface_item_names,
-            &inputs.source_ref,
-            &inputs.source,
-            &prepared.snapshot,
-            &mut interface_check_diagnostics,
-        )?;
+        collision_inputs.push(InterfaceNameCollisionInput {
+            interface: descriptor.owner.def_id,
+            file: descriptor.file,
+            generated_use_aliases,
+            local_definitions: interface_item_names,
+        });
         // Direct path resolution and alias expansion are collected in
         // separate passes for each owner. Re-establish source order before
         // graph deduplication so the retained edge (and its diagnostic span)
@@ -796,14 +1158,214 @@ fn collect_interface_uses_input(
     for reference in &mut references {
         reference.location.file.snapshot = None;
     }
-    Ok((
-        InterfaceUsesInput {
-            package,
-            interfaces: interface_ids,
-            references,
-        },
-        interface_check_diagnostics,
-    ))
+    let input = InterfaceUsesInput {
+        package,
+        interfaces: interface_ids,
+        references,
+    };
+    append_generation_eligible_interface_name_collisions(
+        input.clone(),
+        collision_inputs,
+        &interface_type_members,
+        &local_type_definitions_by_owner,
+        &ineligible_interfaces,
+        &poisoned_owners,
+        &owner_dependencies,
+        &resource_method_parents,
+        &module_inputs,
+        &prepared.snapshot,
+        &mut interface_check_diagnostics,
+    )?;
+    Ok((input, interface_check_diagnostics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_generation_eligible_interface_name_collisions(
+    input: InterfaceUsesInput,
+    collision_inputs: Vec<InterfaceNameCollisionInput>,
+    local_interface_type_members: &HashMap<DefId, LocalDefId>,
+    type_definitions_by_owner: &HashMap<OwnerId, DefId>,
+    ineligible_interfaces: &HashSet<LocalDefId>,
+    directly_poisoned_owners: &HashSet<OwnerId>,
+    owner_dependencies: &HashMap<OwnerId, HashSet<DefId>>,
+    resource_method_parents: &HashMap<OwnerId, OwnerId>,
+    module_inputs: &HashMap<FileId, CurrentOwnerInputs>,
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), InterfaceUsesQueryError> {
+    let cyclic_interfaces = interface_uses(input).cyclic;
+    let mut omitted_owners = directly_poisoned_owners.clone();
+    let mut omitted_local_types = local_interface_type_members
+        .iter()
+        .filter_map(|(definition, owner)| {
+            (ineligible_interfaces.contains(owner) || cyclic_interfaces.contains(owner))
+                .then_some(*definition)
+        })
+        .collect::<HashSet<_>>();
+    for owner in directly_poisoned_owners {
+        if let Some(definition) = type_definitions_by_owner.get(owner) {
+            omitted_local_types.insert(*definition);
+        }
+    }
+
+    let mut local_name_collision_owners = HashSet::new();
+    let mut local_name_collisions = Vec::<(FileId, Vec<WitNameCollision>)>::new();
+    loop {
+        let mut changed = propagate_omitted_interface_owners(
+            &mut omitted_owners,
+            &mut omitted_local_types,
+            owner_dependencies,
+            resource_method_parents,
+            type_definitions_by_owner,
+        );
+
+        for collision_input in &collision_inputs {
+            if ineligible_interfaces.contains(&collision_input.interface)
+                || cyclic_interfaces.contains(&collision_input.interface)
+            {
+                continue;
+            }
+            let eligible_local_definitions = collision_input
+                .local_definitions
+                .iter()
+                .filter(|definition| !omitted_owners.contains(&definition.owner))
+                .cloned()
+                .collect::<Vec<_>>();
+            let collisions = wit_name_collisions(eligible_local_definitions);
+            let new_collisions = collisions
+                .into_iter()
+                .filter(|collision| local_name_collision_owners.insert(collision.later_owner))
+                .collect::<Vec<_>>();
+            if !new_collisions.is_empty() {
+                for collision in &new_collisions {
+                    omitted_owners.insert(collision.later_owner);
+                    if let Some(definition) = type_definitions_by_owner.get(&collision.later_owner)
+                    {
+                        omitted_local_types.insert(*definition);
+                    }
+                }
+                local_name_collisions.push((collision_input.file, new_collisions));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for (file, collisions) in local_name_collisions {
+        let inputs = module_inputs.get(&file).ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(OwnerControlFlowResolutionError::ModuleTreeMismatch)
+        })?;
+        append_wit_name_collisions(
+            collisions,
+            &inputs.source_ref,
+            &inputs.source,
+            snapshot,
+            diagnostics,
+        )?;
+    }
+
+    let mut generated_name_collisions = Vec::<(FileId, WitNameCollision)>::new();
+    loop {
+        let next_collision = collision_inputs.iter().find_map(|collision_input| {
+            if ineligible_interfaces.contains(&collision_input.interface)
+                || cyclic_interfaces.contains(&collision_input.interface)
+            {
+                return None;
+            }
+            let generated_use_aliases = collision_input
+                .generated_use_aliases
+                .iter()
+                .filter(|alias| {
+                    !omitted_owners.contains(&alias.owner)
+                        && !omitted_local_types.contains(&alias.definition)
+                })
+                .cloned()
+                .collect();
+            let local_definitions = collision_input
+                .local_definitions
+                .iter()
+                .filter(|definition| !omitted_owners.contains(&definition.owner))
+                .cloned()
+                .collect::<Vec<_>>();
+            collect_interface_name_collisions(generated_use_aliases, local_definitions)
+                .into_iter()
+                .find(|collision| !omitted_owners.contains(&collision.later_owner))
+                .map(|collision| (collision_input.file, collision))
+        });
+        let Some((file, collision)) = next_collision else {
+            break;
+        };
+
+        omitted_owners.insert(collision.later_owner);
+        if let Some(definition) = type_definitions_by_owner.get(&collision.later_owner) {
+            omitted_local_types.insert(*definition);
+        }
+        // Collision poisoning is monotonic and follows emitted-name order.
+        // Once reported, a collision remains a valid finding from the
+        // candidate scope in which it was discovered, even if poisoning its
+        // later owner subsequently removes an earlier alias that supported a
+        // different finding. Recomputations suppress only later cascades.
+        generated_name_collisions.push((file, collision));
+        propagate_omitted_interface_owners(
+            &mut omitted_owners,
+            &mut omitted_local_types,
+            owner_dependencies,
+            resource_method_parents,
+            type_definitions_by_owner,
+        );
+    }
+
+    for (file, collision) in generated_name_collisions {
+        let inputs = module_inputs.get(&file).ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(OwnerControlFlowResolutionError::ModuleTreeMismatch)
+        })?;
+        append_wit_name_collisions(
+            [collision],
+            &inputs.source_ref,
+            &inputs.source,
+            snapshot,
+            diagnostics,
+        )?;
+    }
+    Ok(())
+}
+
+fn propagate_omitted_interface_owners(
+    omitted_owners: &mut HashSet<OwnerId>,
+    omitted_local_types: &mut HashSet<DefId>,
+    owner_dependencies: &HashMap<OwnerId, HashSet<DefId>>,
+    resource_method_parents: &HashMap<OwnerId, OwnerId>,
+    type_definitions_by_owner: &HashMap<OwnerId, DefId>,
+) -> bool {
+    let mut any_changed = false;
+    loop {
+        let mut changed = false;
+        for (owner, dependencies) in owner_dependencies {
+            if dependencies
+                .iter()
+                .any(|definition| omitted_local_types.contains(definition))
+                && omitted_owners.insert(*owner)
+            {
+                changed = true;
+            }
+        }
+        for (method, resource) in resource_method_parents {
+            if omitted_owners.contains(method) && omitted_owners.insert(*resource) {
+                changed = true;
+            }
+        }
+        for (owner, definition) in type_definitions_by_owner {
+            if omitted_owners.contains(owner) && omitted_local_types.insert(*definition) {
+                changed = true;
+            }
+        }
+        if !changed {
+            return any_changed;
+        }
+        any_changed = true;
+    }
 }
 
 fn collect_owner_references(
@@ -1161,6 +1723,7 @@ fn append_interface_boundary_diagnostics(
     owner: &HirOwner<'_>,
     resolution: &TypeOwnerPathResolution,
     interface_boundary_types: &HashMap<DefId, BoundaryDefinition>,
+    boundary_use_alias_names: &HashMap<DefId, BoundaryUseAliasName>,
     local_boundary_aliases: &LocalBoundaryAliases<'_>,
     interface: LocalDefId,
     interface_type_members: &HashMap<DefId, LocalDefId>,
@@ -1169,8 +1732,10 @@ fn append_interface_boundary_diagnostics(
     source_ref: &SourceRef,
     source: &sai_vfs::SourceFile,
     snapshot: &WorkspaceSnapshot,
+    generated_use_aliases: &mut Vec<GeneratedUseAlias>,
+    owner_dependencies: &mut HashMap<OwnerId, HashSet<DefId>>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<(), InterfaceUsesQueryError> {
+) -> Result<bool, InterfaceUsesQueryError> {
     let owner_id = owner.id;
     let self_resource = match owner.node {
         OwnerNode::InterfaceItem(item) => match item.kind {
@@ -1228,15 +1793,36 @@ fn append_interface_boundary_diagnostics(
         aliases: &local_boundary_aliases.definitions,
         self_resource,
     };
+    let owner_path_candidates = owner_test_only_path_candidates(owner);
+    let mut has_incompatible_boundary = false;
 
     for (ty, position) in interface_boundary_roots(owner) {
         let conversion = boundary_type_with_references(&boundary_context, owner_id, ty, position);
-        if let BoundaryTypeOutcome::Mapped(_) = &conversion.outcome {
-            continue;
-        }
-        let BoundaryTypeOutcome::Incompatible(incompatible) = conversion.outcome else {
-            continue;
+        let incompatible = match conversion.outcome {
+            BoundaryTypeOutcome::Mapped(mapped) => {
+                let mut mapped_definitions = HashSet::new();
+                collect_boundary_type_definitions(&mapped, &mut mapped_definitions);
+                owner_dependencies
+                    .entry(owner_id)
+                    .or_default()
+                    .extend(mapped_definitions.iter().copied());
+                collect_generated_use_aliases(
+                    owner_id,
+                    interface,
+                    &mapped_definitions,
+                    &conversion.references,
+                    ty,
+                    &owner_path_candidates,
+                    resolution,
+                    boundary_use_alias_names,
+                    generated_use_aliases,
+                );
+                continue;
+            }
+            BoundaryTypeOutcome::Incompatible(incompatible) => incompatible,
+            BoundaryTypeOutcome::Suppressed | BoundaryTypeOutcome::Deferred => continue,
         };
+        has_incompatible_boundary = true;
         let snapshot_file = snapshot.file(incompatible.span.file).ok_or_else(|| {
             InterfaceUsesQueryError::Collection(
                 OwnerControlFlowResolutionError::MissingSnapshotFile(incompatible.span.file),
@@ -1285,7 +1871,146 @@ fn append_interface_boundary_diagnostics(
         }
         diagnostics.push(diagnostic);
     }
-    Ok(())
+    Ok(has_incompatible_boundary)
+}
+
+fn collect_generated_use_aliases(
+    owner: OwnerId,
+    current_interface: LocalDefId,
+    mapped_definitions: &HashSet<DefId>,
+    hidden_references: &[sai_ty::boundary::BoundaryTypeReference],
+    root: &Ty<'_>,
+    owner_path_candidates: &[super::OwnerPathHead<'_>],
+    resolution: &TypeOwnerPathResolution,
+    alias_names: &HashMap<DefId, BoundaryUseAliasName>,
+    generated_use_aliases: &mut Vec<GeneratedUseAlias>,
+) {
+    let mut references = Vec::<(DefId, sai_hir::Span)>::new();
+    let mut path_spans = HashMap::new();
+    collect_type_path_spans(root, &mut path_spans);
+    let mut direct_candidates = type_path_candidates_in_roots(owner_path_candidates, &[root]);
+    direct_candidates.sort_by_key(|candidate| candidate.span.range.start());
+    for candidate in direct_candidates {
+        let Some(PathRes {
+            base: Res::Def(_, definition),
+            ..
+        }) = resolution.paths().get(&candidate.hir_id)
+        else {
+            continue;
+        };
+        if mapped_definitions.contains(definition) {
+            references.push((
+                *definition,
+                path_spans
+                    .get(&candidate.hir_id)
+                    .copied()
+                    .unwrap_or(candidate.span),
+            ));
+        }
+    }
+    references.extend(
+        hidden_references
+            .iter()
+            .filter(|reference| mapped_definitions.contains(&reference.definition))
+            .map(|reference| (reference.definition, reference.span)),
+    );
+    references.sort_by_key(|(_, span)| span.range.start());
+
+    for (definition, span) in references {
+        let Some(alias_name) = alias_names.get(&definition) else {
+            continue;
+        };
+        if alias_name.local_interface == Some(current_interface) {
+            continue;
+        }
+        generated_use_aliases.push(GeneratedUseAlias {
+            target: alias_name.target.clone(),
+            emitted_name: alias_name.emitted_name.clone(),
+            collision_name: alias_name.collision_name.clone(),
+            definition,
+            owner,
+            span,
+        });
+    }
+}
+
+fn collect_boundary_type_definitions(
+    boundary_type: &BoundaryType,
+    definitions: &mut HashSet<DefId>,
+) {
+    match boundary_type {
+        BoundaryType::List(inner) | BoundaryType::Option(inner) => {
+            collect_boundary_type_definitions(inner, definitions)
+        }
+        BoundaryType::Result { ok, err } => {
+            if let Some(ok) = ok {
+                collect_boundary_type_definitions(ok, definitions);
+            }
+            if let Some(err) = err {
+                collect_boundary_type_definitions(err, definitions);
+            }
+        }
+        BoundaryType::Tuple(elements) => {
+            for element in elements {
+                collect_boundary_type_definitions(element, definitions);
+            }
+        }
+        BoundaryType::Named(definition)
+        | BoundaryType::Own(definition)
+        | BoundaryType::Borrow(definition) => {
+            definitions.insert(*definition);
+        }
+        BoundaryType::Unit
+        | BoundaryType::Bool
+        | BoundaryType::S8
+        | BoundaryType::S16
+        | BoundaryType::S32
+        | BoundaryType::S64
+        | BoundaryType::U8
+        | BoundaryType::U16
+        | BoundaryType::U32
+        | BoundaryType::U64
+        | BoundaryType::F32
+        | BoundaryType::F64
+        | BoundaryType::Char
+        | BoundaryType::String => {}
+    }
+}
+
+fn collect_type_path_spans(ty: &Ty<'_>, path_spans: &mut HashMap<HirId, sai_hir::Span>) {
+    match ty.kind {
+        TyKind::Path(path) => {
+            path_spans.insert(path.hir_id, path.span);
+            for segment in path.segments {
+                let Some(arguments) = segment.args else {
+                    continue;
+                };
+                for argument in arguments.args {
+                    match *argument {
+                        GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                            collect_type_path_spans(ty, path_spans);
+                        }
+                        GenericArg::Const(_) => {}
+                    }
+                }
+            }
+        }
+        TyKind::Borrow(_, inner) => collect_type_path_spans(inner, path_spans),
+        TyKind::Tuple(elements) => {
+            for element in elements {
+                collect_type_path_spans(element, path_spans);
+            }
+        }
+        TyKind::FnPtr { params, ret, .. } => {
+            for parameter in params {
+                collect_type_path_spans(parameter, path_spans);
+            }
+            if let Some(ret) = ret {
+                collect_type_path_spans(ret, path_spans);
+            }
+        }
+        TyKind::Infer | TyKind::Err => {}
+    }
 }
 
 fn interface_boundary_type_definitions(

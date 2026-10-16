@@ -624,7 +624,11 @@ fn push_indent(output: &mut String, level: usize) {
     }
 }
 
-fn wit_identifier(name: &str) -> String {
+/// Render one WIT identifier, including the `%` escape for reserved words.
+///
+/// This is shared with diagnostics that must use the same bytewise ordering
+/// as the canonical printer.
+pub fn wit_identifier(name: &str) -> String {
     if crate::source_scan::is_wit_keyword(name) {
         format!("%{name}")
     } else {

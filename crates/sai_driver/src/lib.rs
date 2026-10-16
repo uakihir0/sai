@@ -27817,6 +27817,774 @@ mod tests {
     }
 
     #[test]
+    fn interface_check_reports_generated_use_alias_colliding_with_local_item() {
+        let root = concat!(
+            "interface types {\n",
+            "  type FetchUser = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn fetch_user(value: types.FetchUser)\n",
+            "  fn also_fetch(value: types.FetchUser)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let collisions = collection
+            .interface_check_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collisions.len(),
+            1,
+            "{:?}",
+            collection.interface_check_diagnostics()
+        );
+        let collision = collisions[0];
+        let primary = collision
+            .primary()
+            .expect("the local declaration is the later generated WIT name");
+        assert_eq!(
+            root.get(primary.span.range.start().to_usize()..primary.span.range.end().to_usize()),
+            Some("fetch_user")
+        );
+        assert!(matches!(
+            &collision.related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("types") && text.contains("FetchUser"))
+        ));
+    }
+
+    #[test]
+    fn interface_check_reports_generated_use_alias_from_foreign_wit() {
+        let root = concat!(
+            "use acme:codec/iface as codec\n",
+            "interface api {\n",
+            "  fn fetch_user(value: codec.FetchUser)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
+        let codec_key = PackageKey::new("acme:codec#1").expect("codec key is valid");
+        let codec = database
+            .intern_package(codec_key.as_str())
+            .expect("codec package interns");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                )
+                .expect("root graph node is valid"),
+                PackageGraphNode::new(
+                    codec_key.clone(),
+                    "acme:codec",
+                    Version::parse("1.0.0").expect("codec version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("codec graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        database
+            .set_package_manifest(
+                codec,
+                Arc::from(
+                    &b"package acme:codec @ 1.0.0\n\
+                      artifact component {}\n\
+                      wit \"wit\"\n"[..],
+                ),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("artifact manifest is recorded");
+        database
+            .set_wit_files(
+                codec_key.clone(),
+                WitFilesSnapshot::listed(
+                    "wit",
+                    [PackageRelativePath::new("wit/api.wit").expect("WIT path is valid")],
+                )
+                .expect("WIT inventory is valid"),
+                Durability::Low,
+            )
+            .expect("WIT inventory is recorded");
+        database
+            .set_file_contents(
+                FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
+                Arc::from(
+                    &b"package acme:codec@1.0.0; interface iface { record fetch-user { value: u32 } }"[..],
+                ),
+                Durability::Low,
+            )
+            .expect("WIT source is recorded");
+        let wit_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("active WIT view loads");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_scopes,
+            )
+            .expect("foreign WIT member resolves in the interface boundary");
+
+        let collision = collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .expect("the foreign WIT use alias collides with the local function");
+        let primary = collision
+            .primary()
+            .expect("the local declaration follows the generated use alias");
+        assert_eq!(
+            root.get(primary.span.range.start().to_usize()..primary.span.range.end().to_usize()),
+            Some("fetch_user")
+        );
+        assert!(matches!(
+            &collision.related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("codec.FetchUser"))
+        ));
+    }
+
+    #[test]
+    fn interface_check_orders_foreign_use_aliases_by_rendered_wit_target() {
+        let root = concat!(
+            "use acme:interface/iface as keyword_codec\n",
+            "use acme:foo/iface as foo\n",
+            "interface api {\n",
+            "  fn first(value: keyword_codec.SameType)\n",
+            "  fn second(value: foo.SameType)\n",
+            "  fn same_type()\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
+        let keyword_key =
+            PackageKey::new("acme:interface#1").expect("keyword package key is valid");
+        let foo_key = PackageKey::new("acme:foo#1").expect("foo package key is valid");
+        let keyword_package = database
+            .intern_package(keyword_key.as_str())
+            .expect("keyword package interns");
+        let foo_package = database
+            .intern_package(foo_key.as_str())
+            .expect("foo package interns");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![
+                        graph_edge("acme:interface#1", "acme:interface"),
+                        graph_edge("acme:foo#1", "acme:foo"),
+                    ],
+                )
+                .expect("root graph node is valid"),
+                PackageGraphNode::new(
+                    keyword_key.clone(),
+                    "acme:interface",
+                    Version::parse("1.0.0").expect("keyword package version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("keyword package graph node is valid"),
+                PackageGraphNode::new(
+                    foo_key.clone(),
+                    "acme:foo",
+                    Version::parse("1.0.0").expect("foo package version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("foo package graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let set_artifact_wit = |database: &mut RootDatabase,
+                                package,
+                                key: &PackageKey,
+                                identity: &str,
+                                wit_package: &str| {
+            database
+                .set_package_manifest(
+                    package,
+                    Arc::<[u8]>::from(
+                        format!(
+                            "package {identity} @ 1.0.0\n\
+                             artifact component {{}}\n\
+                             wit \"wit\"\n"
+                        )
+                        .into_bytes(),
+                    ),
+                    PackageRole::Dependency,
+                    Durability::Low,
+                )
+                .expect("artifact manifest is recorded");
+            database
+                .set_wit_files(
+                    key.clone(),
+                    WitFilesSnapshot::listed(
+                        "wit",
+                        [PackageRelativePath::new("wit/api.wit").expect("WIT path is valid")],
+                    )
+                    .expect("WIT inventory is valid"),
+                    Durability::Low,
+                )
+                .expect("WIT inventory is recorded");
+            database
+                .set_file_contents(
+                    FileKey::new(key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
+                    Arc::from(
+                        format!(
+                            "package {wit_package}@1.0.0; interface iface {{ record same-type {{ value: u32 }} }}"
+                        )
+                        .into_bytes(),
+                    ),
+                    Durability::Low,
+                )
+                .expect("WIT source is recorded");
+        };
+        set_artifact_wit(
+            &mut database,
+            keyword_package,
+            &keyword_key,
+            "acme:interface",
+            "acme:%interface",
+        );
+        set_artifact_wit(&mut database, foo_package, &foo_key, "acme:foo", "acme:foo");
+        let wit_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("active WIT views load");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires {\n\
+                  acme:interface @ ^1\n\
+                  acme:foo @ ^1\n\
+              }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_scopes,
+            )
+            .expect("foreign WIT members resolve in interface boundaries");
+
+        let alias_collision = collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::WitNameCollision
+                    && diagnostic
+                        .primary()
+                        .and_then(|location| {
+                            root.get(
+                                location.span.range.start().to_usize()
+                                    ..location.span.range.end().to_usize(),
+                            )
+                        })
+                        .is_some_and(|text| text.contains("foo.SameType"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the second emitted target follows the escaped keyword target: {:?}",
+                    collection.interface_check_diagnostics()
+                )
+            });
+        assert!(matches!(
+            &alias_collision.related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("keyword_codec.SameType"))
+        ));
+    }
+
+    #[test]
+    fn interface_check_ignores_use_aliases_from_poisoned_boundary_owners() {
+        let root = concat!(
+            "interface types {\n",
+            "  type FetchUser = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn fetch_user(value: types.FetchUser, bad: (USize, Bool))\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
+        );
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::WitNameCollision),
+            "the incompatible function is omitted together with its otherwise mapped use alias"
+        );
+    }
+
+    #[test]
+    fn interface_check_ignores_use_aliases_from_items_with_name_errors() {
+        let root = concat!(
+            "interface types {\n",
+            "  type FetchUser = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn fetch_user(_invalid: types.FetchUser)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WitNameNotRepresentable
+                })
+        );
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::WitNameCollision),
+            "an interface item with an invalid parameter name is omitted with its alias"
+        );
+    }
+
+    #[test]
+    fn interface_check_ignores_use_aliases_to_poisoned_local_types() {
+        let root = concat!(
+            "interface types {\n",
+            "  type Bad = USize\n",
+            "}\n",
+            "interface api {\n",
+            "  fn bad(value: types.Bad)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
+        );
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::WitNameCollision),
+            "{:?}",
+            collection.interface_check_diagnostics()
+        );
+    }
+
+    #[test]
+    fn interface_check_propagates_generated_name_collisions_to_dependent_interfaces() {
+        let root = concat!(
+            "interface other {\n",
+            "  type FetchUser = U32\n",
+            "}\n",
+            "interface types {\n",
+            "  type FetchUser = U32\n",
+            "  fn lookup(value: other.FetchUser)\n",
+            "}\n",
+            "interface api {\n",
+            "  fn fetch_user(value: types.FetchUser)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let collisions = collection
+            .interface_check_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collisions.len(),
+            1,
+            "the collision that omits types.FetchUser must also omit dependent api.fetch_user: {:?}",
+            collection.interface_check_diagnostics()
+        );
+        let primary = collisions[0]
+            .primary()
+            .expect("the local FetchUser type follows the generated use alias");
+        assert_eq!(
+            root.get(primary.span.range.start().to_usize()..primary.span.range.end().to_usize()),
+            Some("FetchUser")
+        );
+        assert!(matches!(
+            &collisions[0].related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("other.FetchUser"))
+        ));
+    }
+
+    #[test]
+    fn interface_check_recomputes_alias_collisions_after_poisoning_the_later_item() {
+        let root = concat!(
+            "interface alpha {\n",
+            "  type One = U32\n",
+            "  type Two = U32\n",
+            "}\n",
+            "interface beta {\n",
+            "  type One = U32\n",
+            "}\n",
+            "interface gamma {\n",
+            "  type Two = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn first_one(value: alpha.One)\n",
+            "  fn first_two(value: alpha.Two)\n",
+            "  fn use_both(one: beta.One, two: gamma.Two)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let collisions = collection
+            .interface_check_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collisions.len(),
+            1,
+            "after beta.One poisons use_both, its gamma.Two alias must not report another collision: {:?}",
+            collection.interface_check_diagnostics()
+        );
+        let primary = collisions[0]
+            .primary()
+            .expect("the later beta.One alias collides with alpha.One");
+        assert!(
+            root.get(primary.span.range.start().to_usize()..primary.span.range.end().to_usize())
+                .is_some_and(|text| text.contains("beta.One"))
+        );
+    }
+
+    #[test]
+    fn interface_check_retains_discovered_collisions_when_later_poisoning_removes_the_earlier_alias()
+     {
+        let root = concat!(
+            "interface alpha {\n",
+            "  type Fetch = U32\n",
+            "}\n",
+            "interface beta {\n",
+            "  type Fetch = U32\n",
+            "}\n",
+            "interface yeta {\n",
+            "  type Other = U32\n",
+            "}\n",
+            "interface zeta {\n",
+            "  type Other = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn item_b(fetch: alpha.Fetch, other: zeta.Other)\n",
+            "  fn item_c(fetch: beta.Fetch)\n",
+            "  fn item_a(other: yeta.Other)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let collisions = collection
+            .interface_check_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collisions.len(),
+            2,
+            "collision findings are retained in discovery order after an earlier alias owner is poisoned: {:?}",
+            collection.interface_check_diagnostics()
+        );
+        assert!(matches!(
+            (&collisions[0].primary(), &collisions[0].related()[..]),
+            (
+                Some(primary),
+                [sai_diagnostics::Related::DeclaredHere { location, .. }]
+            ) if root.get(
+                primary.span.range.start().to_usize()..primary.span.range.end().to_usize()
+            ).is_some_and(|text| text.contains("beta.Fetch"))
+                && root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("alpha.Fetch"))
+        ));
+        assert!(matches!(
+            (&collisions[1].primary(), &collisions[1].related()[..]),
+            (
+                Some(primary),
+                [sai_diagnostics::Related::DeclaredHere { location, .. }]
+            ) if root.get(
+                primary.span.range.start().to_usize()..primary.span.range.end().to_usize()
+            ).is_some_and(|text| text.contains("zeta.Other"))
+                && root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("yeta.Other"))
+        ));
+    }
+
+    #[test]
+    fn interface_check_ignores_use_aliases_inside_cyclic_interfaces() {
+        let root = concat!(
+            "interface types {\n",
+            "  type FetchUser = U32\n",
+            "  type Response = api.Request\n",
+            "}\n",
+            "interface api {\n",
+            "  type Request = U32\n",
+            "  fn fetch_user(value: types.FetchUser)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        assert_eq!(collection.interface_uses().cyclic.len(), 2);
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::WitNameCollision),
+            "a cyclic interface is omitted with its generated use aliases"
+        );
+    }
+
+    #[test]
+    fn interface_check_anchors_generated_use_aliases_at_module_alias_uses() {
+        let root = concat!(
+            "type RequestAlias = types.FetchUser\n",
+            "interface types {\n",
+            "  type FetchUser = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn fetch_user(value: RequestAlias)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let collision = collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .expect("the generated use alias collides with the local function");
+        assert!(matches!(
+            &collision.related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("RequestAlias"))
+        ));
+    }
+
+    #[test]
+    fn interface_check_orders_generated_use_alias_collisions_by_wit_target() {
+        let root = concat!(
+            "interface z {\n",
+            "  type Item = U32\n",
+            "}\n",
+            "interface a {\n",
+            "  type Item = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn first(value: z.Item)\n",
+            "  fn second(value: a.Item)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let collisions = collection
+            .interface_check_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collisions.len(),
+            1,
+            "{:?}",
+            collection.interface_check_diagnostics()
+        );
+        let collision = collisions[0];
+        assert!(matches!(
+            &collision.related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if root.get(
+                    location.span.range.start().to_usize()..location.span.range.end().to_usize()
+                ).is_some_and(|text| text.contains("a.Item"))
+        ));
+        let primary = collision
+            .primary()
+            .expect("the later generated alias follows target-text order");
+        assert!(
+            root.get(primary.span.range.start().to_usize()..primary.span.range.end().to_usize())
+                .is_some_and(|text| text.contains("z.Item"))
+        );
+    }
+
+    #[test]
+    fn interface_check_ignores_generated_use_aliases_outside_mapped_boundaries() {
+        let root = concat!(
+            "interface types {\n",
+            "  type FetchUser = U32\n",
+            "}\n",
+            "interface api {\n",
+            "  fn generic<T: types.FetchUser>()\n",
+            "  fn fetch_user(value: (USize, types.FetchUser))\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType),
+            "the incompatible tuple boundary remains diagnosed"
+        );
+        assert!(
+            !collection
+                .interface_check_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision),
+            "generic constraints and incompatible roots do not emit use aliases"
+        );
+    }
+
+    #[test]
     fn interface_use_resolution_prefers_interface_members_over_module_imports() {
         let root = concat!(
             "use b::Request\n",
