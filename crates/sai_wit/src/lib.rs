@@ -8,6 +8,8 @@ mod model;
 mod source_scan;
 mod stable_hash;
 mod view;
+mod wasi;
+mod wasi_loader;
 
 pub use closure::*;
 pub use convert::*;
@@ -15,6 +17,8 @@ pub use dependency::*;
 pub use generated::*;
 pub use model::*;
 pub use view::*;
+pub use wasi::*;
+pub use wasi_loader::*;
 
 use sai_hir::{PackageId, Symbol};
 use sai_intern::{Interner, LookupError, PackageIdError, PackageInterner};
@@ -26,17 +30,6 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 use wit_parser::{ParseError, SourceMap, UnresolvedPackageGroup};
-
-const EMBEDDED_WASI_PACKAGES: [&str; 7] = [
-    "cli",
-    "clocks",
-    "filesystem",
-    "http",
-    "io",
-    "random",
-    "sockets",
-];
-const EMBEDDED_WASI_VERSION: &str = "0.2.3";
 
 /// The WIT unit through which a package is viewed.
 ///
@@ -89,10 +82,10 @@ impl WitUnit {
         let name = symbols
             .resolve(package)
             .map_err(WitUnitIdentityError::UnknownSymbol)?;
-        if !EMBEDDED_WASI_PACKAGES.contains(&name.as_ref()) {
+        if !wasi::EMBEDDED_WASI_PACKAGE_NAMES.contains(&name.as_ref()) {
             return Err(WitUnitIdentityError::UnknownWasiPackage);
         }
-        if version.to_string() != EMBEDDED_WASI_VERSION {
+        if version.to_string() != wasi::EMBEDDED_WASI_VERSION {
             return Err(WitUnitIdentityError::UnsupportedWasiVersion);
         }
         let name_with_version = format!("{name}@{version}");
