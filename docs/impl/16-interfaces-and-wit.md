@@ -264,6 +264,32 @@ If a direct foreign unit failed, `U` fails **silently**: it reports no diagnosti
 
 A query cycle here is therefore an internal compiler error.
 
+The tracked driver query rebuilds this graph from the active package graph and
+the current `wit_unit_of` projections. It reads a `Dir` package's tracked WIT
+inventory and each listed file's raw bytes, and checks that the inventory
+directory still matches the directory in the package contract. A `Generated`
+unit reads the tracked `GeneratedText` snapshot and retains its origins and
+completeness for the later view query. The root has no dependent-facing unit:
+the caller requests `Dir(root)` explicitly when its contract declares a WIT
+directory, and may request `Generated(root)` explicitly for component
+lowering. A failed projection on an unrelated active package is treated as a
+target without a WIT unit; it does not stop the requested closure unless a
+reachable package references it.
+
+`WitUnit` equality intentionally scopes identity to the package compatibility
+line, so tracked query outputs must also account for exact selected versions.
+The generic package query hashes the exact canonical names of all closure
+units and of a failed unit. This ensures a same-line dependency update cannot
+reuse a result containing the old selected version.
+
+The driver currently exposes the loaded package closure and typed load
+failure; it has not yet converted these results into diagnostics bound to
+current `FileId`s and `SourceRef`s. Preserve stable package-relative paths and
+byte spans in that conversion. `wit-parser` 0.246.0 does not expose a public
+span accessor for `Resolve::push` semantic errors, so those failures currently
+retain the parser's rendered error string rather than an exact diagnostic
+range.
+
 ---
 
 ## 16.3 The WIT model
@@ -1347,3 +1373,22 @@ The name converter preserves WIT-to-SAI source spelling, including `r#` for stri
 - **Verification:** `cargo test -p sai_resolve --locked --quiet` passes all 149 tests. Added tests build the embedded `wasi:io@0.2.3` view, resolve a known resource from `streams` to its exact `DefId` and `DefKind::Resource`, and report a missing member through the normal module-prefix error. Hostile review approved the behavior and found two P3 issues: stale scope wording and a boxed iterator allocation. Both were fixed; re-review approved with no remaining findings. `cargo fmt --all -- --check` and `git diff --check` pass. `cargo test --workspace --locked --quiet` passes all 2,659 tests.
 - **Human review:** **Review required:** Confirm the span-free WIT member lookup result, the assumption that view members are public, and that `ModuleMemberIndex` and its `Interner` share the same compiler session as the supplied `WitView` and path symbols. Review that the source-only `visible_members` API intentionally does not enumerate WIT members.
 - **Remaining scope:** Add `wit_contract` and `wit_unit_of` inputs, project the active package graph into generic `Dir`/`Generated` package queries, connect generated origins, and continue package-path, world-scope, and type-query integration.
+
+### IR-593: Load tracked WIT package closures
+
+The driver now exposes `wit_package(&WitUnit)` for embedded WASI, explicit
+root `Dir`/`Generated` units, and dependent-facing `Dir`/`Generated` units.
+For package units it reconstructs exact selected versions from the active
+graph, builds the WIT reference graph from active edges, reads directory
+inventory and file bytes through tracked VFS inputs, and reads generated text
+through the tracked snapshot query. The shared `sai_wit` closure loader parses
+only reachable units and returns dependency-first package models, direct
+dependencies, and the post-order closure. Reached generated snapshots remain
+available for the future view query.
+
+- **Decision:** Canonicalize incoming package units from stable package keys and canonical names before querying; permit explicit root `Dir` only when its contract declares `wit`, and explicit root `Generated` for lowering while keeping `wit_unit_of(root) == None`. Represent a failed projection on an unrelated active package as an edge without a WIT unit, so it matters only if a reachable WIT reference uses that edge. Include exact canonical versions for every successful closure unit and the failed unit in query output hashing.
+- **Reason:** `PackageId` and WIT package symbols belong to one database session, and `WitUnit` identity deliberately omits the exact version. Rebuilding units avoids foreign-session interner collisions; hashing canonical names preserves exact MVS selections under compatibility-scoped equality. Root WIT is explicitly loaded for validation and lowering but must not become the root's dependent-facing identity. A package outside the reachable WIT closure cannot invalidate this package's semantic result, while a reference to an active package without a unit remains a graph-visible error.
+- **Verification:** `cargo test -p sai_driver --locked --quiet` passes 151 tests and `cargo test -p sai_wit --locked --quiet` passes 102 tests. `cargo test --workspace --locked --quiet`, `cargo fmt --all -- --check`, and `git diff --check` pass. Added regressions cover directory inventory/file/read failures, contract-directory mismatch, empty inventory parsing, reachable generated dependencies and text invalidation, explicit generated roots, WASI through the generic API, exact-version refresh for a stale root unit and a failing same-line dependency, unrelated projection failure, and package units passed from another database session.
+- **Review:** The first hostile review found two P2 issues: exact dependency versions were omitted from output hashing, allowing a stale failure to survive same-line version changes; and a projection failure in an unrelated active package stopped the requested load. Both received regression tests and fixes. Hostile follow-up approved with no remaining actionable findings.
+- **Human review:** **Review required:** Confirm canonical reconstruction at the database boundary; explicit root `Dir`/`Generated` behavior; exact-version hashing for the full closure and failed unit; and skipping unrelated projection failures while preserving missing-WIT reference errors. Review whether reachable unit-projection failures should be attributed to the referenced package's validation diagnostic once diagnostic collection is wired.
+- **Remaining scope:** Translate tracked loader failures into per-unit diagnostics with current source references, preserving the failing dependency as the diagnostic owner and suppressing duplicate parent diagnostics. Resolve whether the pinned parser API needs an upstream bridge or version change to attach exact ranges to `Resolve::push` errors. Then wire generic `wit_view` queries, generated-origin replacement, package/world scopes, and type-query integration.
