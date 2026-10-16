@@ -2271,6 +2271,7 @@ pub struct PredicateOwnerResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<PredicateOwnerResolution>,
 }
 
@@ -2289,6 +2290,20 @@ impl PredicateOwnerResolutions {
         self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.member_scope_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -7168,6 +7183,38 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_invariant_owner_predicates_inner(collection, module_tree, snapshot, None)
+    }
+
+    /// Resolves invariant type prefixes through a validated active-source
+    /// member-scope closure, leaving predicate and expression analysis intact.
+    pub fn resolve_invariant_owner_predicates_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_invariant_owner_predicates_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_invariant_owner_predicates_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -7175,8 +7222,22 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.invariant_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
@@ -7307,7 +7368,7 @@ impl RootDatabase {
                                     module_scope,
                                     Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    Some(&source_graph_packages),
+                                    Some(source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -7440,6 +7501,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -7459,6 +7522,38 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_refinement_owner_predicates_inner(collection, module_tree, snapshot, None)
+    }
+
+    /// Resolves refined and refinement-bearing distinct type prefixes through
+    /// a validated active-source member-scope closure.
+    pub fn resolve_refinement_owner_predicates_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_refinement_owner_predicates_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_refinement_owner_predicates_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -7466,8 +7561,22 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.refinement_predicate_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
@@ -7655,7 +7764,7 @@ impl RootDatabase {
                                     module_scope,
                                     Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    Some(&source_graph_packages),
+                                    Some(source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -7782,6 +7891,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -8074,6 +8185,7 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: None,
             owners,
         })
     }
@@ -20515,6 +20627,9 @@ mod tests {
                       type FromPrimitive = U32\n\
                       type GenericPrimitive<U32> = U32\n\
                       type FromModule = Array\n\
+                      invariant U32 { { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true } }\n\
+                      type ForeignRefined = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
+                      distinct ForeignDistinct = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
                       fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n\
                       const QUALIFIED_FOREIGN: middle.api.PublicType = { let nested: middle.api.PublicType = 0; 0 }\n\
                       const PRIVATE_FOREIGN: leaf_model.PrivateType = 0\n\
@@ -20530,7 +20645,7 @@ mod tests {
             &mut database,
             "acme:middle#1",
             "acme:middle@1.0.0",
-            &[("lib.sai", b"pub use acme:leaf.{api}\n")],
+            &[("lib.sai", b"pub use acme:deep.{api}\n")],
         );
         let (_, leaf_tree, leaf_snapshot_files) = multi_package_fixture(
             &mut database,
@@ -20547,12 +20662,24 @@ mod tests {
                 (
                     "model.sai",
                     b"pub type PublicType = U32\n\
-                      type PrivateType = U32\n",
+                  type PrivateType = U32\n",
                 ),
             ],
         );
+        let (_, deep_tree, deep_snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:deep#1",
+            "acme:deep@1.0.0",
+            &[(
+                "lib.sai",
+                b"pub interface api {\n\
+                  type PublicType = U32\n\
+                }\n",
+            )],
+        );
         snapshot_files.extend(middle_snapshot_files);
         snapshot_files.extend(leaf_snapshot_files);
+        snapshot_files.extend(deep_snapshot_files);
         let snapshot_files = snapshot_files
             .into_iter()
             .map(|file| {
@@ -20584,11 +20711,18 @@ mod tests {
                     "acme:middle",
                     "1.0.0",
                     PackageGraphRole::Dependency,
-                    vec![graph_edge("acme:leaf#1", "acme:leaf")],
+                    vec![graph_edge("acme:deep#1", "acme:deep")],
                 ),
                 graph_node(
                     "acme:leaf#1",
                     "acme:leaf",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+                graph_node(
+                    "acme:deep#1",
+                    "acme:deep",
                     "1.0.0",
                     PackageGraphRole::Dependency,
                     Vec::new(),
@@ -20609,8 +20743,17 @@ mod tests {
             )
             .expect("leaf scopes collect");
         let leaf_member_package = leaf_collection.module_member_scope_package();
+        let deep_collection = database
+            .collect_phase1_package_scopes_collection(
+                &deep_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("deep scopes collect");
+        let deep_member_package = deep_collection.module_member_scope_package();
         let middle_manifest: Arc<[u8]> =
-            Arc::from(&b"package acme:middle @ 1.0.0\nrequires { acme:leaf @ ^1 }\n"[..]);
+            Arc::from(&b"package acme:middle @ 1.0.0\nrequires { acme:deep @ ^1 }\n"[..]);
         let middle_collection = database
             .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
                 &middle_tree,
@@ -20622,7 +20765,7 @@ mod tests {
                 },
                 middle_manifest,
                 PackageRole::Dependency,
-                &[leaf_member_package.as_foreign_package_scopes("acme:leaf")],
+                &[deep_member_package.as_foreign_package_scopes("acme:deep")],
             )
             .expect("middle re-export scopes collect");
         let middle_member_package = middle_collection.module_member_scope_package();
@@ -20651,7 +20794,11 @@ mod tests {
             .collect_active_source_member_scopes(
                 &root_collection,
                 &graph,
-                &[middle_member_package.clone(), leaf_member_package.clone()],
+                &[
+                    middle_member_package.clone(),
+                    leaf_member_package.clone(),
+                    deep_member_package.clone(),
+                ],
             )
             .expect("transitive source scope closure validates");
         assert_eq!(
@@ -20660,17 +20807,17 @@ mod tests {
                 .iter()
                 .map(|package| package.package_key().as_str())
                 .collect::<Vec<_>>(),
-            ["acme:leaf#1", "acme:middle#1"],
+            ["acme:deep#1", "acme:leaf#1", "acme:middle#1"],
             "the closure includes transitive source packages in stable package order"
         );
         assert!(matches!(
             database.collect_active_source_member_scopes(
                 &root_collection,
                 &graph,
-                &[middle_member_package.clone()],
+                &[middle_member_package.clone(), leaf_member_package.clone()],
             ),
             Err(Phase1ModuleMemberScopeError::MissingSourcePackage(key))
-                if key.as_str() == "acme:leaf#1"
+                if key.as_str() == "acme:deep#1"
         ));
         assert!(matches!(
             database.collect_active_source_member_scopes(
@@ -20680,6 +20827,7 @@ mod tests {
                     middle_member_package.clone(),
                     middle_member_package.clone(),
                     leaf_member_package.clone(),
+                    deep_member_package.clone(),
                 ],
             ),
             Err(Phase1ModuleMemberScopeError::DuplicatePackage(key))
@@ -20734,7 +20882,8 @@ mod tests {
         assert_eq!(
             function_paths.module_path_errors().len(),
             2,
-            "private and missing foreign members remain as typed path errors"
+            "private and missing foreign members remain as typed path errors: {:?}",
+            function_paths.module_path_errors()
         );
         let function_source = snapshot
             .file(root_tree.modules[0].file)
@@ -20930,6 +21079,172 @@ mod tests {
             })
         ));
 
+        let assert_foreign_predicate_paths =
+            |paths: &TypeOwnerPathResolution, source: &str, source_offset: usize| {
+                assert!(
+                    paths.paths().values().any(|path| {
+                        matches!(path.base, Res::Def(DefKind::Alias, _))
+                            && path.resolved_segments == 3
+                            && path.segment_count == 3
+                    }),
+                    "public transitive interface members resolve from predicate type paths"
+                );
+                assert_eq!(paths.module_path_errors().len(), 2);
+                let private_error = paths
+                    .module_path_errors()
+                    .iter()
+                    .find(|entry| {
+                        matches!(entry.error(), ModulePathError::InaccessibleMember { .. })
+                    })
+                    .expect("foreign private predicate type is rejected");
+                let ModulePathError::InaccessibleMember { span, .. } = private_error.error() else {
+                    panic!("private predicate type has an inaccessible-member error");
+                };
+                assert_eq!(
+                    span.range,
+                    member_range(
+                        source,
+                        source_offset,
+                        "leaf_model.PrivateType",
+                        "PrivateType"
+                    )
+                );
+                assert!(matches!(
+                    paths.paths().get(&private_error.hir_id()),
+                    Some(PathRes {
+                        base: Res::Err,
+                        resolved_segments: 2,
+                        segment_count: 2,
+                    })
+                ));
+
+                let missing_error = paths
+                    .module_path_errors()
+                    .iter()
+                    .find(|entry| matches!(entry.error(), ModulePathError::MissingMember { .. }))
+                    .expect("missing transitive predicate type is retained");
+                let ModulePathError::MissingMember { span, .. } = missing_error.error() else {
+                    panic!("missing predicate type has a missing-member error");
+                };
+                assert_eq!(
+                    span.range,
+                    member_range(source, source_offset, "middle.api.PublicTypo", "PublicTypo")
+                );
+                assert!(matches!(
+                    paths.paths().get(&missing_error.hir_id()),
+                    Some(PathRes {
+                        base: Res::Err,
+                        resolved_segments: 3,
+                        segment_count: 3,
+                    })
+                ));
+            };
+
+        let invariant_results = database
+            .resolve_invariant_owner_predicates_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("invariant type paths resolve through transitive member scopes");
+        assert!(invariant_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            invariant_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_invariant_owner_predicates_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(invariant_results.owners().len(), 1);
+        let invariant_start = source_text
+            .find("invariant U32")
+            .expect("foreign invariant appears in the root source");
+        let invariant_end = source_text[invariant_start..]
+            .find('\n')
+            .expect("foreign invariant has a line ending")
+            + invariant_start;
+        let invariant_source = &source_text[invariant_start..invariant_end];
+        let invariant_paths = invariant_results.owners()[0]
+            .type_path_resolution()
+            .expect("invariant type path result succeeds")
+            .expect("invariant has a type path result");
+        assert_foreign_predicate_paths(invariant_paths, invariant_source, invariant_start);
+
+        let refinement_results = database
+            .resolve_refinement_owner_predicates_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("refinement type paths resolve through transitive member scopes");
+        assert!(refinement_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            refinement_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_refinement_owner_predicates_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(refinement_results.owners().len(), 2);
+        let refinement_start = source_text
+            .find("type ForeignRefined")
+            .expect("foreign refined type appears in the root source");
+        let refinement_end = source_text[refinement_start..]
+            .find('\n')
+            .expect("foreign refined type has a line ending")
+            + refinement_start;
+        let refinement_source = &source_text[refinement_start..refinement_end];
+        let refinement_paths = refinement_results.owners()[0]
+            .type_path_resolution()
+            .expect("refinement type path result succeeds")
+            .expect("refined type has a type path result");
+        assert_foreign_predicate_paths(refinement_paths, refinement_source, refinement_start);
+        let distinct_index = refinement_results
+            .owners()
+            .iter()
+            .position(|owner| {
+                root_collection
+                    .scopes()
+                    .refinement_predicate_owners
+                    .iter()
+                    .any(|descriptor| {
+                        descriptor.owner == owner.owner()
+                            && descriptor.kind == RefinementPredicateOwnerKind::Distinct
+                    })
+            })
+            .expect("refinement results include the refinement-bearing distinct owner");
+        let distinct_start = source_text
+            .find("distinct ForeignDistinct")
+            .expect("foreign refinement-bearing distinct appears in the root source");
+        let distinct_end = source_text[distinct_start..]
+            .find('\n')
+            .expect("foreign distinct has a line ending")
+            + distinct_start;
+        let distinct_source = &source_text[distinct_start..distinct_end];
+        let distinct_paths = refinement_results.owners()[distinct_index]
+            .type_path_resolution()
+            .expect("distinct type path result succeeds")
+            .expect("refinement-bearing distinct has a type path result");
+        assert_foreign_predicate_paths(distinct_paths, distinct_source, distinct_start);
+
         let results = database
             .resolve_type_owner_paths_with_member_scopes(
                 &root_collection,
@@ -21050,23 +21365,10 @@ mod tests {
                 _ => None,
             })
             .expect("private transitive member is rejected");
-        let private_start = b"use acme:middle as middle\n\
-                  use acme:check/local as local\n\
-                  use acme:check/local.{Array}\n\
-                  use acme:leaf/model as leaf_model\n\
-                  interface api { type Request = U32 }\n\
-                  type FromInterface = api.Request\n\
-                  type FromLocalModule = local.LocalType\n\
-                  type Record {\n\
-                    public: middle.api.PublicType\n\
-                    private: leaf_model.PrivateType\n\
-                    missing: middle.api.MissingType\n\
-                    tail: middle.api.PublicType.Associated\n\
-                  }\n\
-                  type Generic<T> = middle.api.PublicType<T>\n"
-            .windows(b"PrivateType".len())
-            .position(|window| window == b"PrivateType")
-            .expect("private name is in root source");
+        let private_start = source_text
+            .find("private: leaf_model.PrivateType")
+            .expect("private name is in root source")
+            + "private: leaf_model.".len();
         assert_eq!(
             private_span.range,
             sai_diagnostics::TextRange::new(
@@ -21174,7 +21476,7 @@ mod tests {
                 }
                 _ => None,
             })
-            .expect("missing direct dependency member is retained as a typed failure");
+            .expect("missing foreign interface member is retained as a typed failure");
         assert!(matches!(
             path_errors.paths().get(&missing.hir_id()),
             Some(PathRes {
@@ -21205,7 +21507,7 @@ mod tests {
             .find(|diagnostic| diagnostic.message.contains("`PublicTypo`"))
             .expect("transitive missing member is diagnosed");
         assert!(
-            suggested.message.contains("module `acme:leaf@1.0.0/api`"),
+            suggested.message.contains("module `acme:deep@1.0.0/api`"),
             "the diagnostic names the canonical re-export target"
         );
         assert_eq!(
@@ -21293,7 +21595,11 @@ mod tests {
             .collect_active_source_member_scopes(
                 &suppressed_collection,
                 &graph,
-                &[middle_member_package.clone(), leaf_member_package.clone()],
+                &[
+                    middle_member_package.clone(),
+                    leaf_member_package.clone(),
+                    deep_member_package.clone(),
+                ],
             )
             .expect("suppressed resolution retains the same scope provenance");
         let suppressed = database
@@ -21326,7 +21632,11 @@ mod tests {
             database.collect_active_source_member_scopes(
                 &root_collection,
                 &changed_graph,
-                &[middle_member_package.clone(), leaf_member_package.clone()],
+                &[
+                    middle_member_package.clone(),
+                    leaf_member_package.clone(),
+                    deep_member_package.clone(),
+                ],
             ),
             Err(Phase1ModuleMemberScopeError::PackageGraphMismatch(key))
                 if key.as_str() == "acme:check#1"
