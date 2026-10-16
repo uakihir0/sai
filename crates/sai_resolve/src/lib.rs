@@ -20,8 +20,9 @@ pub mod wit_name_collisions;
 pub use interface_impls::{
     InterfaceImpl, InterfaceImplFunction, InterfaceImplInput, InterfaceImplInterface,
     InterfaceImplInterfaceItem, InterfaceImplInterfaceItemKind, InterfaceImplItem,
-    InterfaceImplItemKind, InterfaceImplResource, InterfaceImplTarget,
-    InterfaceImplUnsupportedFunction, InterfaceImpls, InterfaceImplsInput, collect_interface_impls,
+    InterfaceImplItemKind, InterfaceImplResource, InterfaceImplResourceBinding,
+    InterfaceImplTarget, InterfaceImplTypeResolution, InterfaceImplUnsupportedFunction,
+    InterfaceImpls, InterfaceImplsInput, collect_interface_impls,
 };
 pub use interface_uses::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses,

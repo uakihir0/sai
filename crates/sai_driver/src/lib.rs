@@ -1,10 +1,19 @@
 #![forbid(unsafe_code)]
 
+mod interface_impl_resource_wit;
+mod interface_resource_alias;
 mod interface_use_queries;
 pub mod package_graph;
 mod package_wit_name_queries;
 mod wit_package_queries;
 
+use interface_impl_resource_wit::{
+    WitResourceIdentity, WitResourceOccurrenceIncomplete, WitResourceOccurrenceSearch,
+    WitResourceOccurrenceSite, first_wit_resource_occurrence,
+};
+use interface_resource_alias::{
+    LocalTypeAlias, ResourceAliasContext, ResourceAliasTarget, resolve_resource_alias_target,
+};
 use interface_use_queries::InterfaceUsesQueries;
 pub use interface_use_queries::InterfaceUsesQueryError;
 pub use sai_wit::WitPackageDiagnosticTemplate;
@@ -18,8 +27,8 @@ use crate::package_graph::{PackageForm, PackageGraph, PackageGraphRole};
 use package_wit_name_queries::PackageWitNamesQueries;
 pub use package_wit_name_queries::PackageWitNamesQueryError;
 use sai_diagnostics::{
-    CauseKey, Child, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related, SourceRef,
-    source_text_status_diagnostic,
+    CauseKey, Child, ChildKind, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related,
+    SourceRef, source_text_status_diagnostic,
 };
 use sai_hir::arena::HirArena;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
@@ -95,8 +104,9 @@ use sai_resolve::use_target_diagnostics::{
 use sai_resolve::{
     InterfaceImplInput, InterfaceImplInterface, InterfaceImplInterfaceItem,
     InterfaceImplInterfaceItemKind, InterfaceImplItem, InterfaceImplItemKind, InterfaceImplTarget,
-    InterfaceImplUnsupportedFunction, InterfaceImpls, InterfaceImplsInput, InterfaceUseReference,
-    InterfaceUses, InterfaceUsesInput, collect_interface_impls, interface_uses,
+    InterfaceImplTypeResolution, InterfaceImplUnsupportedFunction, InterfaceImpls,
+    InterfaceImplsInput, InterfaceUseReference, InterfaceUses, InterfaceUsesInput,
+    collect_interface_impls, interface_uses,
 };
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
@@ -114,7 +124,7 @@ use sai_wit::{
     LoadedWitPackage, Unsupported, WitContract, WitContractError, WitContractField, WitPackageEdge,
     WitPackageGraph, WitPackageGraphError, WitPackageLoadError, WitPackageLoadFailure,
     WitPackageNode, WitSourceFile, WitUnit, WitUnitIdentityError, WitUnitKind, WitView,
-    WitViewDefKind, WitViewError, WitWasiLoadError, embedded_wasi_package,
+    WitViewDefKind, WitViewEntity, WitViewError, WitWasiLoadError, embedded_wasi_package,
     load_embedded_wasi_package, load_wit_package_closure,
 };
 use std::cell::RefCell;
@@ -2100,7 +2110,13 @@ struct OwnedPhase1ForeignWitView {
 #[derive(Clone)]
 struct Phase1ActiveWitViewEntry {
     identity: Phase1ActiveWitViewEntryIdentity,
+    /// The canonical WIT unit, retained even when constructing its view
+    /// fails so data-shape validation can still scan a loaded package.
+    unit: Option<WitUnit>,
     available: Option<OwnedPhase1ForeignWitView>,
+    /// Direct package edges in the package graph's canonical order, followed
+    /// by catalog-ordered embedded WASI units.
+    direct_order: Option<usize>,
 }
 
 /// A validated WIT-view closure for the active package graph reachable from
@@ -2177,6 +2193,16 @@ impl Phase1ActiveWitViewScopes {
         self.entries
             .iter()
             .filter_map(|entry| entry.available.as_ref())
+    }
+
+    fn ordered_direct_entries(&self) -> Vec<&Phase1ActiveWitViewEntry> {
+        let mut entries = self
+            .entries
+            .iter()
+            .filter_map(|entry| entry.direct_order.map(|order| (order, entry)))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(order, _)| *order);
+        entries.into_iter().map(|(_, entry)| entry).collect()
     }
 
     fn direct_view_package_keys<'a>(
@@ -3091,6 +3117,7 @@ pub struct TraitImplMemberTestOnlyResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<TraitImplMemberOwnerResolution>,
     session_token: SessionToken,
 }
@@ -3123,6 +3150,20 @@ impl TraitImplMemberTestOnlyResolutions {
 
     pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
         self.member_scope_closure_fingerprint
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
+    }
+
+    pub const fn wit_view_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.wit_view_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -6265,6 +6306,201 @@ fn local_interface_impl_interfaces(
     Ok(interfaces)
 }
 
+fn collect_interface_resource_aliases<'hir>(
+    symbols: &Interner,
+    def_paths_by_package: &HashMap<PackageId, Arc<DefPathInterner>>,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    collection: &Phase1PackageScopesCollection,
+    inputs_by_file: &'hir HashMap<FileId, CurrentOwnerInputs>,
+    snapshot: &WorkspaceSnapshot,
+    arena: &'hir HirArena<'hir>,
+    module_members: &ModuleMemberIndex<'_>,
+    source_graph_packages: &HashSet<PackageId>,
+    aliases: &mut HashMap<DefId, LocalTypeAlias<'hir>>,
+    path_resolutions: &mut HashMap<HirId, PathRes>,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    let owner_index = index_top_level_owner_descriptors(collection);
+    for descriptor in collection
+        .scopes
+        .top_level_owners
+        .iter()
+        .copied()
+        .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
+    {
+        let inputs = inputs_by_file
+            .get(&descriptor.file)
+            .expect("interface owner inputs were collected before alias lowering");
+        if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Interface) {
+            return Err(
+                OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                    owner: descriptor.owner,
+                    file: descriptor.file,
+                },
+            );
+        }
+        let def_paths = def_paths_by_package
+            .get(&descriptor.owner.def_id.package())
+            .cloned()
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?;
+        let expected_path = def_paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?;
+        let context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            snapshot,
+            &inputs.root,
+            arena,
+            symbols,
+            &def_paths,
+        );
+        let owner_descriptor = find_top_level_owner_descriptor(
+            &owner_index,
+            descriptor.owner,
+            descriptor.file,
+            descriptor.item_id,
+            TopLevelOwnerKind::Interface,
+        )?;
+        let (interface_hir, _) = lower_top_level_owner(
+            owner_descriptor,
+            &expected_path,
+            &inputs.filtered_item_tree,
+            &inputs.retained_item_kinds,
+            &context,
+        )?;
+        let interface_members = match interface_hir.node {
+            OwnerNode::Item(item) => match item.kind {
+                ItemKind::Interface { items } => items,
+                _ => {
+                    return Err(OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                        descriptor: TopLevelOwnerKind::Interface,
+                        current: ItemTreeKind::Interface,
+                    });
+                }
+            },
+            _ => {
+                return Err(
+                    OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                    },
+                );
+            }
+        };
+        let parent_entry = inputs
+            .filtered_item_tree
+            .items
+            .iter()
+            .find(|entry| {
+                entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Interface
+            })
+            .ok_or(
+                OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                    owner: descriptor.owner,
+                    file: descriptor.file,
+                },
+            )?;
+        let member_entries = parent_entry
+            .children
+            .iter()
+            .filter(|entry| interface_member_kind(entry.kind).is_some())
+            .collect::<Vec<_>>();
+        if member_entries.len() != interface_members.len() {
+            return Err(OwnerControlFlowResolutionError::Lowering(
+                HirLoweringError::ItemTreeEntryMismatch,
+            ));
+        }
+        let interface_scope = collection
+            .scopes
+            .interfaces
+            .get(&descriptor.owner.def_id.to_def_id())
+            .ok_or(OwnerControlFlowResolutionError::MissingInterfaceScope(
+                descriptor.owner,
+            ))?;
+        let effective_aliases = interface_scope
+            .members
+            .values()
+            .filter_map(|binding| match binding.res {
+                Res::Def(DefKind::Alias, def) => Some(def),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let module_scope =
+            module_scope_for_file(collection, &collection.module_tree, descriptor.file)?;
+        let interface_module_scope = interface_use_queries::module_scope_with_interface_members(
+            module_scope,
+            collection.scopes(),
+            descriptor.owner,
+        )?;
+
+        for (entry, member_owner) in member_entries
+            .into_iter()
+            .zip(interface_members.iter().copied())
+        {
+            if !effective_aliases.contains(&member_owner.def_id.to_def_id()) {
+                continue;
+            }
+            let member_path = def_paths
+                .resolve_def_id(member_owner.def_id.to_def_id())
+                .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                    member_owner,
+                ))?;
+            let (member_hir, _) = lower_interface_item_owner(
+                member_owner,
+                &member_path,
+                &interface_hir,
+                descriptor.item_id,
+                entry.ast_id,
+                &inputs.filtered_item_tree,
+                &context,
+            )
+            .map_err(OwnerControlFlowResolutionError::Lowering)?;
+            let OwnerNode::InterfaceItem(item) = member_hir.node else {
+                return Err(OwnerControlFlowResolutionError::Lowering(
+                    HirLoweringError::ItemTreeEntryMismatch,
+                ));
+            };
+            let HirInterfaceItemKind::Alias { generics, ty } = item.kind else {
+                continue;
+            };
+            let candidates = owner_test_only_path_candidates(&member_hir);
+            let generic_resolutions = owner_type_generic_resolutions(&member_hir);
+            let resolution = resolve_partial_type_owner_paths(
+                member_owner,
+                &candidates,
+                &generic_resolutions,
+                primitive_prelude,
+                &interface_module_scope,
+                collection.module_tree.package,
+                Some(module_members),
+                Some(source_graph_packages),
+            )?;
+            path_resolutions.extend(
+                resolution
+                    .paths()
+                    .iter()
+                    .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+            );
+            aliases.insert(
+                member_owner.def_id.to_def_id(),
+                LocalTypeAlias {
+                    owner: member_owner,
+                    params: generics.params,
+                    target: ty,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 fn wit_view_interface_impl_interfaces(
     wit_view_scopes: &Phase1ActiveWitViewScopes,
 ) -> HashMap<DefId, InterfaceImplInterface> {
@@ -6330,6 +6566,263 @@ fn interface_impl_source_location(
     .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
         owner,
     ))
+}
+
+fn validate_interface_resource_bindings(
+    package: &str,
+    module_tree: &ModuleTree,
+    collection: &Phase1PackageScopesCollection,
+    external_checks: &HashMap<DefId, InterfaceResourceExternalCheck>,
+    interface_impls: &mut InterfaceImpls,
+) -> Vec<(sai_hir::LocalDefId, Diagnostic)> {
+    let top_level_resources = collection
+        .scopes
+        .top_level_owners
+        .iter()
+        .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Resource)
+        .map(|descriptor| descriptor.owner.def_id.to_def_id())
+        .collect::<HashSet<_>>();
+    let mut first_binding_by_type = HashMap::<sai_hir::DefId, sai_diagnostics::Location>::new();
+    let mut diagnostics = Vec::new();
+
+    for implementation in &mut interface_impls.impls {
+        let is_selected_impl = implementation.interface.is_some_and(|interface| {
+            interface_impls.by_interface.get(&interface) == Some(&implementation.impl_def)
+        });
+        let candidates = std::mem::take(&mut implementation.resource_bindings);
+        if !is_selected_impl {
+            continue;
+        }
+
+        for binding in candidates {
+            let implementation_type = match binding.implementation_type {
+                InterfaceImplTypeResolution::Unresolved => continue,
+                InterfaceImplTypeResolution::NonDefinition => {
+                    diagnostics.push((
+                        implementation.impl_def,
+                        invalid_interface_resource_binding_diagnostic(
+                            package,
+                            &binding,
+                            "the binding target is not a resource type",
+                            None,
+                        ),
+                    ));
+                    continue;
+                }
+                InterfaceImplTypeResolution::Definition(def) => def,
+            };
+
+            if implementation_type.package != module_tree.package
+                || !top_level_resources.contains(&implementation_type)
+            {
+                diagnostics.push((
+                    implementation.impl_def,
+                    invalid_interface_resource_binding_diagnostic(
+                        package,
+                        &binding,
+                        "the binding target must be a module-level resource in this package",
+                        None,
+                    ),
+                ));
+                continue;
+            }
+
+            if let Some(earlier_binding) = first_binding_by_type.get(&implementation_type) {
+                diagnostics.push((
+                    implementation.impl_def,
+                    invalid_interface_resource_binding_diagnostic(
+                        package,
+                        &binding,
+                        "this resource is already bound to another interface resource",
+                        Some(earlier_binding),
+                    ),
+                ));
+                continue;
+            }
+
+            match external_checks.get(&binding.resource) {
+                Some(InterfaceResourceExternalCheck::Occurrence(occurrence)) => {
+                    let mut diagnostic = invalid_interface_resource_binding_diagnostic(
+                        package,
+                        &binding,
+                        "the view resource occurs in a visible WIT data type",
+                        None,
+                    );
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Note,
+                            message: describe_wit_resource_occurrence(occurrence),
+                            location: None,
+                        })
+                        .expect("a locationless WIT note is valid");
+                    diagnostics.push((implementation.impl_def, diagnostic));
+                    continue;
+                }
+                Some(InterfaceResourceExternalCheck::Incomplete(_)) => {
+                    // An incomplete external scan cannot establish that the
+                    // binding violates §16.7.3. Leave it out of `resources`
+                    // so it cannot authorize a redirect, but keep the owning
+                    // WIT/load diagnostic as the only proven failure.
+                    continue;
+                }
+                Some(
+                    InterfaceResourceExternalCheck::NotViewResource
+                    | InterfaceResourceExternalCheck::NoOccurrence,
+                )
+                | None => {}
+            }
+
+            first_binding_by_type.insert(implementation_type, binding.binding_location.clone());
+            implementation
+                .resources
+                .push(sai_resolve::InterfaceImplResource {
+                    resource: binding.resource,
+                    implementation_type,
+                    binding_span: binding.binding_span,
+                });
+        }
+    }
+    diagnostics
+}
+
+fn order_interface_impl_diagnostics(
+    impl_locations: &[(sai_hir::LocalDefId, Vec<sai_diagnostics::Location>)],
+    collector_diagnostics: Vec<Diagnostic>,
+    binding_diagnostics: Vec<(sai_hir::LocalDefId, Diagnostic)>,
+) -> Result<Vec<Diagnostic>, Option<String>> {
+    let indexes = impl_locations
+        .iter()
+        .enumerate()
+        .map(|(index, (impl_def, _))| (*impl_def, index))
+        .collect::<HashMap<_, _>>();
+    let mut diagnostics_by_impl = (0..impl_locations.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<Diagnostic>>>();
+
+    for diagnostic in collector_diagnostics {
+        let Some(primary) = diagnostic.primary() else {
+            return Err(None);
+        };
+        let Some((index, _)) = impl_locations
+            .iter()
+            .enumerate()
+            .find(|(_, (_, locations))| locations.iter().any(|location| location == primary))
+        else {
+            return Err(Some(primary.file.path.clone()));
+        };
+        diagnostics_by_impl[index].push(diagnostic);
+    }
+
+    for (impl_def, diagnostic) in binding_diagnostics {
+        let Some(index) = indexes.get(&impl_def).copied() else {
+            return Err(diagnostic
+                .primary()
+                .map(|primary| primary.file.path.clone()));
+        };
+        diagnostics_by_impl[index].push(diagnostic);
+    }
+
+    Ok(diagnostics_by_impl.into_iter().flatten().collect())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InterfaceResourceExternalCheck {
+    NotViewResource,
+    NoOccurrence,
+    Occurrence(interface_impl_resource_wit::WitResourceOccurrence),
+    Incomplete(String),
+}
+
+fn describe_wit_resource_occurrence(
+    occurrence: &interface_impl_resource_wit::WitResourceOccurrence,
+) -> String {
+    let site = match &occurrence.site {
+        WitResourceOccurrenceSite::RecordField { name, .. } => {
+            format!("record field `{name}`")
+        }
+        WitResourceOccurrenceSite::VariantCase { name, .. } => {
+            format!("variant payload for case `{name}`")
+        }
+        WitResourceOccurrenceSite::AliasTarget => "alias target".to_owned(),
+        WitResourceOccurrenceSite::UsedAlias => "used alias".to_owned(),
+    };
+    let source = occurrence
+        .item_span
+        .as_ref()
+        .map_or_else(String::new, |span| {
+            format!(
+                " in `{}` bytes {}..{}",
+                span.path, span.range.start, span.range.end
+            )
+        });
+    let occurrence_order = if occurrence.first_occurrence_known {
+        "first view-resource occurrence".to_owned()
+    } else {
+        "view-resource occurrence (an earlier occurrence cannot be excluded)".to_owned()
+    };
+    format!(
+        "{occurrence_order}: {site} of WIT item `{}.{}` in unit `{}`{source}",
+        occurrence.interface_name,
+        occurrence.item_name,
+        occurrence.unit.canonical_name(),
+    )
+}
+
+fn describe_wit_resource_occurrence_incomplete(
+    incomplete: &WitResourceOccurrenceIncomplete,
+) -> String {
+    match incomplete {
+        WitResourceOccurrenceIncomplete::UnsupportedType {
+            unsupported,
+            location,
+        } => format!(
+            "could not finish the WIT resource scan: `{unsupported:?}` at WIT item `{}.{}` in unit `{}` may hide a resource type",
+            location.interface_name,
+            location.item_name,
+            location.unit.canonical_name(),
+        ),
+        WitResourceOccurrenceIncomplete::MissingPackage { unit } => format!(
+            "could not finish the WIT resource scan: package model for `{}` is missing",
+            unit.canonical_name(),
+        ),
+        WitResourceOccurrenceIncomplete::MissingInterface { unit, interface } => format!(
+            "could not finish the WIT resource scan: interface {interface:?} is missing from `{}`",
+            unit.canonical_name(),
+        ),
+        WitResourceOccurrenceIncomplete::MissingItem {
+            unit,
+            interface,
+            item,
+        } => format!(
+            "could not finish the WIT resource scan: item {item:?} in interface {interface:?} is missing from `{}`",
+            unit.canonical_name(),
+        ),
+    }
+}
+
+fn invalid_interface_resource_binding_diagnostic(
+    package: &str,
+    binding: &sai_resolve::InterfaceImplResourceBinding,
+    reason: &str,
+    earlier_binding: Option<&sai_diagnostics::Location>,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::new(
+        sai_diagnostics::Code::InvalidResourceBinding,
+        sai_diagnostics::Severity::Error,
+        format!("invalid resource binding: {reason}"),
+        Some(binding.type_location.clone()),
+    );
+    diagnostic.primary_label = "invalid resource type".to_owned();
+    diagnostic.package = Some(package.to_owned());
+    if let Some(earlier_binding) = earlier_binding {
+        diagnostic
+            .push_related(Related::DeclaredHere {
+                location: earlier_binding.clone(),
+                what: "earlier binding of this resource".to_owned(),
+            })
+            .expect("unbound diagnostic accepts related locations");
+    }
+    diagnostic
 }
 
 fn interface_impl_target_diagnostics(
@@ -11066,6 +11559,12 @@ impl RootDatabase {
         }
 
         let graph_fingerprint = fingerprint(graph);
+        let direct_edge_order = requester_node
+            .active_edges()
+            .iter()
+            .enumerate()
+            .map(|(order, edge)| (edge.target().clone(), order))
+            .collect::<HashMap<_, _>>();
         let mut entries = Vec::with_capacity(reachable.len());
         for key in reachable.into_iter().filter(|key| key != &requester) {
             let node = graph.node(&key).ok_or_else(|| {
@@ -11088,6 +11587,7 @@ impl RootDatabase {
                 view_fingerprint: None,
                 failure: None,
             };
+            let mut unit_result = None;
             let available = match self.wit_unit_of(package) {
                 Ok(None) => None,
                 Err(error) if wit_unit_of_error_is_runtime(&error) => {
@@ -11101,6 +11601,7 @@ impl RootDatabase {
                     None
                 }
                 Ok(Some(unit)) => {
+                    unit_result = Some(unit.clone());
                     let expected_name = format!("{}@{}", node.identity(), node.version());
                     let expected_stable_key = match unit.kind() {
                         WitUnitKind::Generated { .. } => {
@@ -11150,7 +11651,7 @@ impl RootDatabase {
                                 visible_identity: node.identity().to_owned(),
                                 view,
                                 source_def_paths,
-                                directly_visible: false,
+                                directly_visible: direct_edge_order.contains_key(&key),
                             })
                         }
                         Err(error) if wit_view_query_error_is_runtime(&error) => {
@@ -11167,11 +11668,13 @@ impl RootDatabase {
                 }
             };
             entries.push(Phase1ActiveWitViewEntry {
+                direct_order: direct_edge_order.get(&key).copied(),
                 identity,
+                unit: unit_result,
                 available,
             });
         }
-        for package in EMBEDDED_WASI_CATALOG {
+        for (wasi_index, package) in EMBEDDED_WASI_CATALOG.iter().enumerate() {
             let unit = self.wasi_unit(package.name).map_err(|failure| {
                 let package_key = PackageKey::new(format!(
                     "wit:wasi:{}@{}",
@@ -11194,6 +11697,7 @@ impl RootDatabase {
             })?;
             let view_fingerprint = fingerprint(view.as_ref());
             entries.push(Phase1ActiveWitViewEntry {
+                direct_order: Some(requester_node.active_edges().len() + wasi_index),
                 identity: Phase1ActiveWitViewEntryIdentity {
                     package_key,
                     package_identity: format!("wasi:{}", package.name),
@@ -11204,6 +11708,7 @@ impl RootDatabase {
                     view_fingerprint: Some(view_fingerprint),
                     failure: None,
                 },
+                unit: Some(unit),
                 available: Some(OwnedPhase1ForeignWitView {
                     visible_identity: format!("wasi:{}", package.name),
                     view,
@@ -12443,7 +12948,9 @@ impl RootDatabase {
         match wit_view_scopes {
             Some(scopes) => {
                 self.validate_active_wit_view_scopes(collection, snapshot, scopes)?;
-                if !header_resolutions.matches_wit_view_scopes(collection, scopes) {
+                if !header_resolutions.matches_wit_view_scopes(collection, scopes)
+                    || !member_resolutions.matches_wit_view_scopes(collection, scopes)
+                {
                     return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
                         Phase1ModuleMemberScopeError::PackageGraphMismatch(
                             collection.package_key.clone(),
@@ -12451,7 +12958,9 @@ impl RootDatabase {
                     ));
                 }
             }
-            None if header_resolutions.wit_view_closure_fingerprint.is_some() => {
+            None if header_resolutions.wit_view_closure_fingerprint.is_some()
+                || member_resolutions.wit_view_closure_fingerprint.is_some() =>
+            {
                 return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
                     Phase1ModuleMemberScopeError::PackageGraphMismatch(
                         collection.package_key.clone(),
@@ -12482,6 +12991,213 @@ impl RootDatabase {
         if let Some(wit_view_scopes) = wit_view_scopes {
             interfaces.extend(wit_view_interface_impl_interfaces(wit_view_scopes));
         }
+
+        let type_owner_resolutions = match wit_view_scopes {
+            Some(wit_view_scopes) => self
+                .resolve_type_owner_paths_with_member_scopes_and_wit_views(
+                    collection,
+                    module_tree,
+                    snapshot,
+                    member_scopes,
+                    wit_view_scopes,
+                )?,
+            None => self.resolve_type_owner_paths_with_member_scopes(
+                collection,
+                module_tree,
+                snapshot,
+                member_scopes,
+            )?,
+        };
+        let alias_collections = std::iter::once(collection)
+            .chain(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(|package| &package.collection),
+            )
+            .collect::<Vec<_>>();
+        let mut alias_inputs_by_file = HashMap::new();
+        for alias_collection in &alias_collections {
+            for descriptor in alias_collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .filter(|descriptor| {
+                    matches!(
+                        descriptor.kind,
+                        TopLevelOwnerKind::Alias | TopLevelOwnerKind::Interface
+                    )
+                })
+            {
+                if alias_inputs_by_file.contains_key(&descriptor.file) {
+                    continue;
+                }
+                let inputs = self.current_owner_inputs(
+                    snapshot,
+                    descriptor.file,
+                    &alias_collection.target_cfg,
+                )?;
+                alias_inputs_by_file.insert(descriptor.file, inputs);
+            }
+        }
+        let alias_symbols = Arc::clone(&self.symbols);
+        let alias_def_paths = self.def_paths.clone();
+        let alias_primitive_prelude = self.primitive_prelude.clone();
+        let alias_wit_views = wit_view_scopes
+            .into_iter()
+            .flat_map(Phase1ActiveWitViewScopes::views)
+            .map(|view| view.view.as_ref())
+            .collect::<Vec<_>>();
+        let alias_module_members = ModuleMemberIndex::new_with_wit_views(
+            alias_collections.iter().map(|package| package.scopes()),
+            alias_wit_views.iter().copied(),
+            &alias_symbols,
+        );
+        let alias_arena = HirArena::new();
+        let mut local_type_aliases = HashMap::new();
+        let mut resource_alias_path_resolutions = HashMap::new();
+        for owner in type_owner_resolutions.owners() {
+            if let Ok(paths) = owner.path_resolution() {
+                resource_alias_path_resolutions
+                    .extend(paths.paths().iter().map(|(id, path)| (*id, *path)));
+            }
+        }
+        for source_collection in alias_collections.iter().skip(1).copied() {
+            let source_type_resolutions = self.resolve_type_owner_paths_inner(
+                source_collection,
+                &source_collection.module_tree,
+                snapshot,
+                Some(&alias_module_members),
+                None,
+                None,
+            )?;
+            for owner in source_type_resolutions.owners() {
+                if let Ok(paths) = owner.path_resolution() {
+                    resource_alias_path_resolutions
+                        .extend(paths.paths().iter().map(|(id, path)| (*id, *path)));
+                }
+            }
+        }
+        for owner in member_resolutions.owners() {
+            for member in owner.members() {
+                if member.kind() != TraitImplMemberKind::ImplAssociatedType {
+                    continue;
+                }
+                if let Some(paths) = member.type_path_resolution().ok() {
+                    resource_alias_path_resolutions
+                        .extend(paths.paths().iter().map(|(id, path)| (*id, *path)));
+                }
+            }
+        }
+        for alias_collection in &alias_collections {
+            let owner_index = index_top_level_owner_descriptors(alias_collection);
+            for descriptor in alias_collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Alias)
+            {
+                let inputs = alias_inputs_by_file
+                    .get(&descriptor.file)
+                    .expect("alias owner inputs were collected before alias lowering");
+                if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Alias)
+                {
+                    continue;
+                }
+                let def_paths = alias_def_paths
+                    .get(&descriptor.owner.def_id.package())
+                    .cloned()
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let expected_path = def_paths
+                    .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                        descriptor.owner,
+                    ))?;
+                let context = HirLoweringContext::new(
+                    &inputs.ast_ids,
+                    snapshot,
+                    &inputs.root,
+                    &alias_arena,
+                    &alias_symbols,
+                    &def_paths,
+                );
+                let owner_descriptor = find_top_level_owner_descriptor(
+                    &owner_index,
+                    descriptor.owner,
+                    descriptor.file,
+                    descriptor.item_id,
+                    TopLevelOwnerKind::Alias,
+                )?;
+                let (hir_owner, _) = lower_top_level_owner(
+                    owner_descriptor,
+                    &expected_path,
+                    &inputs.filtered_item_tree,
+                    &inputs.retained_item_kinds,
+                    &context,
+                )?;
+                let OwnerNode::Item(item) = hir_owner.node else {
+                    return Err(
+                        OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                };
+                let ItemKind::Alias { generics, ty } = item.kind else {
+                    return Err(OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                        descriptor: TopLevelOwnerKind::Alias,
+                        current: ItemTreeKind::Alias,
+                    });
+                };
+                local_type_aliases.insert(
+                    descriptor.owner.def_id.to_def_id(),
+                    LocalTypeAlias {
+                        owner: descriptor.owner,
+                        params: generics.params,
+                        target: ty,
+                    },
+                );
+            }
+            collect_interface_resource_aliases(
+                &alias_symbols,
+                &alias_def_paths,
+                &alias_primitive_prelude,
+                alias_collection,
+                &alias_inputs_by_file,
+                snapshot,
+                &alias_arena,
+                &alias_module_members,
+                &member_scopes.source_graph_packages,
+                &mut local_type_aliases,
+                &mut resource_alias_path_resolutions,
+            )?;
+        }
+        let local_resource_defs = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Resource)
+            .map(|descriptor| descriptor.owner.def_id.to_def_id())
+            .collect::<HashSet<_>>();
+        let wit_alias_defs = alias_wit_views
+            .iter()
+            .flat_map(|view| view.interfaces.values())
+            .flat_map(|interface| interface.members.values())
+            .filter(|member| member.kind == WitViewDefKind::Alias)
+            .map(|member| member.def)
+            .collect::<HashSet<_>>();
+        let resource_alias_context = ResourceAliasContext {
+            path_resolutions: &resource_alias_path_resolutions,
+            aliases: &local_type_aliases,
+            wit_aliases: &wit_alias_defs,
+            local_resources: &local_resource_defs,
+        };
 
         let mut header_by_owner = HashMap::with_capacity(header_resolutions.owners.len());
         for owner in &header_resolutions.owners {
@@ -12684,21 +13400,99 @@ impl RootDatabase {
                 let kind = match item.kind {
                     ImplItemKind::Fn { .. } => InterfaceImplItemKind::Function,
                     ImplItemKind::AssocType { ty } => {
-                        let resolved_type = match ty.kind {
-                            TyKind::Path(path) => impl_associated_type_resolutions
-                                .get(&item.owner_id)
-                                .and_then(|resolution| resolution.type_path_resolution().ok())
-                                .and_then(|resolution| resolution.paths().get(&path.hir_id))
-                                .filter(|resolution| {
-                                    resolution.resolved_segments == resolution.segment_count
-                                })
-                                .and_then(|resolution| match resolution.base {
-                                    Res::Def(_, def) => Some(def),
-                                    _ => None,
-                                }),
-                            _ => None,
+                        let type_location =
+                            interface_impl_source_location(item.owner_id, ty.span, &inputs)?;
+                        let resolution = match ty.kind {
+                            TyKind::Path(path) => {
+                                let root_resolution = impl_associated_type_resolutions
+                                    .get(&item.owner_id)
+                                    .and_then(|resolution| resolution.type_path_resolution().ok())
+                                    .and_then(|resolution| resolution.paths().get(&path.hir_id))
+                                    .filter(|resolution| {
+                                        resolution.resolved_segments == resolution.segment_count
+                                    });
+                                match (
+                                    root_resolution,
+                                    resolve_resource_alias_target(
+                                        &resource_alias_context,
+                                        item.owner_id,
+                                        &ty,
+                                    ),
+                                ) {
+                                    (Some(_), ResourceAliasTarget::Resource(resource)) => {
+                                        InterfaceImplTypeResolution::Definition(resource)
+                                    }
+                                    (Some(root), ResourceAliasTarget::NonResource) => {
+                                        match root.base {
+                                            Res::Def(DefKind::Resource, _) => {
+                                                InterfaceImplTypeResolution::NonDefinition
+                                            }
+                                            Res::Def(_, def) => {
+                                                InterfaceImplTypeResolution::Definition(def)
+                                            }
+                                            Res::PrimTy(_) | Res::Local(_) => {
+                                                InterfaceImplTypeResolution::NonDefinition
+                                            }
+                                            Res::Err | Res::TestOnly(_) => {
+                                                InterfaceImplTypeResolution::Unresolved
+                                            }
+                                        }
+                                    }
+                                    (Some(root), ResourceAliasTarget::Suppressed) => {
+                                        match root.base {
+                                            Res::Def(DefKind::Alias, alias)
+                                                if wit_view_scopes.is_some_and(|scopes| {
+                                                    scopes.views().any(|foreign| {
+                                                        foreign.view.definition(alias).is_some_and(
+                                                            |definition| {
+                                                                definition.kind
+                                                                    == WitViewDefKind::Alias
+                                                            },
+                                                        )
+                                                    })
+                                                }) =>
+                                            {
+                                                // An external WIT alias cannot
+                                                // name a local SAI resource.
+                                                InterfaceImplTypeResolution::Definition(alias)
+                                            }
+                                            Res::Def(DefKind::Alias, _) => {
+                                                // An unavailable or incomplete
+                                                // source alias stays deferred;
+                                                // its declaration or arguments
+                                                // may already have an error.
+                                                InterfaceImplTypeResolution::Unresolved
+                                            }
+                                            Res::Def(DefKind::Resource, _) => {
+                                                InterfaceImplTypeResolution::NonDefinition
+                                            }
+                                            Res::Def(DefKind::TyParam, parameter) => {
+                                                InterfaceImplTypeResolution::Definition(parameter)
+                                            }
+                                            Res::Def(_, def) => {
+                                                InterfaceImplTypeResolution::Definition(def)
+                                            }
+                                            Res::PrimTy(_) | Res::Local(_) => {
+                                                InterfaceImplTypeResolution::NonDefinition
+                                            }
+                                            Res::Err | Res::TestOnly(_) => {
+                                                InterfaceImplTypeResolution::Unresolved
+                                            }
+                                        }
+                                    }
+                                    (None, _) => InterfaceImplTypeResolution::Unresolved,
+                                }
+                            }
+                            TyKind::Err => InterfaceImplTypeResolution::Unresolved,
+                            TyKind::Borrow(..)
+                            | TyKind::Tuple(..)
+                            | TyKind::FnPtr { .. }
+                            | TyKind::Infer => InterfaceImplTypeResolution::NonDefinition,
                         };
-                        InterfaceImplItemKind::AssociatedType { resolved_type }
+                        InterfaceImplItemKind::AssociatedType {
+                            resolution,
+                            type_location,
+                        }
                     }
                 };
                 items.push(InterfaceImplItem {
@@ -12708,6 +13502,11 @@ impl RootDatabase {
                     name_location: interface_impl_source_location(
                         item.owner_id,
                         item.name.span,
+                        &inputs,
+                    )?,
+                    item_location: interface_impl_source_location(
+                        item.owner_id,
+                        item.span,
                         &inputs,
                     )?,
                     item_span: sai_vfs::Span::new(item.span.file, item.span.range),
@@ -12721,17 +13520,46 @@ impl RootDatabase {
             });
         }
 
+        let package = package.unwrap_or_else(|| {
+            collection
+                .package_key
+                .as_str()
+                .split_once('#')
+                .map_or(collection.package_key.as_str(), |(identity, _)| identity)
+                .to_owned()
+        });
+        let impl_diagnostic_locations = impls
+            .iter()
+            .map(|implementation| {
+                let mut locations = vec![implementation.target_location.clone()];
+                for item in &implementation.items {
+                    locations.push(item.name_location.clone());
+                    locations.push(item.item_location.clone());
+                }
+                (implementation.impl_def, locations)
+            })
+            .collect::<Vec<_>>();
         let mut collected = collect_interface_impls(InterfaceImplsInput {
-            package: package.unwrap_or_else(|| {
-                collection
-                    .package_key
-                    .as_str()
-                    .split_once('#')
-                    .map_or(collection.package_key.as_str(), |(identity, _)| identity)
-                    .to_owned()
-            }),
+            package: package.clone(),
             impls,
         });
+        let external_resource_checks =
+            self.interface_resource_external_wit_checks(&collected, wit_view_scopes);
+        let binding_diagnostics = validate_interface_resource_bindings(
+            &package,
+            module_tree,
+            collection,
+            &external_resource_checks,
+            &mut collected,
+        );
+        collected.diagnostics = order_interface_impl_diagnostics(
+            &impl_diagnostic_locations,
+            std::mem::take(&mut collected.diagnostics),
+            binding_diagnostics,
+        )
+        .map_err(|file_path| {
+            OwnerControlFlowResolutionError::InterfaceImplDiagnosticSourceMismatch { file_path }
+        })?;
         for diagnostic in &mut collected.diagnostics {
             let Some(primary) = diagnostic.primary() else {
                 return Err(
@@ -12754,6 +13582,121 @@ impl RootDatabase {
                 .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
         }
         Ok(collected)
+    }
+
+    fn interface_resource_external_wit_checks(
+        &mut self,
+        interface_impls: &InterfaceImpls,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) -> HashMap<DefId, InterfaceResourceExternalCheck> {
+        let Some(wit_view_scopes) = wit_view_scopes else {
+            return HashMap::new();
+        };
+        let mut resource_defs = HashSet::new();
+        for implementation in &interface_impls.impls {
+            let is_selected_impl = implementation.interface.is_some_and(|interface| {
+                interface_impls.by_interface.get(&interface) == Some(&implementation.impl_def)
+            });
+            if is_selected_impl {
+                resource_defs.extend(
+                    implementation
+                        .resource_bindings
+                        .iter()
+                        .map(|binding| binding.resource),
+                );
+            }
+        }
+        if resource_defs.is_empty() {
+            return HashMap::new();
+        }
+
+        let visible_closures = wit_view_scopes
+            .ordered_direct_entries()
+            .into_iter()
+            .filter_map(|entry| match (&entry.unit, &entry.identity.failure) {
+                (Some(unit), _) => Some(match self.wit_package(unit) {
+                    Err(error) => Err(format!(
+                        "could not load visible WIT unit `{}`: {error:?}",
+                        unit.canonical_name()
+                    )),
+                    Ok(result) => match (result.package, result.failure) {
+                        (Some(package), None) => Ok(package),
+                        (_, Some(failure)) => Err(format!(
+                            "visible WIT unit `{}` has an incomplete package closure: {failure:?}",
+                            unit.canonical_name()
+                        )),
+                        (None, None) => Err(format!(
+                            "visible WIT unit `{}` returned no package model",
+                            unit.canonical_name()
+                        )),
+                    },
+                }),
+                (None, Some(failure)) => Some(Err(format!(
+                    "could not determine the visible WIT unit for `{}`: {failure}",
+                    entry.identity.package_key.as_str()
+                ))),
+                (None, None) => None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut checks = HashMap::with_capacity(resource_defs.len());
+        for resource_def in resource_defs {
+            let identity = wit_view_scopes.views().find_map(|foreign| {
+                let definition = foreign.view.definition(resource_def)?;
+                if definition.kind != WitViewDefKind::Resource {
+                    return None;
+                }
+                let WitViewEntity::Item { interface, item } = definition.entity else {
+                    return None;
+                };
+                Some(WitResourceIdentity {
+                    unit: foreign.view.unit.clone(),
+                    interface,
+                    item,
+                })
+            });
+            let Some(identity) = identity else {
+                checks.insert(
+                    resource_def,
+                    InterfaceResourceExternalCheck::NotViewResource,
+                );
+                continue;
+            };
+
+            let mut result = InterfaceResourceExternalCheck::NoOccurrence;
+            let mut first_incomplete = None;
+            for loaded in &visible_closures {
+                let loaded = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(reason) => {
+                        first_incomplete.get_or_insert_with(|| reason.clone());
+                        continue;
+                    }
+                };
+                match first_wit_resource_occurrence(loaded, &identity) {
+                    WitResourceOccurrenceSearch::Found(mut occurrence) => {
+                        if first_incomplete.is_some() {
+                            occurrence.first_occurrence_known = false;
+                        }
+                        result = InterfaceResourceExternalCheck::Occurrence(occurrence);
+                        break;
+                    }
+                    WitResourceOccurrenceSearch::NotFound => {}
+                    WitResourceOccurrenceSearch::Incomplete(reason) => {
+                        first_incomplete.get_or_insert_with(|| {
+                            describe_wit_resource_occurrence_incomplete(&reason)
+                        });
+                    }
+                }
+            }
+            if matches!(result, InterfaceResourceExternalCheck::NoOccurrence)
+                && let Some(reason) = first_incomplete
+            {
+                result = InterfaceResourceExternalCheck::Incomplete(reason);
+            }
+            checks.insert(resource_def, result);
+        }
+        checks
     }
 
     /// Resolves partial type heads and diagnoses test-only references in
@@ -13122,6 +14065,7 @@ impl RootDatabase {
             module_tree,
             snapshot,
             None,
+            None,
         )
     }
 
@@ -13144,6 +14088,32 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves associated trait and impl type paths through validated
+    /// active-source member scopes and foreign WIT views from the same graph.
+    pub fn resolve_trait_impl_member_test_only_paths_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<TraitImplMemberTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_trait_impl_member_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
         )
     }
 
@@ -13153,6 +14123,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<TraitImplMemberTestOnlyResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -13172,7 +14143,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -13596,6 +14576,7 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             owners,
             session_token: self.session_token.clone(),
         })
@@ -20636,8 +21617,29 @@ mod tests {
     fn interface_impl_collection_records_resolved_resource_bindings() {
         let source = concat!(
             "resource Concrete {}\n",
-            "interface api { resource Handle {} }\n",
-            "impl api { type Handle = Concrete }\n",
+            "resource AliasConcrete {}\n",
+            "resource TopAliasConcrete {}\n",
+            "resource GenericConcrete {}\n",
+            "resource ConstGenericConcrete {}\n",
+            "type Direct = TopAliasConcrete\n",
+            "type Identity<T> = T\n",
+            "type Through<T> = Identity<T>\n",
+            "type ConstThrough<const N: U8> = ConstGenericConcrete\n",
+            "interface api {\n",
+            "  resource Handle {}\n",
+            "  resource AliasHandle {}\n",
+            "  resource TopAliasHandle {}\n",
+            "  resource GenericHandle {}\n",
+            "  resource ConstGenericHandle {}\n",
+            "  type ConcreteAlias = AliasConcrete\n",
+            "}\n",
+            "impl api {\n",
+            "  type Handle = Concrete\n",
+            "  type AliasHandle = api.ConcreteAlias\n",
+            "  type TopAliasHandle = Direct\n",
+            "  type GenericHandle = Through<GenericConcrete>\n",
+            "  type ConstGenericHandle = ConstThrough<1>\n",
+            "}\n",
             "interface unresolved_api { resource Thing {} }\n",
             "impl unresolved_api { type Thing = missing }\n",
         );
@@ -20700,6 +21702,26 @@ mod tests {
             .symbols
             .intern("Concrete")
             .expect("implementation resource name interns");
+        let alias_concrete_symbol = database
+            .symbols
+            .intern("AliasConcrete")
+            .expect("aliased implementation resource name interns");
+        let top_alias_concrete_symbol = database
+            .symbols
+            .intern("TopAliasConcrete")
+            .expect("top-level aliased resource name interns");
+        let generic_concrete_symbol = database
+            .symbols
+            .intern("GenericConcrete")
+            .expect("generic implementation resource name interns");
+        let const_generic_concrete_symbol = database
+            .symbols
+            .intern("ConstGenericConcrete")
+            .expect("const generic implementation resource name interns");
+        let top_alias_handle_symbol = database
+            .symbols
+            .intern("TopAliasHandle")
+            .expect("top-level alias resource name interns");
         let module_scope = &collection.scopes.modules[0].scope;
         let interface_def = match module_scope
             .get(&api_symbol)
@@ -20726,11 +21748,72 @@ mod tests {
             Res::Def(DefKind::Resource, def) => def,
             other => panic!("Concrete resolves to a top-level resource, got {other:?}"),
         };
-        assert_eq!(collected.impls[0].resources.len(), 1);
+        let alias_implementation_type = match module_scope
+            .get(&alias_concrete_symbol)
+            .expect("aliased resource binding exists")
+            .res
+        {
+            Res::Def(DefKind::Resource, def) => def,
+            other => panic!("AliasConcrete resolves to a resource, got {other:?}"),
+        };
+        let top_alias_implementation_type = match module_scope
+            .get(&top_alias_concrete_symbol)
+            .expect("top-level aliased resource binding exists")
+            .res
+        {
+            Res::Def(DefKind::Resource, def) => def,
+            other => panic!("TopAliasConcrete resolves to a resource, got {other:?}"),
+        };
+        let generic_implementation_type = match module_scope
+            .get(&generic_concrete_symbol)
+            .expect("generic aliased resource binding exists")
+            .res
+        {
+            Res::Def(DefKind::Resource, def) => def,
+            other => panic!("GenericConcrete resolves to a resource, got {other:?}"),
+        };
+        let const_generic_implementation_type = match module_scope
+            .get(&const_generic_concrete_symbol)
+            .expect("const generic aliased resource binding exists")
+            .res
+        {
+            Res::Def(DefKind::Resource, def) => def,
+            other => panic!("ConstGenericConcrete resolves to a resource, got {other:?}"),
+        };
+        let top_alias_resource = match collection.scopes.interfaces[&interface_def]
+            .members
+            .get(&top_alias_handle_symbol)
+            .expect("top-level alias resource binding exists")
+            .res
+        {
+            Res::Def(DefKind::Resource, def) => def,
+            other => panic!("TopAliasHandle resolves to a resource, got {other:?}"),
+        };
+        assert_eq!(collected.impls[0].resources.len(), 5);
         assert_eq!(collected.impls[0].resources[0].resource, interface_resource);
         assert_eq!(
             collected.impls[0].resources[0].implementation_type,
             implementation_type
+        );
+        assert_eq!(
+            collected.impls[0].resources[1].implementation_type, alias_implementation_type,
+            "a transparent non-generic alias expands to its resource"
+        );
+        assert_eq!(
+            collected.impls[0].resources[2].implementation_type, top_alias_implementation_type,
+            "a top-level alias can target a local resource"
+        );
+        assert_eq!(
+            collected.impls[0].resources[2].resource, top_alias_resource,
+            "interface aliases retain their abstract resource identity"
+        );
+        assert_eq!(
+            collected.impls[0].resources[3].implementation_type, generic_implementation_type,
+            "generic alias applications substitute their type arguments"
+        );
+        assert_eq!(
+            collected.impls[0].resources[4].implementation_type, const_generic_implementation_type,
+            "const generic alias arguments preserve their resource target"
         );
         let binding_start = source.find("type Handle = Concrete").unwrap();
         assert_eq!(
@@ -20745,6 +21828,560 @@ mod tests {
         assert!(
             collected.diagnostics.is_empty(),
             "an unresolved RHS still satisfies item-name matching without a missing-item cascade"
+        );
+    }
+
+    #[test]
+    fn interface_resource_bindings_expand_foreign_source_aliases() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[(
+                "lib.sai",
+                b"use acme:dep as dep\n\
+                  resource Concrete {}\n\
+                  resource AnotherConcrete {}\n\
+                  interface api {\n\
+                    resource TopLevelAlias {}\n\
+                    resource InterfaceAlias {}\n\
+                    resource IncompleteAlias {}\n\
+                  }\n\
+                  impl api {\n\
+                    type TopLevelAlias = dep.Through<Concrete>\n\
+                    type InterfaceAlias = dep.types.Identity<AnotherConcrete>\n\
+                    type IncompleteAlias = dep.Broken<Concrete>\n\
+                  }\n",
+            )],
+        );
+        let (_, dependency_tree, dependency_snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:dep#1",
+            "acme:dep@1.0.0",
+            &[(
+                "lib.sai",
+                b"pub type Identity<T> = T\n\
+                  pub type Through<T> = Identity<T>\n\
+                  pub type Broken<T> = Missing<T>\n\
+                  pub interface types { type Identity<T> = T }\n",
+            )],
+        );
+        snapshot_files.extend(dependency_snapshot_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              requires { acme:dep @ ^1 }\n"[..],
+        );
+        let dependency_manifest: Arc<[u8]> = Arc::from(&b"package acme:dep @ 1.0.0\n"[..]);
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:dep#1", "acme:dep")],
+                ),
+                graph_node(
+                    "acme:dep#1",
+                    "acme:dep",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let dependency_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &dependency_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                dependency_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("source dependency scopes collect");
+        let dependency_member_package = dependency_collection.module_member_scope_package();
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[dependency_member_package.as_foreign_package_scopes("acme:dep")],
+            )
+            .expect("root can resolve source dependency aliases");
+        let member_scopes = database
+            .collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[dependency_member_package],
+            )
+            .expect("source dependency closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("interface targets resolve");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("associated type RHS paths resolve");
+
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("foreign transparent aliases are expanded");
+
+        let concrete = ["Concrete", "AnotherConcrete"]
+            .into_iter()
+            .map(|name| {
+                let symbol = database
+                    .symbols
+                    .intern(name)
+                    .expect("resource name interns");
+                match root_collection.scopes.modules[0]
+                    .scope
+                    .get(&symbol)
+                    .expect("root resource binding exists")
+                    .res
+                {
+                    Res::Def(DefKind::Resource, def) => def,
+                    other => panic!("{name} resolves to a resource, got {other:?}"),
+                }
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(collected.impls.len(), 1);
+        assert_eq!(collected.impls[0].resources.len(), 2);
+        assert!(
+            collected.impls[0]
+                .resources
+                .iter()
+                .all(|resource| concrete.contains(&resource.implementation_type)),
+            "both source-package aliases resolve to the caller's resource"
+        );
+        assert!(
+            collected.diagnostics.is_empty(),
+            "an incomplete foreign alias body defers instead of reporting a false invalid binding"
+        );
+    }
+
+    #[test]
+    fn interface_resource_binding_rejects_generic_parameter_alias_targets() {
+        let source = concat!(
+            "type Identity<T> = T\n",
+            "interface api { resource Handle {} }\n",
+            "impl<T> api { type Handle = Identity<T> }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("generic interface impl collects");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("generic interface target resolves");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("generic associated type resolves");
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("resource binding is validated");
+
+        assert_eq!(collected.impls.len(), 1);
+        assert!(collected.impls[0].resources.is_empty());
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidResourceBinding),
+            "a generic parameter hidden by a transparent alias is not a concrete local resource: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn interface_resource_bindings_require_local_resources_and_detect_duplicates() {
+        let source = concat!(
+            "resource Concrete {}\n",
+            "type Plain {}\n",
+            "interface source { resource Inner {} }\n",
+            "interface api {\n",
+            "  resource BadRecord {}\n",
+            "  resource BadAbstract {}\n",
+            "  resource BadAssociatedAlias {}\n",
+            "  resource First {}\n",
+            "  resource Second {}\n",
+            "  resource BadPrimitive {}\n",
+            "  resource BadGeneric {}\n",
+            "  type PlainAlias = Plain\n",
+            "}\n",
+            "impl api {\n",
+            "  type BadRecord = Plain\n",
+            "  type BadAbstract = source.Inner\n",
+            "  type BadAssociatedAlias = api.PlainAlias\n",
+            "  type First = Concrete\n",
+            "  type Second = Concrete\n",
+            "  type BadPrimitive = U32\n",
+            "  type BadGeneric = Concrete<U8>\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("resource binding source collects");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("interface target resolves");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("associated type RHS paths resolve");
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("resource bindings are validated");
+
+        assert_eq!(collected.impls[0].resources.len(), 1);
+        assert_eq!(
+            collected.diagnostics.len(),
+            6,
+            "diagnostics={:?}; impls={:?}",
+            collected.diagnostics,
+            collected.impls
+        );
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidResourceBinding)
+        );
+        for (target, start, len) in [
+            (
+                "Plain",
+                source.find("type BadRecord = Plain").unwrap() + "type BadRecord = ".len(),
+                "Plain".len(),
+            ),
+            (
+                "source.Inner",
+                source.rfind("source.Inner").unwrap(),
+                "source.Inner".len(),
+            ),
+            (
+                "api.PlainAlias",
+                source.rfind("api.PlainAlias").unwrap(),
+                "api.PlainAlias".len(),
+            ),
+            (
+                "Concrete duplicate",
+                source.rfind("Second = Concrete").unwrap() + "Second = ".len(),
+                "Concrete".len(),
+            ),
+            ("U32", source.rfind("U32").unwrap(), "U32".len()),
+            (
+                "Concrete<U8>",
+                source.rfind("Concrete<U8>").unwrap(),
+                "Concrete<U8>".len(),
+            ),
+        ] {
+            assert!(
+                collected.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.primary().is_some_and(|location| {
+                        location.span.range.start() == sai_diagnostics::TextSize::new(start as u32)
+                            && location.span.range.end()
+                                == sai_diagnostics::TextSize::new((start + len) as u32)
+                    })
+                }),
+                "expected an invalid-resource finding at `{target}`"
+            );
+        }
+        let duplicate = collected
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("already bound"))
+            .expect("the later concrete binding is rejected as a duplicate");
+        assert!(matches!(
+            duplicate.related(),
+            [Related::DeclaredHere { what, .. }] if what == "earlier binding of this resource"
+        ));
+    }
+
+    #[test]
+    fn incomplete_external_wit_scan_does_not_emit_a_false_invalid_binding() {
+        let source = concat!(
+            "resource Concrete {}\n",
+            "interface api { resource Handle {} }\n",
+            "impl api { type Handle = Concrete }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("resource binding source collects");
+        let concrete = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Resource)
+            .expect("a module-level resource exists")
+            .owner
+            .def_id
+            .to_def_id();
+        let implementation = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Impl)
+            .expect("an interface impl exists")
+            .owner;
+        let file = sai_diagnostics::SourceRef {
+            path: "src/lib.sai".to_owned(),
+            package: Some("acme:phase1@1.0.0".to_owned()),
+            snapshot: None,
+        };
+        let location = sai_diagnostics::Location {
+            file,
+            span: sai_diagnostics::Span::new(
+                FileId::new(1),
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(0),
+                    sai_diagnostics::TextSize::new(1),
+                )
+                .expect("diagnostic span is ordered"),
+            ),
+        };
+        let mut interface_impls = InterfaceImpls {
+            impls: vec![sai_resolve::InterfaceImpl {
+                impl_def: implementation.def_id,
+                interface: Some(concrete),
+                fns: Vec::new(),
+                resource_bindings: vec![sai_resolve::InterfaceImplResourceBinding {
+                    resource: concrete,
+                    implementation_type: InterfaceImplTypeResolution::Definition(concrete),
+                    type_location: location.clone(),
+                    binding_span: sai_vfs::Span::new(
+                        FileId::new(1),
+                        sai_vfs::TextRange::new(
+                            sai_vfs::TextSize::new(0),
+                            sai_vfs::TextSize::new(1),
+                        )
+                        .expect("binding span is ordered"),
+                    ),
+                    binding_location: location,
+                }],
+                resources: Vec::new(),
+                unsupported: Vec::new(),
+            }],
+            by_interface: HashMap::from([(concrete, implementation.def_id)]),
+            diagnostics: Vec::new(),
+        };
+        let external_checks = HashMap::from([(
+            concrete,
+            InterfaceResourceExternalCheck::Incomplete(
+                "an unrelated visible WIT map type obscures later references".to_owned(),
+            ),
+        )]);
+
+        let diagnostics = validate_interface_resource_bindings(
+            "acme:phase1@1.0.0",
+            &module_tree,
+            &collection,
+            &external_checks,
+            &mut interface_impls,
+        );
+
+        assert!(
+            diagnostics.is_empty(),
+            "an incomplete scan is not proof of an invalid binding"
+        );
+        assert!(
+            interface_impls.impls[0].resources.is_empty(),
+            "a binding with an incomplete external scan cannot authorize a redirect"
+        );
+    }
+
+    #[test]
+    fn interface_impl_binding_diagnostics_keep_generation_order() {
+        let source = "interface first {}\nimpl first {}\ninterface second {}\nimpl second {}\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("interface impl source collects");
+        let impl_defs = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Impl)
+            .map(|descriptor| descriptor.owner.def_id)
+            .collect::<Vec<_>>();
+        assert_eq!(impl_defs.len(), 2);
+        let file_id = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Impl)
+            .expect("impl descriptor exists")
+            .file;
+        let source_ref = sai_diagnostics::SourceRef {
+            path: "src/lib.sai".to_owned(),
+            package: Some("acme:phase1@1.0.0".to_owned()),
+            snapshot: None,
+        };
+        let first_location = sai_diagnostics::Location {
+            file: source_ref.clone(),
+            span: sai_diagnostics::Span::new(
+                file_id,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(0),
+                    sai_diagnostics::TextSize::new(1),
+                )
+                .expect("first diagnostic span is ordered"),
+            ),
+        };
+        let later_location = sai_diagnostics::Location {
+            file: source_ref,
+            span: sai_diagnostics::Span::new(
+                file_id,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(2),
+                    sai_diagnostics::TextSize::new(3),
+                )
+                .expect("later diagnostic span is ordered"),
+            ),
+        };
+        let invalid_binding = Diagnostic::new(
+            sai_diagnostics::Code::InvalidResourceBinding,
+            sai_diagnostics::Severity::Error,
+            "invalid binding",
+            Some(first_location.clone()),
+        );
+        let later_extra_item = Diagnostic::new(
+            sai_diagnostics::Code::InterfaceImplExtraItem,
+            sai_diagnostics::Severity::Error,
+            "later extra item",
+            Some(later_location.clone()),
+        );
+
+        let ordered = order_interface_impl_diagnostics(
+            &[
+                (impl_defs[0], vec![first_location]),
+                (impl_defs[1], vec![later_location]),
+            ],
+            vec![later_extra_item],
+            vec![(impl_defs[0], invalid_binding)],
+        )
+        .expect("all diagnostic locations map to an impl");
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::InvalidResourceBinding,
+                sai_diagnostics::Code::InterfaceImplExtraItem
+            ]
         );
     }
 
@@ -21130,11 +22767,12 @@ mod tests {
         assert!(diagnostics[0].has_workspace_snapshot());
 
         let member_resolutions = database
-            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes_and_wit_views(
                 &collection,
                 &module_tree,
                 &snapshot,
                 &member_scopes,
+                &wit_view_scopes,
             )
             .expect("WIT-targeted impl associated types resolve");
         let collected = database
@@ -21158,6 +22796,285 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::ImplTargetNotInterface),
             "the existing resolved-path owner remains the sole target-kind diagnostic"
+        );
+    }
+
+    #[test]
+    fn interface_resource_binding_scans_transitive_wit_closures_in_graph_order() {
+        let source = concat!(
+            "use acme:core/api as api\n",
+            "use acme:alpha/wrapper as wrapper\n",
+            "resource Concrete {}\n",
+            "impl api { type Buffer = Concrete }\n",
+            "type ImportedAlias = wrapper.Buffer\n",
+            "interface local {\n",
+            "  resource Imported {}\n",
+            "  resource ImportedViaAlias {}\n",
+            "}\n",
+            "impl local {\n",
+            "  type Imported = wrapper.Buffer\n",
+            "  type ImportedViaAlias = ImportedAlias\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root package key is valid");
+        let alpha_key = PackageKey::new("acme:alpha#1").expect("alpha package key is valid");
+        let core_key = PackageKey::new("acme:core#1").expect("core package key is valid");
+        let zeta_key = PackageKey::new("acme:zeta#1").expect("zeta package key is valid");
+        let alpha = database
+            .intern_package(alpha_key.as_str())
+            .expect("alpha package interns");
+        let core = database
+            .intern_package(core_key.as_str())
+            .expect("core package interns");
+        let zeta = database
+            .intern_package(zeta_key.as_str())
+            .expect("zeta package interns");
+        let artifact_node = |key: PackageKey, identity: &str, edges: Vec<PackageGraphEdge>| {
+            PackageGraphNode::new(
+                key,
+                identity,
+                Version::parse("1.0.0").expect("artifact version is valid"),
+                PackageForm::Artifact,
+                PackageGraphRole::Dependency,
+                edges,
+            )
+            .expect("artifact graph node is valid")
+        };
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![
+                        graph_edge("acme:zeta#1", "acme:zeta"),
+                        graph_edge("acme:core#1", "acme:core"),
+                        graph_edge("acme:alpha#1", "acme:alpha"),
+                    ],
+                )
+                .expect("root graph node is valid"),
+                artifact_node(
+                    alpha_key.clone(),
+                    "acme:alpha",
+                    vec![graph_edge("acme:core#1", "acme:core")],
+                ),
+                artifact_node(core_key.clone(), "acme:core", Vec::new()),
+                artifact_node(
+                    zeta_key.clone(),
+                    "acme:zeta",
+                    vec![graph_edge("acme:core#1", "acme:core")],
+                ),
+            ],
+        )
+        .expect("WIT dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+
+        let set_artifact_wit = |database: &mut RootDatabase,
+                                package: PackageId,
+                                key: &PackageKey,
+                                identity: &str,
+                                requirements: &str,
+                                wit_source: &str| {
+            database
+                .set_package_manifest(
+                    package,
+                    Arc::<[u8]>::from(
+                        format!(
+                            "package {identity} @ 1.0.0\n\
+                             artifact component {{}}\n\
+                             wit \"wit\"\n\
+                             {requirements}"
+                        )
+                        .into_bytes(),
+                    ),
+                    PackageRole::Dependency,
+                    Durability::Low,
+                )
+                .expect("artifact manifest is recorded");
+            database
+                .set_wit_files(
+                    key.clone(),
+                    WitFilesSnapshot::listed(
+                        "wit",
+                        [PackageRelativePath::new("wit/api.wit").expect("WIT path is valid")],
+                    )
+                    .expect("WIT inventory is valid"),
+                    Durability::Low,
+                )
+                .expect("WIT inventory is recorded");
+            database
+                .set_file_contents(
+                    FileKey::new(key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
+                    Arc::<[u8]>::from(wit_source.as_bytes()),
+                    Durability::Low,
+                )
+                .expect("WIT source is recorded");
+        };
+        set_artifact_wit(
+            &mut database,
+            alpha,
+            &alpha_key,
+            "acme:alpha",
+            "requires { acme:core @ ^1 }\n",
+            "package acme:alpha@1.0.0; interface wrapper { use acme:core/api.{buffer}; }",
+        );
+        set_artifact_wit(
+            &mut database,
+            core,
+            &core_key,
+            "acme:core",
+            "",
+            "package acme:core@1.0.0; interface api { resource buffer {} }",
+        );
+        set_artifact_wit(
+            &mut database,
+            zeta,
+            &zeta_key,
+            "acme:zeta",
+            "requires { acme:core @ ^1 }\n",
+            "package acme:zeta@1.0.0; interface wrapper { use acme:core/api.{buffer}; }",
+        );
+
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("direct WIT views and transitive package closures load");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires {\n\
+                acme:alpha @ ^1\n\
+                acme:core @ ^1\n\
+                acme:zeta @ ^1\n\
+              }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_view_scopes,
+            )
+            .expect("root scopes include the direct WIT interface");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("the root source closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("WIT interface impl target resolves");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("associated resource binding resolves");
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                Some(&wit_view_scopes),
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("external WIT resource occurrences are checked");
+
+        assert_eq!(collected.impls.len(), 2);
+        assert!(collected.impls[0].resources.is_empty());
+        let invalid = collected
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InvalidResourceBinding
+                    && diagnostic.primary().is_some_and(|primary| {
+                        primary.span.range.start().to_usize()
+                            == source
+                                .rfind("wrapper.Buffer")
+                                .expect("WIT alias RHS exists")
+                    })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "a resolved WIT use alias cannot be bound as a local resource: {collected:?}"
+                )
+            });
+        assert_eq!(
+            invalid.primary().map(|location| location.span.range),
+            Some(
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(
+                        source.rfind("wrapper.Buffer").expect("binding RHS exists") as u32,
+                    ),
+                    sai_diagnostics::TextSize::new(
+                        (source.rfind("wrapper.Buffer").expect("binding RHS exists")
+                            + "wrapper.Buffer".len()) as u32,
+                    ),
+                )
+                .expect("binding RHS range is ordered")
+            )
+        );
+        let external_resource_binding = collected
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InvalidResourceBinding
+                    && diagnostic.primary().is_some_and(|primary| {
+                        primary.span.range.start().to_usize()
+                            == source
+                                .rfind("Concrete")
+                                .expect("external binding RHS exists")
+                    })
+            })
+            .unwrap_or_else(|| {
+                panic!("the direct WIT resource binding is rejected: {collected:?}")
+            });
+        let source_aliased_wit_resource_binding = collected
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InvalidResourceBinding
+                    && diagnostic.primary().is_some_and(|primary| {
+                        primary.span.range.start().to_usize()
+                            == source
+                                .rfind("ImportedAlias")
+                                .expect("source alias binding RHS exists")
+                    })
+            })
+            .unwrap_or_else(|| {
+                panic!("a source alias to a WIT resource is rejected: {collected:?}")
+            });
+        assert!(
+            source_aliased_wit_resource_binding
+                .message
+                .contains("must be a module-level resource"),
+            "the resolved WIT alias is classified as a foreign resource: {source_aliased_wit_resource_binding:?}"
+        );
+        assert!(
+            external_resource_binding.children().iter().any(|child| {
+                child.kind == ChildKind::Note
+                    && child.message.contains("alias target")
+                    && child.message.contains("acme:alpha@1.0.0")
+            }),
+            "the note reports the earliest graph-ordered transitive occurrence: {external_resource_binding:?}"
         );
     }
 

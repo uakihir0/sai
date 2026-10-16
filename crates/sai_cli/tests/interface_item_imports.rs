@@ -260,6 +260,120 @@ fn check_reports_non_interface_impl_targets_but_accepts_wit_view_interfaces() {
 }
 
 #[test]
+fn check_rejects_a_wit_resource_used_by_a_visible_record() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let dependency = package.join("dep");
+    let source_directory = package.join("src");
+    let wit_directory = dependency.join("wit");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::create_dir_all(&wit_directory).expect("create dependency WIT directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:codec @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write package manifest");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:codec @ 1.0.0\n",
+            "wit \"wit\"\n",
+            "export world host\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/codec.wasm\" }\n"
+        ),
+    )
+    .expect("write WIT dependency manifest");
+    fs::write(
+        wit_directory.join("api.wit"),
+        concat!(
+            "package acme:codec@1.0.0;\n",
+            "interface api {\n",
+            "  resource buffer {}\n",
+            "  record envelope { value: own<buffer> }\n",
+            "}\n",
+            "world host { export api; }\n"
+        ),
+    )
+    .expect("write WIT resource and record");
+    fs::write(dependency.join("dist/codec.wasm"), b"component")
+        .expect("write dependency component artifact");
+    fs::write(
+        package.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:codec @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:codec @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+    let source = concat!(
+        "use acme:codec/api as api\n",
+        "resource Concrete {}\n",
+        "impl api { type Buffer = Concrete }\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source).expect("write concrete resource binding");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let binding_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"INVALID_RESOURCE_BINDING\""))
+        .collect::<Vec<_>>();
+    assert_eq!(binding_diagnostics.len(), 1, "{stdout}");
+    let binding = binding_diagnostics[0];
+    let binding_start = source.rfind("Concrete").expect("binding target is present");
+    let binding_end = binding_start + "Concrete".len();
+    assert!(
+        binding.contains(&format!(
+            "\"primary\":{{\"file\":{{\"path\":\"src/lib.sai\",\"package\":\"acme:check@0.1.0\",\"snapshot\":null}},\"start\":{{\"byte\":{binding_start},"
+        )),
+        "{binding}"
+    );
+    assert!(
+        binding.contains(&format!("\"end\":{{\"byte\":{binding_end},")),
+        "{binding}"
+    );
+    assert!(
+        binding.contains("\"kind\":\"note\"")
+            && binding.contains("envelope")
+            && binding.contains("record field `value`")
+            && binding.contains("acme:codec@1.0.0"),
+        "the note identifies the first WIT occurrence:\n{binding}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"INTERFACE_IMPL_MISSING_ITEM\""),
+        "a rejected binding still matched the interface item:\n{stdout}"
+    );
+}
+
+#[test]
 fn check_reports_tracked_interface_use_cycle_diagnostics() {
     let directory = TestDirectory::new();
     let package = directory.path().join("package");

@@ -70,19 +70,34 @@ pub struct InterfaceImplItem {
     pub name_location: Location,
     /// The complete `type R = C` span. Used for resource-binding records.
     pub item_span: Span,
+    /// Snapshot-bound location of the complete `type R = C` binding.
+    pub item_location: Location,
 }
 
 /// Source item kinds that can match an interface function or resource.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InterfaceImplItemKind {
     Function,
     AssociatedType {
-        /// The resolved type definition, if type-path resolution succeeded.
-        ///
-        /// An unresolved RHS still matches the declared resource name, so it
-        /// does not cause a second `INTERFACE_IMPL_MISSING_ITEM` diagnostic.
-        resolved_type: Option<DefId>,
+        /// Distinguishes an existing resolution error from a resolved
+        /// non-definition such as a primitive. Both match by name, while
+        /// §16.7.3 diagnoses resolved invalid targets.
+        resolution: InterfaceImplTypeResolution,
+        /// Snapshot-bound location of the RHS type `C`.
+        type_location: Location,
     },
+}
+
+/// Resolution state for the RHS of an associated resource binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceImplTypeResolution {
+    /// A complete path resolved to a definition. The driver still checks
+    /// that it is a top-level resource in the current package.
+    Definition(DefId),
+    /// The type syntax resolved, but did not resolve to a definition.
+    NonDefinition,
+    /// Name resolution already owns this path or type error.
+    Unresolved,
 }
 
 /// One interface impl in package generation order.
@@ -122,6 +137,19 @@ pub struct InterfaceImplResource {
     pub binding_span: Span,
 }
 
+/// A name-matched resource binding candidate before §16.7.3 validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceImplResourceBinding {
+    pub resource: DefId,
+    pub implementation_type: InterfaceImplTypeResolution,
+    /// The `C` type span used for `INVALID_RESOURCE_BINDING`.
+    pub type_location: Location,
+    /// The complete binding span used by later signature/member diagnostics.
+    pub binding_span: Span,
+    /// The complete source location, used for duplicate-binding notes.
+    pub binding_location: Location,
+}
+
 /// One collected interface impl. Function/resource vectors preserve the
 /// implementation's source order.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +158,9 @@ pub struct InterfaceImpl {
     /// `None` for non-interface and unresolved targets.
     pub interface: Option<DefId>,
     pub fns: Vec<InterfaceImplFunction>,
+    /// Resource items matched by name, before §16.7.3 validation.
+    pub resource_bindings: Vec<InterfaceImplResourceBinding>,
+    /// Resource bindings accepted by §16.7.3 in the driver adapter.
     pub resources: Vec<InterfaceImplResource>,
     /// Unsupported interface functions in interface declaration/WIT order.
     pub unsupported: Vec<DefId>,
@@ -166,6 +197,7 @@ pub fn collect_interface_impls(input: InterfaceImplsInput) -> InterfaceImpls {
             impl_def: implementation.impl_def,
             interface: None,
             fns: Vec::new(),
+            resource_bindings: Vec::new(),
             resources: Vec::new(),
             unsupported: Vec::new(),
         };
@@ -258,7 +290,7 @@ pub fn collect_interface_impls(input: InterfaceImplsInput) -> InterfaceImpls {
                 // The unsupported interface function is ignored by step 4.
                 // A same-kind source function is therefore neither mapped
                 // nor diagnosed; a different-kind item is still extra.
-                if !matches!(item.kind, InterfaceImplItemKind::Function) {
+                if !matches!(&item.kind, InterfaceImplItemKind::Function) {
                     diagnostics.push(extra_interface_impl_item_diagnostic(
                         &input.package,
                         &item.name_location,
@@ -268,7 +300,7 @@ pub fn collect_interface_impls(input: InterfaceImplsInput) -> InterfaceImpls {
                 continue;
             }
 
-            match (interface_item.kind, item.kind) {
+            match (interface_item.kind, &item.kind) {
                 (
                     InterfaceImplInterfaceItemKind::Function { unsupported: None },
                     InterfaceImplItemKind::Function,
@@ -281,16 +313,19 @@ pub fn collect_interface_impls(input: InterfaceImplsInput) -> InterfaceImpls {
                 }
                 (
                     InterfaceImplInterfaceItemKind::Resource,
-                    InterfaceImplItemKind::AssociatedType { resolved_type },
+                    InterfaceImplItemKind::AssociatedType {
+                        resolution,
+                        type_location,
+                    },
                 ) => {
                     matched_interface_items.insert(interface_index);
-                    if let Some(implementation_type) = resolved_type {
-                        record.resources.push(InterfaceImplResource {
-                            resource: interface_item.def,
-                            implementation_type,
-                            binding_span: item.item_span,
-                        });
-                    }
+                    record.resource_bindings.push(InterfaceImplResourceBinding {
+                        resource: interface_item.def,
+                        implementation_type: *resolution,
+                        type_location: type_location.clone(),
+                        binding_span: item.item_span,
+                        binding_location: item.item_location.clone(),
+                    });
                 }
                 _ => {
                     diagnostics.push(extra_interface_impl_item_diagnostic(
@@ -540,6 +575,7 @@ mod tests {
                 kind,
                 name_location: location("src/lib.sai", name_start, name_start + name.len() as u32),
                 item_span: span(item_start, item_end),
+                item_location: location("src/lib.sai", item_start, item_end),
             }
         }
 
@@ -595,18 +631,13 @@ mod tests {
         let buffer_impl = fixture.implementation_item(
             "Buffer",
             InterfaceImplItemKind::AssociatedType {
-                resolved_type: Some(buffer_impl_target),
+                resolution: InterfaceImplTypeResolution::Definition(buffer_impl_target),
+                type_location: location("src/lib.sai", 53, 65),
             },
             40,
             34,
             55,
         );
-        let buffer_impl_type = match buffer_impl.kind {
-            InterfaceImplItemKind::AssociatedType {
-                resolved_type: Some(def),
-            } => def,
-            _ => unreachable!(),
-        };
         let stop_impl =
             fixture.implementation_item("stop", InterfaceImplItemKind::Function, 65, 61, 75);
         let stop_impl_def = stop_impl.def;
@@ -638,12 +669,18 @@ mod tests {
             ]
         );
         assert_eq!(
-            result.impls[0].resources,
-            [InterfaceImplResource {
+            result.impls[0].resource_bindings,
+            [InterfaceImplResourceBinding {
                 resource: buffer_def,
-                implementation_type: buffer_impl_type,
+                implementation_type: InterfaceImplTypeResolution::Definition(buffer_impl_target),
+                type_location: location("src/lib.sai", 53, 65),
                 binding_span: span(34, 55),
+                binding_location: location("src/lib.sai", 34, 55),
             }]
+        );
+        assert!(
+            result.impls[0].resources.is_empty(),
+            "the data-only collector leaves resource validity to §16.7.3"
         );
     }
 
@@ -710,7 +747,8 @@ mod tests {
         let wrong_kind = fixture.implementation_item(
             "run",
             InterfaceImplItemKind::AssociatedType {
-                resolved_type: Some(run_type),
+                resolution: InterfaceImplTypeResolution::Definition(run_type),
+                type_location: location("src/lib.sai", 28, 36),
             },
             40,
             35,
@@ -721,7 +759,8 @@ mod tests {
         let matched_resource = fixture.implementation_item(
             "Buffer",
             InterfaceImplItemKind::AssociatedType {
-                resolved_type: Some(buffer_impl_type),
+                resolution: InterfaceImplTypeResolution::Definition(buffer_impl_type),
+                type_location: location("src/lib.sai", 47, 58),
             },
             60,
             55,
@@ -764,7 +803,8 @@ mod tests {
         assert!(result.diagnostics[3].message.contains("`run`"));
         assert_eq!(result.diagnostics[4].primary(), Some(&target));
         assert!(result.diagnostics[4].message.contains("`stop`"));
-        assert_eq!(result.impls[0].resources.len(), 1);
+        assert_eq!(result.impls[0].resource_bindings.len(), 1);
+        assert!(result.impls[0].resources.is_empty());
         assert_eq!(result.impls[0].fns.len(), 0);
     }
 
@@ -915,14 +955,15 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_resource_rhs_matches_without_recording_a_binding_or_missing_item() {
+    fn unresolved_resource_rhs_matches_without_a_missing_item_cascade() {
         let mut fixture = Fixture::new();
         let resource = fixture.resource("Stream");
         let interface = fixture.interface("api", vec![resource]);
         let item = fixture.implementation_item(
             "Stream",
             InterfaceImplItemKind::AssociatedType {
-                resolved_type: None,
+                resolution: InterfaceImplTypeResolution::Unresolved,
+                type_location: location("src/lib.sai", 27, 34),
             },
             20,
             15,
@@ -938,6 +979,11 @@ mod tests {
         let result = collect_interface_impls(input(vec![implementation]));
 
         assert!(result.diagnostics.is_empty());
+        assert_eq!(result.impls[0].resource_bindings.len(), 1);
+        assert_eq!(
+            result.impls[0].resource_bindings[0].implementation_type,
+            InterfaceImplTypeResolution::Unresolved
+        );
         assert!(result.impls[0].resources.is_empty());
     }
 }
