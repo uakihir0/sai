@@ -356,6 +356,14 @@ closure-aware function bridge retains private and missing member failures as
 typed path errors; final diagnostic mapping and CLI consumption remain later
 work.
 
+**Const type paths over validated source closures (IR-565).** The driver
+provides the same validated-closure entry point for const declared types and
+initializer type paths. It preserves the package-local API and records closure
+provenance in `ConstOwnerResolutions`. The const regression covers transitive
+public resolution, foreign private and missing member errors, and rejection
+when the closure belongs to another package collection. Expression lookup and
+diagnostic construction remain separate.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
