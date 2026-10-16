@@ -53,8 +53,8 @@ pub enum ModulePathError {
         span: sai_hir::Span,
         declaration_span: sai_vfs::Span,
     },
-    /// The input was a module/interface `Res`, but its source package scope
-    /// was not supplied to `ModuleMemberIndex`.
+    /// The input was a module/interface `Res`, but its source package scope or
+    /// WIT view scope was not supplied to `ModuleMemberIndex`.
     MissingTargetScope { segment_index: usize, target: DefId },
 }
 
@@ -119,6 +119,17 @@ pub fn resolve_module_prefix(
                     });
                 }
             }
+            ModuleMemberLookup::WitMember(res) => {
+                current = res;
+                consumed_segments += 1;
+                if current == Res::Err {
+                    return Ok(ModulePathPrefix {
+                        base: Res::Err,
+                        consumed_segments,
+                        stop: ModulePathStop::SuppressedError,
+                    });
+                }
+            }
             ModuleMemberLookup::Missing => {
                 return Err(ModulePathError::MissingMember {
                     segment_index,
@@ -171,8 +182,11 @@ mod tests {
         OwnerId, PackageId, Span, SpanCtxt,
     };
     use sai_intern::{Interner, ItemLocalId, PackageInterner};
+    use sai_package::version::Version;
     use sai_vfs::{FileId, Span as SourceSpan, TextRange, TextSize};
+    use sai_wit::{WitUnit, WitView, WitViewDefKind, load_embedded_wasi_package};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn package_id(packages: &PackageInterner, name: &str) -> PackageId {
         packages.intern(name).expect("package interns")
@@ -216,6 +230,25 @@ mod tests {
             range: TextRange::new(TextSize::new(start), TextSize::new(end))
                 .expect("ordered source span"),
         }
+    }
+
+    fn wasi_io_view(packages: &PackageInterner, symbols: &Interner) -> WitView {
+        let package_name = symbol(symbols, "io");
+        let version = Version::parse("0.2.3").expect("pinned WASI version parses");
+        let unit =
+            WitUnit::wasi(package_name, symbols, &version).expect("WASI io unit is supported");
+        let model = load_embedded_wasi_package(&unit, symbols)
+            .expect("embedded WASI io package loads")
+            .root()
+            .clone();
+        let view_package = packages
+            .intern(unit.stable_key())
+            .expect("WIT view package interns");
+        let paths = Arc::new(
+            DefPathInterner::new(view_package, packages, symbols)
+                .expect("WIT view interner constructs"),
+        );
+        WitView::build(model, packages, symbols, paths).expect("WIT view builds")
     }
 
     fn module_scope(module_def_id: LocalDefId) -> Phase1ModuleScopes {
@@ -561,5 +594,71 @@ mod tests {
             original_args
         ));
         assert_eq!(segments[0].args, Some(&generic_args));
+    }
+
+    #[test]
+    fn resolves_wit_view_interface_member_as_its_definition() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let requester = package_id(&packages, "acme:app#1.0");
+        let view = wasi_io_view(&packages, &symbols);
+        let interface = view
+            .interfaces
+            .get("streams")
+            .expect("WASI io streams interface exists");
+        let (member_spelling, member) = interface
+            .members
+            .iter()
+            .find(|(_, member)| member.kind == WitViewDefKind::Resource)
+            .expect("streams exposes a resource type");
+        let member_name = symbol(&symbols, member_spelling);
+        let root = local_def_id(requester, &packages, &symbols, Vec::new());
+        let index = ModuleMemberIndex::new_with_wit_views([], [&view], &symbols);
+
+        let prefix = resolve_module_prefix(
+            Res::Def(DefKind::Interface, interface.def),
+            &[segment(root, 1, member_name, 0, 11, None)],
+            requester,
+            &index,
+        )
+        .expect("WIT resource member resolves");
+
+        assert_eq!(
+            prefix,
+            ModulePathPrefix {
+                base: Res::Def(DefKind::Resource, member.def),
+                consumed_segments: 1,
+                stop: ModulePathStop::SegmentsExhausted,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_missing_wit_view_interface_member() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let requester = package_id(&packages, "acme:app#1.0");
+        let view = wasi_io_view(&packages, &symbols);
+        let interface = view
+            .interfaces
+            .get("streams")
+            .expect("WASI io streams interface exists");
+        let missing_name = symbol(&symbols, "definitely_missing");
+        let root = local_def_id(requester, &packages, &symbols, Vec::new());
+        let index = ModuleMemberIndex::new_with_wit_views([], [&view], &symbols);
+
+        assert!(matches!(
+            resolve_module_prefix(
+                Res::Def(DefKind::Interface, interface.def),
+                &[segment(root, 1, missing_name, 4, 22, None)],
+                requester,
+                &index,
+            ),
+            Err(ModulePathError::MissingMember {
+                name,
+                segment_index: 0,
+                ..
+            }) if name == missing_name
+        ));
     }
 }

@@ -1,16 +1,18 @@
 //! Qualified lookup through module-like path prefixes.
 //!
-//! The index is built from the active source package scopes supplied by the
-//! caller. Supply every active source package that can own a re-exported
-//! target, including transitive packages when a public re-export points to one.
-//! All scopes must come from the same package graph and its shared
-//! `PackageInterner`.
+//! The index is built from active source package scopes and optional WIT views
+//! supplied by the caller. Supply every active source package that can own a
+//! re-exported target, including transitive packages when a public re-export
+//! points to one. All scopes and views must come from the same package graph
+//! and its shared `PackageInterner`.
 //! Package-local [`super::ModuleId`] values are deliberately not part of this
 //! API: module targets are keyed by their canonical [`DefId`] instead.
 
-use crate::package_scopes::{Binding, InterfaceScope, Phase1ModuleScopes, Phase1PackageScopes};
+use crate::package_scopes::{Binding, Phase1PackageScopes};
 use crate::package_scopes::{DefKind, Res};
 use sai_hir::{DefId, PackageId, Symbol, Visibility};
+use sai_intern::Interner;
+use sai_wit::{ViewInterface, ViewMember, WitView, WitViewDefKind};
 use std::collections::HashMap;
 
 /// A normalized module or interface target from a resolver `Res`.
@@ -28,7 +30,7 @@ impl ModuleTarget {
     /// Normalize a current resolver result into a module-like target.
     ///
     /// The target need not be present in a particular index; `lookup` reports
-    /// `NotModule` when its source package scope was not supplied.
+    /// `NotModule` when its source package or WIT view scope was not supplied.
     pub const fn from_res(res: Res) -> Option<Self> {
         match res {
             Res::Def(DefKind::Module | DefKind::Interface, def_id) => Some(Self { def_id }),
@@ -49,6 +51,10 @@ impl ModuleTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModuleMemberLookup<'a> {
     Found(&'a Binding),
+    /// A WIT member definition, which has no SAI source span.
+    ///
+    /// WIT view members are public and intentionally do not use `Binding`.
+    WitMember(Res),
     Missing,
     Inaccessible(&'a Binding),
     NotModule,
@@ -56,24 +62,37 @@ pub enum ModuleMemberLookup<'a> {
 
 #[derive(Clone, Copy)]
 enum MemberScope<'a> {
-    Module(&'a Phase1ModuleScopes),
-    Interface(&'a InterfaceScope),
+    Source(&'a HashMap<Symbol, Binding>),
+    WitInterface(&'a ViewInterface),
+}
+
+enum MemberLookupValue<'a> {
+    Source(&'a Binding),
+    Wit(Res),
 }
 
 impl<'a> MemberScope<'a> {
-    fn get(self, name: Symbol) -> Option<&'a Binding> {
+    fn get(self, name: Symbol, symbols: Option<&Interner>) -> Option<MemberLookupValue<'a>> {
         match self {
-            Self::Module(scope) => scope.members.get(&name),
-            Self::Interface(scope) => scope.members.get(&name),
+            Self::Source(members) => members.get(&name).map(MemberLookupValue::Source),
+            Self::WitInterface(interface) => {
+                let spelling = symbols?.resolve(name).ok()?;
+                interface
+                    .members
+                    .get(spelling.as_ref())
+                    .and_then(wit_member_res)
+                    .map(MemberLookupValue::Wit)
+            }
         }
     }
 
-    fn iter(self) -> impl Iterator<Item = (Symbol, &'a Binding)> + 'a {
-        let members = match self {
-            Self::Module(scope) => &scope.members,
-            Self::Interface(scope) => &scope.members,
-        };
-        members.iter().map(|(name, binding)| (*name, binding))
+    fn iter(self) -> Option<impl Iterator<Item = (Symbol, &'a Binding)> + 'a> {
+        match self {
+            Self::Source(members) => Some(members.iter().map(|(name, binding)| (*name, binding))),
+            // This legacy enumeration API returns source-backed Bindings.
+            // WIT lookup has a separate span-free result representation.
+            Self::WitInterface(_) => None,
+        }
     }
 }
 
@@ -86,10 +105,11 @@ struct IndexedTarget<'a> {
 /// An index from canonical module/interface identities to their member maps.
 ///
 /// Construction hides the `ModuleId`-indexed representation in
-/// `Phase1PackageScopes`; lookup results contain canonical definitions and
-/// original bindings only.
+/// `Phase1PackageScopes`; source lookup results contain canonical definitions
+/// and original bindings, while WIT results are span-free.
 pub struct ModuleMemberIndex<'a> {
     targets: HashMap<DefId, IndexedTarget<'a>>,
+    wit_symbols: Option<&'a Interner>,
 }
 
 impl<'a> ModuleMemberIndex<'a> {
@@ -100,6 +120,29 @@ impl<'a> ModuleMemberIndex<'a> {
     /// definition from a transitive package, so direct dependencies alone may
     /// not be enough.
     pub fn new(package_scopes: impl IntoIterator<Item = &'a Phase1PackageScopes>) -> Self {
+        Self::build(package_scopes, std::iter::empty(), None)
+    }
+
+    /// Build an index over source scopes and foreign WIT views.
+    ///
+    /// WIT interface members are keyed by canonical SAI spelling in the view
+    /// and by session-local `Symbol` in resolver paths, so `symbols` must be
+    /// the interner used to construct those paths and views. WIT members are
+    /// returned as [`ModuleMemberLookup::WitMember`], without manufacturing
+    /// source spans or `Binding`s.
+    pub fn new_with_wit_views(
+        package_scopes: impl IntoIterator<Item = &'a Phase1PackageScopes>,
+        wit_views: impl IntoIterator<Item = &'a WitView>,
+        symbols: &'a Interner,
+    ) -> Self {
+        Self::build(package_scopes, wit_views, Some(symbols))
+    }
+
+    fn build(
+        package_scopes: impl IntoIterator<Item = &'a Phase1PackageScopes>,
+        wit_views: impl IntoIterator<Item = &'a WitView>,
+        wit_symbols: Option<&'a Interner>,
+    ) -> Self {
         let mut targets = HashMap::new();
 
         for package in package_scopes {
@@ -107,24 +150,36 @@ impl<'a> ModuleMemberIndex<'a> {
                 let def_id = module.module_def_id.to_def_id();
                 targets.entry(def_id).or_insert(IndexedTarget {
                     package: module.module_def_id.package(),
-                    scope: MemberScope::Module(module),
+                    scope: MemberScope::Source(&module.members),
                 });
             }
 
             for (def_id, interface) in &package.interfaces {
                 targets.entry(*def_id).or_insert(IndexedTarget {
                     package: def_id.package,
-                    scope: MemberScope::Interface(interface),
+                    scope: MemberScope::Source(&interface.members),
                 });
             }
         }
 
-        Self { targets }
+        for view in wit_views {
+            for interface in view.interfaces.values() {
+                targets.entry(interface.def).or_insert(IndexedTarget {
+                    package: interface.def.package,
+                    scope: MemberScope::WitInterface(interface),
+                });
+            }
+        }
+
+        Self {
+            targets,
+            wit_symbols,
+        }
     }
 
     /// Look up a member of a module or interface `Res`.
     ///
-    /// A missing source scope and a non-module `Res` both yield `NotModule`.
+    /// A missing source/WIT scope and a non-module `Res` both yield `NotModule`.
     /// A member from another package is available only when its effective
     /// visibility is `Visibility::Pub` or `Visibility::Export`; private members
     /// remain available within their declaring package.
@@ -150,30 +205,37 @@ impl<'a> ModuleMemberIndex<'a> {
         let Some(indexed) = self.targets.get(&target.def_id) else {
             return ModuleMemberLookup::NotModule;
         };
-        let Some(binding) = indexed.scope.get(name) else {
+        let Some(member) = indexed.scope.get(name, self.wit_symbols) else {
             return ModuleMemberLookup::Missing;
         };
-        if indexed.package != requesting_package
-            && !matches!(binding.visibility, Visibility::Pub | Visibility::Export)
-        {
-            return ModuleMemberLookup::Inaccessible(binding);
+        match member {
+            MemberLookupValue::Wit(res) => ModuleMemberLookup::WitMember(res),
+            MemberLookupValue::Source(binding) => {
+                if indexed.package != requesting_package
+                    && !matches!(binding.visibility, Visibility::Pub | Visibility::Export)
+                {
+                    ModuleMemberLookup::Inaccessible(binding)
+                } else {
+                    ModuleMemberLookup::Found(binding)
+                }
+            }
         }
-        ModuleMemberLookup::Found(binding)
     }
 
-    /// Enumerate members visible through a normalized module or interface target.
+    /// Enumerate source-backed bindings visible through a module or interface.
     ///
-    /// A missing source scope returns `None`. Package-private members are
-    /// included when the requesting package owns the target; for foreign
-    /// targets, only `Pub` and `Export` bindings are included. The iteration
-    /// order is unspecified because member scopes use hash maps.
+    /// A missing target or WIT view scope returns `None`, because WIT members
+    /// have no source `Binding`. Package-private members are included when the
+    /// requesting package owns the target; for foreign source targets, only
+    /// `Pub` and `Export` bindings are included. The iteration order is
+    /// unspecified because source member scopes use hash maps.
     pub fn visible_members(
         &self,
         target: ModuleTarget,
         requesting_package: PackageId,
     ) -> Option<impl Iterator<Item = (Symbol, &'a Binding)> + 'a> {
         let indexed = *self.targets.get(&target.def_id)?;
-        Some(indexed.scope.iter().filter_map(move |(name, binding)| {
+        Some(indexed.scope.iter()?.filter_map(move |(name, binding)| {
             (indexed.package == requesting_package
                 || matches!(binding.visibility, Visibility::Pub | Visibility::Export))
             .then_some((name, binding))
@@ -181,10 +243,29 @@ impl<'a> ModuleMemberIndex<'a> {
     }
 }
 
+fn wit_member_res(member: &ViewMember) -> Option<Res> {
+    let kind = match member.kind {
+        WitViewDefKind::Struct => DefKind::Struct,
+        WitViewDefKind::Enum => DefKind::Enum,
+        WitViewDefKind::Resource => DefKind::Resource,
+        WitViewDefKind::Alias => DefKind::Alias,
+        WitViewDefKind::Fn => DefKind::Fn,
+        WitViewDefKind::Interface
+        | WitViewDefKind::World
+        | WitViewDefKind::Field
+        | WitViewDefKind::Variant
+        | WitViewDefKind::AssocFn
+        | WitViewDefKind::WorldFn => return None,
+    };
+    Some(Res::Def(kind, member.def))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::package_scopes::{BindingOrigin, Phase1PackageScopes};
+    use crate::package_scopes::{
+        BindingOrigin, InterfaceScope, Phase1ModuleScopes, Phase1PackageScopes,
+    };
     use sai_hir::{DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, LocalDefId};
     use sai_intern::{Interner, PackageInterner};
     use sai_vfs::{FileId, Span, TextRange, TextSize};
