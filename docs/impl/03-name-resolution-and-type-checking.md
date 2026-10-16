@@ -848,6 +848,14 @@ typed path results remain distinct. Package-local calls leave mapped
 diagnostics absent. `sai check` collects member and resource-method diagnostics
 independently and reports structural failures at their owning level.
 
+**World function type-path diagnostics (IR-579).** The closure-aware world
+adapter maps typed private and missing member failures independently for
+import/export function signature owners. World module/interface references and
+includes keep their world namespace handling and receive no type-member
+diagnostics. Package-local calls leave mapped diagnostics absent. `sai check`
+collects each item independently and reports a parent world analysis failure
+once.
+
 **Qualified missing-member diagnostics (IR-545).** The module path walker
 retains the exact `ModuleTarget` when a member is missing. The driver emits a
 snapshot-bound `UNRESOLVED_NAME` at that segment with the canonical package
