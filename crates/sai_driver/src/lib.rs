@@ -123,6 +123,7 @@ pub struct RootDatabase {
     type_owner_paths: TypeOwnerPathQueries,
     declared_requirements: DeclaredRequirementsQueries,
     wit_contracts: WitContractQueries,
+    wit_units: WitUnitOfQueries,
     package_graph: InputQuery<u8, Option<PackageGraph>>,
     wasi_packages: WasiPackageQueries,
     wasi_views: WasiViewQueries,
@@ -519,6 +520,247 @@ impl WitContractQueries {
                     Ok(Arc::new(contract))
                 });
                 Ok(WitContractQueryOutput { result })
+            },
+        )?;
+        Ok(Self { query })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WitUnitOfFailure {
+    PackageGraphUnavailable,
+    PackageNotActive,
+    Contract(WitContractQueryFailure),
+    PackageVersionMismatch {
+        manifest_version: String,
+        selected_version: String,
+    },
+    PackageFormMismatch {
+        package_kind: sai_wit::WitPackageKind,
+        selected_form: PackageForm,
+    },
+    UnitIdentity(WitUnitIdentityError),
+}
+
+impl StableHash for WitUnitOfFailure {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        match self {
+            Self::PackageGraphUnavailable => hasher.write_tag(0xDD),
+            Self::PackageNotActive => hasher.write_tag(0xDE),
+            Self::Contract(error) => {
+                hasher.write_tag(0xDF);
+                error.stable_hash(hasher);
+            }
+            Self::PackageVersionMismatch {
+                manifest_version,
+                selected_version,
+            } => {
+                hasher.write_tag(0xE0);
+                manifest_version.stable_hash(hasher);
+                selected_version.stable_hash(hasher);
+            }
+            Self::PackageFormMismatch {
+                package_kind,
+                selected_form,
+            } => {
+                hasher.write_tag(0xE1);
+                hasher.write_tag(match package_kind {
+                    sai_wit::WitPackageKind::Source => 0x01,
+                    sai_wit::WitPackageKind::Artifact => 0x02,
+                    sai_wit::WitPackageKind::Hybrid => 0x03,
+                });
+                hasher.write_tag(match selected_form {
+                    PackageForm::Source => 0x01,
+                    PackageForm::Artifact => 0x02,
+                });
+            }
+            Self::UnitIdentity(error) => {
+                hasher.write_tag(0xE2);
+                match error {
+                    WitUnitIdentityError::UnknownPackage(error) => {
+                        hasher.write_tag(0x01);
+                        hasher.write_tag(match error {
+                            PackageIdError::TooManyPackages => 0x01,
+                            PackageIdError::UnknownPackage => 0x02,
+                            PackageIdError::LockPoisoned => 0x03,
+                        });
+                    }
+                    WitUnitIdentityError::UnknownSymbol(error) => {
+                        hasher.write_tag(0x02);
+                        hasher.write_tag(match error {
+                            LookupError::UnknownSymbol => 0x01,
+                            LookupError::LockPoisoned => 0x02,
+                            LookupError::TooManySymbols => 0x03,
+                        });
+                    }
+                    WitUnitIdentityError::UnknownWasiPackage => hasher.write_tag(0x03),
+                    WitUnitIdentityError::UnsupportedWasiVersion => hasher.write_tag(0x04),
+                    WitUnitIdentityError::PackageKeyMismatch => hasher.write_tag(0x05),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WitUnitOfQueryOutput {
+    result: Result<Option<WitUnit>, WitUnitOfFailure>,
+    /// `WitUnit` equality deliberately uses the compatibility-line view key
+    /// and omits the exact selected version. Keep the version here so a
+    /// same-line selection change still invalidates downstream queries that
+    /// depend on `wit_unit_of`.
+    selected_version: Option<String>,
+}
+
+impl StableHash for WitUnitOfQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        self.selected_version.stable_hash(hasher);
+        match &self.result {
+            Ok(Some(unit)) => {
+                hasher.write_tag(0xE3);
+                unit.stable_hash(hasher);
+            }
+            Ok(None) => hasher.write_tag(0xE4),
+            Err(error) => {
+                hasher.write_tag(0xE5);
+                error.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+/// Errors returned while deriving the WIT unit exposed by an active package.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WitUnitOfError {
+    Package(PackageIdError),
+    PackageKey(PackageKeyError),
+    Query(QueryError),
+    PackageGraphUnavailable,
+    PackageNotActive {
+        package_key: String,
+    },
+    Contract(WitContractQueryError),
+    PackageVersionMismatch {
+        package_key: String,
+        manifest_version: String,
+        selected_version: String,
+    },
+    PackageFormMismatch {
+        package_key: String,
+        package_kind: sai_wit::WitPackageKind,
+        selected_form: PackageForm,
+    },
+    UnitIdentity {
+        package_key: String,
+        error: WitUnitIdentityError,
+    },
+}
+
+impl From<PackageIdError> for WitUnitOfError {
+    fn from(error: PackageIdError) -> Self {
+        Self::Package(error)
+    }
+}
+
+impl From<PackageKeyError> for WitUnitOfError {
+    fn from(error: PackageKeyError) -> Self {
+        Self::PackageKey(error)
+    }
+}
+
+impl From<QueryError> for WitUnitOfError {
+    fn from(error: QueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
+struct WitUnitOfQueries {
+    query: DerivedQuery<PackageKey, WitUnitOfQueryOutput>,
+}
+
+impl WitUnitOfQueries {
+    fn new(
+        contracts: DerivedQuery<PackageKey, WitContractQueryOutput>,
+        package_graph: InputQuery<u8, Option<PackageGraph>>,
+        packages: Arc<PackageInterner>,
+    ) -> Result<Self, QueryError> {
+        let query = DerivedQuery::new(
+            "wit_unit_of",
+            move |database: &mut QueryDatabase, key: &PackageKey| {
+                if matches!(key.as_str(), "sai:core" | "sai:alloc") {
+                    return Ok(WitUnitOfQueryOutput {
+                        result: Ok(None),
+                        selected_version: None,
+                    });
+                }
+                let graph_input = package_graph.get(database, 0)?;
+                let Some(graph) = graph_input.as_ref() else {
+                    return Ok(WitUnitOfQueryOutput {
+                        result: Err(WitUnitOfFailure::PackageGraphUnavailable),
+                        selected_version: None,
+                    });
+                };
+                let Some(node) = graph.node(key) else {
+                    return Ok(WitUnitOfQueryOutput {
+                        result: Err(WitUnitOfFailure::PackageNotActive),
+                        selected_version: None,
+                    });
+                };
+                if node.role() == PackageGraphRole::Root {
+                    return Ok(WitUnitOfQueryOutput {
+                        result: Ok(None),
+                        selected_version: None,
+                    });
+                }
+                let contract_output = contracts.get(database, key.clone())?;
+                let result = contract_output
+                    .result
+                    .as_ref()
+                    .map_err(|error| WitUnitOfFailure::Contract(error.clone()))
+                    .and_then(|contract| {
+                        if contract.identity().to_string() != node.identity()
+                            || contract.version() != node.version()
+                        {
+                            return Err(WitUnitOfFailure::PackageVersionMismatch {
+                                manifest_version: contract.version().to_string(),
+                                selected_version: node.version().to_string(),
+                            });
+                        }
+                        if matches!(
+                            (contract.kind(), node.form()),
+                            (sai_wit::WitPackageKind::Source, PackageForm::Artifact)
+                                | (sai_wit::WitPackageKind::Artifact, PackageForm::Source)
+                        ) {
+                            return Err(WitUnitOfFailure::PackageFormMismatch {
+                                package_kind: contract.kind(),
+                                selected_form: node.form(),
+                            });
+                        }
+                        let package = packages.intern(key.as_str()).map_err(|error| {
+                            WitUnitOfFailure::UnitIdentity(WitUnitIdentityError::UnknownPackage(
+                                error,
+                            ))
+                        })?;
+                        let version = MvsPackageVersion::new(
+                            contract.identity().to_string(),
+                            contract.version().clone(),
+                        )
+                        .expect("a projected package identity is valid");
+                        let unit = match contract.kind() {
+                            sai_wit::WitPackageKind::Source => {
+                                WitUnit::generated(package, &packages, &version)
+                            }
+                            sai_wit::WitPackageKind::Artifact | sai_wit::WitPackageKind::Hybrid => {
+                                WitUnit::dir(package, &packages, &version)
+                            }
+                        }
+                        .map_err(WitUnitOfFailure::UnitIdentity)?;
+                        Ok(Some(unit))
+                    });
+                Ok(WitUnitOfQueryOutput {
+                    result,
+                    selected_version: Some(node.version().to_string()),
+                })
             },
         )?;
         Ok(Self { query })
@@ -6150,6 +6392,11 @@ impl RootDatabase {
         let package_graph =
             InputQuery::<u8, Option<PackageGraph>>::new("package_graph", Durability::Medium)?;
         package_graph.set(&mut query_database, 0, None)?;
+        let wit_units = WitUnitOfQueries::new(
+            wit_contracts.query.clone(),
+            package_graph.clone(),
+            Arc::clone(&packages),
+        )?;
         let wasi_packages = WasiPackageQueries::new(Arc::clone(&symbols))?;
         let wasi_def_paths = Arc::new(Mutex::new(HashMap::new()));
         let wasi_views = WasiViewQueries::new(
@@ -6173,6 +6420,7 @@ impl RootDatabase {
             type_owner_paths,
             declared_requirements,
             wit_contracts,
+            wit_units,
             package_graph,
             wasi_packages,
             wasi_views,
@@ -6390,6 +6638,71 @@ impl RootDatabase {
                 expected_package_key,
                 found_identity,
                 found_compatibility_line,
+            },
+        })
+    }
+
+    /// Returns the selected WIT unit through which other packages view this
+    /// active package.
+    ///
+    /// The root package has no dependent-facing unit, because its own package
+    /// references resolve to local SAI items and its WIT directory is handled
+    /// by separate validation queries. `sai:core` and `sai:alloc` also have no
+    /// WIT unit. Source packages expose generated WIT; artifact and hybrid
+    /// packages expose their declared WIT directory regardless of which
+    /// hybrid form the active graph selected. The manifest's exact version
+    /// and content kind are checked against the active graph before
+    /// constructing the session-bound unit.
+    pub fn wit_unit_of(&mut self, package: PackageId) -> Result<Option<WitUnit>, WitUnitOfError> {
+        let package_key = self
+            .packages
+            .resolve(package)
+            .map_err(WitUnitOfError::from)?;
+        let package_key = PackageKey::new(package_key.as_ref()).map_err(WitUnitOfError::from)?;
+        let package_key_text = package_key.as_str().to_owned();
+        let output = self
+            .wit_units
+            .query
+            .get(&mut self.query_database, package_key)
+            .map_err(WitUnitOfError::from)?;
+        output.result.clone().map_err(|failure| match failure {
+            WitUnitOfFailure::PackageGraphUnavailable => WitUnitOfError::PackageGraphUnavailable,
+            WitUnitOfFailure::PackageNotActive => WitUnitOfError::PackageNotActive {
+                package_key: package_key_text,
+            },
+            WitUnitOfFailure::Contract(WitContractQueryFailure::Projection(error)) => {
+                WitUnitOfError::Contract(WitContractQueryError::Projection {
+                    package_key: package_key_text,
+                    error,
+                })
+            }
+            WitUnitOfFailure::Contract(WitContractQueryFailure::PackageMismatch {
+                found_identity,
+                found_compatibility_line,
+            }) => WitUnitOfError::Contract(WitContractQueryError::ManifestPackageMismatch {
+                expected_package_key: package_key_text,
+                found_identity,
+                found_compatibility_line,
+            }),
+            WitUnitOfFailure::PackageVersionMismatch {
+                manifest_version,
+                selected_version,
+            } => WitUnitOfError::PackageVersionMismatch {
+                package_key: package_key_text,
+                manifest_version,
+                selected_version,
+            },
+            WitUnitOfFailure::PackageFormMismatch {
+                package_kind,
+                selected_form,
+            } => WitUnitOfError::PackageFormMismatch {
+                package_key: package_key_text,
+                package_kind,
+                selected_form,
+            },
+            WitUnitOfFailure::UnitIdentity(error) => WitUnitOfError::UnitIdentity {
+                package_key: package_key_text,
+                error,
             },
         })
     }
@@ -26653,6 +26966,403 @@ mod tests {
                 ..
             }) if found_identity == "acme:wit-contract" && found_compatibility_line == "2"
         ));
+    }
+
+    #[test]
+    fn wit_unit_of_projects_active_source_artifact_and_hybrid_packages() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let root = database
+            .intern_package("acme:wit-root#1")
+            .expect("root package key interns");
+        let source = database
+            .intern_package("acme:wit-source#1")
+            .expect("source package key interns");
+        let artifact = database
+            .intern_package("acme:wit-artifact#1")
+            .expect("artifact package key interns");
+        let hybrid_source = database
+            .intern_package("acme:wit-hybrid-source#1")
+            .expect("source-form hybrid package key interns");
+        let hybrid_artifact = database
+            .intern_package("acme:wit-hybrid-artifact#1")
+            .expect("artifact-form hybrid package key interns");
+
+        let node = |key: &str,
+                    identity: &str,
+                    form: PackageForm,
+                    role: PackageGraphRole,
+                    edges: Vec<PackageGraphEdge>| {
+            PackageGraphNode::new(
+                PackageKey::new(key).expect("graph key is valid"),
+                identity,
+                Version::parse("1.0.0").expect("version is valid"),
+                form,
+                role,
+                edges,
+            )
+            .expect("graph node is valid")
+        };
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                node(
+                    "acme:wit-root#1",
+                    "acme:wit-root",
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![
+                        graph_edge("acme:wit-source#1", "acme:wit-source"),
+                        graph_edge("acme:wit-artifact#1", "acme:wit-artifact"),
+                        graph_edge("acme:wit-hybrid-source#1", "acme:wit-hybrid-source"),
+                        graph_edge("acme:wit-hybrid-artifact#1", "acme:wit-hybrid-artifact"),
+                    ],
+                ),
+                node(
+                    "acme:wit-source#1",
+                    "acme:wit-source",
+                    PackageForm::Source,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+                node(
+                    "acme:wit-artifact#1",
+                    "acme:wit-artifact",
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+                node(
+                    "acme:wit-hybrid-source#1",
+                    "acme:wit-hybrid-source",
+                    PackageForm::Source,
+                    PackageGraphRole::WorkspaceMember,
+                    Vec::new(),
+                ),
+                node(
+                    "acme:wit-hybrid-artifact#1",
+                    "acme:wit-hybrid-artifact",
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("active graph is valid");
+
+        let set_manifest = |database: &mut RootDatabase, package, role, source: &str| {
+            database
+                .set_package_manifest(package, Arc::from(source.as_bytes()), role, Durability::Low)
+                .expect("manifest input is set");
+        };
+        set_manifest(
+            &mut database,
+            root,
+            PackageRole::Root,
+            "package acme:wit-root @ 1.0.0\nsource \"src\"\n",
+        );
+        set_manifest(
+            &mut database,
+            source,
+            PackageRole::Dependency,
+            "package acme:wit-source @ 1.0.0\nsource \"src\"\nwit \"authored\"\n",
+        );
+        set_manifest(
+            &mut database,
+            artifact,
+            PackageRole::Dependency,
+            "package acme:wit-artifact @ 1.0.0\nartifact component {}\n",
+        );
+        set_manifest(
+            &mut database,
+            hybrid_source,
+            PackageRole::Dependency,
+            "package acme:wit-hybrid-source @ 1.0.0\nsource \"src\"\nartifact component {}\n",
+        );
+        set_manifest(
+            &mut database,
+            hybrid_artifact,
+            PackageRole::Dependency,
+            "package acme:wit-hybrid-artifact @ 1.0.0\nsource \"src\"\nartifact component {}\n",
+        );
+        database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is set");
+
+        let root_unit = database
+            .wit_unit_of(root)
+            .expect("root's dependent-facing unit resolves");
+        assert_eq!(root_unit, None);
+
+        let source_unit = database
+            .wit_unit_of(source)
+            .expect("source package unit resolves")
+            .expect("source packages expose generated WIT");
+        assert!(source_unit.stable_key().starts_with("wit:gen:"));
+        assert_eq!(
+            source_unit.kind(),
+            WitUnitKind::Generated { package: source }
+        );
+        assert_eq!(source_unit.canonical_name(), "acme:wit-source@1.0.0");
+
+        let artifact_unit = database
+            .wit_unit_of(artifact)
+            .expect("artifact package unit resolves")
+            .expect("artifact packages expose directory WIT");
+        assert!(artifact_unit.stable_key().starts_with("wit:dir:"));
+        assert_eq!(artifact_unit.kind(), WitUnitKind::Dir { package: artifact });
+
+        for (package, expected_prefix) in
+            [(hybrid_source, "wit:dir:"), (hybrid_artifact, "wit:dir:")]
+        {
+            let unit = database
+                .wit_unit_of(package)
+                .expect("hybrid package unit resolves")
+                .expect("hybrid packages expose directory WIT in either form");
+            assert!(unit.stable_key().starts_with(expected_prefix));
+            assert_eq!(unit.kind(), WitUnitKind::Dir { package });
+        }
+
+        set_manifest(
+            &mut database,
+            root,
+            PackageRole::Root,
+            "package acme:wit-root @ 1.0.0\nsource \"src\"\nartifact component {}\n",
+        );
+        assert_eq!(
+            database
+                .wit_unit_of(root)
+                .expect("hybrid root unit resolves"),
+            None,
+            "the root's directory WIT is loaded by separate validation queries"
+        );
+    }
+
+    #[test]
+    fn wit_unit_of_handles_implicit_packages_and_rejects_invalid_active_inputs() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        for identity in ["sai:core", "sai:alloc"] {
+            let package = database
+                .intern_package(identity)
+                .expect("implicit package key interns");
+            assert_eq!(
+                database
+                    .wit_unit_of(package)
+                    .expect("implicit package query resolves"),
+                None
+            );
+        }
+
+        let dependency = database
+            .intern_package("acme:wit-dependency#1")
+            .expect("dependency package key interns");
+        assert!(matches!(
+            database.wit_unit_of(dependency),
+            Err(WitUnitOfError::PackageGraphUnavailable)
+        ));
+
+        let root_node = PackageGraphNode::new(
+            PackageKey::new("acme:wit-root#1").expect("root key is valid"),
+            "acme:wit-root",
+            Version::parse("1.0.0").expect("root version is valid"),
+            PackageForm::Source,
+            PackageGraphRole::Root,
+            vec![graph_edge("acme:wit-dependency#1", "acme:wit-dependency")],
+        )
+        .expect("root node is valid");
+        let dependency_node = PackageGraphNode::new(
+            PackageKey::new("acme:wit-dependency#1").expect("dependency key is valid"),
+            "acme:wit-dependency",
+            Version::parse("1.2.0").expect("selected version is valid"),
+            PackageForm::Artifact,
+            PackageGraphRole::Dependency,
+            Vec::new(),
+        )
+        .expect("dependency node is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [root_node, dependency_node],
+        )
+        .expect("active graph is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is set");
+
+        database
+            .set_package_manifest(
+                dependency,
+                Arc::from(&b"package acme:wit-dependency @ 1.1.0\nsource \"src\"\n"[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("older manifest version is tracked");
+        assert!(matches!(
+            database.wit_unit_of(dependency),
+            Err(WitUnitOfError::PackageVersionMismatch {
+                manifest_version,
+                selected_version,
+                ..
+            }) if manifest_version == "1.1.0" && selected_version == "1.2.0"
+        ));
+
+        database
+            .set_package_manifest(
+                dependency,
+                Arc::from(&b"package acme:wit-dependency @ 1.2.0\nsource \"src\"\n"[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("matching source contract is tracked");
+        assert!(matches!(
+            database.wit_unit_of(dependency),
+            Err(WitUnitOfError::PackageFormMismatch {
+                package_kind: sai_wit::WitPackageKind::Source,
+                selected_form: PackageForm::Artifact,
+                ..
+            })
+        ));
+
+        let source_form_graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    PackageKey::new("acme:wit-root#1").expect("root key is valid"),
+                    "acme:wit-root",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:wit-dependency#1", "acme:wit-dependency")],
+                )
+                .expect("root node is valid"),
+                PackageGraphNode::new(
+                    PackageKey::new("acme:wit-dependency#1").expect("dependency key is valid"),
+                    "acme:wit-dependency",
+                    Version::parse("1.2.0").expect("selected version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("dependency node is valid"),
+            ],
+        )
+        .expect("source-form graph is valid");
+        database
+            .set_package_graph(Some(source_form_graph))
+            .expect("source-form package graph is set");
+        database
+            .set_package_manifest(
+                dependency,
+                Arc::from(&b"package acme:wit-dependency @ 1.2.0\nartifact component {}\n"[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("artifact contract is tracked");
+        assert!(matches!(
+            database.wit_unit_of(dependency),
+            Err(WitUnitOfError::PackageFormMismatch {
+                package_kind: sai_wit::WitPackageKind::Artifact,
+                selected_form: PackageForm::Source,
+                ..
+            })
+        ));
+
+        // A package absent from the active graph is not an implicit no-WIT
+        // package and must not silently look like an empty view.
+        let inactive = database
+            .intern_package("acme:wit-inactive#1")
+            .expect("inactive package key interns");
+        assert!(matches!(
+            database.wit_unit_of(inactive),
+            Err(WitUnitOfError::PackageNotActive { .. })
+        ));
+    }
+
+    #[test]
+    fn wit_unit_of_invalidates_dependents_when_exact_version_changes_within_a_line() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let dependency = database
+            .intern_package("acme:wit-versioned#1")
+            .expect("dependency package key interns");
+        let package_key = PackageKey::new("acme:wit-versioned#1").expect("dependency key is valid");
+
+        let graph_for_version = |dependency_version: &str| {
+            let root = PackageGraphNode::new(
+                PackageKey::new("acme:wit-root#1").expect("root key is valid"),
+                "acme:wit-root",
+                Version::parse("1.0.0").expect("root version is valid"),
+                PackageForm::Source,
+                PackageGraphRole::Root,
+                vec![graph_edge("acme:wit-versioned#1", "acme:wit-versioned")],
+            )
+            .expect("root node is valid");
+            let dependency = PackageGraphNode::new(
+                package_key.clone(),
+                "acme:wit-versioned",
+                Version::parse(dependency_version).expect("selected version is valid"),
+                PackageForm::Source,
+                PackageGraphRole::Dependency,
+                Vec::new(),
+            )
+            .expect("dependency node is valid");
+            PackageGraph::new(
+                Version::parse("1.8.2").expect("toolchain version is valid"),
+                [root, dependency],
+            )
+            .expect("active graph is valid")
+        };
+        let set_versioned_manifest = |database: &mut RootDatabase, version: &str| {
+            let source = format!("package acme:wit-versioned @ {version}\nsource \"src\"\n");
+            database
+                .set_package_manifest(
+                    dependency,
+                    Arc::from(source.into_bytes()),
+                    PackageRole::Dependency,
+                    Durability::Low,
+                )
+                .expect("manifest input is set");
+        };
+
+        database
+            .set_package_graph(Some(graph_for_version("1.2.3")))
+            .expect("first selected graph is set");
+        set_versioned_manifest(&mut database, "1.2.3");
+        let first = database
+            .wit_unit_of(dependency)
+            .expect("first selected unit resolves")
+            .expect("source package exposes generated WIT");
+        assert_eq!(first.canonical_name(), "acme:wit-versioned@1.2.3");
+        let first_output = database
+            .wit_units
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("first unit query output exists");
+
+        database
+            .set_package_graph(Some(graph_for_version("1.2.4")))
+            .expect("updated selected graph is set");
+        set_versioned_manifest(&mut database, "1.2.4");
+        let second = database
+            .wit_unit_of(dependency)
+            .expect("updated selected unit resolves")
+            .expect("source package still exposes generated WIT");
+        assert_eq!(second.canonical_name(), "acme:wit-versioned@1.2.4");
+        assert_eq!(
+            first.stable_key(),
+            second.stable_key(),
+            "the persistent WIT view key remains compatibility-line scoped"
+        );
+        assert_eq!(
+            first, second,
+            "WitUnit equality deliberately omits the exact selected version"
+        );
+        let second_output = database
+            .wit_units
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("updated unit query output exists");
+        assert!(
+            !Arc::ptr_eq(&first_output, &second_output),
+            "the query output's exact-version projection prevents early cutoff"
+        );
     }
 
     #[test]
