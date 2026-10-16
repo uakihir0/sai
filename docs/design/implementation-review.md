@@ -4580,3 +4580,11 @@
 - **Review:** The hostile reviewer noted that the disjoint-cycle fixture verifies results but is not a deterministic performance guard against restoring per-component allocations; the test name was narrowed to describe its semantic assertion.
 - **Human review:** **Review required:** Confirm that callers supply unique interface IDs in package generation order and references in source order; that interfaces outside the package and self-use are omitted; and that the first source reference per ordered pair and the chosen SCC witness determine stable primary and note locations.
 - **Remaining scope:** Build references from original path resolution, wire this analysis into tracked driver queries and diagnostic collection, and poison cyclic interfaces during generation.
+
+### IR-602: Share SAI-to-WIT name conversion rules
+
+- **Decision:** Move identifier conversion and compact-name suggestions into the public `sai_resolve::wit_name` module, and reuse those functions from package-scope name collection. Keep WIT keyword escaping in the printer, separate from conversion.
+- **Reason:** Interface, world, package-scope, and generated WIT names must apply the same spec-defined patterns. A shared converter avoids drift as later checks are connected.
+- **Verification:** `cargo test -p sai_resolve --locked --quiet` passes 178 tests and crate formatting passes. Existing package collector behavior is preserved. Focused tests cover snake_case, UpperCamel including acronyms, raw identifiers, malformed and non-ASCII identifiers, and compact suggestions. Hostile review found no actionable findings.
+- **Human review:** **Review required:** Confirm that raw identifier prefixes are removed before conversion; the current UpperCamel rule maps `HTTPClient` to `h-t-t-p-client`; and compact suggestions strip non-ASCII-alphanumeric characters before checking representability.
+- **Remaining scope:** Reuse the public conversion helpers for names inside interfaces and worlds, plus generation.

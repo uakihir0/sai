@@ -8,6 +8,7 @@
 
 use super::{ModuleId, ModuleTree};
 use crate::package_scopes::{FilteredModule, Phase1PackageScopes, TopLevelOwnerKind};
+use crate::wit_name::{sai_identifier_to_wit_name, suggested_representable_name};
 use sai_diagnostics::{Child, ChildKind, Code, Diagnostic, Location, Related, Severity, Value};
 use sai_hir::LocalDefId;
 use sai_hir::item_tree::{ErasedAstId, ItemTreeEntry, ItemTreeKind};
@@ -289,71 +290,6 @@ fn collect_package_wit_names(
     }
 
     PackageWitNames { names, diagnostics }
-}
-
-fn sai_identifier_to_wit_name(identifier: &str) -> Option<String> {
-    let identifier = identifier.strip_prefix("r#").unwrap_or(identifier);
-    if is_lower_sai_identifier(identifier) {
-        return Some(identifier.replace('_', "-"));
-    }
-    if !is_upper_sai_identifier(identifier) {
-        return None;
-    }
-
-    let mut wit_name = String::with_capacity(identifier.len() + 4);
-    for (index, byte) in identifier.bytes().enumerate() {
-        if index != 0 && byte.is_ascii_uppercase() {
-            wit_name.push('-');
-        }
-        wit_name.push(char::from(byte.to_ascii_lowercase()));
-    }
-    Some(wit_name)
-}
-
-fn is_lower_sai_identifier(identifier: &str) -> bool {
-    let mut segments = identifier.split('_');
-    let Some(first) = segments.next() else {
-        return false;
-    };
-    if !is_lower_segment(first) {
-        return false;
-    }
-    segments.all(is_lower_segment)
-}
-
-fn is_lower_segment(segment: &str) -> bool {
-    let mut bytes = segment.bytes();
-    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
-        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-}
-
-fn is_upper_sai_identifier(identifier: &str) -> bool {
-    let bytes = identifier.as_bytes();
-    if bytes.is_empty() || !identifier.is_ascii() {
-        return false;
-    }
-    let mut index = 0;
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_uppercase() {
-            return false;
-        }
-        index += 1;
-        while index < bytes.len()
-            && (bytes[index].is_ascii_lowercase() || bytes[index].is_ascii_digit())
-        {
-            index += 1;
-        }
-    }
-    true
-}
-
-fn suggested_representable_name(identifier: &str) -> Option<String> {
-    let identifier = identifier.strip_prefix("r#").unwrap_or(identifier);
-    let compact = identifier
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect::<String>();
-    sai_identifier_to_wit_name(&compact).map(|_| compact)
 }
 
 fn declaration_name_location(
@@ -875,30 +811,5 @@ mod tests {
             result.diagnostics[0].related(),
             [Related::DeclaredHere { location, .. }] if location == &first_candidate.location
         ));
-    }
-
-    #[test]
-    fn conversion_follows_both_identifier_patterns_and_strips_raw_prefixes() {
-        assert_eq!(
-            sai_identifier_to_wit_name("fetch_user").as_deref(),
-            Some("fetch-user")
-        );
-        assert_eq!(
-            sai_identifier_to_wit_name("HTTPClient").as_deref(),
-            Some("h-t-t-p-client")
-        );
-        assert_eq!(
-            sai_identifier_to_wit_name("Ipv4Address").as_deref(),
-            Some("ipv4-address")
-        );
-        assert_eq!(
-            sai_identifier_to_wit_name("r#type").as_deref(),
-            Some("type")
-        );
-        assert_eq!(
-            suggested_representable_name("User_Id").as_deref(),
-            Some("UserId")
-        );
-        assert_eq!(sai_identifier_to_wit_name("_hidden"), None);
     }
 }
