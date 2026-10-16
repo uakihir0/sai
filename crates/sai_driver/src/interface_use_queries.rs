@@ -22,7 +22,7 @@ use sai_resolve::package_scopes::{
 };
 use sai_resolve::{InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
-use sai_ty::iface::interface_item_check;
+use sai_ty::iface::{InterfaceCheckIssue, interface_item_check};
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -215,6 +215,52 @@ impl InterfaceUsesQueries {
     }
 }
 
+fn append_interface_item_diagnostics(
+    issues: Vec<InterfaceCheckIssue>,
+    source_ref: &SourceRef,
+    source: &sai_vfs::SourceFile,
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), InterfaceUsesQueryError> {
+    for issue in issues {
+        let snapshot_file = snapshot.file(issue.span.file).ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::MissingSnapshotFile(issue.span.file),
+            )
+        })?;
+        let location = Location::from_decoded_source(
+            source_ref.clone(),
+            sai_diagnostics::Span::new(issue.span.file, issue.span.range),
+            source,
+        )
+        .ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),
+            )
+        })?;
+        let (message, primary_label) = match issue.code {
+            sai_diagnostics::Code::GenericInterfaceItem => (
+                "WIT interface items cannot have generic parameters or a `where` clause",
+                "generic interface item",
+            ),
+            sai_diagnostics::Code::WitEmptyType => (
+                "WIT interface types must not be empty",
+                "empty WIT interface type",
+            ),
+            _ => {
+                return Err(InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),
+                ));
+            }
+        };
+        let mut diagnostic = Diagnostic::new(issue.code, Severity::Error, message, Some(location));
+        diagnostic.primary_label = primary_label.to_owned();
+        diagnostic.package = snapshot_file.package().map(str::to_owned);
+        diagnostics.push(diagnostic);
+    }
+    Ok(())
+}
+
 fn collect_interface_uses_input(
     package_key: &PackageKey,
     prepared: &PreparedPhase1PackageScopes,
@@ -393,36 +439,13 @@ fn collect_interface_uses_input(
             )
             .map_err(OwnerControlFlowResolutionError::Lowering)
             .map_err(InterfaceUsesQueryError::Collection)?;
-            if let Some(issue) = interface_item_check(&member_hir) {
-                let snapshot_file = prepared.snapshot.file(issue.span.file).ok_or_else(|| {
-                    InterfaceUsesQueryError::Collection(
-                        OwnerControlFlowResolutionError::MissingSnapshotFile(issue.span.file),
-                    )
-                })?;
-                let location = Location::from_decoded_source(
-                    SourceRef {
-                        path: inputs.source_ref.path.clone(),
-                        package: inputs.source_ref.package.clone(),
-                        snapshot: inputs.source_ref.snapshot,
-                    },
-                    sai_diagnostics::Span::new(issue.span.file, issue.span.range),
-                    &inputs.source,
-                )
-                .ok_or_else(|| {
-                    InterfaceUsesQueryError::Collection(
-                        OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),
-                    )
-                })?;
-                let mut diagnostic = Diagnostic::new(
-                    issue.code,
-                    Severity::Error,
-                    "WIT interface types must not be empty",
-                    Some(location),
-                );
-                diagnostic.primary_label = "empty WIT interface type".to_owned();
-                diagnostic.package = snapshot_file.package().map(str::to_owned);
-                interface_check_diagnostics.push(diagnostic);
-            }
+            append_interface_item_diagnostics(
+                interface_item_check(&member_hir),
+                &inputs.source_ref,
+                &inputs.source,
+                &prepared.snapshot,
+                &mut interface_check_diagnostics,
+            )?;
             let kind = interface_member_kind(entry.kind).ok_or_else(|| {
                 InterfaceUsesQueryError::Collection(OwnerControlFlowResolutionError::Lowering(
                     sai_hir::lower::HirLoweringError::ItemTreeEntryMismatch,
@@ -506,6 +529,13 @@ fn collect_interface_uses_input(
                 )
                 .map_err(OwnerControlFlowResolutionError::Lowering)
                 .map_err(InterfaceUsesQueryError::Collection)?;
+                append_interface_item_diagnostics(
+                    interface_item_check(&method_hir),
+                    &inputs.source_ref,
+                    &inputs.source,
+                    &prepared.snapshot,
+                    &mut interface_check_diagnostics,
+                )?;
                 collect_owner_references(
                     &mut owner_references,
                     descriptor.owner.def_id,

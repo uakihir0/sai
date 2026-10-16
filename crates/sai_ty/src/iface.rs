@@ -12,20 +12,35 @@ pub struct InterfaceCheckIssue {
 
 /// Runs the interface-item checks implemented by `sai_ty`.
 ///
-/// This first vertical slice rejects empty records and enums. The driver
-/// converts the returned source span into a snapshot-bound diagnostic.
-pub fn interface_item_check(owner: &HirOwner<'_>) -> Option<InterfaceCheckIssue> {
+/// The driver converts each returned source span into a snapshot-bound
+/// diagnostic.
+pub fn interface_item_check(owner: &HirOwner<'_>) -> Vec<InterfaceCheckIssue> {
     let OwnerNode::InterfaceItem(item) = owner.node else {
-        return None;
+        return Vec::new();
     };
-    if !is_empty_wit_type(&item.kind) {
-        return None;
+    let mut issues = Vec::new();
+    if let Some(span) = item.generic_params_span {
+        issues.push(InterfaceCheckIssue {
+            owner: item.owner_id,
+            code: Code::GenericInterfaceItem,
+            span,
+        });
     }
-    Some(InterfaceCheckIssue {
-        owner: item.owner_id,
-        code: Code::WitEmptyType,
-        span: item.name.span,
-    })
+    if let Some(span) = item.where_clause_span {
+        issues.push(InterfaceCheckIssue {
+            owner: item.owner_id,
+            code: Code::GenericInterfaceItem,
+            span,
+        });
+    }
+    if is_empty_wit_type(&item.kind) {
+        issues.push(InterfaceCheckIssue {
+            owner: item.owner_id,
+            code: Code::WitEmptyType,
+            span: item.name.span,
+        });
+    }
+    issues
 }
 
 fn is_empty_wit_type(kind: &InterfaceItemKind<'_>) -> bool {

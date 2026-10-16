@@ -250,18 +250,16 @@ fn check_reports_empty_interface_records_and_enums() {
         ),
     )
     .expect("write package manifest");
-    fs::write(
-        source_directory.join("lib.sai"),
-        concat!(
-            "pub interface api {\n",
-            "    type EmptyRecord {}\n",
-            "    enum EmptyEnum {}\n",
-            "    type NonEmptyRecord { value: U32 }\n",
-            "    enum NonEmptyEnum { Ready }\n",
-            "}\n"
-        ),
-    )
-    .expect("write empty and nonempty interface types");
+    let source = concat!(
+        "pub interface api {\n",
+        "    type EmptyRecord {}\n",
+        "    enum EmptyEnum {}\n",
+        "    type NonEmptyRecord { value: U32 }\n",
+        "    enum NonEmptyEnum { Ready }\n",
+        "}\n"
+    );
+    fs::write(source_directory.join("lib.sai"), source)
+        .expect("write empty and nonempty interface types");
 
     let output = Command::new(env!("CARGO_BIN_EXE_sai"))
         .current_dir(package)
@@ -304,6 +302,96 @@ fn check_reports_empty_interface_records_and_enums() {
     );
     assert!(
         stdout.contains("\"type\":\"summary\",\"errors\":3,"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"stage\":0,\"feature\":\"sai check\""),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn check_reports_generic_interface_types_functions_and_resource_members_once() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    let source = concat!(
+        "pub interface api {\n",
+        "  type Box<T> where T: Copy { value: T }\n",
+        "  enum Choice<T> where T: Copy { Ready(T) }\n",
+        "  type Refined<T> = U32 where true\n",
+        "  fn invoke<T>() where T: Copy\n",
+        "  resource Handle {\n",
+        "    fn method<T>() where T: Copy\n",
+        "  }\n",
+        "  type Plain { value: U32 }\n",
+        "  fn plain()\n",
+        "}\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source).expect("write generic interface items");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let generic_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"GENERIC_INTERFACE_ITEM\""))
+        .collect::<Vec<_>>();
+    assert_eq!(generic_diagnostics.len(), 9, "{stdout}");
+    assert!(
+        generic_diagnostics.iter().all(|line| line.contains(
+            "\"message\":\"WIT interface items cannot have generic parameters or a `where` clause\""
+        )),
+        "{generic_diagnostics:?}"
+    );
+
+    let expected_spans = [
+        "<T>",
+        "where T: Copy",
+        "<T>",
+        "where T: Copy",
+        "<T>",
+        "<T>",
+        "where T: Copy",
+        "<T>",
+        "where T: Copy",
+    ];
+    let mut search_from = 0;
+    for (diagnostic, text) in generic_diagnostics.iter().zip(expected_spans) {
+        let start = source[search_from..]
+            .find(text)
+            .map(|relative| search_from + relative)
+            .expect("expected generic syntax appears after the previous span");
+        let end = start + text.len();
+        assert!(
+            diagnostic.contains(&format!("\"start\":{{\"byte\":{start},")),
+            "diagnostic should start at {text:?} ({start}): {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("\"end\":{{\"byte\":{end},")),
+            "diagnostic should end at {text:?} ({end}): {diagnostic}"
+        );
+        search_from = end;
+    }
+    assert!(
+        stdout.contains("\"type\":\"summary\",\"errors\":10,"),
         "{stdout}"
     );
     assert!(

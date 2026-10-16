@@ -27419,6 +27419,72 @@ mod tests {
     }
 
     #[test]
+    fn interface_check_reports_generic_lists_and_where_clauses_at_full_spans() {
+        let root = concat!(
+            "pub interface api {\n",
+            "  type Box<T> where T: Copy { value: T }\n",
+            "  enum Choice<T> where T: Copy { Ready(T) }\n",
+            "  type Refined<T> = U32 where true\n",
+            "  fn invoke<T>() where T: Copy\n",
+            "  resource Handle {\n",
+            "    fn method<T>() where T: Copy\n",
+            "  }\n",
+            "  type Plain { value: U32 }\n",
+            "  fn plain()\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let diagnostics = collection.interface_check_diagnostics();
+        assert_eq!(diagnostics.len(), 9, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::GenericInterfaceItem),
+            "{diagnostics:?}"
+        );
+
+        let mut spans = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let primary = diagnostic
+                    .primary()
+                    .expect("generic interface diagnostic has a primary location");
+                let start = primary.span.range.start().to_usize();
+                let end = primary.span.range.end().to_usize();
+                (
+                    start,
+                    root.get(start..end).expect("diagnostic span is in source"),
+                )
+            })
+            .collect::<Vec<_>>();
+        spans.sort_by_key(|(start, _)| *start);
+        assert_eq!(
+            spans.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+            [
+                "<T>",
+                "where T: Copy",
+                "<T>",
+                "where T: Copy",
+                "<T>",
+                "<T>",
+                "where T: Copy",
+                "<T>",
+                "where T: Copy",
+            ],
+            "generic diagnostics cover their complete syntax nodes and include refined aliases"
+        );
+    }
+
+    #[test]
     fn interface_use_resolution_prefers_interface_members_over_module_imports() {
         let root = concat!(
             "use b::Request\n",

@@ -2028,10 +2028,12 @@ mod tests {
     }
 
     #[test]
-    fn interface_function_heads_reject_generics_clauses_and_async() {
+    fn interface_function_heads_defer_generics_and_reject_other_clauses() {
+        use crate::ast::{AstNode, FnDecl};
+
         let source = concat!(
             "interface storage {\n",
-            "fn generic<T>()\n",
+            "fn generic<T>() where T: Copy\n",
             "fn precondition() requires true\n",
             "fn effectful() effects { alloc }\n",
             "async fn later()\n",
@@ -2048,7 +2050,6 @@ mod tests {
         assert_eq!(
             codes,
             [
-                Code::GenericInterfaceItem,
                 Code::InterfaceFnClause,
                 Code::EffectsOnInterfaceFn,
                 Code::FeatureNotImplemented,
@@ -2062,6 +2063,13 @@ mod tests {
                 .count(),
             4
         );
+        let generic = root
+            .descendants()
+            .filter_map(FnDecl::cast)
+            .next()
+            .expect("generic interface function remains in syntax");
+        assert!(generic.generic_params().is_some());
+        assert!(generic.where_clause().is_some());
         assert_eq!(root.green().text_len().to_usize(), source.len());
     }
 

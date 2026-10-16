@@ -326,6 +326,10 @@ pub struct InterfaceItem<'hir> {
     pub name: Name,
     pub kind: InterfaceItemKind<'hir>,
     pub span: Span,
+    /// Exact syntax range of this item's generic parameter list, when present.
+    pub generic_params_span: Option<Span>,
+    /// Exact syntax range of this item's `where` clause, when present.
+    pub where_clause_span: Option<Span>,
 }
 
 impl PartialEq for InterfaceItem<'_> {
@@ -829,6 +833,8 @@ mod tests {
                 fields: &[],
             },
             span: span(5),
+            generic_params_span: None,
+            where_clause_span: None,
         };
         let interface_item_right = InterfaceItem {
             name: name(&ids, 60),
@@ -1139,6 +1145,8 @@ mod tests {
             name: name(&ids, 1),
             kind: interface_kinds[6],
             span: span(0),
+            generic_params_span: None,
+            where_clause_span: None,
         });
         let extern_item = arena.alloc_extern_item(ExternItem {
             owner_id: ids.owner,

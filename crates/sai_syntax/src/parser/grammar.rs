@@ -161,6 +161,7 @@ enum FnBodyPolicy {
     Required,
     Optional,
     Forbidden,
+    ForbiddenInterface,
     Extern,
 }
 
@@ -894,7 +895,7 @@ impl Parser<'_, '_> {
             return Ok(());
         }
         if self.at_fn_decl_start() {
-            self.fn_decl(declaration, FnBodyPolicy::Forbidden)?;
+            self.fn_decl(declaration, FnBodyPolicy::ForbiddenInterface)?;
             return Ok(());
         }
 
@@ -1032,7 +1033,7 @@ impl Parser<'_, '_> {
             visibility.complete(self, SyntaxKind::ERROR)?;
         }
         if self.at_fn_decl_start() {
-            self.fn_decl(declaration, FnBodyPolicy::Forbidden)?;
+            self.fn_decl(declaration, FnBodyPolicy::ForbiddenInterface)?;
             return Ok(());
         }
 
@@ -3221,8 +3222,10 @@ impl Parser<'_, '_> {
         self.eat(SyntaxKind::ASYNC_KW);
         self.expect(SyntaxKind::FN_KW)?;
         self.name_node(&[SyntaxKind::LIDENT], SyntaxKind::NAME)?;
-        if matches!(body_policy, FnBodyPolicy::Forbidden | FnBodyPolicy::Extern)
-            && let Some(range) = async_range
+        if matches!(
+            body_policy,
+            FnBodyPolicy::Forbidden | FnBodyPolicy::ForbiddenInterface | FnBodyPolicy::Extern
+        ) && let Some(range) = async_range
         {
             self.emit_staged_feature_diagnostic(
                 range,
@@ -3231,8 +3234,10 @@ impl Parser<'_, '_> {
                 "async functions in interfaces, worlds, and extern blocks require Stage 5",
             )?;
         }
-        if body_policy == FnBodyPolicy::Forbidden
-            && let Some(range) = unsafe_range
+        if matches!(
+            body_policy,
+            FnBodyPolicy::Forbidden | FnBodyPolicy::ForbiddenInterface
+        ) && let Some(range) = unsafe_range
         {
             self.emit_parser_diagnostic(
                 sai_diagnostics::Code::InterfaceFnClause,
@@ -3261,7 +3266,12 @@ impl Parser<'_, '_> {
             self.ret_type()?;
         }
 
-        if let Err(error) = self.fn_clauses(body_policy == FnBodyPolicy::Forbidden) {
+        let interface_function = matches!(
+            body_policy,
+            FnBodyPolicy::Forbidden | FnBodyPolicy::ForbiddenInterface
+        );
+        let report_generic_clause = body_policy == FnBodyPolicy::Forbidden;
+        if let Err(error) = self.fn_clauses(interface_function, report_generic_clause) {
             declaration.abandon(self)?;
             return Err(error);
         }
@@ -3270,7 +3280,7 @@ impl Parser<'_, '_> {
             self.eat_nl();
         }
         if self.at(SyntaxKind::L_BRACE) {
-            if body_policy == FnBodyPolicy::Forbidden {
+            if interface_function {
                 let range = self
                     .current_token()
                     .map(|token| token.range)
@@ -3298,7 +3308,10 @@ impl Parser<'_, '_> {
                     return Err(error);
                 }
             };
-            if matches!(body_policy, FnBodyPolicy::Forbidden | FnBodyPolicy::Extern) {
+            if matches!(
+                body_policy,
+                FnBodyPolicy::Forbidden | FnBodyPolicy::ForbiddenInterface | FnBodyPolicy::Extern
+            ) {
                 body.precede(self).complete(self, SyntaxKind::ERROR)?;
             }
         } else if body_policy == FnBodyPolicy::Required {
@@ -3308,7 +3321,11 @@ impl Parser<'_, '_> {
         declaration.complete(self, SyntaxKind::FN_DECL)
     }
 
-    fn fn_clauses(&mut self, interface_function: bool) -> Result<(), ParserError> {
+    fn fn_clauses(
+        &mut self,
+        interface_function: bool,
+        report_generic_clause: bool,
+    ) -> Result<(), ParserError> {
         let mut last_rank = 0;
         let mut seen_where = false;
         let mut seen_borrows = false;
@@ -3334,7 +3351,10 @@ impl Parser<'_, '_> {
                 break;
             };
             let range = self.current_token().map(|token| token.range);
-            if interface_function && let Some(range) = range {
+            if interface_function
+                && (!matches!(kind, FnClauseKind::Where) || report_generic_clause)
+                && let Some(range) = range
+            {
                 let (code, message) = match kind {
                     FnClauseKind::Where => (
                         sai_diagnostics::Code::GenericInterfaceItem,
