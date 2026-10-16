@@ -822,6 +822,14 @@ existing type, function, and const diagnostics. Locked CLI coverage exercises
 transitive re-export paths from invariant/refined predicates and an extern
 signature; the command remains incomplete.
 
+**Trait/impl header type-path member diagnostics (IR-576).** The closure-aware
+trait and impl header adapter maps typed private and missing member failures
+through the same snapshot-aware mapper. `TraitImplHeaderResolution` exposes a
+separate optional channel, leaving package-local path resolution and existing
+test-only results unchanged. `sai check` collects diagnostics from trait and
+impl headers alongside the previously mapped owner families; associated
+members remain a separate follow-up.
+
 **Qualified missing-member diagnostics (IR-545).** The module path walker
 retains the exact `ModuleTarget` when a member is missing. The driver emits a
 snapshot-bound `UNRESOLVED_NAME` at that segment with the canonical package
