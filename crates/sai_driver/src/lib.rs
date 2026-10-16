@@ -1775,6 +1775,7 @@ pub struct WorldTestOnlyResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<WorldOwnerTestOnlyResolution>,
 }
 
@@ -1791,6 +1792,20 @@ impl WorldTestOnlyResolutions {
         self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.member_scope_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -9287,6 +9302,38 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_world_test_only_paths_inner(collection, module_tree, snapshot, None)
+    }
+
+    /// Resolves world function signature type paths through a validated
+    /// active-source member-scope closure.
+    pub fn resolve_world_test_only_paths_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_world_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_world_test_only_paths_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -9301,8 +9348,22 @@ impl RootDatabase {
             .copied()
             .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
             .collect::<Vec<_>>();
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let mut owners = Vec::with_capacity(descriptors.len());
 
@@ -9603,6 +9664,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -20855,7 +20918,15 @@ mod tests {
             &[
                 (
                     "lib.sai",
-                    b"use acme:middle as middle\n\
+                    b"world included_world {}\n\
+                      world foreign_world {\n\
+                        import fn transitive_import(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType\n\
+                        export fn transitive_export(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType\n\
+                        import middle.api\n\
+                        export middle.api\n\
+                        include included_world\n\
+                      }\n\
+                      use acme:middle as middle\n\
                       use acme:check/local as local\n\
                       use acme:check/local.{Array}\n\
                       use acme:leaf/model as leaf_model\n\
@@ -20900,7 +20971,8 @@ mod tests {
                 ),
                 (
                     "local.sai",
-                    b"pub type LocalType = U32\npub type Array = U32\n",
+                    b"pub type LocalType = U32\n\
+                      pub type Array = U32\n",
                 ),
             ],
         );
@@ -22324,6 +22396,102 @@ mod tests {
             &source_text[resource_method_line_start..resource_method_line_end],
             resource_method_line_start,
         );
+
+        let world_source_file = root_tree.modules[0].file;
+        let world_source_text = source_text;
+        let world_parsed = database
+            .parse_file(&snapshot, world_source_file)
+            .expect("root world source parses");
+        let world_start = world_source_text
+            .find("world included_world")
+            .expect("world fixture source exists");
+        let following_item_start = world_source_text
+            .find("use acme:middle as middle")
+            .expect("package imports follow the world fixture");
+        assert!(
+            world_parsed.errors.iter().all(|diagnostic| {
+                diagnostic.primary().is_none_or(|primary| {
+                    let start = primary.span.range.start().to_usize();
+                    start < world_start || start >= following_item_start
+                })
+            }),
+            "the transitive world fixture parses without diagnostics: {:?}",
+            world_parsed.errors
+        );
+        let world_results = database
+            .resolve_world_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("world function signatures resolve through transitive member scopes");
+        assert!(world_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            world_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_world_test_only_paths_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(world_results.owners().len(), 2);
+        let foreign_world = &world_results.owners()[1];
+        assert!(foreign_world.error().is_none());
+        assert_eq!(
+            foreign_world
+                .items()
+                .iter()
+                .map(WorldItemTestOnlyResolution::kind)
+                .collect::<Vec<_>>(),
+            [
+                WorldItemTestOnlyKind::Import,
+                WorldItemTestOnlyKind::Export,
+                WorldItemTestOnlyKind::Import,
+                WorldItemTestOnlyKind::Export,
+                WorldItemTestOnlyKind::Include,
+            ]
+        );
+        for item_index in [0, 1] {
+            let item_paths = foreign_world.items()[item_index]
+                .type_path_resolution()
+                .expect("world function type path result succeeds")
+                .expect("world function signature has a type path result");
+            let method_name = if item_index == 0 {
+                "fn transitive_import"
+            } else {
+                "fn transitive_export"
+            };
+            let method_start = world_source_text
+                .find(method_name)
+                .expect("transitive world function source exists");
+            let method_line_start = world_source_text[..method_start]
+                .rfind('\n')
+                .map_or(0, |index| index + 1);
+            let method_line_end = world_source_text[method_start..]
+                .find('\n')
+                .map_or(world_source_text.len(), |index| method_start + index);
+            assert_foreign_predicate_paths(
+                item_paths,
+                &world_source_text[method_line_start..method_line_end],
+                method_line_start,
+            );
+        }
+        for item in &foreign_world.items()[2..] {
+            assert!(
+                item.type_path_resolution()
+                    .expect("world module/interface/include path result succeeds")
+                    .is_none(),
+                "module, interface, and include references stay in the world namespace"
+            );
+        }
 
         let changed_graph = PackageGraph::new(
             Version::parse("1.8.3").expect("changed toolchain version is valid"),
