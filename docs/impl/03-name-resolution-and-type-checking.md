@@ -897,6 +897,14 @@ typed path errors. The shared resolver's world-item call still has no member
 index, so world module, interface, and include paths keep their separate
 namespace behavior. Foreign scopes and WIT members stay deferred.
 
+**Qualified local world signature prefixes (IR-563).** Import and export
+function type paths continue through current-package module and interface
+members. Only function-signature candidates receive this type lookup; world
+module, interface, and include references remain in their own namespace.
+Stop at the first non-module member, retain the full path length and
+type-relative suffix, and keep missing local members as typed path errors.
+Foreign scopes and WIT members stay deferred.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
