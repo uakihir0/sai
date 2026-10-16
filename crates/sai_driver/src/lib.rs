@@ -2265,6 +2265,7 @@ pub struct PredicateOwnerResolution {
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
@@ -2310,6 +2311,19 @@ impl PredicateOwnerResolution {
         self.type_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns snapshot-bound type member diagnostics for predicate owners
+    /// analyzed with a validated active-source member-scope closure.
+    ///
+    /// Package-local adapters leave this channel absent so callers can keep
+    /// mapping their typed path errors with their own snapshot context.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     /// Returns rejected non-expression paths, such as types, effects, and
@@ -7395,6 +7409,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -7620,12 +7635,32 @@ impl RootDatabase {
                         Err(error),
                     )
                 });
+                let module_path_diagnostics =
+                    match (member_scopes, type_path_resolution.as_ref()) {
+                        (Some(member_scopes), Ok(Some(path_resolution))) => Some(
+                            self.type_owner_module_path_diagnostics(
+                                descriptor.owner,
+                                path_resolution,
+                                &inputs,
+                                Some(&module_members),
+                                snapshot,
+                                &collection.target_cfg,
+                                Some(member_scopes),
+                            )
+                            .map(Some),
+                        ),
+                        (Some(_), Err(error)) => Some(Err(error.clone())),
+                        (Some(_), Ok(None)) => Some(Ok(Some(Vec::new()))),
+                        (None, _) => None,
+                    }
+                    .unwrap_or(Ok(None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -7734,6 +7769,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -8010,12 +8046,32 @@ impl RootDatabase {
                         Err(error),
                     )
                 });
+                let module_path_diagnostics =
+                    match (member_scopes, type_path_resolution.as_ref()) {
+                        (Some(member_scopes), Ok(Some(path_resolution))) => Some(
+                            self.type_owner_module_path_diagnostics(
+                                descriptor.owner,
+                                path_resolution,
+                                &inputs,
+                                Some(&module_members),
+                                snapshot,
+                                &collection.target_cfg,
+                                Some(member_scopes),
+                            )
+                            .map(Some),
+                        ),
+                        (Some(_), Err(error)) => Some(Err(error.clone())),
+                        (Some(_), Ok(None)) => Some(Ok(Some(Vec::new()))),
+                        (None, _) => None,
+                    }
+                    .unwrap_or(Ok(None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -8122,6 +8178,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -8350,12 +8407,32 @@ impl RootDatabase {
                     test_only_diagnostics.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let type_path_resolution =
                     type_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let module_path_diagnostics =
+                    match (member_scopes, type_path_resolution.as_ref()) {
+                        (Some(member_scopes), Ok(Some(path_resolution))) => Some(
+                            self.type_owner_module_path_diagnostics(
+                                descriptor.owner,
+                                path_resolution,
+                                &inputs,
+                                Some(&module_members),
+                                snapshot,
+                                &collection.target_cfg,
+                                Some(member_scopes),
+                            )
+                            .map(Some),
+                        ),
+                        (Some(_), Err(error)) => Some(Err(error.clone())),
+                        (Some(_), Ok(None)) => Some(Ok(Some(Vec::new()))),
+                        (None, _) => None,
+                    }
+                    .unwrap_or(Ok(None));
                 owners.push(PredicateOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -21052,9 +21129,24 @@ mod tests {
                       type FromPrimitive = U32\n\
                       type GenericPrimitive<U32> = U32\n\
                       type FromModule = Array\n\
-                      invariant U32 { { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true } }\n\
-                      type ForeignRefined = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
-                      distinct ForeignDistinct = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
+                      invariant U32 { {\n\
+                        let public: middle.api.PublicType = 0\n\
+                        let private: leaf_model.PrivateType = 0\n\
+                        let missing: middle.api.PublicTypo = 0\n\
+                        true\n\
+                      } }\n\
+                      type ForeignRefined = U32 where {\n\
+                        let public: middle.api.PublicType = 0\n\
+                        let private: leaf_model.PrivateType = 0\n\
+                        let missing: middle.api.PublicTypo = 0\n\
+                        true\n\
+                      }\n\
+                      distinct ForeignDistinct = U32 where {\n\
+                        let public: middle.api.PublicType = 0\n\
+                        let private: leaf_model.PrivateType = 0\n\
+                        let missing: middle.api.PublicTypo = 0\n\
+                        true\n\
+                      }\n\
                       trait ForeignHeader<Public: middle.api.PublicType, Private: leaf_model.PrivateType, Missing: middle.api.PublicTypo> {\n\
                         type ForeignAssociated: middle.api.PublicType\n\
                         fn foreign_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo)\n\
@@ -21974,6 +22066,63 @@ mod tests {
                 ));
             };
 
+        let assert_predicate_path_diagnostics =
+            |owner: &PredicateOwnerResolution, source: &str, source_offset: usize| {
+                let diagnostics = owner
+                    .module_path_diagnostics()
+                    .expect("predicate type member diagnostics resolve")
+                    .expect("the closure-aware predicate adapter maps member failures");
+                assert_eq!(diagnostics.len(), 2);
+                let private_span = member_range(
+                    source,
+                    source_offset,
+                    "leaf_model.PrivateType",
+                    "PrivateType",
+                );
+                let missing_span =
+                    member_range(source, source_offset, "middle.api.PublicTypo", "PublicTypo");
+                let private = diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::PrivateItem)
+                    .expect("private predicate type becomes PRIVATE_ITEM");
+                assert_eq!(
+                    private.primary().map(|location| &location.span),
+                    Some(&sai_diagnostics::Span::new(
+                        root_tree.modules[0].file,
+                        private_span
+                    ))
+                );
+                assert!(
+                    private.related().iter().any(|related| matches!(
+                        related,
+                        Related::DeclaredHere { location, .. }
+                            if location.span == sai_diagnostics::Span::new(
+                                private_const_declaration_span.file,
+                                private_const_declaration_span.range
+                            )
+                    )),
+                    "predicate private diagnostics retain the foreign declaration location"
+                );
+                let missing = diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnresolvedName)
+                    .expect("missing predicate type becomes UNRESOLVED_NAME");
+                assert_eq!(
+                    missing.primary().map(|location| &location.span),
+                    Some(&sai_diagnostics::Span::new(
+                        root_tree.modules[0].file,
+                        missing_span
+                    ))
+                );
+                assert_eq!(
+                    missing.data.get("candidates"),
+                    Some(&sai_diagnostics::Value::Array(vec![
+                        sai_diagnostics::Value::String("PublicType".to_owned())
+                    ])),
+                    "predicate suggestions use the visible transitive target members"
+                );
+            };
+
         let header_results = database
             .resolve_trait_impl_header_test_only_paths_with_member_scopes(
                 &root_collection,
@@ -22248,6 +22397,11 @@ mod tests {
             &source_text[extern_line_start..extern_line_end],
             extern_line_start,
         );
+        assert_predicate_path_diagnostics(
+            &extern_results.owners()[0],
+            &source_text[extern_line_start..extern_line_end],
+            extern_line_start,
+        );
 
         let invariant_results = database
             .resolve_invariant_owner_predicates_with_member_scopes(
@@ -22277,16 +22431,36 @@ mod tests {
         let invariant_start = source_text
             .find("invariant U32")
             .expect("foreign invariant appears in the root source");
-        let invariant_end = source_text[invariant_start..]
-            .find('\n')
-            .expect("foreign invariant has a line ending")
-            + invariant_start;
-        let invariant_source = &source_text[invariant_start..invariant_end];
+        let refinement_start = source_text
+            .find("type ForeignRefined")
+            .expect("foreign refined type appears in the root source");
+        let distinct_start = source_text
+            .find("distinct ForeignDistinct")
+            .expect("foreign refinement-bearing distinct appears in the root source");
+        let trait_start = source_text
+            .find("trait ForeignHeader")
+            .expect("foreign trait follows the predicate owners");
+        let invariant_source = &source_text[invariant_start..refinement_start];
         let invariant_paths = invariant_results.owners()[0]
             .type_path_resolution()
             .expect("invariant type path result succeeds")
             .expect("invariant has a type path result");
         assert_foreign_predicate_paths(invariant_paths, invariant_source, invariant_start);
+        assert_predicate_path_diagnostics(
+            &invariant_results.owners()[0],
+            invariant_source,
+            invariant_start,
+        );
+        let package_local_invariants = database
+            .resolve_invariant_owner_predicates(&root_collection, &root_tree, &snapshot)
+            .expect("package-local invariant analysis remains available");
+        assert!(
+            package_local_invariants.owners()[0]
+                .module_path_diagnostics()
+                .expect("package-local diagnostic channel remains healthy")
+                .is_none(),
+            "package-local callers receive no snapshot-bound mapped diagnostics"
+        );
 
         let refinement_results = database
             .resolve_refinement_owner_predicates_with_member_scopes(
@@ -22313,19 +22487,17 @@ mod tests {
             )) if key.as_str() == "acme:middle#1"
         ));
         assert_eq!(refinement_results.owners().len(), 2);
-        let refinement_start = source_text
-            .find("type ForeignRefined")
-            .expect("foreign refined type appears in the root source");
-        let refinement_end = source_text[refinement_start..]
-            .find('\n')
-            .expect("foreign refined type has a line ending")
-            + refinement_start;
-        let refinement_source = &source_text[refinement_start..refinement_end];
+        let refinement_source = &source_text[refinement_start..distinct_start];
         let refinement_paths = refinement_results.owners()[0]
             .type_path_resolution()
             .expect("refinement type path result succeeds")
             .expect("refined type has a type path result");
         assert_foreign_predicate_paths(refinement_paths, refinement_source, refinement_start);
+        assert_predicate_path_diagnostics(
+            &refinement_results.owners()[0],
+            refinement_source,
+            refinement_start,
+        );
         let distinct_index = refinement_results
             .owners()
             .iter()
@@ -22340,19 +22512,17 @@ mod tests {
                     })
             })
             .expect("refinement results include the refinement-bearing distinct owner");
-        let distinct_start = source_text
-            .find("distinct ForeignDistinct")
-            .expect("foreign refinement-bearing distinct appears in the root source");
-        let distinct_end = source_text[distinct_start..]
-            .find('\n')
-            .expect("foreign distinct has a line ending")
-            + distinct_start;
-        let distinct_source = &source_text[distinct_start..distinct_end];
+        let distinct_source = &source_text[distinct_start..trait_start];
         let distinct_paths = refinement_results.owners()[distinct_index]
             .type_path_resolution()
             .expect("distinct type path result succeeds")
             .expect("refinement-bearing distinct has a type path result");
         assert_foreign_predicate_paths(distinct_paths, distinct_source, distinct_start);
+        assert_predicate_path_diagnostics(
+            &refinement_results.owners()[distinct_index],
+            distinct_source,
+            distinct_start,
+        );
 
         let results = database
             .resolve_type_owner_paths_with_member_scopes(

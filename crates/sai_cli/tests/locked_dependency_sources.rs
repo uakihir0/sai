@@ -267,6 +267,17 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         "  public: middle.api.PublicType\n",
         "}\n",
         "type RootTypo = middle.api.PublicTypo\n",
+        "invariant RootInvariant { {\n",
+        "  let missing: middle.api.PublicTypo = 0\n",
+        "  true\n",
+        "} }\n",
+        "type RootRefined = U32 where {\n",
+        "  let missing: middle.api.PublicTypo = 0\n",
+        "  true\n",
+        "}\n",
+        "unsafe extern \"wasm\" module \"env\" {\n",
+        "  fn transitive_extern(missing: middle.api.PublicTypo)\n",
+        "}\n",
     );
     fs::write(root.join("src/lib.sai"), root_source).expect("write root source");
     fs::write(
@@ -291,6 +302,21 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             "}\n",
             "const MIDDLE_CONST: leaf_model.PrivateType = { let nested: leaf_model.PublicTypo = 0; 0 }\n",
             "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
+            "invariant U32 { {\n",
+            "  let private: leaf_model.PrivateType = 0\n",
+            "  let missing: leaf_model.PublicTypo = 0\n",
+            "  true\n",
+            "} }\n",
+            "type MiddleRefined = U32 where {\n",
+            "  let private: leaf_model.PrivateType = 0\n",
+            "  let missing: leaf_model.PublicTypo = 0\n",
+            "  true\n",
+            "}\n",
+            "distinct MiddleDistinct = U32 where {\n",
+            "  let private: leaf_model.PrivateType = 0\n",
+            "  let missing: leaf_model.PublicTypo = 0\n",
+            "  true\n",
+            "}\n",
         ),
     )
     .expect("write middle package scopes and type owner");
@@ -358,7 +384,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"PRIVATE_ITEM\""))
         .collect::<Vec<_>>();
-    assert_eq!(private_diagnostics.len(), 4, "{stdout}");
+    assert_eq!(private_diagnostics.len(), 7, "{stdout}");
     let middle_source = concat!(
         "use acme:leaf/model as leaf_model\n",
         "pub use acme:leaf.{api}\n",
@@ -369,6 +395,21 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         "}\n",
         "const MIDDLE_CONST: leaf_model.PrivateType = { let nested: leaf_model.PublicTypo = 0; 0 }\n",
         "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
+        "invariant U32 { {\n",
+        "  let private: leaf_model.PrivateType = 0\n",
+        "  let missing: leaf_model.PublicTypo = 0\n",
+        "  true\n",
+        "} }\n",
+        "type MiddleRefined = U32 where {\n",
+        "  let private: leaf_model.PrivateType = 0\n",
+        "  let missing: leaf_model.PublicTypo = 0\n",
+        "  true\n",
+        "}\n",
+        "distinct MiddleDistinct = U32 where {\n",
+        "  let private: leaf_model.PrivateType = 0\n",
+        "  let missing: leaf_model.PublicTypo = 0\n",
+        "  true\n",
+        "}\n",
     );
     let reference_start = middle_source
         .find("PrivateType")
@@ -517,7 +558,63 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
         .collect::<Vec<_>>();
-    assert_eq!(unresolved_diagnostics.len(), 6, "{stdout}");
+    assert_eq!(unresolved_diagnostics.len(), 12, "{stdout}");
+    for (owner_name, owner_source) in [
+        ("invariant", "invariant U32"),
+        ("refined type", "type MiddleRefined"),
+        ("refinement-bearing distinct", "distinct MiddleDistinct"),
+    ] {
+        let owner_start = middle_source
+            .find(owner_source)
+            .unwrap_or_else(|| panic!("{owner_name} source exists"));
+        let owner_source = &middle_source[owner_start..];
+        let private_start = owner_start
+            + owner_source
+                .find("PrivateType")
+                .unwrap_or_else(|| panic!("{owner_name} has a private type path"));
+        let missing_start = owner_start
+            + owner_source
+                .find("PublicTypo")
+                .unwrap_or_else(|| panic!("{owner_name} has a missing type path"));
+        assert_eq!(
+            private_diagnostics
+                .iter()
+                .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{private_start},")))
+                .count(),
+            1,
+            "{owner_name} private path is reported exactly once: {stdout}"
+        );
+        let private = private_diagnostics
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{private_start},")))
+            .unwrap_or_else(|| panic!("{owner_name} private type diagnostic is present"));
+        assert!(
+            private.contains("\"package\":\"acme:middle@1.0.0\"")
+                && private.contains("\"what\":\"private member declared here\"")
+                && private.contains(
+                    "\"path\":\"dep:acme:leaf@1.0.0/src/model.sai\",\"package\":\"acme:leaf@1.0.0\""
+                ),
+            "{private}"
+        );
+        assert_eq!(
+            unresolved_diagnostics
+                .iter()
+                .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{missing_start},")))
+                .count(),
+            1,
+            "{owner_name} missing path is reported exactly once: {stdout}"
+        );
+        let missing = unresolved_diagnostics
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{missing_start},")))
+            .unwrap_or_else(|| panic!("{owner_name} missing type diagnostic is present"));
+        assert!(
+            missing.contains("\"package\":\"acme:middle@1.0.0\"")
+                && missing.contains("no item `PublicTypo` in module `acme:leaf@1.0.0/model`")
+                && missing.contains("\"candidates\":[\"PublicType\"]"),
+            "{missing}"
+        );
+    }
     let missing_start = middle_source
         .find("PublicTypo")
         .expect("missing reference exists");
@@ -563,6 +660,40 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         root_missing.contains("similar names: `PublicType`, `PublicTypoC`, `PublicTypoB`"),
         "the help child preserves the same ordered, capped candidates: {root_missing}"
     );
+    for (owner_name, owner_source) in [
+        ("invariant", "invariant RootInvariant"),
+        ("refined type", "type RootRefined"),
+        ("extern function", "transitive_extern"),
+    ] {
+        let owner_start = root_source
+            .find(owner_source)
+            .unwrap_or_else(|| panic!("{owner_name} source exists"));
+        let path_start = owner_start
+            + root_source[owner_start..]
+                .find("middle.api.PublicTypo")
+                .unwrap_or_else(|| panic!("{owner_name} has a transitive missing path"))
+            + "middle.api.".len();
+        assert_eq!(
+            unresolved_diagnostics
+                .iter()
+                .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{path_start},")))
+                .count(),
+            1,
+            "{owner_name} transitive path is reported exactly once: {stdout}"
+        );
+        let diagnostic = unresolved_diagnostics
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{path_start},")))
+            .unwrap_or_else(|| panic!("{owner_name} transitive path diagnostic is present"));
+        assert!(
+            diagnostic.contains("\"package\":\"acme:check@0.1.0\"")
+                && diagnostic.contains("\"path\":\"src/lib.sai\"")
+                && diagnostic.contains("no item `PublicTypo` in module `acme:leaf@1.0.0/api`")
+                && diagnostic
+                    .contains("\"candidates\":[\"PublicType\",\"PublicTypoC\",\"PublicTypoB\"]"),
+            "{diagnostic}"
+        );
+    }
     let function_missing_start = function_start
         + function_signature
             .rfind("PublicTypo")
