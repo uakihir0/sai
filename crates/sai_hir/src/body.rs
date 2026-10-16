@@ -1,7 +1,7 @@
 use crate::expressions::Expr;
 use crate::source_map::HirSourceId;
 use crate::types::{EffectRef, Name, Provenance, Ty};
-use crate::{BindingId, HirId, OwnerId, Safety};
+use crate::{BindingId, HirId, OwnerId, Safety, Span};
 use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -16,13 +16,36 @@ pub struct FnSig<'hir> {
     pub ensures: &'hir [HirId],
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct FnParam<'hir> {
     pub hir_id: HirId,
     pub name: Option<Name>,
     pub is_self: bool,
     pub mutable: bool,
     pub ty: &'hir Ty<'hir>,
+    pub span: Span,
+}
+
+impl PartialEq for FnParam<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hir_id == other.hir_id
+            && self.name == other.name
+            && self.is_self == other.is_self
+            && self.mutable == other.mutable
+            && self.ty == other.ty
+    }
+}
+
+impl Eq for FnParam<'_> {}
+
+impl Hash for FnParam<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hir_id.hash(state);
+        self.name.hash(state);
+        self.is_self.hash(state);
+        self.mutable.hash(state);
+        self.ty.hash(state);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,7 +164,25 @@ mod tests {
             is_self: false,
             mutable: true,
             ty: &ty,
+            span: span(2),
         };
+        let shifted_span_param = FnParam {
+            span: span(15),
+            ..param
+        };
+        assert_eq!(
+            param, shifted_span_param,
+            "source ranges do not change function-signature equality"
+        );
+        let mut original_param_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&param, &mut original_param_hasher);
+        let mut shifted_param_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&shifted_span_param, &mut shifted_param_hasher);
+        assert_eq!(
+            original_param_hasher.finish(),
+            shifted_param_hasher.finish(),
+            "source ranges do not change function-signature hashing"
+        );
         let params = [param];
         let sig = FnSig {
             safety: Safety::Unsafe,

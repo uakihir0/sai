@@ -746,6 +746,8 @@ Each `Err` is `WIT_INCOMPATIBLE_TYPE`, one per top-level position. `world_check`
 
 A name that does not match the patterns there is `WIT_NAME_NOT_REPRESENTABLE` at the name, with the suggested name of spec/13 §13.8.4 when one exists. A WIT keyword is not an error; it is printed with `%`. A parameter without a name (a pattern parameter or `_`) is `WIT_NAME_NOT_REPRESENTABLE` at the parameter.
 
+The current SAI subset rejects record-shaped variant payloads as a whole (§16.6.1). Until those payloads are supported, report that unsupported payload without separate name findings for its fields.
+
 ### 16.6.4 WIT names and collisions
 
 `WIT_NAME_COLLISION` is reported when two distinct entities of one scope have the same WIT name. It is reported at the later entity in generation order, with a note at the earlier one. Two entities with equal SAI names in one SAI scope are already `DUPLICATE_BINDING` (spec/04 §4.4.3) or `WORLD_DUPLICATE_ITEM` (§16.8.3) and are not reported again. The scopes are those of spec/13 §13.8.5, plus one more:

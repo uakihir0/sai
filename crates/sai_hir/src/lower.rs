@@ -5513,7 +5513,7 @@ fn lower_function_param<'hir>(
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
 ) -> Result<(FnParam<'hir>, PendingBodyParam), HirLoweringError> {
-    let (hir_id, _) = source_map.add_node_with_span(param.syntax(), SpanCtxt::Root)?;
+    let (hir_id, span) = source_map.add_node_with_span(param.syntax(), SpanCtxt::Root)?;
     let (name, binding_syntax, is_self, mutable) = match &param {
         FunctionParamSyntax::Param(param) => {
             let source_name = param.name();
@@ -5565,6 +5565,7 @@ fn lower_function_param<'hir>(
         is_self,
         mutable,
         ty,
+        span,
     };
     let body_param = PendingBodyParam {
         syntax: param.syntax().clone(),
@@ -20085,10 +20086,8 @@ mod tests {
     #[test]
     fn lowers_function_signature_parameters_and_body() {
         let file = crate::FileId::new(208);
-        let (snapshot, parsed, ast_ids) = parse_file(
-            file,
-            "unsafe fn f(var x: I32, _: U8, var self: Self) -> (I32, U8) borrows {x.field, self.field} effects {io, net.http} { x }\n",
-        );
+        let source = "unsafe fn f(var x: I32, _: U8, var self: Self) -> (I32, U8) borrows {x.field, self.field} effects {io, net.http} { x }\n";
+        let (snapshot, parsed, ast_ids) = parse_file(file, source);
         assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
         let function = function_node(&parsed.root);
         let declaration = ast::FnDecl::cast(function.clone()).expect("function declaration");
@@ -20105,6 +20104,19 @@ mod tests {
         assert_eq!(signature.safety, Safety::Unsafe);
         assert!(!signature.is_async);
         assert_eq!(signature.params.len(), 3);
+        for (param, expected) in
+            signature
+                .params
+                .iter()
+                .zip(["var x: I32", "_: U8", "var self: Self"])
+        {
+            assert_eq!(param.span.file, file);
+            assert_eq!(
+                &source[param.span.range.start().to_usize()..param.span.range.end().to_usize()],
+                expected,
+                "parameter HIR retains its full source range"
+            );
+        }
         assert_eq!(
             signature.params[0].name.map(|name| {
                 symbols

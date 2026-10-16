@@ -235,6 +235,136 @@ fn check_reports_package_wit_name_collisions_and_counts_them() {
 }
 
 #[test]
+fn check_reports_unrepresentable_interface_names_and_accepts_raw_keyword_names() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    let source = concat!(
+        "pub interface api {\n",
+        "  type User_Id = U32\n",
+        "  type Record { bad__field: U32 }\n",
+        "  enum Kind { Bad_Case }\n",
+        "  fn run__task(value__name: U32, _: U32)\n",
+        "  resource Handle {\n",
+        "    fn get__value(self: borrow Self, input__value: U32)\n",
+        "  }\n",
+        "  fn r#type()\n",
+        "}\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source)
+        .expect("write interface with boundary names");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let name_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_NAME_NOT_REPRESENTABLE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(name_diagnostics.len(), 8, "{stdout}");
+
+    for (name, suggestion) in [
+        ("User_Id", "UserId"),
+        ("bad__field", "badfield"),
+        ("Bad_Case", "BadCase"),
+        ("run__task", "runtask"),
+        ("value__name", "valuename"),
+        ("get__value", "getvalue"),
+        ("input__value", "inputvalue"),
+    ] {
+        let diagnostic = name_diagnostics
+            .iter()
+            .find(|line| line.contains(&format!("\"suggestion\":\"{suggestion}\"")))
+            .unwrap_or_else(|| panic!("missing suggestion for {name}:\n{stdout}"));
+        let start = source
+            .find(name)
+            .unwrap_or_else(|| panic!("fixture name {name} is present"));
+        let end = start + name.len();
+        assert!(
+            diagnostic.contains(&format!("\"start\":{{\"byte\":{start},")),
+            "diagnostic for {name} should start at byte {start}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("\"end\":{{\"byte\":{end},")),
+            "diagnostic for {name} should end at byte {end}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("\"path\":\"src/lib.sai\""),
+            "diagnostic for {name} should point to the package source: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("\"package\":\"acme:check@0.1.0\""),
+            "diagnostic for {name} should carry its package: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!(
+                "\"kind\":\"help\",\"message\":\"try `{suggestion}`\""
+            )),
+            "diagnostic for {name} should include its help suggestion: {diagnostic}"
+        );
+    }
+
+    let unnamed_parameter = "_: U32";
+    let unnamed_start = source
+        .find(unnamed_parameter)
+        .expect("the unnamed parameter is present");
+    let unnamed_end = unnamed_start + unnamed_parameter.len();
+    let unnamed_diagnostic = name_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains(&format!("\"start\":{{\"byte\":{unnamed_start},"))
+                && line.contains(&format!("\"end\":{{\"byte\":{unnamed_end},"))
+        })
+        .expect("the unnamed parameter diagnostic spans the whole parameter");
+    assert!(
+        unnamed_diagnostic.contains("\"children\":[]"),
+        "an unnamed parameter has no name suggestion: {unnamed_diagnostic}"
+    );
+
+    let self_start = source
+        .find("self: borrow Self")
+        .expect("the resource receiver is present");
+    assert!(
+        name_diagnostics
+            .iter()
+            .all(|line| { !line.contains(&format!("\"start\":{{\"byte\":{self_start},")) }),
+        "the resource receiver `self` must not get a name diagnostic: {name_diagnostics:?}"
+    );
+    let raw_keyword_start = source.find("r#type").expect("raw keyword name is present");
+    assert!(
+        name_diagnostics
+            .iter()
+            .all(|line| { !line.contains(&format!("\"start\":{{\"byte\":{raw_keyword_start},")) }),
+        "the raw keyword `r#type` has a representable WIT name: {name_diagnostics:?}"
+    );
+    assert!(
+        stdout.contains("\"type\":\"summary\",\"errors\":9,"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"stage\":0,\"feature\":\"sai check\""),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn check_reports_empty_interface_records_and_enums() {
     let directory = TestDirectory::new();
     let package = directory.path().join("package");

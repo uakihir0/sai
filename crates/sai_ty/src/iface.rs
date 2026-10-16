@@ -1,6 +1,9 @@
 use sai_diagnostics::Code;
 use sai_hir::items::{HirOwner, InterfaceItemKind, MemberRole, OwnerNode, Variant, VariantShape};
+use sai_hir::types::Name;
 use sai_hir::{OwnerId, Span};
+use sai_intern::{Interner, LookupError};
+use sai_resolve::{sai_identifier_to_wit_name, suggested_representable_name};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InterfaceCheckIssueKind {
@@ -11,6 +14,7 @@ pub enum InterfaceCheckIssueKind {
     UnsupportedVariantPayload,
     InvalidFlagsEnum,
     InvalidResourceReceiver,
+    WitNameNotRepresentable,
 }
 
 impl InterfaceCheckIssueKind {
@@ -22,6 +26,7 @@ impl InterfaceCheckIssueKind {
             Self::EmptyType => Code::WitEmptyType,
             Self::InvalidFlagsEnum => Code::InvalidFlagsEnum,
             Self::InvalidResourceReceiver => Code::WitIncompatibleType,
+            Self::WitNameNotRepresentable => Code::WitNameNotRepresentable,
         }
     }
 
@@ -40,6 +45,7 @@ impl InterfaceCheckIssueKind {
                 "flags enums require unit variants without explicit discriminants and at most 32 flags"
             }
             Self::InvalidResourceReceiver => "resource methods must borrow their resource receiver",
+            Self::WitNameNotRepresentable => "SAI name cannot be represented as a WIT name",
         }
     }
 
@@ -52,16 +58,38 @@ impl InterfaceCheckIssueKind {
             Self::UnsupportedVariantPayload => "unsupported WIT variant payload",
             Self::InvalidFlagsEnum => "invalid flags enum",
             Self::InvalidResourceReceiver => "invalid resource receiver",
+            Self::WitNameNotRepresentable => "not representable as a WIT name",
         }
     }
 }
 
 /// One local interface-check finding with its original HIR source span.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceCheckIssue {
     pub owner: OwnerId,
     pub kind: InterfaceCheckIssueKind,
     pub span: Span,
+    pub name: Option<String>,
+    pub suggestion: Option<String>,
+}
+
+impl InterfaceCheckIssue {
+    pub fn message(&self) -> String {
+        match (&self.kind, &self.name) {
+            (InterfaceCheckIssueKind::WitNameNotRepresentable, Some(name)) => {
+                format!("SAI name `{name}` cannot be represented as a WIT name")
+            }
+            (InterfaceCheckIssueKind::WitNameNotRepresentable, None) => {
+                "unnamed interface parameters cannot be represented as WIT names".to_owned()
+            }
+            _ => self.kind.message().to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceCheckError {
+    SymbolLookup(LookupError),
 }
 
 /// Runs the interface-item checks implemented by `sai_ty`.
@@ -71,16 +99,53 @@ pub struct InterfaceCheckIssue {
 pub fn interface_item_check(
     owner: &HirOwner<'_>,
     flags_marker_accepted: bool,
-) -> Vec<InterfaceCheckIssue> {
+    symbols: &Interner,
+) -> Result<Vec<InterfaceCheckIssue>, InterfaceCheckError> {
     let OwnerNode::InterfaceItem(item) = owner.node else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut issues = Vec::new();
+    push_name_issue(&mut issues, item.owner_id, item.name, symbols)?;
+    match item.kind {
+        InterfaceItemKind::Struct { fields, .. } => {
+            for field in fields {
+                push_name_issue(&mut issues, item.owner_id, field.name, symbols)?;
+            }
+        }
+        InterfaceItemKind::Enum { variants, .. } => {
+            for variant in variants {
+                push_name_issue(&mut issues, item.owner_id, variant.name, symbols)?;
+            }
+        }
+        InterfaceItemKind::Fn { sig, .. } | InterfaceItemKind::ResourceMember { sig, .. } => {
+            for param in sig.params {
+                if param.is_self {
+                    continue;
+                }
+                if let Some(name) = param.name {
+                    push_name_issue(&mut issues, item.owner_id, name, symbols)?;
+                } else {
+                    issues.push(InterfaceCheckIssue {
+                        owner: item.owner_id,
+                        kind: InterfaceCheckIssueKind::WitNameNotRepresentable,
+                        span: param.span,
+                        name: None,
+                        suggestion: None,
+                    });
+                }
+            }
+        }
+        InterfaceItemKind::Alias { .. }
+        | InterfaceItemKind::Refined { .. }
+        | InterfaceItemKind::Resource { .. } => {}
+    }
     if let Some(span) = item.generic_params_span {
         issues.push(InterfaceCheckIssue {
             owner: item.owner_id,
             kind: InterfaceCheckIssueKind::GenericItem,
             span,
+            name: None,
+            suggestion: None,
         });
     }
     if let Some(span) = item.where_clause_span {
@@ -88,6 +153,8 @@ pub fn interface_item_check(
             owner: item.owner_id,
             kind: InterfaceCheckIssueKind::GenericItem,
             span,
+            name: None,
+            suggestion: None,
         });
     }
     if let InterfaceItemKind::ResourceMember {
@@ -105,6 +172,8 @@ pub fn interface_item_check(
                     owner: item.owner_id,
                     kind: InterfaceCheckIssueKind::InvalidResourceReceiver,
                     span: receiver.ty.span,
+                    name: None,
+                    suggestion: None,
                 });
             }
         }
@@ -114,6 +183,8 @@ pub fn interface_item_check(
             owner: item.owner_id,
             kind: InterfaceCheckIssueKind::AliasRefinement,
             span: clause,
+            name: None,
+            suggestion: None,
         });
     }
     let flags_invalid = match item.kind {
@@ -132,6 +203,8 @@ pub fn interface_item_check(
                     owner: item.owner_id,
                     kind: InterfaceCheckIssueKind::ExplicitDiscriminant,
                     span: variant.span,
+                    name: None,
+                    suggestion: None,
                 });
             }
         }
@@ -141,6 +214,8 @@ pub fn interface_item_check(
             owner: item.owner_id,
             kind: InterfaceCheckIssueKind::EmptyType,
             span: item.name.span,
+            name: None,
+            suggestion: None,
         });
     }
     if let InterfaceItemKind::Enum { variants, .. } = item.kind {
@@ -155,11 +230,39 @@ pub fn interface_item_check(
                     owner: item.owner_id,
                     kind: InterfaceCheckIssueKind::UnsupportedVariantPayload,
                     span: variant.payload_span.unwrap_or(variant.span),
+                    name: None,
+                    suggestion: None,
                 });
             }
         }
     }
-    issues
+    Ok(issues)
+}
+
+fn push_name_issue(
+    issues: &mut Vec<InterfaceCheckIssue>,
+    owner: OwnerId,
+    name: Name,
+    symbols: &Interner,
+) -> Result<(), InterfaceCheckError> {
+    if name.is_error() {
+        return Ok(());
+    }
+    let source_name = symbols
+        .resolve(name.sym)
+        .map_err(InterfaceCheckError::SymbolLookup)?;
+    if sai_identifier_to_wit_name(&source_name).is_some() {
+        return Ok(());
+    }
+    let source_name = source_name.to_string();
+    issues.push(InterfaceCheckIssue {
+        owner,
+        kind: InterfaceCheckIssueKind::WitNameNotRepresentable,
+        span: name.span,
+        suggestion: suggested_representable_name(&source_name),
+        name: Some(source_name),
+    });
+    Ok(())
 }
 
 fn invalid_flags_enum_issue(
@@ -186,6 +289,8 @@ fn invalid_flags_enum_issue(
         owner,
         kind: InterfaceCheckIssueKind::InvalidFlagsEnum,
         span,
+        name: None,
+        suggestion: None,
     })
 }
 
@@ -202,12 +307,13 @@ mod tests {
     use super::{InterfaceCheckIssueKind, interface_item_check, is_empty_wit_type};
     use sai_hir::body::{FnParam, FnSig};
     use sai_hir::items::{
-        HirOwner, InterfaceItem, InterfaceItemKind, MemberRole, OwnerNode, Variant, VariantShape,
+        FieldDef, HirOwner, InterfaceItem, InterfaceItemKind, MemberRole, OwnerNode, Variant,
+        VariantShape,
     };
     use sai_hir::types::{Generics, Name, Path, PathRoot, Ty, TyKind};
     use sai_hir::{
         DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, Mutability,
-        OwnerId, Safety, Span, SpanCtxt,
+        OwnerId, Safety, Span, SpanCtxt, Visibility,
     };
     use sai_intern::{Interner, ItemLocalId, PackageInterner};
     use sai_vfs::{FileId, TextRange, TextSize};
@@ -264,6 +370,39 @@ mod tests {
         }
     }
 
+    fn name(symbols: &Interner, value: &str, start: u32, end: u32) -> Name {
+        Name {
+            sym: symbols.intern(value).expect("test name interns"),
+            span: span(start, end),
+        }
+    }
+
+    fn check_item_kind<'hir>(
+        ids: &TestIds,
+        item_name: Name,
+        kind: InterfaceItemKind<'hir>,
+        flags_marker_accepted: bool,
+        symbols: &Interner,
+    ) -> Result<Vec<super::InterfaceCheckIssue>, super::InterfaceCheckError> {
+        let item = InterfaceItem {
+            owner_id: ids.owner,
+            interface: ids.owner.def_id,
+            name: item_name,
+            kind,
+            span: span(0, 1000),
+            generic_params_span: None,
+            where_clause_span: None,
+        };
+        let owner = HirOwner {
+            id: ids.owner,
+            node: OwnerNode::InterfaceItem(&item),
+            body: None,
+            raw_attrs: &[],
+            diagnostics: Vec::new(),
+        };
+        super::interface_item_check(&owner, flags_marker_accepted, symbols)
+    }
+
     fn variant(
         ids: &TestIds,
         index: u32,
@@ -291,30 +430,22 @@ mod tests {
         ids: &TestIds,
         variants: &[Variant<'_>],
         flags_marker_accepted: bool,
+        symbols: &Interner,
     ) -> Vec<super::InterfaceCheckIssue> {
-        let item = InterfaceItem {
-            owner_id: ids.owner,
-            interface: ids.owner.def_id,
-            name: Name {
+        check_item_kind(
+            ids,
+            Name {
                 sym: ids.symbol,
                 span: span(0, 5),
             },
-            kind: InterfaceItemKind::Enum {
+            InterfaceItemKind::Enum {
                 generics: EMPTY_GENERICS,
                 variants,
             },
-            span: span(0, 1000),
-            generic_params_span: None,
-            where_clause_span: None,
-        };
-        let owner = HirOwner {
-            id: ids.owner,
-            node: OwnerNode::InterfaceItem(&item),
-            body: None,
-            raw_attrs: &[],
-            diagnostics: Vec::new(),
-        };
-        interface_item_check(&owner, flags_marker_accepted)
+            flags_marker_accepted,
+            symbols,
+        )
+        .expect("HIR symbols resolve")
     }
 
     fn check_resource_member(
@@ -322,7 +453,7 @@ mod tests {
         outer_borrow: Option<Mutability>,
         error_type: bool,
     ) -> Vec<super::InterfaceCheckIssue> {
-        let (ids, _symbols) = test_ids();
+        let (ids, symbols) = test_ids();
         let inner_ty = Ty {
             hir_id: ids.hir,
             kind: TyKind::Path(Path {
@@ -353,6 +484,7 @@ mod tests {
             is_self: true,
             mutable: false,
             ty: &receiver_ty,
+            span: span(20, 34),
         };
         let params = [receiver];
         let sig = FnSig {
@@ -389,7 +521,7 @@ mod tests {
             raw_attrs: &[],
             diagnostics: Vec::new(),
         };
-        interface_item_check(&owner, false)
+        interface_item_check(&owner, false, &symbols).expect("HIR symbols resolve")
     }
 
     #[test]
@@ -413,13 +545,13 @@ mod tests {
 
     #[test]
     fn flags_enum_validation_uses_payload_discriminant_and_count_precedence() {
-        let (ids, _symbols) = test_ids();
+        let (ids, symbols) = test_ids();
         let payload = span(4, 9);
         let with_payload_and_discriminant = [
             variant(&ids, 0, VariantShape::Tuple(&[]), true, Some(payload)),
             variant(&ids, 1, VariantShape::Unit, false, None),
         ];
-        let issues = check_enum(&ids, &with_payload_and_discriminant, true);
+        let issues = check_enum(&ids, &with_payload_and_discriminant, true, &symbols);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, InterfaceCheckIssueKind::InvalidFlagsEnum);
         assert_eq!(issues[0].span, payload);
@@ -427,14 +559,14 @@ mod tests {
         let mut with_discriminant_and_33_variants = (0..33)
             .map(|index| variant(&ids, index, VariantShape::Unit, index == 7, None))
             .collect::<Vec<_>>();
-        let issues = check_enum(&ids, &with_discriminant_and_33_variants, true);
+        let issues = check_enum(&ids, &with_discriminant_and_33_variants, true, &symbols);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, InterfaceCheckIssueKind::InvalidFlagsEnum);
         assert_eq!(issues[0].span, with_discriminant_and_33_variants[7].span);
 
         with_discriminant_and_33_variants[7].has_explicit_discriminant = false;
         with_discriminant_and_33_variants[7].discriminant = None;
-        let issues = check_enum(&ids, &with_discriminant_and_33_variants, true);
+        let issues = check_enum(&ids, &with_discriminant_and_33_variants, true, &symbols);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, InterfaceCheckIssueKind::InvalidFlagsEnum);
         assert_eq!(
@@ -445,12 +577,12 @@ mod tests {
 
     #[test]
     fn valid_and_empty_flags_enums_use_the_expected_interface_checks() {
-        let (ids, _symbols) = test_ids();
+        let (ids, symbols) = test_ids();
         for count in [1, 32] {
             let variants = (0..count)
                 .map(|index| variant(&ids, index, VariantShape::Unit, false, None))
                 .collect::<Vec<_>>();
-            let issues = check_enum(&ids, &variants, true);
+            let issues = check_enum(&ids, &variants, true, &symbols);
             assert!(
                 issues
                     .iter()
@@ -463,13 +595,13 @@ mod tests {
             );
         }
 
-        let issues = check_enum(&ids, &[], true);
+        let issues = check_enum(&ids, &[], true, &symbols);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, InterfaceCheckIssueKind::EmptyType);
         assert_eq!(issues[0].span, span(0, 5));
 
         let explicit = [variant(&ids, 0, VariantShape::Unit, true, None)];
-        let issues = check_enum(&ids, &explicit, false);
+        let issues = check_enum(&ids, &explicit, false, &symbols);
         assert_eq!(issues.len(), 1);
         assert_eq!(
             issues[0].kind,
@@ -503,5 +635,105 @@ mod tests {
                 "only methods have a resource receiver rule"
             );
         }
+    }
+
+    #[test]
+    fn wit_name_check_reports_item_and_field_names_but_skips_error_names() {
+        let (ids, symbols) = test_ids();
+        let ty = Ty {
+            hir_id: ids.hir,
+            kind: TyKind::Err,
+            span: span(50, 53),
+        };
+        let fields = [
+            FieldDef {
+                hir_id: ids.hir,
+                def_id: ids.owner.def_id,
+                vis: Visibility::Pub,
+                name: name(&symbols, "User_Id", 10, 17),
+                ty: &ty,
+            },
+            FieldDef {
+                hir_id: ids.hir,
+                def_id: ids.owner.def_id,
+                vis: Visibility::Pub,
+                name: Name {
+                    sym: sai_hir::Symbol::ERROR,
+                    span: span(20, 25),
+                },
+                ty: &ty,
+            },
+        ];
+        let issues = check_item_kind(
+            &ids,
+            name(&symbols, "Record", 0, 6),
+            InterfaceItemKind::Struct {
+                generics: EMPTY_GENERICS,
+                fields: &fields,
+            },
+            false,
+            &symbols,
+        )
+        .expect("error names do not require an interner lookup");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0].kind,
+            InterfaceCheckIssueKind::WitNameNotRepresentable
+        );
+        assert_eq!(issues[0].span, span(10, 17));
+        assert_eq!(issues[0].name.as_deref(), Some("User_Id"));
+        assert_eq!(issues[0].suggestion.as_deref(), Some("UserId"));
+        assert_eq!(
+            issues[0].message(),
+            "SAI name `User_Id` cannot be represented as a WIT name"
+        );
+    }
+
+    #[test]
+    fn wit_name_check_does_not_report_fields_of_unsupported_record_variant_payloads() {
+        let (ids, symbols) = test_ids();
+        let ty = Ty {
+            hir_id: ids.hir,
+            kind: TyKind::Err,
+            span: span(50, 53),
+        };
+        let fields = [FieldDef {
+            hir_id: ids.hir,
+            def_id: ids.owner.def_id,
+            vis: Visibility::Pub,
+            name: name(&symbols, "User_Id", 10, 17),
+            ty: &ty,
+        }];
+        let variants = [Variant {
+            shape: VariantShape::Record(&fields),
+            ..variant(&ids, 0, VariantShape::Unit, false, None)
+        }];
+        let issues = check_enum(&ids, &variants, false, &symbols);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0].kind,
+            InterfaceCheckIssueKind::UnsupportedVariantPayload
+        );
+        assert_eq!(issues[0].span, variants[0].span);
+    }
+
+    #[test]
+    fn wit_name_check_skips_error_item_names_before_resolving_them() {
+        let (ids, symbols) = test_ids();
+        let issues = check_item_kind(
+            &ids,
+            Name {
+                sym: sai_hir::Symbol::ERROR,
+                span: span(0, 5),
+            },
+            InterfaceItemKind::Resource { members: &[] },
+            false,
+            &symbols,
+        )
+        .expect("error item name does not require an interner lookup");
+
+        assert!(issues.is_empty());
     }
 }

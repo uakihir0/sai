@@ -1383,7 +1383,7 @@ pub struct FnSig<'hir> {
     pub requires: &'hir [HirId],              // HirIds of contract expressions in the body (see Body)
     pub ensures: &'hir [HirId],
 }
-pub struct FnParam<'hir> { pub hir_id: HirId, pub name: Option<Name>, pub is_self: bool, pub mutable: bool, pub ty: &'hir Ty<'hir> }
+pub struct FnParam<'hir> { pub hir_id: HirId, pub name: Option<Name>, pub is_self: bool, pub mutable: bool, pub ty: &'hir Ty<'hir>, pub span: Span /* complete source range; ignored by HIR equality */ }
 pub struct Provenance<'hir> { pub root: Name /* `self` or a parameter */, pub fields: &'hir [Name] }
 pub struct EffectRef<'hir> { pub hir_id: HirId, pub segments: &'hir [Name] }
 

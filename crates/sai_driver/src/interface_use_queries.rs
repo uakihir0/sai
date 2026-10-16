@@ -9,7 +9,7 @@ use super::{
     owner_test_only_path_candidates, owner_type_generic_resolutions,
     resolve_partial_type_owner_paths,
 };
-use sai_diagnostics::{Diagnostic, Location, Severity, SourceRef};
+use sai_diagnostics::{Child, ChildKind, Diagnostic, Location, Severity, SourceRef, Value};
 use sai_hir::arena::HirArena;
 use sai_hir::item_tree::ItemTreeKind;
 use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, OwnerNode};
@@ -22,7 +22,7 @@ use sai_resolve::package_scopes::{
 };
 use sai_resolve::{InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
-use sai_ty::iface::{InterfaceCheckIssue, interface_item_check};
+use sai_ty::iface::{InterfaceCheckError, InterfaceCheckIssue, interface_item_check};
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -240,12 +240,38 @@ fn append_interface_item_diagnostics(
             )
         })?;
         let mut diagnostic =
-            Diagnostic::new(code, Severity::Error, issue.kind.message(), Some(location));
+            Diagnostic::new(code, Severity::Error, issue.message(), Some(location));
         diagnostic.primary_label = issue.kind.primary_label().to_owned();
         diagnostic.package = snapshot_file.package().map(str::to_owned);
+        if let Some(suggestion) = issue.suggestion {
+            diagnostic
+                .data
+                .insert("suggestion".to_owned(), Value::String(suggestion.clone()));
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Help,
+                    message: format!("try `{suggestion}`"),
+                    location: None,
+                })
+                .expect("unbound diagnostics accept help children");
+        }
         diagnostics.push(diagnostic);
     }
     Ok(())
+}
+
+fn collect_interface_item_issues(
+    owner: &HirOwner<'_>,
+    flags_marker_accepted: bool,
+    symbols: &Interner,
+) -> Result<Vec<InterfaceCheckIssue>, InterfaceUsesQueryError> {
+    interface_item_check(owner, flags_marker_accepted, symbols)
+        .map_err(|error| match error {
+            InterfaceCheckError::SymbolLookup(error) => {
+                OwnerControlFlowResolutionError::SymbolLookup(error)
+            }
+        })
+        .map_err(InterfaceUsesQueryError::Collection)
 }
 
 fn collect_interface_uses_input(
@@ -428,7 +454,7 @@ fn collect_interface_uses_input(
             .map_err(InterfaceUsesQueryError::Collection)?;
             let flags_marker_accepted = inputs.accepted_flags_attributes.contains(&entry.ast_id);
             append_interface_item_diagnostics(
-                interface_item_check(&member_hir, flags_marker_accepted),
+                collect_interface_item_issues(&member_hir, flags_marker_accepted, symbols)?,
                 &inputs.source_ref,
                 &inputs.source,
                 &prepared.snapshot,
@@ -518,7 +544,7 @@ fn collect_interface_uses_input(
                 .map_err(OwnerControlFlowResolutionError::Lowering)
                 .map_err(InterfaceUsesQueryError::Collection)?;
                 append_interface_item_diagnostics(
-                    interface_item_check(&method_hir, false),
+                    collect_interface_item_issues(&method_hir, false, symbols)?,
                     &inputs.source_ref,
                     &inputs.source,
                     &prepared.snapshot,

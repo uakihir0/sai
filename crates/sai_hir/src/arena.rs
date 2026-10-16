@@ -756,6 +756,7 @@ mod tests {
             is_self: false,
             mutable: true,
             ty,
+            span: span(1),
         });
         let fn_params = arena.alloc_fn_params(&[*fn_param]);
         let required = arena.alloc_hir_ids(&[hir_id]);
