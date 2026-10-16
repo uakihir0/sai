@@ -278,6 +278,8 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         "unsafe extern \"wasm\" module \"env\" {\n",
         "  fn transitive_extern(missing: middle.api.PublicTypo)\n",
         "}\n",
+        "trait RootHeader<Missing: middle.api.PublicTypo> {}\n",
+        "impl middle.api.PublicType for middle.api.PublicType where Self: middle.api.PublicTypo {}\n",
     );
     fs::write(root.join("src/lib.sai"), root_source).expect("write root source");
     fs::write(
@@ -558,7 +560,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
         .collect::<Vec<_>>();
-    assert_eq!(unresolved_diagnostics.len(), 12, "{stdout}");
+    assert_eq!(unresolved_diagnostics.len(), 14, "{stdout}");
     for (owner_name, owner_source) in [
         ("invariant", "invariant U32"),
         ("refined type", "type MiddleRefined"),
@@ -664,6 +666,11 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         ("invariant", "invariant RootInvariant"),
         ("refined type", "type RootRefined"),
         ("extern function", "transitive_extern"),
+        ("trait header", "trait RootHeader"),
+        (
+            "impl header",
+            "impl middle.api.PublicType for middle.api.PublicType",
+        ),
     ] {
         let owner_start = root_source
             .find(owner_source)

@@ -1393,6 +1393,7 @@ pub struct TraitImplHeaderResolution {
     owner: OwnerId,
     kind: TopLevelOwnerKind,
     type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -1411,6 +1412,19 @@ impl TraitImplHeaderResolution {
         &self,
     ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
         self.type_path_resolution.as_ref()
+    }
+
+    /// Returns snapshot-bound type member diagnostics for headers analyzed
+    /// with a validated active-source member-scope closure.
+    ///
+    /// Package-local adapters leave this channel absent so callers can keep
+    /// mapping their typed path errors with their own snapshot context.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn test_only_path_resolution(
@@ -9934,6 +9948,7 @@ impl RootDatabase {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         type_path_resolution: Err(error.clone()),
+                        module_path_diagnostics: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
                         lowering_diagnostics,
@@ -10064,10 +10079,29 @@ impl RootDatabase {
 
             match analysis {
                 Ok((type_path_resolution, path_resolution, diagnostics)) => {
+                    let module_path_diagnostics =
+                        match (member_scopes, type_path_resolution.as_ref()) {
+                            (Some(member_scopes), Ok(path_resolution)) => Some(
+                                self.type_owner_module_path_diagnostics(
+                                    descriptor.owner,
+                                    path_resolution,
+                                    &inputs,
+                                    Some(&module_members),
+                                    snapshot,
+                                    &collection.target_cfg,
+                                    Some(member_scopes),
+                                )
+                                .map(Some),
+                            ),
+                            (Some(_), Err(error)) => Some(Err(error.clone())),
+                            (None, _) => None,
+                        }
+                        .unwrap_or(Ok(None));
                     owners.push(TraitImplHeaderResolution {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         type_path_resolution,
+                        module_path_diagnostics,
                         test_only_path_resolution: path_resolution,
                         test_only_diagnostics: diagnostics,
                         lowering_diagnostics,
@@ -10078,6 +10112,7 @@ impl RootDatabase {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         type_path_resolution: Err(error.clone()),
+                        module_path_diagnostics: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
                         lowering_diagnostics,
@@ -22066,12 +22101,8 @@ mod tests {
                 ));
             };
 
-        let assert_predicate_path_diagnostics =
-            |owner: &PredicateOwnerResolution, source: &str, source_offset: usize| {
-                let diagnostics = owner
-                    .module_path_diagnostics()
-                    .expect("predicate type member diagnostics resolve")
-                    .expect("the closure-aware predicate adapter maps member failures");
+        let assert_type_member_diagnostics =
+            |diagnostics: &[Diagnostic], source: &str, source_offset: usize| {
                 assert_eq!(diagnostics.len(), 2);
                 let private_span = member_range(
                     source,
@@ -22101,12 +22132,12 @@ mod tests {
                                 private_const_declaration_span.range
                             )
                     )),
-                    "predicate private diagnostics retain the foreign declaration location"
+                    "private diagnostics retain the foreign declaration location"
                 );
                 let missing = diagnostics
                     .iter()
                     .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnresolvedName)
-                    .expect("missing predicate type becomes UNRESOLVED_NAME");
+                    .expect("missing type becomes UNRESOLVED_NAME");
                 assert_eq!(
                     missing.primary().map(|location| &location.span),
                     Some(&sai_diagnostics::Span::new(
@@ -22119,8 +22150,16 @@ mod tests {
                     Some(&sai_diagnostics::Value::Array(vec![
                         sai_diagnostics::Value::String("PublicType".to_owned())
                     ])),
-                    "predicate suggestions use the visible transitive target members"
+                    "suggestions use the visible transitive target members"
                 );
+            };
+        let assert_predicate_path_diagnostics =
+            |owner: &PredicateOwnerResolution, source: &str, source_offset: usize| {
+                let diagnostics = owner
+                    .module_path_diagnostics()
+                    .expect("predicate type member diagnostics resolve")
+                    .expect("the closure-aware predicate adapter maps member failures");
+                assert_type_member_diagnostics(diagnostics, source, source_offset);
             };
 
         let header_results = database
@@ -22175,6 +22214,25 @@ mod tests {
             &source_text[header_start..header_end],
             header_start,
         );
+        let trait_header_diagnostics = header_results.owners()[0]
+            .module_path_diagnostics()
+            .expect("trait header member diagnostics resolve")
+            .expect("the closure-aware header adapter maps member failures");
+        assert_type_member_diagnostics(
+            trait_header_diagnostics,
+            &source_text[header_start..header_end],
+            header_start,
+        );
+        let package_local_headers = database
+            .resolve_trait_impl_header_test_only_paths(&root_collection, &root_tree, &snapshot)
+            .expect("package-local trait and impl headers remain available");
+        assert!(
+            package_local_headers.owners()[0]
+                .module_path_diagnostics()
+                .expect("package-local header diagnostic channel remains healthy")
+                .is_none(),
+            "package-local callers receive no snapshot-bound mapped diagnostics"
+        );
         let impl_header_start = source_text
             .find("impl middle.api.PublicType")
             .expect("transitive impl header appears in the root source");
@@ -22186,6 +22244,15 @@ mod tests {
             .expect("impl header type path result succeeds");
         assert_foreign_predicate_paths(
             impl_header_paths,
+            &source_text[impl_header_start..impl_header_end],
+            impl_header_start,
+        );
+        let impl_header_diagnostics = header_results.owners()[1]
+            .module_path_diagnostics()
+            .expect("impl header member diagnostics resolve")
+            .expect("the closure-aware header adapter maps member failures");
+        assert_type_member_diagnostics(
+            impl_header_diagnostics,
             &source_text[impl_header_start..impl_header_end],
             impl_header_start,
         );
