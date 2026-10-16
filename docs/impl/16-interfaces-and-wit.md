@@ -711,6 +711,8 @@ For each member of an interface `resource R` (spec/13 §13.2.4):
 
 The boundary types of members are then checked by §16.6.3. The receiver is not a boundary type, because WIT does not print it (spec/13 §13.11.2).
 
+**Implementation progress (IR-618).** The Phase 1 driver now checks borrowed method receivers after alias-aware boundary conversion: `Self`, the enclosing resource, and known current-package module aliases must resolve to the same resource definition. Borrowed non-resource and different-resource targets are rejected at the full receiver type span. Unresolved and deferred targets do not cascade, and non-borrow receivers remain owned by the existing shape check. Receiver paths are deliberately excluded from emitted boundary roots, generated `use` aliases, and `interface_uses`, because WIT omits the receiver.
+
 ### 16.6.3 WIT compatibility and names
 
 **Boundary type conversion.** One function converts a HIR type in a boundary position to a WIT type, or reports why it cannot:
